@@ -2041,6 +2041,243 @@
           "echo"
         ]
       }
+    },
+    "/tenants/{tenantId}/inventory/adjustments": {
+      "post": {
+        "operationId": "InventoryController_adjustStock",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StockAdjustmentDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Adjustment committed: the ledger event snapshot plus the resulting on-hand quantity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StockAdjustmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or invalid body (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks stock.adjust (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse, bin, or SKU does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Concurrent request on the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse), or the movement would drive on-hand below zero (insufficient-on-hand names the bin and current on-hand)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Records a manual stock adjustment (one ledger event + on-hand projection in one commit)",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/inventory/events": {
+      "get": {
+        "operationId": "InventoryController_listEvents",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "skuId",
+            "required": false,
+            "in": "query",
+            "description": "Only events of one SKU",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The warehouse's ledger event-timeline page (newest first, keyset cursor)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LedgerEventListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed skuId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists one warehouse's ledger event timeline (keyset cursor pagination, newest first)",
+        "tags": [
+          "inventory"
+        ]
+      }
     }
   },
   "info": {
@@ -3108,6 +3345,216 @@
         "required": [
           "echoed",
           "time"
+        ]
+      },
+      "StockAdjustmentDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Warehouse holding the bin"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantityDelta": {
+            "type": "number",
+            "description": "Signed base-UoM integer; positive into the bin, negative out"
+          },
+          "reasonCode": {
+            "type": "string",
+            "description": "Machine reason for the correction (e.g. stock-count)"
+          },
+          "note": {
+            "type": "string",
+            "description": "The Ops Manager's note, carried verbatim on the event"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "skuId",
+          "binId",
+          "quantityDelta",
+          "reasonCode",
+          "note"
+        ]
+      },
+      "LedgerEventSnapshotDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "seq": {
+            "type": "number",
+            "description": "Gap-free per-warehouse replay order"
+          },
+          "type": {
+            "type": "string",
+            "example": "stock.adjusted"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "quantityDelta": {
+            "type": "number",
+            "description": "Signed base-UoM delta"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC business time"
+          },
+          "recordedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC commit time"
+          }
+        },
+        "required": [
+          "id",
+          "seq",
+          "type",
+          "skuId",
+          "binId",
+          "quantityDelta",
+          "occurredAt",
+          "recordedAt"
+        ]
+      },
+      "OnHandSnapshotDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantity": {
+            "type": "number",
+            "description": "On-hand in base UoM after the movement"
+          }
+        },
+        "required": [
+          "skuId",
+          "binId",
+          "quantity"
+        ]
+      },
+      "StockAdjustmentResponse": {
+        "type": "object",
+        "properties": {
+          "event": {
+            "$ref": "#/components/schemas/LedgerEventSnapshotDto"
+          },
+          "onHand": {
+            "$ref": "#/components/schemas/OnHandSnapshotDto"
+          }
+        },
+        "required": [
+          "event",
+          "onHand"
+        ]
+      },
+      "LedgerEventDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "seq": {
+            "type": "number"
+          },
+          "type": {
+            "type": "string",
+            "example": "stock.adjusted"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "quantityDelta": {
+            "type": "number"
+          },
+          "actorUserId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "occurredAt": {
+            "type": "string"
+          },
+          "recordedAt": {
+            "type": "string"
+          },
+          "eventHash": {
+            "type": "string",
+            "description": "sha256 over the canonical event bytes (chain link)"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC commit time of the append"
+          }
+        },
+        "required": [
+          "id",
+          "seq",
+          "type",
+          "skuId",
+          "fromBinId",
+          "toBinId",
+          "quantityDelta",
+          "actorUserId",
+          "occurredAt",
+          "recordedAt",
+          "eventHash",
+          "createdAt"
+        ]
+      },
+      "LedgerEventListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LedgerEventDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
         ]
       }
     }

@@ -21,3 +21,18 @@ export function gstBps(percent: number): GstBps {
   if (bps < 0 || bps > 10000) throw new Error(`GST out of range (0–100%): ${percent}`);
   return bps as GstBps;
 }
+
+/**
+ * Signed quantity (Story 2.1): the ledger's movement delta — a **signed**
+ * integer in the SKU's base unit of measure. `BaseQuantity` stays
+ * non-negative (on-hand is a level, never signed); a movement is a signed
+ * delta, so it gets this sibling brand rather than loosening `BaseQuantity`.
+ */
+export type SignedQuantity = number & { readonly __brand: 'signed-quantity' };
+
+export function signedQuantity(value: number): SignedQuantity {
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`Quantity delta must be an integer in base UoM: ${value}`);
+  }
+  return value as SignedQuantity;
+}
