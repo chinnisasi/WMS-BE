@@ -51,4 +51,4 @@ bun run openapi:export  # write openapi/openapi.json — the API contract
 
 ## Environment
 
-Copy `.env.example` → `.env`: `PORT`, `DATABASE_URL`.
+Copy `.env.example` → `.env`: `PORT`, `DATABASE_URL`, `JWT_SECRET` (session signing, length-validated), `DATABASE_AUTH_URL` (optional BYPASSRLS connection, falls back to `DATABASE_URL`), and `CORS_ORIGIN` (browser-client origin allow-list, comma-separated — default `http://localhost:3001`, the web dev server).
