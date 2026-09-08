@@ -1134,6 +1134,351 @@
         ]
       }
     },
+    "/tenants/{tenantId}/catalog/imports": {
+      "post": {
+        "operationId": "CatalogController_importCatalog",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "CSV or XLSX with the documented header (sku_code,name,uom,gst_rate required)"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "initial",
+                      "fix"
+                    ],
+                    "description": "`initial` (default) or `fix` — fix processes only the latest run's failed SKU codes"
+                  }
+                },
+                "required": [
+                  "file"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Partial commit: counts + row-level errors (a 201 can carry failures)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogImportResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a file that cannot be parsed (file-unreadable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a .csv/.xlsx file (unsupported-file-type)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "More than 10,000 rows or 5 MB (import-too-large), or idempotency-key-reuse",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Imports a CSV/XLSX catalog — valid rows commit in one transaction, bad rows are listed per row (≤ 10,000 rows, ≤ 5 MB)",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/catalog/skus": {
+      "get": {
+        "operationId": "CatalogController_listSkus",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkuListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor (invalid-cursor) or out-of-range limit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists SKUs (keyset cursor pagination)",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/catalog/skus/{skuId}": {
+      "patch": {
+        "operationId": "CatalogController_editSku",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "skuId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchSkuDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkuResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or invalid/empty body",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SKU does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Barcode already belongs to another SKU (duplicate-barcode names it)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Edits a SKU (name, GST, HSN, flags, reorder defaults, barcode — the SKU code is immutable)",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
     "/health": {
       "get": {
         "operationId": "HealthController_health",
@@ -1850,6 +2195,252 @@
         "required": [
           "steps"
         ]
+      },
+      "CatalogImportErrorResponse": {
+        "type": "object",
+        "properties": {
+          "rowNumber": {
+            "type": "number",
+            "example": 3,
+            "description": "1-based data-row index (header excluded)"
+          },
+          "skuCode": {
+            "type": "string",
+            "nullable": true,
+            "example": "MAS-CHILI-100",
+            "description": "Absent when the row failed shape validation before a code could be read"
+          },
+          "code": {
+            "type": "string",
+            "example": "duplicate-sku-code",
+            "description": "validation-failed | duplicate-sku-code | duplicate-barcode"
+          },
+          "detail": {
+            "type": "string",
+            "example": "SKU code \"MAS-CHILI-100\" already exists in this tenant's catalog — duplicates are rejected, never merged."
+          }
+        },
+        "required": [
+          "rowNumber",
+          "skuCode",
+          "code",
+          "detail"
+        ]
+      },
+      "CatalogImportResponse": {
+        "type": "object",
+        "properties": {
+          "importId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "initial",
+              "fix"
+            ],
+            "example": "initial"
+          },
+          "committedRows": {
+            "type": "number",
+            "example": 4970,
+            "description": "Rows committed in this run's single transaction"
+          },
+          "failedRows": {
+            "type": "number",
+            "example": 30,
+            "description": "Rows rejected with a row-level error"
+          },
+          "skippedRows": {
+            "type": "number",
+            "example": 0,
+            "description": "Rows skipped by fix mode (not in the latest run's failed set)"
+          },
+          "errors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogImportErrorResponse"
+            }
+          }
+        },
+        "required": [
+          "importId",
+          "mode",
+          "committedRows",
+          "failedRows",
+          "skippedRows",
+          "errors"
+        ]
+      },
+      "SkuUomConversionResponse": {
+        "type": "object",
+        "properties": {
+          "uom": {
+            "type": "string",
+            "example": "box"
+          },
+          "factor": {
+            "type": "number",
+            "example": 12,
+            "description": "Positive integer, relative to the SKU's base UoM"
+          }
+        },
+        "required": [
+          "uom",
+          "factor"
+        ]
+      },
+      "SkuResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "MAS-CHILI-100"
+          },
+          "name": {
+            "type": "string",
+            "example": "Chili powder 100g"
+          },
+          "uom": {
+            "type": "string",
+            "example": "pcs"
+          },
+          "gstRateBps": {
+            "type": "number",
+            "example": 1800,
+            "description": "GST in basis points (1800 = 18%)"
+          },
+          "hsn": {
+            "type": "string",
+            "nullable": true,
+            "example": "10062020"
+          },
+          "batchTracked": {
+            "type": "boolean",
+            "example": false
+          },
+          "serialTracked": {
+            "type": "boolean",
+            "example": false
+          },
+          "reorderPoint": {
+            "type": "number",
+            "example": 50
+          },
+          "reorderQty": {
+            "type": "number",
+            "example": 100
+          },
+          "barcode": {
+            "type": "string",
+            "example": "0198f7a2-1b3c-7d4e-8f90-112233445588",
+            "description": "Generated server-side (uuidv7) unless provided"
+          },
+          "uomConversions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SkuUomConversionResponse"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "example": "2026-09-08T00:00:00.000Z"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "code",
+          "name",
+          "uom",
+          "gstRateBps",
+          "hsn",
+          "batchTracked",
+          "serialTracked",
+          "reorderPoint",
+          "reorderQty",
+          "barcode",
+          "uomConversions",
+          "createdAt"
+        ]
+      },
+      "SkuListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SkuResponse"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true,
+            "description": "Opaque keyset cursor"
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PatchSkuDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "gstRate": {
+            "type": "number",
+            "example": 1800,
+            "minimum": 0,
+            "maximum": 10000,
+            "description": "GST in basis points (1800 = 18%)"
+          },
+          "hsn": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 32
+          },
+          "batchTracked": {
+            "type": "boolean",
+            "example": false
+          },
+          "serialTracked": {
+            "type": "boolean",
+            "example": false
+          },
+          "reorderPoint": {
+            "type": "number",
+            "example": 50,
+            "minimum": 0,
+            "maximum": 2147483647,
+            "description": "Base-UoM units"
+          },
+          "reorderQty": {
+            "type": "number",
+            "example": 100,
+            "minimum": 0,
+            "maximum": 2147483647,
+            "description": "Base-UoM units"
+          },
+          "barcode": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        }
       },
       "HealthResponse": {
         "type": "object",
