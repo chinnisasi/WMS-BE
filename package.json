@@ -1,0 +1,48 @@
+{
+  "name": "wms-be",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WMS backend — NestJS 12 modular monolith (api + jobs shells)",
+  "packageManager": "bun@1.2.20",
+  "engines": {
+    "bun": ">=1.2"
+  },
+  "scripts": {
+    "dev": "bun --watch src/main.ts",
+    "start": "bun src/main.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint .",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "bun src/shared/db/migrate.ts",
+    "openapi:export": "bun src/api/export-openapi.ts"
+  },
+  "dependencies": {
+    "@nestjs/common": "12.0.1",
+    "@nestjs/core": "12.0.1",
+    "@nestjs/platform-express": "12.0.1",
+    "@nestjs/swagger": "12.0.1",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.15.1",
+    "drizzle-orm": "0.45.2",
+    "postgres": "3.4.9",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "12.0.1",
+    "@swc/core": "1.16.2",
+    "@swc/jest": "0.2.39",
+    "@types/express": "^5.0.6",
+    "@types/jest": "30.0.0",
+    "@types/node": "24.0.0",
+    "@types/supertest": "6.0.3",
+    "drizzle-kit": "0.31.10",
+    "eslint": "9.30.0",
+    "jest": "30.5.1",
+    "supertest": "7.2.2",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.70.0"
+  }
+}

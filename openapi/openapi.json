@@ -1,0 +1,58 @@
+{
+  "openapi": "3.0.0",
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "HealthController_health",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "summary": "Liveness check",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/echo": {
+      "post": {
+        "operationId": "EchoController_echo",
+        "parameters": [],
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "summary": "Echoes the request payload back with a timestamp",
+        "tags": [
+          "echo"
+        ]
+      }
+    }
+  },
+  "info": {
+    "title": "WMS API",
+    "description": "Warehouse Management System backend — modular monolith. This document is the contract: web and mobile clients generate typed clients from it (AD-8).",
+    "version": "1.0.0",
+    "contact": {
+      "name": "WMS",
+      "url": "https://wms.example.com",
+      "email": "api@wms.example.com"
+    },
+    "license": {
+      "name": "Proprietary",
+      "url": "https://wms.example.com/license"
+    }
+  },
+  "tags": [],
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "components": {
+    "schemas": {}
+  }
+}
