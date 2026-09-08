@@ -24,9 +24,11 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from './idempotency-guard
 // the runtime class tokens for decorator metadata (eslint rule bends for them).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { UsersCommand } from './users.command';
-import type {
-  InviteUserDto,
-  SetUserRoleDto} from './tenancy.dto';
+// InviteUserDto/SetUserRoleDto are bound to @Body() *and* read by the Swagger
+// explorer through emitDecoratorMetadata — a type-only import erases the
+// runtime reference and the OpenAPI document loses the request body.
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { InviteUserDto, SetUserRoleDto } from './tenancy.dto';
 import {
   AcceptInviteDto,
   AcceptInviteResponse,

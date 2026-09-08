@@ -1149,6 +1149,16 @@
             }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InviteUserDto"
+              }
+            }
+          }
+        },
         "responses": {
           "201": {
             "description": "",
@@ -1332,6 +1342,16 @@
             }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetUserRoleDto"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "",
@@ -2656,6 +2676,30 @@
           "steps"
         ]
       },
+      "InviteUserDto": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "example": "dev@example.com",
+            "format": "email"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "owner",
+              "ops_manager",
+              "operator",
+              "accountant"
+            ],
+            "example": "operator"
+          }
+        },
+        "required": [
+          "email",
+          "role"
+        ]
+      },
       "InviteUserResponse": {
         "type": "object",
         "properties": {
@@ -2696,6 +2740,24 @@
         "required": [
           "items",
           "nextCursor"
+        ]
+      },
+      "SetUserRoleDto": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "owner",
+              "ops_manager",
+              "operator",
+              "accountant"
+            ],
+            "example": "ops_manager"
+          }
+        },
+        "required": [
+          "role"
         ]
       },
       "AcceptInviteDto": {
