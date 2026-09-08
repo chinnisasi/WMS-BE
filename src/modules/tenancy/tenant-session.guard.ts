@@ -18,8 +18,10 @@ export const CurrentSession = createParamDecorator(
 
 /**
  * Session transport for warehouse endpoints (spec decision): a valid,
- * unexpired HS256 Bearer token minted by sign-in. Transport only — authority
- * is re-evaluated at command-service entry.
+ * unexpired HS256 Bearer token minted by sign-in. Transport only — the token
+ * proves *who* is calling; tenant-ownership of the path is enforced at the
+ * controller boundary (`assertOwnTenant`), so any future non-HTTP caller of a
+ * command service must bring its own authority check.
  */
 @Injectable()
 export class TenantSessionGuard implements CanActivate {

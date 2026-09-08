@@ -32,9 +32,21 @@ export function createLazyDatabase(): Database {
  * for auth-time reads only; every tenant-scoped path stays on `DATABASE`.
  */
 export function createLazyAuthDatabase(): Database {
-  return lazyDatabaseProxy(() =>
-    createDatabase(process.env.DATABASE_AUTH_URL || requiredDbUrl()),
-  );
+  return lazyDatabaseProxy(() => {
+    const authUrl = process.env.DATABASE_AUTH_URL;
+    if (!authUrl) {
+      // A deployment that forgets DATABASE_AUTH_URL fails closed (the scoped
+      // role is non-superuser → every auth-time read returns zero rows → bare
+      // 401s with no distinguishing log). Say so once, loudly, at first use.
+      console.warn(
+        'DATABASE_AUTH_URL is not set — the auth connection is falling back to ' +
+          'DATABASE_URL. In production DATABASE_AUTH_URL must point at a role ' +
+          'with BYPASSRLS (see scripts/provision-roles.sql); the fallback only ' +
+          'works where the DATABASE_URL role itself is superuser (dev/CI).',
+      );
+    }
+    return createDatabase(authUrl || requiredDbUrl());
+  });
 }
 
 function lazyDatabaseProxy(create: () => Database): Database {

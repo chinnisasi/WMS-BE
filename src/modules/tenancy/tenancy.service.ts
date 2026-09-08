@@ -99,9 +99,17 @@ export class TenancyService {
   }
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The cursor is opaque to clients but crafted input is still possible — a
+ * base64-valid payload with a non-uuid `id` would otherwise reach the
+ * `::uuid` cast in SQL and surface as a 500 instead of a 400.
+ */
 function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
+  let decoded: { createdAt: string; id: string };
   try {
-    return decodeCursor(cursor);
+    decoded = decodeCursor(cursor);
   } catch {
     throw new ProblemException(
       'invalid-cursor',
@@ -110,4 +118,13 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
       'The cursor parameter is not a valid opaque page cursor.',
     );
   }
+  if (!UUID_RE.test(decoded.id) || Number.isNaN(Date.parse(decoded.createdAt))) {
+    throw new ProblemException(
+      'invalid-cursor',
+      400,
+      'Malformed pagination cursor',
+      'The cursor parameter is not a valid opaque page cursor.',
+    );
+  }
+  return decoded;
 }

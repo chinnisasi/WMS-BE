@@ -133,17 +133,26 @@ export class WarehouseCommand {
     );
 
     if (!replayed) {
-      await this.eventBus.publish({
-        eventId: uuidv7(),
-        type: 'warehouse.created',
-        tenantId: command.tenantId,
-        occurredAt: nowIso(),
-        payload: {
-          warehouseId: snapshot.warehouse.id,
-          code: snapshot.warehouse.code,
-          name: snapshot.warehouse.name,
-        },
-      } satisfies DomainEvent);
+      // Publish after the commit; a throwing bus must not 500 already-committed
+      // work (the client's retry would replay instead of re-emit).
+      try {
+        await this.eventBus.publish({
+          eventId: uuidv7(),
+          type: 'warehouse.created',
+          tenantId: command.tenantId,
+          occurredAt: nowIso(),
+          payload: {
+            warehouseId: snapshot.warehouse.id,
+            code: snapshot.warehouse.code,
+            name: snapshot.warehouse.name,
+          },
+        } satisfies DomainEvent);
+      } catch (error) {
+        console.warn(
+          `Event publish failed after commit — type=warehouse.created tenant=${command.tenantId}:`,
+          error,
+        );
+      }
     }
     return snapshot;
   }

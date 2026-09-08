@@ -13,9 +13,9 @@ export class LoggingEventBus implements EventBus {
   private readonly logger = new Logger('EventBus');
 
   async publish(event: DomainEvent): Promise<void> {
-    this.logger.log(
-      `${event.type} tenant=${event.tenantId} event=${event.eventId} payload=${JSON.stringify(event.payload)}`,
-    );
+    // No payload: event bodies can carry PII (owner emails) — type, tenant
+    // and event id are enough to correlate with the outbox later.
+    this.logger.log(`${event.type} tenant=${event.tenantId} event=${event.eventId}`);
   }
 
   subscribe(): void {

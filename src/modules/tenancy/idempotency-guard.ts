@@ -45,7 +45,13 @@ export function parseRequiredIdempotencyKey(raw: string | undefined): string {
   return raw;
 }
 
-/** Stable payload fingerprint — canonical JSON of the command, sha256. */
+/**
+ * Stable payload fingerprint — sha256 over the JSON-serialized command.
+ * `JSON.stringify` is key-order dependent, so this is only stable because each
+ * command type constructs its payload with a fixed key shape; never hash a
+ * dynamically-ordered object here, or the same logical payload fingerprints
+ * differently and replays 422.
+ */
 export function hashCommandPayload(command: Record<string, unknown>): string {
   return createHash('sha256').update(JSON.stringify(command), 'utf8').digest('hex');
 }

@@ -63,7 +63,8 @@ export class RegistrationCommand {
     idempotencyKey: string,
   ): Promise<TenantRegistrationSnapshot> {
     const email = command.ownerEmail.trim().toLowerCase();
-    const passwordHash = await hashPassword(command.password);
+    // Cheap fingerprint first, replay lookup second, scrypt hash LAST — a
+    // replay must not pay the ~100 ms hashing cost just to discard it.
     const payloadHash = hashCommandPayload({
       name: command.name,
       ownerEmail: email,
@@ -82,7 +83,9 @@ export class RegistrationCommand {
       return existing[0].responseSnapshot as TenantRegistrationSnapshot;
     }
 
-    const { snapshot, replayed } = await this.db.transaction(async (tx) => {
+    const passwordHash = await hashPassword(command.password);
+
+    const snapshot = await this.db.transaction(async (tx) => {
       const tenantId = uuidv7();
       await setTenantScope(tx, tenantId);
 
@@ -123,10 +126,12 @@ export class RegistrationCommand {
         payloadHash,
         responseSnapshot: body,
       });
-      return { snapshot: body, replayed: false };
+      return body;
     });
 
-    if (!replayed) {
+    // Publish after the commit; a throwing bus must not 500 already-committed
+    // work (the client's retry would replay instead of re-emit).
+    try {
       await this.eventBus.publish({
         eventId: uuidv7(),
         type: 'tenant.registered',
@@ -134,8 +139,14 @@ export class RegistrationCommand {
         occurredAt: nowIso(),
         payload: { name: snapshot.tenant.name, ownerEmail: snapshot.owner.email },
       } satisfies DomainEvent);
+    } catch (error) {
+      this.logPublishFailure('tenant.registered', snapshot.tenant.id, error);
     }
     return snapshot;
+  }
+
+  private logPublishFailure(type: string, tenantId: string, error: unknown): void {
+    console.warn(`Event publish failed after commit — type=${type} tenant=${tenantId}:`, error);
   }
 }
 

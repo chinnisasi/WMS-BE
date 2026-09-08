@@ -8,6 +8,7 @@ import {
   ApiHeaders,
   ApiOkResponse,
   ApiOperation,
+  ApiParam,
   ApiProperty,
   ApiResponse,
   ApiTags,
@@ -39,7 +40,7 @@ export class WarehouseListQuery {
   @IsString()
   cursor?: string;
 
-  @ApiProperty({ required: false, example: 50 })
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
@@ -53,6 +54,8 @@ const IDEMPOTENCY_HEADER = [
     name: 'Idempotency-Key',
     required: true,
     description: 'Client-generated ULID key; replays return the original response',
+    // ULID: 26 chars, Crockford base32.
+    schema: { type: 'string', minLength: 26, maxLength: 26, pattern: '^[0-9A-HJKMNP-TV-Z]{26}$' },
   },
 ];
 
@@ -116,6 +119,7 @@ export class TenancyController {
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('Warehouse code already exists (duplicate-warehouse-code names the code)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async createWarehouse(
     @Param('tenantId') tenantId: string,
     @IdempotencyKey() idempotencyKey: string | undefined,
@@ -139,6 +143,7 @@ export class TenancyController {
   @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async listWarehouses(
     @Param('tenantId') tenantId: string,
     @CurrentSession() session: TenantSession,
@@ -148,7 +153,7 @@ export class TenancyController {
     const page = await this.tenancyService.listWarehouses(
       tenantId,
       query.cursor,
-      query.limit === undefined ? undefined : Number(query.limit),
+      query.limit === undefined ? undefined : query.limit,
     );
     return { items: [...page.items], nextCursor: page.nextCursor };
   }

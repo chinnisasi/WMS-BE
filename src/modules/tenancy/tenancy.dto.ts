@@ -1,13 +1,26 @@
 import { ApiProperty } from '@nestjs/swagger';
+import { Transform } from 'class-transformer';
 import { IsEmail, IsString, Length } from 'class-validator';
+
+/**
+ * Trim inputs at the validation boundary so the command layer's normalized
+ * values and the validator agree: a padded `" a@b.com "` would otherwise fail
+ * `@IsEmail` with a 400 even though sign-in/registration normalize with
+ * `trim().toLowerCase()`, and `" BLR-01"` would become a second, distinct
+ * warehouse code. A whitespace-only field trims to `''` and fails `@Length`.
+ */
+const Trimmed = () =>
+  Transform(({ value }) => (typeof value === 'string' ? value.trim() : value));
 
 export class RegisterTenantDto {
   @ApiProperty({ example: 'Priya Spices Pvt Ltd', minLength: 1, maxLength: 200 })
+  @Trimmed()
   @IsString()
   @Length(1, 200)
   name!: string;
 
-  @ApiProperty({ example: 'priya@example.com' })
+  @ApiProperty({ example: 'priya@example.com', format: 'email' })
+  @Trimmed()
   @IsEmail()
   ownerEmail!: string;
 
@@ -18,7 +31,8 @@ export class RegisterTenantDto {
 }
 
 export class SignInDto {
-  @ApiProperty({ example: 'priya@example.com' })
+  @ApiProperty({ example: 'priya@example.com', format: 'email' })
+  @Trimmed()
   @IsEmail()
   email!: string;
 
@@ -30,18 +44,20 @@ export class SignInDto {
 
 export class CreateWarehouseDto {
   @ApiProperty({ example: 'BLR-01', minLength: 1, maxLength: 32 })
+  @Trimmed()
   @IsString()
   @Length(1, 32)
   code!: string;
 
   @ApiProperty({ example: 'Whitefield', minLength: 1, maxLength: 120 })
+  @Trimmed()
   @IsString()
   @Length(1, 120)
   name!: string;
 }
 
 export class TenantResponse {
-  @ApiProperty({ example: '0198abcdef0102030405060708090ab' })
+  @ApiProperty({ format: 'uuid', example: '0198f7a2-1b3c-7d4e-8f90-112233445566' })
   id!: string;
 
   @ApiProperty({ example: 'Priya Spices Pvt Ltd' })
@@ -49,7 +65,7 @@ export class TenantResponse {
 }
 
 export class OwnerUserResponse {
-  @ApiProperty({ example: '0198abcdef0102030405060708090cd' })
+  @ApiProperty({ format: 'uuid', example: '0198f7a2-1b3c-7d4e-8f90-112233445599' })
   id!: string;
 
   @ApiProperty({ example: 'priya@example.com' })
@@ -79,10 +95,10 @@ export class SignInResponse {
 }
 
 export class WarehouseResponse {
-  @ApiProperty({ example: '0198abcdef0102030405060708090ef' })
+  @ApiProperty({ format: 'uuid', example: '0198f7a2-1b3c-7d4e-8f90-112233445577' })
   id!: string;
 
-  @ApiProperty({ example: '0198abcdef0102030405060708090ab' })
+  @ApiProperty({ format: 'uuid', example: '0198f7a2-1b3c-7d4e-8f90-112233445566' })
   tenantId!: string;
 
   @ApiProperty({ example: 'BLR-01' })

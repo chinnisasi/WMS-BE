@@ -6,7 +6,8 @@ import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
-import { DATABASE } from '../src/shared/shared.module';
+import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
+import { signTenantSession } from '../src/modules/tenancy/jwt-session';
 import { TenancyService } from '../src/modules/tenancy/tenancy.service';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
@@ -30,15 +31,42 @@ describe('tenancy (e2e)', () => {
   const createdTenantIds: string[] = [];
 
   beforeAll(async () => {
+    // Deployment parity for the auth connection (review loop 2): point
+    // DATABASE_AUTH_URL at a real non-superuser BYPASSRLS role so sign-in and
+    // the registration replay run under RLS-binding conditions, not the
+    // superuser fallback. The lazy proxy reads the env on first auth query —
+    // set it before the suite touches the endpoints.
+    const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await admin.unsafe(`
+        do $$ begin
+          if not exists (select from pg_roles where rolname = 'wms_auth_probe') then
+            create role wms_auth_probe login password 'wms_auth_probe' nosuperuser bypassrls;
+          end if;
+        end $$;
+      `);
+      await admin.unsafe('grant usage on schema public to wms_auth_probe');
+      await admin.unsafe(
+        'grant select, insert, update, delete on all tables in schema public to wms_auth_probe',
+      );
+      const authUrl = new URL(process.env.DATABASE_URL!);
+      authUrl.username = 'wms_auth_probe';
+      authUrl.password = 'wms_auth_probe';
+      process.env.DATABASE_AUTH_URL = authUrl.toString();
+    } finally {
+      await admin.end();
+    }
     app = await createApp(false);
     await app.init();
   });
 
   afterAll(async () => {
     await cleanupRows();
-    // Close the shared pool (drizzle exposes it as $client) so jest exits.
+    // Close both shared pools (drizzle exposes them as $client) so jest exits.
     const db = app.get<unknown>(DATABASE) as { $client?: { end(): Promise<void> } };
     await db.$client?.end();
+    const authDb = app.get<unknown>(AUTH_DATABASE) as { $client?: { end(): Promise<void> } };
+    await authDb.$client?.end();
     await app.close();
   });
 
@@ -331,6 +359,140 @@ describe('tenancy (e2e)', () => {
     expect(malformed.body).toMatchObject({ code: 'invalid-cursor' });
   });
 
+  test('warehouse create rejects a malformed Idempotency-Key with 400 (same contract as registration)', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await registerTenant(email).expect(201);
+    createdTenantIds.push(registered.body.tenant.id);
+    const token = await signIn(email);
+    const tenantId = registered.body.tenant.id as string;
+
+    const res = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', 'not-a-ulid')
+      .send(warehouseBody(`BLR-${ulid().slice(10, 16).toUpperCase()}`))
+      .expect(400);
+    expect(res.body).toMatchObject({ code: 'idempotency-key-invalid' });
+  });
+
+  test('warehouse list limit is bounded (0 and 201 are 400, 1 and 200 pass validation)', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await registerTenant(email).expect(201);
+    createdTenantIds.push(registered.body.tenant.id);
+    const token = await signIn(email);
+    const tenantId = registered.body.tenant.id as string;
+    const get = (limit: number): SupertestTest =>
+      request(app.getHttpServer())
+        .get(`${IDENTITY_URL}/${tenantId}/warehouses`)
+        .query({ limit })
+        .set('Authorization', `Bearer ${token}`);
+
+    expect((await get(0).expect(400)).body).toMatchObject({ code: 'validation-failed' });
+    expect((await get(201).expect(400)).body).toMatchObject({ code: 'validation-failed' });
+    await get(1).expect(200);
+    await get(200).expect(200);
+  });
+
+  test('a present-but-invalid bearer token is 401 unauthenticated', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await registerTenant(email).expect(201);
+    createdTenantIds.push(registered.body.tenant.id);
+    const tenantId = registered.body.tenant.id as string;
+    const userId = registered.body.owner.id as string;
+    const secret = process.env.JWT_SECRET!;
+
+    const sendWith = (token: string) =>
+      request(app.getHttpServer())
+        .get(`${IDENTITY_URL}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${token}`);
+
+    // Expired: signed a clock-hour ago with the real secret.
+    const expired = signTenantSession(tenantId, userId, secret, Math.floor(Date.now() / 1000) - 3600);
+    const expiredRes = await sendWith(expired).expect(401);
+    expect(expiredRes.body).toMatchObject({ code: 'unauthenticated' });
+
+    // Wrong secret: signature fails; the claims look perfect.
+    const forged = signTenantSession(tenantId, userId, 'attacker-chosen-secret-0123456789');
+    const forgedRes = await sendWith(forged).expect(401);
+    expect(forgedRes.body).toMatchObject({ code: 'unauthenticated' });
+
+    // Tampered payload: real signature, different claims — the HMAC must not match.
+    const [, realPayload, realSig] = (await signIn(email)).split('.');
+    const tamperedPayload = Buffer.from(
+      JSON.stringify({ sub: userId, tenant_id: uuidv7(), iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 900 }),
+      'utf8',
+    ).toString('base64url');
+    const tamperedRes = await sendWith(`${realPayload}.${tamperedPayload}.${realSig}`).expect(401);
+    expect(tamperedRes.body).toMatchObject({ code: 'unauthenticated' });
+  });
+
+  test('a crafted cursor with a non-uuid id is 400 invalid-cursor, not a 500', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await registerTenant(email).expect(201);
+    createdTenantIds.push(registered.body.tenant.id);
+    const token = await signIn(email);
+    const tenantId = registered.body.tenant.id as string;
+    const code = `BLR-${ulid().slice(10, 16).toUpperCase()}`;
+    await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', ulid())
+      .send(warehouseBody(code))
+      .expect(201);
+
+    // base64-valid JSON that decodeCursor's typeof checks accept — only the
+    // id-format gate keeps it off the ::uuid cast in SQL.
+    const crafted = Buffer.from(
+      JSON.stringify({ createdAt: '2026-01-01T00:00:00.000Z', id: 'garbage' }),
+      'utf8',
+    ).toString('base64url');
+    const res = await request(app.getHttpServer())
+      .get(`${IDENTITY_URL}/${tenantId}/warehouses`)
+      .query({ cursor: crafted })
+      .set('Authorization', `Bearer ${token}`)
+      .expect(400);
+    expect(res.body).toMatchObject({ code: 'invalid-cursor' });
+  });
+
+  test('padded inputs are trimmed at the validation boundary', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await registerTenant(email).expect(201);
+    createdTenantIds.push(registered.body.tenant.id);
+    const tenantId = registered.body.tenant.id as string;
+    const code = `BLR-${ulid().slice(10, 16).toUpperCase()}`;
+
+    // Sign-in with a whitespace-padded email reaches the normalized lookup.
+    await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/sign-in`)
+      .send({ email: `  ${email}  `, password: 'correct-horse-battery' })
+      .expect(200);
+
+    const token = await signIn(email);
+    await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', ulid())
+      .send({ code: `  ${code}  `, name: '  Whitefield  ' })
+      .expect(201);
+
+    // The trimmed code is the stored one: the unpadded duplicate conflicts.
+    const dup = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', ulid())
+      .send({ code, name: 'Whitefield again' })
+      .expect(409);
+    expect(dup.body).toMatchObject({ code: 'duplicate-warehouse-code' });
+
+    // A whitespace-only name trims to '' and fails @Length.
+    await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', ulid())
+      .send({ code: `BLR-${ulid().slice(10, 16).toUpperCase()}`, name: '   ' })
+      .expect(400);
+  });
+
   test('warehouse endpoints require a session; foreign sessions get permission-denied', async () => {
     const emailA = `owner-${ulid().toLowerCase()}@example.com`;
     const registeredA = await registerTenant(emailA).expect(201);
@@ -461,7 +623,7 @@ describe('tenancy (e2e)', () => {
         await tx`insert into warehouses (id, tenant_id, code, name)
           values (${uuidv7()}, ${tenantB}, ${`RLS-${ulid().slice(0, 6)}`}, 'rls probe')`;
       });
-      expect(foreignInsert).rejects.toThrow(/row-level security/i);
+      await expect(foreignInsert).rejects.toThrow(/row-level security/i);
     } finally {
       await scoped?.end();
       await admin.end();

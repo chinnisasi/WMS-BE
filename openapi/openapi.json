@@ -11,7 +11,10 @@
             "description": "Client-generated ULID key; replays return the original response",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
             }
           }
         ],
@@ -133,7 +136,9 @@
             "name": "tenantId",
             "required": true,
             "in": "path",
+            "description": "Owning tenant (must match the session)",
             "schema": {
+              "format": "uuid",
               "type": "string"
             }
           },
@@ -143,7 +148,10 @@
             "description": "Client-generated ULID key; replays return the original response",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
             }
           }
         ],
@@ -236,7 +244,9 @@
             "name": "tenantId",
             "required": true,
             "in": "path",
+            "description": "Owning tenant (must match the session)",
             "schema": {
+              "format": "uuid",
               "type": "string"
             }
           },
@@ -254,6 +264,8 @@
             "required": false,
             "in": "query",
             "schema": {
+              "minimum": 1,
+              "maximum": 200,
               "example": 50,
               "type": "number"
             }
@@ -502,7 +514,8 @@
           },
           "ownerEmail": {
             "type": "string",
-            "example": "priya@example.com"
+            "example": "priya@example.com",
+            "format": "email"
           },
           "password": {
             "type": "string",
@@ -522,7 +535,8 @@
         "properties": {
           "id": {
             "type": "string",
-            "example": "0198abcdef0102030405060708090ab"
+            "format": "uuid",
+            "example": "0198f7a2-1b3c-7d4e-8f90-112233445566"
           },
           "name": {
             "type": "string",
@@ -539,7 +553,8 @@
         "properties": {
           "id": {
             "type": "string",
-            "example": "0198abcdef0102030405060708090cd"
+            "format": "uuid",
+            "example": "0198f7a2-1b3c-7d4e-8f90-112233445599"
           },
           "email": {
             "type": "string",
@@ -571,7 +586,8 @@
         "properties": {
           "email": {
             "type": "string",
-            "example": "priya@example.com"
+            "example": "priya@example.com",
+            "format": "email"
           },
           "password": {
             "type": "string",
@@ -637,11 +653,13 @@
         "properties": {
           "id": {
             "type": "string",
-            "example": "0198abcdef0102030405060708090ef"
+            "format": "uuid",
+            "example": "0198f7a2-1b3c-7d4e-8f90-112233445577"
           },
           "tenantId": {
             "type": "string",
-            "example": "0198abcdef0102030405060708090ab"
+            "format": "uuid",
+            "example": "0198f7a2-1b3c-7d4e-8f90-112233445566"
           },
           "code": {
             "type": "string",

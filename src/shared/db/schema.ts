@@ -1,4 +1,4 @@
-import { jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
 /**
@@ -108,7 +108,13 @@ export const idempotencyKeys = pgTable(
     responseSnapshot: jsonb('response_snapshot').notNull(),
     ...tenantTimestamps,
   },
-  (table) => [uniqueIndex('idempotency_keys_tenant_id_key_unique').on(table.tenantId, table.key)],
+  (table) => [
+    uniqueIndex('idempotency_keys_tenant_id_key_unique').on(table.tenantId, table.key),
+    // Registration replay looks up by key alone (no tenant context yet) —
+    // without this the auth path sequential-scans a table that grows on
+    // every mutating request.
+    index('idempotency_keys_key_idx').on(table.key),
+  ],
 );
 
 export type IdempotencyKeyRow = typeof idempotencyKeys.$inferSelect;
