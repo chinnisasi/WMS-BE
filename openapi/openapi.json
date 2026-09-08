@@ -7,7 +7,14 @@
         "parameters": [],
         "responses": {
           "200": {
-            "description": ""
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Liveness check",
@@ -21,8 +28,15 @@
         "operationId": "EchoController_echo",
         "parameters": [],
         "responses": {
-          "201": {
-            "description": ""
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EchoResponse"
+                }
+              }
+            }
           }
         },
         "summary": "Echoes the request payload back with a timestamp",
@@ -53,6 +67,46 @@
     }
   ],
   "components": {
-    "schemas": {}
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "example": "ok"
+          },
+          "service": {
+            "type": "string",
+            "example": "wms-be"
+          },
+          "time": {
+            "type": "string",
+            "example": "2026-09-08T00:00:00.000Z"
+          }
+        },
+        "required": [
+          "status",
+          "service",
+          "time"
+        ]
+      },
+      "EchoResponse": {
+        "type": "object",
+        "properties": {
+          "echoed": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "time": {
+            "type": "string",
+            "example": "2026-09-08T00:00:00.000Z"
+          }
+        },
+        "required": [
+          "echoed",
+          "time"
+        ]
+      }
+    }
   }
 }
