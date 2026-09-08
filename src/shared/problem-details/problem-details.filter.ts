@@ -1,5 +1,5 @@
-import type { ArgumentsHost, ExceptionFilter} from '@nestjs/common';
-import { Catch, HttpException, HttpStatus } from '@nestjs/common';
+import type { ArgumentsHost, ExceptionFilter } from '@nestjs/common';
+import { Catch, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import type { ProblemDetails } from './problem-details';
 import { problem } from './problem-details';
 
@@ -11,8 +11,16 @@ const PROBLEM_JSON = 'application/problem+json; charset=utf-8';
  */
 @Catch()
 export class ProblemDetailsFilter implements ExceptionFilter {
+  private readonly logger = new Logger('ProblemDetailsFilter');
+
   catch(exception: unknown, host: ArgumentsHost): void {
-    const res = host.switchToHttp().getResponse<{ status: (n: number) => unknown; set: (k: string, v: string) => unknown; send: (b: unknown) => unknown }>();
+    const http = host.switchToHttp();
+    const res = http.getResponse<{
+      status: (n: number) => unknown;
+      set: (k: string, v: string) => unknown;
+      send: (b: unknown) => unknown;
+    }>();
+    const req = http.getRequest<{ url?: string }>();
 
     let details: ProblemDetails;
     if (exception instanceof HttpException) {
@@ -22,16 +30,31 @@ export class ProblemDetailsFilter implements ExceptionFilter {
         typeof body === 'object' && body !== null && 'code' in body
           ? String((body as { code: unknown }).code)
           : httpCodeToProblemCode(status);
-      details = problem(
-        code,
-        status,
-        exception.message,
-        typeof body === 'object' && body !== null && 'detail' in body
-          ? String((body as { detail: unknown }).detail)
-          : undefined,
-      );
+      // ValidationPipe puts field errors in `message` (string or string[]);
+      // preserve them so clients can render substance, not just a code.
+      const rawMessage =
+        typeof body === 'object' && body !== null && 'message' in body
+          ? (body as { message: unknown }).message
+          : undefined;
+      const errors = Array.isArray(rawMessage)
+        ? rawMessage.map(String)
+        : typeof rawMessage === 'string'
+          ? [rawMessage]
+          : undefined;
+      details = {
+        ...problem(
+          code,
+          status,
+          exception.message,
+          errors ? errors.join('; ') : undefined,
+          errors ? { errors } : undefined,
+        ),
+        ...(typeof req?.url === 'string' ? { instance: req.url } : {}),
+      };
     } else {
-      // Unexpected faults are logged server-side and reported without internals.
+      // Unexpected faults are logged server-side (with stack) and reported
+      // without internals.
+      this.logger.error('Unhandled exception', exception instanceof Error ? exception.stack : String(exception));
       details = problem('internal-error', HttpStatus.INTERNAL_SERVER_ERROR, 'Internal Server Error');
     }
 

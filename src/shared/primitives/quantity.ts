@@ -17,6 +17,7 @@ export type GstBps = number & { readonly __brand: 'gst-bps' };
 
 export function gstBps(percent: number): GstBps {
   const bps = Math.round(percent * 100);
+  if (!Number.isFinite(bps)) throw new Error(`Non-finite GST rate: ${percent}`);
   if (bps < 0 || bps > 10000) throw new Error(`GST out of range (0–100%): ${percent}`);
   return bps as GstBps;
 }

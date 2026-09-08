@@ -8,8 +8,21 @@ export function nowIso(): string {
 }
 
 export function assertUtcIso(value: string): string {
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(value)) {
-    throw new Error(`Timestamp must be ISO-8601 UTC ('Z'-suffixed): ${value}`);
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?Z$/.exec(value);
+  // Date.parse rolls impossible dates (Feb 31 → Mar 3) instead of failing, so
+  // the components must round-trip through Date as well.
+  const date = match === null ? new Date(NaN) : new Date(value);
+  const ok =
+    match !== null &&
+    !Number.isNaN(date.getTime()) &&
+    date.getUTCFullYear() === Number(match[1]) &&
+    date.getUTCMonth() + 1 === Number(match[2]) &&
+    date.getUTCDate() === Number(match[3]) &&
+    date.getUTCHours() === Number(match[4]) &&
+    date.getUTCMinutes() === Number(match[5]) &&
+    date.getUTCSeconds() === Number(match[6]);
+  if (!ok) {
+    throw new Error(`Timestamp must be a valid ISO-8601 UTC instant ('Z'-suffixed): ${value}`);
   }
   return value;
 }

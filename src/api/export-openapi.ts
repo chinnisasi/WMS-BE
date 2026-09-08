@@ -18,4 +18,7 @@ async function main(): Promise<void> {
   await app.close();
 }
 
-void main();
+main().catch((err: unknown) => {
+  console.error(err);
+  process.exit(1);
+});

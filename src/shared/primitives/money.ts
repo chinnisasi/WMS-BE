@@ -8,6 +8,7 @@ export type Paise = number & { readonly __brand: 'paise' };
 export function paise(rupees: number): Paise {
   if (!Number.isFinite(rupees)) throw new Error(`Non-finite rupee amount: ${rupees}`);
   const value = Math.round(rupees * 100);
+  if (!Number.isSafeInteger(value)) throw new Error(`Rupee amount out of safe paise range: ${rupees}`);
   return value as Paise;
 }
 

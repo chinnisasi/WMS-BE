@@ -42,6 +42,9 @@ export function buildPage<T extends { createdAt: string; id: string }>(
   rows: readonly T[],
   limit: number,
 ): Page<T> {
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw new Error(`Pagination limit must be a positive integer: ${limit}`);
+  }
   const hasMore = rows.length > limit;
   const items = hasMore ? rows.slice(0, limit) : rows;
   const last = items.at(-1);

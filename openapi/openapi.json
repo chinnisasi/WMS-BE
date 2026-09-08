@@ -27,6 +27,17 @@
       "post": {
         "operationId": "EchoController_echo",
         "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "",
@@ -37,9 +48,19 @@
                 }
               }
             }
+          },
+          "400": {
+            "description": "Body is not a JSON object",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
           }
         },
-        "summary": "Echoes the request payload back with a timestamp",
+        "summary": "Echoes the request JSON object back with a timestamp",
         "tags": [
           "echo"
         ]
@@ -88,6 +109,50 @@
           "status",
           "service",
           "time"
+        ]
+      },
+      "ProblemDetailsDto": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "example": "https://wms.example.com/problems/validation-failed"
+          },
+          "title": {
+            "type": "string",
+            "example": "Bad Request"
+          },
+          "status": {
+            "type": "number",
+            "example": 400
+          },
+          "code": {
+            "type": "string",
+            "example": "validation-failed"
+          },
+          "detail": {
+            "type": "string",
+            "example": "Echo body must be a JSON object"
+          },
+          "instance": {
+            "type": "string",
+            "example": "/api/v1/echo"
+          },
+          "errors": {
+            "example": [
+              "key should not exist"
+            ],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "status",
+          "code"
         ]
       },
       "EchoResponse": {
