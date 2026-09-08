@@ -833,6 +833,61 @@ describe('catalog (e2e)', () => {
     }
   });
 
+  test('concurrent imports sharing one Idempotency-Key: exactly one 201, the loser gets 409 conflict', async () => {
+    const { tenantId, token } = await setupTenantWithSeed(0);
+    // Two different files with disjoint SKU codes so the only possible loser
+    // conflict is the (tenant_id, key) unique index itself — not a row clash.
+    // The big file keeps its transaction open long enough that the small
+    // file's idempotency lookup happens before either key insert commits;
+    // otherwise the loser would instead see the committed key with a
+    // different payload hash and take the sequential-reuse 422 path.
+    const key = ulid();
+    const bigRows = Array.from({ length: 2_000 }, (_, i) => ({
+      sku_code: `RACE-BIG-${String(i + 1).padStart(4, '0')}`,
+      name: `Racer big ${i + 1}`,
+      uom: 'pcs',
+      gst_rate: '500',
+    }));
+    const fileA = csvFile(bigRows);
+    const fileB = csvFile([{ sku_code: 'RACE-SMALL', name: 'Racer small', uom: 'pcs', gst_rate: '500' }]);
+    const settled = await Promise.allSettled([
+      importCatalog(token, tenantId, { buffer: fileA, name: 'a.csv', mimetype: 'text/csv' }, { idempotencyKey: key }),
+      importCatalog(token, tenantId, { buffer: fileB, name: 'b.csv', mimetype: 'text/csv' }, { idempotencyKey: key }),
+    ]);
+    const outcomes = settled.flatMap((outcome) =>
+      outcome.status === 'fulfilled'
+        ? [{ status: outcome.value.status as number, code: outcome.value.body.code as string | undefined }]
+        : [],
+    );
+    outcomes.sort((a, b) => a.status - b.status);
+    expect(outcomes.map((o) => o.status)).toEqual([201, 409]);
+    expect(outcomes.find((o) => o.status === 409)!.code).toBe('conflict');
+  });
+
+  test('concurrent PATCHes claiming the same new barcode: the loser gets 409 duplicate-barcode, not a 500', async () => {
+    const { tenantId, token } = await setupTenantWithSeed(2);
+    const list = await listSkus(token, tenantId).expect(200);
+    const items = list.body.items as { id: string; barcode: string | null }[];
+    const [skuA, skuB] = items;
+    expect(skuA).toBeTruthy();
+    expect(skuB).toBeTruthy();
+    // Both pre-checks pass (neither SKU carries the barcode yet), so the race
+    // is decided by the skus_tenant_id_barcode_unique constraint — the loser's
+    // UPDATE must surface as the mapped 409, never a raw 500.
+    const settled = await Promise.allSettled([
+      patchSku(token, tenantId, skuA!.id, { barcode: 'RACE-BARCODE' }),
+      patchSku(token, tenantId, skuB!.id, { barcode: 'RACE-BARCODE' }),
+    ]);
+    const outcomes = settled.flatMap((outcome) =>
+      outcome.status === 'fulfilled'
+        ? [{ status: outcome.value.status as number, code: outcome.value.body.code as string | undefined }]
+        : [],
+    );
+    outcomes.sort((a, b) => a.status - b.status);
+    expect(outcomes.map((o) => o.status)).toEqual([200, 409]);
+    expect(outcomes.find((o) => o.status === 409)!.code).toBe('duplicate-barcode');
+  });
+
   test('the OpenAPI document exposes the catalog contract (drift guard companion)', async () => {
     const committed = JSON.parse(
       readFileSync(resolve(process.cwd(), 'openapi/openapi.json'), 'utf8') as string,

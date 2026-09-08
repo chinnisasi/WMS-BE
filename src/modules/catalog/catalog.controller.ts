@@ -78,7 +78,7 @@ export class CatalogUploadFilter implements ExceptionFilter {
       'import-too-large',
       422,
       'Import exceeds the row or size cap',
-      `The file exceeds the ${MAX_IMPORT_BYTES}-byte (5 MB) cap.`,
+      `The file exceeds the ${MAX_IMPORT_BYTES}-byte (${MAX_IMPORT_BYTES / (1024 * 1024)} MB) cap.`,
     );
   }
 }
@@ -123,6 +123,7 @@ export class CatalogController {
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a file that cannot be parsed (file-unreadable)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Concurrent import with the same Idempotency-Key (conflict), or the SKU/barcode this file introduces was committed by a concurrent import and a row-level check raced it (duplicate-sku-code / duplicate-barcode) — regenerate the key or retry') })
   @ApiResponse({ status: 415, ...problemJsonResponse('Not a .csv/.xlsx file (unsupported-file-type)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('More than 10,000 rows or 5 MB (import-too-large), or idempotency-key-reuse') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })

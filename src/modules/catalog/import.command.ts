@@ -232,6 +232,11 @@ export class ImportCommand {
           insertable.push(row);
         }
 
+        // One error per row, reported in document order regardless of which
+        // pass produced it (validation failures collect first, duplicates in
+        // the loop below).
+        errors.sort((a, b) => a.rowNumber - b.rowNumber);
+
         const importId = uuidv7();
         const committedRows = insertable.length;
         const failedRows = errors.length;
@@ -253,7 +258,9 @@ export class ImportCommand {
             barcode: row.barcode ?? uuidv7(),
           }));
           try {
-            await tx.insert(skus).values(skuRows);
+            for (const chunk of chunked(skuRows)) {
+              await tx.insert(skus).values(chunk);
+            }
           } catch (err) {
             // A concurrent writer won the race between the pre-check and the
             // insert; the transaction aborts and the retry re-runs the checks.
@@ -271,8 +278,8 @@ export class ImportCommand {
               factor: conversion.factor,
             })),
           );
-          if (conversionRows.length > 0) {
-            await tx.insert(uomConversions).values(conversionRows);
+          for (const chunk of chunked(conversionRows)) {
+            await tx.insert(uomConversions).values(chunk);
           }
         }
 
@@ -285,7 +292,7 @@ export class ImportCommand {
           skippedRows,
         });
         if (errors.length > 0) {
-          await tx.insert(catalogImportErrors).values(
+          for (const chunk of chunked(
             errors.map((error) => ({
               id: uuidv7(),
               tenantId: command.tenantId,
@@ -295,7 +302,9 @@ export class ImportCommand {
               reasonCode: error.code,
               reasonDetail: error.detail,
             })),
-          );
+          )) {
+            await tx.insert(catalogImportErrors).values(chunk);
+          }
         }
 
         const snapshot: CatalogImportResponse = {
@@ -364,6 +373,23 @@ function rowError(
   detail: string,
 ): CatalogImportErrorDto {
   return { rowNumber, skuCode, code, detail };
+}
+
+/**
+ * Bulk inserts are chunked: Postgres binds at most 65,535 parameters per
+ * statement, and a cap-admitting file (10,000 rows × 12 sku columns ≈ 120k
+ * params, or 10,000 error rows × 7 columns) would exceed it and 500 the whole
+ * import despite passing the row cap. 2,000 rows/chunk keeps every statement
+ * far below the ceiling.
+ */
+const INSERT_CHUNK_ROWS = 2_000;
+
+function chunked<T>(rows: readonly T[]): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < rows.length; i += INSERT_CHUNK_ROWS) {
+    chunks.push(rows.slice(i, i + INSERT_CHUNK_ROWS));
+  }
+  return chunks;
 }
 
 export function duplicateSkuCode(code: string): ProblemException {
@@ -448,11 +474,41 @@ async function parseSheetAsync(file: ImportCatalogCommand['file']): Promise<RawR
 }
 
 function parseCsvSheet(buffer: Buffer): RawRow[] {
+  // The columns callback sees the raw header row: validate the shared header
+  // contract there (unknown, duplicate, and missing-required columns are all
+  // 400 file-unreadable — a duplicate would otherwise let the last
+  // occurrence's values silently win). The problem is captured rather than
+  // thrown so we never depend on how csv-parse propagates callback errors.
+  let headerProblem: string | null = null;
   let records: Record<string, string | string[]>[];
   try {
     records = parseCsv(new Uint8Array(buffer), {
       bom: true,
-      columns: true,
+      columns: (header: string[]) => {
+        const seen = new Set<string>();
+        for (const raw of header) {
+          const name = raw.trim().toLowerCase();
+          if (name === '') continue;
+          if (!KNOWN_COLUMNS.has(name)) {
+            headerProblem = `Unknown column "${raw.trim()}" — the header must use the documented column names.`;
+            break;
+          }
+          if (seen.has(name)) {
+            headerProblem = `Duplicate column "${name}" in the header row.`;
+            break;
+          }
+          seen.add(name);
+        }
+        if (headerProblem === null) {
+          for (const required of REQUIRED_COLUMNS) {
+            if (!seen.has(required)) {
+              headerProblem = `Missing required column "${required}" in the header row.`;
+              break;
+            }
+          }
+        }
+        return header.map((raw) => raw.trim().toLowerCase());
+      },
       skip_empty_lines: true,
       relax_column_count: true,
       trim: false,
@@ -460,23 +516,16 @@ function parseCsvSheet(buffer: Buffer): RawRow[] {
   } catch (error) {
     throw fileUnreadable(`The CSV could not be parsed: ${(error as Error).message}`);
   }
-  // Header contract (shared with the xlsx path): unknown columns and missing
-  // required columns make the file unreadable (400), not per-row errors.
-  const headerNames = new Set<string>();
-  for (const key of Object.keys(records[0] ?? {})) {
-    const name = key.trim().toLowerCase();
-    if (name === '') continue;
-    if (!KNOWN_COLUMNS.has(name)) {
-      throw fileUnreadable(`Unknown column "${key.trim()}" — the header must use the documented column names.`);
-    }
-    headerNames.add(name);
-  }
-  for (const required of REQUIRED_COLUMNS) {
-    if (!headerNames.has(required)) {
-      throw fileUnreadable(`Missing required column "${required}" in the header row.`);
-    }
+  if (headerProblem !== null) {
+    throw fileUnreadable(headerProblem);
   }
   const rows = records.map((record, index) => {
+    // relax_column_count keeps parsing past a row carrying more fields than
+    // the header but parks the excess in __parsed_extra — silent data loss;
+    // reject instead.
+    if (Array.isArray((record as Record<string, unknown>)['__parsed_extra'])) {
+      throw fileUnreadable('A data row has more fields than the header — every row must match the documented column set.');
+    }
     const values: Record<string, string> = {};
     for (const [key, value] of Object.entries(record)) {
       const name = key.trim().toLowerCase();
@@ -500,7 +549,13 @@ async function parseXlsxSheet(buffer: Buffer): Promise<RawRow[]> {
   if (!sheet) {
     throw fileUnreadable('The workbook has no worksheets.');
   }
+  // Only the first sheet would silently win — make the extra sheets a parse
+  // failure instead.
+  if (workbook.worksheets.length > 1) {
+    throw fileUnreadable('The workbook must contain exactly one worksheet — remove the extra sheets and try again.');
+  }
   const columns = new Map<number, string>();
+  const seenNames = new Set<string>();
   sheet.getRow(1).eachCell({ includeEmpty: false }, (cell, colNumber) => {
     const header = cellText(cell.value).trim();
     if (header === '') return;
@@ -508,6 +563,10 @@ async function parseXlsxSheet(buffer: Buffer): Promise<RawRow[]> {
     if (!KNOWN_COLUMNS.has(name)) {
       throw fileUnreadable(`Unknown column "${header}" — the header must use the documented column names.`);
     }
+    if (seenNames.has(name)) {
+      throw fileUnreadable(`Duplicate column "${header}" in the header row — the last occurrence would silently win.`);
+    }
+    seenNames.add(name);
     columns.set(colNumber, name);
   });
   for (const required of REQUIRED_COLUMNS) {
@@ -530,7 +589,13 @@ async function parseXlsxSheet(buffer: Buffer): Promise<RawRow[]> {
   return finalizeRows(rows);
 }
 
-/** Blank-row filtering + the row cap, shared by both formats. */
+/**
+ * Blank-row filtering + the row cap, shared by both formats. Row numbers are
+ * renumbered sequentially here so the documented `rowNumber` (1-based
+ * data-row index, header excluded) is gap-free and identical across formats:
+ * CSV's skip_empty_lines already compresses blanks, while XLSX rows carry
+ * sheet-row gaps that would otherwise leak through.
+ */
 function finalizeRows(
   rows: readonly { rowNumber: number; values: Record<string, string> }[],
 ): RawRow[] {
@@ -543,7 +608,7 @@ function finalizeRows(
   if (nonBlank.length > MAX_IMPORT_ROWS) {
     throw importTooLarge(`The file has ${nonBlank.length} data rows — the cap is ${MAX_IMPORT_ROWS}.`);
   }
-  return nonBlank.map((row) => ({ rowNumber: row.rowNumber, values: row.values }));
+  return nonBlank.map((row, index) => ({ rowNumber: index + 1, values: row.values }));
 }
 
 /** ExcelJS cell values: formulas ({result}), rich text, dates, booleans. */
