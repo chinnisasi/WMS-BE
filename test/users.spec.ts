@@ -547,6 +547,43 @@ describe('users, roles, and permission gating (e2e)', () => {
     expect(deniedImport.body).toMatchObject({ code: 'role-denied' });
     expect(deniedImport.body.detail).toContain('catalog.import');
 
+    // The remaining three gates, pinned the same way: bin.block, bin.create
+    // (grid generation), sku.edit — removing any of these asserts fails CI.
+    const ownerBin = await createBin(ownerToken, tenantId, warehouseId, zoneId, {
+      code: 'A-01-01',
+      capacity: 10,
+      type: 'shelf',
+    }).expect(201);
+
+    const deniedBlock = await request(app.getHttpServer())
+      .patch(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/bins/${ownerBin.body.id}`)
+      .set('Authorization', `Bearer ${operator.token}`)
+      .set('Idempotency-Key', ulid())
+      .send({ blocked: true })
+      .expect(403);
+    expect(deniedBlock.body).toMatchObject({ code: 'role-denied' });
+    expect(deniedBlock.body.detail).toContain('bin.block');
+
+    const deniedGrid = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins/grid`)
+      .set('Authorization', `Bearer ${operator.token}`)
+      .set('Idempotency-Key', ulid())
+      .send({ aisleFrom: 'C', aisleTo: 'D', baysPerAisle: 2, levelsPerBay: 2, capacity: 10, type: 'shelf' })
+      .expect(403);
+    expect(deniedGrid.body).toMatchObject({ code: 'role-denied' });
+    expect(deniedGrid.body.detail).toContain('bin.create');
+
+    const operatorSkus = await listSkus(operator.token, tenantId).expect(200);
+    const sku1 = operatorSkus.body.items.find((s: { code: string }) => s.code === 'SKU-1');
+    const deniedSkuEdit = await request(app.getHttpServer())
+      .patch(`${IDENTITY_URL}/${tenantId}/catalog/skus/${sku1.id}`)
+      .set('Authorization', `Bearer ${operator.token}`)
+      .set('Idempotency-Key', ulid())
+      .send({ name: 'Turmeric powder' })
+      .expect(403);
+    expect(deniedSkuEdit.body).toMatchObject({ code: 'role-denied' });
+    expect(deniedSkuEdit.body.detail).toContain('sku.edit');
+
     // … and the denied import committed nothing (no partial writes).
     const skus = await listSkus(operator.token, tenantId).expect(200);
     expect(skus.body.items.map((s: { code: string }) => s.code)).toEqual(['SKU-1']);
@@ -627,17 +664,23 @@ describe('users, roles, and permission gating (e2e)', () => {
     const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
     let scoped: postgres.Sql<Record<string, unknown>> | undefined;
     try {
-      await admin.unsafe(`
-        do $$ begin
-          if not exists (select from pg_roles where rolname = 'wms_rls_probe') then
-            create role wms_rls_probe login password 'wms_rls_probe' nosuperuser;
-          end if;
-        end $$;
-      `);
-      await admin.unsafe('grant usage on schema public to wms_rls_probe');
-      await admin.unsafe(
-        'grant select, insert, update, delete on all tables in schema public to wms_rls_probe',
-      );
+      // Serialized across parallel jest workers like the beforeAll probe:
+      // concurrent CREATE ROLE / GRANT ON ALL TABLES from sibling suites trip
+      // "tuple concurrently updated" on the shared catalog rows.
+      await admin.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(742105)`;
+        await tx.unsafe(`
+          do $$ begin
+            if not exists (select from pg_roles where rolname = 'wms_rls_probe') then
+              create role wms_rls_probe login password 'wms_rls_probe' nosuperuser;
+            end if;
+          end $$;
+        `);
+        await tx.unsafe('grant usage on schema public to wms_rls_probe');
+        await tx.unsafe(
+          'grant select, insert, update, delete on all tables in schema public to wms_rls_probe',
+        );
+      });
       const probeUrl = new URL(process.env.DATABASE_URL!);
       probeUrl.username = 'wms_rls_probe';
       probeUrl.password = 'wms_rls_probe';

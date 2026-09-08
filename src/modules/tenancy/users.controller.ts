@@ -83,6 +83,7 @@ export class UsersController {
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Invites a user (Owner only) — returns the one-time invite token' })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.CREATED, type: InviteUserResponse })
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
@@ -133,6 +134,7 @@ export class UsersController {
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Changes a user’s role (Owner capability users.role_change; effective on the user’s next command)' })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.OK, type: UserResponse })
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
@@ -173,7 +175,7 @@ export class UsersController {
   ): Promise<AcceptInviteResponse> {
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const snapshot = await this.usersCommand.acceptInvite(
-      { token: dto.token, password: dto.password },
+      { tenantId, token: dto.token, password: dto.password },
       key,
     );
     return { ...snapshot };

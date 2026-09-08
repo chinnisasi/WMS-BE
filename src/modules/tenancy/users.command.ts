@@ -45,7 +45,12 @@ export interface InviteUserInput {
   readonly role: UserRole;
 }
 
-/** The invite response — the one-time raw token exists only here, never stored. */
+/**
+ * The invite response. The raw token's only durable store is this snapshot,
+ * persisted in the idempotency row's `response_snapshot` so a same-key
+ * replay can re-serve the exact link — only its sha256 hash lives on the
+ * users row.
+ */
 export interface InviteUserSnapshot {
   readonly user: UserView;
   readonly inviteToken: string;
@@ -60,6 +65,8 @@ export interface SetUserRoleInput {
 }
 
 export interface AcceptInviteInput {
+  /** The inviting tenant from the URL — must match the invite row. */
+  readonly tenantId: string;
   readonly token: string;
   readonly password: string;
 }
@@ -107,8 +114,9 @@ function inviteInvalid(): ProblemException {
  * any tenant member — reads are never gated), role change (Owner only, with
  * the last-Owner guard), and the unauthenticated accept-invite (AUTH_DATABASE
  * path like sign-in, tenant-scoped write inside). Every invitation and role
- * change writes an audit_events row (actor, action, target, time, idempotency
- * reference) in the same transaction as the mutation.
+ * change, and accept-invite writes an audit_events row (actor, action,
+ * target, time, idempotency reference) in the same transaction as the
+ * mutation.
  *
  * Authority is `assertPermission` at command-service entry against the role
  * read from the DB **in the same tenant transaction** (`getMemberRoleIn`) —
@@ -278,14 +286,39 @@ export class UsersCommand {
         );
       }
 
-      // The last Owner of a tenant cannot be demoted or moved away from
-      // Owner — such attempts fail closed with no mutation persisted.
-      if (target.role === 'owner' && command.role !== 'owner') {
-        const ownerRows = await tx
-          .select({ n: sql<number>`count(*)::int` })
+      // Atomic last-Owner guard (review): the role UPDATE itself refuses to
+      // demote a tenant's last Owner — the owner count is a subquery inside
+      // the UPDATE's where clause, evaluated in the same statement, and a
+      // demotion that matches no rows answers 409 `last-owner` with nothing
+      // persisted. The owner rows are locked FOR UPDATE first because under
+      // READ COMMITTED two concurrent demotions of *different* owners would
+      // each count 2 from their own snapshot; the row locks make the second
+      // transaction re-read the freshly demoted row before its count runs.
+      const demotingLastOwner = target.role === 'owner' && command.role !== 'owner';
+      if (demotingLastOwner) {
+        await tx
+          .select({ id: users.id })
           .from(users)
-          .where(and(eq(users.tenantId, command.tenantId), eq(users.role, 'owner')));
-        if ((ownerRows[0]?.n ?? 0) <= 1) {
+          .where(and(eq(users.tenantId, command.tenantId), eq(users.role, 'owner')))
+          .for('update');
+      }
+
+      const updatedRows = await tx
+        .update(users)
+        .set({ role: command.role, updatedAt: nowIso() })
+        .where(
+          and(
+            eq(users.id, command.targetUserId),
+            eq(users.tenantId, command.tenantId),
+            demotingLastOwner
+              ? sql`1 < (select count(*) from ${users} owner_rows
+                  where owner_rows.tenant_id = ${users.tenantId} and owner_rows.role = 'owner')`
+              : undefined,
+          ),
+        )
+        .returning();
+      if (updatedRows.length === 0) {
+        if (demotingLastOwner) {
           throw new ProblemException(
             'last-owner',
             409,
@@ -293,13 +326,14 @@ export class UsersCommand {
             'The last Owner of a tenant cannot be demoted — invite another Owner first.',
           );
         }
+        // Unreachable in this story (no user delete), but fail closed.
+        throw new ProblemException(
+          'not-found',
+          404,
+          'User not found',
+          'No user with this id exists in this tenant.',
+        );
       }
-
-      const updatedRows = await tx
-        .update(users)
-        .set({ role: command.role, updatedAt: nowIso() })
-        .where(eq(users.id, command.targetUserId))
-        .returning();
       const updated = toUserView(updatedRows[0]!);
 
       await insertAuditRow(tx, {
@@ -340,13 +374,14 @@ export class UsersCommand {
    * hashes to the stored sha256 digest; the lookup runs on the AUTH_DATABASE
    * connection (BYPASSRLS — same reasoning as sign-in), and the credential +
    * status flip happens in the invited user's own tenant transaction.
-   * Unknown / used / expired tokens are one indistinguishable 400
-   * `invite-invalid`. The idempotency fingerprint covers the token only —
-   * never password material (same discipline as registration).
+   * Unknown / used / expired tokens (and tokens offered on the wrong
+   * tenant's URL) are one indistinguishable 400 `invite-invalid`. The
+   * idempotency fingerprint covers the tenant + token — never password
+   * material (same discipline as registration).
    */
   async acceptInvite(command: AcceptInviteInput, idempotencyKey: string): Promise<AcceptInviteSnapshot> {
     const tokenHash = hashInviteToken(command.token);
-    const payloadHash = hashCommandPayload({ token: command.token });
+    const payloadHash = hashCommandPayload({ tenantId: command.tenantId, token: command.token });
 
     // Auth-time replay lookup (no tenant context yet) — BYPASSRLS connection.
     const existing = await this.authDb
@@ -369,6 +404,9 @@ export class UsersCommand {
     const invite = inviteRows[0];
     if (
       !invite ||
+      // The token is only valid on the inviting tenant's URL — accepting it
+      // through any other tenant's path is one indistinguishable 400.
+      invite.tenantId !== command.tenantId ||
       invite.status !== 'invited' ||
       invite.inviteExpiresAt === null ||
       Date.parse(invite.inviteExpiresAt) <= Date.now()
@@ -379,24 +417,11 @@ export class UsersCommand {
     const passwordHash = await hashPassword(command.password);
 
     const snapshot = await withTenantTransaction(this.db, invite.tenantId, async (tx) => {
-      // Re-verify inside the tenant transaction — the authoritative row could
-      // have been accepted (or the invite expired) since the AUTH read.
-      const currentRows = await tx
-        .select()
-        .from(users)
-        .where(and(eq(users.id, invite.id), eq(users.tenantId, invite.tenantId)))
-        .limit(1);
-      const current = currentRows[0];
-      if (
-        !current ||
-        current.status !== 'invited' ||
-        current.inviteTokenHash !== tokenHash ||
-        current.inviteExpiresAt === null ||
-        Date.parse(current.inviteExpiresAt) <= Date.now()
-      ) {
-        throw inviteInvalid();
-      }
-
+      // The UPDATE itself carries every validity condition (review): still
+      // `invited`, same token hash, unexpired — so two concurrent accepts of
+      // the same token cannot both succeed (the loser's UPDATE matches no
+      // rows and answers the same invite-invalid), and an invite that expired
+      // between the AUTH read and this transaction is caught here too.
       const updatedRows = await tx
         .update(users)
         .set({
@@ -406,9 +431,31 @@ export class UsersCommand {
           inviteExpiresAt: null,
           updatedAt: nowIso(),
         })
-        .where(eq(users.id, invite.id))
+        .where(
+          and(
+            eq(users.id, invite.id),
+            eq(users.tenantId, invite.tenantId),
+            eq(users.status, 'invited'),
+            eq(users.inviteTokenHash, tokenHash),
+            sql`${users.inviteExpiresAt} is not null and ${users.inviteExpiresAt} > now()`,
+          ),
+        )
         .returning();
+      if (updatedRows.length === 0) {
+        // The invite was accepted (or expired/cleared) between the AUTH read
+        // and this transaction — one indistinguishable 400.
+        throw inviteInvalid();
+      }
       const updated = updatedRows[0]!;
+
+      await insertAuditRow(tx, {
+        tenantId: invite.tenantId,
+        actorUserId: updated.id,
+        action: 'user.accepted',
+        targetType: 'user',
+        targetId: updated.id,
+        reference: idempotencyKey,
+      });
 
       const body: AcceptInviteSnapshot = {
         user: {
