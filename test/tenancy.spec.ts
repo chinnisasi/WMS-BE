@@ -75,6 +75,10 @@ describe('tenancy (e2e)', () => {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      // Children before parents: bins → zones → warehouses (no FKs, but the
+      // order keeps the intent legible).
+      await sql.unsafe('DELETE FROM bins WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await sql.unsafe('DELETE FROM zones WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM warehouses WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM users WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM tenants WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -96,6 +100,104 @@ describe('tenancy (e2e)', () => {
       .send({ email, password })
       .expect(200);
     return res.body.accessToken as string;
+  }
+
+  /** Register → sign in → create one warehouse: the zone/bin test scaffold. */
+  async function setupTenantWithWarehouse(): Promise<{
+    tenantId: string;
+    token: string;
+    warehouseId: string;
+  }> {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await registerTenant(email).expect(201);
+    createdTenantIds.push(registered.body.tenant.id);
+    const tenantId = registered.body.tenant.id as string;
+    const token = await signIn(email);
+    const warehouseId = await createWarehouseFor(tenantId, token);
+    return { tenantId, token, warehouseId };
+  }
+
+  /** One warehouse in an existing tenant (the 1.2 surface). */
+  async function createWarehouseFor(tenantId: string, token: string): Promise<string> {
+    const warehouse = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', ulid())
+      .send(warehouseBody(`BLR-${ulid().slice(10, 16).toUpperCase()}`))
+      .expect(201);
+    return warehouse.body.id as string;
+  }
+
+  function createZone(
+    token: string,
+    tenantId: string,
+    warehouseId: string,
+    body: Record<string, unknown>,
+    idempotencyKey = ulid(),
+  ): SupertestTest {
+    return request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', idempotencyKey)
+      .send(body);
+  }
+
+  function createBin(
+    token: string,
+    tenantId: string,
+    warehouseId: string,
+    zoneId: string,
+    body: Record<string, unknown>,
+    idempotencyKey = ulid(),
+  ): SupertestTest {
+    return request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', idempotencyKey)
+      .send(body);
+  }
+
+  function generateBins(
+    token: string,
+    tenantId: string,
+    warehouseId: string,
+    zoneId: string,
+    body: Record<string, unknown>,
+    idempotencyKey = ulid(),
+  ): SupertestTest {
+    return request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins/grid`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', idempotencyKey)
+      .send(body);
+  }
+
+  function listBins(
+    token: string,
+    tenantId: string,
+    warehouseId: string,
+    zoneId: string,
+    query: Record<string, unknown> = {},
+  ): SupertestTest {
+    return request(app.getHttpServer())
+      .get(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+      .query(query)
+      .set('Authorization', `Bearer ${token}`);
+  }
+
+  function patchBin(
+    token: string,
+    tenantId: string,
+    warehouseId: string,
+    binId: string,
+    body: Record<string, unknown>,
+    idempotencyKey = ulid(),
+  ): SupertestTest {
+    return request(app.getHttpServer())
+      .patch(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/bins/${binId}`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('Idempotency-Key', idempotencyKey)
+      .send(body);
   }
 
   test('registration creates a tenant + owner user, exposing no password material', async () => {
@@ -630,6 +732,377 @@ describe('tenancy (e2e)', () => {
     }
   });
 
+  test('zone create is idempotent, listed, and duplicates name the code; foreign warehouse is 404', async () => {
+    const { tenantId, token, warehouseId } = await setupTenantWithWarehouse();
+    const code = `Z${ulid().slice(10, 13).toUpperCase()}`;
+    const body = { code, name: 'Fast movers' };
+    const key = ulid();
+
+    const first = await createZone(token, tenantId, warehouseId, body, key).expect(201);
+    expect(first.body).toMatchObject({ tenantId, warehouseId, code });
+    expect(first.body.id).toMatch(/^[0-9a-f-]{36}$/);
+
+    // Replay: same key + same body re-serves the original 201, no second row.
+    const replay = await createZone(token, tenantId, warehouseId, body, key).expect(201);
+    expect(replay.body).toEqual(first.body);
+
+    const list = await request(app.getHttpServer())
+      .get(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(200);
+    expect(list.body.items.map((z: { code: string }) => z.code)).toContain(code);
+
+    // Duplicate zone code in the same warehouse — names the code.
+    const duplicate = await createZone(token, tenantId, warehouseId, body).expect(409);
+    expect(duplicate.body).toMatchObject({ status: 409, code: 'duplicate-zone-code' });
+    expect(duplicate.body.detail).toContain(code);
+
+    // A nonexistent (or foreign) warehouse is 404 not-found.
+    const foreign = await createZone(token, tenantId, uuidv7(), body).expect(404);
+    expect(foreign.body).toMatchObject({ code: 'not-found' });
+  });
+
+  test('a manual bin is immediately listed and usable; duplicate bin codes name the code across the warehouse', async () => {
+    const { tenantId, token, warehouseId } = await setupTenantWithWarehouse();
+    const zone = await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }).expect(201);
+    const zoneId = zone.body.id as string;
+
+    const created = await createBin(token, tenantId, warehouseId, zoneId, {
+      code: 'A-01-01',
+      capacity: 120,
+      type: 'shelf',
+    }).expect(201);
+    expect(created.body).toMatchObject({
+      tenantId,
+      warehouseId,
+      zoneId,
+      code: 'A-01-01',
+      capacity: 120,
+      type: 'shelf',
+      blocked: false,
+    });
+
+    // No dormant state: the created bin is right there in the zone's list.
+    const listed = await listBins(token, tenantId, warehouseId, zoneId).expect(200);
+    expect(listed.body.items.map((b: { code: string }) => b.code)).toContain('A-01-01');
+    expect(listed.body.nextCursor).toBeNull();
+
+    // Same code, same zone → 409 naming the code.
+    const duplicate = await createBin(token, tenantId, warehouseId, zoneId, {
+      code: 'A-01-01',
+      capacity: 50,
+      type: 'pallet',
+    }).expect(409);
+    expect(duplicate.body).toMatchObject({ status: 409, code: 'duplicate-bin-code' });
+    expect(duplicate.body.detail).toContain('A-01-01');
+
+    // Codes are unique per warehouse, not per zone: a second zone still conflicts.
+    const zoneB = await createZone(token, tenantId, warehouseId, { code: 'B', name: 'Zone B' }).expect(201);
+    const crossZone = await createBin(token, tenantId, warehouseId, zoneB.body.id as string, {
+      code: 'A-01-01',
+      capacity: 50,
+      type: 'pallet',
+    }).expect(409);
+    expect(crossZone.body).toMatchObject({ code: 'duplicate-bin-code' });
+
+    // Foreign zone → 404 not-found.
+    await createBin(token, tenantId, warehouseId, uuidv7(), {
+      code: 'C-01-01',
+      capacity: 50,
+      type: 'floor',
+    }).expect(404);
+  });
+
+  test('grid generation creates all bins in one run; replay re-serves the snapshot without double bins', async () => {
+    const { tenantId, token, warehouseId } = await setupTenantWithWarehouse();
+    const zone = await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }).expect(201);
+    const zoneId = zone.body.id as string;
+    const grid = { aisleFrom: 'A', aisleTo: 'B', baysPerAisle: 2, levelsPerBay: 2, capacity: 100, type: 'pallet' };
+    const key = ulid();
+
+    const run = await generateBins(token, tenantId, warehouseId, zoneId, grid, key).expect(201);
+    expect(run.body).toMatchObject({
+      warehouseId,
+      zoneId,
+      generatedCount: 8,
+      firstCode: 'A-01-01',
+      lastCode: 'B-02-02',
+    });
+
+    // Replay: same key + same body → the stored snapshot, no second batch.
+    const replay = await generateBins(token, tenantId, warehouseId, zoneId, grid, key).expect(201);
+    expect(replay.body).toEqual(run.body);
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const rows = await sql`select count(*)::int as n from bins where warehouse_id = ${warehouseId}`;
+      expect(rows[0]!.n).toBe(8);
+    } finally {
+      await sql.end();
+    }
+
+    // The created bins are immediately listed; the keyset walk sees all 8.
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page += 1) {
+      const res = await listBins(token, tenantId, warehouseId, zoneId, { limit: 3, cursor }).expect(200);
+      seen.push(...res.body.items.map((b: { code: string }) => b.code));
+      if (res.body.nextCursor === null) break;
+      cursor = res.body.nextCursor as string;
+    }
+    expect(seen).toHaveLength(8);
+    expect(new Set(seen)).toEqual(
+      new Set([
+        'A-01-01', 'A-01-02', 'A-02-01', 'A-02-02',
+        'B-01-01', 'B-01-02', 'B-02-01', 'B-02-02',
+      ]),
+    );
+  });
+
+  test('grid generation rejects collisions naming the first conflicting code with nothing committed', async () => {
+    const { tenantId, token, warehouseId } = await setupTenantWithWarehouse();
+    const zone = await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }).expect(201);
+    const zoneId = zone.body.id as string;
+    const grid = { aisleFrom: 'A', aisleTo: 'A', baysPerAisle: 1, levelsPerBay: 1, capacity: 10, type: 'floor' };
+    await generateBins(token, tenantId, warehouseId, zoneId, grid).expect(201);
+
+    // Overlapping run, fresh key: the first colliding code is named, and the
+    // failed run commits nothing (no bins, no idempotency record).
+    const overlapping = { ...grid, aisleTo: 'B', baysPerAisle: 2, levelsPerBay: 2 };
+    const key = ulid();
+    const res = await generateBins(token, tenantId, warehouseId, zoneId, overlapping, key).expect(409);
+    expect(res.body).toMatchObject({ status: 409, code: 'duplicate-bin-code' });
+    expect(res.body.detail).toContain('A-01-01');
+
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const rows = await sql`select count(*)::int as n from bins where warehouse_id = ${warehouseId}`;
+      expect(rows[0]!.n).toBe(1);
+      const keys = await sql`select count(*)::int as n from idempotency_keys where key = ${key}`;
+      expect(keys[0]!.n).toBe(0);
+    } finally {
+      await sql.end();
+    }
+
+    // Beyond the 500 cap → 422 grid-too-large.
+    const huge = await generateBins(token, tenantId, warehouseId, zoneId, {
+      aisleFrom: 'A',
+      aisleTo: 'Z',
+      baysPerAisle: 99,
+      levelsPerBay: 99,
+      capacity: 10,
+      type: 'floor',
+    }).expect(422);
+    expect(huge.body).toMatchObject({ code: 'grid-too-large' });
+
+    // A descending aisle range is a bad request, not an empty grid.
+    const descending = await generateBins(token, tenantId, warehouseId, zoneId, {
+      aisleFrom: 'B',
+      aisleTo: 'A',
+      baysPerAisle: 1,
+      levelsPerBay: 1,
+      capacity: 10,
+      type: 'floor',
+    }).expect(400);
+    expect(descending.body).toMatchObject({ code: 'validation-failed' });
+  });
+
+  test('bin block toggle: 200 with the flag, replay re-serves, unknown bin 404, foreign session 403', async () => {
+    const { tenantId, token, warehouseId } = await setupTenantWithWarehouse();
+    const zone = await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }).expect(201);
+    const bin = await createBin(token, tenantId, warehouseId, zone.body.id as string, {
+      code: 'A-01-01',
+      capacity: 120,
+      type: 'shelf',
+    }).expect(201);
+    const binId = bin.body.id as string;
+    const body = { blocked: true };
+    const key = ulid();
+
+    const blocked = await patchBin(token, tenantId, warehouseId, binId, body, key).expect(200);
+    expect(blocked.body).toMatchObject({ id: binId, blocked: true });
+
+    const replay = await patchBin(token, tenantId, warehouseId, binId, body, key).expect(200);
+    expect(replay.body).toEqual(blocked.body);
+
+    const unblocked = await patchBin(token, tenantId, warehouseId, binId, { blocked: false }).expect(200);
+    expect(unblocked.body).toMatchObject({ id: binId, blocked: false });
+
+    // Unknown bin in a known warehouse → 404 not-found.
+    await patchBin(token, tenantId, warehouseId, uuidv7(), body).expect(404);
+
+    // Foreign session → 403 permission-denied.
+    const emailB = `owner-${ulid().toLowerCase()}@example.com`;
+    const registeredB = await registerTenant(emailB).expect(201);
+    createdTenantIds.push(registeredB.body.tenant.id);
+    const tokenB = await signIn(emailB);
+    const cross = await patchBin(tokenB, tenantId, warehouseId, binId, body).expect(403);
+    expect(cross.body).toMatchObject({ code: 'permission-denied' });
+  });
+
+  test('the setup checklist is computed on read and checks off as steps are satisfied', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await registerTenant(email).expect(201);
+    createdTenantIds.push(registered.body.tenant.id);
+    const tenantId = registered.body.tenant.id as string;
+    const token = await signIn(email);
+
+    const fetchChecklist = async () =>
+      request(app.getHttpServer())
+        .get(`${IDENTITY_URL}/${tenantId}/setup-checklist`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+
+    const empty = await fetchChecklist();
+    expect(empty.body.steps.map((s: { key: string }) => s.key)).toEqual([
+      'warehouse',
+      'bins',
+      'catalog',
+      'users',
+    ]);
+    expect(empty.body.steps.map((s: { done: boolean }) => s.done)).toEqual([false, false, false, false]);
+    expect(empty.body.steps.every((s: { href: string }) => s.href === '/settings')).toBe(true);
+
+    // Warehouse done after 1.2 …
+    const warehouseId = await createWarehouseFor(tenantId, token);
+    const afterWarehouse = await fetchChecklist();
+    expect(afterWarehouse.body.steps.find((s: { key: string }) => s.key === 'warehouse').done).toBe(true);
+    expect(afterWarehouse.body.steps.find((s: { key: string }) => s.key === 'bins').done).toBe(false);
+
+    // … bins done once ≥ 1 bin exists; catalog/users stay honestly pending.
+    const zone = await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }).expect(201);
+    await createBin(token, tenantId, warehouseId, zone.body.id as string, {
+      code: 'A-01-01',
+      capacity: 120,
+      type: 'shelf',
+    }).expect(201);
+    const afterBins = await fetchChecklist();
+    expect(afterBins.body.steps.find((s: { key: string }) => s.key === 'bins').done).toBe(true);
+    expect(afterBins.body.steps.find((s: { key: string }) => s.key === 'catalog').done).toBe(false);
+    expect(afterBins.body.steps.find((s: { key: string }) => s.key === 'users').done).toBe(false);
+  });
+
+  test('zone and bin endpoints enforce tenant ownership (403) and require sessions (401)', async () => {
+    const { tenantId, token, warehouseId } = await setupTenantWithWarehouse();
+    await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }).expect(201);
+
+    // No session → 401.
+    await createZone(token, tenantId, warehouseId, { code: 'B', name: 'Zone B' })
+      .unset('Authorization')
+      .expect(401);
+
+    const emailB = `owner-${ulid().toLowerCase()}@example.com`;
+    const registeredB = await registerTenant(emailB).expect(201);
+    createdTenantIds.push(registeredB.body.tenant.id);
+    const tokenB = await signIn(emailB);
+
+    const crossZone = await createZone(tokenB, tenantId, warehouseId, { code: 'B', name: 'Zone B' }).expect(403);
+    expect(crossZone.body).toMatchObject({ code: 'permission-denied' });
+
+    const crossList = await request(app.getHttpServer())
+      .get(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones`)
+      .set('Authorization', `Bearer ${tokenB}`)
+      .expect(403);
+    expect(crossList.body).toMatchObject({ code: 'permission-denied' });
+
+    const crossChecklist = await request(app.getHttpServer())
+      .get(`${IDENTITY_URL}/${tenantId}/setup-checklist`)
+      .set('Authorization', `Bearer ${tokenB}`)
+      .expect(403);
+    expect(crossChecklist.body).toMatchObject({ code: 'permission-denied' });
+
+    // The zone/bin list of a nonexistent warehouse is 404, not an empty page.
+    const missingWarehouse = await request(app.getHttpServer())
+      .get(`${IDENTITY_URL}/${tenantId}/warehouses/${uuidv7()}/zones`)
+      .set('Authorization', `Bearer ${token}`)
+      .expect(404);
+    expect(missingWarehouse.body).toMatchObject({ code: 'not-found' });
+  });
+
+  test('RLS: a tenant-scoped session cannot read another tenant’s zone or bin rows', async () => {
+    const { tenantId: tenantA, token: tokenA, warehouseId } = await setupTenantWithWarehouse();
+    const zoneA = await createZone(tokenA, tenantA, warehouseId, { code: 'A', name: 'Zone A' }).expect(201);
+    await createBin(tokenA, tenantA, warehouseId, zoneA.body.id as string, {
+      code: 'A-01-01',
+      capacity: 120,
+      type: 'shelf',
+    }).expect(201);
+
+    const emailB = `owner-${ulid().toLowerCase()}@example.com`;
+    const registeredB = await registerTenant(emailB).expect(201);
+    createdTenantIds.push(registeredB.body.tenant.id);
+    const tenantB = registeredB.body.tenant.id as string;
+
+    // Real non-superuser probe role (same pattern as the warehouses RLS test).
+    const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
+    let scoped: postgres.Sql<Record<string, unknown>> | undefined;
+    try {
+      await admin.unsafe(`
+        do $$ begin
+          if not exists (select from pg_roles where rolname = 'wms_rls_probe') then
+            create role wms_rls_probe login password 'wms_rls_probe' nosuperuser;
+          end if;
+        end $$;
+      `);
+      await admin.unsafe('grant usage on schema public to wms_rls_probe');
+      await admin.unsafe(
+        'grant select, insert, update, delete on all tables in schema public to wms_rls_probe',
+      );
+      const probeUrl = new URL(process.env.DATABASE_URL!);
+      probeUrl.username = 'wms_rls_probe';
+      probeUrl.password = 'wms_rls_probe';
+      scoped = postgres(probeUrl.toString(), { max: 1 });
+
+      // Zones: own read visible, foreign read empty, unscoped fail-closed.
+      const ownZones = await scoped.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantA}, true)`;
+        return tx`select id from zones where tenant_id = ${tenantA}`;
+      });
+      expect(ownZones.length).toBe(1);
+
+      const foreignZones = await scoped.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantB}, true)`;
+        return tx`select id from zones where tenant_id = ${tenantA}`;
+      });
+      expect(foreignZones).toHaveLength(0);
+
+      const unscopedZones = await scoped`select id from zones where tenant_id = ${tenantA}`;
+      expect(unscopedZones).toHaveLength(0);
+
+      const foreignZoneInsert = scoped.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantA}, true)`;
+        await tx`insert into zones (id, tenant_id, warehouse_id, code, name)
+          values (${uuidv7()}, ${tenantB}, ${warehouseId}, ${`RLS-${ulid().slice(0, 4)}`}, 'rls probe')`;
+      });
+      await expect(foreignZoneInsert).rejects.toThrow(/row-level security/i);
+
+      // Bins: the same four probes against the second new table.
+      const ownBins = await scoped.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantA}, true)`;
+        return tx`select id from bins where tenant_id = ${tenantA}`;
+      });
+      expect(ownBins.length).toBe(1);
+
+      const foreignBins = await scoped.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantB}, true)`;
+        return tx`select id from bins where tenant_id = ${tenantA}`;
+      });
+      expect(foreignBins).toHaveLength(0);
+
+      const unscopedBins = await scoped`select id from bins where tenant_id = ${tenantA}`;
+      expect(unscopedBins).toHaveLength(0);
+
+      const foreignBinInsert = scoped.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantA}, true)`;
+        await tx`insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type)
+          values (${uuidv7()}, ${tenantB}, ${warehouseId}, ${zoneA.body.id}, ${`RLS-${ulid().slice(0, 4)}`}, 1, 'shelf')`;
+      });
+      await expect(foreignBinInsert).rejects.toThrow(/row-level security/i);
+    } finally {
+      await scoped?.end();
+      await admin.end();
+    }
+  });
+
   test('the OpenAPI document exposes the tenancy contract (drift guard companion)', async () => {
     const committed = JSON.parse(
       readFileSync(resolve(process.cwd(), 'openapi/openapi.json'), 'utf8') as string,
@@ -639,6 +1112,11 @@ describe('tenancy (e2e)', () => {
         '/tenants',
         '/tenants/sign-in',
         '/tenants/{tenantId}/warehouses',
+        '/tenants/{tenantId}/warehouses/{warehouseId}/zones',
+        '/tenants/{tenantId}/warehouses/{warehouseId}/zones/{zoneId}/bins',
+        '/tenants/{tenantId}/warehouses/{warehouseId}/zones/{zoneId}/bins/grid',
+        '/tenants/{tenantId}/warehouses/{warehouseId}/bins/{binId}',
+        '/tenants/{tenantId}/setup-checklist',
       ]),
     );
   });
