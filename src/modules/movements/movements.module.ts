@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 
 /**
- * Moves module — spine module placeholder (Story 1.1).
+ * Movements module — spine module placeholder (Story 1.1).
  *
  * Ownership discipline (architecture spine): this module exclusively owns
  * its tables and publishes domain events. Other modules communicate with it
@@ -12,4 +12,4 @@ import { Module } from '@nestjs/common';
   providers: [],
   exports: [],
 })
-export class MovesModule {}
+export class MovementsModule {}

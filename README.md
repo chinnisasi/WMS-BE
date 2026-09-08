@@ -8,9 +8,10 @@ WMS backend — NestJS 12 modular monolith (api + jobs shells) with Drizzle migr
 src/
   api/        api shell — the only HTTP surface (health, echo, OpenAPI document)
   jobs/       jobs shell — background/relay workers (outbox relay lands in 1.2+)
-  modules/    13 spine modules: tenancy, catalog, inventory, inbound, outbound,
-              moves, conflicts, replenishment, channels, compliance,
-              notifications, reports, settings
+  modules/    13 spine modules (ARCHITECTURE-SPINE.md §Structural Seed):
+              tenancy, catalog, inventory, inbound, putaway, outbound,
+              movements, replenishment, channels, compliance, reporting,
+              carriers, notifications
   shared/     primitives (ids/time/money/quantity/pagination), problem-details,
               idempotency + event-bus/outbox seams, Drizzle db layer
 drizzle/      generated SQL migrations (committed)

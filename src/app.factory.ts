@@ -44,10 +44,6 @@ export async function createApp(withListener = false): Promise<INestApplication>
     }),
   );
 
-  app.get(OpenApiDocumentHolder).set(document as unknown as Record<string, unknown>);
-  // Human-readable contract browser (JSON at /api/docs/json).
-  SwaggerModule.setup('api/docs', app, document);
-
   if (withListener) {
     await app.listen(Number(process.env.PORT ?? 3000));
   }
