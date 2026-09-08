@@ -20,8 +20,26 @@ export function createDatabase(url: string = requiredDbUrl()): Database {
  * DATABASE_URL; only touching Postgres does.
  */
 export function createLazyDatabase(): Database {
+  return lazyDatabaseProxy(() => createDatabase());
+}
+
+/**
+ * Auth-time connection (review loop 1 decision): sign-in and the registration
+ * replay lookup run before any tenant context exists, so the fail-closed RLS
+ * policies would hide every row from the scoped (non-superuser) app role.
+ * This client reads through a dedicated connection whose role carries
+ * BYPASSRLS — `DATABASE_AUTH_URL` when set, `DATABASE_URL` otherwise. It is
+ * for auth-time reads only; every tenant-scoped path stays on `DATABASE`.
+ */
+export function createLazyAuthDatabase(): Database {
+  return lazyDatabaseProxy(() =>
+    createDatabase(process.env.DATABASE_AUTH_URL || requiredDbUrl()),
+  );
+}
+
+function lazyDatabaseProxy(create: () => Database): Database {
   let instance: Database | undefined;
-  const resolved = (): Database => (instance ??= createDatabase());
+  const resolved = (): Database => (instance ??= create());
 
   // Promise-protocol / introspection probes (NestJS checks `then` on every
   // provider at boot, lifecycle hook names at init/shutdown) must not trigger

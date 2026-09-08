@@ -2,6 +2,7 @@ import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Query, UseGua
 import { Type } from 'class-transformer';
 import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 import {
+  ApiBearerAuth,
   ApiBody,
   ApiExtraModels,
   ApiHeaders,
@@ -105,6 +106,7 @@ export class TenancyController {
   @Post(':tenantId/warehouses')
   @HttpCode(HttpStatus.CREATED)
   @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
   @ApiOperation({ summary: 'Creates a warehouse (code unique per tenant)' })
   @ApiBody({ type: CreateWarehouseDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
@@ -131,6 +133,7 @@ export class TenancyController {
 
   @Get(':tenantId/warehouses')
   @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
   @ApiOperation({ summary: 'Lists warehouses (keyset cursor pagination)' })
   @ApiOkResponse({ type: WarehouseListResponse })
   @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor') })

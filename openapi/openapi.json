@@ -219,6 +219,11 @@
             }
           }
         },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
         "summary": "Creates a warehouse (code unique per tenant)",
         "tags": [
           "tenancy"
@@ -296,6 +301,11 @@
             }
           }
         },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
         "summary": "Lists warehouses (keyset cursor pagination)",
         "tags": [
           "tenancy"
@@ -429,6 +439,13 @@
     }
   ],
   "components": {
+    "securitySchemes": {
+      "bearer": {
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "type": "http"
+      }
+    },
     "schemas": {
       "ProblemDetailsDto": {
         "type": "object",

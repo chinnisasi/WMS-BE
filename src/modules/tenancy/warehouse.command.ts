@@ -102,10 +102,23 @@ export class WarehouseCommand {
           if (isUniqueViolationOn(err, WAREHOUSES_TENANT_CODE)) {
             throw duplicateWarehouseCode(command.code);
           }
+          throw err;
+        }
+
+        try {
+          await tx.insert(idempotencyKeys).values({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            key: idempotencyKey,
+            payloadHash,
+            responseSnapshot: { warehouse },
+          });
+        } catch (err) {
           if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
             // Concurrent duplicate of the same idempotent request — the
             // winner's response is authoritative; this request carries no
-            // new state.
+            // new state. The unique (tenant_id, key) index is the arbiter
+            // (the existence check above cannot see an uncommitted winner).
             throw new ProblemException(
               'conflict',
               409,
@@ -115,14 +128,6 @@ export class WarehouseCommand {
           }
           throw err;
         }
-
-        await tx.insert(idempotencyKeys).values({
-          id: uuidv7(),
-          tenantId: command.tenantId,
-          key: idempotencyKey,
-          payloadHash,
-          responseSnapshot: { warehouse },
-        });
         return { snapshot: { warehouse }, replayed: false };
       },
     );

@@ -1,11 +1,11 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { eq } from 'drizzle-orm';
-import { DATABASE } from '../../shared/shared.module';
+import { AUTH_DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { tenants, users } from '../../shared/db/schema';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { SESSION_TTL_SECONDS, signTenantSession, tenantSessionSecret } from './jwt-session';
-import { verifyPassword } from './passwords';
+import { DUMMY_HASH, verifyPassword } from './passwords';
 
 export interface SignInInput {
   readonly email: string;
@@ -16,12 +16,17 @@ export interface SignInInput {
  * Minimal sign-in (spec decision): verifies the password and issues a
  * short-lived HS256 session token carrying `sub` + `tenant_id`. No refresh,
  * no role enforcement — 1.5 owns permissions. Not a state change, so no
- * idempotency key applies. The email lookup is cross-tenant by nature
- * (the caller has no tenant scope yet); the table owner reads it directly.
+ * idempotency key applies.
+ *
+ * The email lookup is cross-tenant by nature (the caller has no tenant scope
+ * yet), so it reads through the AUTH_DATABASE connection — a BYPASSRLS role
+ * (review loop 1 decision); the fail-closed RLS policies would hide every row
+ * from the scoped app role. The auth connection is read-only here and never
+ * sees tenant-scoped query paths.
  */
 @Injectable()
 export class SignInCommand {
-  constructor(@Inject(DATABASE) private readonly db: Database) {}
+  constructor(@Inject(AUTH_DATABASE) private readonly authDb: Database) {}
 
   async execute(command: SignInInput): Promise<{
     accessToken: string;
@@ -29,13 +34,16 @@ export class SignInCommand {
     expiresInSeconds: number;
     tenant: { id: string; name: string };
   }> {
-    const userRows = await this.db
+    const email = command.email.trim().toLowerCase();
+    const userRows = await this.authDb
       .select()
       .from(users)
-      .where(eq(users.email, command.email))
+      .where(eq(users.email, email))
       .limit(1);
     const user = userRows[0];
-    const ok = user !== undefined && (await verifyPassword(command.password, user.passwordHash));
+    // Always pay one scrypt round — unknown email vs wrong password must be
+    // indistinguishable in body *and* in time (no enumeration).
+    const ok = await verifyPassword(command.password, user?.passwordHash ?? DUMMY_HASH);
     if (user === undefined || !ok) {
       // One message for unknown email and wrong password — no enumeration.
       throw new ProblemException(
@@ -45,7 +53,7 @@ export class SignInCommand {
         'Unknown email or wrong password.',
       );
     }
-    const tenantRows = await this.db
+    const tenantRows = await this.authDb
       .select({ id: tenants.id, name: tenants.name })
       .from(tenants)
       .where(eq(tenants.id, user.tenantId))

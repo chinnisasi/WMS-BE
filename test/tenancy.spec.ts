@@ -142,14 +142,27 @@ describe('tenancy (e2e)', () => {
     const first = await registerTenant(email).expect(201);
     createdTenantIds.push(first.body.tenant.id);
 
+    const duplicateKey = ulid();
     const res = await request(app.getHttpServer())
       .post(IDENTITY_URL)
-      .set('Idempotency-Key', ulid())
+      .set('Idempotency-Key', duplicateKey)
       .send(registrationBody(email))
       .expect(409);
     expect(res.headers['content-type']).toContain('application/problem+json');
     expect(res.body).toMatchObject({ status: 409, code: 'duplicate-email' });
     expect(res.body.detail).toContain(email);
+
+    // Rollback: the failed attempt left no partial rows behind — no user
+    // beyond the original owner, no idempotency record for the failed key.
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const users = await sql`select count(*)::int as n from users where email = ${email}`;
+      const keys = await sql`select count(*)::int as n from idempotency_keys where key = ${duplicateKey}`;
+      expect(users[0]!.n).toBe(1);
+      expect(keys[0]!.n).toBe(0);
+    } finally {
+      await sql.end();
+    }
   });
 
   test('missing or malformed Idempotency-Key is rejected with 400', async () => {
@@ -231,6 +244,91 @@ describe('tenancy (e2e)', () => {
       .expect(409);
     // A different key on the same payload is not a replay — the code conflict wins.
     expect(replay.body.code).toBe('duplicate-warehouse-code');
+  });
+
+  test('warehouse replay: same key re-serves the original 201; same key + different payload 422s', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await registerTenant(email).expect(201);
+    createdTenantIds.push(registered.body.tenant.id);
+    const token = await signIn(email);
+    const tenantId = registered.body.tenant.id as string;
+    const code = `BLR-${ulid().slice(0, 6).toUpperCase()}`;
+    const key = ulid();
+
+    const send = (body: Record<string, unknown>, idempotencyKey = key): SupertestTest =>
+      request(app.getHttpServer())
+        .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', idempotencyKey)
+        .send(body);
+
+    // warehouseBody() randomizes the name per call — build the payload once
+    // so the resend below is byte-for-byte identical (a differing payload is
+    // the 422 case, not a replay).
+    const body = warehouseBody(code);
+    const first = await send(body).expect(201);
+
+    // Verbatim resend (the form's double-submit / retry path): the stored
+    // snapshot is re-served, no second warehouse row appears.
+    const replay = await send(body).expect(201);
+    expect(replay.body).toEqual(first.body);
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const rows = await sql`select count(*)::int as n from warehouses where tenant_id = ${tenantId} and code = ${code}`;
+      expect(rows[0]!.n).toBe(1);
+    } finally {
+      await sql.end();
+    }
+
+    // Same key, different payload → idempotency-key-reuse, not a replay.
+    const reuse = await send({ code, name: 'A different name entirely' }).expect(422);
+    expect(reuse.body).toMatchObject({ code: 'idempotency-key-reuse' });
+  });
+
+  test('warehouse list follows the keyset cursor chain; malformed cursor is 400', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await registerTenant(email).expect(201);
+    createdTenantIds.push(registered.body.tenant.id);
+    const token = await signIn(email);
+    const tenantId = registered.body.tenant.id as string;
+    // ulid()'s first 10 chars are the timestamp — slice from the randomness
+    // region so three codes minted in the same millisecond stay distinct.
+    const codes = [
+      `BLR-${ulid().slice(10, 16).toUpperCase()}`,
+      `BLR-${ulid().slice(10, 16).toUpperCase()}`,
+      `BLR-${ulid().slice(10, 16).toUpperCase()}`,
+    ];
+    for (const code of codes) {
+      await request(app.getHttpServer())
+        .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', ulid())
+        .send(warehouseBody(code))
+        .expect(201);
+    }
+
+    // limit=1 walks the cursor chain through all three warehouses.
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page += 1) {
+      const res = await request(app.getHttpServer())
+        .get(`${IDENTITY_URL}/${tenantId}/warehouses`)
+        .query(cursor === undefined ? { limit: 1 } : { limit: 1, cursor })
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      seen.push(...res.body.items.map((w: { code: string }) => w.code));
+      if (res.body.nextCursor === null) break;
+      cursor = res.body.nextCursor as string;
+    }
+    expect(seen).toHaveLength(3);
+    expect(seen.sort()).toEqual([...codes].sort());
+
+    const malformed = await request(app.getHttpServer())
+      .get(`${IDENTITY_URL}/${tenantId}/warehouses`)
+      .query({ cursor: 'not-a-cursor' })
+      .set('Authorization', `Bearer ${token}`)
+      .expect(400);
+    expect(malformed.body).toMatchObject({ code: 'invalid-cursor' });
   });
 
   test('warehouse endpoints require a session; foreign sessions get permission-denied', async () => {
@@ -354,6 +452,16 @@ describe('tenancy (e2e)', () => {
       // No app.tenant_id at all → fail closed.
       const unscoped = await scoped`select id from warehouses where tenant_id = ${tenantA}`;
       expect(unscoped).toHaveLength(0);
+
+      // The WRITE side is fail-closed too: the policy's WITH CHECK rejects an
+      // INSERT stamped with a foreign tenant_id (42501), so a scoped connection
+      // cannot seed rows into a tenant it is not scoped to.
+      const foreignInsert = scoped.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantA}, true)`;
+        await tx`insert into warehouses (id, tenant_id, code, name)
+          values (${uuidv7()}, ${tenantB}, ${`RLS-${ulid().slice(0, 6)}`}, 'rls probe')`;
+      });
+      expect(foreignInsert).rejects.toThrow(/row-level security/i);
     } finally {
       await scoped?.end();
       await admin.end();

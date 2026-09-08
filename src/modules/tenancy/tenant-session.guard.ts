@@ -26,10 +26,12 @@ export class TenantSessionGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
     const request = context.switchToHttp().getRequest<TenantSessionRequest>();
     const header = request.headers.authorization;
-    if (typeof header !== 'string' || !header.startsWith('Bearer ')) {
+    // The auth scheme is case-insensitive (RFC 7235 §5.1 — "bearer" is valid).
+    const match = typeof header === 'string' ? /^bearer\s+(.+)$/i.exec(header) : null;
+    if (match === null) {
       throw unauthenticated('A Bearer session token is required.');
     }
-    const session = verifyTenantSession(header.slice('Bearer '.length), tenantSessionSecret());
+    const session = verifyTenantSession(match[1]!.trim(), tenantSessionSecret());
     if (!session) {
       throw unauthenticated('The session token is invalid or expired.');
     }

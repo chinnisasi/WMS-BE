@@ -35,6 +35,12 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # The e2e suite (tenancy registration/RLS/idempotency) needs the real
+      # tables — this job's postgres service starts empty (services are
+      # per-job; the `migrations` job's migrate step does not carry over).
+      - name: Apply migrations
+        run: bun run db:migrate
+
       - name: Lint
         run: bun run lint
 

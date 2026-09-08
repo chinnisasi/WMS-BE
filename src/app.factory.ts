@@ -28,6 +28,9 @@ export async function createApp(withListener = false): Promise<INestApplication>
     .setContact('WMS', 'https://wms.example.com', 'api@wms.example.com')
     .setLicense('Proprietary', 'https://wms.example.com/license')
     .addServer(`/${API_PREFIX}`)
+    // Bearer session scheme — the warehouse endpoints' `security` entries
+    // reference this (Swagger UI can then exercise them with a sign-in token).
+    .addBearerAuth()
     .build();
   const document = SwaggerModule.createDocument(app, config);
 

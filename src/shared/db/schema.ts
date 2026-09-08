@@ -25,10 +25,15 @@ const tenantTimestamps = {
 
 /**
  * Tenancy spine (Story 1.2). AD-3: every table carries `tenant_id` (uuid v7,
- * NOT NULL) and Postgres RLS backs the app-layer scoping (see the migration —
- * policies compare against the `app.tenant_id` session setting). `warehouses`
- * is the first warehouse-scoped pattern: operational tables in later stories
- * add `warehouse_id` alongside `tenant_id`.
+ * NOT NULL) and Postgres RLS backs the app-layer scoping. **RLS is declared
+ * only in the migration SQL** (0001: `ENABLE ROW LEVEL SECURITY` + the
+ * `app.tenant_id` policies): drizzle-orm 0.45 cannot model RLS in the schema
+ * (no `enableRLS`; `pgPolicy` declarations would make future `generate` runs
+ * emit conflicting `CREATE POLICY` against the hand-written DDL), so the
+ * drizzle snapshot records `isRLSEnabled: false` — a known, documented gap.
+ * Never rely on drizzle-kit for RLS; carry the DDL in migrations by hand.
+ * `warehouses` is the first warehouse-scoped pattern: operational tables in
+ * later stories add `warehouse_id` alongside `tenant_id`.
  *
  * `tenants.tenant_id` is stamped equal to `id`: the RLS policy is uniform on
  * every table, so the tenant row scopes to itself.

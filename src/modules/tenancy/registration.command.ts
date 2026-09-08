@@ -1,7 +1,7 @@
 import { Inject } from '@nestjs/common';
 import { Injectable } from '@nestjs/common';
 import { eq } from 'drizzle-orm';
-import { DATABASE } from '../../shared/shared.module';
+import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { idempotencyKeys, tenants, users } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
@@ -36,14 +36,24 @@ const USERS_EMAIL = 'users_email_unique';
  *
  * Idempotency scoping note: registration is the one command with no tenant
  * context yet. The stored row is still tenant-scoped (tenant_id = the created
- * tenant), but replay lookup is by key alone — a foreign replay fails the
- * payload-hash comparison (422 `idempotency-key-reuse`), so nothing leaks.
- * Duplicate email is enforced by the DB unique constraint (the RLS-scoped
- * session cannot see other tenants' users to check first).
+ * tenant), but the replay lookup runs by key alone on the AUTH_DATABASE
+ * connection (BYPASSRLS role — review loop 1 decision): the fail-closed RLS
+ * policies would hide the row from the scoped app role and turn every replay
+ * into a duplicate-email 409. A foreign replay fails the payload-hash
+ * comparison (422 `idempotency-key-reuse`), so nothing leaks. Duplicate email
+ * is enforced by the DB unique constraint inside the scoped write
+ * transaction.
+ *
+ * The payload fingerprint covers `name` + the normalized `ownerEmail` —
+ * never password material: the raw password would make a leaked idempotency
+ * row an offline password oracle, and the scrypt hash is salted (random per
+ * call), so it cannot be part of a replay-deterministic fingerprint either.
+ * A retry with the same key+name+email replays the original response.
  */
 @Injectable()
 export class RegistrationCommand {
   constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
     @Inject(DATABASE) private readonly db: Database,
     @Inject(EVENT_BUS) private readonly eventBus: EventBus,
   ) {}
@@ -52,32 +62,29 @@ export class RegistrationCommand {
     command: RegisterTenantCommand,
     idempotencyKey: string,
   ): Promise<TenantRegistrationSnapshot> {
+    const email = command.ownerEmail.trim().toLowerCase();
+    const passwordHash = await hashPassword(command.password);
     const payloadHash = hashCommandPayload({
       name: command.name,
-      ownerEmail: command.ownerEmail,
-      password: command.password,
+      ownerEmail: email,
     });
-    const passwordHash = await hashPassword(command.password);
+
+    // Auth-time replay lookup (no tenant context yet) — BYPASSRLS connection.
+    const existing = await this.authDb
+      .select()
+      .from(idempotencyKeys)
+      .where(eq(idempotencyKeys.key, idempotencyKey))
+      .limit(1);
+    if (existing[0]) {
+      if (existing[0].payloadHash !== payloadHash) {
+        throw idempotencyKeyReuse();
+      }
+      return existing[0].responseSnapshot as TenantRegistrationSnapshot;
+    }
 
     const { snapshot, replayed } = await this.db.transaction(async (tx) => {
-      const existing = await tx
-        .select()
-        .from(idempotencyKeys)
-        .where(eq(idempotencyKeys.key, idempotencyKey))
-        .limit(1);
-      if (existing[0]) {
-        if (existing[0].payloadHash !== payloadHash) {
-          throw idempotencyKeyReuse();
-        }
-        return {
-          snapshot: existing[0].responseSnapshot as TenantRegistrationSnapshot,
-          replayed: true,
-        };
-      }
-
       const tenantId = uuidv7();
       await setTenantScope(tx, tenantId);
-      const email = command.ownerEmail;
 
       const tenantRows = await tx
         .insert(tenants)
