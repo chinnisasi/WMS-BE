@@ -78,11 +78,10 @@ function gridCode(aisle: string, bay: number, level: number): string {
 }
 
 /**
- * The generated code set: aisles are letters `aisleFrom..aisleTo` (A–Z,
- * inclusive, ascending), bays and levels 1–99 zero-padded to width 2.
- * A descending aisle range is a bad request, not an empty grid.
+ * Aisle count for an inclusive letter range — a descending or out-of-range
+ * aisle span is a bad request, not an empty grid.
  */
-function gridCodes(aisleFrom: string, aisleTo: string, bays: number, levels: number): string[] {
+function aisleRangeCount(aisleFrom: string, aisleTo: string): number {
   if (aisleFrom < 'A' || aisleTo > 'Z' || aisleFrom > aisleTo) {
     throw new ProblemException(
       'validation-failed',
@@ -91,6 +90,11 @@ function gridCodes(aisleFrom: string, aisleTo: string, bays: number, levels: num
       `aisleFrom..aisleTo must be an ascending A–Z range (got "${aisleFrom}".."${aisleTo}").`,
     );
   }
+  return aisleTo.charCodeAt(0) - aisleFrom.charCodeAt(0) + 1;
+}
+
+/** The generated code set; callers bound the total before calling this. */
+function buildGridCodes(aisleFrom: string, aisleTo: string, bays: number, levels: number): string[] {
   const codes: string[] = [];
   for (let a = aisleFrom.charCodeAt(0); a <= aisleTo.charCodeAt(0); a += 1) {
     const aisle = String.fromCharCode(a);
@@ -156,6 +160,10 @@ export class BinCommand {
           };
         }
 
+        // Warehouse ownership inside the write transaction — before any bin
+        // write (same gate as generateGrid / setBlocked).
+        await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
+
         const bin = await insertBin(tx, command);
 
         try {
@@ -187,22 +195,27 @@ export class BinCommand {
   async generateGrid(command: GenerateBinsCommand, idempotencyKey: string): Promise<BinGridSnapshot> {
     const from = command.aisleFrom.toUpperCase();
     const to = command.aisleTo.toUpperCase();
-    const codes = gridCodes(from, to, command.baysPerAisle, command.levelsPerBay);
-    if (codes.length > MAX_BINS_PER_GRID_RUN) {
+    // Count arithmetically first — a Z×99×99 request must not materialize a
+    // 255k-code array just to reject it.
+    const total = aisleRangeCount(from, to) * command.baysPerAisle * command.levelsPerBay;
+    if (total > MAX_BINS_PER_GRID_RUN) {
       throw new ProblemException(
         'grid-too-large',
         422,
         'Grid generation exceeds the bin cap',
-        `This grid would create ${codes.length} bins — the cap is ${MAX_BINS_PER_GRID_RUN} per run. Narrow the aisle range, bays, or levels.`,
+        `This grid would create ${total} bins — the cap is ${MAX_BINS_PER_GRID_RUN} per run. Narrow the aisle range, bays, or levels.`,
       );
     }
+    const codes = buildGridCodes(from, to, command.baysPerAisle, command.levelsPerBay);
 
+    // Hash the normalized aisle letters: the codes come from the uppercased
+    // values, so a case-variant replay of the same request must replay too.
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       warehouseId: command.warehouseId,
       zoneId: command.zoneId,
-      aisleFrom: command.aisleFrom,
-      aisleTo: command.aisleTo,
+      aisleFrom: from,
+      aisleTo: to,
       baysPerAisle: command.baysPerAisle,
       levelsPerBay: command.levelsPerBay,
       capacity: command.capacity,

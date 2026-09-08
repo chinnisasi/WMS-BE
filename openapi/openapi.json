@@ -507,7 +507,7 @@
             }
           },
           "400": {
-            "description": "Malformed cursor",
+            "description": "Malformed cursor (invalid-cursor) or out-of-range limit (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -759,7 +759,7 @@
             }
           },
           "400": {
-            "description": "Malformed cursor",
+            "description": "Malformed cursor (invalid-cursor) or out-of-range limit (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -877,7 +877,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or invalid body",
+            "description": "Missing or malformed Idempotency-Key, invalid body, or a descending aisle range (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {

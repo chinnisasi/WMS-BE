@@ -734,7 +734,7 @@ describe('tenancy (e2e)', () => {
 
   test('zone create is idempotent, listed, and duplicates name the code; foreign warehouse is 404', async () => {
     const { tenantId, token, warehouseId } = await setupTenantWithWarehouse();
-    const code = `Z${ulid().slice(10, 13).toUpperCase()}`;
+    const code = `Z${ulid().slice(10, 16).toUpperCase()}`;
     const body = { code, name: 'Fast movers' };
     const key = ulid();
 
@@ -746,11 +746,38 @@ describe('tenancy (e2e)', () => {
     const replay = await createZone(token, tenantId, warehouseId, body, key).expect(201);
     expect(replay.body).toEqual(first.body);
 
+    // Same key, different payload → idempotency-key-reuse, not a replay.
+    const reuse = await createZone(token, tenantId, warehouseId, { code, name: 'A different zone name' }, key).expect(422);
+    expect(reuse.body).toMatchObject({ code: 'idempotency-key-reuse' });
+
     const list = await request(app.getHttpServer())
       .get(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones`)
       .set('Authorization', `Bearer ${token}`)
       .expect(200);
     expect(list.body.items.map((z: { code: string }) => z.code)).toContain(code);
+
+    // Two more zones, then walk the keyset cursor chain across all three.
+    const otherCodes = [
+      `Z${ulid().slice(10, 16).toUpperCase()}`,
+      `Z${ulid().slice(10, 16).toUpperCase()}`,
+    ];
+    for (const otherCode of otherCodes) {
+      await createZone(token, tenantId, warehouseId, { code: otherCode, name: `Zone ${otherCode}` }).expect(201);
+    }
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page += 1) {
+      const res = await request(app.getHttpServer())
+        .get(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones`)
+        .query(cursor === undefined ? { limit: 1 } : { limit: 1, cursor })
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      seen.push(...res.body.items.map((z: { code: string }) => z.code));
+      if (res.body.nextCursor === null) break;
+      cursor = res.body.nextCursor as string;
+    }
+    expect(seen).toHaveLength(3);
+    expect(seen.sort()).toEqual([code, ...otherCodes].sort());
 
     // Duplicate zone code in the same warehouse — names the code.
     const duplicate = await createZone(token, tenantId, warehouseId, body).expect(409);
@@ -767,11 +794,9 @@ describe('tenancy (e2e)', () => {
     const zone = await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }).expect(201);
     const zoneId = zone.body.id as string;
 
-    const created = await createBin(token, tenantId, warehouseId, zoneId, {
-      code: 'A-01-01',
-      capacity: 120,
-      type: 'shelf',
-    }).expect(201);
+    const binKey = ulid();
+    const binBody = { code: 'A-01-01', capacity: 120, type: 'shelf' };
+    const created = await createBin(token, tenantId, warehouseId, zoneId, binBody, binKey).expect(201);
     expect(created.body).toMatchObject({
       tenantId,
       warehouseId,
@@ -781,6 +806,22 @@ describe('tenancy (e2e)', () => {
       type: 'shelf',
       blocked: false,
     });
+
+    // Replay: same key + same body re-serves the original 201, no second row.
+    const binReplay = await createBin(token, tenantId, warehouseId, zoneId, binBody, binKey).expect(201);
+    expect(binReplay.body).toEqual(created.body);
+
+    // Same key, different payload → idempotency-key-reuse, not a replay.
+    const binReuse = await createBin(token, tenantId, warehouseId, zoneId, { ...binBody, capacity: 5 }, binKey).expect(422);
+    expect(binReuse.body).toMatchObject({ code: 'idempotency-key-reuse' });
+
+    // Capacity beyond the Postgres integer ceiling is 400 at the boundary,
+    // not an unhandled 500 at the column.
+    await createBin(token, tenantId, warehouseId, zoneId, {
+      code: 'A-01-99',
+      capacity: 2147483648,
+      type: 'shelf',
+    }).expect(400);
 
     // No dormant state: the created bin is right there in the zone's list.
     const listed = await listBins(token, tenantId, warehouseId, zoneId).expect(200);
@@ -832,6 +873,10 @@ describe('tenancy (e2e)', () => {
     // Replay: same key + same body → the stored snapshot, no second batch.
     const replay = await generateBins(token, tenantId, warehouseId, zoneId, grid, key).expect(201);
     expect(replay.body).toEqual(run.body);
+
+    // Same key, different payload → idempotency-key-reuse, not a replay.
+    const reuse = await generateBins(token, tenantId, warehouseId, zoneId, { ...grid, capacity: 55 }, key).expect(422);
+    expect(reuse.body).toMatchObject({ code: 'idempotency-key-reuse' });
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       const rows = await sql`select count(*)::int as n from bins where warehouse_id = ${warehouseId}`;
@@ -894,6 +939,13 @@ describe('tenancy (e2e)', () => {
     }).expect(422);
     expect(huge.body).toMatchObject({ code: 'grid-too-large' });
 
+    // baysPerAisle above the documented 99 is 400 at the validation boundary.
+    const overBays = await generateBins(token, tenantId, warehouseId, zoneId, {
+      ...grid,
+      baysPerAisle: 100,
+    }).expect(400);
+    expect(overBays.body).toMatchObject({ code: 'validation-failed' });
+
     // A descending aisle range is a bad request, not an empty grid.
     const descending = await generateBins(token, tenantId, warehouseId, zoneId, {
       aisleFrom: 'B',
@@ -923,6 +975,10 @@ describe('tenancy (e2e)', () => {
 
     const replay = await patchBin(token, tenantId, warehouseId, binId, body, key).expect(200);
     expect(replay.body).toEqual(blocked.body);
+
+    // Same key, different payload → idempotency-key-reuse, not a replay.
+    const reuse = await patchBin(token, tenantId, warehouseId, binId, { blocked: false }, key).expect(422);
+    expect(reuse.body).toMatchObject({ code: 'idempotency-key-reuse' });
 
     const unblocked = await patchBin(token, tenantId, warehouseId, binId, { blocked: false }).expect(200);
     expect(unblocked.body).toMatchObject({ id: binId, blocked: false });
@@ -1016,6 +1072,39 @@ describe('tenancy (e2e)', () => {
       .set('Authorization', `Bearer ${token}`)
       .expect(404);
     expect(missingWarehouse.body).toMatchObject({ code: 'not-found' });
+  });
+
+  test('zone and bin lists bound limit and reject crafted cursors with 400 invalid-cursor', async () => {
+    const { tenantId, token, warehouseId } = await setupTenantWithWarehouse();
+    const zone = await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }).expect(201);
+    const zoneId = zone.body.id as string;
+    const listZones = (query: Record<string, unknown>) =>
+      request(app.getHttpServer())
+        .get(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones`)
+        .query(query)
+        .set('Authorization', `Bearer ${token}`);
+    const listBinsQ = (query: Record<string, unknown>) =>
+      listBins(token, tenantId, warehouseId, zoneId, query);
+
+    // Out-of-range limits are 400 validation-failed on both list routes.
+    await listZones({ limit: 0 }).expect(400);
+    await listZones({ limit: 201 }).expect(400);
+    await listBinsQ({ limit: 0 }).expect(400);
+    await listBinsQ({ limit: 201 }).expect(400);
+
+    // A crafted cursor (base64-valid JSON, non-uuid id) is 400, not a 500.
+    const crafted = Buffer.from(
+      JSON.stringify({ createdAt: '2026-01-01T00:00:00.000Z', id: 'garbage' }),
+      'utf8',
+    ).toString('base64url');
+    const badZones = await listZones({ cursor: crafted }).expect(400);
+    expect(badZones.body).toMatchObject({ code: 'invalid-cursor' });
+    const badBins = await listBinsQ({ cursor: crafted }).expect(400);
+    expect(badBins.body).toMatchObject({ code: 'invalid-cursor' });
+
+    // In-range limits pass validation.
+    await listZones({ limit: 1 }).expect(200);
+    await listBinsQ({ limit: 200 }).expect(200);
   });
 
   test('RLS: a tenant-scoped session cannot read another tenant’s zone or bin rows', async () => {
