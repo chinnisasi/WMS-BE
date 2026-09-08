@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { forwardRef, Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -10,6 +10,11 @@ import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { buildPage, decodeCursor, type Page } from '../../shared/primitives/pagination';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
+import { assertPermission } from '../tenancy/permissions';
+// Constructor param is a type here but must stay a value import: Nest DI needs
+// the runtime class token for decorator metadata (eslint rule bends for it).
+ 
+import { TenancyService } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { EVENT_BUS } from '../../shared/events/event-bus';
 
@@ -38,6 +43,8 @@ export interface SkuSnapshot {
 
 export interface EditSkuCommand {
   readonly tenantId: string;
+  /** The session user — authority is re-read from the DB at command entry. */
+  readonly actorUserId: string;
   readonly skuId: string;
   readonly name?: string | undefined;
   readonly gstRateBps?: number | undefined;
@@ -63,6 +70,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export class SkuCommand {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
+    // forwardRef: tenancy and catalog reference each other (checklist facade
+    // ↔ role lookup). The role is resolved per request through the
+    // TenancyService facade — catalog never reads tenancy tables.
+    @Inject(forwardRef(() => TenancyService)) private readonly tenancy: TenancyService,
     @Inject(EVENT_BUS) private readonly eventBus: EventBus,
   ) {}
 
@@ -150,6 +161,13 @@ export class SkuCommand {
       this.db,
       command.tenantId,
       async (tx) => {
+        // Authority at command-service entry (Story 1.5): the role is read
+        // through the TenancyService facade in this same tenant transaction.
+        assertPermission(
+          await this.tenancy.getMemberRole(command.tenantId, command.actorUserId, tx),
+          'sku.edit',
+        );
+
         const existing = await tx
           .select()
           .from(idempotencyKeys)

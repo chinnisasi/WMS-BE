@@ -99,7 +99,7 @@ export class RegistrationCommand {
       try {
         const userRows = await tx
           .insert(users)
-          .values({ id: uuidv7(), tenantId, email, passwordHash })
+          .values({ id: uuidv7(), tenantId, email, passwordHash, role: 'owner' })
           .returning();
         const user = userRows[0]!;
         owner = { id: user.id, email: user.email };

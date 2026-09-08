@@ -7,4 +7,5 @@ export { SignInCommand } from './sign-in.command';
 export { WarehouseCommand } from './warehouse.command';
 export { ZoneCommand } from './zone.command';
 export { BinCommand } from './bin.command';
+export { UsersCommand } from './users.command';
 export { TenancyService } from './tenancy.service';

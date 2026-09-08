@@ -38,17 +38,23 @@ describe('tenancy (e2e)', () => {
     // set it before the suite touches the endpoints.
     const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
-      await admin.unsafe(`
-        do $$ begin
-          if not exists (select from pg_roles where rolname = 'wms_auth_probe') then
-            create role wms_auth_probe login password 'wms_auth_probe' nosuperuser bypassrls;
-          end if;
-        end $$;
-      `);
-      await admin.unsafe('grant usage on schema public to wms_auth_probe');
-      await admin.unsafe(
-        'grant select, insert, update, delete on all tables in schema public to wms_auth_probe',
-      );
+      // Serialized across parallel jest workers: concurrent CREATE ROLE /
+      // GRANT ON ALL TABLES from sibling suites trips "tuple concurrently
+      // updated" on the shared catalog rows.
+      await admin.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(742105)`;
+        await tx.unsafe(`
+          do $$ begin
+            if not exists (select from pg_roles where rolname = 'wms_auth_probe') then
+              create role wms_auth_probe login password 'wms_auth_probe' nosuperuser bypassrls;
+            end if;
+          end $$;
+        `);
+        await tx.unsafe('grant usage on schema public to wms_auth_probe');
+        await tx.unsafe(
+          'grant select, insert, update, delete on all tables in schema public to wms_auth_probe',
+        );
+      });
       const authUrl = new URL(process.env.DATABASE_URL!);
       authUrl.username = 'wms_auth_probe';
       authUrl.password = 'wms_auth_probe';
@@ -75,6 +81,7 @@ describe('tenancy (e2e)', () => {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       // Children before parents: bins → zones → warehouses (no FKs, but the
       // order keeps the intent legible).
       await sql.unsafe('DELETE FROM bins WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);

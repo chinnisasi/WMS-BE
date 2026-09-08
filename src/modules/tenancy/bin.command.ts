@@ -9,12 +9,15 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
-import { assertWarehouseInTenant } from './tenancy.service';
+import { assertPermission } from './permissions';
+import { assertWarehouseInTenant, getMemberRoleIn } from './tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { EVENT_BUS } from '../../shared/events/event-bus';
 
 export interface CreateBinCommand {
   readonly tenantId: string;
+  /** The session user — authority is re-read from the DB at command entry. */
+  readonly actorUserId: string;
   readonly warehouseId: string;
   readonly zoneId: string;
   readonly code: string;
@@ -24,6 +27,7 @@ export interface CreateBinCommand {
 
 export interface GenerateBinsCommand {
   readonly tenantId: string;
+  readonly actorUserId: string;
   readonly warehouseId: string;
   readonly zoneId: string;
   /** Single aisle letters, inclusive — `A`..`C` spans A, B, C. */
@@ -37,6 +41,7 @@ export interface GenerateBinsCommand {
 
 export interface SetBinBlockedCommand {
   readonly tenantId: string;
+  readonly actorUserId: string;
   readonly warehouseId: string;
   readonly binId: string;
   readonly blocked: boolean;
@@ -140,6 +145,12 @@ export class BinCommand {
       this.db,
       command.tenantId,
       async (tx) => {
+        // Authority at command-service entry (Story 1.5) — DB read, same tx.
+        assertPermission(
+          await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+          'bin.create',
+        );
+
         const existing = await tx
           .select()
           .from(idempotencyKeys)
@@ -226,6 +237,12 @@ export class BinCommand {
       this.db,
       command.tenantId,
       async (tx) => {
+        // Authority at command-service entry (Story 1.5) — DB read, same tx.
+        assertPermission(
+          await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+          'bin.create',
+        );
+
         const existing = await tx
           .select()
           .from(idempotencyKeys)
@@ -351,6 +368,12 @@ export class BinCommand {
       this.db,
       command.tenantId,
       async (tx) => {
+        // Authority at command-service entry (Story 1.5) — DB read, same tx.
+        assertPermission(
+          await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+          'bin.block',
+        );
+
         const existing = await tx
           .select()
           .from(idempotencyKeys)

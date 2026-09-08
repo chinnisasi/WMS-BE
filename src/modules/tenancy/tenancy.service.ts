@@ -1,11 +1,12 @@
-import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { forwardRef, Inject, Injectable } from '@nestjs/common';
+import { and, desc, eq, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { bins, warehouses, zones } from '../../shared/db/schema';
+import { bins, users, warehouses, zones } from '../../shared/db/schema';
+import type { UserRole } from '../../shared/db/schema';
 // Constructor param is a type here but must stay a value import: Nest DI needs
 // the runtime class token for decorator metadata (eslint rule bends for it).
-// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+ 
 import { CatalogFacade } from '../catalog/catalog.facade';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
@@ -90,6 +91,39 @@ function warehouseNotFound(): ProblemException {
 }
 
 /**
+ * The role of one tenant member, read **inside the caller's tenant
+ * transaction** when `tx` is given (the command-service-entry pattern of
+ * Story 1.5 — the DB read *is* the epoch, so a role change applies to the
+ * user's next command without re-login). Without `tx`, its own tenant-scoped
+ * transaction is opened. Catalog and other foreign modules call the
+ * `TenancyService.getMemberRole` facade; they never touch tenancy tables.
+ *
+ * A missing member row fails closed: the caller has no role and no
+ * capabilities (`role-denied` names it).
+ */
+export async function getMemberRoleIn(
+  tx: TenantTx,
+  tenantId: string,
+  userId: string,
+): Promise<UserRole> {
+  const rows = await tx
+    .select({ role: users.role })
+    .from(users)
+    .where(and(eq(users.id, userId), eq(users.tenantId, tenantId)))
+    .limit(1);
+  const role = rows[0]?.role;
+  if (role === undefined) {
+    throw new ProblemException(
+      'role-denied',
+      403,
+      'Role lacks the required capability',
+      'The caller is not a member of this tenant (role "none").',
+    );
+  }
+  return role;
+}
+
+/**
  * Tenancy facade for other spine modules and the api shell. Modules never
  * touch tenancy tables directly — they call this service (or consume its
  * domain events).
@@ -98,8 +132,28 @@ function warehouseNotFound(): ProblemException {
 export class TenancyService {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
+    // forwardRef: the catalog module resolves TenancyService for its own
+    // command-entry role lookups (Story 1.5) while this facade consumes the
+    // CatalogFacade — the first two-way spine module dependency.
+    @Inject(forwardRef(() => CatalogFacade))
     private readonly catalogFacade: CatalogFacade,
   ) {}
+
+  /**
+   * Role lookup for other modules' command services (Story 1.5 — the
+   * facade-provided role read; foreign modules must not read tenancy
+   * tables). Callers with their own tenant transaction pass it in so the
+   * authority read shares the mutation's transaction; otherwise a fresh
+   * tenant-scoped transaction is opened. See `getMemberRoleIn`.
+   */
+  async getMemberRole(tenantId: string, userId: string, tx?: TenantTx): Promise<UserRole> {
+    if (tx) {
+      return getMemberRoleIn(tx, tenantId, userId);
+    }
+    return withTenantTransaction(this.db, tenantId, (inner) =>
+      getMemberRoleIn(inner, tenantId, userId),
+    );
+  }
 
   /**
    * Zero-warehouse invariant guard (consumed by Epic 2 stock-record
@@ -266,8 +320,9 @@ export class TenancyService {
    * The per-tenant setup checklist (Story 1.3, catalog step wired to the
    * catalog facade in 1.4), **computed on read** — no stored step rows to go
    * stale: the flags derive from counts. Catalog aggregates through the
-   * catalog module's facade (module tables stay exclusive); users (1.5) is
-   * still shown honestly as pending until its story builds the surface.
+   * catalog module's facade (module tables stay exclusive); the users step
+   * (Story 1.5) counts non-Owner users — invited or active, the team is
+   * "invited" once at least one non-owner user exists.
    */
   async computeSetupChecklist(tenantId: string): Promise<SetupChecklist> {
     const counts = await withTenantTransaction(this.db, tenantId, async (tx) => {
@@ -279,13 +334,22 @@ export class TenancyService {
         .select({ n: sql<number>`count(*)::int` })
         .from(bins)
         .where(eq(bins.tenantId, tenantId));
-      return { warehouses: warehouseRows[0]?.n ?? 0, bins: binRows[0]?.n ?? 0 };
+      const memberRows = await tx
+        .select({ n: sql<number>`count(*)::int` })
+        .from(users)
+        .where(and(eq(users.tenantId, tenantId), ne(users.role, 'owner')));
+      return {
+        warehouses: warehouseRows[0]?.n ?? 0,
+        bins: binRows[0]?.n ?? 0,
+        members: memberRows[0]?.n ?? 0,
+      };
     });
     const catalog = await this.catalogFacade.getImportSummary(tenantId);
 
     const warehouseDone = counts.warehouses >= 1;
     const binsDone = counts.bins >= 1;
     const catalogDone = catalog.skuCount >= 1;
+    const usersDone = counts.members >= 1;
     const catalogDetail = catalogDone
       ? `Done · ${catalog.skuCount} SKUs · last import ${catalog.lastImport?.committedRows ?? 0} committed, ${catalog.lastImport?.failedRows ?? 0} failed`
       : catalog.lastImport !== null
@@ -321,8 +385,10 @@ export class TenancyService {
         {
           key: 'users',
           label: 'Invite users and roles',
-          done: false,
-          detail: 'Pending · team invitations arrive with story 1.5.',
+          done: usersDone,
+          detail: usersDone
+            ? `Done · ${counts.members} team member${counts.members === 1 ? '' : 's'} invited`
+            : 'No team members yet — invite your first user below.',
           href: '/settings',
         },
       ],

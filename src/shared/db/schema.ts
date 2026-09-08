@@ -1,4 +1,4 @@
-import { boolean, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { boolean, index, integer, jsonb, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
 /**
@@ -50,9 +50,32 @@ export const tenants = pgTable('tenants', {
 export type Tenant = typeof tenants.$inferSelect;
 
 /**
+ * The four coarse roles (Story 1.5): Owner, Ops Manager, Operator, Accountant.
+ * Authority is a per-command DB read of this column — never a JWT claim.
+ */
+export const userRoleEnum = pgEnum('user_role', ['owner', 'ops_manager', 'operator', 'accountant']);
+
+export type UserRole = (typeof userRoleEnum.enumValues)[number];
+
+/**
+ * Invite lifecycle status: `invited` (credentials not yet set) → `active`.
+ * Sign-in rejects `invited` users with 403 `invite-pending`.
+ */
+export const USER_STATUSES = ['invited', 'active'] as const;
+export type UserStatus = (typeof USER_STATUSES)[number];
+
+/**
  * Owner and team users. Emails are globally unique (one account per email —
- * registration of an existing owner email is a 409 `duplicate-email`).
+ * registration of an existing owner email is a 409 `duplicate-email`, and
+ * inviting one is a 409 `email-exists`).
  * Passwords are stored as `node:crypto` scrypt hashes only.
+ *
+ * Story 1.5: `role` gates mutations (capability→role map in
+ * `modules/tenancy/permissions.ts`, re-read from the DB at every command
+ * service entry); `status` carries the invite lifecycle; `invite_token_hash`
+ * + `invite_expires_at` carry the one-time invite (sha256 hash of the raw
+ * token — the raw token is only ever in the invite API response, never
+ * stored; 7-day expiry).
  */
 export const users = pgTable('users', {
   id: uuid('id')
@@ -61,10 +84,43 @@ export const users = pgTable('users', {
   tenantId: uuid('tenant_id').notNull(),
   email: text('email').notNull().unique(),
   passwordHash: text('password_hash').notNull(),
+  role: userRoleEnum('role').notNull().default('operator'),
+  status: text('status').notNull().default('active'),
+  inviteTokenHash: text('invite_token_hash'),
+  inviteExpiresAt: timestamp('invite_expires_at', { withTimezone: true, mode: 'string' }),
   ...tenantTimestamps,
 });
 
 export type User = typeof users.$inferSelect;
+
+/**
+ * Append-only audit trail for user/role actions (Story 1.5): one row per
+ * invitation and role change, written in the same transaction as the
+ * mutation. `reference` stores the request's idempotency key so retried
+ * commands dedupe visibly. Rows are never updated or deleted (append-only by
+ * convention; no update/delete code path exists).
+ */
+export const auditEvents = pgTable(
+  'audit_events',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    actorUserId: uuid('actor_user_id').notNull(),
+    action: text('action').notNull(),
+    targetType: text('target_type').notNull(),
+    targetId: uuid('target_id').notNull(),
+    reference: text('reference'),
+    occurredAt: timestamp('occurred_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    index('audit_events_tenant_id_occurred_at_idx').on(table.tenantId, table.occurredAt),
+  ],
+);
+
+export type AuditEvent = typeof auditEvents.$inferSelect;
 
 /**
  * Stocking sites. Warehouse codes are unique per tenant — duplicate rejection
