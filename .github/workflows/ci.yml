@@ -63,3 +63,21 @@ jobs:
 
       - name: Round-trip check (schema vs migrations drift guard)
         run: bun run db:verify
+
+  openapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.20
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Export OpenAPI document
+        run: bun run openapi:export
+
+      - name: Spec drift guard (committed spec matches the code)
+        run: git diff --exit-code openapi/
