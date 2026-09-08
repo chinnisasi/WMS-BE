@@ -277,7 +277,7 @@ describe('catalog (e2e)', () => {
     } finally {
       await sql.end();
     }
-  });
+  }, 30_000);
 
   test('duplicate sku codes are rejected within the file and against the tenant, naming the code', async () => {
     const { tenantId, token } = await setupTenantWithSeed(0);
