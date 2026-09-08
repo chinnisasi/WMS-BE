@@ -3,10 +3,13 @@
  * client-generated ULID key, de-duped tenant-scoped in the same transaction
  * as the write.
  *
- * Story 1.1 lays the seam only — the table, tenant scoping, and interceptor
- * land with the first mutating endpoints (Story 1.2) inside the tenancy
- * module. Do not build storage here, and do not consume the key as if
- * tenant scoping already exists.
+ * Story 1.2 landed the real storage: the `idempotency_keys` table (unique
+ * `(tenant_id, key)`, payload hash, response snapshot) and the
+ * same-transaction de-dupe live in the tenancy module's command services
+ * (`modules/tenancy/*-command.ts`) — the first command-layer consumers.
+ * This file stays the contract-only key-format primitive; new mutating
+ * endpoints follow the command-service pattern rather than building
+ * storage here.
  */
 
 import { ulid } from '../primitives/ids';

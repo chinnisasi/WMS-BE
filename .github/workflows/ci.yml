@@ -8,6 +8,23 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    services:
+      # The e2e suite (tenancy registration/RLS/idempotency) talks to real Postgres.
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: wms
+          POSTGRES_PASSWORD: wms
+          POSTGRES_DB: wms
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U wms"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://wms:wms@localhost:55432/wms
     steps:
       - uses: actions/checkout@v4
 

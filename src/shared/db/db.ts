@@ -13,6 +13,57 @@ export function createDatabase(url: string = requiredDbUrl()): Database {
   return drizzle(client, { schema });
 }
 
+/**
+ * DI-friendly wrapper (first wired consumer: SharedModule's `DATABASE`
+ * provider). Connection setup is deferred to the first actual query so that
+ * booting the app — OpenAPI export, contract tests — never requires
+ * DATABASE_URL; only touching Postgres does.
+ */
+export function createLazyDatabase(): Database {
+  let instance: Database | undefined;
+  const resolved = (): Database => (instance ??= createDatabase());
+
+  // Promise-protocol / introspection probes (NestJS checks `then` on every
+  // provider at boot, lifecycle hook names at init/shutdown) must not trigger
+  // connection setup.
+  const INERT = new Set([
+    'then',
+    'catch',
+    'finally',
+    'constructor',
+    'prototype',
+    '__proto__',
+    'onModuleInit',
+    'onModuleDestroy',
+    'onApplicationBootstrap',
+    'onApplicationShutdown',
+    'beforeApplicationShutdown',
+  ]);
+
+  type Mutable = Record<string | symbol, unknown>;
+  return new Proxy({} as unknown as Database, {
+    get(_target, prop) {
+      if (typeof prop !== 'string' || INERT.has(prop)) return undefined;
+      const db = resolved() as unknown as Mutable;
+      const value = Reflect.get(db, prop, db);
+      // Bind prototype methods (select, transaction, …) to the resolved
+      // instance; own properties like `$client` (the postgres client —
+      // itself a callable with its own methods) pass through untouched.
+      if (typeof value === 'function' && !Object.prototype.hasOwnProperty.call(db, prop)) {
+        return (value as () => unknown).bind(db);
+      }
+      return value;
+    },
+    set(_target, prop, value) {
+      (resolved() as unknown as Mutable)[prop] = value;
+      return true;
+    },
+    has(_target, prop) {
+      return typeof prop === 'string' && !INERT.has(prop) && prop in (resolved() as unknown as Mutable);
+    },
+  });
+}
+
 export function requiredDbUrl(): string {
   const url = process.env.DATABASE_URL;
   if (!url) {
