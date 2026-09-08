@@ -148,7 +148,7 @@ export class TenancyController {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const snapshot = await this.warehouseCommand.create(
-      { tenantId, code: dto.code, name: dto.name },
+      { tenantId, actorUserId: session.userId, code: dto.code, name: dto.name },
       key,
     );
     return snapshot.warehouse;
@@ -203,7 +203,7 @@ export class TenancyController {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const snapshot = await this.zoneCommand.create(
-      { tenantId, warehouseId, code: dto.code, name: dto.name },
+      { tenantId, actorUserId: session.userId, warehouseId, code: dto.code, name: dto.name },
       key,
     );
     return snapshot.zone;
@@ -266,6 +266,7 @@ export class TenancyController {
     const snapshot = await this.binCommand.createBin(
       {
         tenantId,
+        actorUserId: session.userId,
         warehouseId,
         zoneId,
         code: dto.code,
@@ -309,6 +310,7 @@ export class TenancyController {
     return this.binCommand.generateGrid(
       {
         tenantId,
+        actorUserId: session.userId,
         warehouseId,
         zoneId,
         aisleFrom: dto.aisleFrom,
@@ -379,7 +381,7 @@ export class TenancyController {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const snapshot = await this.binCommand.setBlocked(
-      { tenantId, warehouseId, binId, blocked: dto.blocked },
+      { tenantId, actorUserId: session.userId, warehouseId, binId, blocked: dto.blocked },
       key,
     );
     return snapshot.bin;

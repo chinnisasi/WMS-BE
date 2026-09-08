@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { CatalogModule } from '../catalog/catalog.module';
 import { BinCommand } from './bin.command';
@@ -7,6 +7,8 @@ import { SignInCommand } from './sign-in.command';
 import { TenancyController } from './tenancy.controller';
 import { TenancyService } from './tenancy.service';
 import { TenantSessionGuard } from './tenant-session.guard';
+import { UsersController } from './users.controller';
+import { UsersCommand } from './users.command';
 import { WarehouseCommand } from './warehouse.command';
 import { ZoneCommand } from './zone.command';
 
@@ -24,14 +26,18 @@ import { ZoneCommand } from './zone.command';
  * guard for stock-record creation (Epic 2).
  */
 @Module({
-  imports: [SharedModule, CatalogModule],
-  controllers: [TenancyController],
+  // forwardRef: catalog commands resolve the caller's role through the
+  // TenancyService facade (Story 1.5), while this module consumes the
+  // CatalogFacade for the checklist — the only two-way spine dependency.
+  imports: [SharedModule, forwardRef(() => CatalogModule)],
+  controllers: [TenancyController, UsersController],
   providers: [
     RegistrationCommand,
     SignInCommand,
     WarehouseCommand,
     ZoneCommand,
     BinCommand,
+    UsersCommand,
     TenancyService,
     TenantSessionGuard,
   ],

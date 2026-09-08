@@ -147,6 +147,7 @@ export class CatalogController {
     const snapshot = await this.importCommand.execute(
       {
         tenantId,
+        actorUserId: session.userId,
         file: { name: file.originalname, mimetype: file.mimetype, buffer: file.buffer, size: file.size },
         mode: parseMode(dto.mode),
       },
@@ -209,6 +210,7 @@ export class CatalogController {
     const sku = await this.skuCommand.edit(
       {
         tenantId,
+        actorUserId: session.userId,
         skuId,
         name: dto.name,
         gstRateBps: dto.gstRate,

@@ -9,11 +9,15 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
+import { assertPermission } from './permissions';
+import { getMemberRoleIn } from './tenancy.service';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { EVENT_BUS } from '../../shared/events/event-bus';
 
 export interface CreateWarehouseCommand {
   readonly tenantId: string;
+  /** The session user — authority is re-read from the DB at command entry. */
+  readonly actorUserId: string;
   readonly code: string;
   readonly name: string;
 }
@@ -59,6 +63,13 @@ export class WarehouseCommand {
       this.db,
       command.tenantId,
       async (tx) => {
+        // Authority at command-service entry (Story 1.5): the role is re-read
+        // from the DB in this same tenant transaction — never a JWT claim.
+        assertPermission(
+          await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+          'warehouse.create',
+        );
+
         const existing = await tx
           .select()
           .from(idempotencyKeys)

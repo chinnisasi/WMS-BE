@@ -80,6 +80,87 @@ export class TenantRegistrationResponse {
   owner!: OwnerUserResponse;
 }
 
+/** The four coarse roles (spec 1.5) — validated, never free-form. */
+export const USER_ROLES = ['owner', 'ops_manager', 'operator', 'accountant'] as const;
+export type UserRoleDto = (typeof USER_ROLES)[number];
+
+export const USER_STATUSES = ['invited', 'active'] as const;
+
+export class UserResponse {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ example: 'dev@example.com' })
+  email!: string;
+
+  @ApiProperty({ enum: USER_ROLES, example: 'owner' })
+  role!: string;
+
+  @ApiProperty({ enum: USER_STATUSES, example: 'active' })
+  status!: string;
+
+  @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
+  createdAt!: string;
+}
+
+export class InviteUserDto {
+  @ApiProperty({ example: 'dev@example.com', format: 'email' })
+  @Trimmed()
+  @IsEmail()
+  email!: string;
+
+  @ApiProperty({ enum: USER_ROLES, example: 'operator' })
+  @IsIn(USER_ROLES)
+  role!: UserRoleDto;
+}
+
+export class SetUserRoleDto {
+  @ApiProperty({ enum: USER_ROLES, example: 'ops_manager' })
+  @IsIn(USER_ROLES)
+  role!: UserRoleDto;
+}
+
+export class AcceptInviteDto {
+  @ApiProperty({ description: 'The one-time invite token from the invite response' })
+  @IsString()
+  @Length(1, 512)
+  token!: string;
+
+  @ApiProperty({ example: 'correct-horse-battery', minLength: 8, maxLength: 200 })
+  @IsString()
+  @Length(8, 200)
+  password!: string;
+}
+
+export class UserListResponse {
+  @ApiProperty({ type: [UserResponse] })
+  items!: UserResponse[];
+
+  @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
+  nextCursor!: string | null;
+}
+
+export class InviteUserResponse {
+  @ApiProperty({ type: UserResponse })
+  user!: UserResponse;
+
+  @ApiProperty({ description: 'The one-time invite token — share the accept link out-of-band' })
+  inviteToken!: string;
+
+  @ApiProperty({ example: '2026-09-15T00:00:00.000Z', description: 'One-time link expiry (7 days)' })
+  inviteExpiresAt!: string;
+}
+
+export class AcceptInviteResponse {
+  @ApiProperty({ type: UserResponse })
+  user!: UserResponse;
+}
+
+export class MeResponse {
+  @ApiProperty({ type: UserResponse })
+  user!: UserResponse;
+}
+
 export class SignInResponse {
   @ApiProperty({ description: 'HS256 session token (15 min), claims: sub + tenant_id' })
   accessToken!: string;
@@ -92,6 +173,9 @@ export class SignInResponse {
 
   @ApiProperty({ type: TenantResponse })
   tenant!: TenantResponse;
+
+  @ApiProperty({ type: UserResponse })
+  user!: UserResponse;
 }
 
 export class WarehouseResponse {
