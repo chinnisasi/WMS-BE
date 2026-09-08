@@ -13,6 +13,87 @@ export function createDatabase(url: string = requiredDbUrl()): Database {
   return drizzle(client, { schema });
 }
 
+/**
+ * DI-friendly wrapper (first wired consumer: SharedModule's `DATABASE`
+ * provider). Connection setup is deferred to the first actual query so that
+ * booting the app — OpenAPI export, contract tests — never requires
+ * DATABASE_URL; only touching Postgres does.
+ */
+export function createLazyDatabase(): Database {
+  return lazyDatabaseProxy(() => createDatabase());
+}
+
+/**
+ * Auth-time connection (review loop 1 decision): sign-in and the registration
+ * replay lookup run before any tenant context exists, so the fail-closed RLS
+ * policies would hide every row from the scoped (non-superuser) app role.
+ * This client reads through a dedicated connection whose role carries
+ * BYPASSRLS — `DATABASE_AUTH_URL` when set, `DATABASE_URL` otherwise. It is
+ * for auth-time reads only; every tenant-scoped path stays on `DATABASE`.
+ */
+export function createLazyAuthDatabase(): Database {
+  return lazyDatabaseProxy(() => {
+    const authUrl = process.env.DATABASE_AUTH_URL;
+    if (!authUrl) {
+      // A deployment that forgets DATABASE_AUTH_URL fails closed (the scoped
+      // role is non-superuser → every auth-time read returns zero rows → bare
+      // 401s with no distinguishing log). Say so once, loudly, at first use.
+      console.warn(
+        'DATABASE_AUTH_URL is not set — the auth connection is falling back to ' +
+          'DATABASE_URL. In production DATABASE_AUTH_URL must point at a role ' +
+          'with BYPASSRLS (see scripts/provision-roles.sql); the fallback only ' +
+          'works where the DATABASE_URL role itself is superuser (dev/CI).',
+      );
+    }
+    return createDatabase(authUrl || requiredDbUrl());
+  });
+}
+
+function lazyDatabaseProxy(create: () => Database): Database {
+  let instance: Database | undefined;
+  const resolved = (): Database => (instance ??= create());
+
+  // Promise-protocol / introspection probes (NestJS checks `then` on every
+  // provider at boot, lifecycle hook names at init/shutdown) must not trigger
+  // connection setup.
+  const INERT = new Set([
+    'then',
+    'catch',
+    'finally',
+    'constructor',
+    'prototype',
+    '__proto__',
+    'onModuleInit',
+    'onModuleDestroy',
+    'onApplicationBootstrap',
+    'onApplicationShutdown',
+    'beforeApplicationShutdown',
+  ]);
+
+  type Mutable = Record<string | symbol, unknown>;
+  return new Proxy({} as unknown as Database, {
+    get(_target, prop) {
+      if (typeof prop !== 'string' || INERT.has(prop)) return undefined;
+      const db = resolved() as unknown as Mutable;
+      const value = Reflect.get(db, prop, db);
+      // Bind prototype methods (select, transaction, …) to the resolved
+      // instance; own properties like `$client` (the postgres client —
+      // itself a callable with its own methods) pass through untouched.
+      if (typeof value === 'function' && !Object.prototype.hasOwnProperty.call(db, prop)) {
+        return (value as () => unknown).bind(db);
+      }
+      return value;
+    },
+    set(_target, prop, value) {
+      (resolved() as unknown as Mutable)[prop] = value;
+      return true;
+    },
+    has(_target, prop) {
+      return typeof prop === 'string' && !INERT.has(prop) && prop in (resolved() as unknown as Mutable);
+    },
+  });
+}
+
 export function requiredDbUrl(): string {
   const url = process.env.DATABASE_URL;
   if (!url) {

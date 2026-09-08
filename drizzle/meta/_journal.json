@@ -8,6 +8,20 @@
       "when": 1788836429672,
       "tag": "0000_funny_eddie_brock",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1788840538268,
+      "tag": "0001_greedy_scarecrow",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788844652959,
+      "tag": "0002_misty_romulus",
+      "breakpoints": true
     }
   ]
 }

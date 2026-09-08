@@ -21,12 +21,13 @@ import { JobsModule } from './jobs/jobs.module';
  * spine modules (ARCHITECTURE-SPINE.md §Structural Seed). Modules own their
  * tables exclusively and communicate only through interfaces and domain
  * events.
+ *
+ * Import order matters: spine modules register their routes before the api
+ * shell, whose NotFoundController catch-all (`{*path}`) must map last.
  */
 @Module({
   imports: [
     SharedModule,
-    ApiModule,
-    JobsModule,
     TenancyModule,
     CatalogModule,
     InventoryModule,
@@ -40,6 +41,8 @@ import { JobsModule } from './jobs/jobs.module';
     CarriersModule,
     NotificationsModule,
     ReportingModule,
+    JobsModule,
+    ApiModule,
   ],
 })
 export class AppModule {}

@@ -1,0 +1,1 @@
+CREATE INDEX "idempotency_keys_key_idx" ON "idempotency_keys" USING btree ("key");
