@@ -197,7 +197,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied)",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks warehouse.create (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -402,7 +402,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied)",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks zone.create (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -645,7 +645,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied)",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks bin.create (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -897,7 +897,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied)",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks bin.create (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1035,7 +1035,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied)",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1128,7 +1128,7 @@
             "bearer": []
           }
         ],
-        "summary": "Computed onboarding checklist (warehouse, bins, catalog, users — catalog/users pending)",
+        "summary": "Computed onboarding checklist (warehouse, bins, catalog, users — all four wired)",
         "tags": [
           "tenancy"
         ]
@@ -1669,7 +1669,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied)",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks catalog.import (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1886,7 +1886,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied)",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
