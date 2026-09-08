@@ -16,6 +16,14 @@ export const API_PREFIX = 'api/v1';
 export async function createApp(withListener = false): Promise<INestApplication> {
   const app = await NestFactory.create(AppModule, { logger: ['error', 'warn', 'log'] });
 
+  // CORS: the web client runs on its own origin (dev: localhost:3001) and
+  // talks to this API cross-origin with a bearer token — an allow-list, not a
+  // wildcard (auth rides the Authorization header, so no cookies/credentials).
+  const corsOrigins = (process.env.CORS_ORIGIN ?? 'http://localhost:3001')
+    .split(',')
+    .map((origin) => origin.trim());
+  app.enableCors({ origin: corsOrigins });
+
   // The OpenAPI document is built before the global prefix so its paths are
   // clean (/health) and the base path travels in `servers` instead (AD-8).
   const config = new DocumentBuilder()
