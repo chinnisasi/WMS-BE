@@ -184,3 +184,133 @@ export const idempotencyKeys = pgTable(
 );
 
 export type IdempotencyKeyRow = typeof idempotencyKeys.$inferSelect;
+
+/**
+ * Sellable units (Story 1.4 — the first catalog module tables; the module
+ * owns these exclusively). Codes are unique per tenant — duplicate imports
+ * are row-level rejections naming the code, never a silent merge. Barcodes
+ * are unique per tenant too; a barcode resolving to two SKUs is a row-level
+ * rejection naming the conflicting SKU. `barcode` is generated server-side at
+ * entry (uuidv7-derived) unless the import/edit supplies one. GST is stored
+ * as basis points (integer); `reorderPoint`/`reorderQty` are base-UoM integer
+ * defaults. No price/cost fields (spec 1.4 boundary). SKU code is immutable —
+ * editing happens through the PATCH fields only.
+ */
+export const skus = pgTable(
+  'skus',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    code: text('code').notNull(),
+    name: text('name').notNull(),
+    uom: text('uom').notNull(),
+    gstRateBps: integer('gst_rate_bps').notNull(),
+    hsn: text('hsn'),
+    batchTracked: boolean('batch_tracked').notNull().default(false),
+    serialTracked: boolean('serial_tracked').notNull().default(false),
+    reorderPoint: integer('reorder_point').notNull().default(0),
+    reorderQty: integer('reorder_qty').notNull().default(0),
+    barcode: text('barcode').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('skus_tenant_id_code_unique').on(table.tenantId, table.code),
+    uniqueIndex('skus_tenant_id_barcode_unique').on(table.tenantId, table.barcode),
+    index('skus_created_at_id_idx').on(table.createdAt, table.id),
+    index('skus_tenant_id_idx').on(table.tenantId),
+  ],
+);
+
+export type Sku = typeof skus.$inferSelect;
+
+/**
+ * UoM conversions relative to the SKU's base UoM (Story 1.4): `factor` is a
+ * **positive integer** — one `uom` equals `factor` base units (a box of 12 is
+ * factor 12 against base `pcs`). Owned by catalog; `sku_id` → `skus.id` by
+ * uuid column (no FK, repo convention), validated in the command transaction.
+ * One conversion per (sku, uom) — a repeated target UoM in the same file is a
+ * row-level `validation-failed`.
+ */
+export const uomConversions = pgTable(
+  'uom_conversions',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    uom: text('uom').notNull(),
+    factor: integer('factor').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('uom_conversions_sku_id_uom_unique').on(table.skuId, table.uom),
+    index('uom_conversions_tenant_id_idx').on(table.tenantId),
+  ],
+);
+
+export type UomConversion = typeof uomConversions.$inferSelect;
+
+/**
+ * One row per import run (Story 1.4): `mode` is `initial` or `fix`, the
+ * counts are the response snapshot's counts. **Fix-mode targeting is the
+ * latest run** (newest created_at, id tiebreaker): the failed SKU codes of
+ * that row's `catalog_import_errors` are the fix set. Imports are synchronous
+ * and idempotent (AD-5) — the idempotency record lives in `idempotency_keys`
+ * (payload hash over file sha256 + mode), this table is the run ledger.
+ */
+export const catalogImports = pgTable(
+  'catalog_imports',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    mode: text('mode').notNull(),
+    committedRows: integer('committed_rows').notNull(),
+    failedRows: integer('failed_rows').notNull(),
+    skippedRows: integer('skipped_rows').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    index('catalog_imports_tenant_id_created_at_id_idx').on(
+      table.tenantId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type CatalogImport = typeof catalogImports.$inferSelect;
+
+/**
+ * Row-level import failures (Story 1.4): one row per rejected spreadsheet row
+ * — `row_number` is the 1-based data-row index (header excluded), `sku_code`
+ * may be absent when the row failed shape validation before a code could be
+ * read. `reason_code` is the machine code clients branch on
+ * (validation-failed / duplicate-sku-code / duplicate-barcode); `reason_detail`
+ * is the human line. The latest run's non-null sku_codes are the fix set.
+ */
+export const catalogImportErrors = pgTable(
+  'catalog_import_errors',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    importId: uuid('import_id').notNull(),
+    rowNumber: integer('row_number').notNull(),
+    skuCode: text('sku_code'),
+    reasonCode: text('reason_code').notNull(),
+    reasonDetail: text('reason_detail').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    index('catalog_import_errors_import_id_idx').on(table.importId),
+    index('catalog_import_errors_tenant_id_idx').on(table.tenantId),
+  ],
+);
+
+export type CatalogImportError = typeof catalogImportErrors.$inferSelect;

@@ -9,8 +9,8 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
-import { withTenantTransaction } from './tenant-scope';
-import { EVENT_BUS } from './event-bus';
+import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { EVENT_BUS } from '../../shared/events/event-bus';
 
 export interface CreateWarehouseCommand {
   readonly tenantId: string;

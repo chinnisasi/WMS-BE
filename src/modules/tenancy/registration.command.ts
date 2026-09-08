@@ -10,8 +10,8 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { hashPassword } from './passwords';
 import { hashCommandPayload } from './idempotency-guard';
-import { setTenantScope } from './tenant-scope';
-import { EVENT_BUS } from './event-bus';
+import { setTenantScope } from '../../shared/db/tenant-scope';
+import { EVENT_BUS } from '../../shared/events/event-bus';
 
 /** Registration command input (AD-10: state changes enter command services). */
 export interface RegisterTenantCommand {

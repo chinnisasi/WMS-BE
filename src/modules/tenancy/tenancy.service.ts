@@ -3,10 +3,14 @@ import { and, desc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { bins, warehouses, zones } from '../../shared/db/schema';
+// Constructor param is a type here but must stay a value import: Nest DI needs
+// the runtime class token for decorator metadata (eslint rule bends for it).
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { CatalogFacade } from '../catalog/catalog.facade';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { withTenantTransaction, type TenancyTx } from './tenant-scope';
+import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 
 /** What other modules get from the tenancy spine (module boundary — AD-6). */
 export interface ActiveWarehouse {
@@ -62,7 +66,7 @@ export interface SetupChecklist {
  * scoping is app-layer, RLS stays single-dimension (`tenant_isolation`).
  */
 export async function assertWarehouseInTenant(
-  tx: TenancyTx,
+  tx: TenantTx,
   tenantId: string,
   warehouseId: string,
 ): Promise<void> {
@@ -92,7 +96,10 @@ function warehouseNotFound(): ProblemException {
  */
 @Injectable()
 export class TenancyService {
-  constructor(@Inject(DATABASE) private readonly db: Database) {}
+  constructor(
+    @Inject(DATABASE) private readonly db: Database,
+    private readonly catalogFacade: CatalogFacade,
+  ) {}
 
   /**
    * Zero-warehouse invariant guard (consumed by Epic 2 stock-record
@@ -256,10 +263,11 @@ export class TenancyService {
   }
 
   /**
-   * The per-tenant setup checklist (Story 1.3), **computed on read** — no
-   * stored step rows to go stale: the flags derive from counts in one
-   * transaction. Catalog (1.4) and users (1.5) are shown honestly as pending
-   * until their stories build the surfaces that satisfy them.
+   * The per-tenant setup checklist (Story 1.3, catalog step wired to the
+   * catalog facade in 1.4), **computed on read** — no stored step rows to go
+   * stale: the flags derive from counts. Catalog aggregates through the
+   * catalog module's facade (module tables stay exclusive); users (1.5) is
+   * still shown honestly as pending until its story builds the surface.
    */
   async computeSetupChecklist(tenantId: string): Promise<SetupChecklist> {
     const counts = await withTenantTransaction(this.db, tenantId, async (tx) => {
@@ -273,9 +281,16 @@ export class TenancyService {
         .where(eq(bins.tenantId, tenantId));
       return { warehouses: warehouseRows[0]?.n ?? 0, bins: binRows[0]?.n ?? 0 };
     });
+    const catalog = await this.catalogFacade.getImportSummary(tenantId);
 
     const warehouseDone = counts.warehouses >= 1;
     const binsDone = counts.bins >= 1;
+    const catalogDone = catalog.skuCount >= 1;
+    const catalogDetail = catalogDone
+      ? `Done · ${catalog.skuCount} SKUs · last import ${catalog.lastImport?.committedRows ?? 0} committed, ${catalog.lastImport?.failedRows ?? 0} failed`
+      : catalog.lastImport !== null
+        ? `Pending · 0 SKUs · last import ${catalog.lastImport.committedRows} committed, ${catalog.lastImport.failedRows} failed`
+        : 'No SKUs yet — import your catalog below.';
     return {
       steps: [
         {
@@ -299,8 +314,8 @@ export class TenancyService {
         {
           key: 'catalog',
           label: 'Import your catalog',
-          done: false,
-          detail: 'Pending · catalog import arrives with story 1.4.',
+          done: catalogDone,
+          detail: catalogDetail,
           href: '/settings',
         },
         {

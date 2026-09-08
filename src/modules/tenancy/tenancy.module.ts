@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
-import { EVENT_BUS, LoggingEventBus } from './event-bus';
+import { CatalogModule } from '../catalog/catalog.module';
 import { BinCommand } from './bin.command';
 import { RegistrationCommand } from './registration.command';
 import { SignInCommand } from './sign-in.command';
@@ -24,10 +24,9 @@ import { ZoneCommand } from './zone.command';
  * guard for stock-record creation (Epic 2).
  */
 @Module({
-  imports: [SharedModule],
+  imports: [SharedModule, CatalogModule],
   controllers: [TenancyController],
   providers: [
-    { provide: EVENT_BUS, useClass: LoggingEventBus },
     RegistrationCommand,
     SignInCommand,
     WarehouseCommand,

@@ -1,10 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
-import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
+import type { DomainEvent, EventBus } from './event-bus.seam';
 
 /**
- * First real EventBus consumer of the seam (Story 1.2): the command layer
- * emits domain events after a committed write. The delivery-guaranteed bus
- * (outbox + relay) lands with the first cross-module consumer; until then
+ * First real EventBus implementation of the seam (Story 1.2): the command
+ * layer emits domain events after a committed write. The delivery-guaranteed
+ * bus (outbox + relay) lands with the first cross-module consumer; until then
  * events are logged — the seam contract stays identical, so swapping the
  * implementation later cannot touch the command services.
  */
@@ -24,4 +24,5 @@ export class LoggingEventBus implements EventBus {
   }
 }
 
+/** DI token for the event bus seam — provided by SharedModule for every module. */
 export const EVENT_BUS = 'EVENT_BUS' as const;

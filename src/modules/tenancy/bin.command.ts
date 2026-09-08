@@ -10,8 +10,8 @@ import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
 import { assertWarehouseInTenant } from './tenancy.service';
-import { withTenantTransaction, type TenancyTx } from './tenant-scope';
-import { EVENT_BUS } from './event-bus';
+import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
+import { EVENT_BUS } from '../../shared/events/event-bus';
 
 export interface CreateBinCommand {
   readonly tenantId: string;
@@ -447,7 +447,7 @@ export class BinCommand {
  * + app-layer integrity). A foreign/nonexistent zone is 404 `not-found`.
  */
 async function assertZoneInWarehouse(
-  tx: TenancyTx,
+  tx: TenantTx,
   zoneId: string,
   warehouseId: string,
 ): Promise<void> {
@@ -468,7 +468,7 @@ async function assertZoneInWarehouse(
 
 /** Shared insert path for manually-created bins (same duplicate mapping). */
 async function insertBin(
-  tx: TenancyTx,
+  tx: TenantTx,
   command: CreateBinCommand,
 ): Promise<BinSnapshot['bin']> {
   // Zone must exist and belong to the warehouse before any bin write.
