@@ -17,6 +17,7 @@ import {
 } from '@nestjs/swagger';
 import { nowIso } from '../shared/primitives/time';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
+import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 
 export class EchoResponse {
   @ApiProperty({ type: 'object', additionalProperties: true })
@@ -38,8 +39,15 @@ export class EchoController {
   @ApiOkResponse({ type: EchoResponse })
   @ApiResponse({
     status: 400,
-    description: 'Body is not a JSON object',
-    type: ProblemDetailsDto,
+    ...problemJsonResponse('Body is not a JSON object'),
+  })
+  @ApiResponse({
+    status: 404,
+    ...problemJsonResponse('Route not found'),
+  })
+  @ApiResponse({
+    status: 500,
+    ...problemJsonResponse('Internal error'),
   })
   echo(@Body() body: Record<string, unknown>): EchoResponse {
     if (typeof body !== 'object' || body === null || Array.isArray(body)) {

@@ -13,7 +13,7 @@ export function createDatabase(url: string = requiredDbUrl()): Database {
   return drizzle(client, { schema });
 }
 
-function requiredDbUrl(): string {
+export function requiredDbUrl(): string {
   const url = process.env.DATABASE_URL;
   if (!url) {
     throw new Error('DATABASE_URL is required (ISO-8601-UTC Postgres session conventions apply)');

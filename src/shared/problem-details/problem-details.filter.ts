@@ -16,6 +16,7 @@ export class ProblemDetailsFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost): void {
     const http = host.switchToHttp();
     const res = http.getResponse<{
+      headersSent?: boolean;
       status: (n: number) => unknown;
       set: (k: string, v: string) => unknown;
       send: (b: unknown) => unknown;
@@ -58,6 +59,11 @@ export class ProblemDetailsFilter implements ExceptionFilter {
       details = problem('internal-error', HttpStatus.INTERNAL_SERVER_ERROR, 'Internal Server Error');
     }
 
+    if (res.headersSent) {
+      // The response already started streaming — rendering now would throw
+      // ERR_HTTP_HEADERS_SENT from inside the error filter itself.
+      return;
+    }
     res.status(details.status);
     res.set('Content-Type', PROBLEM_JSON);
     res.send(details);

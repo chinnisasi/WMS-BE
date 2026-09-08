@@ -15,6 +15,12 @@ describe('ids primitives', () => {
     );
   });
 
+  test('uuidv7 embeds the exact unix-ms timestamp (RFC 9562 unix_ts_ms)', () => {
+    const t = Date.parse('2026-09-08T00:00:00Z');
+    const id = uuidv7(t);
+    expect(Number(BigInt(`0x${id.replace(/-/g, '').slice(0, 12)}`))).toBe(t);
+  });
+
   test('uuidv7 is unique within the same millisecond', () => {
     const t = Date.parse('2026-09-08T00:00:00Z');
     const ids = new Set(Array.from({ length: 5000 }, () => uuidv7(t)));

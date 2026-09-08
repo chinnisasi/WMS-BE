@@ -27,7 +27,8 @@ bun install
 bun run dev          # api on :3000 (bun --watch)
 bun run start        # api without watch
 bun run lint         # eslint
-bun test             # unit + api e2e suite (jest under the hood; bun's runner also passes)
+bun run test         # unit + api e2e suite (jest)
+bun run typecheck    # tsc over src/ and test/ (no emit)
 bun run build        # tsc → dist/
 bun run db:generate  # drizzle-kit generate (after editing src/shared/db/schema.ts)
 bun run db:migrate   # apply pending migrations (needs DATABASE_URL)

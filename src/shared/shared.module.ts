@@ -7,8 +7,9 @@ export type { ModuleMetadata };
 
 /**
  * Shared primitives (AD-9): ids, time, money, quantity, GST basis points,
- * cursor pagination, problem-details, idempotency/event/outbox seams. Every
- * spine module imports this module; nothing outside shared/ re-implements them.
+ * cursor pagination, problem-details, idempotency/event/outbox seams. Spine
+ * modules import this module as they gain functionality; nothing outside
+ * shared/ re-implements these primitives.
  */
 @Module({
   providers: [{ provide: APP_FILTER, useClass: ProblemDetailsFilter }],

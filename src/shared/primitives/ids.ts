@@ -23,7 +23,7 @@ export function uuidv7(now: number = Date.now()): string {
   const bytes = new Uint8Array(16);
   const view = new DataView(bytes.buffer);
   view.setUint32(0, Math.floor(now / 2 ** 16));
-  view.setUint16(4, now >>> 16);
+  view.setUint16(4, now & 0xffff);
   view.setUint8(6, 0x70 | (seq >> 8)); // version 7 + top 4 seq bits
   view.setUint8(7, seq & 0xff);
   crypto.getRandomValues(bytes.subarray(8, 16));

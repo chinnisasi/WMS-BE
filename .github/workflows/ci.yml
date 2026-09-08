@@ -24,5 +24,42 @@ jobs:
       - name: Test
         run: bun run test
 
+      - name: Typecheck (incl. tests)
+        run: bun run typecheck
+
       - name: Build (typecheck + emit)
         run: bun run build
+
+  migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: wms
+          POSTGRES_PASSWORD: wms
+          POSTGRES_DB: wms
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U wms"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://wms:wms@localhost:55432/wms
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.2.20
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Apply migrations
+        run: bun run db:migrate
+
+      - name: Round-trip check (schema vs migrations drift guard)
+        run: bun run db:verify

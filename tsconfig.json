@@ -5,8 +5,6 @@
     "moduleResolution": "node",
     "ignoreDeprecations": "6.0",
     "lib": ["ES2022"],
-    "outDir": "./dist",
-    "rootDir": "./src",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -20,8 +18,9 @@
     "removeComments": false,
     "sourceMap": true,
     "incremental": true,
+    "noEmit": true,
     "types": ["node", "jest"]
   },
-  "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "test"]
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
 }

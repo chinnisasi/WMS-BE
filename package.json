@@ -2,7 +2,7 @@
   "name": "wms-be",
   "version": "0.1.0",
   "private": true,
-  "description": "WMS backend — NestJS 12 modular monolith (api + jobs shells)",
+  "description": "WMS backend \u2014 NestJS 12 modular monolith (api + jobs shells)",
   "packageManager": "bun@1.2.20",
   "engines": {
     "bun": ">=1.2"
@@ -11,11 +11,13 @@
     "dev": "bun --watch src/main.ts",
     "start": "bun src/main.ts",
     "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "jest",
     "test:watch": "jest --watch",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "bun src/shared/db/migrate.ts",
+    "db:verify": "bun src/shared/db/verify.ts",
     "openapi:export": "bun src/api/export-openapi.ts"
   },
   "dependencies": {
