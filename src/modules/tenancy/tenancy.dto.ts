@@ -1,6 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsEmail, IsIn, IsInt, IsString, Length, Matches, Min } from 'class-validator';
+import { IsBoolean, IsEmail, IsIn, IsInt, IsString, Length, Matches, Max, Min } from 'class-validator';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -147,6 +147,8 @@ export class CreateBinDto {
   @ApiProperty({ example: 120, minimum: 1, description: 'Positive integer, base-UoM units' })
   @IsInt()
   @Min(1)
+  // Postgres `integer` ceiling — a bigger number would 500 on the column, not 400.
+  @Max(2147483647)
   capacity!: number;
 
   @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
@@ -172,16 +174,19 @@ export class GenerateBinsDto {
   @ApiProperty({ example: 10, minimum: 1, maximum: 99 })
   @IsInt()
   @Min(1)
+  @Max(99)
   baysPerAisle!: number;
 
   @ApiProperty({ example: 4, minimum: 1, maximum: 99 })
   @IsInt()
   @Min(1)
+  @Max(99)
   levelsPerBay!: number;
 
   @ApiProperty({ example: 120, minimum: 1, description: 'Capacity per bin, base-UoM units' })
   @IsInt()
   @Min(1)
+  @Max(2147483647)
   capacity!: number;
 
   @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
