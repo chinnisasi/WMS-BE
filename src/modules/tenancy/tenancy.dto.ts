@@ -1,6 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsEmail, IsString, Length } from 'class-validator';
+import { IsBoolean, IsEmail, IsIn, IsInt, IsString, Length, Matches, Min } from 'class-validator';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -117,4 +117,186 @@ export class WarehouseListResponse {
 
   @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
   nextCursor!: string | null;
+}
+
+/** Bin types are a fixed set (spec 1.3) — validated, never free-form. */
+export const BIN_TYPES = ['shelf', 'pallet', 'floor', 'staging'] as const;
+export type BinType = (typeof BIN_TYPES)[number];
+
+export class CreateZoneDto {
+  @ApiProperty({ example: 'A', minLength: 1, maxLength: 32 })
+  @Trimmed()
+  @IsString()
+  @Length(1, 32)
+  code!: string;
+
+  @ApiProperty({ example: 'Fast movers', minLength: 1, maxLength: 120 })
+  @Trimmed()
+  @IsString()
+  @Length(1, 120)
+  name!: string;
+}
+
+export class CreateBinDto {
+  @ApiProperty({ example: 'A-01-01', minLength: 1, maxLength: 32 })
+  @Trimmed()
+  @IsString()
+  @Length(1, 32)
+  code!: string;
+
+  @ApiProperty({ example: 120, minimum: 1, description: 'Positive integer, base-UoM units' })
+  @IsInt()
+  @Min(1)
+  capacity!: number;
+
+  @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
+  @IsIn(BIN_TYPES)
+  type!: BinType;
+}
+
+export class GenerateBinsDto {
+  @ApiProperty({ example: 'A', description: 'First aisle letter (A–Z, ascending range)' })
+  @Trimmed()
+  @IsString()
+  @Length(1, 1)
+  @Matches(/^[A-Za-z]$/, { message: 'aisleFrom must be a single letter A–Z' })
+  aisleFrom!: string;
+
+  @ApiProperty({ example: 'C', description: 'Last aisle letter (A–Z, inclusive)' })
+  @Trimmed()
+  @IsString()
+  @Length(1, 1)
+  @Matches(/^[A-Za-z]$/, { message: 'aisleTo must be a single letter A–Z' })
+  aisleTo!: string;
+
+  @ApiProperty({ example: 10, minimum: 1, maximum: 99 })
+  @IsInt()
+  @Min(1)
+  baysPerAisle!: number;
+
+  @ApiProperty({ example: 4, minimum: 1, maximum: 99 })
+  @IsInt()
+  @Min(1)
+  levelsPerBay!: number;
+
+  @ApiProperty({ example: 120, minimum: 1, description: 'Capacity per bin, base-UoM units' })
+  @IsInt()
+  @Min(1)
+  capacity!: number;
+
+  @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
+  @IsIn(BIN_TYPES)
+  type!: BinType;
+}
+
+export class PatchBinDto {
+  @ApiProperty({ example: false, description: 'true blocks the bin (broken); false unblocks' })
+  @IsBoolean()
+  blocked!: boolean;
+}
+
+export class ZoneResponse {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ example: 'A' })
+  code!: string;
+
+  @ApiProperty({ example: 'Fast movers' })
+  name!: string;
+
+  @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
+  createdAt!: string;
+}
+
+export class ZoneListResponse {
+  @ApiProperty({ type: [ZoneResponse] })
+  items!: ZoneResponse[];
+
+  @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
+  nextCursor!: string | null;
+}
+
+export class BinResponse {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  zoneId!: string;
+
+  @ApiProperty({ example: 'A-01-01' })
+  code!: string;
+
+  @ApiProperty({ example: 120, description: 'Base-UoM units' })
+  capacity!: number;
+
+  // `string` here (not the BinType union): the response echoes DB rows whose
+  // column is text; the enum is still pinned in the OpenAPI schema below.
+  @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
+  type!: string;
+
+  @ApiProperty({ example: false })
+  blocked!: boolean;
+
+  @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
+  createdAt!: string;
+}
+
+export class BinListResponse {
+  @ApiProperty({ type: [BinResponse] })
+  items!: BinResponse[];
+
+  @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
+  nextCursor!: string | null;
+}
+
+export class BinGridResponse {
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  zoneId!: string;
+
+  @ApiProperty({ example: 12, description: 'Bins created by this run (≤ 500)' })
+  generatedCount!: number;
+
+  @ApiProperty({ example: 'A-01-01' })
+  firstCode!: string;
+
+  @ApiProperty({ example: 'C-10-04' })
+  lastCode!: string;
+}
+
+export class SetupChecklistStepResponse {
+  @ApiProperty({ enum: ['warehouse', 'bins', 'catalog', 'users'], example: 'bins' })
+  key!: string;
+
+  @ApiProperty({ example: 'Define zones and bins' })
+  label!: string;
+
+  @ApiProperty({ example: true })
+  done!: boolean;
+
+  @ApiProperty({ example: 'Done · 312 bins defined' })
+  detail!: string;
+
+  @ApiProperty({ example: '/settings', description: 'Deep link for the Continue affordance' })
+  href!: string;
+}
+
+export class SetupChecklistResponse {
+  @ApiProperty({ type: [SetupChecklistStepResponse] })
+  steps!: SetupChecklistStepResponse[];
 }

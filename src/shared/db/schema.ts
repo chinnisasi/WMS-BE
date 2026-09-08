@@ -1,4 +1,4 @@
-import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { boolean, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
 /**
@@ -85,6 +85,72 @@ export const warehouses = pgTable(
 );
 
 export type Warehouse = typeof warehouses.$inferSelect;
+
+/**
+ * Warehouse floor areas (Story 1.3). The first tables beyond `warehouses` to
+ * carry `warehouse_id` alongside `tenant_id`: warehouse ownership is enforced
+ * in the app layer (`assertWarehouseInTenant` inside the command transaction);
+ * RLS stays single-dimension (`tenant_isolation`) — composite (tenant +
+ * warehouse) policies are rejected (see spec 1.3 Design Notes). No FK
+ * constraints (repo convention): `zones.warehouse_id` → `warehouses.id` is
+ * uuid column + index, validated in the command transaction.
+ *
+ * Zone codes are unique per warehouse — duplicate rejection names the code
+ * (409 `duplicate-zone-code`). No editing beyond creation (rename/re-move are
+ * later stories).
+ */
+export const zones = pgTable(
+  'zones',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    code: text('code').notNull(),
+    name: text('name').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('zones_warehouse_id_code_unique').on(table.warehouseId, table.code),
+    index('zones_created_at_id_idx').on(table.createdAt, table.id),
+  ],
+);
+
+export type Zone = typeof zones.$inferSelect;
+
+/**
+ * Putaway/pick locations (Story 1.3) — the first warehouse-scoped operational
+ * rows: `warehouse_id` alongside `tenant_id`. Bin codes are unique per
+ * warehouse (`bins_warehouse_id_code_unique`); duplicates are rejected naming
+ * the conflicting code (409 `duplicate-bin-code`). `capacity` is a positive
+ * integer in base-UoM units; `type` is the fixed set shelf/pallet/floor/
+ * staging. `blocked` marks broken bins (default false). A created bin is
+ * immediately usable downstream — no dormant state. `zone_id` → `zones.id` by
+ * uuid column (no FK), validated in the command transaction.
+ */
+export const bins = pgTable(
+  'bins',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    zoneId: uuid('zone_id').notNull(),
+    code: text('code').notNull(),
+    capacity: integer('capacity').notNull(),
+    type: text('type').notNull(),
+    blocked: boolean('blocked').notNull().default(false),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('bins_warehouse_id_code_unique').on(table.warehouseId, table.code),
+    index('bins_created_at_id_idx').on(table.createdAt, table.id),
+  ],
+);
+
+export type Bin = typeof bins.$inferSelect;
 
 /**
  * Real idempotency storage (AD-5): unique `(tenant_id, key)` with the payload
