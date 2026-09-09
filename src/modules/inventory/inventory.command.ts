@@ -8,8 +8,8 @@ import type { SignedQuantity } from '../../shared/primitives/quantity';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
 import { isUniqueViolationOn, ProblemException } from '../../shared/problem-details/problem.exception';
-import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
-import { EVENT_BUS } from '../../shared/events/event-bus';
+import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
+import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
@@ -77,7 +77,7 @@ const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 export class StockAdjustmentCommand {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
-    @Inject(EVENT_BUS) private readonly eventBus: EventBus,
+    @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
     // No cycle: the command consumes the ledger one-way.
     @Inject(LedgerService) private readonly ledger: LedgerService,
   ) {}
@@ -161,6 +161,28 @@ export class StockAdjustmentCommand {
 
         const snapshot = await this.adjustToSnapshot(tx, command, delta, occurredAt);
 
+        // In-transaction outbox append (AD-7, story outbox-relay) — replaces
+        // the post-commit publish, and keeps the old `!replayed` gate
+        // structurally: the idempotent replay returned above (and a
+        // concurrent duplicate's transaction rolls back whole), so a replayed
+        // adjustment appends nothing.
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: 'stock.adjusted',
+          // Business time — the same instant the event committed with,
+          // not the relay's publish clock.
+          occurredAt,
+          payload: {
+            warehouseId: command.warehouseId,
+            skuId: command.skuId,
+            binId: command.binId,
+            quantityDelta: command.quantityDelta,
+            seq: snapshot.event.seq,
+            eventId: snapshot.event.id,
+          },
+        });
+
         try {
           await tx.insert(idempotencyKeys).values({
             id: uuidv7(),
@@ -184,33 +206,6 @@ export class StockAdjustmentCommand {
       },
     );
 
-    if (!replayed) {
-      // Post-commit publish (the epic-1 pattern): a throwing bus must not
-      // 500 already-committed work — the client's retry would replay.
-      try {
-        await this.eventBus.publish({
-          eventId: uuidv7(),
-          type: 'stock.adjusted',
-          tenantId: command.tenantId,
-          // Business time — the same instant the event committed with,
-          // not the publish clock.
-          occurredAt,
-          payload: {
-            warehouseId: command.warehouseId,
-            skuId: command.skuId,
-            binId: command.binId,
-            quantityDelta: command.quantityDelta,
-            seq: snapshot.event.seq,
-            eventId: snapshot.event.id,
-          },
-        } satisfies DomainEvent);
-      } catch (error) {
-        console.warn(
-          `Event publish failed after commit — type=stock.adjusted tenant=${command.tenantId}:`,
-          error,
-        );
-      }
-    }
     return { snapshot, replayed };
   }
 

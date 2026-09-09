@@ -6,13 +6,13 @@ import { idempotencyKeys, warehouses } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
-import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
 import { assertPermission } from './permissions';
 import { getMemberRoleIn } from './tenancy.service';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
-import { EVENT_BUS } from '../../shared/events/event-bus';
+import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
+import type { OutboxSink } from '../../shared/events/outbox.seam';
 
 export interface CreateWarehouseCommand {
   readonly tenantId: string;
@@ -46,7 +46,7 @@ const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 export class WarehouseCommand {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
-    @Inject(EVENT_BUS) private readonly eventBus: EventBus,
+    @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
   ) {}
 
   async create(
@@ -59,7 +59,7 @@ export class WarehouseCommand {
       name: command.name,
     });
 
-    const { snapshot, replayed } = await withTenantTransaction(
+    const { snapshot } = await withTenantTransaction(
       this.db,
       command.tenantId,
       async (tx) => {
@@ -116,6 +116,23 @@ export class WarehouseCommand {
           throw err;
         }
 
+        // In-transaction outbox append (AD-7, story outbox-relay) — replaces
+        // the old post-commit publish. The `!replayed` gate of the old
+        // post-commit publish is structural here: the idempotent replay
+        // returned above (and a concurrent duplicate's transaction rolls
+        // back whole), so a replayed create appends nothing.
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: 'warehouse.created',
+          occurredAt: nowIso(),
+          payload: {
+            warehouseId: warehouse.id,
+            code: warehouse.code,
+            name: warehouse.name,
+          },
+        });
+
         try {
           await tx.insert(idempotencyKeys).values({
             id: uuidv7(),
@@ -143,28 +160,6 @@ export class WarehouseCommand {
       },
     );
 
-    if (!replayed) {
-      // Publish after the commit; a throwing bus must not 500 already-committed
-      // work (the client's retry would replay instead of re-emit).
-      try {
-        await this.eventBus.publish({
-          eventId: uuidv7(),
-          type: 'warehouse.created',
-          tenantId: command.tenantId,
-          occurredAt: nowIso(),
-          payload: {
-            warehouseId: snapshot.warehouse.id,
-            code: snapshot.warehouse.code,
-            name: snapshot.warehouse.name,
-          },
-        } satisfies DomainEvent);
-      } catch (error) {
-        console.warn(
-          `Event publish failed after commit — type=warehouse.created tenant=${command.tenantId}:`,
-          error,
-        );
-      }
-    }
     return snapshot;
   }
 }

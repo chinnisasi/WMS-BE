@@ -11,8 +11,8 @@ import type { SignedQuantity } from '../../shared/primitives/quantity';
 import { nowIso } from '../../shared/primitives/time';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
-import { EVENT_BUS } from '../../shared/events/event-bus';
+import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
+import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { LEDGER_GRAMMAR_VERSION, getLedgerEventType } from './ledger-registry';
 import type { LedgerReferenceDoc } from './ledger-registry';
 import { LEDGER_ANCHOR_STORE } from './anchor-store';
@@ -230,7 +230,7 @@ export class LedgerService {
 
   constructor(
     @Inject(DATABASE) private readonly db: Database,
-    @Inject(EVENT_BUS) private readonly eventBus: EventBus,
+    @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
     @Inject(LEDGER_ANCHOR_STORE) private readonly anchorStore: LedgerAnchorStore,
   ) {}
 
@@ -452,11 +452,15 @@ export class LedgerService {
         `SEVERITY-1 ledger chain break: tenant=${report.tenantId} ` +
           `warehouse=${report.warehouseId} seq=${report.fromSeq}..${report.toSeq} — ${report.reason}`,
       );
-      try {
-        await this.eventBus.publish({
-          eventId: uuidv7(),
-          type: 'ledger.chain_broken',
+      // The severity-1 alert rides the transactional outbox like every other
+      // event: it has no domain write of its own to piggyback on, so it gets
+      // its own small tenant transaction (story outbox-relay). A failure here
+      // propagates — a lost chain-break alert must fail loudly, not silently.
+      await withTenantTransaction(this.db, tenantId, (tx) =>
+        this.outbox.append(tx, {
+          messageId: uuidv7(),
           tenantId,
+          type: 'ledger.chain_broken',
           occurredAt: nowIso(),
           payload: {
             warehouseId: report.warehouseId,
@@ -464,13 +468,8 @@ export class LedgerService {
             toSeq: report.toSeq,
             reason: report.reason,
           },
-        } satisfies DomainEvent);
-      } catch (error) {
-        this.logger.error(
-          `Failed to publish the ledger.chain_broken alert tenant=${tenantId}:`,
-          error,
-        );
-      }
+        }),
+      );
     }
     return report;
   }

@@ -7,11 +7,11 @@ import { idempotencyKeys, tenants, users } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
-import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
+import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
+import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { hashPassword } from './passwords';
 import { hashCommandPayload } from './idempotency-guard';
 import { setTenantScope } from '../../shared/db/tenant-scope';
-import { EVENT_BUS } from '../../shared/events/event-bus';
 
 /** Registration command input (AD-10: state changes enter command services). */
 export interface RegisterTenantCommand {
@@ -55,7 +55,7 @@ export class RegistrationCommand {
   constructor(
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
     @Inject(DATABASE) private readonly db: Database,
-    @Inject(EVENT_BUS) private readonly eventBus: EventBus,
+    @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
   ) {}
 
   async register(
@@ -119,6 +119,17 @@ export class RegistrationCommand {
         tenant: { id: tenant.id, name: tenant.name },
         owner,
       };
+      // In-transaction outbox append (AD-7, story outbox-relay) — replaces
+      // the old post-commit publish. The auth-time replay lookup returned
+      // before this transaction, so a replayed registration appends nothing;
+      // a concurrent duplicate's transaction rolls back whole.
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId,
+        type: 'tenant.registered',
+        occurredAt: nowIso(),
+        payload: { name: tenant.name, ownerEmail: owner.email },
+      });
       await tx.insert(idempotencyKeys).values({
         id: uuidv7(),
         tenantId,
@@ -129,24 +140,7 @@ export class RegistrationCommand {
       return body;
     });
 
-    // Publish after the commit; a throwing bus must not 500 already-committed
-    // work (the client's retry would replay instead of re-emit).
-    try {
-      await this.eventBus.publish({
-        eventId: uuidv7(),
-        type: 'tenant.registered',
-        tenantId: snapshot.tenant.id,
-        occurredAt: nowIso(),
-        payload: { name: snapshot.tenant.name, ownerEmail: snapshot.owner.email },
-      } satisfies DomainEvent);
-    } catch (error) {
-      this.logPublishFailure('tenant.registered', snapshot.tenant.id, error);
-    }
     return snapshot;
-  }
-
-  private logPublishFailure(type: string, tenantId: string, error: unknown): void {
-    console.warn(`Event publish failed after commit — type=${type} tenant=${tenantId}:`, error);
   }
 }
 

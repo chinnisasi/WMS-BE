@@ -3,18 +3,17 @@ import { Module } from '@nestjs/common';
 import { APP_FILTER } from '@nestjs/core';
 import { createLazyAuthDatabase, createLazyDatabase } from './db/db';
 import { EVENT_BUS, LoggingEventBus } from './events/event-bus';
+import { OUTBOX_RELAY, OUTBOX_SINK } from './events/outbox.seam';
+import { PostgresOutboxRelay, PostgresOutboxSink } from './events/outbox';
 import { ProblemDetailsFilter } from './problem-details/problem-details.filter';
+import { AUTH_DATABASE, DATABASE } from './db/tokens';
 
 export type { ModuleMetadata };
 
-/** DI token for the shared Drizzle `Database` client (see `shared/db/db.ts`). */
-export const DATABASE = 'DATABASE' as const;
-
-/**
- * DI token for the auth-time Drizzle client: the only connection allowed to
- * read before a tenant scope exists (BYPASSRLS role — see `shared/db/db.ts`).
- */
-export const AUTH_DATABASE = 'AUTH_DATABASE' as const;
+// The client tokens keep their long-standing public surface: every module
+// imports them from this module (they are declared in `db/tokens.ts`, a leaf,
+// so infrastructure provided here can inject them without an import cycle).
+export { DATABASE, AUTH_DATABASE } from './db/tokens';
 
 /**
  * Shared primitives (AD-9): ids, time, money, quantity, GST basis points,
@@ -36,7 +35,12 @@ export const AUTH_DATABASE = 'AUTH_DATABASE' as const;
     // The event bus seam is shared infrastructure: every emitting module
     // (tenancy since 1.2, catalog since 1.4) injects the same token.
     { provide: EVENT_BUS, useClass: LoggingEventBus },
+    // The transactional outbox (AD-7, story outbox-relay): commands append
+    // in-transaction through OUTBOX_SINK; the jobs-shell relay worker drives
+    // OUTBOX_RELAY, which publishes through EVENT_BUS above.
+    { provide: OUTBOX_SINK, useClass: PostgresOutboxSink },
+    { provide: OUTBOX_RELAY, useClass: PostgresOutboxRelay },
   ],
-  exports: [DATABASE, AUTH_DATABASE, EVENT_BUS],
+  exports: [DATABASE, AUTH_DATABASE, EVENT_BUS, OUTBOX_SINK, OUTBOX_RELAY],
 })
 export class SharedModule {}

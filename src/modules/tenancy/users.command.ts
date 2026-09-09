@@ -8,7 +8,6 @@ import type { UserRole, UserStatus } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
-import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import type { Page } from '../../shared/primitives/pagination';
 import { hashCommandPayload } from './idempotency-guard';
@@ -17,7 +16,8 @@ import { assertPermission } from './permissions';
 import { getMemberRoleIn } from './tenancy.service';
 import { DUMMY_HASH, hashPassword } from './passwords';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
-import { EVENT_BUS } from '../../shared/events/event-bus';
+import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
+import type { OutboxSink } from '../../shared/events/outbox.seam';
 
 export const DEFAULT_USER_PAGE_SIZE = 50;
 export const MAX_USER_PAGE_SIZE = 200;
@@ -127,7 +127,7 @@ export class UsersCommand {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
-    @Inject(EVENT_BUS) private readonly eventBus: EventBus,
+    @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
   ) {}
 
   async invite(command: InviteUserInput, idempotencyKey: string): Promise<InviteUserSnapshot> {
@@ -216,6 +216,21 @@ export class UsersCommand {
         inviteToken: rawToken,
         inviteExpiresAt,
       };
+      // In-transaction outbox append (AD-7, story outbox-relay) — replaces
+      // the old post-commit publish, and closes retro item 3: an idempotent
+      // replay returns above (and a concurrent duplicate's transaction rolls
+      // back whole), so a replayed invite writes NO second outbox row.
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId: command.tenantId,
+        type: 'user.invited',
+        occurredAt: nowIso(),
+        payload: {
+          userId: user.id,
+          email: user.email,
+          role: command.role,
+        },
+      });
       try {
         await tx.insert(idempotencyKeys).values({
           id: uuidv7(),
@@ -233,11 +248,6 @@ export class UsersCommand {
       return body;
     });
 
-    await this.publishSafely('user.invited', command.tenantId, {
-      userId: snapshot.user.id,
-      email: snapshot.user.email,
-      role: snapshot.user.role,
-    });
     return snapshot;
   }
 
@@ -345,6 +355,20 @@ export class UsersCommand {
         reference: idempotencyKey,
       });
 
+      // In-transaction outbox append (AD-7) — suppression parity: the
+      // idempotent replay returned above, so a replayed role change writes
+      // no second outbox row.
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId: command.tenantId,
+        type: 'user.role_changed',
+        occurredAt: nowIso(),
+        payload: {
+          userId: updated.id,
+          role: updated.role,
+        },
+      });
+
       try {
         await tx.insert(idempotencyKeys).values({
           id: uuidv7(),
@@ -362,10 +386,6 @@ export class UsersCommand {
       return updated;
     });
 
-    await this.publishSafely('user.role_changed', command.tenantId, {
-      userId: snapshot.id,
-      role: snapshot.role,
-    });
     return snapshot;
   }
 
@@ -466,6 +486,20 @@ export class UsersCommand {
           createdAt: updated.createdAt,
         },
       };
+      // In-transaction outbox append (AD-7) — suppression parity: the
+      // auth-time replay lookup returned before this transaction, and a
+      // concurrent duplicate accept rolls back whole, so a replayed accept
+      // writes no second outbox row.
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId: invite.tenantId,
+        type: 'user.accepted',
+        occurredAt: nowIso(),
+        payload: {
+          userId: updated.id,
+          email: updated.email,
+        },
+      });
       try {
         await tx.insert(idempotencyKeys).values({
           id: uuidv7(),
@@ -483,10 +517,6 @@ export class UsersCommand {
       return body;
     });
 
-    await this.publishSafely('user.accepted', invite.tenantId, {
-      userId: snapshot.user.id,
-      email: snapshot.user.email,
-    });
     return snapshot;
   }
 
@@ -540,25 +570,6 @@ export class UsersCommand {
       );
     }
     return toUserView(user);
-  }
-
-  /** Publish after the commit; a throwing bus must not 500 committed work. */
-  private async publishSafely(
-    type: 'user.invited' | 'user.role_changed' | 'user.accepted',
-    tenantId: string,
-    payload: Record<string, unknown>,
-  ): Promise<void> {
-    try {
-      await this.eventBus.publish({
-        eventId: uuidv7(),
-        type,
-        tenantId,
-        occurredAt: nowIso(),
-        payload,
-      } satisfies DomainEvent);
-    } catch (error) {
-      console.warn(`Event publish failed after commit — type=${type} tenant=${tenantId}:`, error);
-    }
   }
 }
 

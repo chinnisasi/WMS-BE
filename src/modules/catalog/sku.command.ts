@@ -6,7 +6,6 @@ import { idempotencyKeys, skus, uomConversions } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
-import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { buildPage, decodeCursor, type Page } from '../../shared/primitives/pagination';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -16,7 +15,8 @@ import { assertPermission } from '../tenancy/permissions';
  
 import { TenancyService } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
-import { EVENT_BUS } from '../../shared/events/event-bus';
+import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
+import type { OutboxSink } from '../../shared/events/outbox.seam';
 
 export const DEFAULT_SKU_PAGE_SIZE = 50;
 export const MAX_SKU_PAGE_SIZE = 200;
@@ -74,7 +74,7 @@ export class SkuCommand {
     // ↔ role lookup). The role is resolved per request through the
     // TenancyService facade — catalog never reads tenancy tables.
     @Inject(forwardRef(() => TenancyService)) private readonly tenancy: TenancyService,
-    @Inject(EVENT_BUS) private readonly eventBus: EventBus,
+    @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
   ) {}
 
   async list(
@@ -157,7 +157,7 @@ export class SkuCommand {
       ...fields,
     });
 
-    const { snapshot, replayed } = await withTenantTransaction(
+    const { snapshot } = await withTenantTransaction(
       this.db,
       command.tenantId,
       async (tx) => {
@@ -229,6 +229,18 @@ export class SkuCommand {
             .returning();
           const updated = updatedRows[0]!;
           const snapshot = await withConversions(tx, command.tenantId, updated);
+          // In-transaction outbox append (AD-7, story outbox-relay) — replaces
+          // the old post-commit publish. The `!replayed` gate of the old
+          // post-commit publish is structural here: the idempotent replay
+          // returned above (and a concurrent duplicate's transaction rolls
+          // back whole), so a replayed edit appends nothing.
+          await this.outbox.append(tx, {
+            messageId: uuidv7(),
+            tenantId: command.tenantId,
+            type: 'catalog.sku_edited',
+            occurredAt: nowIso(),
+            payload: { skuId: command.skuId, code: updated.code },
+          });
           try {
             await tx.insert(idempotencyKeys).values({
               id: uuidv7(),
@@ -263,22 +275,6 @@ export class SkuCommand {
       },
     );
 
-    if (!replayed) {
-      try {
-        await this.eventBus.publish({
-          eventId: uuidv7(),
-          type: 'catalog.sku_edited',
-          tenantId: command.tenantId,
-          occurredAt: nowIso(),
-          payload: { skuId: command.skuId, code: snapshot.code },
-        } satisfies DomainEvent);
-      } catch (error) {
-        console.warn(
-          `Event publish failed after commit — type=catalog.sku_edited tenant=${command.tenantId}:`,
-          error,
-        );
-      }
-    }
     return snapshot;
   }
 }
