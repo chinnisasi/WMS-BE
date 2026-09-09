@@ -14,10 +14,13 @@ import type {
   ChainBreakReport,
   ChainVerifyReport,
   DigestExport,
+  RebuildReport,
   ReplayReport,
 } from './ledger.service';
 import { StockAdjustmentCommand } from './inventory.command';
 import type { AdjustStockCommand, StockAdjustmentSnapshot } from './inventory.command';
+import { ReconciliationService } from './reconcile';
+import type { ReconcileReport } from './reconcile';
 
 /** One event-timeline row (the read model of the ledger). */
 export interface LedgerTimelineEntry {
@@ -91,6 +94,9 @@ export class InventoryFacade {
     // No cycle: the command/facade layer consumes the ledger one-way.
     @Inject(LedgerService) private readonly ledger: LedgerService,
     @Inject(StockAdjustmentCommand) private readonly stockAdjustment: StockAdjustmentCommand,
+    // Continuous reconciliation (Story 2.2) — background work; the jobs shell
+    // drives it through this facade. No HTTP route.
+    @Inject(ReconciliationService) private readonly reconciliation: ReconciliationService,
   ) {}
 
   /** `stock.adjustment` — the first movement producer (Story 2.1). */
@@ -185,8 +191,16 @@ export class InventoryFacade {
     return this.ledger.verifyChain(tenantId, warehouseId, fromSeq, toSeq);
   }
 
-  /** Anchors the chain head (or the tail since the last anchor). */
-  async anchorChain(tenantId: string, warehouseId: string, uptoSeq?: number): Promise<ChainAnchor> {
+  /**
+   * Anchors the chain head (or the tail since the last anchor) — after
+   * verify-before-anchor: a tampered range returns the `ChainBreakReport`
+   * and commits no anchor row.
+   */
+  async anchorChain(
+    tenantId: string,
+    warehouseId: string,
+    uptoSeq?: number,
+  ): Promise<ChainAnchor | ChainBreakReport> {
     return this.ledger.anchorChain(tenantId, warehouseId, uptoSeq);
   }
 
@@ -198,5 +212,37 @@ export class InventoryFacade {
     toSeq: number,
   ): Promise<DigestExport> {
     return this.ledger.exportDigest(tenantId, warehouseId, fromSeq, toSeq);
+  }
+
+  /**
+   * Continuous replay-reconciliation (Story 2.2): one (tenant, warehouse)
+   * cycle — validate the checkpoint, replay-fold to the watermark, handle
+   * divergence (rebuild + alert; repeat → quarantine + re-alert), advance
+   * the checkpoint only on a clean pass. Background work: no HTTP route.
+   */
+  async reconcile(tenantId: string, warehouseId: string): Promise<ReconcileReport> {
+    return this.reconciliation.reconcile(tenantId, warehouseId);
+  }
+
+  /**
+   * The jobs-shell worker's entry: one partition per tick,
+   * oldest-checkpoint-first — or null when every partition is reconciled
+   * through its head.
+   */
+  async reconcileNext(): Promise<ReconcileReport | null> {
+    return this.reconciliation.reconcileNext();
+  }
+
+  /**
+   * Derived-state repair (Story 2.2, for tests/operator use): rewrites
+   * `stock_on_hand` to the replayed quantities for the requested scope (or
+   * every divergent scope when omitted) — alert + rebuild in one commit.
+   */
+  async rebuildProjections(
+    tenantId: string,
+    warehouseId: string,
+    scope?: { skuId?: string; binId?: string },
+  ): Promise<RebuildReport> {
+    return this.ledger.rebuildProjections(tenantId, warehouseId, scope);
   }
 }

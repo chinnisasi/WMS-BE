@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm';
 import { boolean, index, integer, jsonb, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
@@ -593,3 +594,94 @@ export const outboxMessages = pgTable(
 );
 
 export type OutboxMessageRow = typeof outboxMessages.$inferSelect;
+
+/**
+ * Continuous reconciliation state (Story 2.2): one row per (tenant, warehouse)
+ * partition — `last_seq` is the watermark through which the projection has
+ * been verified, `invalid_attempts` the consecutive checkpoint-validation
+ * failures (a checkpoint that fails twice is discarded, and the DISCARDING
+ * cycle itself replays from seq 1 immediately), and `last_divergences` the
+ * scopes flagged by the most
+ * recent non-advanced pass (the "repeat within the window" memory: a scope
+ * flagged again before the checkpoint advances is a REPEAT divergence —
+ * quarantined and re-alerted, not silently rebuilt a second time). Cleared on
+ * a clean advance and on discard.
+ *
+ * RLS policy lives **only in the migration SQL** (0008, the 0006/0007
+ * pattern): fail-closed single-dimension `tenant_isolation`. The worker's one
+ * cross-tenant read (partition discovery, oldest-checkpoint-first) runs on the
+ * BYPASSRLS connection like the relay's tenant discovery; every row write
+ * stays in a tenant-scoped transaction.
+ */
+export const reconciliationCheckpoints = pgTable(
+  'reconciliation_checkpoints',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    lastSeq: integer('last_seq').notNull().default(0),
+    invalidAttempts: integer('invalid_attempts').notNull().default(0),
+    lastDivergences: jsonb('last_divergences').$type<Record<string, unknown>[] | null>(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One checkpoint per (tenant, warehouse) partition.
+    uniqueIndex('reconciliation_checkpoints_tenant_warehouse_unique').on(
+      table.tenantId,
+      table.warehouseId,
+    ),
+    // Partition discovery orders by the oldest checkpoint first (fairness:
+    // no partition starves).
+    index('reconciliation_checkpoints_tenant_updated_at_idx').on(
+      table.tenantId,
+      table.updatedAt,
+    ),
+  ],
+);
+
+export type ReconciliationCheckpoint = typeof reconciliationCheckpoints.$inferSelect;
+
+/**
+ * Durable quarantine of a stock scope (Story 2.2): a (tenant, warehouse,
+ * sku, bin) whose projection diverged REPEATEDLY within one checkpoint window
+ * — first divergence is rebuilt+alerted, a repeat is quarantined and
+ * re-alerted before it is rebuilt again. `from_seq`/`to_seq` name the
+ * divergent event range, `reason` the machine cause. The flag gates nothing
+ * in this story (2.3's reservation path enforces it); surfaced here only as
+ * data. One OPEN row per scope (partial unique index) — history accumulates
+ * as rows move to `resolved`.
+ *
+ * RLS policy + status CHECK live **only in the migration SQL** (0008).
+ */
+export const inventoryQuarantines = pgTable(
+  'inventory_quarantines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    binId: uuid('bin_id').notNull(),
+    fromSeq: integer('from_seq').notNull(),
+    toSeq: integer('to_seq').notNull(),
+    reason: text('reason').notNull(),
+    status: text('status').notNull().default('open'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The scan's repeat check: one open quarantine per scope.
+    uniqueIndex('inventory_quarantines_open_scope_unique')
+      .on(table.tenantId, table.warehouseId, table.skuId, table.binId)
+      .where(sql`status = 'open'`),
+    index('inventory_quarantines_tenant_warehouse_status_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.status,
+    ),
+  ],
+);
+
+export type InventoryQuarantine = typeof inventoryQuarantines.$inferSelect;

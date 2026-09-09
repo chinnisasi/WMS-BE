@@ -12,6 +12,10 @@ import { ProblemException } from '../src/shared/problem-details/problem.exceptio
 // default; CI provides the service container) and signs sessions.
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
+// A host that exports either poll interval would boot the background workers
+// and race these tests — the same convention as the reconciliation suite.
+delete process.env.OUTBOX_RELAY_POLL_MS;
+delete process.env.OUTBOX_RECONCILE_POLL_MS;
 
 const API = '/api/v1/tenants';
 /** The invitee's own password (set at accept-invite, spec 1.5). */
@@ -467,8 +471,8 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       // exactly the threat the verifier exists to catch.
       await sql.unsafe('set session_replication_role = replica');
       await sql.unsafe(
-        'update ledger_events set quantity_delta = quantity_delta + 1 where tenant_id = $1 and seq = 1',
-        [tenantId],
+        'update ledger_events set quantity_delta = quantity_delta + 1 where tenant_id = $1 and warehouse_id = $2 and seq = 1',
+        [tenantId, warehouseId],
       );
       await sql.unsafe('set session_replication_role = DEFAULT');
     } finally {
@@ -490,11 +494,32 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
     expect(alertText).toContain(`warehouse=${warehouseId}`);
     expect(alertText).toContain('seq=1..');
     errorSpy.mockRestore();
+    // Story 2.2's verify-before-anchor: the later anchor test runs over this
+    // same range, so the probe must restore what it tampered (the stored
+    // event_hash matches the ORIGINAL delta — restoring the value heals the
+    // recomputed hash without touching the append-only row's hash). A fresh
+    // client: the probe's own was ended above.
+    const restore = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await restore.unsafe('set session_replication_role = replica');
+      await restore.unsafe(
+        'update ledger_events set quantity_delta = quantity_delta - 1 where tenant_id = $1 and warehouse_id = $2 and seq = 1',
+        [tenantId, warehouseId],
+      );
+      await restore.unsafe('set session_replication_role = DEFAULT');
+    } finally {
+      await restore.end();
+    }
   });
 
   it('anchors and digest exports: deterministic, verifiable, append-only, and single-anchored', async () => {
     const last = await eventCount();
     const anchor = await facade.anchorChain(tenantId, warehouseId);
+    // Verify-before-anchor (story 2.2): a healthy chain anchors (the union
+    // return type exists for the tampered-range refusal arm).
+    if (!('digest' in anchor)) {
+      throw new Error(`anchorChain refused a healthy range: ${JSON.stringify(anchor)}`);
+    }
     expect(anchor.fromSeq).toBe(1);
     expect(anchor.toSeq).toBe(last);
     expect(anchor.digest).toMatch(/^[0-9a-f]{64}$/);
