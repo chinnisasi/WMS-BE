@@ -124,7 +124,13 @@ export class PostgresOutboxRelay implements OutboxRelay {
       try {
         return await this.drainLocked(limit);
       } finally {
-        await session`select pg_advisory_unlock(hashtextextended(${RELAY_LOCK_SQL_KEY}, 0))`;
+        try {
+          await session`select pg_advisory_unlock(hashtextextended(${RELAY_LOCK_SQL_KEY}, 0))`;
+        } catch (error) {
+          // Never mask the cycle's original failure — a failed unlock just
+          // leaves the lock to expire with the session.
+          this.logger.error('Outbox relay advisory unlock failed', error as Error);
+        }
       }
     } finally {
       session.release();
@@ -148,30 +154,45 @@ export class PostgresOutboxRelay implements OutboxRelay {
       if (published.length >= limit) {
         break;
       }
-      // Per-tenant batch under the tenant scope (AD-3): due rows only,
-      // oldest-first within the tenant.
-      const rows = await withTenantTransaction(this.db, tenantId, (tx) =>
-        tx
-          .select()
-          .from(outboxMessages)
-          .where(
-            and(
-              eq(outboxMessages.tenantId, tenantId),
-              eq(outboxMessages.status, 'pending'),
-              sql`${outboxMessages.nextAttemptAt} <= now()`,
-            ),
-          )
-          .orderBy(asc(outboxMessages.createdAt), asc(outboxMessages.id))
-          .limit(limit - published.length),
-      );
-      for (const row of rows) {
-        if (published.length >= limit) {
-          break;
+      try {
+        // Per-tenant batch under the tenant scope (AD-3): due rows only,
+        // oldest-first within the tenant.
+        const rows = await withTenantTransaction(this.db, tenantId, (tx) =>
+          tx
+            .select()
+            .from(outboxMessages)
+            .where(
+              and(
+                eq(outboxMessages.tenantId, tenantId),
+                eq(outboxMessages.status, 'pending'),
+                sql`${outboxMessages.nextAttemptAt} <= now()`,
+              ),
+            )
+            .orderBy(asc(outboxMessages.createdAt), asc(outboxMessages.id))
+            .limit(limit - published.length),
+        );
+        for (const row of rows) {
+          if (published.length >= limit) {
+            break;
+          }
+          try {
+            const message = await this.deliver(row);
+            if (message) {
+              published.push(message);
+            }
+          } catch (error) {
+            // One bad row skips instead of aborting its tenant's batch (the
+            // row stays pending and is retried next cycle).
+            this.logger.error(
+              `Outbox row drain failed tenant=${tenantId} message=${row.id}`,
+              error as Error,
+            );
+          }
         }
-        const message = await this.deliver(row);
-        if (message) {
-          published.push(message);
-        }
+      } catch (error) {
+        // One bad tenant skips instead of aborting the cycle — later tenants
+        // still get their drain this cycle.
+        this.logger.error(`Outbox tenant drain failed tenant=${tenantId}`, error as Error);
       }
     }
     return published;
@@ -180,7 +201,9 @@ export class PostgresOutboxRelay implements OutboxRelay {
   /**
    * Publish one row through the bus; delete on ack. A throwing bus marks the
    * row failed (attempts/backoff/last_error — quarantining past the budget)
-   * and returns undefined so later rows still drain.
+   * and returns undefined so later rows still drain. A failed ack-delete (or
+   * a failed failure-bookkeeping write) also returns undefined: the row stays
+   * pending and the next cycle re-publishes (at-least-once) and re-acks.
    */
   private async deliver(row: OutboxMessageRow): Promise<OutboxMessage | undefined> {
     const event: DomainEvent = {
@@ -195,14 +218,31 @@ export class PostgresOutboxRelay implements OutboxRelay {
     try {
       await this.eventBus.publish(event);
     } catch (error) {
-      await this.markFailed(row, error);
+      try {
+        await this.markFailed(row, error);
+      } catch (markError) {
+        // Bookkeeping must not abort the cycle; the row stays pending with
+        // its old attempts counter and is retried next cycle.
+        this.logger.error(
+          `Outbox failure bookkeeping failed tenant=${row.tenantId} message=${row.id}`,
+          markError as Error,
+        );
+      }
       return undefined;
     }
-    await withTenantTransaction(this.db, row.tenantId, (tx) =>
-      tx
-        .delete(outboxMessages)
-        .where(and(eq(outboxMessages.id, row.id), eq(outboxMessages.status, 'pending'))),
-    );
+    try {
+      await withTenantTransaction(this.db, row.tenantId, (tx) =>
+        tx
+          .delete(outboxMessages)
+          .where(and(eq(outboxMessages.id, row.id), eq(outboxMessages.status, 'pending'))),
+      );
+    } catch (error) {
+      this.logger.error(
+        `Outbox ack-delete failed tenant=${row.tenantId} message=${row.id}`,
+        error as Error,
+      );
+      return undefined;
+    }
     return {
       messageId: row.id,
       tenantId: row.tenantId,

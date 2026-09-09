@@ -13,6 +13,11 @@ CREATE TABLE "outbox_messages" (
 );
 --> statement-breakpoint
 CREATE INDEX "outbox_messages_tenant_status_next_attempt_idx" ON "outbox_messages" USING btree ("tenant_id","status","next_attempt_at","created_at");
+--> statement-breakpoint
+-- Hand-append (same as the RLS block below): a typo'd status would be
+-- invisible to the drain's `status = 'pending'` filter — keep the state
+-- machine DB-enforced.
+ALTER TABLE "outbox_messages" ADD CONSTRAINT "outbox_messages_status_check" CHECK ("status" IN ('pending','quarantined'));
 -- Story outbox-relay hand-append (the 0006 RLS policy pattern): RLS is
 -- declared only in migration SQL, never in schema.ts. Same fail-closed
 -- single-dimension `tenant_isolation` policy. The `current_setting(..., true)`

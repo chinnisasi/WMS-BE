@@ -6,6 +6,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import type { Database } from '../src/shared/db/db';
 import {
+  outboxBackoffMs,
   OUTBOX_MAX_ATTEMPTS,
   OUTBOX_OPERATOR_REPLAY_SQL,
   PostgresOutboxRelay,
@@ -16,6 +17,9 @@ import type { DomainEvent, EventBus } from '../src/shared/events/event-bus.seam'
 // CI provides the service container) and signs sessions.
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
+// A host that exports a poll interval would boot the relay worker and race
+// these tests for the same rows — the suite drives `drain()` itself.
+delete process.env.OUTBOX_RELAY_POLL_MS;
 
 const IDENTITY_URL = '/api/v1/tenants';
 const KEY_HEADER = 'Idempotency-Key';
@@ -199,6 +203,19 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
     return new PostgresOutboxRelay(db, authDb, bus);
   }
 
+  /**
+   * The row's `next_attempt_at` was stamped `outboxBackoffMs(attempts)` after
+   * markFailed's clock reading; assert the delta against the computed budget
+   * with generous read-back slack (a loaded runner can lag the write) — a
+   * wrong exponent still fails one of the two bounds.
+   */
+  function expectBackoff(nextAttemptAt: string, attempts: number): void {
+    const backoff = outboxBackoffMs(attempts);
+    const nextAt = new Date(nextAttemptAt).getTime();
+    expect(nextAt).toBeLessThanOrEqual(Date.now() + backoff);
+    expect(nextAt).toBeGreaterThan(Date.now() + backoff - 5_000);
+  }
+
   it('a committing command leaves exactly one pending row in the same commit (registration)', async () => {
     const key = ulid();
     const email = `owner-outbox-${ulid().toLowerCase()}@example.com`;
@@ -330,9 +347,7 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
     expect(failed.status).toBe('pending');
     expect(failed.attempts).toBe(1);
     expect(failed.lastError).toContain('bus down for boom.event');
-    const nextAt = new Date(failed.nextAttemptAt).getTime();
-    expect(nextAt).toBeGreaterThan(Date.now() + 4_000); // ~5s backoff
-    expect(nextAt).toBeLessThan(Date.now() + 15_000);
+    expectBackoff(failed.nextAttemptAt, 1); // ~5s backoff
 
     // Force the row due again: the next failure doubles the backoff (10s).
     await makeRowDue(failing);
@@ -343,8 +358,7 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
     ).toHaveLength(0);
     const afterSecond = (await outboxRowsFor(tenantId)).find((row) => row.id === failing)!;
     expect(afterSecond.attempts).toBe(2);
-    const nextAt2 = new Date(afterSecond.nextAttemptAt).getTime();
-    expect(nextAt2).toBeGreaterThan(Date.now() + 9_000); // ~10s backoff
+    expectBackoff(afterSecond.nextAttemptAt, 2); // ~10s backoff
     expect(await outboxRowsFor(tenantId)).toHaveLength(1); // only the failed row remains
   });
 
@@ -365,6 +379,16 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
     expect(quarantined.status).toBe('quarantined');
     expect(quarantined.attempts).toBe(OUTBOX_MAX_ATTEMPTS);
     expect(quarantined.lastError).toContain('bus down for boom.quarantine');
+
+    // The quarantine exits the drain directly (the status = 'pending' filter,
+    // not the clock): force the row due and prove no cycle picks it up.
+    await makeRowDue(id);
+    expect(
+      (await newRelay(new RecordingEventBus()).drain(1_000)).filter(
+        (m) => m.tenantId === tenantId,
+      ),
+    ).toHaveLength(0);
+    expect((await outboxRowsFor(tenantId)).find((row) => row.id === id)!.status).toBe('quarantined');
 
     // A quarantined row re-drains only by operator action (the documented SQL).
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
@@ -405,6 +429,208 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
       .map((event) => event.eventId);
     expect(new Set(eventIds).size).toBe(eventIds.length);
     expect(await outboxRowsFor(tenantId)).toHaveLength(0);
+  });
+
+  it('every command appends its event in the same commit (the other nine types)', async () => {
+    const Bearer = (t: string) => ['Authorization', `Bearer ${t}`] as const;
+    // --- tenancy structure ---
+    const registered = await request(app.getHttpServer())
+      .post(IDENTITY_URL)
+      .set(KEY_HEADER, ulid())
+      .send({ name: 'Nine Events Spices', ownerEmail: `owner-nine-${ulid().toLowerCase()}@example.com`, password: 'correct-horse-battery' })
+      .expect(201);
+    const tenantId = registered.body.tenant.id as string;
+    createdTenantIds.push(tenantId);
+    const signedIn = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/sign-in`)
+      .send({ email: registered.body.owner.email as string, password: 'correct-horse-battery' })
+      .expect(200);
+    const [scheme, token] = Bearer(signedIn.body.accessToken as string);
+
+    // warehouse.created
+    const warehouse = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
+      .set(scheme, token)
+      .set(KEY_HEADER, ulid())
+      .send({ code: 'WH-9', name: 'Nine Warehouse' })
+      .expect(201);
+    const warehouseId = warehouse.body.id as string;
+    expect(warehouse.body.code).toBe('WH-9');
+
+    // zone.created
+    const zone = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones`)
+      .set(scheme, token)
+      .set(KEY_HEADER, ulid())
+      .send({ code: 'A', name: 'Zone A' })
+      .expect(201);
+    const zoneId = zone.body.id as string;
+
+    // bins.generated
+    const grid = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins/grid`)
+      .set(scheme, token)
+      .set(KEY_HEADER, ulid())
+      .send({ aisleFrom: 'A', aisleTo: 'A', baysPerAisle: 1, levelsPerBay: 1, capacity: 100, type: 'pallet' })
+      .expect(201);
+    expect(grid.body.generatedCount).toBe(1);
+    const binId = (
+      await request(app.getHttpServer())
+        .get(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set(scheme, token)
+        .expect(200)
+    ).body.items[0].id as string;
+
+    // bin.blocked
+    await request(app.getHttpServer())
+      .patch(`${IDENTITY_URL}/${tenantId}/warehouses/${warehouseId}/bins/${binId}`)
+      .set(scheme, token)
+      .set(KEY_HEADER, ulid())
+      .send({ blocked: true })
+      .expect(200);
+
+    // --- catalog: catalog.imported, catalog.sku_edited ---
+    const csv = Buffer.from(
+      ['sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode']
+        .concat(['SKU-9,Outbox Turmeric,pcs,,500,,false,false,5,10,'])
+        .join('\n'),
+      'utf8',
+    );
+    const imported = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/catalog/imports`)
+      .set(scheme, token)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', csv, { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skuId = (
+      await request(app.getHttpServer())
+        .get(`${IDENTITY_URL}/${tenantId}/catalog/skus`)
+        .set(scheme, token)
+        .expect(200)
+    ).body.items[0].id as string;
+    await request(app.getHttpServer())
+      .patch(`${IDENTITY_URL}/${tenantId}/catalog/skus/${skuId}`)
+      .set(scheme, token)
+      .set(KEY_HEADER, ulid())
+      .send({ barcode: 'OUTBOX-BARCODE-9' })
+      .expect(200);
+
+    // --- inventory: stock.adjusted (business time rides on the event) ---
+    const adjusted = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/inventory/adjustments`)
+      .set(scheme, token)
+      .set(KEY_HEADER, ulid())
+      .send({
+        warehouseId,
+        skuId,
+        binId,
+        quantityDelta: 5,
+        reasonCode: 'cycle-count',
+        note: 'outbox row assertion',
+      })
+      .expect(201);
+    const adjustedEvent = adjusted.body.event as { id: string; seq: number; occurredAt: string };
+
+    // --- users: user.invited, user.accepted, user.role_changed ---
+    const inviteeEmail = `invitee-nine-${ulid().toLowerCase()}@example.com`;
+    const invited = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/users`)
+      .set(scheme, token)
+      .set(KEY_HEADER, ulid())
+      .send({ email: inviteeEmail, role: 'operator' })
+      .expect(201);
+    const inviteeId = invited.body.user.id as string;
+    await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/${tenantId}/accept-invite`)
+      .set(KEY_HEADER, ulid())
+      .send({ token: invited.body.inviteToken, password: 'invitee-password-1' })
+      .expect(200);
+    await request(app.getHttpServer())
+      .patch(`${IDENTITY_URL}/${tenantId}/users/${inviteeId}`)
+      .set(scheme, token)
+      .set(KEY_HEADER, ulid())
+      .send({ role: 'ops_manager' })
+      .expect(200);
+
+    const rows = await outboxRowsFor(tenantId);
+    expect(rows.map((row) => row.type)).toEqual([
+      'tenant.registered',
+      'warehouse.created',
+      'zone.created',
+      'bins.generated',
+      'bin.blocked',
+      'catalog.imported',
+      'catalog.sku_edited',
+      'stock.adjusted',
+      'user.invited',
+      'user.accepted',
+      'user.role_changed',
+    ]);
+    const byType = new Map(rows.map((row) => [row.type, row]));
+    expect(byType.get('warehouse.created')).toMatchObject({ tenantId, attempts: 0 });
+    expect(byType.get('warehouse.created')!.payload).toMatchObject({
+      warehouseId,
+      code: 'WH-9',
+      name: 'Nine Warehouse',
+    });
+    expect(byType.get('zone.created')!.payload).toMatchObject({
+      zoneId,
+      warehouseId,
+      code: 'A',
+    });
+    expect(byType.get('bins.generated')!.payload).toMatchObject({
+      warehouseId,
+      zoneId,
+      count: 1,
+      firstCode: 'A-01-01',
+      lastCode: 'A-01-01',
+    });
+    expect(byType.get('bin.blocked')!.payload).toMatchObject({
+      binId,
+      warehouseId,
+      blocked: true,
+    });
+    expect(byType.get('catalog.imported')!.payload).toMatchObject({
+      importId: imported.body.importId,
+      mode: 'initial',
+      committedRows: 1,
+      failedRows: 0,
+    });
+    expect(byType.get('catalog.sku_edited')!.payload).toMatchObject({
+      skuId,
+      code: 'SKU-9',
+    });
+    const adjustedRow = byType.get('stock.adjusted')!;
+    expect(adjustedRow.payload).toMatchObject({
+      warehouseId,
+      skuId,
+      binId,
+      quantityDelta: 5,
+      seq: adjustedEvent.seq,
+      eventId: adjustedEvent.id,
+    });
+    // Business time: the event's occurredAt is the adjustment's ledger time,
+    // not the relay's publish clock.
+    expect(Date.parse(adjustedRow.occurredAt)).toBe(Date.parse(adjustedEvent.occurredAt));
+    expect(byType.get('user.invited')!.payload).toMatchObject({
+      userId: inviteeId,
+      email: inviteeEmail,
+      role: 'operator',
+    });
+    expect(byType.get('user.accepted')!.payload).toMatchObject({
+      userId: inviteeId,
+      email: inviteeEmail,
+    });
+    expect(byType.get('user.role_changed')!.payload).toMatchObject({
+      userId: inviteeId,
+      role: 'ops_manager',
+    });
+    // Every row carries its tenant — the append is inside the tenant tx.
+    for (const row of rows) {
+      expect(row.tenantId).toBe(tenantId);
+      expect(row.status).toBe('pending');
+    }
   });
 
   it('row-level security: outbox_messages is tenant-isolated and fails closed', async () => {
