@@ -1,10 +1,12 @@
 import { Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
+import { ValkeyModule } from '../../shared/valkey/valkey.module';
 import { LedgerService } from './ledger.service';
 import { LEDGER_ANCHOR_STORE, PostgresLedgerAnchorStore } from './anchor-store';
 import { InventoryFacade } from './inventory.facade';
 import { StockAdjustmentCommand } from './inventory.command';
 import { ReconciliationService } from './reconcile';
+import { ReservationService } from './reservation.service';
 
 /**
  * Inventory module — the append-only ledger core and its derived
@@ -26,7 +28,7 @@ import { ReconciliationService } from './reconcile';
  * `LoggingEventBus` from SharedModule stays the delivery seam untouched.
  */
 @Module({
-  imports: [SharedModule],
+  imports: [SharedModule, ValkeyModule],
   providers: [
     LedgerService,
     // The anchor target is a seam: this Postgres implementation appends to
@@ -38,6 +40,10 @@ import { ReconciliationService } from './reconcile';
     // by the jobs shell's `ReconciliationWorker` through the facade; no HTTP
     // surface.
     ReconciliationService,
+    // Atomic reservations (Story 2.3) — grant/commit/release + ATP through
+    // the pre-declared-keys Valkey scripts, journalled to Postgres; consumed
+    // through the facade (reads become HTTP in 2.5, order wiring in Epic 4).
+    ReservationService,
     InventoryFacade,
   ],
   exports: [InventoryFacade],

@@ -685,3 +685,65 @@ export const inventoryQuarantines = pgTable(
 );
 
 export type InventoryQuarantine = typeof inventoryQuarantines.$inferSelect;
+
+/**
+ * Reservation journal (Story 2.3, AD-12): the durable truth for sellable-stock
+ * holds — Valkey's per-(warehouse, sku) reserved counters are a mirror of
+ * `state IN ('held','committed')` sums, rebuilt from this table on divergence
+ * (Postgres wins; the journal never repairs toward the mirror). One row per
+ * owner hold:
+ *
+ * - `owner_type` / `owner_id` — who holds it (Epic 4's order lines are the
+ *   first writers); grant is idempotent per (owner, warehouse, sku) while
+ *   held — the partial unique index is the DB backstop.
+ * - `state` — `held → committed → released/expired`; terminal transitions
+ *   serialize through a conditional UPDATE (`… WHERE state = 'held'`), so
+ *   exactly one caller wins and a second terminal write is a deterministic
+ *   conflict (rowcount = 0). `committed` units stay deducted until the
+ *   consuming ledger movement (Epic 4's dispatch); `released`/`expired`
+ *   restore the counter.
+ * - `expires_at` — the hold's TTL; the sheddable reaper (jobs shell)
+ *   transitions past-TTL rows to `expired` exactly once and restores the
+ *   counter. Valkey key TTLs are a backstop only.
+ *
+ * Scope is (tenant, warehouse, sku) — never bin-level (no batch/serial
+ * dimensions; Story 2.4 and Epic 7 are out of scope here).
+ *
+ * RLS policy + state/quantity CHECKs live **only in the migration SQL**
+ * (0009, the 0006/0007/0008 pattern).
+ */
+export const reservations = pgTable(
+  'reservations',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    ownerType: text('owner_type').notNull(),
+    ownerId: text('owner_id').notNull(),
+    quantity: integer('quantity').notNull(),
+    state: text('state').notNull().default('held'),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The reaper's scan (held rows past TTL) and any state-filtered read.
+    index('reservations_tenant_state_expires_at_idx').on(table.tenantId, table.state, table.expiresAt),
+    // Grant idempotency (AD-5 adjacency): one OPEN hold per owner scope —
+    // a repeat grant while held returns the existing row.
+    uniqueIndex('reservations_open_owner_scope_unique')
+      .on(table.tenantId, table.warehouseId, table.skuId, table.ownerType, table.ownerId)
+      .where(sql`state = 'held'`),
+    // Reserved-counter rebuild: per-scope sums over the live states.
+    index('reservations_tenant_warehouse_sku_state_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.skuId,
+      table.state,
+    ),
+  ],
+);
+
+export type Reservation = typeof reservations.$inferSelect;
