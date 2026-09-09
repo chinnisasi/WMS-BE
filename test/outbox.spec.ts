@@ -17,9 +17,11 @@ import type { DomainEvent, EventBus } from '../src/shared/events/event-bus.seam'
 // CI provides the service container) and signs sessions.
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
-// A host that exports a poll interval would boot the relay worker and race
-// these tests for the same rows — the suite drives `drain()` itself.
+// A host that exports a poll interval would boot the relay worker (or the
+// story-2.2 reconciliation worker) and race these tests for the same rows —
+// the suite drives `drain()` itself.
 delete process.env.OUTBOX_RELAY_POLL_MS;
+delete process.env.OUTBOX_RECONCILE_POLL_MS;
 
 const IDENTITY_URL = '/api/v1/tenants';
 const KEY_HEADER = 'Idempotency-Key';

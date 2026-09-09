@@ -14,6 +14,10 @@ import { TenancyService } from '../src/modules/tenancy/tenancy.service';
 // CI provides the service container) and signs sessions.
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
+// A host that exports either poll interval would boot the background workers
+// and race these tests — the same convention as the reconciliation suite.
+delete process.env.OUTBOX_RELAY_POLL_MS;
+delete process.env.OUTBOX_RECONCILE_POLL_MS;
 
 const IDENTITY_URL = '/api/v1/tenants';
 

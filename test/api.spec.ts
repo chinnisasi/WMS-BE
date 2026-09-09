@@ -5,6 +5,12 @@ import request from 'supertest';
 import { createApp } from '../src/app.factory';
 import { OpenApiDocumentHolder } from '../src/api/openapi-document.holder';
 
+// Boots the AppModule: a host that exports either poll interval would start
+// the background workers and race the other e2e suites for shared rows —
+// the same convention as the reconciliation suite.
+delete process.env.OUTBOX_RELAY_POLL_MS;
+delete process.env.OUTBOX_RECONCILE_POLL_MS;
+
 describe('api shell (e2e)', () => {
   let app: INestApplication;
 

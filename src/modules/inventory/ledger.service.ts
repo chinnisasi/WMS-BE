@@ -60,6 +60,13 @@ export interface ReplayDivergence {
   readonly binId: string;
   readonly projectedQuantity: number | null;
   readonly replayedQuantity: number;
+  /**
+   * The divergent scope's event range inside the scan's compare window
+   * (Story 2.2's bounded scan; the plain `replay` compares the whole ledger
+   * and leaves these undefined).
+   */
+  readonly fromSeq?: number;
+  readonly toSeq?: number;
 }
 
 export interface ReplayReport {
@@ -87,6 +94,36 @@ export interface ChainVerifyReport {
   readonly fromSeq: number;
   readonly toSeq: number;
   readonly eventCount: number;
+}
+
+/** One scope repaired by a rebuild: the replayed value that was written. */
+export interface RebuiltScope {
+  readonly skuId: string;
+  readonly binId: string;
+  /** The stored projection before the repair (null: the row was missing). */
+  readonly projectedQuantity: number | null;
+  /** The replayed quantity written (the scope's row is at this value now). */
+  readonly quantity: number;
+  /** True when the repair DELETED a fabricated row (a scope with no events). */
+  readonly deleted: boolean;
+}
+
+export interface RebuildReport {
+  readonly warehouseId: string;
+  readonly repaired: readonly RebuiltScope[];
+  /** The divergences the rebuild observed (and alerted) before repairing. */
+  readonly divergences: readonly ReplayDivergence[];
+}
+
+/**
+ * The per-(tenant, warehouse) advisory transaction lock — the ONE
+ * serialization point per warehouse, shared by the append path (seq
+ * allocation), the anchor path, and Story 2.2's rebuild path (so a rebuild's
+ * absolute projection write can never clobber a concurrent increment — the
+ * append either commits before the lock is taken, or blocks until after it).
+ */
+export function warehouseAdvisoryLock(tenantId: string, warehouseId: string): SQL {
+  return sql`select pg_advisory_xact_lock(hashtextextended(${tenantId} || ':' || ${warehouseId}, 0))`;
 }
 
 /** The verifiable digest artifact produced on demand over an event range. */
@@ -260,9 +297,7 @@ export class LedgerService {
 
     // Concurrency: one writer per warehouse for this transaction. The lock
     // is transaction-scoped — it dies with the commit/rollback.
-    await tx.execute(
-      sql`select pg_advisory_xact_lock(hashtextextended(${movement.tenantId} || ':' || ${movement.warehouseId}, 0))`,
-    );
+    await tx.execute(warehouseAdvisoryLock(movement.tenantId, movement.warehouseId));
 
     const headRows = await tx
       .select({ seq: ledgerEvents.seq, eventHash: ledgerEvents.eventHash })
@@ -432,6 +467,71 @@ export class LedgerService {
   }
 
   /**
+   * Rebuild (Story 2.2 — derived-state repair, the operator/debug entry into
+   * `rebuildProjectionsInTx`): recomputes `stock_on_hand` from
+   * `ledger_events` for the requested scope (or every divergent scope of the
+   * warehouse when the scope is omitted) and rewrites the rows to the
+   * replayed quantities — under the same per-warehouse advisory xact lock the
+   * append path uses, so no concurrent increment is clobbered, and in ONE
+   * transaction with the `reconciliation.divergence` alert that names what it
+   * repaired (alert + rebuild together; silence is never an outcome). A
+   * scope that replays clean writes nothing — the worker never rewrites a
+   * projection it has not proven divergent by replay.
+   */
+  async rebuildProjections(
+    tenantId: string,
+    warehouseId: string,
+    scope?: { skuId?: string; binId?: string },
+  ): Promise<RebuildReport> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await tx.execute(warehouseAdvisoryLock(tenantId, warehouseId));
+      // Observe first: the repair targets exactly the scopes replay proves
+      // divergent (never a blind rewrite).
+      const report = await replayInTx(tx, tenantId, warehouseId, scope?.skuId, scope?.binId);
+      if (report.matches) {
+        return { warehouseId, repaired: [], divergences: [] };
+      }
+      const headRows = await tx
+        .select({ seq: ledgerEvents.seq })
+        .from(ledgerEvents)
+        .where(
+          and(eq(ledgerEvents.tenantId, tenantId), eq(ledgerEvents.warehouseId, warehouseId)),
+        )
+        .orderBy(desc(ledgerEvents.seq))
+        .limit(1);
+      const repaired = await rebuildProjectionsInTx(
+        tx,
+        tenantId,
+        warehouseId,
+        report.divergences.map((divergence) => ({ skuId: divergence.skuId, binId: divergence.binId })),
+      );
+      // The divergence alert, in the SAME transaction as the repair (the
+      // chain_broken precedent: a small tenant transaction for an event with
+      // no domain write of its own to piggyback on).
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId,
+        type: 'reconciliation.divergence',
+        occurredAt: nowIso(),
+        payload: {
+          warehouseId,
+          watermark: headRows[0]?.seq ?? 0,
+          trigger: 'manual-rebuild',
+          divergences: report.divergences.map((divergence) => ({
+            skuId: divergence.skuId,
+            binId: divergence.binId,
+            projected: divergence.projectedQuantity,
+            replayed: divergence.replayedQuantity,
+            fromSeq: divergence.fromSeq ?? 1,
+            toSeq: divergence.toSeq ?? headRows[0]?.seq ?? 0,
+          })),
+        },
+      });
+      return { warehouseId, repaired, divergences: report.divergences };
+    });
+  }
+
+  /**
    * Chain verification (AD-16): walks the chain in `seq` order, recomputing
    * each event's hash over its canonical bytes and checking the
    * predecessor linkage. Any break surfaces as a severity-1 alert (error
@@ -478,19 +578,27 @@ export class LedgerService {
    * Anchors the chain head — or the tail since the last anchor — to the
    * configured anchor store: one `ledger_anchors` row (append-only) with
    * the verifiable range digest, committed in one tenant transaction.
+   *
+   * Verify-before-anchor (Story 2.2): the range is walked inside the anchor
+   * transaction before anything is committed — an anchor is only ever
+   * committed over a chain that still verifies. On a break the method
+   * RETURNS the `ChainBreakReport` (no anchor row, no digest committed) and
+   * the existing severity-1 alert path fires after it, exactly as
+   * `verifyChain` reports a break.
    */
   async anchorChain(
     tenantId: string,
     warehouseId: string,
     uptoSeq?: number,
-  ): Promise<ChainAnchor> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
+  ): Promise<ChainAnchor | ChainBreakReport> {
+    const result = await withTenantTransaction<ChainAnchor | ChainBreakReport>(
+      this.db,
+      tenantId,
+      async (tx) => {
       // One anchor committer per warehouse scope: two concurrent anchor
       // calls would otherwise read the same lastToSeq and commit
       // overlapping anchor rows. Same mechanism as the seq allocation.
-      await tx.execute(
-        sql`select pg_advisory_xact_lock(hashtextextended(${tenantId} || ':' || ${warehouseId}, 0))`,
-      );
+      await tx.execute(warehouseAdvisoryLock(tenantId, warehouseId));
       const headRows = await tx
         .select({ seq: ledgerEvents.seq })
         .from(ledgerEvents)
@@ -544,11 +652,44 @@ export class LedgerService {
           `Expected ${toSeq - fromSeq + 1} events in seq ${fromSeq}..${toSeq} but found ${rangeRows.length} — the range is gapped.`,
         );
       }
+      // Verify-before-anchor: walk the range's chain inside the anchor
+      // transaction — a tampered (or gapped, or predecessor-missing) range
+      // must never get a digest committed over it.
+      const chainReport = await verifyChainInTx(tx, tenantId, warehouseId, fromSeq, toSeq);
+      if (chainReport.ok === false) {
+        return chainReport; // refuse: the transaction commits nothing.
+      }
       const digest = digestOverRange(rangeRows);
       const anchoredAt = nowIso();
       await this.anchorStore.anchor({ tenantId, warehouseId, fromSeq, toSeq, digest, anchoredAt }, tx);
       return { tenantId, warehouseId, fromSeq, toSeq, digest, anchoredAt };
     });
+    if ('reason' in result) {
+      // The severity-1 alert rides the transactional outbox like every other
+      // event: its own small tenant transaction (the `verifyChain`
+      // precedent) — the anchor transaction committed nothing, so the alert
+      // must not ride it. A failure here propagates: a lost chain-break
+      // alert must fail loudly, not silently.
+      this.logger.error(
+        `SEVERITY-1 ledger chain break: tenant=${result.tenantId} ` +
+          `warehouse=${result.warehouseId} seq=${result.fromSeq}..${result.toSeq} — ${result.reason}`,
+      );
+      await withTenantTransaction(this.db, tenantId, (tx) =>
+        this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId,
+          type: 'ledger.chain_broken',
+          occurredAt: nowIso(),
+          payload: {
+            warehouseId: result.warehouseId,
+            fromSeq: result.fromSeq,
+            toSeq: result.toSeq,
+            reason: result.reason,
+          },
+        }),
+      );
+    }
+    return result;
   }
 
   /**
@@ -616,30 +757,43 @@ export class LedgerService {
 }
 
 /**
- * Replay recomputation inside an existing transaction: folds every event's
- * signed delta into per-(sku, bin) buckets in `seq` order — the replay
- * order (AD-11) — then compares the buckets against the stored projection
- * exactly (`matches` names every divergence; never auto-heals).
+ * The shared fold (Story 2.2): walks one warehouse's events in `seq` order —
+ * the replay order (AD-11) — folding each event's signed delta into
+ * per-(sku, bin) buckets. Quantities are absolute, so the fold is always
+ * whole (from seq 1); `toSeq` bounds WHICH events are folded (the watermark:
+ * a movement committing mid-scan has seq > toSeq and is never folded).
+ *
+ * `windowFromSeq` additionally records, for every scope touched by an event
+ * with `seq > windowFromSeq`, the min/max seq of the window's events touching
+ * it — Story 2.2's bounded compare window (the checkpoint bounds what the
+ * scan compares, not what it folds).
  */
-export async function replayInTx(
+async function foldLedgerInTx(
   tx: TenantTx,
   tenantId: string,
   warehouseId: string,
-  skuId?: string,
-  binId?: string,
-): Promise<ReplayReport> {
+  options: { skuId?: string; binId?: string; toSeq?: number; windowFromSeq?: number } = {},
+): Promise<{
+  replayed: Map<string, number>;
+  windowScopes: Map<string, { fromSeq: number; toSeq: number }>;
+  eventCount: number;
+}> {
   const conditions: SQL[] = [
     eq(ledgerEvents.tenantId, tenantId),
     eq(ledgerEvents.warehouseId, warehouseId),
   ];
-  if (skuId !== undefined) {
-    conditions.push(eq(ledgerEvents.skuId, skuId));
+  if (options.skuId !== undefined) {
+    conditions.push(eq(ledgerEvents.skuId, options.skuId));
   }
-  if (binId !== undefined) {
+  if (options.binId !== undefined) {
     // Same scope as the projected side: without this, sibling bins of the
     // SKU (excluded from the projection comparison) surface as phantom
     // divergences.
-    conditions.push(or(eq(ledgerEvents.toBinId, binId), eq(ledgerEvents.fromBinId, binId))!);
+    conditions.push(or(eq(ledgerEvents.toBinId, options.binId), eq(ledgerEvents.fromBinId, options.binId))!);
+  }
+  if (options.toSeq !== undefined) {
+    // The watermark: only events the cycle has proven committed are folded.
+    conditions.push(lte(ledgerEvents.seq, options.toSeq));
   }
   const rows = await tx
     .select({
@@ -654,17 +808,63 @@ export async function replayInTx(
     .orderBy(asc(ledgerEvents.seq));
 
   const replayed = new Map<string, number>();
+  const windowScopes = new Map<string, { fromSeq: number; toSeq: number }>();
+  const recordWindowScope = (key: string, seq: number): void => {
+    const range = windowScopes.get(key);
+    windowScopes.set(key, {
+      fromSeq: Math.min(range?.fromSeq ?? seq, seq),
+      toSeq: Math.max(range?.toSeq ?? seq, seq),
+    });
+  };
   for (const row of rows) {
     const magnitude = Math.abs(row.quantityDelta);
+    const inWindow = options.windowFromSeq !== undefined && row.seq > options.windowFromSeq;
     if (row.toBinId !== null) {
       const key = replayKey(row.skuId, row.toBinId);
       replayed.set(key, (replayed.get(key) ?? 0) + magnitude);
+      if (inWindow) {
+        recordWindowScope(key, row.seq);
+      }
     }
     if (row.fromBinId !== null) {
       const key = replayKey(row.skuId, row.fromBinId);
       replayed.set(key, (replayed.get(key) ?? 0) - magnitude);
+      if (inWindow) {
+        recordWindowScope(key, row.seq);
+      }
     }
   }
+
+  return { replayed, windowScopes, eventCount: rows.length };
+}
+
+function replayKey(skuId: string, binId: string): string {
+  return `${skuId}:${binId}`;
+}
+
+/**
+ * Replay recomputation inside an existing transaction: folds every event's
+ * signed delta into per-(sku, bin) buckets in `seq` order — the replay
+ * order (AD-11) — then compares the buckets against the stored projection
+ * exactly (`matches` names every divergence; never auto-heals).
+ */
+export async function replayInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  skuId?: string,
+  binId?: string,
+): Promise<ReplayReport> {
+  const { replayed, eventCount } = await foldLedgerInTx(
+    tx,
+    tenantId,
+    warehouseId,
+    // `exactOptionalPropertyTypes`: the filters are absent, not undefined.
+    {
+      ...(skuId !== undefined ? { skuId } : {}),
+      ...(binId !== undefined ? { binId } : {}),
+    },
+  );
 
   // The stored projection for the same scope — compared entry by entry.
   const scopeConditions: SQL[] = [
@@ -707,11 +907,150 @@ export async function replayInTx(
     });
   }
 
-  return { warehouseId, eventCount: rows.length, matches: divergences.length === 0, divergences };
+  return { warehouseId, eventCount, matches: divergences.length === 0, divergences };
 }
 
-function replayKey(skuId: string, binId: string): string {
-  return `${skuId}:${binId}`;
+/**
+ * The bounded scan (Story 2.2): folds events with `seq <= toSeq` from seq 1
+ * (quantities are absolute — the fold is whole) but compares ONLY the
+ * (sku, bin) scopes touched by events in `(fromSeq, toSeq]` — the checkpoint's
+ * bounded compare window. A pre-existing divergence on an untouched scope is
+ * caught by a full pass (no checkpoint) or a rebuild, not this scan. Each
+ * divergence names its scope's event range inside the window.
+ */
+export async function reconcileScanInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  fromSeq: number,
+  toSeq: number,
+): Promise<ReplayReport> {
+  const { replayed, windowScopes, eventCount } = await foldLedgerInTx(tx, tenantId, warehouseId, {
+    toSeq,
+    windowFromSeq: fromSeq,
+  });
+
+  // The stored projection, read warehouse-wide (one MVCC-consistent read —
+  // the scan takes no lock) and filtered in memory to the window's scopes.
+  const projectedRows = await tx
+    .select({ skuId: stockOnHand.skuId, binId: stockOnHand.binId, quantity: stockOnHand.quantity })
+    .from(stockOnHand)
+    .where(
+      and(eq(stockOnHand.tenantId, tenantId), eq(stockOnHand.warehouseId, warehouseId)),
+    );
+  const projectedByKey = new Map(projectedRows.map((row) => [replayKey(row.skuId, row.binId), row]));
+
+  const divergences: ReplayDivergence[] = [];
+  for (const [key, range] of windowScopes) {
+    const projected = projectedByKey.get(key);
+    const replayedQuantity = replayed.get(key) ?? 0;
+    // A scope touched in the window must have a projection row whose
+    // quantity matches the replay exactly (the same rule the full replay
+    // applies to every scope — including a missing row, which is itself
+    // divergence).
+    if (projected === undefined || projected.quantity !== replayedQuantity) {
+      const [skuIdPart, binIdPart] = key.split(':');
+      divergences.push({
+        skuId: skuIdPart!,
+        binId: binIdPart!,
+        projectedQuantity: projected?.quantity ?? null,
+        replayedQuantity,
+        fromSeq: range.fromSeq,
+        toSeq: range.toSeq,
+      });
+    }
+  }
+
+  return { warehouseId, eventCount, matches: divergences.length === 0, divergences };
+}
+
+/**
+ * Derived-state repair inside an existing transaction (Story 2.2): rewrites
+ * `stock_on_hand` rows to the replayed quantities for the requested scopes —
+ * the single sanctioned stock write, beside the append path's `addToOnHand`
+ * in this same file. Callers hold the per-warehouse advisory lock (so no
+ * concurrent increment is clobbered) and own the divergence alert that
+ * travels with the rebuild. A requested scope with NO ledger events at all
+ * has a fabricated row at best: the repair deletes it — the ledger is the
+ * only stock truth. A scope that already matches is left untouched.
+ */
+export async function rebuildProjectionsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  scopes: readonly { skuId: string; binId: string }[],
+): Promise<readonly RebuiltScope[]> {
+  // Quantities are absolute: fold the whole ledger once (fresh reads — the
+  // caller's repair transaction is read-committed, so anything that committed
+  // between detection and this lock is included rather than clobbered).
+  const { replayed } = await foldLedgerInTx(tx, tenantId, warehouseId, {});
+
+  const repaired: RebuiltScope[] = [];
+  for (const scope of scopes) {
+    const key = replayKey(scope.skuId, scope.binId);
+    const existingRows = await tx
+      .select({ quantity: stockOnHand.quantity })
+      .from(stockOnHand)
+      .where(
+        and(
+          eq(stockOnHand.tenantId, tenantId),
+          eq(stockOnHand.warehouseId, warehouseId),
+          eq(stockOnHand.skuId, scope.skuId),
+          eq(stockOnHand.binId, scope.binId),
+        ),
+      )
+      .limit(1);
+    const existing = existingRows[0];
+    if (!replayed.has(key)) {
+      // No events support this scope at all: any row here is fabricated.
+      if (existing !== undefined) {
+        await tx
+          .delete(stockOnHand)
+          .where(
+            and(
+              eq(stockOnHand.tenantId, tenantId),
+              eq(stockOnHand.warehouseId, warehouseId),
+              eq(stockOnHand.skuId, scope.skuId),
+              eq(stockOnHand.binId, scope.binId),
+            ),
+          );
+        repaired.push({
+          skuId: scope.skuId,
+          binId: scope.binId,
+          projectedQuantity: existing.quantity,
+          quantity: 0,
+          deleted: true,
+        });
+      }
+      continue;
+    }
+    const quantity = replayed.get(key)!;
+    if (existing !== undefined && existing.quantity === quantity) {
+      continue; // already matches (e.g. fixed between detection and repair)
+    }
+    await tx
+      .insert(stockOnHand)
+      .values({
+        id: uuidv7(),
+        tenantId,
+        warehouseId,
+        skuId: scope.skuId,
+        binId: scope.binId,
+        quantity,
+      })
+      .onConflictDoUpdate({
+        target: [stockOnHand.tenantId, stockOnHand.warehouseId, stockOnHand.skuId, stockOnHand.binId],
+        set: { quantity, updatedAt: nowIso() },
+      });
+    repaired.push({
+      skuId: scope.skuId,
+      binId: scope.binId,
+      projectedQuantity: existing?.quantity ?? null,
+      quantity,
+      deleted: false,
+    });
+  }
+  return repaired;
 }
 
 /**

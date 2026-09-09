@@ -28,13 +28,29 @@ export async function setTenantScope(tx: TenantTx, tenantId: string): Promise<vo
   await tx.execute(sql`select set_config('app.tenant_id', ${tenantId}, true)`);
 }
 
+/** Isolation the caller may pin for one tenant transaction (default: DB's). */
+export interface TenantTransactionOptions {
+  /**
+   * Drizzle passes this into `begin isolation level …`. A multi-statement
+   * read that must see ONE snapshot (the reconciliation scan: watermark →
+   * event fold → projection compare under MVCC, so a movement committing
+   * mid-read is either fully visible or fully invisible — never half) pins
+   * `repeatable read` here. Every other caller keeps the default.
+   */
+  readonly isolationLevel?: 'repeatable read';
+}
+
 export async function withTenantTransaction<T>(
   db: TenantDb,
   tenantId: string,
   fn: (tx: TenantTx) => Promise<T>,
+  options: TenantTransactionOptions = {},
 ): Promise<T> {
-  return db.transaction(async (tx) => {
+  const scoped = async (tx: TenantTx): Promise<T> => {
     await setTenantScope(tx, tenantId);
     return fn(tx);
-  });
+  };
+  return options.isolationLevel === undefined
+    ? db.transaction(scoped)
+    : db.transaction(scoped, { isolationLevel: options.isolationLevel });
 }

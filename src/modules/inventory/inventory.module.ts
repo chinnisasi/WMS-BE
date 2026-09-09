@@ -4,6 +4,7 @@ import { LedgerService } from './ledger.service';
 import { LEDGER_ANCHOR_STORE, PostgresLedgerAnchorStore } from './anchor-store';
 import { InventoryFacade } from './inventory.facade';
 import { StockAdjustmentCommand } from './inventory.command';
+import { ReconciliationService } from './reconcile';
 
 /**
  * Inventory module — the append-only ledger core and its derived
@@ -33,6 +34,10 @@ import { StockAdjustmentCommand } from './inventory.command';
     // external WORM store swaps in behind the interface.
     { provide: LEDGER_ANCHOR_STORE, useClass: PostgresLedgerAnchorStore },
     StockAdjustmentCommand,
+    // Continuous replay-reconciliation (Story 2.2) — background work driven
+    // by the jobs shell's `ReconciliationWorker` through the facade; no HTTP
+    // surface.
+    ReconciliationService,
     InventoryFacade,
   ],
   exports: [InventoryFacade],
