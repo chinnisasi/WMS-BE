@@ -1,8 +1,8 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { ledgerEvents } from '../../shared/db/schema';
+import { batchOnHand, ledgerEvents } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
@@ -52,6 +52,51 @@ export interface LedgerTimelineQuery {
 }
 
 export const DEFAULT_TIMELINE_PAGE_SIZE = 50;
+
+/** One per-batch on-hand row (Story 2.4 — the batch-arm sibling of on-hand). */
+export interface BatchOnHandEntry {
+  readonly warehouseId: string;
+  readonly skuId: string;
+  readonly binId: string;
+  readonly batchId: string;
+  readonly quantity: number;
+}
+
+/** One ledger event of a serial's movement history (oldest first). */
+export interface SerialLedgerEntry {
+  readonly warehouseId: string;
+  readonly seq: number;
+  readonly type: string;
+  readonly skuId: string;
+  readonly quantityDelta: number;
+  readonly fromBinId: string | null;
+  readonly toBinId: string | null;
+  readonly batchRef: string | null;
+  readonly occurredAt: string;
+  readonly recordedAt: string;
+  readonly eventHash: string;
+}
+
+/** One ledger event of a batch's movement history (oldest first). */
+export interface BatchLedgerEntry {
+  readonly warehouseId: string;
+  readonly seq: number;
+  readonly type: string;
+  readonly skuId: string;
+  readonly quantityDelta: number;
+  readonly fromBinId: string | null;
+  readonly toBinId: string | null;
+  readonly serialRef: string | null;
+  readonly occurredAt: string;
+  readonly recordedAt: string;
+  readonly eventHash: string;
+}
+
+/** A serial's derived current location (the ledger's latest event's bin). */
+export interface SerialLocation {
+  readonly warehouseId: string;
+  readonly binId: string;
+}
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -116,6 +161,32 @@ export class InventoryFacade {
     idempotencyKey: string,
   ): Promise<StockAdjustmentSnapshot> {
     return this.stockAdjustment.adjust(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  /**
+   * The adjustment's idempotency fingerprint (Story 2.4, review loop 1):
+   * command-owned hashing exposed for the api layer's replay pre-check —
+   * the api layer never hashes payload bytes itself.
+   */
+  adjustmentFingerprint(command: AdjustStockCommand): string {
+    return this.stockAdjustment.fingerprint(command);
+  }
+
+  /**
+   * The replay pre-check (review loop 1 — "replay beats composition"):
+   * returns the stored snapshot for (tenant, key) when the payload hash
+   * matches — BEFORE the api layer runs any composition (identity ensure,
+   * tracked-SKU validation, FEFO resolution), so a retry of a succeeded
+   * draw replays even when the FEFO batch has since been exhausted. A hash
+   * mismatch throws the command-owned 422 `idempotency-key-reuse`; no row
+   * returns null and the caller proceeds to composition.
+   */
+  async replayAdjustment(
+    tenantId: string,
+    idempotencyKey: string,
+    payloadHash: string,
+  ): Promise<StockAdjustmentSnapshot | null> {
+    return this.stockAdjustment.replayPriorSnapshot(tenantId, idempotencyKey, payloadHash);
   }
 
   /**
@@ -295,5 +366,135 @@ export class InventoryFacade {
    */
   async expireDueReservations(): Promise<number> {
     return this.reservations.expireDue();
+  }
+
+  // ── Story 2.4 traceability reads (facade-only; HTTP surfaces in 2.5) ────
+
+  /**
+   * Per-batch on-hand (Story 2.4): the `batch_on_hand` projection read —
+   * inventory's half of the api layer's FEFO join (catalog owns expiry).
+   * Scoped to the warehouse, optionally to one SKU and/or one bin (the FEFO
+   * composition reads one bin's batches; pick-order composition in Epic 4
+   * consumes the same rows). A read — never capability-gated; the warehouse
+   * must belong to the tenant (404 otherwise).
+   */
+  async batchOnHand(
+    tenantId: string,
+    warehouseId: string,
+    query: { skuId?: string; binId?: string } = {},
+  ): Promise<BatchOnHandEntry[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      return tx
+        .select({
+          warehouseId: batchOnHand.warehouseId,
+          skuId: batchOnHand.skuId,
+          binId: batchOnHand.binId,
+          batchId: batchOnHand.batchId,
+          quantity: batchOnHand.quantity,
+        })
+        .from(batchOnHand)
+        .where(
+          and(
+            eq(batchOnHand.tenantId, tenantId),
+            eq(batchOnHand.warehouseId, warehouseId),
+            query.skuId === undefined ? undefined : eq(batchOnHand.skuId, query.skuId),
+            query.binId === undefined ? undefined : eq(batchOnHand.binId, query.binId),
+          ),
+        )
+        .orderBy(asc(batchOnHand.batchId));
+    });
+  }
+
+  /**
+   * A serial's full movement history (Story 2.4): one query over the
+   * `(tenant_id, serial_ref, seq)` index — the ledger is the only source of
+   * serial history (AD-6).
+   */
+  async serialHistory(tenantId: string, serialId: string): Promise<SerialLedgerEntry[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({
+          warehouseId: ledgerEvents.warehouseId,
+          seq: ledgerEvents.seq,
+          type: ledgerEvents.type,
+          skuId: ledgerEvents.skuId,
+          quantityDelta: ledgerEvents.quantityDelta,
+          fromBinId: ledgerEvents.fromBinId,
+          toBinId: ledgerEvents.toBinId,
+          batchRef: ledgerEvents.batchRef,
+          occurredAt: ledgerEvents.occurredAt,
+          recordedAt: ledgerEvents.recordedAt,
+          eventHash: ledgerEvents.eventHash,
+        })
+        .from(ledgerEvents)
+        .where(and(eq(ledgerEvents.tenantId, tenantId), eq(ledgerEvents.serialRef, serialId)))
+        .orderBy(asc(ledgerEvents.seq));
+      return rows.map((row) => ({
+        ...row,
+        occurredAt: canonicalInstant(row.occurredAt),
+        recordedAt: canonicalInstant(row.recordedAt),
+      }));
+    });
+  }
+
+  /**
+   * A serial's current location (Story 2.4): derived from its latest ledger
+   * event — the from/to bin of the highest-seq row, tenant-wide (a serial's
+   * location can cross warehouses). One query; null when never moved. For a
+   * serial in stock this is its bin; for a serial drawn out of stock it is
+   * the last-known bin (the derived state, never a projection).
+   */
+  async serialLocation(tenantId: string, serialId: string): Promise<SerialLocation | null> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({
+          warehouseId: ledgerEvents.warehouseId,
+          fromBinId: ledgerEvents.fromBinId,
+          toBinId: ledgerEvents.toBinId,
+        })
+        .from(ledgerEvents)
+        .where(and(eq(ledgerEvents.tenantId, tenantId), eq(ledgerEvents.serialRef, serialId)))
+        .orderBy(desc(ledgerEvents.seq))
+        .limit(1);
+      const latest = rows[0];
+      if (latest === undefined) {
+        return null;
+      }
+      const binId = latest.toBinId ?? latest.fromBinId;
+      return binId === null ? null : { warehouseId: latest.warehouseId, binId };
+    });
+  }
+
+  /**
+   * A batch's full movement history (Story 2.4): one query over the
+   * `(tenant_id, batch_ref, seq)` index — the hash-chained ledger is the
+   * batch's audit log.
+   */
+  async batchHistory(tenantId: string, batchId: string): Promise<BatchLedgerEntry[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({
+          warehouseId: ledgerEvents.warehouseId,
+          seq: ledgerEvents.seq,
+          type: ledgerEvents.type,
+          skuId: ledgerEvents.skuId,
+          quantityDelta: ledgerEvents.quantityDelta,
+          fromBinId: ledgerEvents.fromBinId,
+          toBinId: ledgerEvents.toBinId,
+          serialRef: ledgerEvents.serialRef,
+          occurredAt: ledgerEvents.occurredAt,
+          recordedAt: ledgerEvents.recordedAt,
+          eventHash: ledgerEvents.eventHash,
+        })
+        .from(ledgerEvents)
+        .where(and(eq(ledgerEvents.tenantId, tenantId), eq(ledgerEvents.batchRef, batchId)))
+        .orderBy(asc(ledgerEvents.seq));
+      return rows.map((row) => ({
+        ...row,
+        occurredAt: canonicalInstant(row.occurredAt),
+        recordedAt: canonicalInstant(row.recordedAt),
+      }));
+    });
   }
 }

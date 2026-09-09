@@ -311,6 +311,78 @@ export const uomConversions = pgTable(
 export type UomConversion = typeof uomConversions.$inferSelect;
 
 /**
+ * Batch identity (Story 2.4 — catalog-owned, beside `skus`): one row per
+ * (tenant, sku, code) batch of a batch-tracked SKU, carrying the intake
+ * master data — `mfg_date` / `expiry_date` (nullable; expiry is optional at
+ * intake, and FEFO orders by expiry ASC with nulls last). Created
+ * **idempotently** through the catalog facade's `ensureBatches` — never by a
+ * direct table write from another module (AD-6: catalog owns batch identity).
+ *
+ * `status` is the lifecycle flag ('active' | 'blocked'); a DB CHECK in the
+ * migration DDL enforces the set. The batch's *location and quantity* live in
+ * the inventory module's `batch_on_hand` projection — never here (AD-6:
+ * identity in catalog, stock state in inventory), and no location column
+ * exists on this table by design.
+ */
+export const batches = pgTable(
+  'batches',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    code: text('code').notNull(),
+    mfgDate: timestamp('mfg_date', { withTimezone: true, mode: 'string' }),
+    expiryDate: timestamp('expiry_date', { withTimezone: true, mode: 'string' }),
+    status: text('status').notNull().default('active'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('batches_tenant_sku_code_unique').on(table.tenantId, table.skuId, table.code),
+    index('batches_tenant_sku_idx').on(table.tenantId, table.skuId),
+  ],
+);
+
+export type Batch = typeof batches.$inferSelect;
+
+/**
+ * Serial identity (Story 2.4 — catalog-owned, beside `skus`): one row per
+ * (tenant, sku, serial_number) unit of a serial-tracked SKU. Created
+ * idempotently through the catalog facade's `ensureSerials` (AD-6).
+ *
+ * Like batches, **no location column exists here by design**: a serial's
+ * current location is *derived* from its latest `ledger_events` row (the
+ * inventory module's `(tenant_id, serial_ref, seq)` index) — the ledger is
+ * the only source of serial location and history, so there is nothing to
+ * reconcile. `status` is the lifecycle flag ('active' | 'blocked'), CHECK in
+ * the migration DDL.
+ */
+export const serials = pgTable(
+  'serials',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    serialNumber: text('serial_number').notNull(),
+    status: text('status').notNull().default('active'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('serials_tenant_sku_serial_unique').on(
+      table.tenantId,
+      table.skuId,
+      table.serialNumber,
+    ),
+    index('serials_tenant_sku_idx').on(table.tenantId, table.skuId),
+  ],
+);
+
+export type Serial = typeof serials.$inferSelect;
+
+/**
  * One row per import run (Story 1.4): `mode` is `initial` or `fix`, the
  * counts are the response snapshot's counts. **Fix-mode targeting is the
  * latest run** (newest created_at, id tiebreaker): the failed SKU codes of
@@ -391,8 +463,11 @@ export type CatalogImportError = typeof catalogImportErrors.$inferSelect;
  *   integer (`SignedQuantity`); positive deltas carry `to_bin_id`, negative
  *   deltas `from_bin_id` (both nullable — a transfer later story carries
  *   both).
- * - `batch_ref` / `serial_ref` — **reserved** nullable arms for Story 2.4;
- *   nothing populates them (the registry rejects non-null values).
+ * - `batch_ref` / `serial_ref` — the Story 2.4 batch/serial arms: the
+ *   catalog-owned `batches.id` / `serials.id` identity (as text), opened on
+ *   `stock.adjusted` by the registry; a serial-tracked movement is exactly
+ *   one event per unit (one `serial_ref` each). Old events with both null
+ *   verify identically — the arms are additive.
  * - `actor_user_id`, `occurred_at` (business time, client-supplied),
  *   `recorded_at` (commit time, server), `reference_doc` (the typed
  *   reference union arm as jsonb).
@@ -454,6 +529,19 @@ export const ledgerEvents = pgTable(
       table.createdAt,
       table.id,
     ),
+    // Story 2.4 traceability reads: one query per serial (full movement
+    // history, latest event = current location) and per batch — tenant-scoped
+    // (a serial's location can cross warehouses), seq-ordered.
+    index('ledger_events_tenant_serial_ref_seq_idx').on(
+      table.tenantId,
+      table.serialRef,
+      table.seq,
+    ),
+    index('ledger_events_tenant_batch_ref_seq_idx').on(
+      table.tenantId,
+      table.batchRef,
+      table.seq,
+    ),
   ],
 );
 
@@ -498,6 +586,53 @@ export const stockOnHand = pgTable(
 );
 
 export type StockOnHand = typeof stockOnHand.$inferSelect;
+
+/**
+ * Derived per-batch on-hand projection (Story 2.4): one row per
+ * (tenant, warehouse, SKU, bin, **batch**) — the batch-arm sibling of
+ * `stock_on_hand`, maintained in the SAME transaction as the ledger event
+ * that moves the batch (and re-derived by rebuild/reconcile exactly from the
+ * ledger). `batch_ref` on the event carries the `batches.id` identity; this
+ * table carries the quantity. Non-negative (the DB CHECK
+ * `batch_on_hand_quantity_nonnegative` in the migration DDL is the backstop;
+ * the fold rejects a batch over-draw first, naming the batch).
+ *
+ * RLS policy lives **only in the migration SQL** (0010, the 0006-0009
+ * pattern). Like `stock_on_hand`, this is a mutable projection: the only
+ * write paths are the append fold and the rebuild, both inside
+ * `modules/inventory/ledger.service.ts` (the architecture test pins it).
+ */
+export const batchOnHand = pgTable(
+  'batch_on_hand',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    binId: uuid('bin_id').notNull(),
+    batchId: uuid('batch_id').notNull(),
+    quantity: integer('quantity').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('batch_on_hand_scope_unique').on(
+      table.tenantId,
+      table.warehouseId,
+      table.skuId,
+      table.binId,
+      table.batchId,
+    ),
+    index('batch_on_hand_tenant_warehouse_sku_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.skuId,
+    ),
+  ],
+);
+
+export type BatchOnHand = typeof batchOnHand.$inferSelect;
 
 /**
  * Chain anchors (Story 2.1, AD-16 — the human Option A decision): chain

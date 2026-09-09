@@ -4,7 +4,7 @@ import { and, asc, desc, eq, gte, lte, or, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { ledgerEvents, stockOnHand } from '../../shared/db/schema';
+import { batchOnHand, ledgerEvents, stockOnHand } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { SignedQuantity } from '../../shared/primitives/quantity';
@@ -32,7 +32,12 @@ export interface LedgerMovement {
   readonly quantityDelta: SignedQuantity;
   readonly fromBinId: string | null;
   readonly toBinId: string | null;
-  /** Reserved for Story 2.4 — the registry rejects non-null values today. */
+  /**
+   * The Story 2.4 arms: the catalog-owned `batches.id` / `serials.id`
+   * identity (as text), gated by the registry. A serial-tracked movement is
+   * exactly one event per unit — one `serialRef` each, qty ±1. The batch
+   * fold and the serial guards key off these refs.
+   */
   readonly batchRef: string | null;
   readonly serialRef: string | null;
   readonly actorUserId: string;
@@ -60,6 +65,11 @@ export interface ReplayDivergence {
   readonly binId: string;
   readonly projectedQuantity: number | null;
   readonly replayedQuantity: number;
+  /**
+   * Story 2.4: set when the divergence is on the `batch_on_hand` projection
+   * (the batch arm of the scope) rather than the plain (sku, bin) quantity.
+   */
+  readonly batchRef?: string;
   /**
    * The divergent scope's event range inside the scan's compare window
    * (Story 2.2's bounded scan; the plain `replay` compares the whole ledger
@@ -100,6 +110,11 @@ export interface ChainVerifyReport {
 export interface RebuiltScope {
   readonly skuId: string;
   readonly binId: string;
+  /**
+   * Story 2.4: set when the repaired row is a `batch_on_hand` row (the batch
+   * arm of the scope) rather than the plain (sku, bin) quantity row.
+   */
+  readonly batchRef?: string;
   /** The stored projection before the repair (null: the row was missing). */
   readonly projectedQuantity: number | null;
   /** The replayed quantity written (the scope's row is at this value now). */
@@ -124,6 +139,20 @@ export interface RebuildReport {
  */
 export function warehouseAdvisoryLock(tenantId: string, warehouseId: string): SQL {
   return sql`select pg_advisory_xact_lock(hashtextextended(${tenantId} || ':' || ${warehouseId}, 0))`;
+}
+
+/**
+ * The tenant-wide serial-identity lock (Story 2.4, review loop 1): a serial's
+ * location can cross warehouses, so the per-warehouse lock alone does not
+ * serialize two concurrent appends of the same serial into different
+ * warehouses — the serial-arm guards (duplicate-serial / serial-elsewhere)
+ * read the serial's LATEST EVENT tenant-wide and are only race-free when
+ * every writer of that serial holds this lock first. Keyed on the tenant +
+ * serial identity (the catalog `serials.id`), transaction-scoped like the
+ * warehouse lock.
+ */
+export function serialAdvisoryLock(tenantId: string, serialRef: string): SQL {
+  return sql`select pg_advisory_xact_lock(hashtextextended(${tenantId} || ':serial:' || ${serialRef}, 0))`;
 }
 
 /** The verifiable digest artifact produced on demand over an event range. */
@@ -245,6 +274,118 @@ function insufficientOnHand(binCode: string, current: number, delta: number): Pr
   );
 }
 
+/** Batch over-draw: the batch's on-hand in the bin would go negative. */
+function insufficientBatchOnHand(batchRef: string, current: number, delta: number): ProblemException {
+  return new ProblemException(
+    'insufficient-on-hand',
+    422,
+    'Adjustment would drive the batch on-hand below zero',
+    `Batch "${batchRef}" currently holds ${current} in this bin; this movement of ${delta} would take it below zero.`,
+  );
+}
+
+/** Intake of a serial that already has a ledger location — 409 naming it. */
+function duplicateSerial(serialRef: string, locatedBinId: string): ProblemException {
+  return new ProblemException(
+    'duplicate-serial',
+    409,
+    'Serial is already located in a bin',
+    `Serial "${serialRef}" is already located in bin "${locatedBinId}" — a serial can live in only one place; draw it out before scanning it in again.`,
+  );
+}
+
+/** Draw of a serial whose current location is not the from-bin — 409 naming it. */
+function serialElsewhere(serialRef: string, locatedBinId: string): ProblemException {
+  return new ProblemException(
+    'serial-elsewhere',
+    409,
+    'Serial is located in another bin',
+    `Serial "${serialRef}" is currently located in bin "${locatedBinId}", not the bin this movement draws from.`,
+  );
+}
+
+/** Draw of a serial the ledger has never seen — 404. */
+function serialUnknown(serialRef: string): ProblemException {
+  return new ProblemException(
+    'serial-unknown',
+    404,
+    'Serial has no ledger location',
+    `Serial "${serialRef}" has never been moved — there is nothing to draw it from.`,
+  );
+}
+
+/**
+ * The serial's latest event (Story 2.4) — the ledger-derived state a guard
+ * reads: an intake event (`to_bin_id` set) means the serial IS in that bin; a
+ * draw event (`from_bin_id` set) means the serial is OUT of stock (last seen
+ * leaving that bin). Tenant-wide (a serial's location can cross warehouses),
+ * via the `(tenant_id, serial_ref, seq)` index — never projected (AD-6: the
+ * ledger is the only source of serial location and history).
+ */
+async function serialLatestEventInTx(
+  tx: TenantTx,
+  tenantId: string,
+  serialRef: string,
+): Promise<{ fromBinId: string | null; toBinId: string | null } | undefined> {
+  const rows = await tx
+    .select({ fromBinId: ledgerEvents.fromBinId, toBinId: ledgerEvents.toBinId })
+    .from(ledgerEvents)
+    .where(and(eq(ledgerEvents.tenantId, tenantId), eq(ledgerEvents.serialRef, serialRef)))
+    .orderBy(desc(ledgerEvents.seq))
+    .limit(1);
+  return rows[0];
+}
+
+/**
+ * The serial-arm guards (Story 2.4), enforced at ledger-write time — serial
+ * uniqueness-in-a-bin is the inventory module's rule (AD-6), never a catalog
+ * index. Serial-tracked movements are one event per unit (qty ±1), so the
+ * per-event check IS the per-unit check:
+ *
+ * - intake (`quantityDelta > 0`): the serial must not already live in a bin —
+ *   its latest event being an intake (any bin, the same one included: a
+ *   re-scan would double-count the unit) is a 409 `duplicate-serial` naming
+ *   that bin. A serial whose latest event is a DRAW is out of stock and may
+ *   re-enter (nothing lives anywhere).
+ * - draw (`quantityDelta < 0`): the serial's latest event must be an intake
+ *   into the movement's `fromBinId` — an intake into another bin is a 409
+ *   `serial-elsewhere` naming that bin, a serial already drawn out is a 409
+ *   `serial-elsewhere` naming its last-known bin, never-moved is a 404
+ *   `serial-unknown`.
+ *
+ * Runs under the per-warehouse advisory lock AND the tenant-wide serial lock
+ * (review loop 1 — the guard's read is tenant-wide, so the lock must be too)
+ * inside the append transaction, and reads the transaction's own prior
+ * writes — so the N events of one adjustment see each other, and a
+ * concurrent append of the same serial serializes behind the lock even
+ * across warehouses.
+ */
+async function assertSerialArmLegal(tx: TenantTx, movement: LedgerMovement): Promise<void> {
+  const serialRef = movement.serialRef;
+  if (serialRef === null) {
+    return;
+  }
+  const latest = await serialLatestEventInTx(tx, movement.tenantId, serialRef);
+  if (movement.quantityDelta > 0) {
+    if (latest !== undefined && latest.toBinId !== null) {
+      throw duplicateSerial(serialRef, latest.toBinId);
+    }
+  } else {
+    if (latest === undefined) {
+      throw serialUnknown(serialRef);
+    }
+    if (latest.toBinId !== null) {
+      // Currently in stock — the from-bin must be where it lives.
+      if (latest.toBinId !== movement.fromBinId) {
+        throw serialElsewhere(serialRef, latest.toBinId);
+      }
+    } else {
+      // Already drawn out of stock — nothing to draw again.
+      throw serialElsewhere(serialRef, latest.fromBinId!);
+    }
+  }
+}
+
 /**
  * The ledger core (Story 2.1): the ONLY code path that writes
  * `ledger_events` / `stock_on_hand` / `ledger_anchors`. Appends run
@@ -296,8 +437,20 @@ export class LedgerService {
     }
 
     // Concurrency: one writer per warehouse for this transaction. The lock
-    // is transaction-scoped — it dies with the commit/rollback.
+    // is transaction-scoped — it dies with the commit/rollback. A serial-arm
+    // movement additionally holds the tenant-wide serial lock (a serial's
+    // location can cross warehouses — the guards below are tenant-wide
+    // reads); the multi-serial caller pre-locks its whole set in sorted
+    // order via `lockSerialsInTx`, so this re-acquire is a no-op.
     await tx.execute(warehouseAdvisoryLock(movement.tenantId, movement.warehouseId));
+    if (movement.serialRef !== null) {
+      await tx.execute(serialAdvisoryLock(movement.tenantId, movement.serialRef));
+    }
+
+    // Story 2.4 serial guards: under the lock (so a concurrent scan of the
+    // same serial serializes behind it), before any write — a duplicate scan
+    // or a wrong-bin draw fails the whole transaction naming the conflict.
+    await assertSerialArmLegal(tx, movement);
 
     const headRows = await tx
       .select({ seq: ledgerEvents.seq, eventHash: ledgerEvents.eventHash })
@@ -359,11 +512,13 @@ export class LedgerService {
       eventHash,
     });
 
-    // Derived projection, same transaction: the to-bin RECEIVES the
+    // Derived projections, same transaction: the to-bin RECEIVES the
     // movement's magnitude, the from-bin RELEASES it (a later two-arm
     // transfer event carries the magnitude on both arms). An over-draw is
     // rejected naming the bin and its current on-hand — the whole
-    // transaction rolls back with it.
+    // transaction rolls back with it. The Story 2.4 batch arm folds the SAME
+    // magnitude into `batch_on_hand` beside the (sku, bin) fold — one event,
+    // one transaction, both projections.
     const touched: { binId: string; quantity: number }[] = [];
     const magnitude = Math.abs(movement.quantityDelta);
     if (movement.toBinId !== null) {
@@ -388,6 +543,30 @@ export class LedgerService {
       );
       touched.push({ binId: row.binId, quantity: row.quantity });
     }
+    if (movement.batchRef !== null) {
+      if (movement.toBinId !== null) {
+        await this.addToBatchOnHand(
+          tx,
+          movement.tenantId,
+          movement.warehouseId,
+          movement.skuId,
+          movement.toBinId,
+          movement.batchRef,
+          magnitude,
+        );
+      }
+      if (movement.fromBinId !== null) {
+        await this.addToBatchOnHand(
+          tx,
+          movement.tenantId,
+          movement.warehouseId,
+          movement.skuId,
+          movement.fromBinId,
+          movement.batchRef,
+          -magnitude,
+        );
+      }
+    }
 
     return {
       eventId,
@@ -398,6 +577,24 @@ export class LedgerService {
       recordedAt: movement.recordedAt,
       touched,
     };
+  }
+
+  /**
+   * Pre-locks a serial-tracked movement's WHOLE serial set, tenant-wide and
+   * in sorted (deterministic) acquisition order — review loop 1: two
+   * concurrent multi-serial adjustments whose sets overlap could otherwise
+   * deadlock acquiring their per-event serial locks in input order. Call
+   * once inside the movement's transaction BEFORE the first append; each
+   * append's own serial lock (same key) is then a re-entrant no-op.
+   */
+  async lockSerialsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    serialRefs: readonly string[],
+  ): Promise<void> {
+    for (const serialRef of [...serialRefs].sort()) {
+      await tx.execute(serialAdvisoryLock(tenantId, serialRef));
+    }
   }
 
   /**
@@ -455,6 +652,68 @@ export class LedgerService {
       .returning({ binId: stockOnHand.binId, quantity: stockOnHand.quantity });
     const row = rows[0]!;
     return { binId: row.binId, quantity: row.quantity };
+  }
+
+  /**
+   * The batch-arm fold (Story 2.4) — the `batch_on_hand` sibling of
+   * `addToOnHand`, in this same file and the same transaction: upserts the
+   * (tenant, warehouse, sku, bin, batch) scope with the signed delta. An
+   * over-draw beyond the BATCH's bin quantity is rejected naming the batch
+   * (the api layer names the code; here the ledger names the batchRef it was
+   * handed) — the whole transaction rolls back with it.
+   */
+  private async addToBatchOnHand(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    binId: string,
+    batchId: string,
+    delta: number,
+  ): Promise<{ binId: string; batchId: string; quantity: number }> {
+    const currentRows = await tx
+      .select({ quantity: batchOnHand.quantity })
+      .from(batchOnHand)
+      .where(
+        and(
+          eq(batchOnHand.tenantId, tenantId),
+          eq(batchOnHand.warehouseId, warehouseId),
+          eq(batchOnHand.skuId, skuId),
+          eq(batchOnHand.binId, binId),
+          eq(batchOnHand.batchId, batchId),
+        ),
+      )
+      .limit(1);
+    const current = currentRows[0]?.quantity ?? 0;
+    if (current + delta < 0) {
+      throw insufficientBatchOnHand(batchId, current, delta);
+    }
+
+    const rows = await tx
+      .insert(batchOnHand)
+      .values({
+        id: uuidv7(),
+        tenantId,
+        warehouseId,
+        skuId,
+        binId,
+        batchId,
+        // Same speculative-tuple CHECK clamp as `addToOnHand` above.
+        quantity: sql`greatest(${delta}, 0)`,
+      })
+      .onConflictDoUpdate({
+        target: [
+          batchOnHand.tenantId,
+          batchOnHand.warehouseId,
+          batchOnHand.skuId,
+          batchOnHand.binId,
+          batchOnHand.batchId,
+        ],
+        set: { quantity: sql`${batchOnHand.quantity} + ${delta}`, updatedAt: nowIso() },
+      })
+      .returning({ binId: batchOnHand.binId, batchId: batchOnHand.batchId, quantity: batchOnHand.quantity });
+    const row = rows[0]!;
+    return { binId: row.binId, batchId: row.batchId, quantity: row.quantity };
   }
 
   /**
@@ -784,6 +1043,9 @@ async function foldLedgerInTx(
 ): Promise<{
   replayed: Map<string, number>;
   windowScopes: Map<string, { fromSeq: number; toSeq: number }>;
+  /** Story 2.4: the batch-arm fold — per (sku, bin, batch) buckets. */
+  batchReplayed: Map<string, number>;
+  batchWindowScopes: Map<string, { fromSeq: number; toSeq: number }>;
   eventCount: number;
 }> {
   const conditions: SQL[] = [
@@ -810,6 +1072,7 @@ async function foldLedgerInTx(
       quantityDelta: ledgerEvents.quantityDelta,
       fromBinId: ledgerEvents.fromBinId,
       toBinId: ledgerEvents.toBinId,
+      batchRef: ledgerEvents.batchRef,
     })
     .from(ledgerEvents)
     .where(and(...conditions))
@@ -817,9 +1080,19 @@ async function foldLedgerInTx(
 
   const replayed = new Map<string, number>();
   const windowScopes = new Map<string, { fromSeq: number; toSeq: number }>();
-  const recordWindowScope = (key: string, seq: number): void => {
-    const range = windowScopes.get(key);
-    windowScopes.set(key, {
+  // Story 2.4: the batch arm folds the SAME events into per-(sku, bin, batch)
+  // buckets — keyed `${skuId}:${binId}:${batchId}` (uuids carry no ':', so
+  // the scope prefix parses unambiguously). Events without the batch arm
+  // touch nothing here.
+  const batchReplayed = new Map<string, number>();
+  const batchWindowScopes = new Map<string, { fromSeq: number; toSeq: number }>();
+  const recordWindowScope = (
+    scopes: Map<string, { fromSeq: number; toSeq: number }>,
+    key: string,
+    seq: number,
+  ): void => {
+    const range = scopes.get(key);
+    scopes.set(key, {
       fromSeq: Math.min(range?.fromSeq ?? seq, seq),
       toSeq: Math.max(range?.toSeq ?? seq, seq),
     });
@@ -831,23 +1104,41 @@ async function foldLedgerInTx(
       const key = replayKey(row.skuId, row.toBinId);
       replayed.set(key, (replayed.get(key) ?? 0) + magnitude);
       if (inWindow) {
-        recordWindowScope(key, row.seq);
+        recordWindowScope(windowScopes, key, row.seq);
+      }
+      if (row.batchRef !== null) {
+        const batchKey = batchReplayKey(row.skuId, row.toBinId, row.batchRef);
+        batchReplayed.set(batchKey, (batchReplayed.get(batchKey) ?? 0) + magnitude);
+        if (inWindow) {
+          recordWindowScope(batchWindowScopes, batchKey, row.seq);
+        }
       }
     }
     if (row.fromBinId !== null) {
       const key = replayKey(row.skuId, row.fromBinId);
       replayed.set(key, (replayed.get(key) ?? 0) - magnitude);
       if (inWindow) {
-        recordWindowScope(key, row.seq);
+        recordWindowScope(windowScopes, key, row.seq);
+      }
+      if (row.batchRef !== null) {
+        const batchKey = batchReplayKey(row.skuId, row.fromBinId, row.batchRef);
+        batchReplayed.set(batchKey, (batchReplayed.get(batchKey) ?? 0) - magnitude);
+        if (inWindow) {
+          recordWindowScope(batchWindowScopes, batchKey, row.seq);
+        }
       }
     }
   }
 
-  return { replayed, windowScopes, eventCount: rows.length };
+  return { replayed, windowScopes, batchReplayed, batchWindowScopes, eventCount: rows.length };
 }
 
 function replayKey(skuId: string, binId: string): string {
   return `${skuId}:${binId}`;
+}
+
+function batchReplayKey(skuId: string, binId: string, batchId: string): string {
+  return `${skuId}:${binId}:${batchId}`;
 }
 
 /**
@@ -863,7 +1154,7 @@ export async function replayInTx(
   skuId?: string,
   binId?: string,
 ): Promise<ReplayReport> {
-  const { replayed, eventCount } = await foldLedgerInTx(
+  const { replayed, batchReplayed, eventCount } = await foldLedgerInTx(
     tx,
     tenantId,
     warehouseId,
@@ -915,6 +1206,52 @@ export async function replayInTx(
     });
   }
 
+  // Story 2.4 rebuild parity: the `batch_on_hand` projection is replayed and
+  // compared by the same exactness rule — the ledger re-derives it too.
+  const batchScopeConditions: SQL[] = [
+    eq(batchOnHand.tenantId, tenantId),
+    eq(batchOnHand.warehouseId, warehouseId),
+  ];
+  if (skuId !== undefined) {
+    batchScopeConditions.push(eq(batchOnHand.skuId, skuId));
+  }
+  if (binId !== undefined) {
+    batchScopeConditions.push(eq(batchOnHand.binId, binId));
+  }
+  const projectedBatchRows = await tx
+    .select({
+      skuId: batchOnHand.skuId,
+      binId: batchOnHand.binId,
+      batchId: batchOnHand.batchId,
+      quantity: batchOnHand.quantity,
+    })
+    .from(batchOnHand)
+    .where(and(...batchScopeConditions));
+  for (const projected of projectedBatchRows) {
+    const key = batchReplayKey(projected.skuId, projected.binId, projected.batchId);
+    const replayedQuantity = batchReplayed.get(key) ?? 0;
+    if (replayedQuantity !== projected.quantity) {
+      divergences.push({
+        skuId: projected.skuId,
+        binId: projected.binId,
+        batchRef: projected.batchId,
+        projectedQuantity: projected.quantity,
+        replayedQuantity,
+      });
+    }
+    batchReplayed.delete(key);
+  }
+  for (const [key, replayedQuantity] of batchReplayed) {
+    const [skuIdPart, binIdPart, batchIdPart] = key.split(':');
+    divergences.push({
+      skuId: skuIdPart!,
+      binId: binIdPart!,
+      batchRef: batchIdPart!,
+      projectedQuantity: null,
+      replayedQuantity,
+    });
+  }
+
   return { warehouseId, eventCount, matches: divergences.length === 0, divergences };
 }
 
@@ -933,10 +1270,11 @@ export async function reconcileScanInTx(
   fromSeq: number,
   toSeq: number,
 ): Promise<ReplayReport> {
-  const { replayed, windowScopes, eventCount } = await foldLedgerInTx(tx, tenantId, warehouseId, {
-    toSeq,
-    windowFromSeq: fromSeq,
-  });
+  const { replayed, windowScopes, batchReplayed, batchWindowScopes, eventCount } =
+    await foldLedgerInTx(tx, tenantId, warehouseId, {
+      toSeq,
+      windowFromSeq: fromSeq,
+    });
 
   // The stored projection, read warehouse-wide (one MVCC-consistent read —
   // the scan takes no lock) and filtered in memory to the window's scopes.
@@ -969,6 +1307,39 @@ export async function reconcileScanInTx(
     }
   }
 
+  // Story 2.4: the batch arm is scanned under the same bounded-window rule —
+  // only batch scopes touched by window events are compared.
+  const projectedBatchRows = await tx
+    .select({
+      skuId: batchOnHand.skuId,
+      binId: batchOnHand.binId,
+      batchId: batchOnHand.batchId,
+      quantity: batchOnHand.quantity,
+    })
+    .from(batchOnHand)
+    .where(
+      and(eq(batchOnHand.tenantId, tenantId), eq(batchOnHand.warehouseId, warehouseId)),
+    );
+  const projectedBatchByKey = new Map(
+    projectedBatchRows.map((row) => [batchReplayKey(row.skuId, row.binId, row.batchId), row]),
+  );
+  for (const [key, range] of batchWindowScopes) {
+    const projected = projectedBatchByKey.get(key);
+    const replayedQuantity = batchReplayed.get(key) ?? 0;
+    if (projected === undefined || projected.quantity !== replayedQuantity) {
+      const [skuIdPart, binIdPart, batchIdPart] = key.split(':');
+      divergences.push({
+        skuId: skuIdPart!,
+        binId: binIdPart!,
+        batchRef: batchIdPart!,
+        projectedQuantity: projected?.quantity ?? null,
+        replayedQuantity,
+        fromSeq: range.fromSeq,
+        toSeq: range.toSeq,
+      });
+    }
+  }
+
   return { warehouseId, eventCount, matches: divergences.length === 0, divergences };
 }
 
@@ -991,7 +1362,7 @@ export async function rebuildProjectionsInTx(
   // Quantities are absolute: fold the whole ledger once (fresh reads — the
   // caller's repair transaction is read-committed, so anything that committed
   // between detection and this lock is included rather than clobbered).
-  const { replayed } = await foldLedgerInTx(tx, tenantId, warehouseId, {});
+  const { replayed, batchReplayed } = await foldLedgerInTx(tx, tenantId, warehouseId, {});
 
   const repaired: RebuiltScope[] = [];
   for (const scope of scopes) {
@@ -1030,10 +1401,18 @@ export async function rebuildProjectionsInTx(
           deleted: true,
         });
       }
+      // The batch arm of a scope with no events is empty by the same proof
+      // (batch buckets are a subset of the scope's events) — the shared
+      // batch re-fold below deletes any fabricated batch rows.
+      await rebuildBatchArmInTx(tx, tenantId, warehouseId, scope, batchReplayed, repaired);
       continue;
     }
     const quantity = replayed.get(key)!;
     if (existing !== undefined && existing.quantity === quantity) {
+      // The plain quantity already matches (e.g. fixed between detection and
+      // repair), but the batch arm of the SAME scope may still diverge — the
+      // re-fold below is unconditional and idempotent from the ledger.
+      await rebuildBatchArmInTx(tx, tenantId, warehouseId, scope, batchReplayed, repaired);
       continue; // already matches (e.g. fixed between detection and repair)
     }
     await tx
@@ -1057,8 +1436,97 @@ export async function rebuildProjectionsInTx(
       quantity,
       deleted: false,
     });
+    await rebuildBatchArmInTx(tx, tenantId, warehouseId, scope, batchReplayed, repaired);
   }
   return repaired;
+}
+
+/**
+ * The batch-arm re-fold (Story 2.4): rewrites every `batch_on_hand` row of
+ * one (sku, bin) scope to the replayed per-(sku, bin, batch) buckets —
+ * `batch_on_hand` re-derives exactly from the ledger, the same absolute
+ * recompute the plain quantity gets. Rows with no supporting event are
+ * fabricated (deleted); a row that already matches is left untouched.
+ * Mutates `repaired` (the caller's report) with one entry per rewritten row.
+ */
+async function rebuildBatchArmInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  scope: { skuId: string; binId: string },
+  batchReplayed: Map<string, number>,
+  repaired: RebuiltScope[],
+): Promise<void> {
+  const prefix = `${scope.skuId}:${scope.binId}:`;
+  const scopeBuckets = new Map<string, number>();
+  for (const [key, quantity] of batchReplayed) {
+    if (key.startsWith(prefix)) {
+      scopeBuckets.set(key.slice(prefix.length), quantity);
+    }
+  }
+
+  const existingRows = await tx
+    .select({ id: batchOnHand.id, batchId: batchOnHand.batchId, quantity: batchOnHand.quantity })
+    .from(batchOnHand)
+    .where(
+      and(
+        eq(batchOnHand.tenantId, tenantId),
+        eq(batchOnHand.warehouseId, warehouseId),
+        eq(batchOnHand.skuId, scope.skuId),
+        eq(batchOnHand.binId, scope.binId),
+      ),
+    );
+  for (const row of existingRows) {
+    const quantity = scopeBuckets.get(row.batchId);
+    if (quantity === undefined) {
+      // No events support this batch scope: the row is fabricated.
+      await tx.delete(batchOnHand).where(eq(batchOnHand.id, row.id));
+      repaired.push({
+        skuId: scope.skuId,
+        binId: scope.binId,
+        batchRef: row.batchId,
+        projectedQuantity: row.quantity,
+        quantity: 0,
+        deleted: true,
+      });
+      continue;
+    }
+    scopeBuckets.delete(row.batchId);
+    if (row.quantity === quantity) {
+      continue; // already matches
+    }
+    await tx
+      .update(batchOnHand)
+      .set({ quantity, updatedAt: nowIso() })
+      .where(eq(batchOnHand.id, row.id));
+    repaired.push({
+      skuId: scope.skuId,
+      binId: scope.binId,
+      batchRef: row.batchId,
+      projectedQuantity: row.quantity,
+      quantity,
+      deleted: false,
+    });
+  }
+  for (const [batchId, quantity] of scopeBuckets) {
+    await tx.insert(batchOnHand).values({
+      id: uuidv7(),
+      tenantId,
+      warehouseId,
+      skuId: scope.skuId,
+      binId: scope.binId,
+      batchId,
+      quantity,
+    });
+    repaired.push({
+      skuId: scope.skuId,
+      binId: scope.binId,
+      batchRef: batchId,
+      projectedQuantity: null,
+      quantity,
+      deleted: false,
+    });
+  }
 }
 
 /**

@@ -33,6 +33,18 @@ import { LedgerService } from './ledger.service';
  * response (no second event), same key + different payload is a 422
  * `idempotency-key-reuse`.
  */
+/** The client's batch input (Story 2.4) — identity fields plus the override reason. */
+export interface AdjustStockBatch {
+  readonly code: string;
+  readonly mfgDate?: string | undefined;
+  readonly expiryDate?: string | undefined;
+  /**
+   * Required when an explicit batch overrides the FEFO default on a draw —
+   * recorded verbatim in the ledger reference doc (the audit trail).
+   */
+  readonly overrideReason?: string | undefined;
+}
+
 export interface AdjustStockCommand {
   readonly tenantId: string;
   /** The session user — authority is re-read from the DB at command entry. */
@@ -50,6 +62,27 @@ export interface AdjustStockCommand {
    * controller passes the DTO's maybe-undefined field straight through.)
    */
   readonly occurredAt?: string | undefined;
+  // ── Story 2.4 (additive; all omitted on the untracked passthrough) ───────
+  /**
+   * The client's raw batch input — part of the idempotency fingerprint (a
+   * retry must replay on the same request body, not on FEFO's current
+   * opinion). The api layer resolves it to `batchRef` before calling.
+   */
+  readonly batch?: AdjustStockBatch | undefined;
+  /** The client's raw serial numbers — the fingerprint counterpart of `serialRefs`. */
+  readonly serials?: readonly string[] | undefined;
+  /**
+   * The resolved batch identity (the catalog `batches.id`) for the
+   * movement's batch arm — explicit code or FEFO default, composed at the
+   * api layer (catalog owns batch identity, AD-6). Null/omitted = no batch arm.
+   */
+  readonly batchRef?: string | null | undefined;
+  /**
+   * The resolved serial identities (catalog `serials.id`), same order as
+   * `serials`. Present only on serial-tracked movements: the command emits
+   * exactly one ledger event per serial unit (qty ±1, one transaction).
+   */
+  readonly serialRefs?: readonly string[] | undefined;
 }
 
 /** The API response body (the idempotency snapshot). */
@@ -82,6 +115,77 @@ export class StockAdjustmentCommand {
     @Inject(LedgerService) private readonly ledger: LedgerService,
   ) {}
 
+  /**
+   * The idempotency fingerprint over the command's business fields (fixed
+   * key order — see `hashCommandPayload`). Command-owned by design (review
+   * loop 1): the api layer's replay pre-check hashes through THIS method
+   * (via the facade) so a retry's replay decision and the command's own
+   * in-transaction comparison can never diverge. The Story 2.4 arms
+   * fingerprint the NORMALIZED raw request body — never the FEFO-resolved
+   * refs — so `JSON.stringify` drops undefined properties and a fieldless
+   * adjustment hashes byte-identically to its pre-2.4 shape.
+   */
+  fingerprint(command: AdjustStockCommand): string {
+    return hashCommandPayload({
+      tenantId: command.tenantId,
+      warehouseId: command.warehouseId,
+      skuId: command.skuId,
+      binId: command.binId,
+      quantityDelta: command.quantityDelta,
+      reasonCode: command.reasonCode,
+      note: command.note,
+      occurredAt: command.occurredAt,
+      batch:
+        command.batch === undefined
+          ? undefined
+          : {
+              code: command.batch.code,
+              mfgDate: command.batch.mfgDate,
+              expiryDate: command.batch.expiryDate,
+              overrideReason: command.batch.overrideReason,
+            },
+      // Null behaves as absent (normalized upstream too — never a 500 here).
+      serials: command.serials == null ? undefined : [...command.serials],
+    });
+  }
+
+  /**
+   * The api layer's replay pre-check (review loop 1 — "replay beats
+   * composition"): looks up the key's stored record OUTSIDE any composition
+   * and compares the payload hash — a match returns the stored snapshot so a
+   * retry replays even when the composition's current-state inputs (the
+   * FEFO batch's remaining stock, the bin's batch state) have since changed;
+   * a mismatch throws the deterministic 422 `idempotency-key-reuse` BEFORE
+   * the composition can create identity or surface a validation error; no
+   * row returns null and the caller proceeds to composition. The
+   * comparison stays command-owned (this is the same payload hash `adjust`
+   * re-checks inside its transaction — the in-transaction lookup remains
+   * the authority for concurrent duplicates).
+   */
+  async replayPriorSnapshot(
+    tenantId: string,
+    idempotencyKey: string,
+    payloadHash: string,
+  ): Promise<StockAdjustmentSnapshot | null> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select()
+        .from(idempotencyKeys)
+        .where(
+          and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)),
+        )
+        .limit(1);
+      const existing = rows[0];
+      if (existing === undefined) {
+        return null;
+      }
+      if (existing.payloadHash !== payloadHash) {
+        throw idempotencyKeyReuse();
+      }
+      return existing.responseSnapshot as StockAdjustmentSnapshot;
+    });
+  }
+
   async adjust(
     command: AdjustStockCommand,
     idempotencyKey: string,
@@ -105,19 +209,26 @@ export class StockAdjustmentCommand {
     }
     const delta = this.assertNonZeroDelta(command.quantityDelta);
 
+    // Serial-tracked movements move exactly one unit per event: the serial
+    // count must equal the movement's magnitude (400 otherwise — the api
+    // layer's DTO validation composes, this is the command's own backstop).
+    const serialRefs = command.serialRefs ?? [];
+    if (serialRefs.length > 0 && serialRefs.length !== Math.abs(delta)) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'quantityDelta must match the serial count',
+        `A serial-tracked movement writes one ledger event per serial unit — ${serialRefs.length} serials cannot move ${delta} units.`,
+      );
+    }
+
     // Stable fingerprint over the command's business fields (fixed key
     // order — see hashCommandPayload). An omitted occurredAt is absent
     // from both attempts, so the fingerprint is stable across retries.
-    const payloadHash = hashCommandPayload({
-      tenantId: command.tenantId,
-      warehouseId: command.warehouseId,
-      skuId: command.skuId,
-      binId: command.binId,
-      quantityDelta: command.quantityDelta,
-      reasonCode: command.reasonCode,
-      note: command.note,
-      occurredAt: command.occurredAt,
-    });
+    // The Story 2.4 fields fingerprint the RAW request body (not the
+    // FEFO-resolved ref): `JSON.stringify` drops undefined properties, so a
+    // fieldless adjustment hashes byte-identically to its pre-2.4 shape.
+    const payloadHash = this.fingerprint(command);
 
     const { snapshot, replayed } = await withTenantTransaction(
       this.db,
@@ -279,6 +390,14 @@ export class StockAdjustmentCommand {
    * The movement itself: a positive delta is an into-bin movement
    * (`to_bin_id`), a negative delta an out-of-bin movement (`from_bin_id`)
    * — the signed-delta envelope convention documented on `ledger_events`.
+   *
+   * Story 2.4 arms: a batch-tracked movement carries the resolved `batchRef`
+   * (and its reference doc carries the override reason when the client drew
+   * an explicit batch over the FEFO default); a serial-tracked movement is
+   * exactly ONE event per serial unit — N qty-±1 events in this one
+   * transaction, each with its own `serialRef`. The snapshot reports the
+   * last appended event and the bin's final on-hand (the response shape is
+   * unchanged — additive arms only).
    */
   private async adjustToSnapshot(
     tx: TenantTx,
@@ -286,25 +405,64 @@ export class StockAdjustmentCommand {
     delta: SignedQuantity,
     occurredAt: string,
   ): Promise<StockAdjustmentSnapshot> {
-    const appended = await this.ledger.appendMovement(tx, {
+    const serialRefs = command.serialRefs ?? [];
+    // Review loop 1: lock the whole serial set tenant-wide in sorted order
+    // BEFORE the first append — two concurrent multi-serial adjustments with
+    // overlapping serials must not deadlock acquiring per-event locks in
+    // input order (each append re-acquires its own serial's lock as a no-op).
+    if (serialRefs.length > 0) {
+      await this.ledger.lockSerialsInTx(tx, command.tenantId, serialRefs);
+    }
+    // One unit per serial event; a fieldless/batch-only movement moves the
+    // whole delta on one event.
+    const perEventDelta = (serialRefs.length > 0 ? Math.sign(delta) : delta) as SignedQuantity;
+    // The override reason rides the reference doc verbatim — the
+    // hash-chained ledger is the audit log (CHECKPOINT 1 resolution).
+    const referenceDoc = {
+      kind: 'manual-adjustment' as const,
+      reasonCode: command.reasonCode,
+      note: command.note,
+      ...(command.batch?.overrideReason !== undefined
+        ? { overrideReason: command.batch.overrideReason }
+        : {}),
+    };
+
+    // Zero deltas are rejected upstream (`assertNonZeroDelta`), so `< 0` /
+    // `> 0` partition every reachable delta — a zero-delta event would carry
+    // no bin on either arm.
+    let appended = await this.ledger.appendMovement(tx, {
       tenantId: command.tenantId,
       warehouseId: command.warehouseId,
       type: 'stock.adjusted',
       skuId: command.skuId,
-      quantityDelta: delta,
+      quantityDelta: perEventDelta,
       fromBinId: delta < 0 ? command.binId : null,
-      toBinId: delta >= 0 ? command.binId : null,
-      batchRef: null,
-      serialRef: null,
+      toBinId: delta > 0 ? command.binId : null,
+      batchRef: command.batchRef ?? null,
+      serialRef: serialRefs[0] ?? null,
       actorUserId: command.actorUserId,
       occurredAt,
       recordedAt: nowIso(),
-      referenceDoc: {
-        kind: 'manual-adjustment',
-        reasonCode: command.reasonCode,
-        note: command.note,
-      },
+      referenceDoc,
     });
+    for (let i = 1; i < serialRefs.length; i += 1) {
+      appended = await this.ledger.appendMovement(tx, {
+        tenantId: command.tenantId,
+        warehouseId: command.warehouseId,
+        type: 'stock.adjusted',
+        skuId: command.skuId,
+        quantityDelta: perEventDelta,
+        fromBinId: delta < 0 ? command.binId : null,
+        toBinId: delta > 0 ? command.binId : null,
+        batchRef: command.batchRef ?? null,
+        serialRef: serialRefs[i]!,
+        actorUserId: command.actorUserId,
+        occurredAt,
+        recordedAt: nowIso(),
+        referenceDoc,
+      });
+    }
+
     const touched = appended.touched[0]!;
     return {
       event: {
