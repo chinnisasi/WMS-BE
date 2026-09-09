@@ -235,6 +235,28 @@ export class StockAdjustmentResponse {
   onHand!: OnHandSnapshotDto;
 }
 
+/**
+ * The typed `reference_doc` union arm as it exists today (AD-11) — the
+ * timeline's passthrough. Future event kinds extend the union additively;
+ * this DTO documents the shape clients see today.
+ */
+export class LedgerReferenceDocDto {
+  @ApiProperty({ example: 'manual-adjustment', description: 'Discriminator of the typed reference union' })
+  kind!: string;
+
+  @ApiProperty({ description: 'Machine reason for the correction (e.g. stock-count)' })
+  reasonCode!: string;
+
+  @ApiProperty({ description: "The Ops Manager's note, carried verbatim" })
+  note!: string;
+
+  @ApiProperty({
+    required: false,
+    description: 'The recorded reason when a draw overrode the FEFO default batch (absent on every other adjustment)',
+  })
+  overrideReason?: string;
+}
+
 /** One event-timeline row. */
 export class LedgerEventDto {
   @ApiProperty({ format: 'uuid' })
@@ -257,6 +279,28 @@ export class LedgerEventDto {
 
   @ApiProperty()
   quantityDelta!: number;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: 'Story 2.4 batch arm — the catalog batch id; null on every arm-less (legacy) event',
+  })
+  batchRef!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: 'Story 2.4 serial arm — the catalog serial id; null on every arm-less (legacy) event',
+  })
+  serialRef!: string | null;
+
+  @ApiProperty({
+    type: LedgerReferenceDocDto,
+    nullable: true,
+    description:
+      'The typed reference document itself ({kind, reasonCode, note, overrideReason?} today) — the event\'s reference document, extended additively by future event kinds',
+  })
+  referenceDoc!: LedgerReferenceDocDto | null;
 
   @ApiProperty({ format: 'uuid' })
   actorUserId!: string;
@@ -281,4 +325,247 @@ export class LedgerEventListResponse {
 
   @ApiProperty({ type: String, nullable: true, required: false })
   nextCursor?: string | null;
+}
+
+// ── Story 2.5: the inventory read surfaces (stock, batches, serials) ──────
+
+/** Query of the stock-list read (keyset cursor pagination). */
+export class StockListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: 'Only rows of one SKU' })
+  @IsOptional()
+  @IsUUID()
+  skuId?: string;
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Only rows of one bin' })
+  @IsOptional()
+  @IsUUID()
+  binId?: string;
+
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
+/** One on-hand projection row of the stock list (no batch fields — plain stock truth). */
+export class StockEntryDto {
+  @ApiProperty({ format: 'uuid', description: 'The projection row id (the cursor tiebreaker)' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty({ description: 'On-hand in base UoM (non-negative)', minimum: 0 })
+  quantity!: number;
+
+  @ApiProperty({ description: 'ISO-8601 UTC projection-row commit time (the cursor sort key)' })
+  createdAt!: string;
+}
+
+/** GET …/warehouses/{warehouseId}/inventory/stock response. */
+export class StockListResponse {
+  @ApiProperty({ type: [StockEntryDto] })
+  items!: readonly StockEntryDto[];
+
+  @ApiProperty({ type: String, nullable: true, required: false })
+  nextCursor?: string | null;
+}
+
+/** Query of the batch list (the FEFO-ordered catalog × on-hand join). */
+export class BatchListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: 'The SKU whose batches are listed (required — 400 when omitted)' })
+  @IsOptional()
+  @IsUUID()
+  skuId?: string;
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Only on-hand rows of one bin (the quantity narrows with it)' })
+  @IsOptional()
+  @IsUUID()
+  binId?: string;
+}
+
+/** One batch-list row: catalog identity joined with its on-hand quantity. */
+export class BatchListItemDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: 'Batch code (unique per tenant + SKU)' })
+  code!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Manufacturing date (ISO-8601 UTC), null when unrecorded' })
+  mfgDate!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Expiry date (ISO-8601 UTC), null when unrecorded — orders last (FEFO)' })
+  expiryDate!: string | null;
+
+  @ApiProperty({ description: 'Batch lifecycle status (active today)' })
+  status!: string;
+
+  @ApiProperty({ description: 'On-hand of this batch in the queried warehouse (the bin filter applied; 0 when none)' })
+  quantity!: number;
+}
+
+/** GET …/warehouses/{warehouseId}/inventory/batches response (FEFO order). */
+export class BatchListResponse {
+  @ApiProperty({ type: [BatchListItemDto] })
+  items!: readonly BatchListItemDto[];
+}
+
+/** One per-bin on-hand row of a batch (the detail's "where the stock lives"). */
+export class BatchBinOnHandDto {
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty({ description: 'On-hand of the batch in this bin' })
+  quantity!: number;
+}
+
+/** One ledger event of a batch's movement history (oldest first). */
+export class BatchLedgerEntryDto {
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ description: 'Gap-free per-warehouse replay order' })
+  seq!: number;
+
+  @ApiProperty({ example: 'stock.adjusted' })
+  type!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ description: 'Signed base-UoM delta' })
+  quantityDelta!: number;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true })
+  fromBinId!: string | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true })
+  toBinId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The serial arm on a combined batch+serial event' })
+  serialRef!: string | null;
+
+  @ApiProperty({ description: 'ISO-8601 UTC business time' })
+  occurredAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC commit time' })
+  recordedAt!: string;
+
+  @ApiProperty({ description: 'sha256 over the canonical event bytes (chain link)' })
+  eventHash!: string;
+}
+
+/** GET …/inventory/batches/{batchId} response — identity, per-bin on-hand, full history. */
+export class BatchDetailResponse {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The SKU the batch belongs to' })
+  skuId!: string;
+
+  @ApiProperty({ description: 'Batch code (unique per tenant + SKU)' })
+  code!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Manufacturing date (ISO-8601 UTC), null when unrecorded' })
+  mfgDate!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Expiry date (ISO-8601 UTC), null when unrecorded' })
+  expiryDate!: string | null;
+
+  @ApiProperty({ description: 'Batch lifecycle status (active today)' })
+  status!: string;
+
+  @ApiProperty({ type: [BatchBinOnHandDto], description: 'Per-bin on-hand rows across every warehouse of the tenant' })
+  bins!: readonly BatchBinOnHandDto[];
+
+  @ApiProperty({ type: [BatchLedgerEntryDto], description: 'Full movement history (oldest first, one query)' })
+  history!: readonly BatchLedgerEntryDto[];
+}
+
+/** The serial's derived current location (the ledger's latest event's bin). */
+export class SerialLocationDto {
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+}
+
+/** One ledger event of a serial's movement history (oldest first). */
+export class SerialLedgerEntryDto {
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ description: 'Gap-free per-warehouse replay order' })
+  seq!: number;
+
+  @ApiProperty({ example: 'stock.adjusted' })
+  type!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ description: 'Signed base-UoM delta (±1 per serial unit)' })
+  quantityDelta!: number;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true })
+  fromBinId!: string | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true })
+  toBinId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The batch the unit moved with (null when unbatched)' })
+  batchRef!: string | null;
+
+  @ApiProperty({ description: 'ISO-8601 UTC business time' })
+  occurredAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC commit time' })
+  recordedAt!: string;
+
+  @ApiProperty({ description: 'sha256 over the canonical event bytes (chain link)' })
+  eventHash!: string;
+}
+
+/** GET …/inventory/serials/{serialId} response — identity, derived location, full history. */
+export class SerialDetailResponse {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The SKU the serial belongs to' })
+  skuId!: string;
+
+  @ApiProperty({ description: 'The serial number (unique per tenant + SKU)' })
+  serialNumber!: string;
+
+  @ApiProperty({ description: 'Serial lifecycle status (active today)' })
+  status!: string;
+
+  @ApiProperty({
+    type: SerialLocationDto,
+    nullable: true,
+    description: 'Derived current location — the ledger’s latest event’s bin (tenant-wide); null when never moved',
+  })
+  location!: SerialLocationDto | null;
+
+  @ApiProperty({ type: [SerialLedgerEntryDto], description: 'Full movement history (oldest first, one query)' })
+  history!: readonly SerialLedgerEntryDto[];
 }

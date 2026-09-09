@@ -2,13 +2,14 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { batchOnHand, ledgerEvents } from '../../shared/db/schema';
+import { batchOnHand, ledgerEvents, stockOnHand } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { canonicalInstant, LedgerService } from './ledger.service';
+import type { LedgerReferenceDoc } from './ledger-registry';
 import type {
   ChainAnchor,
   ChainBreakReport,
@@ -29,7 +30,14 @@ import type {
   ReservationSnapshot,
 } from './reservation.service';
 
-/** One event-timeline row (the read model of the ledger). */
+/**
+ * One event-timeline row (the read model of the ledger). Story 2.5 adds the
+ * additive traceability passthroughs: `batchRef` / `serialRef` (the 2.4 arms
+ * — null on every arm-less event, so legacy items serialize identically
+ * apart from the new null fields) and `referenceDoc` (the typed reference
+ * union arm itself — `{kind, reasonCode, note, overrideReason?}` today,
+ * extended additively by future event kinds).
+ */
 export interface LedgerTimelineEntry {
   readonly id: string;
   readonly seq: number;
@@ -38,6 +46,9 @@ export interface LedgerTimelineEntry {
   readonly fromBinId: string | null;
   readonly toBinId: string | null;
   readonly quantityDelta: number;
+  readonly batchRef: string | null;
+  readonly serialRef: string | null;
+  readonly referenceDoc: LedgerReferenceDoc;
   readonly actorUserId: string;
   readonly occurredAt: string;
   readonly recordedAt: string;
@@ -60,6 +71,41 @@ export interface BatchOnHandEntry {
   readonly binId: string;
   readonly batchId: string;
   readonly quantity: number;
+}
+
+/**
+ * One per-bin on-hand row of a tenant-wide batch read (Story 2.5) — the
+ * batch detail's "where the stock lives" rows. `batchId` is the query key
+ * (implied); the skuId rides along for parity/diagnostics only — the api
+ * layer performs no cross-check against it.
+ */
+export interface BatchBinOnHandEntry {
+  readonly warehouseId: string;
+  readonly skuId: string;
+  readonly binId: string;
+  readonly quantity: number;
+}
+
+/**
+ * One on-hand projection row of the Story 2.5 stock list — plain
+ * `stock_on_hand` truth for any SKU (tracked or not; no batch fields — the
+ * untracked passthrough is the row itself).
+ */
+export interface StockOnHandEntry {
+  readonly id: string;
+  readonly warehouseId: string;
+  readonly skuId: string;
+  readonly binId: string;
+  readonly quantity: number;
+  readonly createdAt: string;
+}
+
+/** Query of the Story 2.5 stock-list read (keyset cursor pagination). */
+export interface StockListQuery {
+  readonly skuId?: string | undefined;
+  readonly binId?: string | undefined;
+  readonly cursor?: string | undefined;
+  readonly limit?: number | undefined;
 }
 
 /** One ledger event of a serial's movement history (oldest first). */
@@ -216,6 +262,11 @@ export class InventoryFacade {
           fromBinId: ledgerEvents.fromBinId,
           toBinId: ledgerEvents.toBinId,
           quantityDelta: ledgerEvents.quantityDelta,
+          // Story 2.5's additive traceability passthroughs — null arms on
+          // arm-less (legacy) events, the reference doc verbatim (jsonb).
+          batchRef: ledgerEvents.batchRef,
+          serialRef: ledgerEvents.serialRef,
+          referenceDoc: ledgerEvents.referenceDoc,
           actorUserId: ledgerEvents.actorUserId,
           occurredAt: ledgerEvents.occurredAt,
           recordedAt: ledgerEvents.recordedAt,
@@ -240,8 +291,63 @@ export class InventoryFacade {
       // verifier and cursors rely on (one shared normalizer, no dup).
       const items = rows.map((row) => ({
         ...row,
+        // jsonb selects as `unknown` — the timeline's typed passthrough (the
+        // verifier's own cast pattern, ledger.service).
+        referenceDoc: row.referenceDoc as LedgerReferenceDoc,
         occurredAt: canonicalInstant(row.occurredAt),
         recordedAt: canonicalInstant(row.recordedAt),
+        createdAt: canonicalInstant(row.createdAt),
+      }));
+      return buildPage(items, pageSize);
+    });
+  }
+
+  /**
+   * Stock-list read (Story 2.5): one warehouse's on-hand projection, keyset
+   * cursor pagination exactly like `listEvents` (the table carries both
+   * `created_at` and `id`), optionally narrowed to one SKU and/or one bin.
+   * Plain `stock_on_hand` rows — tracked and untracked SKUs alike, no batch
+   * fields (the untracked passthrough is the row itself). A read — never
+   * capability-gated; the warehouse must belong to the tenant (404
+   * otherwise).
+   */
+  async listStock(
+    tenantId: string,
+    warehouseId: string,
+    query: StockListQuery = {},
+  ): Promise<Page<StockOnHandEntry>> {
+    // The route-level DTO already bounds `limit` (1..200) — pass it
+    // straight through; clamping here would silently rewrite a bad
+    // request instead of rejecting it.
+    const pageSize = query.limit ?? DEFAULT_TIMELINE_PAGE_SIZE;
+    const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      const rows = await tx
+        .select({
+          id: stockOnHand.id,
+          warehouseId: stockOnHand.warehouseId,
+          skuId: stockOnHand.skuId,
+          binId: stockOnHand.binId,
+          quantity: stockOnHand.quantity,
+          createdAt: stockOnHand.createdAt,
+        })
+        .from(stockOnHand)
+        .where(
+          and(
+            eq(stockOnHand.tenantId, tenantId),
+            eq(stockOnHand.warehouseId, warehouseId),
+            query.skuId === undefined ? undefined : eq(stockOnHand.skuId, query.skuId),
+            query.binId === undefined ? undefined : eq(stockOnHand.binId, query.binId),
+            before === undefined
+              ? undefined
+              : sql`(${stockOnHand.createdAt}, ${stockOnHand.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
+          ),
+        )
+        .orderBy(desc(stockOnHand.createdAt), desc(stockOnHand.id))
+        .limit(pageSize + 1);
+      const items = rows.map((row) => ({
+        ...row,
         createdAt: canonicalInstant(row.createdAt),
       }));
       return buildPage(items, pageSize);
@@ -381,7 +487,7 @@ export class InventoryFacade {
   async batchOnHand(
     tenantId: string,
     warehouseId: string,
-    query: { skuId?: string; binId?: string } = {},
+    query: { skuId?: string | undefined; binId?: string | undefined } = {},
   ): Promise<BatchOnHandEntry[]> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
@@ -404,6 +510,29 @@ export class InventoryFacade {
         )
         .orderBy(asc(batchOnHand.batchId));
     });
+  }
+
+  /**
+   * Tenant-wide per-bin on-hand of ONE batch (Story 2.5): the batch detail
+   * route's "where the stock lives" rows — the `batch_on_hand` projection
+   * read by batch identity across every warehouse of the tenant (a batch's
+   * identity is tenant-scoped; its stock can sit in any bin). A read —
+   * never capability-gated; no warehouse assert (the rows name their
+   * warehouse).
+   */
+  async batchBinsOnHand(tenantId: string, batchId: string): Promise<BatchBinOnHandEntry[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) =>
+      tx
+        .select({
+          warehouseId: batchOnHand.warehouseId,
+          skuId: batchOnHand.skuId,
+          binId: batchOnHand.binId,
+          quantity: batchOnHand.quantity,
+        })
+        .from(batchOnHand)
+        .where(and(eq(batchOnHand.tenantId, tenantId), eq(batchOnHand.batchId, batchId)))
+        .orderBy(asc(batchOnHand.warehouseId), asc(batchOnHand.binId)),
+    );
   }
 
   /**

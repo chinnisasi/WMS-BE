@@ -65,6 +65,10 @@ export interface EnsureBatchInput {
  * tenant+sku+code/serial-number) so the api layer can compose an adjustment:
  * ensure identity here, then hand the resolved ids to the inventory facade
  * (which owns location/quantity/uniqueness-in-a-bin — never this module).
+ *
+ * Story 2.5: the detail routes' catalog 404 checks — tiny `findBatch` /
+ * `findSerial` existence reads (null when the id is unknown or foreign),
+ * checked at the api layer before any detail query (CHECKPOINT 1).
  */
 @Injectable()
 export class CatalogFacade {
@@ -138,6 +142,56 @@ export class CatalogFacade {
         .where(and(eq(batches.tenantId, tenantId), eq(batches.skuId, skuId)))
         .orderBy(batches.code);
       return rows;
+    });
+  }
+
+  /**
+   * The one batch existence read (Story 2.5): null when the id is unknown or
+   * foreign — the batch detail route's catalog 404 check, before any
+   * inventory read. The `skuId` rides along (a batch's SKU identity).
+   */
+  async findBatch(
+    tenantId: string,
+    batchId: string,
+  ): Promise<(BatchIdentity & { readonly skuId: string }) | null> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({
+          id: batches.id,
+          skuId: batches.skuId,
+          code: batches.code,
+          mfgDate: batches.mfgDate,
+          expiryDate: batches.expiryDate,
+          status: batches.status,
+        })
+        .from(batches)
+        .where(and(eq(batches.tenantId, tenantId), eq(batches.id, batchId)))
+        .limit(1);
+      return rows[0] ?? null;
+    });
+  }
+
+  /**
+   * The one serial existence read (Story 2.5): null when the id is unknown
+   * or foreign — the serial detail route's catalog 404 check, before any
+   * ledger read. The `skuId` rides along (a serial's SKU identity).
+   */
+  async findSerial(
+    tenantId: string,
+    serialId: string,
+  ): Promise<(SerialIdentity & { readonly skuId: string }) | null> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({
+          id: serials.id,
+          skuId: serials.skuId,
+          serialNumber: serials.serialNumber,
+          status: serials.status,
+        })
+        .from(serials)
+        .where(and(eq(serials.tenantId, tenantId), eq(serials.id, serialId)))
+        .limit(1);
+      return rows[0] ?? null;
     });
   }
 
