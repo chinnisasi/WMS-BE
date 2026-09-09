@@ -438,7 +438,15 @@ export class LedgerService {
         warehouseId,
         skuId,
         binId,
-        quantity: delta,
+        // Postgres evaluates the table CHECK on the speculative insert tuple
+        // BEFORE the arbiter detects the conflict — a negative delta against
+        // an existing row would fail the non-negative CHECK on the discarded
+        // row even though the UPDATE arm below is the one that lands. The
+        // insert arm only ever fires for a fresh scope, where the
+        // insufficient-on-hand guard above already guarantees delta > 0 — so
+        // clamping the speculative tuple at 0 changes nothing real and keeps
+        // negative adjustments off the CHECK.
+        quantity: sql`greatest(${delta}, 0)`,
       })
       .onConflictDoUpdate({
         target: [stockOnHand.tenantId, stockOnHand.warehouseId, stockOnHand.skuId, stockOnHand.binId],

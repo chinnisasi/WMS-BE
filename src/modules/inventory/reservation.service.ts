@@ -20,6 +20,17 @@ import {
 export const DEFAULT_RESERVATION_TTL_SECONDS = 900;
 
 /**
+ * Hold TTL upper bound (review loop 1): a sane ceiling on how far out a hold
+ * may promise — ten years. Beyond it the journal's `expires_at` would be an
+ * invalid date (raw 500 after compensating), so the bound is validated up
+ * front like every other grant input.
+ */
+export const MAX_RESERVATION_TTL_SECONDS = 10 * 365 * 24 * 3600;
+
+/** The uuid shape of every reservation id (the terminal-transition guard). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
  * Valkey counter keys' TTL seconds — a BACKSTOP only (story 2.3): a counter
  * that outlives all writes eventually vanishes, and a vanished counter fails
  * closed (missing under a ready marker = divergence) into the journal-driven
@@ -32,9 +43,10 @@ export const REAP_BATCH = 100;
 
 /**
  * Zero-valued named hooks (story 2.3 boundary): QC holds and channel buffers
- * subtract from ATP but have no surface in this story — the hooks are where
- * Epic 4/7 plug their computations in (callers pass the scope through, so the
- * formula `on-hand − reserved − QC-held − buffer` never changes).
+ * subtract from ATP but have no surface in this story — these are the
+ * zero-valued placeholders where Epic 4/7 will plug in their (scope-aware)
+ * computations, so the formula `on-hand − reserved − QC-held − buffer` never
+ * changes.
  */
 export function qcHeldUnits(): number {
   return 0;
@@ -127,6 +139,18 @@ function unavailable(detail: string): ProblemException {
   return new ProblemException('unavailable', 409, 'Stock unavailable', detail);
 }
 
+/** Rejects a malformed/empty scope id at the boundary — 400, never a raw 22P02. */
+function requireUuid(value: string, name: string): void {
+  if (!UUID_RE.test(value)) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      `${name} must be a well-formed uuid`,
+      `The ${name} scope id must be a non-empty uuid (got ${value === '' ? "''" : `"${value}"`}).`,
+    );
+  }
+}
+
 /**
  * Reservations (story 2.3, AD-2/AD-12): the ONE atomic decision point for
  * sellable stock. Valkey carries per-(warehouse, sku) reserved counters behind
@@ -196,6 +220,9 @@ export class ReservationService implements OnModuleInit {
    */
   async grant(command: GrantReservationCommand): Promise<ReservationSnapshot> {
     const { tenantId, warehouseId, skuId, ownerType, ownerId } = command;
+    requireUuid(tenantId, 'tenantId');
+    requireUuid(warehouseId, 'warehouseId');
+    requireUuid(skuId, 'skuId');
     if (ownerType === '' || ownerId === '') {
       throw new ProblemException(
         'validation-failed',
@@ -213,12 +240,12 @@ export class ReservationService implements OnModuleInit {
       );
     }
     const ttlSeconds = command.ttlSeconds ?? DEFAULT_RESERVATION_TTL_SECONDS;
-    if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
+    if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0 || ttlSeconds > MAX_RESERVATION_TTL_SECONDS) {
       throw new ProblemException(
         'validation-failed',
         400,
-        'ttlSeconds must be a non-negative integer',
-        `ttlSeconds must be a non-negative integer of seconds (got ${String(ttlSeconds)}).`,
+        'ttlSeconds out of range',
+        `ttlSeconds must be an integer between 0 and ${MAX_RESERVATION_TTL_SECONDS} (got ${String(ttlSeconds)}).`,
       );
     }
     const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
@@ -232,7 +259,7 @@ export class ReservationService implements OnModuleInit {
       ceiling: await this.committedCeiling(tx, tenantId, warehouseId, skuId),
     }));
     if (probe.existing !== undefined) {
-      return toSnapshot(probe.existing); // idempotent repeat while held
+      return this.idempotentHit(probe.existing, command);
     }
 
     const granted = await this.runGrantScript(counterKey, readyKey, tenantId, warehouseId, skuId, {
@@ -271,12 +298,13 @@ export class ReservationService implements OnModuleInit {
       if (isUniqueViolationOn(err, 'reservations_open_owner_scope_unique')) {
         // A concurrent grant for the SAME owner scope won the journal insert:
         // re-probe — if its row is visible this grant collapses into it
-        // (idempotency), else the caller retries against a settled state.
+        // (idempotency — same quantity only), else the caller retries against
+        // a settled state.
         const existing = await withTenantTransaction(this.db, tenantId, (tx) =>
           this.findOpenHold(tx, command),
         );
         if (existing !== undefined) {
-          return toSnapshot(existing);
+          return this.idempotentHit(existing, command);
         }
         throw new ProblemException(
           'conflict',
@@ -290,12 +318,37 @@ export class ReservationService implements OnModuleInit {
   }
 
   /**
+   * The idempotent repeat (review loop 1 decision): a same-quantity replay
+   * while held returns the existing reservation untouched; a replay whose
+   * quantity DIFFERS is a deterministic 409 conflict — silently returning the
+   * hold would let a caller under-hold (ask for 5, keep 2) with a
+   * success-shaped reply.
+   */
+  private idempotentHit(existing: Reservation, command: GrantReservationCommand): ReservationSnapshot {
+    if (existing.quantity !== command.quantity) {
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Reservation quantity mismatch',
+        `This owner scope already holds ${existing.quantity} unit(s); a repeat grant for ` +
+          `${command.quantity} would change the hold — release the existing one first.`,
+      );
+    }
+    return toSnapshot(existing);
+  }
+
+  /**
    * `held → committed` (the consuming flow claims its hold): serialized
    * through the conditional UPDATE — exactly one winner; a second commit is a
    * deterministic conflict. The counter is UNTOUCHED: committed units stay
    * deducted until the consuming ledger movement (Epic 4) moves stock.
    */
   async commit(tenantId: string, reservationId: string): Promise<ReservationSnapshot> {
+    if (!UUID_RE.test(reservationId)) {
+      // A non-uuid id cannot be a row — the contract's 404, not a raw
+      // 22P02 from feeding the garbage into `eq(uuid, …)`.
+      return this.terminalNotFound(reservationId);
+    }
     const rows = await withTenantTransaction(this.db, tenantId, (tx) =>
       tx
         .update(reservations)
@@ -324,6 +377,9 @@ export class ReservationService implements OnModuleInit {
    * Postgres by the next rebuild.
    */
   async release(tenantId: string, reservationId: string): Promise<ReservationSnapshot> {
+    if (!UUID_RE.test(reservationId)) {
+      return this.terminalNotFound(reservationId);
+    }
     const rows = await withTenantTransaction(this.db, tenantId, (tx) =>
       tx
         .update(reservations)
@@ -354,6 +410,9 @@ export class ReservationService implements OnModuleInit {
    * (Postgres wins) before the read.
    */
   async atp(tenantId: string, warehouseId: string, skuId: string): Promise<AtpSnapshot> {
+    requireUuid(tenantId, 'tenantId');
+    requireUuid(warehouseId, 'warehouseId');
+    requireUuid(skuId, 'skuId');
     const onHand = await withTenantTransaction(this.db, tenantId, (tx) =>
       this.committedOnHand(tx, tenantId, warehouseId, skuId),
     );
@@ -380,10 +439,13 @@ export class ReservationService implements OnModuleInit {
       const current = await this.valkey.getCounter(counterKey);
       if (current === null) {
         // Divergence (counter missing while ready): repair toward Postgres —
-        // the journal's live-state sum — before reading.
+        // the journal's live-state sum — before reading. The snapshot reads
+        // the counter BACK after the heal: the journal sum was read before
+        // the SET NX, and a concurrent re-creation (or a concurrent winning
+        // script the NX skipped) must not be overwritten by a stale figure.
         const sum = await this.journalReservedSum(tenantId, warehouseId, skuId);
         await this.valkey.setCounter(counterKey, sum, COUNTER_TTL_SECONDS, false);
-        reserved = sum;
+        reserved = (await this.valkey.getCounter(counterKey)) ?? sum;
       } else {
         reserved = current;
       }
@@ -413,6 +475,10 @@ export class ReservationService implements OnModuleInit {
    * when no warehouse is named.
    */
   async rebuildCounters(tenantId: string, warehouseId?: string): Promise<ReservationRebuildReport[]> {
+    requireUuid(tenantId, 'tenantId');
+    if (warehouseId !== undefined) {
+      requireUuid(warehouseId, 'warehouseId');
+    }
     const targets =
       warehouseId !== undefined
         ? [warehouseId]
@@ -499,26 +565,108 @@ export class ReservationService implements OnModuleInit {
 
     let expired = 0;
     for (const hold of due) {
-      const rows = await withTenantTransaction(this.db, hold.tenantId, (tx) =>
-        tx
-          .update(reservations)
-          .set({ state: 'expired', updatedAt: nowIso() })
-          .where(
-            and(
-              eq(reservations.id, hold.id),
-              eq(reservations.tenantId, hold.tenantId),
-              eq(reservations.state, 'held'),
-            ),
-          )
-          .returning(),
-      );
-      if (rows[0] === undefined) {
-        continue; // a concurrent terminal writer won the row — not ours to count
+      // One poison hold (a repeatedly-failing tenant tx) must not abort the
+      // cycle — it re-selects first every cycle, so a thrown row would
+      // starve every later due hold in the batch. Log and continue.
+      try {
+        const rows = await withTenantTransaction(this.db, hold.tenantId, (tx) =>
+          tx
+            .update(reservations)
+            .set({ state: 'expired', updatedAt: nowIso() })
+            .where(
+              and(
+                eq(reservations.id, hold.id),
+                eq(reservations.tenantId, hold.tenantId),
+                eq(reservations.state, 'held'),
+              ),
+            )
+            .returning(),
+        );
+        if (rows[0] === undefined) {
+          continue; // a concurrent terminal writer won the row — not ours to count
+        }
+        expired += 1;
+        await this.restoreCounter(rows[0], 'expiry');
+      } catch (err) {
+        this.logger.error(
+          `Reservation reaper could not expire hold ${hold.id} — skipped this cycle: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
       }
-      expired += 1;
-      await this.restoreCounter(rows[0], 'expiry');
     }
+    await this.parityPass();
     return expired;
+  }
+
+  /**
+   * The scheduled parity pass (review loop 1 decision): every reaper cycle
+   * ALSO compares each live scope's Valkey counter against its journal sum
+   * (`state IN ('held','committed')`) and triggers a warehouse rebuild from
+   * the journal on any value mismatch — a counter that is PRESENT but WRONG
+   * (the rebuild residual race, a failed compensation/restore) is repaired
+   * toward Postgres instead of persisting silently. A missing counter at a
+   * non-zero sum is a mismatch too (the grant/ATP heal arms repair it lazily;
+   * the scheduled pass closes it on a bound); a missing counter at sum 0 is
+   * not — nothing to repair. Failures log and wait for the next cycle:
+   * expiry, not parity, is the reaper's primary job, and a parity read that
+   * cannot reach Valkey must not fail the expiry cycle.
+   */
+  private async parityPass(): Promise<void> {
+    let live: { tenantId: string; warehouseId: string; skuId: string; reserved: number }[];
+    try {
+      live = (await this.authDb.execute(sql`
+        select tenant_id as "tenantId", warehouse_id as "warehouseId",
+               sku_id as "skuId", coalesce(sum(quantity), 0)::int as reserved
+        from reservations
+        where state in ('held', 'committed')
+        group by tenant_id, warehouse_id, sku_id
+      `)) as unknown as typeof live;
+    } catch (err) {
+      this.logger.error(
+        `Reservation parity pass could not read the journal — retried next cycle: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    if (live.length === 0) {
+      return;
+    }
+    // Group by (tenant, warehouse): one rebuild heals a whole warehouse.
+    const scopes = new Map<string, Map<string, Map<string, number>>>();
+    for (const { tenantId, warehouseId, skuId, reserved } of live) {
+      const warehouseMap = scopes.get(tenantId) ?? new Map<string, Map<string, number>>();
+      const skuSums = warehouseMap.get(warehouseId) ?? new Map<string, number>();
+      skuSums.set(skuId, reserved);
+      warehouseMap.set(warehouseId, skuSums);
+      scopes.set(tenantId, warehouseMap);
+    }
+    for (const [tenantId, warehouseMap] of scopes) {
+      for (const [warehouseId, skuSums] of warehouseMap) {
+        try {
+          let divergent = false;
+          for (const [skuId, reserved] of skuSums) {
+            const counter = await this.valkey.getCounter(reservationCounterKey(tenantId, warehouseId, skuId));
+            if (counter === null ? reserved > 0 : counter !== reserved) {
+              divergent = true;
+              break;
+            }
+          }
+          if (divergent) {
+            this.logger.warn(
+              `Reservation parity pass found a divergent counter — rebuilding from the ` +
+                `journal (Postgres wins): tenant=${tenantId} warehouse=${warehouseId}`,
+            );
+            await this.rebuildCounters(tenantId, warehouseId);
+          }
+        } catch (err) {
+          this.logger.error(
+            `Reservation parity pass failed for warehouse ${warehouseId} — retried next cycle: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
   }
 
   /**
@@ -568,8 +716,19 @@ export class ReservationService implements OnModuleInit {
       return false;
     }
     if (reply[1] === 'missing-counter') {
-      const sum = await this.journalReservedSum(tenantId, warehouseId, skuId);
-      await this.valkey.setCounter(counterKey, sum, COUNTER_TTL_SECONDS, false);
+      // The repair itself can fail (journal read or Valkey write): like every
+      // other arm, it must surface as the deterministic loss the caller
+      // rejects with `unavailable`, never an unclassified error.
+      try {
+        const sum = await this.journalReservedSum(tenantId, warehouseId, skuId);
+        await this.valkey.setCounter(counterKey, sum, COUNTER_TTL_SECONDS, false);
+      } catch (err) {
+        this.logger.error(
+          `Reservation missing-counter repair failed — grant fails closed: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+        return false;
+      }
       try {
         const retry = await this.valkey.grantReservation(
           counterKey,
@@ -737,6 +896,9 @@ export class ReservationService implements OnModuleInit {
 
   /** A row lost by the conditional UPDATE: 404 when absent, else 409 conflict. */
   private async terminalConflict(tenantId: string, reservationId: string): Promise<never> {
+    if (!UUID_RE.test(reservationId)) {
+      return this.terminalNotFound(reservationId);
+    }
     const rows = await withTenantTransaction(this.db, tenantId, (tx) =>
       tx
         .select({ state: reservations.state })
@@ -758,6 +920,16 @@ export class ReservationService implements OnModuleInit {
       409,
       'Reservation is not held',
       `The reservation is already terminal (state "${row.state}") — exactly one terminal transition wins (AD-12).`,
+    );
+  }
+
+  /** The terminal transition's not-found outcome (malformed ids included). */
+  private terminalNotFound(reservationId: string): never {
+    throw new ProblemException(
+      'not-found',
+      404,
+      'Reservation not found',
+      `No reservation with id ${reservationId} exists in this tenant.`,
     );
   }
 

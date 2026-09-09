@@ -99,10 +99,17 @@ export class ValkeyClient implements OnApplicationShutdown {
     }
   }
 
-  /** The counter's current value, or null when the key is absent. */
+  /** The counter's current value, or null when the key is absent/corrupt. */
   async getCounter(key: string): Promise<number | null> {
     const raw = await this.redis().get(key);
-    return raw === null ? null : Number(raw);
+    if (raw === null) {
+      return null;
+    }
+    // A corrupt (non-numeric, non-integer or negative) value is divergence,
+    // not a number: null sends the caller down the heal-from-journal path
+    // (Postgres wins). A reserved counter is always a non-negative integer.
+    const parsed = Number(raw);
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
   }
 
   /** Arms the warehouse's ready marker (rebuild complete). */
