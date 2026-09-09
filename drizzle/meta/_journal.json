@@ -50,6 +50,13 @@
       "when": 1788887193986,
       "tag": "0006_curvy_nehzno",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1788924225447,
+      "tag": "0007_pretty_silver_samurai",
+      "breakpoints": true
     }
   ]
 }

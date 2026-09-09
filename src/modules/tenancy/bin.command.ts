@@ -6,13 +6,13 @@ import { bins, idempotencyKeys, zones } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
-import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
 import { assertPermission } from './permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from './tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
-import { EVENT_BUS } from '../../shared/events/event-bus';
+import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
+import type { OutboxSink } from '../../shared/events/outbox.seam';
 
 export interface CreateBinCommand {
   readonly tenantId: string;
@@ -125,7 +125,7 @@ function buildGridCodes(aisleFrom: string, aisleTo: string, bays: number, levels
 export class BinCommand {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
-    @Inject(EVENT_BUS) private readonly eventBus: EventBus,
+    @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
   ) {}
 
   async createBin(command: CreateBinCommand, idempotencyKey: string): Promise<BinSnapshot> {
@@ -233,7 +233,7 @@ export class BinCommand {
       type: command.type,
     });
 
-    const { snapshot, replayed } = await withTenantTransaction(
+    const { snapshot } = await withTenantTransaction(
       this.db,
       command.tenantId,
       async (tx) => {
@@ -306,6 +306,25 @@ export class BinCommand {
           firstCode: codes[0]!,
           lastCode: codes[codes.length - 1]!,
         };
+        // In-transaction outbox append (AD-7, story outbox-relay) — replaces
+        // the old post-commit publish. The `!replayed` gate of the old
+        // post-commit publish is structural here: the idempotent replay
+        // returned above (and a concurrent duplicate's transaction rolls
+        // back whole), so a replayed grid run appends nothing.
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: 'bins.generated',
+          occurredAt: nowIso(),
+          payload: {
+            warehouseId: command.warehouseId,
+            zoneId: command.zoneId,
+            count: rows.length,
+            firstCode: codes[0]!,
+            lastCode: codes[codes.length - 1]!,
+          },
+        });
+
         try {
           await tx.insert(idempotencyKeys).values({
             id: uuidv7(),
@@ -329,30 +348,6 @@ export class BinCommand {
       },
     );
 
-    if (!replayed) {
-      // Publish after the commit; a throwing bus must not 500 already-committed
-      // work (the client's retry would replay instead of re-emit).
-      try {
-        await this.eventBus.publish({
-          eventId: uuidv7(),
-          type: 'bins.generated',
-          tenantId: command.tenantId,
-          occurredAt: nowIso(),
-          payload: {
-            warehouseId: snapshot.warehouseId,
-            zoneId: snapshot.zoneId,
-            count: snapshot.generatedCount,
-            firstCode: snapshot.firstCode,
-            lastCode: snapshot.lastCode,
-          },
-        } satisfies DomainEvent);
-      } catch (error) {
-        console.warn(
-          `Event publish failed after commit — type=bins.generated tenant=${command.tenantId}:`,
-          error,
-        );
-      }
-    }
     return snapshot;
   }
 
@@ -364,7 +359,7 @@ export class BinCommand {
       blocked: command.blocked,
     });
 
-    const { snapshot, replayed } = await withTenantTransaction(
+    const { snapshot } = await withTenantTransaction(
       this.db,
       command.tenantId,
       async (tx) => {
@@ -417,6 +412,23 @@ export class BinCommand {
           createdAt: row.createdAt,
         };
 
+        // In-transaction outbox append (AD-7, story outbox-relay) — replaces
+        // the old post-commit publish. The `!replayed` gate of the old
+        // post-commit publish is structural here: the idempotent replay
+        // returned above (and a concurrent duplicate's transaction rolls
+        // back whole), so a replayed toggle appends nothing.
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: 'bin.blocked',
+          occurredAt: nowIso(),
+          payload: {
+            binId: bin.id,
+            warehouseId: bin.warehouseId,
+            blocked: bin.blocked,
+          },
+        });
+
         try {
           await tx.insert(idempotencyKeys).values({
             id: uuidv7(),
@@ -440,26 +452,6 @@ export class BinCommand {
       },
     );
 
-    if (!replayed) {
-      try {
-        await this.eventBus.publish({
-          eventId: uuidv7(),
-          type: 'bin.blocked',
-          tenantId: command.tenantId,
-          occurredAt: nowIso(),
-          payload: {
-            binId: snapshot.bin.id,
-            warehouseId: snapshot.bin.warehouseId,
-            blocked: snapshot.bin.blocked,
-          },
-        } satisfies DomainEvent);
-      } catch (error) {
-        console.warn(
-          `Event publish failed after commit — type=bin.blocked tenant=${command.tenantId}:`,
-          error,
-        );
-      }
-    }
     return snapshot;
   }
 }

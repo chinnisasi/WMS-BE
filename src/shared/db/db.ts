@@ -29,7 +29,9 @@ export function createLazyDatabase(): Database {
  * policies would hide every row from the scoped (non-superuser) app role.
  * This client reads through a dedicated connection whose role carries
  * BYPASSRLS — `DATABASE_AUTH_URL` when set, `DATABASE_URL` otherwise. It is
- * for auth-time reads only; every tenant-scoped path stays on `DATABASE`.
+ * for context-free reads only — the auth-time paths above, plus the outbox
+ * relay's one cross-tenant read (tenant discovery, story outbox-relay); every
+ * tenant-scoped path, and every write, stays on `DATABASE`.
  */
 export function createLazyAuthDatabase(): Database {
   return lazyDatabaseProxy(() => {

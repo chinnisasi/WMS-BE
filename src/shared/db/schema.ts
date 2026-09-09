@@ -533,3 +533,63 @@ export const ledgerAnchors = pgTable(
 );
 
 export type LedgerAnchor = typeof ledgerAnchors.$inferSelect;
+
+/**
+ * Transactional outbox (story outbox-relay, AD-7): one pending row per domain
+ * event, inserted in the SAME transaction as the domain write it rides (see
+ * `shared/events/outbox.ts` — the `PostgresOutboxSink`/`PostgresOutboxRelay`
+ * pair). The relay drains pending rows oldest-first, publishes them through
+ * `EVENT_BUS`, and deletes each on ack — **there is no `delivered` state**:
+ * delete-on-ack is the v1 disposition, and the append-only ledger + committed
+ * state can always re-derive an event if delivery must be replayed.
+ *
+ * Columns:
+ * - `status` — `pending` (due per `next_attempt_at`) or `quarantined` (past
+ *   the retry budget; re-drains only by operator action).
+ * - `attempts` / `next_attempt_at` / `last_error` — the retry substrate the
+ *   relay maintains (exponential backoff, `min(2^(attempts-1)·5s, 5min)`;
+ *   IN-07 observability reads these later — no dashboards yet).
+ *
+ * RLS policy lives **only in the migration SQL** (0007, the 0006 pattern):
+ * fail-closed single-dimension `tenant_isolation` — a session without
+ * `app.tenant_id` sees zero rows. The relay's one cross-tenant read (tenant
+ * discovery) runs on the BYPASSRLS connection (see outbox.ts); every row
+ * mutation goes through an explicitly tenant-scoped transaction.
+ */
+export const outboxMessages = pgTable(
+  'outbox_messages',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    type: text('type').notNull(),
+    // The event grammar rides as jsonb unchanged (no per-subscriber shape).
+    payload: jsonb('payload').$type<Record<string, unknown>>().notNull(),
+    // Business time — the instant the event says it happened (command
+    // commit for most), never the relay's publish clock.
+    occurredAt: timestamp('occurred_at', { withTimezone: true, mode: 'string' }).notNull(),
+    status: text('status').notNull().default('pending'),
+    attempts: integer('attempts').notNull().default(0),
+    // Due time for the next drain attempt (now() for a fresh row; null is
+    // never stored — quarantined rows keep their last computed value and are
+    // excluded by status).
+    nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true, mode: 'string' })
+      .notNull()
+      .defaultNow(),
+    lastError: text('last_error'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // Per-tenant batch select (the relay's only hot read): tenant first, then
+    // the due filter, oldest-first by (created_at).
+    index('outbox_messages_tenant_status_next_attempt_idx').on(
+      table.tenantId,
+      table.status,
+      table.nextAttemptAt,
+      table.createdAt,
+    ),
+  ],
+);
+
+export type OutboxMessageRow = typeof outboxMessages.$inferSelect;
