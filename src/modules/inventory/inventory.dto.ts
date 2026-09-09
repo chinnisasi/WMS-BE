@@ -1,5 +1,16 @@
 import { Transform, Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, IsUUID, Length, Max, Min } from 'class-validator';
+import {
+  ArrayMaxSize,
+  IsArray,
+  IsInt,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Length,
+  Max,
+  Min,
+  ValidateNested,
+} from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 /** Trim at the validation boundary (the tenancy DTO pattern). */
@@ -10,10 +21,79 @@ function Trim() {
   );
 }
 
+/** Trim every array element at the validation boundary (Story 2.4 serials). */
+function TrimEach() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return Transform(({ value }: { value: any }) =>
+    Array.isArray(value)
+      ? value.map((element) => (typeof element === 'string' ? element.trim() : element))
+      : value,
+  );
+}
+
+/**
+ * Story 2.4 batch input (additive): the batch's identity for an intake
+ * (`code` + optional mfg/expiry), or the explicit batch of an override draw
+ * — which then REQUIRES `overrideReason` (the FEFO default draw omits the
+ * field entirely).
+ */
+export class BatchInputDto {
+  @ApiProperty({
+    description: 'Batch code — unique per tenant + SKU; ensured idempotently on intake',
+    minLength: 1,
+    maxLength: 64,
+  })
+  @Trim()
+  @IsString()
+  @Length(1, 64)
+  code!: string;
+
+  @ApiProperty({
+    required: false,
+    description: 'Manufacturing date (ISO-8601 UTC, Z-suffixed); recorded at intake',
+    minLength: 20,
+    maxLength: 35,
+  })
+  @IsOptional()
+  @IsString()
+  @Length(20, 35)
+  mfgDate?: string;
+
+  @ApiProperty({
+    required: false,
+    description: 'Expiry date (ISO-8601 UTC, Z-suffixed); optional at intake, orders FEFO (nulls last)',
+    minLength: 20,
+    maxLength: 35,
+  })
+  @IsOptional()
+  @IsString()
+  @Length(20, 35)
+  expiryDate?: string;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Required when a draw names an explicit batch instead of the FEFO default — recorded verbatim in the ledger reference doc',
+    minLength: 1,
+    maxLength: 200,
+  })
+  @Trim()
+  @IsOptional()
+  @IsString()
+  @Length(1, 200)
+  overrideReason?: string;
+}
+
 /**
  * `stock.adjustment` command body (Story 2.1): a signed base-UoM delta on
  * one bin of one SKU, with a typed reason. Zero deltas are rejected — a
  * movement of nothing is not a movement (400 `validation-failed`).
+ *
+ * Story 2.4 additive arms: `batch` (batch-tracked movements — required on
+ * intake, FEFO-defaulted or explicit on a draw) and `serials` (serial-tracked
+ * movements — exactly one ledger event per serial unit, so the count must
+ * equal the delta's magnitude). Both omitted on a flagless SKU: the request
+ * shape and behavior are byte-identical to the pre-2.4 adjustment.
  */
 export class StockAdjustmentDto {
   @ApiProperty({ format: 'uuid', description: 'Warehouse holding the bin' })
@@ -55,6 +135,35 @@ export class StockAdjustmentDto {
   @IsString()
   @Length(20, 35)
   occurredAt?: string;
+
+  @ApiProperty({
+    required: false,
+    type: BatchInputDto,
+    description:
+      'Batch arm (batch-tracked SKUs only): intake identity, or the explicit override draw (with overrideReason)',
+  })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => BatchInputDto)
+  batch?: BatchInputDto;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    maxItems: 1000,
+    description:
+      'Serial arm (serial-tracked SKUs only): one serial number per unit — quantityDelta must equal the count',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  // Trimmed per element BEFORE the length validation: a whitespace-only
+  // serial trims to '' and fails `Length(1, 64)` as a 400 (review loop 1 —
+  // it must never reach identity creation as an empty serial number).
+  @TrimEach()
+  @IsString({ each: true })
+  @Length(1, 64, { each: true })
+  serials?: string[];
 }
 
 /** Query for the event-timeline read (keyset cursor pagination). */

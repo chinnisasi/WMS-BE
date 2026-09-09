@@ -22,6 +22,13 @@ export type LedgerReferenceDoc =
       readonly reasonCode: string;
       /** The Ops Manager's free-text note carried verbatim. */
       readonly note: string;
+      /**
+       * Story 2.4 — the recorded reason when a draw overrides the FEFO
+       * default batch with an explicit one (absent on every other
+       * adjustment). Optional and additive: old events' canonical bytes are
+       * unchanged (the key serializes only when present).
+       */
+      readonly overrideReason?: string;
     };
 // Later stories extend this union with NEW kinds (receipt, pick, transfer,
 // …) — never by reshaping an existing arm.
@@ -34,9 +41,9 @@ export interface LedgerEventTypeDefinition {
   readonly sinceVersion: number;
   /** The `reference_doc.kind` values this event type may carry. */
   readonly referenceKinds: readonly string[];
-  /** Story 2.4's batch arm — nothing populates it until that story. */
+  /** Story 2.4's batch arm (open on `stock.adjusted` since that story). */
   readonly allowsBatchArm: boolean;
-  /** Story 2.4's serial arm — nothing populates them until that story. */
+  /** Story 2.4's serial arm (open on `stock.adjusted` since that story). */
   readonly allowsSerialArm: boolean;
 }
 
@@ -55,15 +62,17 @@ export function registerLedgerEventType(definition: LedgerEventTypeDefinition): 
 
 /**
  * Grammar v1: the manual Ops-Manager adjustment — the first movement
- * producer, exercisable end-to-end. Later stories register their types
- * here (receipts, picks, transfers, …); nothing else may emit events.
+ * producer, exercisable end-to-end. Story 2.4 opens its reserved batch/serial
+ * arms (additive — old events with both arms null verify identically; the
+ * flags gate NEW writes only). Later stories register their types here
+ * (receipts, picks, transfers, …); nothing else may emit events.
  */
 registerLedgerEventType({
   type: 'stock.adjusted',
   sinceVersion: 1,
   referenceKinds: ['manual-adjustment'],
-  allowsBatchArm: false,
-  allowsSerialArm: false,
+  allowsBatchArm: true,
+  allowsSerialArm: true,
 });
 
 /** The registered definition — `undefined` for an unregistered type. */

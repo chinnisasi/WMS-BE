@@ -22,8 +22,12 @@ const SRC_ROOT = join(__dirname, '..', 'src');
 /** The append-only tables: no UPDATE/DELETE from code, ever. */
 const LEDGER_TABLES = ['ledgerEvents', 'ledgerAnchors'] as const;
 /** All stock-state tables: writes are inventory-module-exclusive. */
-const STOCK_TABLES = [...LEDGER_TABLES, 'stockOnHand'] as const;
-/** The one file allowed to mutate `stock_on_hand` (the projection point). */
+const STOCK_TABLES = [...LEDGER_TABLES, 'stockOnHand', 'batchOnHand'] as const;
+/**
+ * The one file allowed to mutate `stock_on_hand` / `batch_on_hand` (the
+ * projection points — Story 2.4 folds the batch arm beside the plain fold,
+ * in the same file and transaction).
+ */
 const PROJECTION_OWNER = join(SRC_ROOT, 'modules', 'inventory', 'ledger.service.ts');
 
 interface ScannedFile {
@@ -55,7 +59,7 @@ function rawWriteOn(physical: string): RegExp {
   return new RegExp(`\\b(insert into|update|delete from)\\s+${physical}\\b`, 'i');
 }
 
-const RAW_STOCK_TABLES = 'ledger_events|ledger_anchors|stock_on_hand';
+const RAW_STOCK_TABLES = 'ledger_events|ledger_anchors|stock_on_hand|batch_on_hand';
 
 describe('architecture: the ledger core is append-only and inventory-module-owned', () => {
   it(
@@ -103,7 +107,7 @@ describe('architecture: the ledger core is append-only and inventory-module-owne
     expect(offenders).toEqual([]);
   });
 
-  it('there is exactly one quantity-mutation path: ledger.service.ts owns stock_on_hand', () => {
+  it('there is exactly one quantity-mutation path: ledger.service.ts owns stock_on_hand (and the batch_on_hand arm)', () => {
     const otherInventoryFiles = files.filter(
       (file) =>
         file.path.startsWith(join(SRC_ROOT, 'modules', 'inventory')) &&
@@ -114,6 +118,8 @@ describe('architecture: the ledger core is append-only and inventory-module-owne
       for (const pattern of [
         drizzleWriteOn('stockOnHand'),
         rawWriteOn('stock_on_hand'),
+        drizzleWriteOn('batchOnHand'),
+        rawWriteOn('batch_on_hand'),
       ]) {
         if (pattern.test(file.source)) {
           offenders.push(`${file.path}: /${pattern.source}/`);
@@ -122,11 +128,11 @@ describe('architecture: the ledger core is append-only and inventory-module-owne
     }
     expect(offenders).toEqual([]);
 
-    // The projection point itself must still write it — the test is only
+    // The projection point itself must still write them — the test is only
     // meaningful while the single path exists.
-    expect(drizzleWriteOn('stockOnHand').test(readFileSync(PROJECTION_OWNER, 'utf8'))).toBe(
-      true,
-    );
+    const projectionOwner = readFileSync(PROJECTION_OWNER, 'utf8');
+    expect(drizzleWriteOn('stockOnHand').test(projectionOwner)).toBe(true);
+    expect(drizzleWriteOn('batchOnHand').test(projectionOwner)).toBe(true);
   });
 
   it('no other module reaches into the inventory module past the facade', () => {
