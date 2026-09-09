@@ -2,6 +2,8 @@ import { forwardRef, Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { CatalogModule } from '../catalog/catalog.module';
 import { BinCommand } from './bin.command';
+import { DeviceSessionGuard } from './device-session.guard';
+import { EnrollmentCommand } from './enrollment.command';
 import { RegistrationCommand } from './registration.command';
 import { SignInCommand } from './sign-in.command';
 import { TenancyController } from './tenancy.controller';
@@ -38,9 +40,11 @@ import { ZoneCommand } from './zone.command';
     ZoneCommand,
     BinCommand,
     UsersCommand,
+    EnrollmentCommand,
     TenancyService,
     TenantSessionGuard,
+    DeviceSessionGuard,
   ],
-  exports: [TenancyService],
+  exports: [TenancyService, EnrollmentCommand],
 })
 export class TenancyModule {}

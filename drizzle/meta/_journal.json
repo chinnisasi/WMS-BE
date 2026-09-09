@@ -85,6 +85,13 @@
       "when": 1788961219378,
       "tag": "0011_tiresome_wraith",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1788968856637,
+      "tag": "0012_lonely_the_renegades",
+      "breakpoints": true
     }
   ]
 }

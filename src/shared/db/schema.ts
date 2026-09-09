@@ -1009,3 +1009,59 @@ export const purchaseOrderLines = pgTable(
 );
 
 export type PurchaseOrderLine = typeof purchaseOrderLines.$inferSelect;
+
+/**
+ * Floor devices (Story 3.2 — tenancy-owned device identity): one row per
+ * enrolled scanner/handheld, bound to its tenant and badge-in operator.
+ *
+ * Lifecycle: a minted one-time enrollment code creates the row **pending
+ * redemption** — `label` / `operator_user_id` / `pin_hash` / `enrolled_at`
+ * are still null and `enrollment_code_hash` is set. The device app redeems
+ * the code (one conditional UPDATE — no double-redeem) to bind label +
+ * operator + 4-6 digit badge-in PIN; redemption clears the hash (the raw
+ * code's only durable store is the mint response / its idempotency snapshot —
+ * sha256-hash stored, the users.invite precedent). Enrolled
+ * (`enrollment_code_hash IS NULL`) devices are what the Settings device list
+ * shows; `status` flips `active → revoked` on revocation (wipe-flagged, one
+ * way — re-revoke is idempotent, never un-revoked).
+ *
+ * `pin_hash` is the badge-in credential (4-6 digit PIN set during
+ * enrollment, human decision 2026-09-09) stored as the `node:crypto` scrypt
+ * hash only — account passwords never appear on the device. `last_seen_at`
+ * is refreshed by device-authenticated requests (badge-in, self-test echo).
+ *
+ * RLS policy + status CHECK live **only in the migration SQL** (0012, the
+ * 0005→0011 pattern).
+ */
+export const devices = pgTable(
+  'devices',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    operatorUserId: uuid('operator_user_id'),
+    label: text('label'),
+    status: text('status').notNull().default('active'),
+    revokedAt: timestamp('revoked_at', { withTimezone: true, mode: 'string' }),
+    revokedBy: uuid('revoked_by'),
+    wipeFlag: boolean('wipe_flag').notNull().default(false),
+    enrollmentCodeHash: text('enrollment_code_hash'),
+    enrollmentCodeExpiresAt: timestamp('enrollment_code_expires_at', { withTimezone: true, mode: 'string' }),
+    enrolledAt: timestamp('enrolled_at', { withTimezone: true, mode: 'string' }),
+    pinHash: text('pin_hash'),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One unredeemed code per hash — redemption is a conditional UPDATE on
+    // this index (no double-redeem race).
+    uniqueIndex('devices_enrollment_code_hash_unique')
+      .on(table.enrollmentCodeHash)
+      .where(sql`enrollment_code_hash is not null`),
+    // The Settings device list (keyset cursor, newest first).
+    index('devices_created_at_id_idx').on(table.createdAt, table.id),
+  ],
+);
+
+export type Device = typeof devices.$inferSelect;

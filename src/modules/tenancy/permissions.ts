@@ -24,6 +24,10 @@ export const CAPABILITIES = [
   // read-only.
   'vendor.manage',
   'po.manage',
+  // Story 3.2 — floor-device lifecycle (mint one-time enrollment codes,
+  // revoke devices). Owner and Ops Manager; enrollment-code redemption and
+  // badge-in authenticate the operator, never a capability.
+  'device.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -47,6 +51,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'stock.adjust',
     'vendor.manage',
     'po.manage',
+    'device.manage',
   ]),
   operator: new Set<Capability>([]),
   accountant: new Set<Capability>([]),
