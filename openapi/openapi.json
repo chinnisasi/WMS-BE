@@ -2091,7 +2091,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or invalid body (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, or a quantityDelta that does not equal the serial count",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2121,7 +2121,7 @@
             }
           },
           "404": {
-            "description": "Warehouse, bin, or SKU does not exist in this tenant (not-found)",
+            "description": "Warehouse, bin, or SKU does not exist in this tenant (not-found), or an explicit batch code does not exist for the SKU (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2131,7 +2131,7 @@
             }
           },
           "409": {
-            "description": "Concurrent request on the same Idempotency-Key (conflict)",
+            "description": "Concurrent request on the same Idempotency-Key (conflict); or a serial-tracked movement scans a serial that already lives in a bin (duplicate-serial, naming it) or draws a serial the ledger last saw in another bin (serial-elsewhere, naming the last-known bin)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2141,7 +2141,7 @@
             }
           },
           "422": {
-            "description": "Idempotency key reused with a different payload (idempotency-key-reuse), or the movement would drive on-hand below zero (insufficient-on-hand names the bin and current on-hand)",
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse), or the movement would drive on-hand, or the resolved/overridden batch's on-hand, below zero (insufficient-on-hand names the bin, and the batchRef on a batch-tracked draw)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2274,6 +2274,394 @@
           }
         ],
         "summary": "Lists one warehouse's ledger event timeline (keyset cursor pagination, newest first)",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/inventory/stock": {
+      "get": {
+        "operationId": "InventoryController_listStock",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "skuId",
+            "required": false,
+            "in": "query",
+            "description": "Only rows of one SKU",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "binId",
+            "required": false,
+            "in": "query",
+            "description": "Only rows of one bin",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The warehouse's on-hand page (keyset cursor) — plain stock truth for tracked and untracked SKUs alike, no batch fields",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StockListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed skuId/binId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists one warehouse's on-hand projection, SKU/bin filterable (keyset cursor pagination)",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/inventory/batches": {
+      "get": {
+        "operationId": "InventoryController_listBatches",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "skuId",
+            "required": false,
+            "in": "query",
+            "description": "The SKU whose batches are listed (required — 400 when omitted)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "binId",
+            "required": false,
+            "in": "query",
+            "description": "Only on-hand rows of one bin (the quantity narrows with it)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The SKU's batches with their on-hand quantity (0 when none) — the FEFO read order is data, not policy; excluding expired stock is the draw policy, not a read filter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed skuId/binId query (validation-failed — skuId is required)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists a SKU's batches of one warehouse joined with on-hand (FEFO order — expiry ASC nulls last; expired batches are still listed)",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/batches/{batchId}": {
+      "get": {
+        "operationId": "InventoryController_getBatch",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "batchId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The batch identity plus the bins (any warehouse of the tenant) where its stock lives and its ledger history (oldest first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchDetailResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No batch with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One batch's detail — catalog identity, per-bin on-hand across the tenant, and its full movement history (one query)",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/serials/{serialId}": {
+      "get": {
+        "operationId": "InventoryController_getSerial",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "serialId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The serial identity, its ledger-derived location (the latest event's bin; null when never moved) and its full movement history (oldest first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SerialDetailResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No serial with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One serial's detail — catalog identity, its derived tenant-wide location, and its full movement history (one query)",
         "tags": [
           "inventory"
         ]
@@ -3522,6 +3910,33 @@
           "onHand"
         ]
       },
+      "LedgerReferenceDocDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "example": "manual-adjustment",
+            "description": "Discriminator of the typed reference union"
+          },
+          "reasonCode": {
+            "type": "string",
+            "description": "Machine reason for the correction (e.g. stock-count)"
+          },
+          "note": {
+            "type": "string",
+            "description": "The Ops Manager's note, carried verbatim"
+          },
+          "overrideReason": {
+            "type": "string",
+            "description": "The recorded reason when a draw overrode the FEFO default batch (absent on every other adjustment)"
+          }
+        },
+        "required": [
+          "kind",
+          "reasonCode",
+          "note"
+        ]
+      },
       "LedgerEventDto": {
         "type": "object",
         "properties": {
@@ -3553,6 +3968,26 @@
           "quantityDelta": {
             "type": "number"
           },
+          "batchRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 2.4 batch arm — the catalog batch id; null on every arm-less (legacy) event"
+          },
+          "serialRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 2.4 serial arm — the catalog serial id; null on every arm-less (legacy) event"
+          },
+          "referenceDoc": {
+            "nullable": true,
+            "description": "The typed reference document itself ({kind, reasonCode, note, overrideReason?} today) — the event's reference document, extended additively by future event kinds",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LedgerReferenceDocDto"
+              }
+            ]
+          },
           "actorUserId": {
             "type": "string",
             "format": "uuid"
@@ -3580,6 +4015,9 @@
           "fromBinId",
           "toBinId",
           "quantityDelta",
+          "batchRef",
+          "serialRef",
+          "referenceDoc",
           "actorUserId",
           "occurredAt",
           "recordedAt",
@@ -3603,6 +4041,388 @@
         },
         "required": [
           "items"
+        ]
+      },
+      "StockEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The projection row id (the cursor tiebreaker)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantity": {
+            "type": "number",
+            "description": "On-hand in base UoM (non-negative)",
+            "minimum": 0
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC projection-row commit time (the cursor sort key)"
+          }
+        },
+        "required": [
+          "id",
+          "warehouseId",
+          "skuId",
+          "binId",
+          "quantity",
+          "createdAt"
+        ]
+      },
+      "StockListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StockEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "BatchListItemDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "Batch code (unique per tenant + SKU)"
+          },
+          "mfgDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "Manufacturing date (ISO-8601 UTC), null when unrecorded"
+          },
+          "expiryDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "Expiry date (ISO-8601 UTC), null when unrecorded — orders last (FEFO)"
+          },
+          "status": {
+            "type": "string",
+            "description": "Batch lifecycle status (active today)"
+          },
+          "quantity": {
+            "type": "number",
+            "description": "On-hand of this batch in the queried warehouse (the bin filter applied; 0 when none)"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "mfgDate",
+          "expiryDate",
+          "status",
+          "quantity"
+        ]
+      },
+      "BatchListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchListItemDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "BatchBinOnHandDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantity": {
+            "type": "number",
+            "description": "On-hand of the batch in this bin"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "binId",
+          "quantity"
+        ]
+      },
+      "BatchLedgerEntryDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "seq": {
+            "type": "number",
+            "description": "Gap-free per-warehouse replay order"
+          },
+          "type": {
+            "type": "string",
+            "example": "stock.adjusted"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantityDelta": {
+            "type": "number",
+            "description": "Signed base-UoM delta"
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "serialRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The serial arm on a combined batch+serial event"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC business time"
+          },
+          "recordedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC commit time"
+          },
+          "eventHash": {
+            "type": "string",
+            "description": "sha256 over the canonical event bytes (chain link)"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "seq",
+          "type",
+          "skuId",
+          "quantityDelta",
+          "fromBinId",
+          "toBinId",
+          "serialRef",
+          "occurredAt",
+          "recordedAt",
+          "eventHash"
+        ]
+      },
+      "BatchDetailResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The SKU the batch belongs to"
+          },
+          "code": {
+            "type": "string",
+            "description": "Batch code (unique per tenant + SKU)"
+          },
+          "mfgDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "Manufacturing date (ISO-8601 UTC), null when unrecorded"
+          },
+          "expiryDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "Expiry date (ISO-8601 UTC), null when unrecorded"
+          },
+          "status": {
+            "type": "string",
+            "description": "Batch lifecycle status (active today)"
+          },
+          "bins": {
+            "description": "Per-bin on-hand rows across every warehouse of the tenant",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchBinOnHandDto"
+            }
+          },
+          "history": {
+            "description": "Full movement history (oldest first, one query)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchLedgerEntryDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "skuId",
+          "code",
+          "mfgDate",
+          "expiryDate",
+          "status",
+          "bins",
+          "history"
+        ]
+      },
+      "SerialLocationDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "binId"
+        ]
+      },
+      "SerialLedgerEntryDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "seq": {
+            "type": "number",
+            "description": "Gap-free per-warehouse replay order"
+          },
+          "type": {
+            "type": "string",
+            "example": "stock.adjusted"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantityDelta": {
+            "type": "number",
+            "description": "Signed base-UoM delta (±1 per serial unit)"
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "batchRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The batch the unit moved with (null when unbatched)"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC business time"
+          },
+          "recordedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC commit time"
+          },
+          "eventHash": {
+            "type": "string",
+            "description": "sha256 over the canonical event bytes (chain link)"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "seq",
+          "type",
+          "skuId",
+          "quantityDelta",
+          "fromBinId",
+          "toBinId",
+          "batchRef",
+          "occurredAt",
+          "recordedAt",
+          "eventHash"
+        ]
+      },
+      "SerialDetailResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The SKU the serial belongs to"
+          },
+          "serialNumber": {
+            "type": "string",
+            "description": "The serial number (unique per tenant + SKU)"
+          },
+          "status": {
+            "type": "string",
+            "description": "Serial lifecycle status (active today)"
+          },
+          "location": {
+            "nullable": true,
+            "description": "Derived current location — the ledger’s latest event’s bin (tenant-wide); null when never moved",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SerialLocationDto"
+              }
+            ]
+          },
+          "history": {
+            "description": "Full movement history (oldest first, one query)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SerialLedgerEntryDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "skuId",
+          "serialNumber",
+          "status",
+          "location",
+          "history"
         ]
       }
     }
