@@ -9,6 +9,7 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/
 import { assertPermission } from '../modules/tenancy/permissions';
 import { TenancyService } from '../modules/tenancy/tenancy.service';
 import { assertUtcIso } from '../shared/primitives/time';
+import { UUID_RE } from '../shared/primitives/ids';
 import { CatalogFacade } from '../modules/catalog/catalog.facade';
 import { InventoryFacade } from '../modules/inventory/inventory.facade';
 import type {
@@ -616,9 +617,6 @@ export class InventoryController {
     };
   }
 }
-
-/** The strict uuid shape (the `decodeCursorSafe` guard's own regex shape). */
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Catalog batch/serial identity dates come back in Postgres's own text

@@ -1,15 +1,24 @@
 import { Module } from '@nestjs/common';
+import { SharedModule } from '../../shared/shared.module';
+import { VendorCommand } from './vendors.command';
+import { PurchaseOrderCommand } from './po.command';
+import { InboundFacade } from './inbound.facade';
 
 /**
- * Inbound module — spine module placeholder (Story 1.1).
+ * Inbound module (Story 3.1): vendor master data and the purchase-order
+ * lifecycle — the upstream half of receiving. `vendors`,
+ * `purchase_orders`, and `purchase_order_lines` are module-exclusive; the
+ * only stock truth stays the inventory module's ledger (a PO is not stock —
+ * this module writes no ledger events, no stock tables).
  *
- * Ownership discipline (architecture spine): this module exclusively owns
- * its tables and publishes domain events. Other modules communicate with it
- * only through its public interfaces and events — never its tables.
- * Implementation starts in later stories (1.2+ for tenancy/catalog).
+ * Imports `SharedModule` only (the spine primitives — DATABASE, OUTBOX_SINK —
+ * and nothing else); the tenancy helpers the commands use at entry
+ * (`assertPermission`, `getMemberRoleIn`, `assertWarehouseInTenant`) are the
+ * shared command-entry pattern's file-level functions.
  */
 @Module({
-  providers: [],
-  exports: [],
+  imports: [SharedModule],
+  providers: [VendorCommand, PurchaseOrderCommand, InboundFacade],
+  exports: [InboundFacade],
 })
 export class InboundModule {}

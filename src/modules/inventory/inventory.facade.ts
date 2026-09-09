@@ -5,6 +5,7 @@ import type { Database } from '../../shared/db/db';
 import { batchOnHand, ledgerEvents, stockOnHand } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
+import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
@@ -143,8 +144,6 @@ export interface SerialLocation {
   readonly warehouseId: string;
   readonly binId: string;
 }
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * The cursor is opaque to clients but crafted input is still possible — a

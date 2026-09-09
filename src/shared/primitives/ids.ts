@@ -66,3 +66,12 @@ export function ulid(now: number = Date.now()): string {
 export function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 }
+
+/**
+ * The loose uuid shape (any version, any case) — the ONE shared uuid matcher
+ * (retro A3): guards cursor payloads and uuid path params before the values
+ * reach a Postgres `::uuid` cast, so crafted input surfaces as a 400/404
+ * instead of a 500. (`isUuid` stays the stricter UUIDv7 identity check —
+ * this one only answers "can this string be a uuid at all".)
+ */
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
