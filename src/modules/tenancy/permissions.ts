@@ -15,6 +15,10 @@ export const CAPABILITIES = [
   'sku.edit',
   'users.invite',
   'users.role_change',
+  // Story 2.1 — the manual stock adjustment (the first ledger movement
+  // producer). Mirrored into wms-fe `src/lib/users.ts` by the frontend (the
+  // cross-repo drift guard for that mirror is a deferred item).
+  'stock.adjust',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -35,6 +39,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'bin.block',
     'catalog.import',
     'sku.edit',
+    'stock.adjust',
   ]),
   operator: new Set<Capability>([]),
   accountant: new Set<Capability>([]),

@@ -370,3 +370,166 @@ export const catalogImportErrors = pgTable(
 );
 
 export type CatalogImportError = typeof catalogImportErrors.$inferSelect;
+
+/**
+ * The append-only inventory ledger (Story 2.1, AD-11/AD-16) — the **only
+ * stock truth** in the system. Every stock movement is exactly one row here,
+ * immutable at the database (the `ledger_events_append_only` trigger in the
+ * migration DDL rejects UPDATE/DELETE — corrections are new compensating
+ * events, never edits). One row per movement, committed in the same
+ * transaction as the `stock_on_hand` projection it drives.
+ *
+ * Columns:
+ * - `tenant_id` + `warehouse_id` + `seq` — seq is the per-warehouse replay
+ *   order, gap-free and unique (unique index + `pg_advisory_xact_lock` per
+ *   warehouse inside the append transaction).
+ * - `type` + `schema_version` — the versioned event grammar: event types
+ *   exist only by registration in `modules/inventory/ledger-registry.ts`
+ *   (additive changes only — arms are never renumbered or repurposed).
+ * - `sku_id` + `quantity_delta` — the movement: a **signed** base-UoM
+ *   integer (`SignedQuantity`); positive deltas carry `to_bin_id`, negative
+ *   deltas `from_bin_id` (both nullable — a transfer later story carries
+ *   both).
+ * - `batch_ref` / `serial_ref` — **reserved** nullable arms for Story 2.4;
+ *   nothing populates them (the registry rejects non-null values).
+ * - `actor_user_id`, `occurred_at` (business time, client-supplied),
+ *   `recorded_at` (commit time, server), `reference_doc` (the typed
+ *   reference union arm as jsonb).
+ * - `prev_hash` / `event_hash` — the hash chain (AD-16): per tenant+warehouse
+ *   chain, `event_hash` is sha256 over the canonical event bytes (fixed key
+ *   order), `prev_hash` the predecessor's `event_hash` (64 zeros for the
+ *   genesis event). The head is anchored via `ledger_anchors`.
+ *
+ * RLS policy + append-only trigger live **only in the migration SQL**
+ * (0006), the established pattern.
+ */
+export const ledgerEvents = pgTable(
+  'ledger_events',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    seq: integer('seq').notNull(),
+    type: text('type').notNull(),
+    schemaVersion: integer('schema_version').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    quantityDelta: integer('quantity_delta').notNull(),
+    fromBinId: uuid('from_bin_id'),
+    toBinId: uuid('to_bin_id'),
+    batchRef: text('batch_ref'),
+    serialRef: text('serial_ref'),
+    actorUserId: uuid('actor_user_id').notNull(),
+    occurredAt: timestamp('occurred_at', { withTimezone: true, mode: 'string' }).notNull(),
+    recordedAt: timestamp('recorded_at', { withTimezone: true, mode: 'string' }).notNull(),
+    referenceDoc: jsonb('reference_doc').notNull(),
+    prevHash: text('prev_hash').notNull(),
+    eventHash: text('event_hash').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // Gap-free, unique replay order per tenant+warehouse; also the
+    // concurrency backstop behind the per-warehouse advisory lock.
+    uniqueIndex('ledger_events_tenant_warehouse_seq_unique').on(
+      table.tenantId,
+      table.warehouseId,
+      table.seq,
+    ),
+    // Replay of one SKU (across its bins) walks this index in seq order.
+    index('ledger_events_tenant_warehouse_sku_seq_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.skuId,
+      table.seq,
+    ),
+    // Event-timeline keyset pagination (created_at + id, standard cursor).
+    // Event-timeline keyset pagination (created_at + id, standard
+    // cursor) — warehouse-prefixed so one index also serves per-warehouse
+    // timeline scans.
+    index('ledger_events_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type LedgerEvent = typeof ledgerEvents.$inferSelect;
+
+/**
+ * Derived on-hand projection (Story 2.1): one row per (tenant, warehouse,
+ * SKU, bin), **maintained in the same transaction as the ledger event** that
+ * moves the stock — never independently. `quantity` is a non-negative
+ * integer in base UoM (the DB CHECK `stock_on_hand_quantity_nonnegative` in
+ * the migration DDL is the backstop; the projection updater rejects an
+ * over-draw naming the bin and current on-hand first). This table is the
+ * only mutable stock table; `ledger_events` is immutable. Consumers read it
+ * through `InventoryFacade`.
+ */
+export const stockOnHand = pgTable(
+  'stock_on_hand',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    binId: uuid('bin_id').notNull(),
+    quantity: integer('quantity').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('stock_on_hand_scope_unique').on(
+      table.tenantId,
+      table.warehouseId,
+      table.skuId,
+      table.binId,
+    ),
+    index('stock_on_hand_tenant_warehouse_sku_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.skuId,
+    ),
+  ],
+);
+
+export type StockOnHand = typeof stockOnHand.$inferSelect;
+
+/**
+ * Chain anchors (Story 2.1, AD-16 — the human Option A decision): chain
+ * heads anchor to this append-only Postgres table — `digest` over the
+ * event-hash range, `from_seq`..`to_seq` inclusive, `anchored_at` the
+ * commitment instant. The anchor *target* is the `LedgerAnchorStore`
+ * interface in the inventory module; a real external WORM store swaps in
+ * behind it without touching the chain. Append-only like the ledger itself
+ * (same trigger pattern in the migration DDL).
+ */
+export const ledgerAnchors = pgTable(
+  'ledger_anchors',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    fromSeq: integer('from_seq').notNull(),
+    toSeq: integer('to_seq').notNull(),
+    digest: text('digest').notNull(),
+    anchoredAt: timestamp('anchored_at', { withTimezone: true, mode: 'string' }).notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One anchor per (tenant, warehouse, toSeq) — the DB backstop behind
+    // the advisory lock against two overlapping anchor ranges.
+    uniqueIndex('ledger_anchors_tenant_warehouse_to_seq_unique').on(
+      table.tenantId,
+      table.warehouseId,
+      table.toSeq,
+    ),
+  ],
+);
+
+export type LedgerAnchor = typeof ledgerAnchors.$inferSelect;
