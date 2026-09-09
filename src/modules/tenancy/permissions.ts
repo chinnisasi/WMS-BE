@@ -28,6 +28,10 @@ export const CAPABILITIES = [
   // revoke devices). Owner and Ops Manager; enrollment-code redemption and
   // badge-in authenticate the operator, never a capability.
   'device.manage',
+  // Story 3.3 — the human-review decisions (over-receipt approve/reject; the
+  // Conflicts & Reviews queue). Owner and Ops Manager decide every
+  // over-receipt in v1; threshold-based Owner routing lands with FR-19.
+  'review.decide',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -52,6 +56,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'vendor.manage',
     'po.manage',
     'device.manage',
+    'review.decide',
   ]),
   operator: new Set<Capability>([]),
   accountant: new Set<Capability>([]),

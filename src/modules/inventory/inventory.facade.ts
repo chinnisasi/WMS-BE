@@ -10,7 +10,14 @@ import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { canonicalInstant, LedgerService } from './ledger.service';
+import type { LedgerMovement } from './ledger.service';
 import type { LedgerReferenceDoc } from './ledger-registry';
+import type { TenantTx } from '../../shared/db/tenant-scope';
+
+// The facade is the only sibling-facing seam (architecture test): the
+// movement shape rides along so cross-module producers import the type here,
+// never from the ledger service internals.
+export type { LedgerMovement, AppendedMovement } from './ledger.service';
 import type {
   ChainAnchor,
   ChainBreakReport,
@@ -206,6 +213,18 @@ export class InventoryFacade {
     idempotencyKey: string,
   ): Promise<StockAdjustmentSnapshot> {
     return this.stockAdjustment.adjust(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  /**
+   * The in-transaction ledger passthrough (Story 3.3): a caller that composes
+   * a ledger event into a larger write in ONE transaction (the GRN command —
+   * GRN rows + batch identity + ledger events + relational state) appends
+   * through here inside its own tenant transaction. Same contract as
+   * `LedgerService.appendMovement` — registry-gated type, hash chain, the
+   * caller's advisory locks; the caller owns the warehouse lock ordering.
+   */
+  async appendLedgerEventInTx(tx: TenantTx, movement: LedgerMovement) {
+    return this.ledger.appendMovement(tx, movement);
   }
 
   /**

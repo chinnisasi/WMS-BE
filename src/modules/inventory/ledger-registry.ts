@@ -29,9 +29,20 @@ export type LedgerReferenceDoc =
        * unchanged (the key serializes only when present).
        */
       readonly overrideReason?: string;
+    }
+  // Story 3.3 — the receipt arm: every `grn.received` movement names the GRN
+  // it landed under, and (when received against a purchase order) the PO and
+  // the exact line. NEW union arm — `manual-adjustment` is never reshaped.
+  | {
+      readonly kind: 'grn-receipt';
+      readonly grnId: string;
+      /** Absent on a blind receipt's events (no PO to name). */
+      readonly poId?: string;
+      /** Absent on the blind arm and on an approved-excess event with no line. */
+      readonly poLineId?: string;
     };
-// Later stories extend this union with NEW kinds (receipt, pick, transfer,
-// …) — never by reshaping an existing arm.
+// Later stories extend this union with NEW kinds (pick, transfer, …) — never
+// by reshaping an existing arm.
 
 /** One registered grammar entry: an event type and what it may carry. */
 export interface LedgerEventTypeDefinition {
@@ -73,6 +84,23 @@ registerLedgerEventType({
   referenceKinds: ['manual-adjustment'],
   allowsBatchArm: true,
   allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 3.3 — the receipt movement: one event per GRN line (the
+ * within-open portion at submit; the excess again on over-receipt approval),
+ * landing stock in the warehouse's system Receiving bin. Batch-tracked
+ * receipts carry the batch arm (identity ensured through the catalog facade
+ * first); serial intake has no receive path yet (serials stay ledger-capable,
+ * the story's Never list keeps serial capture out) — the serial arm stays
+ * closed on this type.
+ */
+registerLedgerEventType({
+  type: 'grn.received',
+  sinceVersion: 1,
+  referenceKinds: ['grn-receipt'],
+  allowsBatchArm: true,
+  allowsSerialArm: false,
 });
 
 /** The registered definition — `undefined` for an unregistered type. */
