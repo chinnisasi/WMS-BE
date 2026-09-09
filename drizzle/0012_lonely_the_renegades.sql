@@ -18,6 +18,10 @@ CREATE TABLE "devices" (
 --> statement-breakpoint
 CREATE UNIQUE INDEX "devices_enrollment_code_hash_unique" ON "devices" USING btree ("enrollment_code_hash") WHERE enrollment_code_hash is not null;--> statement-breakpoint
 CREATE INDEX "devices_created_at_id_idx" ON "devices" USING btree ("created_at","id");--> statement-breakpoint
+-- Story 3.2 hand-append (the audit_events tenant-led convention): every
+-- per-tenant list/pagination query filters tenant_id first — without a
+-- tenant-led index each probe scans the whole table.
+CREATE INDEX "devices_tenant_id_created_at_id_idx" ON "devices" USING btree ("tenant_id","created_at","id");--> statement-breakpoint
 -- Story 3.2 hand-append (the 0005→0011 RLS policy pattern): RLS is declared
 -- only in migration SQL, never in schema.ts. Fail-closed single-dimension
 -- `tenant_isolation` on tenancy-owned `devices` — a session without

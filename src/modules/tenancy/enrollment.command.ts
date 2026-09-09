@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, devices, idempotencyKeys, users } from '../../shared/db/schema';
@@ -10,7 +10,7 @@ import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import type { Page } from '../../shared/primitives/pagination';
-import { generateSecret, seal } from '../../shared/crypto/envelope';
+import { generateSecret, seal, MissingEncryptionKeyError } from '../../shared/crypto/envelope';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
 import { assertPermission } from './permissions';
@@ -379,8 +379,31 @@ export class EnrollmentCommand {
     const pinHash = await hashPassword(command.pin);
     const offlineStoreKey = generateSecret();
 
+    // A missing/short DEVICE_ENCRYPTION_KEY would escape seal() as a raw 500
+    // from inside the transaction — map it to a typed problem instead (the
+    // deployment is misconfigured; the code itself is not yet consumed, so
+    // nothing burns).
+    const sealOfflineStoreKey = (key: Buffer): string => {
+      try {
+        return seal(key);
+      } catch (err) {
+        if (err instanceof MissingEncryptionKeyError) {
+          throw new ProblemException(
+            'device-encryption-unavailable',
+            503,
+            'Device enrollment temporarily unavailable',
+            'The server is missing DEVICE_ENCRYPTION_KEY — device enrollment is unavailable until the deployment sets it (see .env.example).',
+          );
+        }
+        throw err;
+      }
+    };
+
     const snapshot = await withTenantTransaction(this.db, pending.tenantId, async (tx) => {
-      // The UPDATE itself carries every validity condition — no double-redeem.
+      // The UPDATE itself carries every validity condition — no double-redeem,
+      // and a code that expires (or a pending row that gets revoked) between
+      // the AUTH read and this transaction still lands the same
+      // indistinguishable 400.
       const updatedRows = await tx
         .update(devices)
         .set({
@@ -396,12 +419,14 @@ export class EnrollmentCommand {
             eq(devices.id, pending.id),
             eq(devices.tenantId, pending.tenantId),
             eq(devices.enrollmentCodeHash, codeHash),
+            eq(devices.status, 'active'),
+            gt(devices.enrollmentCodeExpiresAt, nowIso()),
           ),
         )
         .returning();
       if (updatedRows.length === 0) {
-        // Redeemed (or expired) between the AUTH read and this transaction —
-        // one indistinguishable 400.
+        // Redeemed, expired, or revoked between the AUTH read and this
+        // transaction — one indistinguishable 400.
         throw enrollmentCodeInvalid();
       }
 
@@ -419,7 +444,7 @@ export class EnrollmentCommand {
         device: { id: pending.id, tenantId: pending.tenantId, label },
         deviceToken,
         expiresInSeconds: DEVICE_SESSION_TTL_SECONDS,
-        offlineStoreKeySealed: seal(offlineStoreKey),
+        offlineStoreKeySealed: sealOfflineStoreKey(offlineStoreKey),
       };
       try {
         await tx.insert(idempotencyKeys).values({

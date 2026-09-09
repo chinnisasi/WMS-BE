@@ -309,6 +309,18 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
       wipeFlag: false,
     });
 
+    // A minted-but-unredeemed (pending) code is NOT a device yet — it never
+    // appears in the list (the enrollment_code_hash filter).
+    await mintCode(token, tenantId).expect(201);
+    const afterPending = await listDevices(token, tenantId).expect(200);
+    expect(
+      afterPending.body.items.some((d: { label: string | null }) => d.label === null),
+    ).toBe(false);
+    expect(afterPending.body.items).toHaveLength(1);
+    expect(
+      afterPending.body.items.some((d: { label: string | null }) => d.label === null),
+    ).toBe(false);
+
     // Second redemption of the same code → 400 enrollment-code-invalid.
     const second = await enroll(tenantId, {
       code: minted.body.code,
@@ -317,9 +329,16 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
     }).expect(400);
     expect(second.body).toMatchObject({ status: 400, code: 'enrollment-code-invalid' });
 
-    // Unknown code — indistinguishable from used/expired.
-    const unknown = await enroll(tenantId, { code: 'no-such-code', label: 'X', pin: '1357' }).expect(400);
+    // Unknown code (well-formed 43-char base64url shape) — indistinguishable
+    // from used/expired. A wrong-SHAPE code is a boundary validation-failed.
+    const unknown = await enroll(tenantId, {
+      code: 'bUp7d7w0B9DOrEmYlnMtdIXLCLiM1acwhLtIstaLYc8',
+      label: 'X',
+      pin: '1357',
+    }).expect(400);
     expect(unknown.body).toMatchObject({ code: 'enrollment-code-invalid' });
+    const wrongShape = await enroll(tenantId, { code: 'short', label: 'X', pin: '1357' }).expect(400);
+    expect(wrongShape.body).toMatchObject({ code: 'validation-failed' });
 
     // A minted code offered on another tenant's path — one indistinguishable 400.
     const otherEmail = `owner-${ulid().toLowerCase()}@example.com`;
@@ -370,6 +389,69 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
     const statuses = race.map((r) => r.status).sort();
     expect(statuses).toEqual([201, 400]);
     expect(race.find((r) => r.status === 400)!.body.code).toBe('enrollment-code-invalid');
+  });
+
+  test('expired-code redemption: a code past its expiresAt is the same indistinguishable 400', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const { tenantId } = await registerTenant(email);
+    const token = await signIn(email);
+
+    const minted = await mintCode(token, tenantId).expect(201);
+
+    // Backdate the pending row past its TTL (let a minted code "pass" its
+    // expiresAt) — the redemption UPDATE re-checks expiry in its WHERE, so
+    // this lands the same invalid-code 400 as an unknown/used code.
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await sql`update devices
+        set enrollment_code_expires_at = now() - interval '1 minute'
+        where tenant_id = ${tenantId}::uuid and enrollment_code_hash is not null`;
+    } finally {
+      await sql.end();
+    }
+
+    const expired = await enroll(tenantId, {
+      code: minted.body.code,
+      label: 'Late scanner',
+      pin: '1357',
+    }).expect(400);
+    expect(expired.body).toMatchObject({ status: 400, code: 'enrollment-code-invalid' });
+
+    // Nothing burned: the row still carries its (expired) hash — not redeemed.
+    const listed = await listDevices(token, tenantId).expect(200);
+    expect(listed.body.items).toHaveLength(0);
+  });
+
+  test('device list pagination: the keyset cursor chain walks to exhaustion without duplicates or gaps; malformed cursors 400', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const { tenantId } = await registerTenant(email);
+    const token = await signIn(email);
+
+    // Five enrolled devices (distinct created_at ordering).
+    const enrolledIds: string[] = [];
+    for (const n of [1, 2, 3, 4, 5]) {
+      const device = await enrollDevice(token, tenantId, `Cursor scanner ${n}`);
+      enrolledIds.push(device.deviceId);
+    }
+
+    // Walk the chain with the returned cursors to exhaustion.
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let hop = 0; ; hop++) {
+      expect(hop).toBeLessThan(10); // the chain must terminate
+      const query: Record<string, unknown> = { limit: 2 };
+      if (cursor !== undefined) query.cursor = cursor;
+      const page = await listDevices(token, tenantId, query).expect(200);
+      seen.push(...page.body.items.map((d: { id: string }) => d.id));
+      if (page.body.nextCursor === null) break;
+      cursor = page.body.nextCursor as string;
+    }
+    expect(seen).toHaveLength(5);
+    expect(new Set(seen).size).toBe(5); // no duplicates
+    expect(new Set(seen)).toEqual(new Set(enrolledIds)); // no gaps
+
+    // A crafted cursor is a 400 invalid-cursor (same boundary as users/zones).
+    await listDevices(token, tenantId, { cursor: 'not-a-real-cursor' }).expect(400);
   });
 
   test('badge-in: wrong operator/PIN is one indistinguishable 401; the operator-bound session drives the self-test echo', async () => {

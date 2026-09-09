@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsObject, IsString, Length, Matches } from 'class-validator';
+import { IsEmail, IsObject, IsString, Length, Matches } from 'class-validator';
 
 /**
  * Devices HTTP surface DTOs (Story 3.2). Validation lives at the boundary;
@@ -8,7 +8,10 @@ import { IsObject, IsString, Length, Matches } from 'class-validator';
 export class MintEnrollmentCodeDto {}
 
 export class MintEnrollmentCodeResponse {
-  @ApiProperty({ description: 'The one-time enrollment code (raw — shown once)', example: '9f86d081884c7d65' })
+  @ApiProperty({
+    description: 'The one-time enrollment code (raw — shown once; 43-char base64url)',
+    example: '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+  })
   code!: string;
 
   @ApiProperty({ description: 'ISO-8601 instant the code expires (15-minute TTL)' })
@@ -16,8 +19,12 @@ export class MintEnrollmentCodeResponse {
 }
 
 export class EnrollDeviceDto {
-  @ApiProperty({ description: 'The one-time enrollment code minted in web Settings' })
+  @ApiProperty({
+    description: 'The one-time enrollment code minted in web Settings (43-char base64url — sha256-hashed server-side)',
+    example: '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+  })
   @IsString()
+  @Length(43, 43)
   code!: string;
 
   @ApiProperty({ description: 'Human-readable device label (1-100 characters)', example: 'Dock scanner 1' })
@@ -61,7 +68,7 @@ export class EnrollDeviceResponse {
 
 export class BadgeInDto {
   @ApiProperty({ description: 'The badge-in operator (email)', format: 'email' })
-  @IsString()
+  @IsEmail()
   operatorEmail!: string;
 
   @ApiProperty({ description: 'The operator badge-in PIN (4-6 digits)' })
@@ -104,12 +111,6 @@ export class BadgeInResponse {
 
   @ApiProperty({ type: BadgeInDeviceResponse })
   device!: BadgeInDeviceResponse;
-}
-
-export class RevokeDeviceDto {
-  @ApiProperty({ format: 'uuid' })
-  @IsString()
-  deviceId!: string;
 }
 
 export class DeviceResponse {

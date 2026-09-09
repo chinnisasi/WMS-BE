@@ -5063,8 +5063,8 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "The one-time enrollment code (raw — shown once)",
-            "example": "9f86d081884c7d65"
+            "description": "The one-time enrollment code (raw — shown once; 43-char base64url)",
+            "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
           },
           "expiresAt": {
             "type": "string",
@@ -5081,7 +5081,8 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "The one-time enrollment code minted in web Settings"
+            "description": "The one-time enrollment code minted in web Settings (43-char base64url — sha256-hashed server-side)",
+            "example": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
           },
           "label": {
             "type": "string",
