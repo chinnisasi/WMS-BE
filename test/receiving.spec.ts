@@ -438,7 +438,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       lines: { id: string; grnId: string; poLineId: string; skuId: string; batchId: string; batchCode: string; qty: number; appliedQty: number; excessQty: number }[];
       rejectedLines?: unknown[];
     };
-    expect(grn.code).toMatch(/^GRN-\d{4}$/);
+    expect(grn.code).toMatch(/^GRN-\d+$/);
     expect(grn.poId).toBe(poId);
     expect(grn.blindReasonCode).toBeNull();
     expect(grn.status).toBe('recorded');
@@ -563,7 +563,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       (item) => item.id === overReceiptId,
     );
     expect(queueItem).toBeTruthy();
-    expect(queueItem!.grnCode).toMatch(/^GRN-\d{4}$/);
+    expect(queueItem!.grnCode).toMatch(/^GRN-\d+$/);
     expect(queueItem!.excessQty).toBe(20);
 
     // An operator (no review.decide) is 403 role-denied (the command's
@@ -1099,5 +1099,83 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     } finally {
       await sql.end();
     }
+  });
+
+  // ── Pinned arms from the review triage (review_loop_iteration 1) ───────────
+
+  it('grn.submit still succeeds after a non-numeric GRN code suffix exists in the tenant (the allocation max ignores it, never a cast 500)', async () => {
+    // `GRN-TESTCHECK` was inserted by the CHECK round-trip test above — a row
+    // whose code tail is not numeric. The next submit still allocates a
+    // numeric `GRN-<n>` successor of the numeric codes.
+    const { poId, lineId } = await createOpenPo(10, plainSkuId);
+    const res = await submitGrn(
+      grnBody([{ poLineId: lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 4 }], poId),
+    ).expect(201);
+    const grn = res.body.goodsReceipt as { code: string };
+    expect(grn.code).toMatch(/^GRN-\d+$/);
+    expect(Number(grn.code.slice(4))).toBeGreaterThan(0);
+  });
+
+  it('a line quantity above the int4 bound of goods_receipt_lines is a 400 before any write — never an insert-time 500', async () => {
+    const { poId, lineId } = await createOpenPo(10, plainSkuId);
+    await submitGrn(
+      grnBody(
+        [{ poLineId: lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 2_147_483_648 }],
+        poId,
+      ),
+    )
+      .expect(400)
+      .then((res) => expect(res.body).toMatchObject({ code: 'validation-failed' }));
+    // The rejected receipt wrote nothing — the PO line's received_qty is untouched.
+    const po = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/inbound/purchase-orders/${poId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const line = (po.body.purchaseOrder as { lines: { receivedQty: number }[] }).lines[0]!;
+    expect(line.receivedQty).toBe(0);
+  });
+
+  it('a PO receipt whose line carries poLineId null settles the SKU in full (the device cache-miss shape) — physical truth applies, no PO gating, no over-receipt row', async () => {
+    const { poId, lineId } = await createOpenPo(50, plainSkuId);
+    const res = await submitGrn(
+      grnBody(
+        [
+          { poLineId: lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 6 },
+          { poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 9 },
+        ],
+        poId,
+      ),
+    ).expect(201);
+    const grn = res.body.goodsReceipt as {
+      id: string;
+      lines: { poLineId: string | null; qty: number; appliedQty: number; excessQty: number }[];
+      rejectedLines?: unknown[];
+    };
+    expect(grn.rejectedLines).toBeUndefined();
+    expect(grn.lines).toHaveLength(2);
+    // The listed line applies within open qty; the unlisted (null-ref) line
+    // applies in full — no over-receipt row for either.
+    expect(grn.lines[0]).toMatchObject({ poLineId: lineId, qty: 6, appliedQty: 6, excessQty: 0 });
+    expect(grn.lines[1]).toMatchObject({ poLineId: null, qty: 9, appliedQty: 9, excessQty: 0 });
+    // The ledger carries both events (the receipt into the receiving bin);
+    // the null-arm event references the GRN without a poLineId.
+    const events = await ledgerRows(grn.id);
+    expect(events).toHaveLength(2);
+    expect(events.map((event) => event.quantity_delta).sort((a, b) => a - b)).toEqual([6, 9]);
+    expect(events.find((event) => event.quantity_delta === 9)!.reference_doc).toMatchObject({
+      kind: 'grn-receipt',
+      grnId: grn.id,
+      poId,
+    });
+    expect(events.find((event) => event.quantity_delta === 9)!.reference_doc.poLineId).toBeUndefined();
+    // received_qty moved only by the listed line.
+    const po = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/inbound/purchase-orders/${poId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const line = (po.body.purchaseOrder as { lines: { receivedQty: number }[] }).lines[0]!;
+    expect(line.receivedQty).toBe(6);
+    // No over-receipt row pended for either line.
+    expect(await outboxRows('over_receipt.requested', grn.id)).toHaveLength(0);
   });
 });

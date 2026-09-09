@@ -7133,8 +7133,9 @@
           },
           "qty": {
             "type": "number",
-            "description": "Physically received quantity in base UoM (positive integer)",
-            "minimum": 1
+            "description": "Physically received quantity in base UoM (positive integer, at most 2147483647 — the int4 bound of the line table)",
+            "minimum": 1,
+            "maximum": 2147483647
           }
         },
         "required": [
@@ -7532,6 +7533,10 @@
           "appliedUnits": {
             "type": "number",
             "description": "Units applied immediately (the excess pends)"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "Row creation time (the keyset cursor field), ISO-8601 UTC"
           }
         },
         "required": [
@@ -7547,7 +7552,8 @@
           "recordedAt",
           "lineCount",
           "totalUnits",
-          "appliedUnits"
+          "appliedUnits",
+          "createdAt"
         ]
       },
       "GoodsReceiptListResponse": {
@@ -7638,6 +7644,10 @@
           "decidedAt": {
             "type": "string",
             "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "Row creation time (the keyset cursor field), ISO-8601 UTC"
           }
         },
         "required": [
@@ -7655,7 +7665,8 @@
           "requestedBy",
           "requestedAt",
           "decidedBy",
-          "decidedAt"
+          "decidedAt",
+          "createdAt"
         ]
       },
       "OverReceiptListResponse": {

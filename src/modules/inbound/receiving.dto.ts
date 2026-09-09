@@ -64,10 +64,15 @@ export class GrnLineInputDto {
   @Length(20, 35)
   mfgDate?: string | null;
 
-  @ApiProperty({ description: 'Physically received quantity in base UoM (positive integer)', minimum: 1 })
+  @ApiProperty({
+    description: 'Physically received quantity in base UoM (positive integer, at most 2147483647 — the int4 bound of the line table)',
+    minimum: 1,
+    maximum: 2147483647,
+  })
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(2_147_483_647)
   qty!: number;
 }
 
@@ -261,6 +266,9 @@ export class GoodsReceiptEntryDto {
 
   @ApiProperty({ description: 'Units applied immediately (the excess pends)' })
   appliedUnits!: number;
+
+  @ApiProperty({ description: 'Row creation time (the keyset cursor field), ISO-8601 UTC' })
+  createdAt!: string;
 }
 
 export class GoodsReceiptListQuery {
@@ -342,6 +350,9 @@ export class OverReceiptDto {
 
   @ApiProperty({ type: String, nullable: true })
   decidedAt!: string | null;
+
+  @ApiProperty({ description: 'Row creation time (the keyset cursor field), ISO-8601 UTC' })
+  createdAt!: string;
 }
 
 export class OverReceiptListQuery {

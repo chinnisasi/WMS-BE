@@ -138,6 +138,8 @@ export interface OverReceiptEntry {
   readonly requestedAt: string;
   readonly decidedBy: string | null;
   readonly decidedAt: string | null;
+  /** Row creation time (the keyset cursor field) — part of the read contract. */
+  readonly createdAt: string;
 }
 
 /** The decide response (the idempotency snapshot). */
@@ -146,6 +148,12 @@ export interface OverReceiptDecisionSnapshot {
 }
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
+
+/**
+ * The line-quantity ceiling: `goods_receipt_lines.qty` is int4, so a larger
+ * (but typable) quantity must be a 400, never an insert-time 500.
+ */
+export const MAX_GRN_LINE_QTY = 2_147_483_647;
 
 /** GRN codes are `GRN-<n>`, zero-padded to 4 digits, unique per tenant. */
 function grnCode(n: number): string {
@@ -279,6 +287,9 @@ export class ReceivingCommand {
       for (const line of command.lines) {
         if (!Number.isInteger(line.qty) || line.qty < 1) {
           throw grnValidation(`Line quantity must be a positive integer (got ${line.qty}).`);
+        }
+        if (line.qty > MAX_GRN_LINE_QTY) {
+          throw grnValidation(`Line quantity must be at most ${MAX_GRN_LINE_QTY} (got ${line.qty}).`);
         }
         if (line.mfgDate !== null) {
           assertUtc(line.mfgDate, 'mfgDate');
@@ -761,6 +772,7 @@ export class ReceivingCommand {
           requestedAt: canonicalInstant(row.requestedAt),
           decidedBy: command.actorUserId,
           decidedAt,
+          createdAt: canonicalInstant(row.createdAt),
         },
       };
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
@@ -884,14 +896,20 @@ export class ReceivingCommand {
   /**
    * The next `GRN-<n>` under the tenant's sequence advisory lock — the
    * unique `(tenant, code)` index is the race backstop (a concurrent submit
-   * of the same tenant serializes on the lock anyway).
+   * of the same tenant serializes on the lock anyway). Only codes matching
+   * the `GRN-<digits>` shape take the max: a non-numeric suffix (any row not
+   * written through this command — a fixture, an import) is ignored, never a
+   * cast 500, and a 5-digit code (`GRN-10000`, past the 4-digit pad) sorts
+   * numerically, not lexically.
    */
   private async allocateGrnCode(tx: TenantTx, tenantId: string): Promise<string> {
     await tx.execute(
       sql`select pg_advisory_xact_lock(hashtextextended(${tenantId} || ':grn-seq', 0))`,
     );
     const headRows = await tx
-      .select({ n: sql<number>`coalesce(max(substring(code from 5)::int), 0)` })
+      .select({
+        n: sql<number>`coalesce(max(substring(code from '^GRN-([0-9]+)$')::int), 0)`,
+      })
       .from(goodsReceiptNotes)
       .where(eq(goodsReceiptNotes.tenantId, tenantId));
     const next = (headRows[0]?.n ?? 0) + 1;
