@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { HealthController } from './health.controller';
 import { EchoController } from './echo.controller';
+import { DevicesController } from './devices.controller';
 import { InventoryController } from './inventory.controller';
 import { InboundController } from './inbound.controller';
 import { OpenApiController } from './openapi.controller';
@@ -35,6 +36,7 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
   controllers: [
     HealthController,
     EchoController,
+    DevicesController,
     InventoryController,
     InboundController,
     OpenApiController,
