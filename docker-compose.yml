@@ -8,3 +8,11 @@ services:
       POSTGRES_DB: wms
     ports:
       - '55432:5432'
+  valkey:
+    # Story 2.3 (AD-2): the atomic-decision store for reservations — carries
+    # ONLY per-(warehouse, sku) reserved counters, tenant-namespaced. Postgres
+    # (`reservations`) is the journal/truth; Valkey state is always rebuildable.
+    image: valkey/valkey:9.1-alpine
+    container_name: wms-be-valkey
+    ports:
+      - '56379:6379'

@@ -23,8 +23,20 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # Story 2.3: the reservation suite exercises the atomic-decision scripts
+      # against real Valkey (the same image docker-compose runs locally).
+      valkey:
+        image: valkey/valkey:9.1-alpine
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       DATABASE_URL: postgres://wms:wms@localhost:55432/wms
+      VALKEY_URL: redis://localhost:56379/0
     steps:
       - uses: actions/checkout@v4
 

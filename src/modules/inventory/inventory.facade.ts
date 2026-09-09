@@ -21,6 +21,13 @@ import { StockAdjustmentCommand } from './inventory.command';
 import type { AdjustStockCommand, StockAdjustmentSnapshot } from './inventory.command';
 import { ReconciliationService } from './reconcile';
 import type { ReconcileReport } from './reconcile';
+import { ReservationService } from './reservation.service';
+import type {
+  AtpSnapshot,
+  GrantReservationCommand,
+  ReservationRebuildReport,
+  ReservationSnapshot,
+} from './reservation.service';
 
 /** One event-timeline row (the read model of the ledger). */
 export interface LedgerTimelineEntry {
@@ -97,6 +104,10 @@ export class InventoryFacade {
     // Continuous reconciliation (Story 2.2) — background work; the jobs shell
     // drives it through this facade. No HTTP route.
     @Inject(ReconciliationService) private readonly reconciliation: ReconciliationService,
+    // Atomic reservations (Story 2.3) — the ONE atomic decision point for
+    // sellable stock; consumed here (reads become HTTP in 2.5, order wiring
+    // in Epic 4).
+    @Inject(ReservationService) private readonly reservations: ReservationService,
   ) {}
 
   /** `stock.adjustment` — the first movement producer (Story 2.1). */
@@ -244,5 +255,45 @@ export class InventoryFacade {
     scope?: { skuId?: string; binId?: string },
   ): Promise<RebuildReport> {
     return this.ledger.rebuildProjections(tenantId, warehouseId, scope);
+  }
+
+  /**
+   * Grants one reservation hold (Story 2.3): the atomic decision point —
+   * idempotent per owner scope; the race loser gets the deterministic 409
+   * `unavailable`. No HTTP route in this story (reads become HTTP in 2.5).
+   */
+  async grantReservation(command: GrantReservationCommand): Promise<ReservationSnapshot> {
+    return this.reservations.grant(command);
+  }
+
+  /** `held → committed` — serialized, exactly one terminal winner. */
+  async commitReservation(tenantId: string, reservationId: string): Promise<ReservationSnapshot> {
+    return this.reservations.commit(tenantId, reservationId);
+  }
+
+  /** `held → released` — restores the reserved counter. */
+  async releaseReservation(tenantId: string, reservationId: string): Promise<ReservationSnapshot> {
+    return this.reservations.release(tenantId, reservationId);
+  }
+
+  /** Real-time ATP: on-hand (quarantine-excluded) − reserved − hooks. */
+  async atp(tenantId: string, warehouseId: string, skuId: string): Promise<AtpSnapshot> {
+    return this.reservations.atp(tenantId, warehouseId, skuId);
+  }
+
+  /** Rebuilds the Valkey reserved counters from the journal (Postgres wins). */
+  async rebuildReservationCounters(
+    tenantId: string,
+    warehouseId?: string,
+  ): Promise<ReservationRebuildReport[]> {
+    return this.reservations.rebuildCounters(tenantId, warehouseId);
+  }
+
+  /**
+   * The reaper's entry: expires every held row past its TTL (serialized
+   * terminal transitions) and restores the counters. Returns the count.
+   */
+  async expireDueReservations(): Promise<number> {
+    return this.reservations.expireDue();
   }
 }
