@@ -5,7 +5,7 @@ import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, idempotencyKeys, users } from '../../shared/db/schema';
 import type { UserRole, UserStatus } from '../../shared/db/schema';
-import { uuidv7 } from '../../shared/primitives/ids';
+import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
@@ -614,8 +614,6 @@ function concurrentIdempotency(): ProblemException {
     'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
   );
 }
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
   let decoded: { createdAt: string; id: string };

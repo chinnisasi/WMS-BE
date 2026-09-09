@@ -3,7 +3,7 @@ import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { idempotencyKeys, skus, uomConversions } from '../../shared/db/schema';
-import { uuidv7 } from '../../shared/primitives/ids';
+import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { buildPage, decodeCursor, type Page } from '../../shared/primitives/pagination';
@@ -55,8 +55,6 @@ export interface EditSkuCommand {
   readonly reorderQty?: number | undefined;
   readonly barcode?: string | undefined;
 }
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * SKU list + edit (Story 1.4). Manual creation is out of scope per planning —

@@ -8,7 +8,7 @@ import type { Reservation } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { nowIso } from '../../shared/primitives/time';
-import { uuidv7 } from '../../shared/primitives/ids';
+import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { isUniqueViolationOn, ProblemException } from '../../shared/problem-details/problem.exception';
 import { ValkeyClient } from '../../shared/valkey/valkey.client';
 import {
@@ -28,8 +28,6 @@ export const DEFAULT_RESERVATION_TTL_SECONDS = 900;
 export const MAX_RESERVATION_TTL_SECONDS = 10 * 365 * 24 * 3600;
 
 /** The uuid shape of every reservation id (the terminal-transition guard). */
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 /**
  * Valkey counter keys' TTL seconds — a BACKSTOP only (story 2.3): a counter
  * that outlives all writes eventually vanishes, and a vanished counter fails

@@ -882,3 +882,130 @@ export const reservations = pgTable(
 );
 
 export type Reservation = typeof reservations.$inferSelect;
+
+/**
+ * Vendors (Story 3.1 — the inbound module's first tables): purchase-order
+ * counterparties as a **real entity** (not a free-text field) — Epic 6's
+ * suggested-PO drafts read default vendors (`is_default`). Codes are unique
+ * per tenant (the SKU-code convention); a duplicate create is a 409 naming
+ * the conflicting code. No editing beyond creation (vendor edit is a later
+ * story).
+ *
+ * RLS policy lives **only in the migration SQL** (0011, the 0005→0010
+ * pattern). `vendors` is tenant-scoped, NOT warehouse-scoped — a vendor is
+ * commercial master data; the PO carries the warehouse.
+ */
+export const vendors = pgTable(
+  'vendors',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    code: text('code').notNull(),
+    name: text('name').notNull(),
+    isDefault: boolean('is_default').notNull().default(false),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('vendors_tenant_id_code_unique').on(table.tenantId, table.code),
+    // Vendor-list keyset pagination (created_at + id, standard cursor).
+    index('vendors_created_at_id_idx').on(table.createdAt, table.id),
+  ],
+);
+
+export type Vendor = typeof vendors.$inferSelect;
+
+/**
+ * Purchase orders (Story 3.1): warehouse-scoped upstream documents —
+ * receiving (3.3) and open-quantity tracking are per-warehouse, so
+ * `warehouse_id` is required from day one (no later re-scoping migration).
+ * Codes are client-supplied and unique per tenant — a duplicate is a 409
+ * naming the conflicting code (the SKU-code convention).
+ *
+ * `status` is the deliberately two-valued lifecycle (`open` → `closed` with
+ * close as an explicit command; text + hand-appended CHECK per the repo
+ * convention, no pgEnum). `carried_from_po_id` references the PO whose open
+ * quantities this row carries at close (a close with ≥1 carried line
+ * auto-creates this successor; uuid column, no FK — validated in-command).
+ * No FKs anywhere (repo convention): `vendor_id` / `warehouse_id` /
+ * `carried_from_po_id` are uuid columns asserted in the command transaction.
+ *
+ * RLS policy + status CHECK live **only in the migration SQL** (0011).
+ */
+export const purchaseOrders = pgTable(
+  'purchase_orders',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    vendorId: uuid('vendor_id').notNull(),
+    code: text('code').notNull(),
+    status: text('status').notNull().default('open'),
+    carriedFromPoId: uuid('carried_from_po_id'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('purchase_orders_tenant_id_code_unique').on(table.tenantId, table.code),
+    // PO-list keyset pagination (the status filter composes on top).
+    index('purchase_orders_tenant_created_at_id_idx').on(
+      table.tenantId,
+      table.createdAt,
+      table.id,
+    ),
+    // The list is warehouse-scoped — keyset within one warehouse.
+    index('purchase_orders_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+    // The carried-from chain: from a closed PO to its successor(s).
+    index('purchase_orders_tenant_carried_from_idx').on(
+      table.tenantId,
+      table.carriedFromPoId,
+    ),
+  ],
+);
+
+export type PurchaseOrder = typeof purchaseOrders.$inferSelect;
+
+/**
+ * Purchase-order lines (Story 3.1): the per-line ordered / received / open
+ * truth. Quantities are **positive integers in base UoM** (`ordered_qty` > 0
+ * by the hand-appended CHECK); `received_qty` ships defaulting to 0 and
+ * is updated transactionally by 3.3's GRN commands — never derived from the
+ * ledger; `open_qty` is ALWAYS derived (`ordered − received`), never stored.
+ * `unit_cost_paise` is the per-line price carrier (integer paise, AD-9).
+ * `status` carries the close disposition (`open` | `cancelled` | `carried`).
+ *
+ * RLS policy + status/non-negative CHECKs live **only in the migration SQL**
+ * (0011, the 0010 pattern). The `open_qty ≥ 0` CHECK (received ≤ ordered)
+ * lands with the 3.3 receipt path — shipping it now would block over-receipt
+ * approval (3.3's mid-receive gate allows receipts past the ordered qty).
+ */
+export const purchaseOrderLines = pgTable(
+  'purchase_order_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    poId: uuid('po_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    orderedQty: integer('ordered_qty').notNull(),
+    receivedQty: integer('received_qty').notNull().default(0),
+    unitCostPaise: integer('unit_cost_paise').notNull(),
+    expectedDate: timestamp('expected_date', { withTimezone: true, mode: 'string' }),
+    status: text('status').notNull().default('open'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The detail read's per-line ordering and any per-PO quantity roll-up.
+    index('purchase_order_lines_po_id_idx').on(table.poId, table.createdAt, table.id),
+  ],
+);
+
+export type PurchaseOrderLine = typeof purchaseOrderLines.$inferSelect;

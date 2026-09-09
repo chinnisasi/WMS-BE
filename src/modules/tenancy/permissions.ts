@@ -19,6 +19,11 @@ export const CAPABILITIES = [
   // producer). Mirrored into wms-fe `src/lib/users.ts` by the frontend (the
   // cross-repo drift guard for that mirror is a deferred item).
   'stock.adjust',
+  // Story 3.1 — the inbound module's mutations (vendor master data + the PO
+  // lifecycle). Owner and Ops Manager only; Operator and Accountant are
+  // read-only.
+  'vendor.manage',
+  'po.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -40,6 +45,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'catalog.import',
     'sku.edit',
     'stock.adjust',
+    'vendor.manage',
+    'po.manage',
   ]),
   operator: new Set<Capability>([]),
   accountant: new Set<Capability>([]),

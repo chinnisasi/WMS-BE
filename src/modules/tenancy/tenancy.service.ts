@@ -9,6 +9,7 @@ import type { UserRole } from '../../shared/db/schema';
  
 import { CatalogFacade } from '../catalog/catalog.facade';
 import type { Page } from '../../shared/primitives/pagination';
+import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -399,8 +400,6 @@ export class TenancyService {
 function clampPageSize(limit: number): number {
   return Math.min(Math.max(Math.trunc(limit) || DEFAULT_WAREHOUSE_PAGE_SIZE, 1), MAX_WAREHOUSE_PAGE_SIZE);
 }
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * The cursor is opaque to clients but crafted input is still possible — a
