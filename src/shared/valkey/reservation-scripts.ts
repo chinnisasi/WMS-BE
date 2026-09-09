@@ -35,6 +35,11 @@ if redis.call('EXISTS', KEYS[1]) == 0 then
   return {0, 'missing-counter'}
 end
 local reserved = tonumber(redis.call('GET', KEYS[1]))
+if reserved == nil then
+  -- A corrupt (non-numeric) value is divergence, not a decision input: the
+  -- caller heals the scope from the journal (Postgres wins) before granting.
+  return {0, 'missing-counter'}
+end
 local qty = tonumber(ARGV[1])
 if qty <= 0 then
   return {0, 'invalid-qty'}
