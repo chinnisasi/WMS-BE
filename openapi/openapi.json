@@ -4995,6 +4995,320 @@
           "receiving"
         ]
       }
+    },
+    "/tenants/{tenantId}/putaway/placements": {
+      "post": {
+        "operationId": "PutawayController_placePutaway",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlacePutawayDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Placement recorded: the placement snapshot with suggestion-vs-actual (the idempotency snapshot — a replay re-serves it, nothing re-moves)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PutawayPlacementResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid body, a system target bin (validation-failed naming the bin), a blocked bin (bin-blocked naming the bin), a full bin (bin-full naming the bin, its capacity and occupancy), an over-place (validation-failed naming the remaining quantity), a missing/malformed mismatch reason, or a serial-arm violation (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown or revoked device (device-revoked), or the operator lacks putaway.execute (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse, GRN line, SKU, batch, or bin does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent idempotent request (conflict), or a serial-tracked placement scans a serial that already lives in a bin or was last seen in another bin (duplicate-serial / serial-elsewhere, naming it)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse), or a diverged replay would drive the Receiving bin below zero (insufficient-on-hand — quarantined, never corrupting)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "putaway.place — records a directed placement exactly once (badge-in session required): a putaway.placed ledger movement moves the stock from the system Receiving bin into the target bin; the suggestion is re-derived server-side and a mismatch reason is required when the operator placed elsewhere",
+        "tags": [
+          "putaway"
+        ]
+      },
+      "get": {
+        "operationId": "PutawayController_listPlacements",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Narrow to one warehouse",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The placement page (newest first, suggestion-vs-actual carried)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PutawayPlacementListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor (invalid-cursor), malformed warehouseId, or out-of-range limit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouseId filter names a warehouse outside this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists putaway placements (keyset cursor pagination, warehouse-filterable — the read-only web surface)",
+        "tags": [
+          "putaway"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/putaway/tasks": {
+      "get": {
+        "operationId": "PutawayController_listPutawayTasks",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "query",
+            "description": "Warehouse the tasks are derived for",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The derived tasks (oldest receipt first) with suggested bins",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PutawayTaskListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed warehouseId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The derived putaway tasks: one per GRN line whose applied stock still sits in the warehouse's system Receiving bin, each with the capacity-only suggested bin (derived on read — no task store)",
+        "tags": [
+          "putaway"
+        ]
+      }
     }
   },
   "info": {
@@ -7797,6 +8111,131 @@
           "lines"
         ]
       },
+      "PutawayBinDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "zoneId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "zoneCode": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "description": "The fixed bin type (shelf/pallet/floor/staging)"
+          },
+          "capacity": {
+            "type": "number",
+            "description": "Capacity in base-UoM units"
+          },
+          "blocked": {
+            "type": "boolean",
+            "description": "Broken-bin flag — blocked bins reject placements"
+          },
+          "systemOwned": {
+            "type": "boolean",
+            "description": "System bins (Receiving/QC-hold) are never placement targets"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "zoneId",
+          "zoneCode",
+          "type",
+          "capacity",
+          "blocked",
+          "systemOwned"
+        ]
+      },
+      "SuggestedBinDto": {
+        "type": "object",
+        "properties": {
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binCode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "binId",
+          "binCode"
+        ]
+      },
+      "PutawayTaskDto": {
+        "type": "object",
+        "properties": {
+          "grnId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnCode": {
+            "type": "string",
+            "description": "The GRN code (server-assigned)"
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "description": "min(applied, receiving-bin on-hand) — the placeable units",
+            "minimum": 1
+          },
+          "suggestedBin": {
+            "nullable": true,
+            "description": "The suggested bin; null when no storage bin has room",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SuggestedBinDto"
+              }
+            ]
+          },
+          "rationale": {
+            "type": "string",
+            "description": "The one-line capacity-only rationale"
+          }
+        },
+        "required": [
+          "grnId",
+          "grnCode",
+          "grnLineId",
+          "skuId",
+          "skuCode",
+          "batchId",
+          "batchCode",
+          "qty",
+          "suggestedBin",
+          "rationale"
+        ]
+      },
       "CatalogSnapshotResponse": {
         "type": "object",
         "properties": {
@@ -7820,13 +8259,29 @@
             "items": {
               "$ref": "#/components/schemas/CatalogSnapshotPoDto"
             }
+          },
+          "bins": {
+            "description": "Story 3.5 (additive): every bin of the warehouse — blocked/system bins included so the device can reject a scan against them pre-queue",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PutawayBinDto"
+            }
+          },
+          "putawayTasks": {
+            "description": "Story 3.5 (additive): the derived putaway tasks with the capacity-only suggestions (advisory — the server re-gates at placement)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PutawayTaskDto"
+            }
           }
         },
         "required": [
           "generatedAt",
           "warehouseId",
           "skus",
-          "openPurchaseOrders"
+          "openPurchaseOrders",
+          "bins",
+          "putawayTasks"
         ]
       },
       "GoodsReceiptEntryDto": {
@@ -8177,6 +8632,254 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/QcHoldDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "PlacePutawayDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Warehouse the placement lands in"
+          },
+          "grnId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The GRN whose received stock is being put away"
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The GRN line this placement moves"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Catalog batch identity (required for batch-tracked SKUs, forbidden otherwise)"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Placed quantity in base UoM (positive integer — partial placements allowed)",
+            "minimum": 1,
+            "maximum": 2147483647
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The target bin the operator scanned/entered"
+          },
+          "reasonCode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "pallet-too-heavy",
+              "suggested-bin-occupied",
+              "consolidation-with-existing-stock",
+              "operator-preference",
+              "other"
+            ],
+            "description": "The mismatch reason (required when the target bin differs from the suggested bin)"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time of the placement (ISO-8601 UTC, Z-suffixed)",
+            "minLength": 20,
+            "maxLength": 35
+          },
+          "serials": {
+            "maxItems": 200,
+            "description": "The serial numbers of a serial-tracked placement (one per unit, no duplicates)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "grnId",
+          "grnLineId",
+          "skuId",
+          "qty",
+          "toBinId",
+          "occurredAt"
+        ]
+      },
+      "PutawayPlacementDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnCode": {
+            "type": "string",
+            "description": "The GRN code (server-assigned)"
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string",
+            "description": "The SKU code (joined for the report surface)"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The catalog batch code; null on non-batch-tracked SKUs"
+          },
+          "qty": {
+            "type": "number",
+            "description": "The placed quantity (positive integer)",
+            "minimum": 1
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The system Receiving bin the units left"
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The target bin the operator placed into"
+          },
+          "toBinCode": {
+            "type": "string",
+            "description": "The target bin code"
+          },
+          "suggestedBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The server's re-derived suggestion; null when no bin fit"
+          },
+          "suggestedBinCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The suggested bin's code; null when no bin fit"
+          },
+          "reasonCode": {
+            "type": "string",
+            "enum": [
+              "pallet-too-heavy",
+              "suggested-bin-occupied",
+              "consolidation-with-existing-stock",
+              "operator-preference",
+              "other"
+            ],
+            "nullable": true,
+            "description": "The recorded mismatch reason; null when the suggestion was followed"
+          },
+          "placedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "placedAt": {
+            "type": "string",
+            "description": "Device time of the placement (AD-1), ISO-8601 UTC"
+          },
+          "deviceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The floor device that recorded the placement"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "Row creation time, ISO-8601 UTC"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "grnId",
+          "grnCode",
+          "grnLineId",
+          "skuId",
+          "skuCode",
+          "batchId",
+          "batchCode",
+          "qty",
+          "fromBinId",
+          "toBinId",
+          "toBinCode",
+          "suggestedBinId",
+          "suggestedBinCode",
+          "reasonCode",
+          "placedBy",
+          "placedAt",
+          "deviceId",
+          "createdAt"
+        ]
+      },
+      "PutawayPlacementResponse": {
+        "type": "object",
+        "properties": {
+          "placement": {
+            "$ref": "#/components/schemas/PutawayPlacementDto"
+          }
+        },
+        "required": [
+          "placement"
+        ]
+      },
+      "PutawayTaskListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PutawayTaskDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "PutawayPlacementListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PutawayPlacementDto"
             }
           },
           "nextCursor": {

@@ -15,6 +15,7 @@ import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
+import { PutawayFacade } from '../putaway/putaway.facade';
 import { ReceivingCommand } from './receiving.command';
 import type {
   DecideOverReceiptCommand,
@@ -78,6 +79,32 @@ export interface CatalogSnapshot {
     readonly vendorId: string;
     readonly lines: readonly PurchaseOrderLineSnapshot[];
   }[];
+  // ── Story 3.5 (additive): the putaway decision fields ────────────────────
+  /** Every bin of the warehouse (blocked/system bins INCLUDED — the device needs them to reject a scan against them pre-queue). */
+  readonly bins: readonly {
+    readonly id: string;
+    readonly code: string;
+    readonly zoneId: string;
+    readonly zoneCode: string;
+    readonly type: string;
+    readonly capacity: number;
+    readonly blocked: boolean;
+    readonly systemOwned: boolean;
+  }[];
+  /** The derived putaway tasks (suggestions baked in are advisory — the server re-derives and re-gates at placement). */
+  readonly putawayTasks: readonly {
+    readonly grnId: string;
+    readonly grnCode: string;
+    readonly grnLineId: string;
+    readonly skuId: string;
+    readonly skuCode: string;
+    readonly batchId: string | null;
+    readonly batchCode: string | null;
+    /** min(applied, receiving-bin on-hand) — the placeable units. */
+    readonly qty: number;
+    readonly suggestedBin: { readonly binId: string; readonly binCode: string } | null;
+    readonly rationale: string;
+  }[];
 }
 
 export const DEFAULT_RECEIVING_PAGE_SIZE = 50;
@@ -121,10 +148,12 @@ export class ReceivingFacade {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(ReceivingCommand) private readonly receiving: ReceivingCommand,
-    // The device snapshot composes catalog identity + inbound open POs —
-    // catalog through its facade (its tables stay module-exclusive), the PO
-    // lines through this module's own tables.
+    // The device snapshot composes catalog identity + inbound open POs +
+    // (Story 3.5, additive) the putaway decision fields — catalog through its
+    // facade (its tables stay module-exclusive), the PO lines through this
+    // module's own tables, bins + putaway tasks through the putaway facade.
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
+    @Inject(PutawayFacade) private readonly putaway: PutawayFacade,
   ) {}
 
   /** `grn.submit` — the device-authenticated whole-GRN command. */
@@ -325,6 +354,13 @@ export class ReceivingFacade {
         list.push(lineSnapshot(line));
         linesByPo.set(line.poId, list);
       }
+      // Story 3.5 (additive): the putaway decision fields ride the same
+      // snapshot — the bins (for the wrong-bin/blocked pre-queue checks) and
+      // the derived tasks (suggestions advisory; the server re-gates).
+      const [binSummaries, putawayTasks] = await Promise.all([
+        this.putaway.getBinSummaries(tenantId, warehouseId),
+        this.putaway.getPutawayTasks(tenantId, warehouseId),
+      ]);
       return {
         generatedAt: new Date().toISOString(),
         warehouseId,
@@ -336,6 +372,8 @@ export class ReceivingFacade {
           vendorId: po.vendorId,
           lines: linesByPo.get(po.id) ?? [],
         })),
+        bins: binSummaries,
+        putawayTasks: putawayTasks.map((task) => ({ ...task })),
       };
     });
   }

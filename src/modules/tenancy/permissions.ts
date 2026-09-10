@@ -36,6 +36,11 @@ export const CAPABILITIES = [
   // scope, release it). Owner and Ops Manager; operators record receipts, they
   // do not quarantine stock. Mirrored into wms-fe `src/lib/users.ts`.
   'qc.manage',
+  // Story 3.5 — the directed-putaway placement command. Owner + Ops Manager +
+  // Operator (the first non-empty operator capability, deliberate: operators
+  // place the stock they received); Accountant stays read-only. Mirrored into
+  // wms-fe `src/lib/users.ts`.
+  'putaway.execute',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -44,7 +49,9 @@ export type Capability = (typeof CAPABILITIES)[number];
  * The permission matrix (spec 1.5): Owner = all capabilities including
  * `users.invite` / `users.role_change`; Ops Manager = all operational
  * mutations (warehouses, zones, bins, catalog import, SKU edit) but no user
- * management; Operator and Accountant are read-only. Reads stay open to any
+ * management; Operator holds exactly the floor capabilities a device session
+ * needs (`putaway.execute`, Story 3.5 — the first non-empty operator
+ * capability, deliberate); Accountant is read-only. Reads stay open to any
  * tenant member.
  */
 export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability>>> = {
@@ -62,8 +69,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'device.manage',
     'review.decide',
     'qc.manage',
+    'putaway.execute',
   ]),
-  operator: new Set<Capability>([]),
+  operator: new Set<Capability>(['putaway.execute']),
   accountant: new Set<Capability>([]),
 };
 

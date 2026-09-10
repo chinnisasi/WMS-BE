@@ -342,11 +342,18 @@ async function serialLatestEventInTx(
  * index. Serial-tracked movements are one event per unit (qty ±1), so the
  * per-event check IS the per-unit check:
  *
- * - intake (`quantityDelta > 0`): the serial must not already live in a bin —
- *   its latest event being an intake (any bin, the same one included: a
- *   re-scan would double-count the unit) is a 409 `duplicate-serial` naming
- *   that bin. A serial whose latest event is a DRAW is out of stock and may
- *   re-enter (nothing lives anywhere).
+ * - intake (`quantityDelta > 0`, no `fromBinId`): the serial must not already
+ *   live in a bin — its latest event being an intake (any bin, the same one
+ *   included: a re-scan would double-count the unit) is a 409
+ *   `duplicate-serial` naming that bin. A serial whose latest event is a DRAW
+ *   is out of stock and may re-enter (nothing lives anywhere).
+ * - relocation (`quantityDelta > 0` WITH a `fromBinId` — Story 3.5's
+ *   directed-putaway placement, one two-arm event per serial unit): the draw
+ *   and the intake are one event, so the serial's latest event must be an
+ *   intake into the movement's `fromBinId` — an intake into another bin is a
+ *   409 `serial-elsewhere` naming that bin, never-moved is a 404
+ *   `serial-unknown`, already drawn out is a 409 `serial-elsewhere` naming
+ *   its last-known bin.
  * - draw (`quantityDelta < 0`): the serial's latest event must be an intake
  *   into the movement's `fromBinId` — an intake into another bin is a 409
  *   `serial-elsewhere` naming that bin, a serial already drawn out is a 409
@@ -366,9 +373,20 @@ async function assertSerialArmLegal(tx: TenantTx, movement: LedgerMovement): Pro
     return;
   }
   const latest = await serialLatestEventInTx(tx, movement.tenantId, serialRef);
-  if (movement.quantityDelta > 0) {
+  if (movement.quantityDelta > 0 && movement.fromBinId === null) {
+    // Pure intake: the serial enters stock.
     if (latest !== undefined && latest.toBinId !== null) {
       throw duplicateSerial(serialRef, latest.toBinId);
+    }
+  } else if (movement.quantityDelta > 0) {
+    // Two-arm relocation (a directed-putaway placement event): the serial
+    // moves out of `fromBinId` and into `toBinId` in one event — the draw
+    // half of the guard decides.
+    if (latest === undefined) {
+      throw serialUnknown(serialRef);
+    }
+    if (latest.toBinId !== movement.fromBinId) {
+      throw serialElsewhere(serialRef, latest.toBinId ?? latest.fromBinId!);
     }
   } else {
     if (latest === undefined) {
