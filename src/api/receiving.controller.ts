@@ -9,6 +9,7 @@ import type { TenantSession, DeviceSession } from '../modules/tenancy/jwt-sessio
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ReceivingFacade } from '../modules/inbound/receiving.facade';
+import { QcFacade } from '../modules/inbound/qc.facade';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -23,6 +24,13 @@ import {
   OverReceiptListResponse,
   SubmitGoodsReceiptDto,
 } from '../modules/inbound/receiving.dto';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import {
+  PlaceQcHoldDto,
+  QcHoldListQuery,
+  QcHoldListResponse,
+  QcHoldResponse,
+} from '../modules/inbound/qc.dto';
 const IDEMPOTENCY_HEADER = [
   {
     name: 'Idempotency-Key',
@@ -46,7 +54,10 @@ const IDEMPOTENCY_HEADER = [
 @ApiExtraModels(ProblemDetailsDto)
 @Controller('tenants')
 export class ReceivingController {
-  constructor(@Inject(ReceivingFacade) private readonly receiving: ReceivingFacade) {}
+  constructor(
+    @Inject(ReceivingFacade) private readonly receiving: ReceivingFacade,
+    @Inject(QcFacade) private readonly qc: QcFacade,
+  ) {}
 
   @Post(':tenantId/receiving/goods-receipts')
   @HttpCode(HttpStatus.CREATED)
@@ -258,10 +269,125 @@ export class ReceivingController {
     );
     return { overReceipt: { ...snapshot.overReceipt } };
   }
+
+  @Post(':tenantId/receiving/qc-holds')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'qc-holds.place — quarantines a (sku, bin) scope: qc.held ledger movements move the stock into the warehouse\'s system QC-hold bin; ATP drops by the moved quantity (qc.manage)',
+  })
+  @ApiBody({ type: PlaceQcHoldDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: QcHoldResponse,
+    description: 'Hold placed: the open hold row (the idempotency snapshot)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, an empty scope, a serial-tracked SKU, or the system QC-hold bin as the hold origin (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, SKU, or bin does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('An open hold already covers this scope (qc-hold-open), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async placeQcHold(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: PlaceQcHoldDto,
+  ): Promise<QcHoldResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.qc.placeHold(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        skuId: dto.skuId,
+        binId: dto.binId,
+        reason: dto.reason,
+      },
+      key,
+    );
+    return { qcHold: { ...snapshot.qcHold } };
+  }
+
+  @Post(':tenantId/receiving/qc-holds/:holdId/release')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Releases a QC hold (qc.manage) — qc.released movements return exactly the held units (the hold\'s own ledger arms) to its recorded origin bin; audited',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.OK,
+    type: QcHoldResponse,
+    description: 'Hold released: the released hold row with its releasedBy/releasedAt (the idempotency snapshot)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed holdId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No QC hold with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Already released (qc-hold-released), the origin bin no longer exists (qc-hold-origin-bin-gone), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'holdId', format: 'uuid' })
+  async releaseQcHold(
+    @Param('tenantId') tenantId: string,
+    @Param('holdId') holdId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<QcHoldResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(holdId, 'holdId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.qc.releaseHold(
+      { tenantId, actorUserId: session.userId, holdId },
+      key,
+    );
+    return { qcHold: { ...snapshot.qcHold } };
+  }
+
+  @Get(':tenantId/receiving/qc-holds')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Lists QC holds (keyset cursor pagination, warehouse- and status-filterable — open to any member)',
+  })
+  @ApiOkResponse({
+    type: QcHoldListResponse,
+    description: 'The QC-hold page (newest first — the Inbound surface\'s holds read)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed status, cursor, warehouseId, or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouseId filter names a warehouse outside this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async listQcHolds(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: QcHoldListQuery,
+  ): Promise<QcHoldListResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    if (query.warehouseId !== undefined) {
+      assertUuidParam(query.warehouseId, 'warehouseId');
+    }
+    const page = await this.qc.listQcHolds(tenantId, {
+      warehouseId: query.warehouseId,
+      status: query.status,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items, nextCursor: page.nextCursor };
+  }
 }
 
 /** Receiving uuid path/query params fail 400 (not a 500 from the `::uuid` cast). */
-function assertUuidParam(value: string, name: 'overReceiptId' | 'warehouseId'): void {
+function assertUuidParam(value: string, name: 'overReceiptId' | 'holdId' | 'warehouseId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

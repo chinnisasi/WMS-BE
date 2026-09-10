@@ -7,6 +7,8 @@ import { PurchaseOrderCommand } from './po.command';
 import { InboundFacade } from './inbound.facade';
 import { ReceivingCommand } from './receiving.command';
 import { ReceivingFacade } from './receiving.facade';
+import { QcCommand } from './qc.command';
+import { QcFacade } from './qc.facade';
 
 /**
  * Inbound module (Story 3.1): vendor master data and the purchase-order
@@ -29,7 +31,15 @@ import { ReceivingFacade } from './receiving.facade';
  */
 @Module({
   imports: [SharedModule, CatalogModule, InventoryModule],
-  providers: [VendorCommand, PurchaseOrderCommand, InboundFacade, ReceivingCommand, ReceivingFacade],
-  exports: [InboundFacade, ReceivingFacade],
+  providers: [
+    VendorCommand,
+    PurchaseOrderCommand,
+    InboundFacade,
+    ReceivingCommand,
+    ReceivingFacade,
+    QcCommand,
+    QcFacade,
+  ],
+  exports: [InboundFacade, ReceivingFacade, QcFacade],
 })
 export class InboundModule {}

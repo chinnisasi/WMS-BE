@@ -1214,3 +1214,58 @@ export const overReceipts = pgTable(
 );
 
 export type OverReceipt = typeof overReceipts.$inferSelect;
+
+/**
+ * QC holds (Story 3.4): one row per Ops-Manager quarantine decision over a
+ * (tenant, warehouse, sku, bin) scope — the decision record (reason, who,
+ * when), never a stock write (the stock moves through the ledger: `qc.held`
+ * movements into the system QC-hold bin at hold time, `qc.released` back to
+ * `bin_id` — the origin captured at hold time, never caller-chosen — at
+ * release). `status` is `open → released` (conditional UPDATE — a second
+ * decision is a deterministic 409); there is no scrap/reject disposition
+ * (a failed inspection keeps the hold open — quantity shrinkage is Epic 5's
+ * adjustment path) and no partial release (v1 releases the full held scope).
+ *
+ * One open hold per scope: the partial unique index is the DB backstop
+ * behind the command's 409 `qc-hold-open` (the `inventory_quarantines`
+ * pattern).
+ *
+ * RLS policy + status CHECK live **only in the migration SQL** (0014).
+ */
+export const qcHolds = pgTable(
+  'qc_holds',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** The origin bin — captured at hold time; release returns the stock here. */
+    binId: uuid('bin_id').notNull(),
+    reason: text('reason').notNull(),
+    status: text('status').notNull().default('open'),
+    heldBy: uuid('held_by').notNull(),
+    heldAt: timestamp('held_at', { withTimezone: true, mode: 'string' }).notNull(),
+    releasedBy: uuid('released_by'),
+    releasedAt: timestamp('released_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One open hold per (tenant, warehouse, sku, bin) scope — the DB backstop
+    // (the command's 409 `qc-hold-open` checks first; the index catches races).
+    uniqueIndex('qc_holds_open_scope_unique')
+      .on(table.tenantId, table.warehouseId, table.skuId, table.binId)
+      .where(sql`status = 'open'`),
+    // The holds-list read (status filter first).
+    index('qc_holds_tenant_status_created_at_id_idx').on(
+      table.tenantId,
+      table.status,
+      table.createdAt,
+      table.id,
+    ),
+    index('qc_holds_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+  ],
+);
+
+export type QcHold = typeof qcHolds.$inferSelect;

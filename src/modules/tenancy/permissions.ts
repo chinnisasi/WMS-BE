@@ -32,6 +32,10 @@ export const CAPABILITIES = [
   // Conflicts & Reviews queue). Owner and Ops Manager decide every
   // over-receipt in v1; threshold-based Owner routing lands with FR-19.
   'review.decide',
+  // Story 3.4 — the QC hold/release decisions (place a hold on a (sku, bin)
+  // scope, release it). Owner and Ops Manager; operators record receipts, they
+  // do not quarantine stock. Mirrored into wms-fe `src/lib/users.ts`.
+  'qc.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -57,6 +61,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'po.manage',
     'device.manage',
     'review.decide',
+    'qc.manage',
   ]),
   operator: new Set<Capability>([]),
   accountant: new Set<Capability>([]),

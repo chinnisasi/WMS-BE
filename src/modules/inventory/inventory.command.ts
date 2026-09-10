@@ -14,6 +14,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
+import { QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { LedgerService } from './ledger.service';
 
@@ -344,7 +345,7 @@ export class StockAdjustmentCommand {
     command: AdjustStockCommand,
   ): Promise<{ id: string; code: string }> {
     const rows = await tx
-      .select({ id: bins.id, code: bins.code })
+      .select({ id: bins.id, code: bins.code, systemOwned: bins.systemOwned })
       .from(bins)
       .where(
         and(
@@ -361,6 +362,18 @@ export class StockAdjustmentCommand {
         404,
         'Bin not found',
         'No bin with this id exists in this warehouse.',
+      );
+    }
+    // The system QC-hold bin is hold/release-owned (story 3.4): an adjustment
+    // moving stock into or out of it would drop ATP with no hold row and no
+    // release path — only the QC hold/release commands ever move stock
+    // through it.
+    if (bin.systemOwned && bin.code === QC_HOLD_BIN_CODE) {
+      throw new ProblemException(
+        'qc-bin-not-adjustable',
+        400,
+        'The system QC-hold bin is not adjustable',
+        'The system QC-hold bin is moved only by QC hold and release commands — stock adjustments cannot touch it.',
       );
     }
     return bin;

@@ -4638,6 +4638,363 @@
           "receiving"
         ]
       }
+    },
+    "/tenants/{tenantId}/receiving/qc-holds": {
+      "post": {
+        "operationId": "ReceivingController_placeQcHold",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlaceQcHoldDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Hold placed: the open hold row (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QcHoldResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid body, an empty scope, a serial-tracked SKU, or the system QC-hold bin as the hold origin (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse, SKU, or bin does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "An open hold already covers this scope (qc-hold-open), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "qc-holds.place — quarantines a (sku, bin) scope: qc.held ledger movements move the stock into the warehouse's system QC-hold bin; ATP drops by the moved quantity (qc.manage)",
+        "tags": [
+          "receiving"
+        ]
+      },
+      "get": {
+        "operationId": "ReceivingController_listQcHolds",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Filter by warehouse",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "open",
+                "released"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The QC-hold page (newest first — the Inbound surface's holds read)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QcHoldListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed status, cursor, warehouseId, or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouseId filter names a warehouse outside this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists QC holds (keyset cursor pagination, warehouse- and status-filterable — open to any member)",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/qc-holds/{holdId}/release": {
+      "post": {
+        "operationId": "ReceivingController_releaseQcHold",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "holdId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Hold released: the released hold row with its releasedBy/releasedAt (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QcHoldResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed holdId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No QC hold with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already released (qc-hold-released), the origin bin no longer exists (qc-hold-origin-bin-gone), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Releases a QC hold (qc.manage) — qc.released movements return exactly the held units (the hold's own ledger arms) to its recorded origin bin; audited",
+        "tags": [
+          "receiving"
+        ]
+      }
     }
   },
   "info": {
@@ -7696,6 +8053,139 @@
         },
         "required": [
           "overReceipt"
+        ]
+      },
+      "PlaceQcHoldDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Warehouse holding the stock"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The scope's origin bin — captured at hold time; release returns the stock here"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why the stock is quarantined (free-form, carried verbatim; at most 200 characters)",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "warehouseId",
+          "skuId",
+          "binId",
+          "reason"
+        ]
+      },
+      "QcHoldDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The origin bin (release returns here)"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why the stock is quarantined (carried verbatim)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "released"
+            ]
+          },
+          "heldBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "heldAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "releasedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "releasedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC instant when released; null while the hold is open"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "Row creation time (the keyset cursor field), ISO-8601 UTC"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "skuId",
+          "binId",
+          "reason",
+          "status",
+          "heldBy",
+          "heldAt",
+          "releasedBy",
+          "releasedAt",
+          "createdAt"
+        ]
+      },
+      "QcHoldResponse": {
+        "type": "object",
+        "properties": {
+          "qcHold": {
+            "$ref": "#/components/schemas/QcHoldDto"
+          }
+        },
+        "required": [
+          "qcHold"
+        ]
+      },
+      "QcHoldListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QcHoldDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
         ]
       }
     }

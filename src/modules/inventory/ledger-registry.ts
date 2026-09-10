@@ -40,6 +40,16 @@ export type LedgerReferenceDoc =
       readonly poId?: string;
       /** Absent on the blind arm and on an approved-excess event with no line. */
       readonly poLineId?: string;
+    }
+  // Story 3.4 — the QC-hold arm: every `qc.held` / `qc.released` movement
+  // names the hold that produced it. `fromBinId` rides the `qc.held` events
+  // only (the origin captured at hold time — release reads the hold row's
+  // `bin_id`, never a caller-chosen bin). NEW union arm — the earlier kinds
+  // are never reshaped.
+  | {
+      readonly kind: 'qc-hold';
+      readonly holdId: string;
+      readonly fromBinId?: string;
     };
 // Later stories extend this union with NEW kinds (pick, transfer, …) — never
 // by reshaping an existing arm.
@@ -99,6 +109,32 @@ registerLedgerEventType({
   type: 'grn.received',
   sinceVersion: 1,
   referenceKinds: ['grn-receipt'],
+  allowsBatchArm: true,
+  allowsSerialArm: false,
+});
+
+/**
+ * Grammar v1, Story 3.4 — the QC-hold movements: a hold moves the whole
+ * (sku, bin) scope's on-hand into the warehouse's system QC-hold bin (one
+ * `qc.held` event per batch on-hand row, the origin bin on the reference),
+ * and a release moves exactly those units back (the same batch arms, derived
+ * from the hold's own `qc.held` events — a concurrent hold of the same SKU
+ * from another origin bin must never return with the wrong release). Both
+ * types register since v1 (no new grammar version — arms append only); the
+ * serial arm stays closed (v1 captures no serials into holds).
+ */
+registerLedgerEventType({
+  type: 'qc.held',
+  sinceVersion: 1,
+  referenceKinds: ['qc-hold'],
+  allowsBatchArm: true,
+  allowsSerialArm: false,
+});
+
+registerLedgerEventType({
+  type: 'qc.released',
+  sinceVersion: 1,
+  referenceKinds: ['qc-hold'],
   allowsBatchArm: true,
   allowsSerialArm: false,
 });
