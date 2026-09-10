@@ -30,6 +30,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerMovement } from '../inventory/inventory.facade';
+import { canonicalInstant } from '../inventory/ledger.service';
 
 // ── command inputs ────────────────────────────────────────────────────────────
 
@@ -448,18 +449,22 @@ export class ReceivingCommand {
         }
       }
 
-      await tx.insert(goodsReceiptLines).values(
-        settled.map((entry) => ({
-          id: entry.lineId,
-          tenantId: command.tenantId,
-          grnId,
-          poLineId: entry.input.poLineId,
-          skuId: entry.input.skuId,
-          batchId: entry.batchId,
-          qty: entry.input.qty,
-          appliedQty: entry.applied,
-        })),
-      );
+      // An all-rejected receipt (every line named an unknown or non-open
+      // PO line — a stale cache) settles nothing and still records.
+      if (settled.length > 0) {
+        await tx.insert(goodsReceiptLines).values(
+          settled.map((entry) => ({
+            id: entry.lineId,
+            tenantId: command.tenantId,
+            grnId,
+            poLineId: entry.input.poLineId,
+            skuId: entry.input.skuId,
+            batchId: entry.batchId,
+            qty: entry.input.qty,
+            appliedQty: entry.applied,
+          })),
+        );
+      }
 
       // Ledger events: one per applied line — the batch arm rides on
       // batch-tracked receipts; the serial arm stays closed (no serial intake).
@@ -502,6 +507,14 @@ export class ReceivingCommand {
         );
       }
       for (const [poLineId, applied] of appliedByPoLine) {
+        // Cumulative ceiling: the per-line @Max admits quantities whose
+        // summed receipts exceed the int4 column — a 400 beats a SQL
+        // overflow 500 (and an approve arm that can never land).
+        if (poLineById.get(poLineId)!.receivedQty + applied > MAX_GRN_LINE_QTY) {
+          throw grnValidation(
+            `Purchase order line "${poLineId}" would exceed its received-quantity ceiling of ${MAX_GRN_LINE_QTY}.`,
+          );
+        }
         await tx
           .update(purchaseOrderLines)
           .set({ receivedQty: sql`${purchaseOrderLines.receivedQty} + ${applied}` })
@@ -711,6 +724,22 @@ export class ReceivingCommand {
           },
         });
         if (row.poLineId !== null) {
+          // Cumulative ceiling (the submit arm enforces the same): an
+          // approval that would overflow the int4 column must be a 400,
+          // never a SQL overflow 500 that leaves the row pending forever.
+          const poLineRows = await tx
+            .select({ receivedQty: purchaseOrderLines.receivedQty })
+            .from(purchaseOrderLines)
+            .where(eq(purchaseOrderLines.id, row.poLineId))
+            .limit(1);
+          if (poLineRows[0] === undefined) {
+            throw grnValidation(`Purchase order line "${row.poLineId}" no longer exists.`);
+          }
+          if (poLineRows[0].receivedQty + row.excessQty > MAX_GRN_LINE_QTY) {
+            throw grnValidation(
+              `Approving would push purchase order line "${row.poLineId}" past its received-quantity ceiling of ${MAX_GRN_LINE_QTY}.`,
+            );
+          }
           await tx
             .update(purchaseOrderLines)
             .set({
@@ -900,7 +929,9 @@ export class ReceivingCommand {
    * the `GRN-<digits>` shape take the max: a non-numeric suffix (any row not
    * written through this command — a fixture, an import) is ignored, never a
    * cast 500, and a 5-digit code (`GRN-10000`, past the 4-digit pad) sorts
-   * numerically, not lexically.
+   * numerically, not lexically. The digits are bounded at 9 so a forged
+   * oversized numeric tail overflows nothing (it is ignored, same as a
+   * non-numeric one).
    */
   private async allocateGrnCode(tx: TenantTx, tenantId: string): Promise<string> {
     await tx.execute(
@@ -908,7 +939,7 @@ export class ReceivingCommand {
     );
     const headRows = await tx
       .select({
-        n: sql<number>`coalesce(max(substring(code from '^GRN-([0-9]+)$')::int), 0)`,
+        n: sql<number>`coalesce(max(substring(code from '^GRN-([0-9]{1,9})$')::int), 0)`,
       })
       .from(goodsReceiptNotes)
       .where(eq(goodsReceiptNotes.tenantId, tenantId));
@@ -935,9 +966,6 @@ function assertUtc(value: string, field: string): string {
 }
 
 /** Postgres returns `timestamptz` in its own text shape; the read contract is ISO-8601 UTC. */
-function canonicalInstant(value: string): string {
-  return new Date(value).toISOString();
-}
 
 /** The PO-state rejection (409 naming the status — the stale-receipt retraction). */
 export function poNotOpen(code: string, status: string): ProblemException {

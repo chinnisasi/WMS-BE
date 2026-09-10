@@ -26,11 +26,7 @@ import { CatalogFacade } from '../catalog/catalog.facade';
 import type { PurchaseOrderLineSnapshot } from './po.command';
 import { lineSnapshot } from './po.command';
 import type { OverReceiptEntry } from './receiving.command';
-
-/** Postgres returns `timestamptz` in its own text shape; the read contract is ISO-8601 UTC. */
-function canonicalInstant(value: string): string {
-  return new Date(value).toISOString();
-}
+import { canonicalInstant } from '../inventory/ledger.service';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
 export interface GoodsReceiptEntry {
@@ -201,8 +197,10 @@ export class ReceivingFacade {
                   .select({
                     grnId: goodsReceiptLines.grnId,
                     lineCount: sql<number>`count(*)::int`,
-                    totalUnits: sql<number>`coalesce(sum(${goodsReceiptLines.qty}), 0)::int`,
-                    appliedUnits: sql<number>`coalesce(sum(${goodsReceiptLines.appliedQty}), 0)::int`,
+                    // bigint, not int4: a per-GRN sum of max-qty lines
+                    // overflows int4, and that must not brick the list read.
+                    totalUnits: sql<string>`coalesce(sum(${goodsReceiptLines.qty}), 0)::bigint`,
+                    appliedUnits: sql<string>`coalesce(sum(${goodsReceiptLines.appliedQty}), 0)::bigint`,
                   })
                   .from(goodsReceiptLines)
                   .where(inArray(goodsReceiptLines.grnId, ids))
@@ -219,8 +217,9 @@ export class ReceivingFacade {
       const items = rows.map((row) => ({
         ...row,
         lineCount: aggregates.get(row.id)?.lineCount ?? 0,
-        totalUnits: aggregates.get(row.id)?.totalUnits ?? 0,
-        appliedUnits: aggregates.get(row.id)?.appliedUnits ?? 0,
+        // int8 arrives as text through postgres.js; the contract is a number.
+        totalUnits: Number(aggregates.get(row.id)?.totalUnits ?? 0),
+        appliedUnits: Number(aggregates.get(row.id)?.appliedUnits ?? 0),
         occurredAt: canonicalInstant(row.occurredAt),
         recordedAt: canonicalInstant(row.recordedAt),
         createdAt: canonicalInstant(row.createdAt),

@@ -1233,4 +1233,169 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       await sql.end();
     }
   });
+
+  // ── Review iteration 1 patches: guards + their pins ────────────────────────
+
+  it('a whitespace-only batch code is a 400 before any write', async () => {
+    const { poId, lineId } = await createOpenPo(4, batchSkuId);
+    await submitGrn(
+      grnBody([{ poLineId: lineId, skuId: batchSkuId, batchCode: '   ', mfgDate: null, qty: 1 }], poId),
+    )
+      .expect(400)
+      .then((res) => expect(res.body).toMatchObject({ code: 'validation-failed' }));
+  });
+
+  it('every receiving route refuses a foreign tenant session with 403 permission-denied', async () => {
+    const foreignTenant = uuidv7();
+    // The device-session surfaces: the same badge token, another tenant's path.
+    await request(app.getHttpServer())
+      .post(`${API}/${foreignTenant}/receiving/goods-receipts`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .send(grnBody([{ poLineId: null, skuId: batchSkuId, batchCode: 'LOT-FOREIGN', mfgDate: null, qty: 1 }]))
+      .expect(403)
+      .then((res) => expect(res.body).toMatchObject({ status: 403, code: 'permission-denied' }));
+    await request(app.getHttpServer())
+      .get(`${API}/${foreignTenant}/devices/catalog-snapshot?warehouseId=${warehouseId}`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(403);
+    // The tenant-session reads + the decisions.
+    await request(app.getHttpServer())
+      .get(`${API}/${foreignTenant}/receiving/goods-receipts`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(403);
+    await request(app.getHttpServer())
+      .get(`${API}/${foreignTenant}/receiving/over-receipts`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(403);
+    await request(app.getHttpServer())
+      .post(`${API}/${foreignTenant}/receiving/over-receipts/${uuidv7()}/approve`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .expect(403)
+      .then((res) => expect(res.body).toMatchObject({ status: 403, code: 'permission-denied' }));
+    await request(app.getHttpServer())
+      .post(`${API}/${foreignTenant}/receiving/over-receipts/${uuidv7()}/reject`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .expect(403)
+      .then((res) => expect(res.body).toMatchObject({ status: 403, code: 'permission-denied' }));
+  });
+
+  it('list reads reject a crafted cursor with 400 invalid-cursor on both goods-receipts and over-receipts', async () => {
+    const bogus = Buffer.from(JSON.stringify({ id: 'not-a-uuid', createdAt: 'nope' })).toString('base64');
+    for (const route of ['goods-receipts', 'over-receipts']) {
+      const rejected = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/receiving/${route}?cursor=${encodeURIComponent(bogus)}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(400);
+      expect(rejected.body).toMatchObject({ status: 400, code: 'invalid-cursor' });
+    }
+  });
+
+  it('the over-receipt queue keyset walks to page 2: distinct, strictly older rows', async () => {
+    // Three fresh pending over-receipts, one per PO line.
+    for (let index = 0; index < 3; index += 1) {
+      const open = await createOpenPo(5);
+      await submitGrn(
+        grnBody(
+          [{ poLineId: open.lineId, skuId: batchSkuId, batchCode: `LOT-PGWALK-${index}`, mfgDate: null, qty: 8 }],
+          open.poId,
+        ),
+      ).expect(201);
+    }
+
+    const page1 = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/receiving/over-receipts?status=pending&limit=2`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    const items1 = page1.body.items as { id: string; createdAt: string }[];
+    expect(items1.length).toBe(2);
+    expect(page1.body.nextCursor).toBeTruthy();
+
+    const page2 = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/receiving/over-receipts?status=pending&limit=2&cursor=${encodeURIComponent(page1.body.nextCursor as string)}`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    const items2 = page2.body.items as { id: string; createdAt: string }[];
+    expect(items2.length).toBeGreaterThan(0);
+    // Page 2 repeats nothing from page 1 and is strictly older by the
+    // (createdAt, id) keyset — no duplicates, no skips.
+    const page1Ids = new Set(items1.map((item) => item.id));
+    const oldest = items1[items1.length - 1]!;
+    for (const item of items2) {
+      expect(page1Ids.has(item.id)).toBe(false);
+      // Every page-2 row sorts before the oldest page-1 row.
+      const younger = item.createdAt > oldest.createdAt || (item.createdAt === oldest.createdAt && item.id > oldest.id);
+      expect(younger).toBe(false);
+    }
+  });
+
+  it('an all-rejected GRN is a 201 with rejectedLines and no line rows (never a values([]) 500)', async () => {
+    const open = await createOpenPo(6, plainSkuId);
+    const res = await submitGrn(
+      grnBody(
+        [{ poLineId: uuidv7(), skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 3 }], // no such line
+        open.poId,
+      ),
+    ).expect(201);
+    const grn = res.body.goodsReceipt as {
+      id: string;
+      lines: unknown[];
+      rejectedLines: { code: string; poLineId: string }[];
+    };
+    expect(grn.lines).toHaveLength(0);
+    expect(grn.rejectedLines).toHaveLength(1);
+    expect(grn.rejectedLines[0]).toMatchObject({ poLineId: expect.any(String), code: 'po-line-not-found' });
+    expect(await ledgerRows(grn.id)).toHaveLength(0);
+    expect(await outboxRows('over_receipt.requested', grn.id)).toHaveLength(0);
+  });
+
+  it('the cumulative received-qty ceiling: approving an excess past the int4 bound is a 400 and the row stays pending', async () => {
+    const open = await createOpenPo(10);
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      // Seed the PO line's received_qty at its int4 ceiling directly (the
+      // overflow is otherwise unreachable in a suite of realistic sizes).
+      await sql`update purchase_order_lines set received_qty = 2147483647 where id = ${open.lineId}`;
+      const created = await submitGrn(
+        grnBody([{ poLineId: open.lineId, skuId: batchSkuId, batchCode: 'LOT-CEIL', mfgDate: null, qty: 2 }], open.poId),
+      ).expect(201);
+      const grn = created.body.goodsReceipt as { id: string; lines: { appliedQty: number; excessQty: number }[] };
+      // Nothing applies (open is already negative) — the whole qty pends.
+      expect(grn.lines[0]).toMatchObject({ appliedQty: 0, excessQty: 2 });
+      const pending = await outboxRows('over_receipt.requested', grn.id);
+      const overReceiptId = (pending[0]!.payload as { overReceiptId: string }).overReceiptId;
+
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/over-receipts/${overReceiptId}/approve`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .expect(400)
+        .then((res) => expect(res.body).toMatchObject({ code: 'validation-failed' }));
+      // The decision never landed: the row is still pending in the queue.
+      const queue = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/receiving/over-receipts?status=pending&limit=200`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .expect(200);
+      expect((queue.body.items as { id: string }[]).map((item) => item.id)).toContain(overReceiptId);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('a forged oversized numeric GRN code tail is ignored by the allocation (never a cast 500)', async () => {
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await sql`
+        insert into goods_receipt_notes (id, tenant_id, warehouse_id, code, po_id, blind_reason_code, status, device_id, recorded_by, occurred_at, recorded_at)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, 'GRN-99999999999', null, null, 'recorded', ${deviceId}, ${operatorUserId}, now(), now())`;
+    } finally {
+      await sql.end();
+    }
+    const open = await createOpenPo(4, plainSkuId);
+    const res = await submitGrn(
+      grnBody([{ poLineId: open.lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 2 }], open.poId),
+    ).expect(201);
+    expect((res.body.goodsReceipt as { code: string }).code).toMatch(/^GRN-\d+$/);
+  });
 });

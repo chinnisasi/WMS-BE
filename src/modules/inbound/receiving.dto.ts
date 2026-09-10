@@ -9,6 +9,7 @@ import {
   IsString,
   IsUUID,
   Length,
+  Matches,
   Max,
   Min,
   ValidateNested,
@@ -49,6 +50,7 @@ export class GrnLineInputDto {
   @IsOptional()
   @IsString()
   @Length(1, 64)
+  @Matches(/\S/, { message: 'batchCode must contain non-whitespace characters' })
   batchCode?: string | null;
 
   @ApiProperty({
