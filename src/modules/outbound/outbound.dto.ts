@@ -35,11 +35,13 @@ export class OrderLineInputDto {
   @ApiProperty({
     description: 'Ordered quantity in base UoM — a positive integer',
     minimum: 1,
+    maximum: 2147483647,
     example: 10,
   })
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(2147483647)
   quantity!: number;
 }
 
@@ -166,9 +168,16 @@ export class OrderResponse {
 
 /** Query of the warehouse-scoped order list (keyset cursor pagination). */
 export class OrderListQuery {
-  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @ApiProperty({
+    required: false,
+    description: 'Opaque keyset cursor from the previous page',
+    // A cursor encodes one timestamp + one uuid — anything near this bound is
+    // crafted input, rejected at the boundary before the base64 decode.
+    maxLength: 200,
+  })
   @IsOptional()
   @IsString()
+  @Length(1, 200)
   cursor?: string;
 
   @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
