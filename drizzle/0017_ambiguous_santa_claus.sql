@@ -27,7 +27,6 @@ CREATE TABLE "orders" (
 CREATE INDEX "order_lines_order_id_idx" ON "order_lines" USING btree ("order_id","created_at","id");--> statement-breakpoint
 CREATE INDEX "order_lines_tenant_id_idx" ON "order_lines" USING btree ("tenant_id");--> statement-breakpoint
 CREATE INDEX "orders_tenant_warehouse_created_at_id_idx" ON "orders" USING btree ("tenant_id","warehouse_id","created_at","id");--> statement-breakpoint
-CREATE INDEX "orders_tenant_created_at_id_idx" ON "orders" USING btree ("tenant_id","created_at","id");--> statement-breakpoint
 CREATE UNIQUE INDEX "orders_source_event_unique" ON "orders" USING btree ("tenant_id","integration_id","external_event_id") WHERE integration_id is not null and external_event_id is not null;--> statement-breakpoint
 -- Story 4.1 hand-append (the 0011 RLS policy pattern): RLS is declared only
 -- in migration SQL, never in schema.ts. Same fail-closed single-dimension
