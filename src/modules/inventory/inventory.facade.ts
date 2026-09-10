@@ -228,6 +228,20 @@ export class InventoryFacade {
   }
 
   /**
+   * The serial-set pre-lock passthrough (Story 3.5): a serial-tracked
+   * placement locks its whole serial set tenant-wide, in sorted order,
+   * BEFORE the first append (the stock.adjustment deadlock rule) — the
+   * caller composes it inside its own transaction through this facade.
+   */
+  async lockSerialsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    serialRefs: readonly string[],
+  ): Promise<void> {
+    return this.ledger.lockSerialsInTx(tx, tenantId, serialRefs);
+  }
+
+  /**
    * The adjustment's idempotency fingerprint (Story 2.4, review loop 1):
    * command-owned hashing exposed for the api layer's replay pre-check —
    * the api layer never hashes payload bytes itself.

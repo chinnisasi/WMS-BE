@@ -16,6 +16,9 @@ import {
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { PurchaseOrderLineDto } from './inbound.dto';
+// Story 3.5 (additive): the snapshot's putaway decision fields reuse the
+// putaway module's DTOs (one shape on every surface).
+import { PutawayBinDto, PutawayTaskDto } from '../putaway/putaway.dto';
 
 /** The fixed blind-receive reason enum (the I/O matrix). */
 export const BLIND_REASON_ENUM = ['unannounced-delivery', 'po-not-found', 'other'] as const;
@@ -452,4 +455,10 @@ export class CatalogSnapshotResponse {
 
   @ApiProperty({ type: [CatalogSnapshotPoDto], description: 'The warehouse\'s open POs with their lines' })
   openPurchaseOrders!: readonly CatalogSnapshotPoDto[];
+
+  @ApiProperty({ type: [PutawayBinDto], description: 'Story 3.5 (additive): every bin of the warehouse — blocked/system bins included so the device can reject a scan against them pre-queue' })
+  bins!: readonly PutawayBinDto[];
+
+  @ApiProperty({ type: [PutawayTaskDto], description: 'Story 3.5 (additive): the derived putaway tasks with the capacity-only suggestions (advisory — the server re-gates at placement)' })
+  putawayTasks!: readonly PutawayTaskDto[];
 }

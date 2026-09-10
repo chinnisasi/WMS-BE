@@ -5,11 +5,13 @@ import { DevicesController } from './devices.controller';
 import { InventoryController } from './inventory.controller';
 import { InboundController } from './inbound.controller';
 import { ReceivingController } from './receiving.controller';
+import { PutawayController } from './putaway.controller';
 import { OpenApiController } from './openapi.controller';
 import { NotFoundController } from './not-found.controller';
 import { OpenApiDocumentHolder } from './openapi-document.holder';
 import { InventoryModule } from '../modules/inventory/inventory.module';
 import { InboundModule } from '../modules/inbound/inbound.module';
+import { PutawayModule } from '../modules/putaway/putaway.module';
 import { CatalogModule } from '../modules/catalog/catalog.module';
 import { TenancyModule } from '../modules/tenancy/tenancy.module';
 
@@ -35,9 +37,14 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
  * Story 3.3: the receiving surface (device `grn.submit` + catalog snapshot,
  * web GRN list + over-receipt queue/approvals) rides the same shape —
  * `ReceivingController` consumes `ReceivingFacade` only.
+ *
+ * Story 3.5: the putaway surface (device `putaway.place`, web task +
+ * placement reads) rides the same shape — `PutawayController` consumes
+ * `PutawayFacade` only; the device snapshot gains the bins + putawayTasks
+ * fields through the receiving facade's additive composition.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, CatalogModule, TenancyModule],
+  imports: [InventoryModule, InboundModule, PutawayModule, CatalogModule, TenancyModule],
   controllers: [
     HealthController,
     EchoController,
@@ -45,6 +52,7 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
     InventoryController,
     InboundController,
     ReceivingController,
+    PutawayController,
     OpenApiController,
     NotFoundController,
   ],

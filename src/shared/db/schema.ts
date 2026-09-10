@@ -1269,3 +1269,64 @@ export const qcHolds = pgTable(
 );
 
 export type QcHold = typeof qcHolds.$inferSelect;
+
+/**
+ * Putaway placements (Story 3.5): one row per completed placement — the
+ * decision record a device operator produced by moving received stock from
+ * the system Receiving bin into a storage bin. Never a stock write (the
+ * stock moves through the ledger: one `putaway.placed` movement per batch
+ * arm — or per serial unit on a serial-tracked SKU — from the Receiving bin
+ * to the target bin, same transaction). `suggested_bin_id` carries the
+ * server's re-derived suggestion at placement time and `reason_code` the
+ * fixed mismatch enum value the operator recorded when the actual bin
+ * differed (required in the payload whenever it did — the SM-3
+ * suggestion-vs-actual report's raw material).
+ *
+ * There is no claim/state table: tasks are derived (GRN lines + the
+ * Receiving bin's on-hand), placements are the only stored rows.
+ *
+ * RLS policy + quantity CHECK live **only in the migration SQL** (0015).
+ */
+export const putawayPlacements = pgTable(
+  'putaway_placements',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    grnId: uuid('grn_id').notNull(),
+    grnLineId: uuid('grn_line_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** The catalog batch identity — null on non-batch-tracked SKUs. */
+    batchId: uuid('batch_id'),
+    qty: integer('qty').notNull(),
+    /** The system Receiving bin the units left (the from-bin identity). */
+    fromBinId: uuid('from_bin_id').notNull(),
+    /** The target bin the operator placed into. */
+    toBinId: uuid('to_bin_id').notNull(),
+    /** The server's re-derived suggestion at placement time; null when no bin fit. */
+    suggestedBinId: uuid('suggested_bin_id'),
+    /** The fixed mismatch-reason enum value; null when the suggestion was followed. */
+    reasonCode: text('reason_code'),
+    placedBy: uuid('placed_by').notNull(),
+    placedAt: timestamp('placed_at', { withTimezone: true, mode: 'string' }).notNull(),
+    deviceId: uuid('device_id').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The placements-list read (warehouse filter first — the story's
+    // `(tenant_id, warehouse_id, created_at, id)` index, 0014 pattern).
+    index('putaway_placements_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+    index('putaway_placements_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    // One GRN's placements, in placement order (the detail read).
+    index('putaway_placements_grn_id_idx').on(table.grnId, table.createdAt, table.id),
+  ],
+);
+
+export type PutawayPlacement = typeof putawayPlacements.$inferSelect;

@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { CatalogModule } from '../catalog/catalog.module';
 import { InventoryModule } from '../inventory/inventory.module';
+import { PutawayModule } from '../putaway/putaway.module';
 import { VendorCommand } from './vendors.command';
 import { PurchaseOrderCommand } from './po.command';
 import { InboundFacade } from './inbound.facade';
@@ -28,9 +29,14 @@ import { QcFacade } from './qc.facade';
  * `CatalogFacade`, ledger events via `InventoryFacade` — so the module
  * imports `CatalogModule` and `InventoryModule` (both export only their
  * facades; neither imports back into inbound, so no cycles).
+ *
+ * Story 3.5 (additive): the device snapshot composes the putaway decision
+ * fields (bins + derived putaway tasks) through `PutawayFacade` — the module
+ * imports `PutawayModule` (it exports only its facade; it imports nothing
+ * back into inbound, so still no cycles).
  */
 @Module({
-  imports: [SharedModule, CatalogModule, InventoryModule],
+  imports: [SharedModule, CatalogModule, InventoryModule, PutawayModule],
   providers: [
     VendorCommand,
     PurchaseOrderCommand,

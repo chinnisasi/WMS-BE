@@ -50,6 +50,20 @@ export type LedgerReferenceDoc =
       readonly kind: 'qc-hold';
       readonly holdId: string;
       readonly fromBinId?: string;
+    }
+  // Story 3.5 — the putaway arm: every `putaway.placed` movement names the
+  // GRN line whose received stock moved from the system Receiving bin, the
+  // server's re-derived suggestion at placement time, and (when the operator
+  // placed elsewhere) the fixed mismatch-reason enum value. NEW union arm —
+  // the earlier kinds are never reshaped.
+  | {
+      readonly kind: 'putaway';
+      readonly grnId: string;
+      readonly grnLineId: string;
+      /** Present only when the operator recorded a mismatch reason. */
+      readonly reasonCode?: string;
+      /** The server's re-derived suggestion (absent when no bin fit). */
+      readonly suggestedBinId?: string;
     };
 // Later stories extend this union with NEW kinds (pick, transfer, …) — never
 // by reshaping an existing arm.
@@ -137,6 +151,25 @@ registerLedgerEventType({
   referenceKinds: ['qc-hold'],
   allowsBatchArm: true,
   allowsSerialArm: false,
+});
+
+/**
+ * Grammar v1, Story 3.5 — the putaway movement: stock moving from the
+ * warehouse's system Receiving bin into the operator's target storage bin
+ * (fromBin + toBin carried on ONE event — the movement is a relocation, the
+ * ledger folds both projections from the single magnitude). Batch-tracked
+ * placements carry the batch arm (one event per batch arm); serial-tracked
+ * placements carry the serial arm (one event per serial unit, mirroring
+ * `stock.adjusted`'s serial pattern — the serial's location record must move
+ * with its stock). Registers sinceVersion 1: no new grammar version — the
+ * reference-doc arm appends only.
+ */
+registerLedgerEventType({
+  type: 'putaway.placed',
+  sinceVersion: 1,
+  referenceKinds: ['putaway'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
 });
 
 /** The registered definition — `undefined` for an unregistered type. */
