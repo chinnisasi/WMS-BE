@@ -4,6 +4,7 @@ import { EchoController } from './echo.controller';
 import { DevicesController } from './devices.controller';
 import { InventoryController } from './inventory.controller';
 import { InboundController } from './inbound.controller';
+import { OutboundController } from './outbound.controller';
 import { ReceivingController } from './receiving.controller';
 import { PutawayController } from './putaway.controller';
 import { OpenApiController } from './openapi.controller';
@@ -11,6 +12,7 @@ import { NotFoundController } from './not-found.controller';
 import { OpenApiDocumentHolder } from './openapi-document.holder';
 import { InventoryModule } from '../modules/inventory/inventory.module';
 import { InboundModule } from '../modules/inbound/inbound.module';
+import { OutboundModule } from '../modules/outbound/outbound.module';
 import { PutawayModule } from '../modules/putaway/putaway.module';
 import { CatalogModule } from '../modules/catalog/catalog.module';
 import { TenancyModule } from '../modules/tenancy/tenancy.module';
@@ -44,13 +46,14 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
  * fields through the receiving facade's additive composition.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, PutawayModule, CatalogModule, TenancyModule],
+  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CatalogModule, TenancyModule],
   controllers: [
     HealthController,
     EchoController,
     DevicesController,
     InventoryController,
     InboundController,
+    OutboundController,
     ReceivingController,
     PutawayController,
     OpenApiController,
