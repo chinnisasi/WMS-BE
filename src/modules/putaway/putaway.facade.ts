@@ -21,7 +21,7 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { RECEIVING_BIN_CODE } from '../tenancy/receiving-bin';
-import { canonicalInstant } from '../inventory/ledger.service';
+import { canonicalInstant } from '../../shared/primitives/time';
 import { PutawayCommand } from './putaway.command';
 import type {
   ListPlacementsQuery,

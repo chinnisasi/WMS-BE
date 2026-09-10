@@ -9,7 +9,7 @@ import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
-import { canonicalInstant } from '../inventory/ledger.service';
+import { canonicalInstant } from '../../shared/primitives/time';
 import { QcCommand } from './qc.command';
 import type {
   PlaceQcHoldCommand,

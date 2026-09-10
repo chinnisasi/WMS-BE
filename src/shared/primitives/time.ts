@@ -7,6 +7,17 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Normalizes a stored `timestamptz` (Postgres returns its own text shape)
+ * to the canonical ISO-8601 UTC form every read surface, idempotency
+ * snapshot, and cursor relies on. Moved here from the inventory module
+ * (epic-3 retro A7): every module used to reach into `ledger.service` for
+ * it — one shared normalizer, no module reach-through.
+ */
+export function canonicalInstant(value: string): string {
+  return new Date(value).toISOString();
+}
+
 export function assertUtcIso(value: string): string {
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?Z$/.exec(value);
   // Date.parse rolls impossible dates (Feb 31 → Mar 3) instead of failing, so
