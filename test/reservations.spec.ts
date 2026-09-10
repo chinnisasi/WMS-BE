@@ -503,8 +503,11 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
 
   it('TTL reaper: a held row past TTL transitions to expired exactly once and restores the counter', async () => {
     const skuId = skuIds.get('RSV-TTL')!;
-    const granted = await grant(skuId, ownerId('ttl'), 1, 0); // already due
+    // F11 (story 4.1): ttlSeconds 0 is no longer a valid hold (400) — age a
+    // normally-granted hold past its TTL directly instead.
+    const granted = await grant(skuId, ownerId('ttl'), 1);
     expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(1);
+    await sql`update reservations set expires_at = now() - interval '1 second' where id = ${granted.id}`;
 
     expect(await facade.expireDueReservations()).toBe(1);
     expect(await reservationRow(granted.id)).toMatchObject({ state: 'expired' });
@@ -567,7 +570,9 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     expect(duringGap.getStatus()).toBe(503);
     // The grant also fails closed — and its not-ready arm triggers (and waits
     // on) the journal rebuild, so the gap closes with the grant's rejection.
-    await expectProblem(grant(skuId, ownerId('rb2'), 1), 409, 'unavailable');
+    // A8 (story 4.1): the store-down arm carries its own 503 machine code,
+    // distinct from the deterministic 409 `unavailable` a losing grant gets.
+    await expectProblem(grant(skuId, ownerId('rb2'), 1), 503, 'reservation-store-unavailable');
 
     // The not-ready grant above triggered a rebuild from the journal —
     // Postgres won: the counter came back at the journal's live sum.
@@ -598,15 +603,18 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     await expectProblem(grant(skuId, ownerId('rb4'), 1), 409, 'unavailable');
   });
 
-  it('fail closed on an unreachable Valkey: grants 409 unavailable, ATP reads 503', async () => {
+  it('fail closed on an unreachable Valkey: grants and ATP reads 503 reservation-store-unavailable (A8)', async () => {
     const skuId = skuIds.get('RSV-HEALTHY')!;
     const valkeyClient = app.get(ValkeyClient);
     const grantSpy = jest.spyOn(valkeyClient, 'grantReservation').mockRejectedValue(new Error('connection refused'));
     try {
-      await expectProblem(grant(skuId, ownerId('down'), 1), 409, 'unavailable');
+      // A8 (story 4.1): a store-DOWN grant is 503 `reservation-store-
+      // unavailable` (nothing written, retryable) — never the deterministic
+      // 409 `unavailable` a losing grant receives.
+      await expectProblem(grant(skuId, ownerId('down'), 1), 503, 'reservation-store-unavailable');
       grantSpy.mockRestore();
       const readSpy = jest.spyOn(valkeyClient, 'isReady').mockRejectedValue(new Error('connection refused'));
-      await expectProblem(facade.atp(tenantId, warehouseId, skuId), 503, 'unavailable');
+      await expectProblem(facade.atp(tenantId, warehouseId, skuId), 503, 'reservation-store-unavailable');
       readSpy.mockRestore();
     } finally {
       jest.restoreAllMocks();
@@ -737,6 +745,9 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     // ttlSeconds above the ten-year ceiling would poison the journal's
     // `expires_at` (an invalid date → raw 500 after compensating) — rejected.
     await expectProblem(grant(skuId, ownerId('v'), 1, 9e12), 400, 'validation-failed');
+    // F11 (story 4.1): a zero-TTL hold expires the instant it is journalled —
+    // it is an input error, 400, never a granted-then-doomed row.
+    await expectProblem(grant(skuId, ownerId('v'), 1, 0), 400, 'validation-failed');
     const rows = await sql`
       select count(*)::int as n from reservations where tenant_id = ${tenantId} and owner_type = ''
     `;
@@ -966,8 +977,10 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
       await expect(facade.releaseReservation(tenantId, released.id)).resolves.toMatchObject({
         state: 'released',
       });
-      // Expiry: the same resilience on the reaper's restore arm.
-      const dueGrant = await grant(skuId, ownerId('rf2'), 1, 0);
+      // Expiry: the same resilience on the reaper's restore arm (F11 —
+      // ttlSeconds 0 is no longer grantable, so age the hold directly).
+      const dueGrant = await grant(skuId, ownerId('rf2'), 1);
+      await sql`update reservations set expires_at = now() - interval '1 second' where id = ${dueGrant.id}`;
       await expect(facade.expireDueReservations()).resolves.toBe(1);
       expect(await reservationRow(dueGrant.id)).toMatchObject({ state: 'expired' });
     } finally {

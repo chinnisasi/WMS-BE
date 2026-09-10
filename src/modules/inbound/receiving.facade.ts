@@ -27,7 +27,7 @@ import { CatalogFacade } from '../catalog/catalog.facade';
 import type { PurchaseOrderLineSnapshot } from './po.command';
 import { lineSnapshot } from './po.command';
 import type { OverReceiptEntry } from './receiving.command';
-import { canonicalInstant } from '../inventory/ledger.service';
+import { canonicalInstant } from '../../shared/primitives/time';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
 export interface GoodsReceiptEntry {

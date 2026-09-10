@@ -46,6 +46,11 @@ export const CAPABILITIES = [
   // (Accountant/Operator none) — a merge moves stock, a retire is terminal.
   // Mirrored into wms-fe `src/lib/users.ts`.
   'bin.retire',
+  // Story 4.1 — the outbound module's mutations (manual order entry +
+  // ingested-order ingestion, both accepted with per-line ATP reservation;
+  // cancellation). Owner and Ops Manager only; Operator and Accountant are
+  // read-only. Mirrored into wms-fe `src/lib/users.ts` by the FE story.
+  'orders.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -76,6 +81,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'qc.manage',
     'putaway.execute',
     'bin.retire',
+    'orders.manage',
   ]),
   operator: new Set<Capability>(['putaway.execute']),
   accountant: new Set<Capability>([]),

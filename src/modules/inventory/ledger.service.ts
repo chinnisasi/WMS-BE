@@ -13,6 +13,7 @@ import { uuidv7 } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
+import { canonicalInstant } from '../../shared/primitives/time';
 import { LEDGER_GRAMMAR_VERSION, getLedgerEventType } from './ledger-registry';
 import type { LedgerReferenceDoc } from './ledger-registry';
 import { LEDGER_ANCHOR_STORE } from './anchor-store';
@@ -224,14 +225,11 @@ function canonicalEventBytes(event: {
   });
 }
 
-/**
- * Timestamps canonicalize to ISO-8601 UTC millis: the row returns
- * `timestamptz` in Postgres's own text shape, so the verifier must not
- * hash the raw string — both sides normalize through the same parse.
- */
-export function canonicalInstant(value: string): string {
-  return new Date(value).toISOString();
-}
+// The timestamp normalizer is a spine primitive (epic-3 retro A7 — one
+// shared normalizer; every module imports it from `shared/primitives/time`,
+// never from this module's internals). Re-exported for the module's own
+// consumers so the import path stays stable.
+export { canonicalInstant } from '../../shared/primitives/time';
 
 function sha256Hex(bytes: string): string {
   return createHash('sha256').update(bytes, 'utf8').digest('hex');

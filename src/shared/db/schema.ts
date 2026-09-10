@@ -1339,3 +1339,105 @@ export const putawayPlacements = pgTable(
 );
 
 export type PutawayPlacement = typeof putawayPlacements.$inferSelect;
+
+/**
+ * Orders (Story 4.1 — the outbound module's first tables): the accepted
+ * order aggregate. Warehouse-scoped like the PO tables; `status` is the
+ * order state machine the outbound module exclusively owns (AD-6) —
+ * additive arms `accepted` / `cancelled` today, picking / packed /
+ * dispatched arrive with stories 4.3 / 4.5 / 4.6 (text + hand-appended
+ * CHECK per the repo convention, no pgEnum).
+ *
+ * `source` carries the provenance arm (`manual` | `ingested`); the channel
+ * arms (`integration_id`, `external_event_id`) are null on a manual order
+ * and required together on an ingested one. Channel-order dedup is a
+ * DATABASE-level partial unique index on
+ * `(tenant_id, integration_id, external_event_id)` — the same payload
+ * delivered twice returns the same order; a divergent payload on the same
+ * ref is the command layer's 422 `order-source-conflict` (the index is the
+ * race backstop). `source_payload_hash` is the ingested payload's
+ * fingerprint the dedup comparison reads.
+ *
+ * No FKs anywhere (repo convention): `warehouse_id`, `integration_id`,
+ * `external_event_id` asserted in the command transaction.
+ *
+ * RLS policy + status CHECKs live **only in the migration SQL** (0017).
+ */
+export const orders = pgTable(
+  'orders',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    status: text('status').notNull().default('accepted'),
+    source: text('source').notNull().default('manual'),
+    /** Channel arms — null on a manual order (Epic 7's adapters plug in here). */
+    integrationId: uuid('integration_id'),
+    externalEventId: text('external_event_id'),
+    /** The ingested payload's fingerprint; null on a manual order. */
+    sourcePayloadHash: text('source_payload_hash'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The warehouse-scoped list's keyset index from day one (the
+    // skus-index lesson — no offset pagination, no late migration).
+    index('orders_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+    index('orders_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    // Channel-order dedup (AD-5): one order per (tenant, integration,
+    // external event id) — partial, so manual orders (null channel arms)
+    // never participate.
+    uniqueIndex('orders_source_event_unique')
+      .on(table.tenantId, table.integrationId, table.externalEventId)
+      .where(sql`integration_id is not null and external_event_id is not null`),
+  ],
+);
+
+export type Order = typeof orders.$inferSelect;
+
+/**
+ * Order lines (Story 4.1): the per-line ordered / reserved / shortfall
+ * truth of one order. Quantities are **positive integers in base UoM**
+ * (`qty` > 0 by the hand-appended CHECK); `reserved_qty` is what acceptance
+ * actually holds through the reservation journal (≤ qty, per-line ATP
+ * split); the shortfall is derived (`qty − reserved_qty`) at every read —
+ * never stored. `reservation_id` is the journal hold the line owns (null
+ * on a fully-backordered line — an unavailable line gets no reservation);
+ * the live reservation STATE is read through the inventory facade, never
+ * copied here. `status` is the line's fulfillment arm (`open` when fully
+ * reserved, `backordered` when any part is short — the DB CHECK enforces
+ * the set).
+ *
+ * RLS policy + status/quantity CHECKs live **only in the migration SQL**
+ * (0017).
+ */
+export const orderLines = pgTable(
+  'order_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    qty: integer('qty').notNull(),
+    reservedQty: integer('reserved_qty').notNull().default(0),
+    /** The line's reservation hold (null when nothing could be reserved). */
+    reservationId: uuid('reservation_id'),
+    status: text('status').notNull().default('open'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The detail read's per-line ordering and any per-order roll-up.
+    index('order_lines_order_id_idx').on(table.orderId, table.createdAt, table.id),
+    index('order_lines_tenant_id_idx').on(table.tenantId),
+  ],
+);
+
+export type OrderLine = typeof orderLines.$inferSelect;

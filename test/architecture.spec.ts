@@ -140,16 +140,24 @@ describe('architecture: the ledger core is append-only and inventory-module-owne
     // additionally wires `inventory.module` and carries the HTTP DTO — the
     // established controller-in-shell wiring, not a second consumer seam.
     const inventoryInternals = new RegExp(
-      'modules/inventory/(?!' +
-        '(inventory\\.facade|inventory\\.module|inventory\\.dto)\\b)',
+      // Both import forms the sibling dirs can produce: the path-absolute
+      // shape and the relative `../inventory/…` import specifier (epic-3
+      // retro A7 — the guard only matched the literal path form before, so
+      // a sibling importing `../inventory/reservation.service` slipped
+      // through undetected).
+      '(?:modules/inventory|\\.\\./inventory)/' +
+        '(?!inventory\\.(facade|module|dto)\\b)',
     );
     const inventoryRoot = join(SRC_ROOT, 'modules', 'inventory');
     const siblingModules = files.filter(
       (file) =>
         file.path.startsWith(join(SRC_ROOT, 'modules')) &&
         !file.path.startsWith(inventoryRoot) &&
-        /modules\/inventory\//.test(file.source),
+        /(?:modules\/inventory|\.\.\/inventory)\//.test(file.source),
     );
+    // The detection itself must see the imports — the test is only
+    // meaningful while it actually scans the sibling consumers.
+    expect(siblingModules.length).toBeGreaterThan(0);
     const offenders: string[] = [];
     for (const file of siblingModules) {
       if (inventoryInternals.test(file.source)) {
@@ -157,5 +165,62 @@ describe('architecture: the ledger core is append-only and inventory-module-owne
       }
     }
     expect(offenders).toEqual([]);
+  });
+});
+
+describe('architecture: the order aggregate is outbound-module-owned (story 4.1)', () => {
+  /**
+   * Story 4.1 adds the order aggregate (`orders`, `order_lines`) —
+   * outbound-module-exclusive exactly like the stock tables are
+   * inventory-exclusive (AD-6): every other module reads order state
+   * through `OutboundFacade` and composes stock through `InventoryFacade`;
+   * nothing outside the outbound module writes these tables.
+   */
+  const ORDER_TABLES = ['orders', 'orderLines'] as const;
+  const RAW_ORDER_TABLES = 'orders|order_lines';
+  const outboundRoot = join(SRC_ROOT, 'modules', 'outbound');
+
+  it('no order-table write happens outside the outbound module', () => {
+    const outside = files.filter((file) => !file.path.startsWith(outboundRoot));
+    const offenders: string[] = [];
+    for (const file of outside) {
+      for (const pattern of [
+        ...ORDER_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_ORDER_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) {
+          offenders.push(`${file.path}: /${pattern.source}/`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no other module reaches into the outbound module past the facade', () => {
+    // The mirror of the inventory guard (same regex fix applied — both
+    // import forms).
+    const outboundInternals = new RegExp(
+      '(?:modules/outbound|\\.\\./outbound)/' +
+        '(?!outbound\\.(facade|module|dto)\\b)',
+    );
+    const siblingModules = files.filter(
+      (file) =>
+        file.path.startsWith(join(SRC_ROOT, 'modules')) &&
+        !file.path.startsWith(outboundRoot) &&
+        /(?:modules\/outbound|\.\.\/outbound)\//.test(file.source),
+    );
+    const offenders: string[] = [];
+    for (const file of siblingModules) {
+      if (outboundInternals.test(file.source)) {
+        offenders.push(file.path);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the outbound module itself still writes the order tables (the test is meaningful)', () => {
+    const source = readFileSync(join(outboundRoot, 'order.command.ts'), 'utf8');
+    expect(drizzleWriteOn('orders').test(source)).toBe(true);
+    expect(drizzleWriteOn('orderLines').test(source)).toBe(true);
   });
 });

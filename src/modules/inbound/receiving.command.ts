@@ -30,7 +30,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerMovement } from '../inventory/inventory.facade';
-import { canonicalInstant } from '../inventory/ledger.service';
+import { canonicalInstant } from '../../shared/primitives/time';
 
 // ── command inputs ────────────────────────────────────────────────────────────
 
