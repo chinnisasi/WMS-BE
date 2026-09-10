@@ -57,7 +57,7 @@ export class PutawayController {
   @ApiBody({ type: PlacePutawayDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({
-    status: HttpStatus.OK,
+    status: HttpStatus.CREATED,
     type: PutawayPlacementResponse,
     description:
       'Placement recorded: the placement snapshot with suggestion-vs-actual (the idempotency snapshot — a replay re-serves it, nothing re-moves)',
@@ -66,7 +66,7 @@ export class PutawayController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or the operator lacks putaway.execute (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, GRN line, SKU, batch, or bin does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict), or a serial-tracked placement scans a serial that already lives in a bin or was last seen in another bin (duplicate-serial / serial-elsewhere, naming it)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict), or a serial-tracked placement scans a serial that is not in the Receiving bin — it lives elsewhere, was already drawn out, or was last seen in another bin (serial-elsewhere, naming the bin)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or a diverged replay would drive the Receiving bin below zero (insufficient-on-hand — quarantined, never corrupting)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
   async placePutaway(
@@ -95,7 +95,10 @@ export class PutawayController {
         toBinId: dto.toBinId,
         reasonCode: dto.reasonCode ?? null,
         occurredAt: dto.occurredAt,
-        serials: dto.serials,
+        // `@IsOptional()` lets an explicit `"serials": null` through (the
+        // mobile op payload always carries it) — normalize to absent so the
+        // command's payload hash spreads an array, never null.
+        serials: dto.serials ?? undefined,
       },
       key,
     );

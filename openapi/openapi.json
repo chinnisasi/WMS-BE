@@ -5034,7 +5034,7 @@
           }
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Placement recorded: the placement snapshot with suggestion-vs-actual (the idempotency snapshot — a replay re-serves it, nothing re-moves)",
             "content": {
               "application/json": {
@@ -5085,7 +5085,7 @@
             }
           },
           "409": {
-            "description": "A concurrent idempotent request (conflict), or a serial-tracked placement scans a serial that already lives in a bin or was last seen in another bin (duplicate-serial / serial-elsewhere, naming it)",
+            "description": "A concurrent idempotent request (conflict), or a serial-tracked placement scans a serial that is not in the Receiving bin — it lives elsewhere, was already drawn out, or was last seen in another bin (serial-elsewhere, naming the bin)",
             "content": {
               "application/problem+json": {
                 "schema": {

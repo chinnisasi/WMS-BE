@@ -187,11 +187,12 @@ export class PutawayFacade {
   /**
    * The derived putaway tasks (FR-10): one task per GRN line whose applied
    * stock still sits in the warehouse's system Receiving bin — remaining is
-   * `min(line.appliedQty, receiving-bin on-hand for that (sku, batch))`,
-   * capped so two GRNs carrying the same (sku, batch) never promise more
-   * than exists; each task names the capacity-only v1 suggestion (the
-   * lowest-occupancy eligible bin) or null when no bin fits. Derived on
-   * every read — there is no claim/state table in v1.
+   * the per-line `min(line.appliedQty, receiving-bin on-hand for that
+   * (sku, batch))` (completion is approximate when two GRNs carry the same
+   * (sku, batch) — the fold attributes stock to no line); each task names
+   * the capacity-only v1 suggestion (the lowest-occupancy eligible bin) or
+   * null when no bin fits. Derived on every read — there is no claim/state
+   * table in v1.
    */
   async getPutawayTasks(tenantId: string, warehouseId: string): Promise<readonly PutawayTask[]> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {

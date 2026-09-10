@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { INestApplication } from '@nestjs/common';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
@@ -253,7 +255,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     toBinId: string;
     reasonCode?: string | null;
     occurredAt: string;
-    serials?: string[];
+    serials?: string[] | null;
   }
 
   function place(body: PlaceBody, token = operatorToken, key = ulid()): SupertestTest {
@@ -1023,6 +1025,89 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     expect(rescan.body.detail as string).toContain(binA04);
   });
 
+  // ── Review arms (controller normalization + batch pairing + guard arms) ────
+
+  it('review arms: an explicit "serials": null body places (the mobile payload), a foreign-line batch is 400, a drawn-out serial is 409 serial-elsewhere, a never-moved serial is 404 serial-unknown', async () => {
+    // (a) The mobile op payload always carries `serials: null` — a null that
+    // passes `@IsOptional()` must normalize at the controller, or the
+    // command's payload hash spreads null and every mobile placement 500s.
+    const plainGrn = await blindGrn([{ poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 2 }]);
+    const plainLine = plainGrn.lines[0]!;
+    const placed = await placeForLine(plainLine, binA04, { serials: null, reasonCode: "operator-preference" }).expect(201);
+    expect((placed.body.placement as { qty: number }).qty).toBe(2);
+
+    // (b) A batch from another GRN line of the same SKU is 400 — the batch
+    // identity must be the line's, or the placement records against the
+    // wrong line's batch.
+    const batchGrn = await blindGrn([
+      { poLineId: null, skuId: batchSkuId, batchCode: 'LOT-PW-R1', mfgDate: null, qty: 3 },
+      { poLineId: null, skuId: batchSkuId, batchCode: 'LOT-PW-R2', mfgDate: null, qty: 3 },
+    ]);
+    const [lineOne, lineTwo] = batchGrn.lines;
+    await placeForLine(lineOne!, binA03, { batchId: lineTwo!.batchId, reasonCode: 'operator-preference' })
+      .expect(400)
+      .then((res) => expect(res.body).toMatchObject({ code: 'validation-failed' }));
+
+    // (c) A serial drawn OUT of the Receiving bin by a −1 adjustment: the
+    // placement's relocation guard takes the "already drawn out" arm — 409
+    // serial-elsewhere naming the bin the draw left.
+    const serialGrn = await blindGrn([{ poLineId: null, skuId: serialSkuId, batchCode: null, mfgDate: null, qty: 2 }]);
+    const serialLine = serialGrn.lines[0]!;
+    const receiving = await receivingBinId();
+    await adjust({
+      warehouseId, skuId: serialSkuId, binId: receiving, quantityDelta: 1,
+      reasonCode: 'cycle-count', note: 'intake for the drawn-out arm', serials: ['PW-SN-D1'],
+    }).expect(201);
+    await adjust({
+      warehouseId, skuId: serialSkuId, binId: receiving, quantityDelta: -1,
+      reasonCode: 'cycle-count', note: 'drawn out for the arm', serials: ['PW-SN-D1'],
+    }).expect(201);
+    const drawnOut = await placeForLine(serialLine, binA04, { qty: 1, serials: ['PW-SN-D1'], reasonCode: 'operator-preference' })
+      .expect(409);
+    expect(drawnOut.body).toMatchObject({ code: 'serial-elsewhere' });
+    expect(drawnOut.body.detail as string).toContain(receiving);
+
+    // (d) A serial that EXISTS but has never moved: resolution succeeds, and
+    // the ledger guard answers 404 serial-unknown — nothing to draw it from.
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await sql`begin`;
+      await sql`set local session_replication_role = replica`;
+      // `serials.id`'s uuidv7 default is a Drizzle $defaultFn, not a column
+      // default — the raw insert must mint its own id.
+      await sql`
+        insert into serials (id, tenant_id, sku_id, serial_number)
+        values (gen_random_uuid(), ${tenantId}, ${serialSkuId}, 'PW-SN-NEVER')`;
+      await sql`commit`;
+    } finally {
+      await sql.end();
+    }
+    await placeForLine(serialLine, binA04, { qty: 1, serials: ['PW-SN-NEVER'], reasonCode: 'operator-preference' })
+      .expect(404)
+      .then((res) => expect(res.body).toMatchObject({ code: 'serial-unknown' }));
+  });
+
+  it('the OpenAPI document exposes the putaway contract (drift guard companion)', () => {
+    const committed = JSON.parse(
+      readFileSync(resolve(process.cwd(), 'openapi/openapi.json'), 'utf8') as string,
+    ) as { paths: Record<string, Record<string, { responses?: Record<string, unknown> }> | undefined> };
+    expect(Object.keys(committed.paths)).toEqual(
+      expect.arrayContaining([
+        '/tenants/{tenantId}/putaway/placements',
+        '/tenants/{tenantId}/putaway/tasks',
+      ]),
+    );
+    // The three putaway operations.
+    const placements = committed.paths['/tenants/{tenantId}/putaway/placements'];
+    expect(placements?.post).toBeDefined();
+    expect(placements?.get).toBeDefined();
+    expect(committed.paths['/tenants/{tenantId}/putaway/tasks']?.get).toBeDefined();
+    // The POST documents 201 (the @HttpCode it actually returns).
+    const responses = placements?.post?.responses ?? {};
+    expect(responses).toHaveProperty('201');
+    expect(responses).not.toHaveProperty('200');
+  });
+
   // ── Validation arms (line pairing) ─────────────────────────────────────────
 
   it('validation: an unknown GRN line is 404; a wrong GRN/warehouse/SKU pairing or batch arm is 400', async () => {
@@ -1093,7 +1178,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       .get(`${API}/${tenantId}/putaway/placements?warehouseId=${warehouseId}&limit=1`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .expect(200);
-    const items = res.body.items as { id: string; placedAt: string; qty: number }[];
+    const items = res.body.items as { id: string; placedAt: string; createdAt: string; qty: number }[];
     expect(items).toHaveLength(1);
     expect(res.body.nextCursor).toBeTruthy();
 
@@ -1104,8 +1189,10 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     const pageTwoItems = pageTwo.body.items as { id: string; createdAt: string }[];
     expect(pageTwoItems).toHaveLength(1);
     expect(pageTwoItems[0]!.id).not.toBe(items[0]!.id);
-    // Strictly older by the (createdAt, id) keyset.
-    expect(pageTwoItems[0]!.createdAt <= items[0]!.placedAt).toBe(true);
+    // Strictly older by the (createdAt, id) keyset — the keyset field is the
+    // server commit time; placedAt is the device time (AD-1) and may sit in
+    // an earlier second than page two's commit.
+    expect(pageTwoItems[0]!.createdAt <= items[0]!.createdAt).toBe(true);
 
     const bogus = Buffer.from(JSON.stringify({ id: 'not-a-uuid', createdAt: 'nope' })).toString('base64');
     await request(app.getHttpServer())

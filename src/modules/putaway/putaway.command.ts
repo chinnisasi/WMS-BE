@@ -354,6 +354,13 @@ export class PutawayCommand {
       } else if (command.batchId !== null) {
         throw putawayValidation(`SKU "${sku.code}" is not batch-tracked — its placement carries no batch.`);
       }
+      // The batch identity must be the GRN line's — a batch from another line
+      // of the same SKU would record the placement against the wrong line.
+      if (line.batchId !== batchId) {
+        throw putawayValidation(
+          `Batch "${command.batchId}" is not GRN line "${command.grnLineId}"'s batch ("${line.batchId ?? 'none'}").`,
+        );
+      }
 
       // ── the serial arm (serial-tracked SKUs, the stock.adjustment mirror) ─
       // Shape backstops first (the stock.adjustment arms), then serial
@@ -405,6 +412,12 @@ export class PutawayCommand {
       }
 
       // ── the target bin (server-side truth, mirrored on-device) ──────────
+      // `for('update')` mutexes the capacity fill: the occupancy read below
+      // runs before the append's advisory lock, so two concurrent placements
+      // into the same bin would otherwise both pass capacity and then append
+      // serially — over capacity. (The Receiving-bin drain side stays the
+      // ledger's insufficiency guard; no existing path locks bin rows, so
+      // bins-row → serial-lock → warehouse-lock stays acyclic.)
       const binRows = await tx
         .select({ id: bins.id, code: bins.code, capacity: bins.capacity, blocked: bins.blocked, systemOwned: bins.systemOwned })
         .from(bins)
@@ -415,6 +428,7 @@ export class PutawayCommand {
             eq(bins.warehouseId, command.warehouseId),
           ),
         )
+        .for('update')
         .limit(1);
       const targetBin = binRows[0];
       if (targetBin === undefined) {
@@ -459,14 +473,23 @@ export class PutawayCommand {
           `Placing into "${targetBin.code}" differs from the suggested bin — a reason code from ${JSON.stringify(PUTAWAY_MISMATCH_REASON_CODES)} is required.`,
         );
       }
+      // The recorded reason: a stale reason on a match is STRIPPED, not
+      // rejected — the server's re-derived suggestion legitimately differs
+      // from the device's task-level suggestion (a stale snapshot), so a
+      // target that equals the server's suggestion carries no reason.
+      const recordedReason = suggestedBinId === command.toBinId ? null : command.reasonCode;
 
       // ── the movements (Receiving bin → target, one event per arm) ───────
-      const placedAt = nowIso();
+      // AD-1: the row's placedAt is the DEVICE time (the GRN-note pattern:
+      // device time + server recordedAt); the ledger's recordedAt and the
+      // row's createdAt stay the server commit time.
+      const recordedAt = nowIso();
+      const placedAt = occurredAt;
       const referenceDoc = {
         kind: 'putaway' as const,
         grnId: command.grnId,
         grnLineId: command.grnLineId,
-        ...(command.reasonCode === null ? {} : { reasonCode: command.reasonCode }),
+        ...(recordedReason === null ? {} : { reasonCode: recordedReason }),
         ...(suggestedBinId === null ? {} : { suggestedBinId }),
       };
       if (serialRefs.length > 0) {
@@ -485,11 +508,15 @@ export class PutawayCommand {
             quantityDelta: signedQuantity(1),
             fromBinId: receivingBin.binId,
             toBinId: targetBin.id,
-            batchRef: null,
+            // The batch arm rides the per-serial events too (the receiving
+            // and adjustment per-serial events do) — a batch+serial-tracked
+            // placement must drain the batch arm of the Receiving bin, or
+            // the derived tasks keep promising moved stock.
+            batchRef: batchId,
             serialRef,
             actorUserId: command.operatorUserId,
             occurredAt,
-            recordedAt: placedAt,
+            recordedAt,
             referenceDoc,
           });
         }
@@ -510,7 +537,7 @@ export class PutawayCommand {
           serialRef: null,
           actorUserId: command.operatorUserId,
           occurredAt,
-          recordedAt: placedAt,
+          recordedAt,
           referenceDoc,
         });
       }
@@ -529,7 +556,7 @@ export class PutawayCommand {
         fromBinId: receivingBin.binId,
         toBinId: targetBin.id,
         suggestedBinId,
-        reasonCode: command.reasonCode,
+        reasonCode: recordedReason,
         placedBy: command.operatorUserId,
         placedAt,
         deviceId: command.deviceId,
@@ -553,11 +580,11 @@ export class PutawayCommand {
           toBinCode: targetBin.code,
           suggestedBinId,
           suggestedBinCode: suggestion?.binCode ?? null,
-          reasonCode: command.reasonCode,
+          reasonCode: recordedReason,
           placedBy: command.operatorUserId,
           placedAt,
           deviceId: command.deviceId,
-          createdAt: placedAt,
+          createdAt: recordedAt,
         },
       };
 
@@ -580,7 +607,7 @@ export class PutawayCommand {
           fromBinId: receivingBin.binId,
           toBinId: targetBin.id,
           suggestedBinId,
-          reasonCode: command.reasonCode,
+          reasonCode: recordedReason,
           placedBy: command.operatorUserId,
           placedAt,
         },
