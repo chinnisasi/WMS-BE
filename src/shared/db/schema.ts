@@ -190,6 +190,13 @@ export type Zone = typeof zones.$inferSelect;
  * facade's auto-created system Receiving bin per warehouse is flagged here so
  * putaway suggestions (3.5) and picking exclude it. Only the tenancy
  * receiving-bin facade sets it true; user-created bins are always false.
+ *
+ * Story 3.6 adds the retirement pair (additive, nullable — the devices
+ * `revoked_at/revoked_by` pattern): `retired_at/retired_by` are set together
+ * by the retire command (the pairing CHECK lives only in the 0016 migration
+ * SQL — the 0014 release-pairing pattern) and are never cleared. Retire is
+ * terminal — the row stays (the (warehouse_id, code) unique key keeps the
+ * code reserved; no bin deletion anywhere).
  */
 export const bins = pgTable(
   'bins',
@@ -205,6 +212,8 @@ export const bins = pgTable(
     type: text('type').notNull(),
     blocked: boolean('blocked').notNull().default(false),
     systemOwned: boolean('system_owned').notNull().default(false),
+    retiredAt: timestamp('retired_at', { withTimezone: true, mode: 'string' }),
+    retiredBy: uuid('retired_by'),
     ...tenantTimestamps,
   },
   (table) => [

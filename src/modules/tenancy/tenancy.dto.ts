@@ -1,6 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsEmail, IsIn, IsInt, IsString, Length, Matches, Max, Min } from 'class-validator';
+import { IsBoolean, IsEmail, IsIn, IsInt, IsString, IsUUID, Length, Matches, Max, Min } from 'class-validator';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -339,6 +339,28 @@ export class BinResponse {
   @ApiProperty({ example: false })
   blocked!: boolean;
 
+  @ApiProperty({
+    example: null,
+    nullable: true,
+    type: String,
+    description: 'The one-way retirement instant (null while the bin is live) — Story 3.6',
+  })
+  retiredAt!: string | null;
+
+  @ApiProperty({
+    format: 'uuid',
+    nullable: true,
+    type: String,
+    description: 'Who retired the bin (null while the bin is live) — Story 3.6',
+  })
+  retiredBy!: string | null;
+
+  @ApiProperty({
+    example: false,
+    description: 'The Receiving/QC-hold system bins (never blockable, mergeable, or retired)',
+  })
+  systemOwned!: boolean;
+
   @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
   createdAt!: string;
 }
@@ -349,6 +371,36 @@ export class BinListResponse {
 
   @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
   nextCursor!: string | null;
+}
+
+export class MergeBinDto {
+  @ApiProperty({ format: 'uuid', description: 'The bin the source bin\'s stock consolidates into' })
+  @IsUUID()
+  targetBinId!: string;
+}
+
+/** The merge's moved summary — declared so the generated client type is shaped. */
+export class BinMovedSummary {
+  @ApiProperty({ example: 2, description: 'Distinct SKUs whose arms moved' })
+  skus!: number;
+
+  @ApiProperty({ example: 17, description: 'Total base-UoM units moved' })
+  units!: number;
+}
+
+export class BinMergeResponse {
+  @ApiProperty({ type: BinResponse, description: 'The source bin, post-merge (retired in the same commit)' })
+  source!: BinResponse;
+
+  @ApiProperty({ type: BinResponse })
+  target!: BinResponse;
+
+  @ApiProperty({
+    type: BinMovedSummary,
+    example: { skus: 2, units: 17 },
+    description: 'Distinct SKUs whose arms moved, and the total base-UoM units moved',
+  })
+  moved!: BinMovedSummary;
 }
 
 export class BinGridResponse {

@@ -64,6 +64,14 @@ export type LedgerReferenceDoc =
       readonly reasonCode?: string;
       /** The server's re-derived suggestion (absent when no bin fit). */
       readonly suggestedBinId?: string;
+    }
+  // Story 3.6 — the bin-merge arm: every `bin.merged` movement names the
+  // merge op that moved the stock (one op per source→target consolidation;
+  // one event per (sku, batch) arm, per serial unit for serial-tracked
+  // stock). NEW union arm — the earlier kinds are never reshaped.
+  | {
+      readonly kind: 'bin-merge';
+      readonly mergeId: string;
     };
 // Later stories extend this union with NEW kinds (pick, transfer, …) — never
 // by reshaping an existing arm.
@@ -168,6 +176,26 @@ registerLedgerEventType({
   type: 'putaway.placed',
   sinceVersion: 1,
   referenceKinds: ['putaway'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 3.6 — the bin-merge movement: stock moving from a source
+ * bin into the merge's target bin, folded from ONE event like the putaway
+ * relocation (both bin arms carried, the magnitude folds +target −source).
+ * One event per (sku, batch) arm; serial-tracked stock moves one two-arm
+ * event per serial unit (the putaway convention — the serial's location
+ * record must move with its stock), with the batch arm carried on the
+ * per-serial events too. Never a direct `stock_on_hand` write — the merge is
+ * real ledger movements, replay/reconciliation/audit all see them. Registers
+ * sinceVersion 1: no new grammar version — the reference-doc arm appends
+ * only.
+ */
+registerLedgerEventType({
+  type: 'bin.merged',
+  sinceVersion: 1,
+  referenceKinds: ['bin-merge'],
   allowsBatchArm: true,
   allowsSerialArm: true,
 });

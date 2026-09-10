@@ -46,6 +46,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
   let opsUserId: string;
   let operatorToken: string; // a team operator (web session) — the 403 arm
   let warehouseId: string;
+  let zoneId: string;
   let binA: string;
   let binB: string;
   let batchHoldId: string;
@@ -117,7 +118,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
       .set(KEY_HEADER, ulid())
       .send({ code: 'A', name: 'Zone A' })
       .expect(201);
-    const zoneId = zone.body.id as string;
+    zoneId = zone.body.id as string;
     const binBody = { capacity: 1000, type: 'shelf' };
     binA = (
       await request(app.getHttpServer())
@@ -640,6 +641,45 @@ describe('QC hold and release (e2e, story 3.4)', () => {
       (await holdLedgerRows(holdId)).filter((m) => m.type === 'qc.released'),
     ).toHaveLength(0);
     expect(await onHandAtBin(qcBin, skuId)).toBe(7);
+  });
+
+  it('origin bin retired mid-hold (story 3.6): 409 qc-hold-origin-bin-gone, no movement, hold stays open', async () => {
+    const skuId = skuIds.get('QC-PLAIN')!;
+    // A fresh bin: the hold relocates its whole scope to the QC bin, leaving
+    // the origin EMPTY — the exact state the retire gate guards.
+    const binC = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A-01-03', capacity: 1000, type: 'shelf' })
+        .expect(201)
+    ).body.id as string;
+    await seedStock(skuId, binC, 2);
+    const holdId = (await placeHold(
+      { warehouseId, skuId, binId: binC, reason: 'Held before the bin retires' },
+    ).expect(201)).body.qcHold.id as string;
+    const qcBin = await qcBinId();
+    // Earlier arms already hold QC-PLAIN units in the QC bin — assert the
+    // DELTA this scope added, not an absolute count.
+    const qcBinBefore = await onHandAtBin(qcBin, skuId);
+
+    // The origin retires out-of-band: the API path now refuses (the hold-open
+    // gate 409s a retire), so this arm drives the state directly — the hold
+    // row is what would be stranded if the release did not refuse.
+    await sql`
+      update bins set retired_at = now(), retired_by = ${opsUserId}
+      where tenant_id = ${tenantId} and id = ${binC}`;
+
+    const res = await releaseHold(holdId).expect(409);
+    expect(res.body.code).toBe('qc-hold-origin-bin-gone');
+    expect(String(res.body.detail)).toContain('A-01-03');
+    expect(await qcHoldRow(holdId)).toMatchObject({ status: 'open' });
+    // No release movement slipped in; the QC bin still holds the units.
+    expect(
+      (await holdLedgerRows(holdId)).filter((m) => m.type === 'qc.released'),
+    ).toHaveLength(0);
+    expect(await onHandAtBin(qcBin, skuId)).toBe(qcBinBefore);
   });
 
   it('multi-batch scope: one qc.held movement per batch arm, each arm distinct', async () => {

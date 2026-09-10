@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -419,7 +419,7 @@ export class PutawayCommand {
       // ledger's insufficiency guard; no existing path locks bin rows, so
       // bins-row → serial-lock → warehouse-lock stays acyclic.)
       const binRows = await tx
-        .select({ id: bins.id, code: bins.code, capacity: bins.capacity, blocked: bins.blocked, systemOwned: bins.systemOwned })
+        .select({ id: bins.id, code: bins.code, capacity: bins.capacity, blocked: bins.blocked, systemOwned: bins.systemOwned, retiredAt: bins.retiredAt })
         .from(bins)
         .where(
           and(
@@ -443,6 +443,11 @@ export class PutawayCommand {
         throw putawayValidation(
           `Bin "${targetBin.code}" is a system bin (Receiving/QC-hold) — placements land in storage bins only.`,
         );
+      }
+      if (targetBin.retiredAt !== null) {
+        // Story 3.6: a retired bin is operationally gone — the target-use
+        // rejection (400, per the retired-bin matrix arm).
+        throw binRetiredAsTarget(targetBin.code);
       }
       if (targetBin.blocked) {
         // FR-10: the rejection names the reason and the bin.
@@ -710,10 +715,10 @@ export interface PutawayBinCandidate {
 }
 
 /**
- * The warehouse's putaway-eligible bins (not blocked, not system-owned),
- * ranked lowest occupancy then bin code — the suggestion's input order.
- * Occupancy is the bin's total on-hand across every SKU (capacity is shared
- * base-UoM space), folded in one grouped query.
+ * The warehouse's putaway-eligible bins (not blocked, not system-owned, not
+ * retired — Story 3.6), ranked lowest occupancy then bin code — the
+ * suggestion's input order. Occupancy is the bin's total on-hand across
+ * every SKU (capacity is shared base-UoM space), folded in one grouped query.
  */
 export async function binCandidatesInTx(
   tx: TenantTx,
@@ -742,6 +747,8 @@ export async function binCandidatesInTx(
         eq(bins.warehouseId, warehouseId),
         eq(bins.blocked, false),
         eq(bins.systemOwned, false),
+        // Story 3.6: a retired bin is operationally gone — it never suggests.
+        isNull(bins.retiredAt),
       ),
     )
     .groupBy(bins.id, bins.code, bins.capacity)
@@ -877,6 +884,34 @@ export function binBlocked(binCode: string): ProblemException {
     400,
     'Target bin is blocked',
     `Bin "${binCode}" is blocked — placements into it are refused until it is unblocked.`,
+  );
+}
+
+/**
+ * The retired-bin target-use rejection (Story 3.6): 400 naming the bin —
+ * a retired bin is operationally gone, referenced as a target (or source)
+ * it always refuses.
+ */
+export function binRetiredAsTarget(binCode: string): ProblemException {
+  return new ProblemException(
+    'bin-retired',
+    400,
+    'Target bin is retired',
+    `Bin "${binCode}" is retired — placements into it are refused; retirement is terminal.`,
+  );
+}
+
+/**
+ * The retired-bin SOURCE rejection (Story 3.6): the sibling of the target arm
+ * above — a merge FROM a retired bin is refused, and the message names the
+ * operation (a retired bin cannot be a merge source, not just a target).
+ */
+export function binRetiredAsSource(binCode: string): ProblemException {
+  return new ProblemException(
+    'bin-retired',
+    400,
+    'Source bin is retired',
+    `Bin "${binCode}" is retired — merging from it is refused; retirement is terminal.`,
   );
 }
 

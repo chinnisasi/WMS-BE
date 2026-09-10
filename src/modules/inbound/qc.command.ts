@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, eq } from 'drizzle-orm';
+import { and, asc, eq, inArray } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, bins, idempotencyKeys, qcHolds, skus } from '../../shared/db/schema';
@@ -66,6 +66,40 @@ const QC_HOLDS_OPEN_SCOPE_KEY = 'qc_holds_open_scope_unique';
 
 /** Max reason length — a hold names why in one sentence, not an essay. */
 const MAX_REASON_LENGTH = 200;
+
+/**
+ * The open holds riding one of the named bins, read inside the CALLER's
+ * transaction (Story 3.6's bin-merge guard): a bin with an open hold can
+ * neither be a merge source nor a merge target — the hold must keep its bin,
+ * because the release returns the held stock to the origin bin it recorded.
+ * `qc_holds` is an inbound-module-exclusive table; the tenancy command
+ * composes this guard through this file-level helper (the shared
+ * command-entry helper pattern — `assertWarehouseInTenant`'s mirror), never
+ * by reaching into the table itself.
+ */
+export async function openQcHoldsForBinsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  binIds: readonly string[],
+): Promise<readonly { binId: string; holdId: string; skuId: string }[]> {
+  if (binIds.length === 0) {
+    return [];
+  }
+  const rows = await tx
+    .select({ binId: qcHolds.binId, holdId: qcHolds.id, skuId: qcHolds.skuId })
+    .from(qcHolds)
+    .where(
+      and(
+        eq(qcHolds.tenantId, tenantId),
+        eq(qcHolds.warehouseId, warehouseId),
+        eq(qcHolds.status, 'open'),
+        inArray(qcHolds.binId, [...binIds]),
+      ),
+    )
+    .orderBy(asc(qcHolds.id));
+  return rows;
+}
 
 /**
  * The QC hold/release commands (Story 3.4): an Ops Manager quarantines a
@@ -170,7 +204,12 @@ export class QcCommand {
             eq(bins.warehouseId, command.warehouseId),
           ),
         )
-        .limit(1);
+        .limit(1)
+        // The bin row locks here (the same row the merge/retire commands lock
+        // id-sorted), so a hold cannot commit alongside a concurrent
+        // merge/retire of its bin — stock never double-moves and a hold is
+        // never stranded on a bin that retires underneath it.
+        .for('update');
       const originBin = binRows[0];
       if (originBin === undefined) {
         throw new ProblemException(
@@ -399,12 +438,14 @@ export class QcCommand {
         );
       }
 
-      // The origin bin must still exist (the matrix's retired/missing arm —
-      // a gone bin cannot receive the stock back; the hold stays open and
-      // the decision retried once the bin state is resolved). Story 3.6's
-      // retire state extends this check when it lands.
+      // The origin bin must still exist and not be retired (the matrix's
+      // retired/missing arm — a gone bin cannot receive the stock back; the
+      // hold stays open and the decision retried once the bin state is
+      // resolved). Story 3.6: retirement is the one-way state that extends
+      // this check — a retired origin bin is operationally gone even though
+      // its row remains.
       const originRows = await tx
-        .select({ id: bins.id, code: bins.code })
+        .select({ id: bins.id, code: bins.code, retiredAt: bins.retiredAt })
         .from(bins)
         .where(
           and(
@@ -421,6 +462,14 @@ export class QcCommand {
           409,
           'Origin bin no longer exists',
           `The hold's origin bin ("${row.binId}") no longer exists in this warehouse — the held stock cannot return to it. Resolve the bin state first; the hold stays open.`,
+        );
+      }
+      if (origin.retiredAt !== null) {
+        throw new ProblemException(
+          'qc-hold-origin-bin-gone',
+          409,
+          'Origin bin is retired',
+          `The hold's origin bin ("${origin.code}") is retired — the held stock cannot return to a retired bin. Resolve the bin state first; the hold stays open.`,
         );
       }
 

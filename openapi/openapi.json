@@ -1015,7 +1015,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or invalid body",
+            "description": "Missing or malformed Idempotency-Key, invalid body, or a system bin (validation-failed names the bin)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1054,6 +1054,16 @@
               }
             }
           },
+          "409": {
+            "description": "The bin is retired (bin-retired — retirement is terminal)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
           "422": {
             "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
             "content": {
@@ -1070,7 +1080,274 @@
             "bearer": []
           }
         ],
-        "summary": "Blocks or unblocks a bin (the only bin edit in this story)",
+        "summary": "Blocks or unblocks a bin (Story 3.6: never a system or retired bin)",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/bins/{binId}/merge": {
+      "post": {
+        "operationId": "TenancyController_mergeBin",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "binId",
+            "required": true,
+            "in": "path",
+            "description": "The SOURCE bin",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MergeBinDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BinMergeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a structural guard (validation-failed / bin-retired / bin-blocked — a blocked SOURCE is allowed, the only way to empty a blocked bin; only the target must be live), or a target overflow (bin-full names capacity and occupancy — nothing committed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks bin.retire (role-denied — Owner and Ops Manager only)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Source or target bin does not exist in this warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A source/target bin has an open QC hold (bin-merge-hold-open names the bin and the hold)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Merges this bin into the target bin (all on-hand moves through real ledger movements; the source retires in the same commit)",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/bins/{binId}/retire": {
+      "post": {
+        "operationId": "TenancyController_retireBin",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "binId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BinResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a system bin (validation-failed), or the bin still holds stock (bin-not-empty names the (sku, batch, qty) rows)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks bin.retire (role-denied — Owner and Ops Manager)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Bin does not exist in this warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The bin is already retired (bin-retired — retirement is terminal)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Retires this bin — one-way, only an EMPTY bin can retire (the row stays; the code stays reserved)",
         "tags": [
           "tenancy"
         ]
@@ -5781,6 +6058,23 @@
             "type": "boolean",
             "example": false
           },
+          "retiredAt": {
+            "type": "string",
+            "example": null,
+            "nullable": true,
+            "description": "The one-way retirement instant (null while the bin is live) — Story 3.6"
+          },
+          "retiredBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Who retired the bin (null while the bin is live) — Story 3.6"
+          },
+          "systemOwned": {
+            "type": "boolean",
+            "example": false,
+            "description": "The Receiving/QC-hold system bins (never blockable, mergeable, or retired)"
+          },
           "createdAt": {
             "type": "string",
             "example": "2026-09-08T00:00:00.000Z"
@@ -5795,6 +6089,9 @@
           "capacity",
           "type",
           "blocked",
+          "retiredAt",
+          "retiredBy",
+          "systemOwned",
           "createdAt"
         ]
       },
@@ -5913,6 +6210,71 @@
         },
         "required": [
           "blocked"
+        ]
+      },
+      "MergeBinDto": {
+        "type": "object",
+        "properties": {
+          "targetBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The bin the source bin's stock consolidates into"
+          }
+        },
+        "required": [
+          "targetBinId"
+        ]
+      },
+      "BinMovedSummary": {
+        "type": "object",
+        "properties": {
+          "skus": {
+            "type": "number",
+            "example": 2,
+            "description": "Distinct SKUs whose arms moved"
+          },
+          "units": {
+            "type": "number",
+            "example": 17,
+            "description": "Total base-UoM units moved"
+          }
+        },
+        "required": [
+          "skus",
+          "units"
+        ]
+      },
+      "BinMergeResponse": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "description": "The source bin, post-merge (retired in the same commit)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BinResponse"
+              }
+            ]
+          },
+          "target": {
+            "$ref": "#/components/schemas/BinResponse"
+          },
+          "moved": {
+            "example": {
+              "skus": 2,
+              "units": 17
+            },
+            "description": "Distinct SKUs whose arms moved, and the total base-UoM units moved",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/BinMovedSummary"
+              }
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "target",
+          "moved"
         ]
       },
       "SetupChecklistStepResponse": {
