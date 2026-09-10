@@ -29,6 +29,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
   let warehouseId: string;
   let vendorId: string;
   let batchSkuId: string; // batch-tracked
+  let secondBatchSkuId: string; // batch-tracked (the cross-SKU batch arm)
   let plainSkuId: string; // not batch-tracked
   let deviceToken: string;
   let deviceId: string;
@@ -112,6 +113,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       csvHeader,
       'RCV-A,Receiving Item A,pcs,,1800,,true,false,,,',
       'RCV-B,Receiving Item B,pcs,,1800,,false,false,,,',
+      'RCV-C,Receiving Item C,pcs,,1800,,true,false,,,',
     ].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
@@ -128,6 +130,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       (skus.body.items as { code: string; id: string }[]).map((item) => [item.code, item.id]),
     );
     batchSkuId = byCode.get('RCV-A')!;
+    secondBatchSkuId = byCode.get('RCV-C')!;
     plainSkuId = byCode.get('RCV-B')!;
 
     // The floor device + its badge-in operator.
@@ -923,7 +926,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     };
     expect(snapshot.warehouseId).toBe(warehouseId);
     expect(snapshot.generatedAt).toBeTruthy();
-    expect(snapshot.skus.map((sku) => sku.code).sort()).toEqual(['RCV-A', 'RCV-B']);
+    expect(snapshot.skus.map((sku) => sku.code).sort()).toEqual(['RCV-A', 'RCV-B', 'RCV-C']);
     const batchSku = snapshot.skus.find((sku) => sku.id === batchSkuId)!;
     expect(batchSku.batchTracked).toBe(true);
     expect(typeof batchSku.barcode).toBe('string');
@@ -1177,5 +1180,57 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     expect(line.receivedQty).toBe(6);
     // No over-receipt row pended for either line.
     expect(await outboxRows('over_receipt.requested', grn.id)).toHaveLength(0);
+  });
+
+  it('the same batch code under a different SKU is a distinct legal batch (matrix row 10, amended): one GRN, two SKUs, one code — 201 with its own batch row per (tenant, sku, code)', async () => {
+    // One PO carrying both batch-tracked SKUs, one GRN carrying the SAME
+    // batch code on both lines. Batch identity is per (tenant, sku, code)
+    // (the frozen 2.4 data model) — the duplicate code under the other SKU
+    // is a distinct legal batch, never an error.
+    const created = await createPo({
+      warehouseId,
+      vendorId,
+      code: `PO-${ulid().slice(10, 18).toUpperCase()}`,
+      lines: [
+        { skuId: batchSkuId, orderedQty: 10, unitCostPaise: 800 },
+        { skuId: secondBatchSkuId, orderedQty: 10, unitCostPaise: 900 },
+      ],
+    }).expect(201);
+    const po = created.body.purchaseOrder as { id: string; lines: { id: string; skuId: string }[] };
+    const lineA = po.lines.find((candidate) => candidate.skuId === batchSkuId)!.id;
+    const lineC = po.lines.find((candidate) => candidate.skuId === secondBatchSkuId)!.id;
+
+    const res = await submitGrn(
+      grnBody([
+        { poLineId: lineA, skuId: batchSkuId, batchCode: 'LOT-SHARED', mfgDate: '2026-07-01T00:00:00Z', qty: 4 },
+        { poLineId: lineC, skuId: secondBatchSkuId, batchCode: 'LOT-SHARED', mfgDate: null, qty: 5 },
+      ], po.id),
+    ).expect(201);
+    const grn = res.body.goodsReceipt as {
+      id: string;
+      lines: { poLineId: string; skuId: string; batchId: string; batchCode: string | null; appliedQty: number }[];
+      rejectedLines?: unknown[];
+    };
+    expect(grn.rejectedLines).toBeUndefined();
+    expect(grn.lines).toHaveLength(2);
+    // Each line settled in full and carries ITS OWN batch id.
+    expect(grn.lines[0]).toMatchObject({ poLineId: lineA, skuId: batchSkuId, batchCode: 'LOT-SHARED', appliedQty: 4 });
+    expect(grn.lines[1]).toMatchObject({ poLineId: lineC, skuId: secondBatchSkuId, batchCode: 'LOT-SHARED', appliedQty: 5 });
+    expect(grn.lines[0]!.batchId).not.toBe(grn.lines[1]!.batchId);
+    // Two batch rows exist under the same code — one per (tenant, sku).
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const rows = await sql`
+        select sku_id, id from batches
+        where tenant_id = ${tenantId} and code = 'LOT-SHARED'
+        order by sku_id`;
+      const batchRows = rows as unknown as { sku_id: string; id: string }[];
+      expect(batchRows).toHaveLength(2);
+      expect(new Set(batchRows.map((row) => row.sku_id))).toEqual(new Set([batchSkuId, secondBatchSkuId]));
+      expect(batchRows.find((row) => row.sku_id === batchSkuId)!.id).toBe(grn.lines[0]!.batchId);
+      expect(batchRows.find((row) => row.sku_id === secondBatchSkuId)!.id).toBe(grn.lines[1]!.batchId);
+    } finally {
+      await sql.end();
+    }
   });
 });
