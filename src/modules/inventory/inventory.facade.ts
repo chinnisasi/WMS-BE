@@ -16,8 +16,14 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 
 // The facade is the only sibling-facing seam (architecture test): the
 // movement shape rides along so cross-module producers import the type here,
-// never from the ledger service internals.
+// never from the ledger service internals. Story 4.1 adds the reservation
+// shapes the same way — the order module reads grant/ATP/snapshot types here.
 export type { LedgerMovement, AppendedMovement } from './ledger.service';
+export type {
+  AtpSnapshot,
+  GrantReservationCommand,
+  ReservationSnapshot,
+} from './reservation.service';
 import type {
   ChainAnchor,
   ChainBreakReport,
@@ -483,6 +489,31 @@ export class InventoryFacade {
   /** `held → released` — restores the reserved counter. */
   async releaseReservation(tenantId: string, reservationId: string): Promise<ReservationSnapshot> {
     return this.reservations.release(tenantId, reservationId);
+  }
+
+  /**
+   * The live journal rows for a set of reservation ids (story 4.1): the
+   * outbound module's per-line reservation-state read rides this passthrough
+   * — AD-6 keeps `reservations` inventory-owned, and cross-module state
+   * reads go through the facade like every other stock-state read. Missing
+   * ids simply come back absent; the caller renders its own nulls.
+   */
+  async reservationsByIds(tenantId: string, ids: readonly string[]): Promise<ReservationSnapshot[]> {
+    return this.reservations.reservationsByIds(tenantId, ids);
+  }
+
+  /**
+   * The same read inside the caller's transaction (story 4.1): a sibling
+   * command that composes the reservation-state read with its own writes in
+   * ONE tenant transaction (the order snapshot) rides this in-tx passthrough
+   * — the `appendLedgerEventInTx` shape. Missing ids come back absent.
+   */
+  async reservationsByIdsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    ids: readonly string[],
+  ): Promise<ReservationSnapshot[]> {
+    return this.reservations.reservationsByIdsInTx(tx, tenantId, ids);
   }
 
   /** Real-time ATP: on-hand (quarantine-excluded) − reserved − hooks. */

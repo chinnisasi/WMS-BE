@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
-import { and, eq, inArray, notExists, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, notExists, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -162,6 +162,24 @@ function unavailable(detail: string): ProblemException {
   return new ProblemException('unavailable', 409, 'Stock unavailable', detail);
 }
 
+/**
+ * The store-down outcome (story 4.1, epic-2 retro A8): the fail-closed arm
+ * gets its OWN machine code — 503 `reservation-store-unavailable` — distinct
+ * from the deterministic 409 `unavailable` a losing grant receives. A 503
+ * here means "nothing was written, retry when the store is healthy"; a 409
+ * means "the decision was made: no stock". Callers (Epic 4's order
+ * acceptance) fail the whole operation closed on the 503.
+ */
+function reservationStoreUnavailable(detail?: string): ProblemException {
+  return new ProblemException(
+    'reservation-store-unavailable',
+    503,
+    'Reservation store unavailable',
+    detail ??
+      'The atomic-decision store (Valkey) is unreachable or its counters are not loaded — the request fails closed rather than risk oversell. Nothing was written; retry once the store is healthy.',
+  );
+}
+
 /** Rejects a malformed/empty scope id at the boundary — 400, never a raw 22P02. */
 function requireUuid(value: string, name: string): void {
   if (!UUID_RE.test(value)) {
@@ -184,9 +202,16 @@ function requireUuid(value: string, name: string): void {
  *
  * Grant shape (journal is truth, commit-then-apply):
  *   probe (idempotency) → ceiling = committed quarantine-excluded on-hand −
- *   hooks → Lua script (check reserved+qty ≤ ceiling, increment) → INSERT the
+ *   hooks → Lua script (check reserved+qty ≤ ceiling, increment) → A2
+ *   re-validation (the ceiling re-read `FOR UPDATE` on the stock rows — the
+ *   grant-vs-adjustment race serializes through Postgres) → INSERT the
  *   `held` journal row → on journal failure a compensating script release
  *   (the decrement never outlives a missing journal row).
+ *
+ * Failure codes (story 4.1, A8): a STORE failure (Valkey unreachable /
+ * counters not loaded) is 503 `reservation-store-unavailable` — nothing
+ * written, retryable; a LOST decision (ceiling insufficient, including the
+ * A2 re-validation) is the deterministic 409 `unavailable`.
  *
  * Terminal transitions (`held → committed/released/expired`) serialize through
  * a conditional UPDATE — the rowcount is the single-winner proof; a second
@@ -263,12 +288,16 @@ export class ReservationService implements OnModuleInit {
       );
     }
     const ttlSeconds = command.ttlSeconds ?? DEFAULT_RESERVATION_TTL_SECONDS;
-    if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0 || ttlSeconds > MAX_RESERVATION_TTL_SECONDS) {
+    // Story 4.1 (epic-2 review F11): a zero TTL is not a valid hold — it
+    // expires the instant it is journalled, a shape every caller reaches only
+    // by accident. 400 like every other out-of-range input; a hold that must
+    // be short still needs at least one second.
+    if (!Number.isInteger(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > MAX_RESERVATION_TTL_SECONDS) {
       throw new ProblemException(
         'validation-failed',
         400,
         'ttlSeconds out of range',
-        `ttlSeconds must be an integer between 0 and ${MAX_RESERVATION_TTL_SECONDS} (got ${String(ttlSeconds)}).`,
+        `ttlSeconds must be an integer between 1 and ${MAX_RESERVATION_TTL_SECONDS} (got ${String(ttlSeconds)}).`,
       );
     }
     const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
@@ -288,11 +317,17 @@ export class ReservationService implements OnModuleInit {
       return this.idempotentHit(probe.existing, command);
     }
 
-    const granted = await this.runGrantScript(counterKey, readyKey, tenantId, warehouseId, skuId, {
+    const outcome = await this.runGrantScript(counterKey, readyKey, tenantId, warehouseId, skuId, {
       quantity: command.quantity,
       ceiling: probe.ceiling,
     });
-    if (!granted) {
+    if (outcome === 'store-down') {
+      // Story 4.1 (A8): the fail-closed arm is a 503 with its own machine
+      // code — nothing written, retryable — never the deterministic 409 a
+      // losing grant receives.
+      throw reservationStoreUnavailable();
+    }
+    if (outcome !== 'granted') {
       throw unavailable(
         `SKU ${skuId} has ${probe.ceiling} sellable unit(s) in warehouse ${warehouseId}` +
           (probe.qcHeld > 0 ? ` (of which ${probe.qcHeld} are QC-held)` : '') +
@@ -304,6 +339,31 @@ export class ReservationService implements OnModuleInit {
     // commit, the decrement is compensated (never the reverse).
     try {
       return await withTenantTransaction(this.db, tenantId, async (tx) => {
+        // Story 4.1 (epic-2 retro A2): re-validate the committed ceiling
+        // under row lock BEFORE the journal INSERT. The Valkey counter
+        // arbitrates grant-vs-grant only; stock can move underneath between
+        // the probe tx and the script (an adjustment committing in that gap
+        // shrinks the ceiling under an already-won script). Locking the
+        // scope's stock rows (the same `FOR UPDATE` discipline every other
+        // stock-mutation command serializes through) makes grant-vs-
+        // adjustment go through Postgres too: a concurrent adjustment must
+        // wait on these locks, so the locked re-read sees its effect. A
+        // ceiling regression compensates (Valkey decrement, no journal row)
+        // with the deterministic 409 `unavailable` — the "never oversells"
+        // module claim holds for grant-vs-stock, not just grant-vs-grant.
+        const lockedCeiling = await this.revalidatedCeiling(tx, tenantId, warehouseId, skuId);
+        const counter = await this.valkey.getCounter(counterKey).catch(() => {
+          throw reservationStoreUnavailable(
+            'The reservation store became unreachable between the grant script and the journal write — the grant fails closed (nothing journalled).',
+          );
+        });
+        if (counter === null || counter > lockedCeiling) {
+          throw unavailable(
+            `SKU ${skuId} in warehouse ${warehouseId} lost sellable units while the grant was in flight ` +
+              `(ceiling ${probe.ceiling} → ${lockedCeiling}, reserved now ${counter ?? 'unknown'}) — ` +
+              `the hold cannot be journalled.`,
+          );
+        }
         const rows = await tx
           .insert(reservations)
           .values({
@@ -457,11 +517,10 @@ export class ReservationService implements OnModuleInit {
       throw this.valkeyDown(err, 'ATP read');
     }
     if (!ready) {
-      // Counters not loaded (cold start / rebuild in progress): fail closed.
-      throw new ProblemException(
-        'unavailable',
-        503,
-        'Reservation counters are not loaded',
+      // Counters not loaded (cold start / rebuild in progress): fail closed
+      // with the A8 machine code (story 4.1) — a read that cannot prove the
+      // reserved figure never invents one.
+      throw reservationStoreUnavailable(
         `Warehouse ${warehouseId} counters are being (re)built from the journal — ATP is unavailable, not zero.`,
       );
     }
@@ -706,8 +765,14 @@ export class ReservationService implements OnModuleInit {
    * - `missing-counter` (divergence under a ready marker): repairs the scope
    *   from the journal (Postgres wins, SET NX so a concurrent winning script
    *   is never clobbered) and retries the script exactly once.
-   * Returns true only on a script win; every other outcome is a deterministic
-   * loss the caller rejects with `unavailable` (never a retry).
+   *
+   * Returns one of three outcomes (story 4.1, A8):
+   * - `'granted'` — the script won; the caller journals.
+   * - `'store-down'` — the store is unreachable or its counters are not
+   *   loaded: the caller fails closed with 503 `reservation-store-unavailable`
+   *   (nothing written, retryable — never a deterministic 409).
+   * - `'lost'` — the script decided against the request (ceiling/quantity):
+   *   the deterministic 409 `unavailable`.
    */
   private async runGrantScript(
     counterKey: string,
@@ -716,7 +781,7 @@ export class ReservationService implements OnModuleInit {
     warehouseId: string,
     skuId: string,
     request: { quantity: number; ceiling: number },
-  ): Promise<boolean> {
+  ): Promise<'granted' | 'store-down' | 'lost'> {
     let reply: Awaited<ReturnType<ValkeyClient['grantReservation']>>;
     try {
       reply = await this.valkey.grantReservation(
@@ -728,27 +793,28 @@ export class ReservationService implements OnModuleInit {
       );
     } catch {
       // Valkey unreachable: fail closed — never oversell on a silent mirror.
-      return false;
+      return 'store-down';
     }
     if (reply[0] === 1) {
-      return true;
+      return 'granted';
     }
     if (reply[1] === 'not-ready') {
       // Cold start / rebuild gap: repair from the journal so subsequent
       // grants have counters to decide against; THIS grant still fails
-      // closed (the I/O matrix: grants during rebuild are `unavailable`).
+      // closed (the I/O matrix: grants during rebuild are store-down).
       await this.rebuildCounters(tenantId, warehouseId).catch((err: unknown) => {
         this.logger.error(
           `Reservation rebuild triggered by a not-ready grant failed: tenant=${tenantId} ` +
             `warehouse=${warehouseId} — ${err instanceof Error ? err.message : String(err)}`,
         );
       });
-      return false;
+      return 'store-down';
     }
     if (reply[1] === 'missing-counter') {
       // The repair itself can fail (journal read or Valkey write): like every
-      // other arm, it must surface as the deterministic loss the caller
-      // rejects with `unavailable`, never an unclassified error.
+      // other arm, it must surface as the store-down outcome the caller
+      // rejects with 503 `reservation-store-unavailable`, never an
+      // unclassified error.
       try {
         const sum = await this.journalReservedSum(tenantId, warehouseId, skuId);
         await this.valkey.setCounter(counterKey, sum, COUNTER_TTL_SECONDS, false);
@@ -757,7 +823,7 @@ export class ReservationService implements OnModuleInit {
           `Reservation missing-counter repair failed — grant fails closed: ` +
             `${err instanceof Error ? err.message : String(err)}`,
         );
-        return false;
+        return 'store-down';
       }
       try {
         const retry = await this.valkey.grantReservation(
@@ -767,12 +833,12 @@ export class ReservationService implements OnModuleInit {
           request.ceiling,
           COUNTER_TTL_SECONDS,
         );
-        return retry[0] === 1;
+        return retry[0] === 1 ? 'granted' : 'lost';
       } catch {
-        return false;
+        return 'store-down';
       }
     }
-    return false; // 'unavailable' (or 'invalid-qty' — the caller pre-validates)
+    return 'lost'; // 'unavailable' (or 'invalid-qty' — the caller pre-validates)
   }
 
   /**
@@ -970,11 +1036,85 @@ export class ReservationService implements OnModuleInit {
       `Valkey unreachable during ${path} — failing closed: ` +
         `${err instanceof Error ? err.message : String(err)}`,
     );
+    // Story 4.1 (A8): the store-down arm carries its own machine code —
+    // 503 `reservation-store-unavailable`, distinct from the deterministic
+    // 409 `unavailable` a losing grant receives.
     return new ProblemException(
-      'unavailable',
+      'reservation-store-unavailable',
       503,
       'Reservation store unavailable',
-      'The atomic-decision store (Valkey) is unreachable — the request fails closed rather than risk oversell.',
+      'The atomic-decision store (Valkey) is unreachable — the request fails closed rather than risk oversell. Nothing was written; retry once the store is healthy.',
     );
+  }
+
+  /**
+   * The A2 re-validation read (story 4.1): the grant ceiling recomputed with
+   * the scope's `stock_on_hand` rows locked `FOR UPDATE` inside the journal
+   * tx. Every stock-mutation command (the ledger's per-warehouse advisory
+   * lock) must UPDATE these same rows to move stock, so a ceiling change
+   * committed after the grant's probe serializes behind this lock — the
+   * locked sum is stable for the journal decision.
+   */
+  private async revalidatedCeiling(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+  ): Promise<number> {
+    // The lock itself: one statement over the scope's rows (both the storage
+    // bins' rows and the QC-hold bin's rows are stock_on_hand rows of the
+    // scope — the ceiling's only contributors).
+    await tx
+      .select({ binId: stockOnHand.binId })
+      .from(stockOnHand)
+      .where(
+        and(
+          eq(stockOnHand.tenantId, tenantId),
+          eq(stockOnHand.warehouseId, warehouseId),
+          eq(stockOnHand.skuId, skuId),
+        ),
+      )
+      .for('update');
+    return this.committedCeiling(tx, tenantId, warehouseId, skuId);
+  }
+
+  /**
+   * The live journal rows for a set of reservation ids (story 4.1): the
+   * outbound module's per-line reservation-state read, through this facade's
+   * sibling seam (AD-6 — the `reservations` table stays inventory-owned).
+   */
+  async reservationsByIds(
+    tenantId: string,
+    ids: readonly string[],
+  ): Promise<ReservationSnapshot[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.reservationsByIdsInTx(tx, tenantId, ids),
+    );
+  }
+
+  /**
+   * The same read inside the CALLER's transaction (story 4.1): a sibling
+   * command that composes the reservation-state read with its own writes in
+   * one tenant transaction (the order snapshot) goes through this in-tx
+   * passthrough — the same shape `appendLedgerEventInTx` established for the
+   * ledger. `withTenantTransaction` opens the facade's own when the caller
+   * has none (`reservationsByIds`).
+   */
+  async reservationsByIdsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    ids: readonly string[],
+  ): Promise<ReservationSnapshot[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+    return tx
+      .select()
+      .from(reservations)
+      .where(and(eq(reservations.tenantId, tenantId), inArray(reservations.id, [...ids])))
+      .orderBy(asc(reservations.id));
   }
 }
