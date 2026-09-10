@@ -7,6 +7,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { ValkeyClient } from '../src/shared/valkey/valkey.client';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
+import { ORDER_LINE_STATUSES, ORDER_SOURCES, ORDER_STATUSES } from '../src/modules/outbound/order.command';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -37,6 +38,7 @@ const SKU_CODES = [
   'ORD-RLS',
   'ORD-ADJ',
   'ORD-TIME',
+  'ORD-ABORT',
 ] as const;
 
 describe('orders: manual entry, idempotent ingestion, acceptance reservation, cancel (e2e, story 4.1)', () => {
@@ -402,6 +404,27 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     await postOrder(opsToken, createBody([])).expect(400);
     await postOrder(opsToken, createBody([{ skuId, quantity: 0 }])).expect(400);
     await postOrder(opsToken, createBody([{ skuId: 'not-a-uuid', quantity: 1 }])).expect(400);
+    // Channel refs are required-together AND ingested-only: a manual order
+    // carrying either arm is an input error (the command owns the rule).
+    await postOrder(
+      opsToken,
+      createBody([{ skuId, quantity: 1 }], { integrationId: uuidv7() }),
+    ).expect(400);
+    await postOrder(
+      opsToken,
+      createBody([{ skuId, quantity: 1 }], { externalEventId: 'evt-1' }),
+    ).expect(400);
+    // The review-patch arms: a non-uuid integrationId and a quantity above
+    // the int4 column bound are rejected at the boundary (never a driver 500).
+    await postOrder(
+      opsToken,
+      createBody([{ skuId, quantity: 1 }], {
+        source: 'ingested',
+        integrationId: 'not-a-uuid',
+        externalEventId: 'evt-1',
+      }),
+    ).expect(400);
+    await postOrder(opsToken, createBody([{ skuId, quantity: 2_147_483_648 }])).expect(400);
     // Nothing reached the journal for the probe SKUs beyond the fixtures.
     expect((await orderHolds(skuId)).length).toBeLessThanOrEqual(2); // the earlier tests' holds
   });
@@ -551,7 +574,21 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       .expect(200);
     const order = cancelled.body.order as { status: string; lines: Record<string, unknown>[] };
     expect(order.status).toBe('cancelled');
-    expect(order.lines[0]).toMatchObject({ reservationState: 'released' });
+    // The line stops claiming stock in the same commit as the flip: the hold
+    // pointer and the reserved qty are both cleared, so no read can report a
+    // hold this order no longer owns (the journal keeps the trail via
+    // `owner_id`). The release itself runs after the flip commits.
+    expect(order.lines[0]).toMatchObject({
+      reservedQty: 0,
+      reservationId: null,
+      reservationState: null,
+    });
+    const cancelledLines = await sql`
+      select reserved_qty, reservation_id from order_lines
+      where tenant_id = ${tenantId} and order_id = ${orderId}
+    `;
+    expect(Number((cancelledLines[0] as unknown as { reserved_qty: number }).reserved_qty)).toBe(0);
+    expect((cancelledLines[0] as unknown as { reservation_id: string | null }).reservation_id).toBeNull();
     // ATP restored; the journal row is terminal-released, never deleted.
     expect(await atp(skuId)).toMatchObject({ onHand: 3, reserved: 0, atp: 3 });
     expect((await orderHolds(skuId)).map((hold) => hold.state)).toEqual(['released']);
@@ -576,6 +613,37 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     `;
     expect(outbox).toHaveLength(1); // one flip → one event, the no-op wrote none
     expect(await orderRow(orderId)).toMatchObject({ status: 'cancelled' });
+  });
+
+  it('concurrent cancels: two racing cancels both settle 200 and the flip emits exactly one order.cancelled event', async () => {
+    // The flip loser (its conditional UPDATE matches no row) sees the
+    // winner's settled state and takes the idempotent no-op arm — two racing
+    // cancels must never double-emit or double-release.
+    const skuId = skuIds.get('ORD-CANCEL')!;
+    await seedStock(skuId, 2);
+    const created = await postOrder(opsToken, createBody([{ skuId, quantity: 1 }])).expect(201);
+    const orderId = (created.body.order as { id: string }).id;
+    const cancelsBefore = await sql`
+      select count(*)::int as n from outbox_messages
+      where tenant_id = ${tenantId} and type = 'order.cancelled'
+    `;
+    const baseline = Number((cancelsBefore[0] as unknown as { n: number }).n);
+    const cancel = (key: string) =>
+      request(app.getHttpServer())
+        .post(`${API}/${tenantId}/outbound/orders/${orderId}/cancel`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, key)
+        .send({});
+    const [a, b] = await Promise.all([cancel(ulid()), cancel(ulid())]);
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    expect(await orderRow(orderId)).toMatchObject({ status: 'cancelled' });
+    expect((await orderHolds(skuId)).every((hold) => hold.state === 'released')).toBe(true);
+    const cancelsAfter = await sql`
+      select count(*)::int as n from outbox_messages
+      where tenant_id = ${tenantId} and type = 'order.cancelled'
+    `;
+    expect(Number((cancelsAfter[0] as unknown as { n: number }).n)).toBe(baseline + 1);
   });
 
   it('cancel refuses an order whose hold a consuming flow already claimed (409 conflict)', async () => {
@@ -622,6 +690,48 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
   });
 
   // ── fail-closed + race arms ──────────────────────────────────────────────
+
+  it('mid-order grant abort: an earlier line\'s hold is RELEASED, not orphaned', async () => {
+    // The store-down arm above is single-line, so its `granted` list is empty
+    // when the abort path runs — deleting the release entirely left it green.
+    // This arm fails the SECOND line's grant with the first already held, so
+    // the compensating release is the only thing that can restore ATP.
+    const first = skuIds.get('ORD-ABORT')!;
+    const second = skuIds.get('ORD-OK')!;
+    await seedStock(first, 6);
+    const atpBefore = await atp(first);
+    const holdsBefore = (await orderHolds(first)).length;
+
+    const valkeyClient = app.get(ValkeyClient);
+    const real = ValkeyClient.prototype.grantReservation;
+    let calls = 0;
+    jest.spyOn(valkeyClient, 'grantReservation').mockImplementation(async (...args) => {
+      calls += 1;
+      if (calls === 1) {
+        return real.apply(valkeyClient, args as Parameters<ValkeyClient['grantReservation']>);
+      }
+      throw new Error('connection refused');
+    });
+    try {
+      const res = await postOrder(
+        opsToken,
+        createBody([
+          { skuId: first, quantity: 2 },
+          { skuId: second, quantity: 1 },
+        ]),
+      ).expect(503);
+      expect(res.body.code).toBe('reservation-store-unavailable');
+    } finally {
+      jest.restoreAllMocks();
+    }
+
+    // The first line's hold was granted and must be gone again: no NEW held
+    // row, and ATP back where it started (the orphan-hold regression).
+    const after = await orderHolds(first);
+    expect(holdsBefore).toBe(0); // a fresh SKU: every hold below is this arm's
+    expect(after.filter((row) => row.state === 'held')).toEqual([]);
+    expect((await atp(first)).atp).toBe(atpBefore.atp);
+  });
 
   it('store-down acceptance: 503 reservation-store-unavailable and NOTHING written', async () => {
     const skuId = skuIds.get('ORD-DOWN')!;
@@ -764,6 +874,13 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       .get(`${API}/${tenantId}/warehouses/${warehouseId}/outbound/orders?cursor=bogus`)
       .set('Authorization', `Bearer ${opsToken}`)
       .expect(400);
+    // An unknown warehouse is a 404 (the facade asserts existence — never a
+    // silently empty page).
+    const unknownWh = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/warehouses/${uuidv7()}/outbound/orders`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(404);
+    expect((unknownWh.body as { code: string }).code).toBe('not-found');
   });
 
   // ── persistence guards ───────────────────────────────────────────────────
@@ -799,6 +916,28 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
         values (${uuidv7()}, ${tenantId}, ${orderId}, ${skuId}, 1, 2, 'open')
       `,
     ).rejects.toMatchObject({ code: '23514' });
+  });
+
+  it('TS/CHECK parity: the 0017 CHECK arm sets equal the command-layer state-machine constants (the drift guard)', async () => {
+    // The CHECKs are the additive backstop to the TypeScript constants; if
+    // they drift apart, a valid arm would be rejected by the DB (or an
+    // invalid one accepted past a stale TS set). The parity guard reads the
+    // live constraint definitions and pins them to the constants.
+    const defs = await sql`
+      select conname, pg_get_constraintdef(oid) as def from pg_constraint
+      where conname in ('orders_status_check', 'orders_source_check', 'order_lines_status_check')
+    `;
+    const armsOf = (conname: string): string[] => {
+      const row = defs.find((item) => (item as unknown as { conname: string }).conname === conname);
+      expect(row).toBeDefined();
+      const def = (row as unknown as { def: string }).def;
+      const arms = [...def.matchAll(/'([a-z]+)'/g)].map((match) => match[1]!);
+      expect(arms.length).toBeGreaterThan(0); // every arm is a quoted literal
+      return arms.sort();
+    };
+    expect(armsOf('orders_status_check')).toEqual([...ORDER_STATUSES].sort());
+    expect(armsOf('orders_source_check')).toEqual([...ORDER_SOURCES].sort());
+    expect(armsOf('order_lines_status_check')).toEqual([...ORDER_LINE_STATUSES].sort());
   });
 
   it('RLS: orders and order_lines are invisible to another tenant even for a same-session probe', async () => {
@@ -837,11 +976,23 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       })
       .expect(404); // the foreign tenant has no such SKU — nothing written
 
-    // Seed one real foreign order directly (RLS probe needs rows on both sides).
+    // Seed one real foreign order AND one foreign line (the RLS probe needs
+    // rows on both sides of BOTH tables — counting order_lines while none
+    // exists returns 0 with RLS on or off, which proves nothing).
+    const foreignOrderId = uuidv7();
     await sql`
       insert into orders (id, tenant_id, warehouse_id, status, source)
-      values (${uuidv7()}, ${foreignTenantId}, ${warehouseId}, 'accepted', 'manual')
+      values (${foreignOrderId}, ${foreignTenantId}, ${warehouseId}, 'accepted', 'manual')
     `;
+    await sql`
+      insert into order_lines (id, tenant_id, order_id, sku_id, qty, reserved_qty, status)
+      values (${uuidv7()}, ${foreignTenantId}, ${foreignOrderId}, ${uuidv7()}, 2, 0, 'open')
+    `;
+    // The probe below is only meaningful because both foreign rows exist.
+    const foreignSeeded = await sql`
+      select count(*)::int as n from order_lines where tenant_id = ${foreignTenantId}
+    `;
+    expect(Number((foreignSeeded[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
     const url = new URL(process.env.DATABASE_URL!);
     url.username = 'wms_rls_probe';
     url.password = 'wms_rls_probe';
@@ -859,14 +1010,36 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
         `select count(*)::int as n from orders where tenant_id = '${tenantId}'::uuid`,
       );
       expect(Number((own[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
+
+      // The write side fails closed too (the WITH CHECK arm): an INSERT
+      // naming a foreign tenant under the session's own scope is a 42501.
+      await expect(
+        rls.unsafe(
+          `insert into orders (id, tenant_id, warehouse_id, status, source)
+           values ('${uuidv7()}'::uuid, '${foreignTenantId}'::uuid, '${warehouseId}'::uuid, 'accepted', 'manual')`,
+        ),
+      ).rejects.toMatchObject({ code: '42501' });
+      // …while the allowed arm (own tenant_id) inserts cleanly.
+      await rls.unsafe(
+        `insert into orders (id, tenant_id, warehouse_id, status, source)
+         values ('${uuidv7()}'::uuid, '${tenantId}'::uuid, '${warehouseId}'::uuid, 'accepted', 'manual')`,
+      );
     } finally {
       await rls.end();
     }
-    // Cross-tenant reads through the app are 404 (the not-found contract).
+    // A session reaching into ANOTHER tenant's path is refused by the tenancy
+    // guard (403) before any read runs — the token's tenant does not own the
+    // path, which is a different contract from the 404 an unknown id inside
+    // the session's OWN tenant returns.
     await request(app.getHttpServer())
       .get(`${API}/${foreignTenantId}/outbound/orders/${uuidv7()}`)
       .set('Authorization', `Bearer ${opsToken}`)
       .expect(403);
+    // The not-found contract, for contrast: own tenant, unknown order id.
+    await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/outbound/orders/${uuidv7()}`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(404);
   });
 
 
