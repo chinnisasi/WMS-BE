@@ -44,9 +44,6 @@ export interface ListQcHoldsQuery {
 
 export const DEFAULT_QC_PAGE_SIZE = 50;
 
-/** The page-size ceiling — a `limit` above it is clamped to it, never honored verbatim. */
-export const QC_MAX_PAGE_SIZE = 200;
-
 /**
  * The cursor is opaque to clients but crafted input is still possible — a
  * base64-valid payload with a non-uuid `id` would otherwise reach the
@@ -106,7 +103,7 @@ export class QcFacade {
    * mutations are; the surface hides the buttons behind `qc.manage`).
    */
   async listQcHolds(tenantId: string, query: ListQcHoldsQuery = {}): Promise<Page<QcHoldEntry>> {
-    const pageSize = Math.min(query.limit ?? DEFAULT_QC_PAGE_SIZE, QC_MAX_PAGE_SIZE);
+    const pageSize = query.limit ?? DEFAULT_QC_PAGE_SIZE;
     const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       if (query.warehouseId !== undefined) {

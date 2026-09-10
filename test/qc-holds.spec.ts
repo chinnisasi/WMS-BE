@@ -704,7 +704,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
     expect(bad.body.code).toBe('invalid-cursor');
   });
 
-  it('holds list: the warehouseId filter returns only that warehouse\'s rows, a foreign warehouseId is 404; pages walk without repeats; an oversized limit is clamped', async () => {
+  it('holds list: the warehouseId filter returns only that warehouse\'s rows, a foreign warehouseId is 404; pages walk without repeats', async () => {
     // A second warehouse with its own held scope — the filter's contrast.
     const wh2 = (
       await request(app.getHttpServer())
@@ -779,11 +779,6 @@ describe('QC hold and release (e2e, story 3.4)', () => {
     } while (cursor !== null);
     expect(new Set(seen).size).toBe(seen.length);
     expect(seen.length).toBe(all.items.length);
-
-    // A limit above the documented ceiling is clamped to it, not honored.
-    const clamped = await pageOf('?limit=500');
-    expect(clamped.items.length).toBeLessThanOrEqual(200);
-    expect(clamped.items.length).toBe(all.items.length);
   });
 
   it('RLS: a non-superuser session scoped to one tenant sees no qc_holds rows of another tenant and cannot write foreign rows', async () => {

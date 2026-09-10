@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsIn, IsInt, IsOptional, IsString, IsUUID, Length, Min } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, IsUUID, Length, Max, Min } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 // ── qc-holds.place input ─────────────────────────────────────────────────────
@@ -89,16 +89,12 @@ export class QcHoldListQuery {
   @IsString()
   cursor?: string;
 
-  @ApiProperty({
-    required: false,
-    example: 50,
-    minimum: 1,
-    description: 'Page size (values above the 200 ceiling are clamped to it)',
-  })
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
+  @Max(200)
   limit?: number;
 }
 
