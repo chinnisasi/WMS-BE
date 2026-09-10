@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { InventoryModule } from '../inventory/inventory.module';
+import { BinStateCommand } from './bin-state.command';
 import { PutawayCommand } from './putaway.command';
 import { PutawayFacade } from './putaway.facade';
 
@@ -18,12 +19,15 @@ import { PutawayFacade } from './putaway.facade';
  * facade exports the in-transaction ledger passthroughs; it imports nothing
  * back, so no cycles). The task derivation reads the GRN lines and the
  * Receiving-bin projections read-only — every mutation runs through the
- * command's own invariant order. Bin operational state (`bins.blocked`) is
- * consumed, not owned here (re-homing lives with Story 3.6).
+ * command's own invariant order.
+ *
+ * Story 3.6: bin operational state is OWNED here — the `blocked` toggle
+ * re-homes from the tenancy module into `BinStateCommand` (the tenancy
+ * controller keeps the URL and delegates; the FE contract is unchanged).
  */
 @Module({
   imports: [SharedModule, InventoryModule],
-  providers: [PutawayCommand, PutawayFacade],
-  exports: [PutawayFacade],
+  providers: [BinStateCommand, PutawayCommand, PutawayFacade],
+  exports: [PutawayFacade, BinStateCommand],
 })
 export class PutawayModule {}

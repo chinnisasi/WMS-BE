@@ -345,7 +345,7 @@ export class StockAdjustmentCommand {
     command: AdjustStockCommand,
   ): Promise<{ id: string; code: string }> {
     const rows = await tx
-      .select({ id: bins.id, code: bins.code, systemOwned: bins.systemOwned })
+      .select({ id: bins.id, code: bins.code, systemOwned: bins.systemOwned, retiredAt: bins.retiredAt })
       .from(bins)
       .where(
         and(
@@ -362,6 +362,17 @@ export class StockAdjustmentCommand {
         404,
         'Bin not found',
         'No bin with this id exists in this warehouse.',
+      );
+    }
+    // Story 3.6: a retired bin is operationally gone — excluded from the
+    // adjustments' target choice. Referenced as a movement target it always
+    // refuses (and a retired bin has no on-hand to draw from anyway).
+    if (bin.retiredAt !== null) {
+      throw new ProblemException(
+        'bin-retired',
+        400,
+        'Bin is retired',
+        `Bin "${bin.code}" is retired — stock adjustments cannot target it; retirement is terminal.`,
       );
     }
     // The system QC-hold bin is hold/release-owned (story 3.4): an adjustment

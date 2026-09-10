@@ -42,6 +42,11 @@ export type BinRow = {
   capacity: number;
   type: string;
   blocked: boolean;
+  /** Story 3.6 — the retirement pair (null while the bin is live). */
+  retiredAt: string | null;
+  retiredBy: string | null;
+  /** The Receiving/QC-hold system bins (never blockable/mergeable/retirable). */
+  systemOwned: boolean;
   createdAt: string;
 };
 
@@ -299,6 +304,12 @@ export class TenancyService {
           capacity: bins.capacity,
           type: bins.type,
           blocked: bins.blocked,
+          // Story 3.6: retired bins STAY listed (the zone bin list is the
+          // master-data view — the FE flags them with `retiredAt`; the
+          // device snapshot is the surface that excludes them).
+          retiredAt: bins.retiredAt,
+          retiredBy: bins.retiredBy,
+          systemOwned: bins.systemOwned,
           createdAt: bins.createdAt,
         })
         .from(bins)

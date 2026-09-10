@@ -41,6 +41,11 @@ export const CAPABILITIES = [
   // place the stock they received); Accountant stays read-only. Mirrored into
   // wms-fe `src/lib/users.ts`.
   'putaway.execute',
+  // Story 3.6 — bin administration's stock-touching mutations (merge a
+  // source bin into a target, retire an empty bin). Owner + Ops Manager only
+  // (Accountant/Operator none) — a merge moves stock, a retire is terminal.
+  // Mirrored into wms-fe `src/lib/users.ts`.
+  'bin.retire',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -70,6 +75,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'review.decide',
     'qc.manage',
     'putaway.execute',
+    'bin.retire',
   ]),
   operator: new Set<Capability>(['putaway.execute']),
   accountant: new Set<Capability>([]),

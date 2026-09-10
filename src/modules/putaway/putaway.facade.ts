@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -329,7 +329,11 @@ export class PutawayFacade {
   /**
    * The warehouse's bins for the snapshot (blocked/system bins INCLUDED —
    * the device needs them to reject a scan against them, verifying
-   * pre-queue; the server re-gates at replay either way).
+   * pre-queue; the server re-gates at replay either way). Story 3.6:
+   * retired bins are EXCLUDED — a retired bin is operationally gone and the
+   * device never targets it; the sealed snapshot shape is unchanged (the
+   * staleness model covers a lingering merged/retired row in a stale cache,
+   * the server re-gate rejects it).
    */
   async getBinSummaries(tenantId: string, warehouseId: string): Promise<readonly PutawayBinSummary[]> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
@@ -347,7 +351,13 @@ export class PutawayFacade {
         })
         .from(bins)
         .innerJoin(zones, eq(zones.id, bins.zoneId))
-        .where(and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId)))
+        .where(
+          and(
+            eq(bins.tenantId, tenantId),
+            eq(bins.warehouseId, warehouseId),
+            isNull(bins.retiredAt),
+          ),
+        )
         .orderBy(asc(bins.code));
       return rows;
     });

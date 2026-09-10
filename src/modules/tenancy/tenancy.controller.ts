@@ -31,11 +31,18 @@ import {
   ZoneCommand,
   TenancyService,
 } from './commands';
+// Story 3.6: the `blocked` toggle's LOGIC re-homed to the putaway module
+// (putaway owns bin operational state) — the URL and FE contract stay here.
+// Value import: Nest DI needs the runtime class token for constructor
+// metadata (same bend as the barrel above).
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { BinStateCommand } from '../putaway/bin-state.command';
 import {
   CreateBinDto,
   CreateWarehouseDto,
   CreateZoneDto,
   GenerateBinsDto,
+  MergeBinDto,
   PatchBinDto,
   RegisterTenantDto,
   SignInDto,
@@ -45,6 +52,7 @@ import {
   WarehouseResponse,
   BinGridResponse,
   BinListResponse,
+  BinMergeResponse,
   BinResponse,
   SetupChecklistResponse,
   ZoneListResponse,
@@ -90,6 +98,7 @@ export class TenancyController {
     private readonly warehouseCommand: WarehouseCommand,
     private readonly zoneCommand: ZoneCommand,
     private readonly binCommand: BinCommand,
+    private readonly binStateCommand: BinStateCommand,
     private readonly tenancyService: TenancyService,
   ) {}
 
@@ -358,14 +367,17 @@ export class TenancyController {
   @HttpCode(HttpStatus.OK)
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Blocks or unblocks a bin (the only bin edit in this story)' })
+  @ApiOperation({
+    summary: 'Blocks or unblocks a bin (Story 3.6: never a system or retired bin)',
+  })
   @ApiBody({ type: PatchBinDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: BinResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, or a system bin (validation-failed names the bin)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Bin does not exist in this warehouse (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The bin is retired (bin-retired — retirement is terminal)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'warehouseId', format: 'uuid' })
@@ -380,11 +392,95 @@ export class TenancyController {
   ): Promise<BinResponse> {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
-    const snapshot = await this.binCommand.setBlocked(
+    // Story 3.6: delegated to the re-homed command — the putaway module owns
+    // bin operational state; the URL and the response body are unchanged.
+    const snapshot = await this.binStateCommand.setBlocked(
       { tenantId, actorUserId: session.userId, warehouseId, binId, blocked: dto.blocked },
       key,
     );
-    return snapshot.bin;
+    return normalizeBin(snapshot.bin);
+  }
+
+  @Post(':tenantId/warehouses/:warehouseId/bins/:binId/merge')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Merges this bin into the target bin (all on-hand moves through real ledger movements; the source retires in the same commit)',
+  })
+  @ApiBody({ type: MergeBinDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: BinMergeResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a structural guard (validation-failed / bin-retired / bin-blocked — a blocked SOURCE is allowed, the only way to empty a blocked bin; only the target must be live), or a target overflow (bin-full names capacity and occupancy — nothing committed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.retire (role-denied — Owner and Ops Manager only)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Source or target bin does not exist in this warehouse (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A source/target bin has an open QC hold (bin-merge-hold-open names the bin and the hold)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  @ApiParam({ name: 'binId', format: 'uuid', description: 'The SOURCE bin' })
+  async mergeBin(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('binId') binId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: MergeBinDto,
+  ): Promise<BinMergeResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.binCommand.mergeBin(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        warehouseId,
+        sourceBinId: binId,
+        targetBinId: dto.targetBinId,
+      },
+      key,
+    );
+    return {
+      source: normalizeBin(snapshot.source),
+      target: normalizeBin(snapshot.target),
+      moved: snapshot.moved,
+    };
+  }
+
+  @Post(':tenantId/warehouses/:warehouseId/bins/:binId/retire')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Retires this bin — one-way, only an EMPTY bin can retire (the row stays; the code stays reserved)',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: BinResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a system bin (validation-failed), or the bin still holds stock (bin-not-empty names the (sku, batch, qty) rows)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.retire (role-denied — Owner and Ops Manager)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Bin does not exist in this warehouse (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The bin is already retired (bin-retired — retirement is terminal)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  @ApiParam({ name: 'binId', format: 'uuid' })
+  async retireBin(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('binId') binId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<BinResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.binCommand.retireBin(
+      { tenantId, actorUserId: session.userId, warehouseId, binId },
+      key,
+    );
+    return normalizeBin(snapshot.bin);
   }
 
   @Get(':tenantId/setup-checklist')
@@ -405,6 +501,24 @@ export class TenancyController {
     const checklist = await this.tenancyService.computeSetupChecklist(tenantId);
     return { steps: [...checklist.steps] };
   }
+}
+
+/**
+ * The bin response normalizer: stored pre-3.6 idempotency snapshots lack the
+ * new nullable pair — an absent field reads as null (additive-nullable
+ * contract; every fresh write stores the full shape).
+ */
+function normalizeBin(bin: {
+  systemOwned?: boolean;
+  retiredAt?: string | null;
+  retiredBy?: string | null;
+}): BinResponse {
+  return {
+    ...bin,
+    systemOwned: bin.systemOwned ?? false,
+    retiredAt: bin.retiredAt ?? null,
+    retiredBy: bin.retiredBy ?? null,
+  } as BinResponse;
 }
 
 function assertOwnTenant(session: TenantSession, tenantId: string): void {

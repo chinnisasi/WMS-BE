@@ -743,6 +743,44 @@ export class InventoryFacade {
       quantity: Math.abs(row.quantityDelta),
     }));
   }
+
+  /**
+   * The serials of ONE SKU currently located in ONE bin (Story 3.6, the
+   * bin-merge's enumeration): the ledger-derived latest event per serial —
+   * an intake (or relocation) whose `to_bin_id` is the queried bin means the
+   * serial is there. Tenant-wide truth (a serial's location can cross
+   * warehouses), read-only over `ledger_events` — AD-6: the ledger is the
+   * only source of serial location; there is no serial projection to query.
+   * The caller's in-transaction passthrough shape (`qcHeldArmsInTx`
+   * precedent); each row carries the serial identity and the batch ref its
+   * latest movement carried (a batch+serial merge event carries it onward).
+   */
+  async serialsLocatedInBinInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuId: string,
+    binId: string,
+  ): Promise<SerialLocationEntry[]> {
+    const rows = await tx
+      .select({
+        serialRef: sql<string>`latest.serial_ref`,
+        batchRef: sql<string | null>`latest.batch_ref`,
+      })
+      .from(
+        sql`(
+          select serial_ref, batch_ref, to_bin_id,
+                 row_number() over (partition by serial_ref order by seq desc) as rn
+          from ledger_events
+          where tenant_id = ${tenantId} and sku_id = ${skuId} and serial_ref is not null
+        ) as latest`,
+      )
+      .where(sql`latest.rn = 1 and latest.to_bin_id = ${binId}`)
+      .orderBy(sql`latest.serial_ref`);
+    return rows.map((row) => ({
+      serialRef: row.serialRef,
+      batchRef: row.batchRef,
+    }));
+  }
 }
 
 interface QcScopeBatch {
@@ -768,4 +806,14 @@ export interface QcHeldArm {
   readonly batchRef: string | null;
   /** The held magnitude (positive) — exactly what release must return. */
   readonly quantity: number;
+}
+
+/**
+ * One serial of a SKU currently located in a bin (Story 3.6's merge
+ * enumeration): the serial identity plus the batch ref its latest ledger
+ * movement carried (null on a non-batch-tracked SKU).
+ */
+export interface SerialLocationEntry {
+  readonly serialRef: string;
+  readonly batchRef: string | null;
 }

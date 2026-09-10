@@ -1,6 +1,8 @@
 import { forwardRef, Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { CatalogModule } from '../catalog/catalog.module';
+import { InventoryModule } from '../inventory/inventory.module';
+import { PutawayModule } from '../putaway/putaway.module';
 import { BinCommand } from './bin.command';
 import { DeviceSessionGuard } from './device-session.guard';
 import { EnrollmentCommand } from './enrollment.command';
@@ -26,12 +28,17 @@ import { ZoneCommand } from './zone.command';
  * exported facade is the command layer other stories consume (AD-10):
  * `TenancyService.requireActiveWarehouse` is the zero-warehouse invariant
  * guard for stock-record creation (Epic 2).
+ *
+ * Story 3.6 composition (one-way, no back-edges): the bin administration
+ * commands consume the re-homed `BinStateCommand` (putaway owns bin
+ * operational state) and the `InventoryFacade` (the ledger passthrough for
+ * the merge movements) — both one-way imports.
  */
 @Module({
   // forwardRef: catalog commands resolve the caller's role through the
   // TenancyService facade (Story 1.5), while this module consumes the
   // CatalogFacade for the checklist — the only two-way spine dependency.
-  imports: [SharedModule, forwardRef(() => CatalogModule)],
+  imports: [SharedModule, forwardRef(() => CatalogModule), PutawayModule, InventoryModule],
   controllers: [TenancyController, UsersController],
   providers: [
     RegistrationCommand,

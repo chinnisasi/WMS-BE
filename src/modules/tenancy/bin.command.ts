@@ -1,9 +1,19 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { bins, idempotencyKeys, zones } from '../../shared/db/schema';
+import {
+  auditEvents,
+  batches,
+  batchOnHand,
+  bins,
+  idempotencyKeys,
+  skus,
+  stockOnHand,
+  zones,
+} from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
+import { signedQuantity } from '../../shared/primitives/quantity';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from './idempotency-guard';
@@ -13,6 +23,17 @@ import { assertWarehouseInTenant, getMemberRoleIn } from './tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
+import { InventoryFacade } from '../inventory/inventory.facade';
+import type { SerialLocationEntry } from '../inventory/inventory.facade';
+import { openQcHoldsForBinsInTx } from '../inbound/qc.command';
+import {
+  binBlocked,
+  binFull,
+  binOccupancyInTx,
+  binRetiredAsSource,
+  binRetiredAsTarget,
+} from '../putaway/putaway.command';
+import { IDEMPOTENCY_TENANT_KEY, binHoldOpen, binNotFound, binRetired409 } from './bin.errors';
 
 export interface CreateBinCommand {
   readonly tenantId: string;
@@ -39,12 +60,23 @@ export interface GenerateBinsCommand {
   readonly type: string;
 }
 
-export interface SetBinBlockedCommand {
+export interface MergeBinCommand {
   readonly tenantId: string;
+  /** The session user — authority is re-read from the DB at command entry. */
+  readonly actorUserId: string;
+  readonly warehouseId: string;
+  /** The bin whose on-hand moves (and which retires in the same commit). */
+  readonly sourceBinId: string;
+  /** The bin the stock consolidates into — same warehouse, not retired/blocked. */
+  readonly targetBinId: string;
+}
+
+export interface RetireBinCommand {
+  readonly tenantId: string;
+  /** The session user — authority is re-read from the DB at command entry. */
   readonly actorUserId: string;
   readonly warehouseId: string;
   readonly binId: string;
-  readonly blocked: boolean;
 }
 
 /** The API response body for a bin (the idempotency snapshot). */
@@ -58,7 +90,24 @@ export interface BinSnapshot {
     readonly capacity: number;
     readonly type: string;
     readonly blocked: boolean;
+    /** The Receiving/QC-hold system bins (never blockable/mergeable/retirable). */
+    readonly systemOwned: boolean;
+    /** Story 3.6 — the retirement pair (null while the bin is live). */
+    readonly retiredAt: string | null;
+    readonly retiredBy: string | null;
     readonly createdAt: string;
+  };
+}
+
+/** The merge response body (the idempotency snapshot): both bins + the moved summary. */
+export interface BinMergeSnapshot {
+  readonly source: BinSnapshot['bin'];
+  readonly target: BinSnapshot['bin'];
+  readonly moved: {
+    /** Distinct SKUs whose arms moved. */
+    readonly skus: number;
+    /** Total base-UoM units moved. */
+    readonly units: number;
   };
 }
 
@@ -75,7 +124,6 @@ export interface BinGridSnapshot {
 export const MAX_BINS_PER_GRID_RUN = 500;
 
 const BINS_WAREHOUSE_CODE = 'bins_warehouse_id_code_unique';
-const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 /** `A-01-01` — aisle letter, zero-padded bay, zero-padded level. */
 function gridCode(aisle: string, bay: number, level: number): string {
@@ -113,19 +161,28 @@ function buildGridCodes(aisleFrom: string, aisleTo: string, bays: number, levels
 }
 
 /**
- * Bin commands (Story 1.3): manual create, the ≤500-bin grid generator, and
- * the `blocked` toggle. Every write asserts the parent warehouse belongs to
- * the tenant inside the transaction (404 `not-found`) and the parent zone
- * belongs to that warehouse (also 404 — foreign zones never leak). Bin codes
- * are unique per warehouse — the duplicate rejection names the conflicting
- * code. Idempotency de-dupe in the same transaction (AD-5); the grid
- * generator is one transaction + one idempotency record (all-or-nothing).
+ * Bin commands: manual create + the ≤500-bin grid generator (Story 1.3) and
+ * the Story 3.6 administration pair — `mergeBin` (per-arm `bin.merged` ledger
+ * movements + source retirement, ONE transaction) and `retireBin` (the
+ * one-way, empty-only state change). The `blocked` toggle re-homed to the
+ * putaway module in 3.6 (putaway owns bin OPERATIONAL state; the controller
+ * URL and FE contract are unchanged). Every write asserts the parent
+ * warehouse belongs to the tenant inside the transaction (404 `not-found`)
+ * and the parent zone belongs to that warehouse (also 404 — foreign zones
+ * never leak). Bin codes are unique per warehouse — the duplicate rejection
+ * names the conflicting code. Idempotency de-dupe in the same transaction
+ * (AD-5); the grid generator is one transaction + one idempotency record
+ * (all-or-nothing).
  */
 @Injectable()
 export class BinCommand {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
+    // The ledger passthrough (the 3.5 composition convention): a merge moves
+    // stock through REAL per-arm ledger movements inside its own transaction
+    // — this module never touches inventory tables directly (AD-6).
+    @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
   ) {}
 
   async createBin(command: CreateBinCommand, idempotencyKey: string): Promise<BinSnapshot> {
@@ -351,12 +408,34 @@ export class BinCommand {
     return snapshot;
   }
 
-  async setBlocked(command: SetBinBlockedCommand, idempotencyKey: string): Promise<BinSnapshot> {
+  /**
+   * Story 3.6 — merge a source bin into a target bin: EVERY on-hand arm of
+   * the source moves through REAL per-arm ledger `bin.merged` movements (the
+   * putaway relocation convention: one two-arm event per (sku, batch) arm,
+   * one two-arm event per serial unit for serial-tracked stock), and the
+   * source auto-retires in the SAME commit (a merged bin is empty by
+   * construction; retiring it reserves the code and ends its life — the
+   * spec's "merge is retire-with-stock"). All-or-nothing: a target overflow
+   * (`400 bin-full`) writes nothing.
+   *
+   * Guards (the matrix order): capability `bin.retire` (Owner + Ops Manager),
+   * idempotency replay, warehouse assertion (404), BOTH bin rows locked
+   * `.for('update')` id-sorted BEFORE any arm is read (serializes against
+   * concurrent placements — the same row-lock the placement takes on its
+   * target), same-bin / system-bin / retired / blocked guards, the open
+   * QC-hold guard (`409 bin-merge-hold-open`, naming bin + hold), then the
+   * capacity gate. Merging FROM a blocked source is allowed by design — it is
+   * the only way to empty a blocked bin; only the TARGET must be live.
+   * Serial sets pre-lock sorted before the first append (the
+   * stock.adjustment deadlock rule); the lock order stays acyclic —
+   * bin rows → serial locks → the warehouse advisory lock inside the appends.
+   */
+  async mergeBin(command: MergeBinCommand, idempotencyKey: string): Promise<BinMergeSnapshot> {
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       warehouseId: command.warehouseId,
-      binId: command.binId,
-      blocked: command.blocked,
+      sourceBinId: command.sourceBinId,
+      targetBinId: command.targetBinId,
     });
 
     const { snapshot } = await withTenantTransaction(
@@ -366,7 +445,302 @@ export class BinCommand {
         // Authority at command-service entry (Story 1.5) — DB read, same tx.
         assertPermission(
           await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
-          'bin.block',
+          'bin.retire',
+        );
+
+        const existing = await tx
+          .select()
+          .from(idempotencyKeys)
+          .where(
+            and(
+              eq(idempotencyKeys.tenantId, command.tenantId),
+              eq(idempotencyKeys.key, idempotencyKey),
+            ),
+          )
+          .limit(1);
+        if (existing[0]) {
+          if (existing[0].payloadHash !== payloadHash) {
+            throw idempotencyKeyReuse();
+          }
+          return {
+            snapshot: existing[0].responseSnapshot as BinMergeSnapshot,
+            replayed: true,
+          };
+        }
+
+        await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
+
+        // ── both bin rows, locked id-sorted BEFORE the arms are read ───────
+        // `.for('update')` serializes merges against placements (which lock
+        // their target bin too) and against each other; the id sort fixes
+        // the two-row lock order (no deadlocks between concurrent merges).
+        // The warehouseId scope IS the cross-warehouse gate: a foreign-
+        // warehouse id simply never resolves here → 404.
+        const lockedBins = await tx
+          .select()
+          .from(bins)
+          .where(
+            and(
+              eq(bins.tenantId, command.tenantId),
+              eq(bins.warehouseId, command.warehouseId),
+              inArray(bins.id, [command.sourceBinId, command.targetBinId]),
+            ),
+          )
+          .orderBy(asc(bins.id))
+          .for('update');
+        const source = lockedBins.find((row) => row.id === command.sourceBinId);
+        const target = lockedBins.find((row) => row.id === command.targetBinId);
+        if (source === undefined || target === undefined) {
+          throw binNotFound();
+        }
+
+        // ── the structural guards ───────────────────────────────────────────
+        if (source.id === target.id) {
+          throw mergeValidation(
+            `Bin "${source.code}" cannot merge into itself — pick a different target bin.`,
+          );
+        }
+        if (source.systemOwned) {
+          throw mergeValidation(
+            `Bin "${source.code}" is a system bin (Receiving/QC-hold) — system bins never merge.`,
+          );
+        }
+        if (target.systemOwned) {
+          throw mergeValidation(
+            `Bin "${target.code}" is a system bin (Receiving/QC-hold) — system bins never merge.`,
+          );
+        }
+        if (source.retiredAt !== null) {
+          throw binRetiredAsSource(source.code);
+        }
+        if (target.retiredAt !== null) {
+          throw binRetiredAsTarget(target.code);
+        }
+        if (target.blocked) {
+          throw binBlocked(target.code);
+        }
+
+        // ── the open QC-hold guard (409, naming bin + hold) ─────────────────
+        const openHolds = await openQcHoldsForBinsInTx(tx, command.tenantId, command.warehouseId, [
+          source.id,
+          target.id,
+        ]);
+        if (openHolds.length > 0) {
+          const hold = openHolds[0]!;
+          const binCode = hold.binId === source.id ? source.code : target.code;
+          throw binHoldOpen(binCode, hold.holdId, 'merging');
+        }
+
+        // ── the source's arms (every non-zero on-hand piece) ────────────────
+        // Three arm shapes, exactly the projections the ledger folds: plain
+        // (sku) rows, batch rows (with their batch identity), and serial-
+        // tracked SKUs (the ledger is the only serial-location source — one
+        // two-arm event per serial unit).
+        const onHandRows = await tx
+          .select({
+            skuId: stockOnHand.skuId,
+            quantity: stockOnHand.quantity,
+            skuCode: skus.code,
+            batchTracked: skus.batchTracked,
+            serialTracked: skus.serialTracked,
+          })
+          .from(stockOnHand)
+          .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+          .where(
+            and(
+              eq(stockOnHand.tenantId, command.tenantId),
+              eq(stockOnHand.warehouseId, command.warehouseId),
+              eq(stockOnHand.binId, source.id),
+              gt(stockOnHand.quantity, 0),
+            ),
+          )
+          .orderBy(asc(stockOnHand.skuId));
+
+        interface MergeArm {
+          readonly skuId: string;
+          readonly batchRef: string | null;
+          readonly serialRef: string | null;
+          readonly qty: number;
+        }
+        const arms: MergeArm[] = [];
+        for (const row of onHandRows) {
+          if (row.serialTracked) {
+            // The ledger is the serial-location source (AD-6) — enumerate the
+            // units through the facade; the aggregate must equal the serial
+            // count or the projections and the ledger disagree (never merge
+            // over a disagreeing source).
+            const serialEntries: readonly SerialLocationEntry[] = await this.inventory
+              .serialsLocatedInBinInTx(tx, command.tenantId, row.skuId, source.id);
+            if (serialEntries.length !== row.quantity) {
+              throw mergeValidation(
+                `Bin "${source.code}" serial state disagrees with its on-hand projection for SKU "${row.skuCode}" (${serialEntries.length} serials vs ${row.quantity} units) — resolve before merging.`,
+              );
+            }
+            for (const entry of serialEntries) {
+              arms.push({
+                skuId: row.skuId,
+                batchRef: entry.batchRef,
+                serialRef: entry.serialRef,
+                qty: 1,
+              });
+            }
+          } else if (row.batchTracked) {
+            const batchRows = await tx
+              .select({ batchId: batchOnHand.batchId, quantity: batchOnHand.quantity })
+              .from(batchOnHand)
+              .where(
+                and(
+                  eq(batchOnHand.tenantId, command.tenantId),
+                  eq(batchOnHand.warehouseId, command.warehouseId),
+                  eq(batchOnHand.skuId, row.skuId),
+                  eq(batchOnHand.binId, source.id),
+                  gt(batchOnHand.quantity, 0),
+                ),
+              )
+              .orderBy(asc(batchOnHand.batchId));
+            for (const batchRow of batchRows) {
+              arms.push({
+                skuId: row.skuId,
+                batchRef: batchRow.batchId,
+                serialRef: null,
+                qty: batchRow.quantity,
+              });
+            }
+          } else {
+            arms.push({
+              skuId: row.skuId,
+              batchRef: null,
+              serialRef: null,
+              qty: row.quantity,
+            });
+          }
+        }
+
+        // The all-or-nothing capacity gate BEFORE any append: the whole merge
+        // must fit, or nothing moves.
+        const movedUnits = arms.reduce((sum, arm) => sum + arm.qty, 0);
+        const targetOccupancy = await binOccupancyInTx(
+          tx,
+          command.tenantId,
+          command.warehouseId,
+          target.id,
+        );
+        if (targetOccupancy + movedUnits > target.capacity) {
+          throw binFull(target.code, target.capacity, targetOccupancy);
+        }
+
+        // ── the movements (one `bin.merged` event per arm) ──────────────────
+        const mergeId = uuidv7();
+        const at = nowIso();
+        const referenceDoc = { kind: 'bin-merge' as const, mergeId };
+        // Serial sets pre-lock tenant-wide, sorted, BEFORE the first append
+        // (the stock.adjustment deadlock rule) — all arms' serials together.
+        const serialRefs = arms
+          .map((arm) => arm.serialRef)
+          .filter((ref): ref is string => ref !== null)
+          .sort();
+        if (serialRefs.length > 0) {
+          await this.inventory.lockSerialsInTx(tx, command.tenantId, serialRefs);
+        }
+        for (const arm of arms) {
+          await this.inventory.appendLedgerEventInTx(tx, {
+            tenantId: command.tenantId,
+            warehouseId: command.warehouseId,
+            type: 'bin.merged',
+            skuId: arm.skuId,
+            quantityDelta: signedQuantity(arm.qty),
+            fromBinId: source.id,
+            toBinId: target.id,
+            batchRef: arm.batchRef,
+            serialRef: arm.serialRef,
+            actorUserId: command.actorUserId,
+            occurredAt: at,
+            recordedAt: at,
+            referenceDoc,
+          });
+        }
+
+        // ── the source's retirement (the same commit) ───────────────────────
+        const retiredRows = await tx
+          .update(bins)
+          .set({ retiredAt: at, retiredBy: command.actorUserId, updatedAt: at })
+          .where(eq(bins.id, source.id))
+          .returning();
+        const sourceBin = binFromRow(retiredRows[0]!);
+        const targetBin = binFromRow(target);
+
+        const snapshot: BinMergeSnapshot = {
+          source: sourceBin,
+          target: targetBin,
+          moved: {
+            skus: new Set(arms.map((arm) => arm.skuId)).size,
+            units: movedUnits,
+          },
+        };
+
+        // ── in-transaction outbox append (AD-7) — one event per operation ───
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: 'bin.merged',
+          occurredAt: at,
+          payload: {
+            mergeId,
+            tenantId: command.tenantId,
+            warehouseId: command.warehouseId,
+            sourceBinId: source.id,
+            sourceBinCode: source.code,
+            targetBinId: target.id,
+            targetBinCode: target.code,
+            moved: snapshot.moved,
+            retiredAt: at,
+            retiredBy: command.actorUserId,
+          },
+        });
+
+        // The audit row — same transaction, after the outbox, before the
+        // idempotency key (the 3.4/3.5 invariant order).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'bin.merged',
+          targetType: 'bin',
+          targetId: source.id,
+          reference: idempotencyKey,
+          occurredAt: at,
+        });
+
+        await writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+        return { snapshot, replayed: false };
+      },
+    );
+
+    return snapshot;
+  }
+
+  /**
+   * Story 3.6 — retire a bin: a ONE-WAY, idempotency-keyed state change that
+   * only an EMPTY bin can take (`400 bin-not-empty` names the offending
+   * (sku, batch, qty) rows). Retirement keeps the row (no bin deletion; the
+   * `(warehouse_id, code)` unique key reserves the code forever) and is
+   * terminal — a re-retire under a different key is `409 bin-retired`.
+   */
+  async retireBin(command: RetireBinCommand, idempotencyKey: string): Promise<BinSnapshot> {
+    const payloadHash = hashCommandPayload({
+      tenantId: command.tenantId,
+      warehouseId: command.warehouseId,
+      binId: command.binId,
+    });
+
+    const { snapshot } = await withTenantTransaction(
+      this.db,
+      command.tenantId,
+      async (tx) => {
+        // Authority at command-service entry (Story 1.5) — DB read, same tx.
+        assertPermission(
+          await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+          'bin.retire',
         );
 
         const existing = await tx
@@ -391,63 +765,130 @@ export class BinCommand {
 
         await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
 
-        const rows = await tx
-          .update(bins)
-          .set({ blocked: command.blocked, updatedAt: nowIso() })
-          .where(and(eq(bins.id, command.binId), eq(bins.warehouseId, command.warehouseId)))
-          .returning();
-        const row = rows[0];
-        if (!row) {
+        const lockedRows = await tx
+          .select()
+          .from(bins)
+          .where(
+            and(
+              eq(bins.id, command.binId),
+              eq(bins.tenantId, command.tenantId),
+              eq(bins.warehouseId, command.warehouseId),
+            ),
+          )
+          .limit(1)
+          .for('update');
+        const row = lockedRows[0];
+        if (row === undefined) {
           throw binNotFound();
         }
-        const bin: BinSnapshot['bin'] = {
-          id: row.id,
-          tenantId: row.tenantId,
-          warehouseId: row.warehouseId,
-          zoneId: row.zoneId,
-          code: row.code,
-          capacity: row.capacity,
-          type: row.type,
-          blocked: row.blocked,
-          createdAt: row.createdAt,
-        };
+        if (row.systemOwned) {
+          throw mergeValidation(
+            `Bin "${row.code}" is a system bin (Receiving/QC-hold) — system bins never retire.`,
+          );
+        }
+        if (row.retiredAt !== null) {
+          throw binRetired409(row.code);
+        }
 
-        // In-transaction outbox append (AD-7, story outbox-relay) — replaces
-        // the old post-commit publish. The `!replayed` gate of the old
-        // post-commit publish is structural here: the idempotent replay
-        // returned above (and a concurrent duplicate's transaction rolls
-        // back whole), so a replayed toggle appends nothing.
+        // The open-QC-hold gate (the mergeBin rejection, the retiring arm):
+        // the hold has already moved this bin's stock to the QC bin, so the
+        // bin is empty and the empty gate alone would let it retire — then
+        // the release could never return the held stock to the origin bin it
+        // recorded, stranding the hold with no resolution path.
+        const openHolds = await openQcHoldsForBinsInTx(tx, command.tenantId, command.warehouseId, [
+          row.id,
+        ]);
+        if (openHolds.length > 0) {
+          const hold = openHolds[0]!;
+          throw binHoldOpen(row.code, hold.holdId, 'retiring');
+        }
+
+        // The empty gate: every non-zero on-hand arm (plain + batch) names
+        // itself in the rejection.
+        const plainRows = await tx
+          .select({
+            skuCode: skus.code,
+            quantity: stockOnHand.quantity,
+          })
+          .from(stockOnHand)
+          .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+          .where(
+            and(
+              eq(stockOnHand.tenantId, command.tenantId),
+              eq(stockOnHand.warehouseId, command.warehouseId),
+              eq(stockOnHand.binId, row.id),
+              gt(stockOnHand.quantity, 0),
+            ),
+          )
+          .orderBy(asc(skus.code));
+        const batchRows = await tx
+          .select({
+            skuCode: skus.code,
+            batchCode: batches.code,
+            quantity: batchOnHand.quantity,
+          })
+          .from(batchOnHand)
+          .innerJoin(skus, eq(skus.id, batchOnHand.skuId))
+          .innerJoin(batches, eq(batches.id, batchOnHand.batchId))
+          .where(
+            and(
+              eq(batchOnHand.tenantId, command.tenantId),
+              eq(batchOnHand.warehouseId, command.warehouseId),
+              eq(batchOnHand.binId, row.id),
+              gt(batchOnHand.quantity, 0),
+            ),
+          )
+          .orderBy(asc(skus.code), asc(batches.code));
+        if (plainRows.length > 0 || batchRows.length > 0) {
+          const parts = [
+            ...plainRows.map((r) => `${r.skuCode} ×${r.quantity}`),
+            ...batchRows.map((r) => `${r.skuCode} (batch ${r.batchCode}) ×${r.quantity}`),
+          ];
+          throw new ProblemException(
+            'bin-not-empty',
+            400,
+            'Bin still holds stock',
+            `Bin "${row.code}" cannot retire while it holds stock: ${parts.join(', ')}.`,
+          );
+        }
+
+        const at = nowIso();
+        const retiredRows = await tx
+          .update(bins)
+          .set({ retiredAt: at, retiredBy: command.actorUserId, updatedAt: at })
+          .where(eq(bins.id, row.id))
+          .returning();
+        const bin = binFromRow(retiredRows[0]!);
+
+        // In-transaction outbox append (AD-7) — a replay appends nothing.
         await this.outbox.append(tx, {
           messageId: uuidv7(),
           tenantId: command.tenantId,
-          type: 'bin.blocked',
-          occurredAt: nowIso(),
+          type: 'bin.retired',
+          occurredAt: at,
           payload: {
             binId: bin.id,
+            binCode: bin.code,
             warehouseId: bin.warehouseId,
-            blocked: bin.blocked,
+            retiredAt: at,
+            retiredBy: command.actorUserId,
           },
         });
 
-        try {
-          await tx.insert(idempotencyKeys).values({
-            id: uuidv7(),
-            tenantId: command.tenantId,
-            key: idempotencyKey,
-            payloadHash,
-            responseSnapshot: { bin },
-          });
-        } catch (err) {
-          if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
-            throw new ProblemException(
-              'conflict',
-              409,
-              'Concurrent idempotent request',
-              'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
-            );
-          }
-          throw err;
-        }
+        // The audit row — same transaction, after the outbox, before the
+        // idempotency key (the 3.4/3.5 invariant order).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'bin.retired',
+          targetType: 'bin',
+          targetId: bin.id,
+          reference: idempotencyKey,
+          occurredAt: at,
+        });
+
+        await writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, { bin });
         return { snapshot: { bin }, replayed: false };
       },
     );
@@ -502,17 +943,7 @@ async function insertBin(
       })
       .returning();
     const row = rows[0]!;
-    return {
-      id: row.id,
-      tenantId: row.tenantId,
-      warehouseId: row.warehouseId,
-      zoneId: row.zoneId,
-      code: row.code,
-      capacity: row.capacity,
-      type: row.type,
-      blocked: row.blocked,
-      createdAt: row.createdAt,
-    };
+    return binFromRow(row);
   } catch (err) {
     if (isUniqueViolationOn(err, BINS_WAREHOUSE_CODE)) {
       throw duplicateBinCode(command.code);
@@ -530,11 +961,63 @@ export function duplicateBinCode(code: string): ProblemException {
   );
 }
 
-function binNotFound(): ProblemException {
+/** The snapshot's bin body from a `bins` row (the Story 3.6 fields included). */
+function binFromRow(row: typeof bins.$inferSelect): BinSnapshot['bin'] {
+  return {
+    id: row.id,
+    tenantId: row.tenantId,
+    warehouseId: row.warehouseId,
+    zoneId: row.zoneId,
+    code: row.code,
+    capacity: row.capacity,
+    type: row.type,
+    blocked: row.blocked,
+    systemOwned: row.systemOwned,
+    retiredAt: row.retiredAt,
+    retiredBy: row.retiredBy,
+    createdAt: row.createdAt,
+  };
+}
+
+/** The merge/retire structural rejections (400, naming the offending bin). */
+function mergeValidation(detail: string): ProblemException {
   return new ProblemException(
-    'not-found',
-    404,
-    'Bin not found',
-    'No bin with this id exists in this warehouse.',
+    'validation-failed',
+    400,
+    'Invalid bin administration request',
+    detail,
   );
+}
+
+/**
+ * The idempotency-key write shared by the bin administration commands: the
+ * LAST write of the invariant order; a concurrent duplicate's unique
+ * violation maps to 409 `conflict`.
+ */
+async function writeIdempotencyKey(
+  tx: TenantTx,
+  tenantId: string,
+  key: string,
+  payloadHash: string,
+  responseSnapshot: unknown,
+): Promise<void> {
+  try {
+    await tx.insert(idempotencyKeys).values({
+      id: uuidv7(),
+      tenantId,
+      key,
+      payloadHash,
+      responseSnapshot,
+    });
+  } catch (err) {
+    if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Concurrent idempotent request',
+        'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
+      );
+    }
+    throw err;
+  }
 }
