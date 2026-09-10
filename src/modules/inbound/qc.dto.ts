@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { IsIn, IsInt, IsOptional, IsString, IsUUID, Length, Max, Min } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, IsUUID, Length, Min } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 // ── qc-holds.place input ─────────────────────────────────────────────────────
@@ -66,7 +66,7 @@ export class QcHoldDto {
   @ApiProperty({ format: 'uuid', type: String, nullable: true })
   releasedBy!: string | null;
 
-  @ApiProperty({ type: String, nullable: true })
+  @ApiProperty({ type: String, nullable: true, description: 'ISO-8601 UTC instant when released; null while the hold is open' })
   releasedAt!: string | null;
 
   @ApiProperty({ description: 'Row creation time (the keyset cursor field), ISO-8601 UTC' })
@@ -89,12 +89,16 @@ export class QcHoldListQuery {
   @IsString()
   cursor?: string;
 
-  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
+  @ApiProperty({
+    required: false,
+    example: 50,
+    minimum: 1,
+    description: 'Page size (values above the 200 ceiling are clamped to it)',
+  })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(200)
   limit?: number;
 }
 

@@ -26,7 +26,7 @@ delete process.env.RESERVATION_REAPER_POLL_MS;
 const API = '/api/v1/tenants';
 const KEY_HEADER = 'Idempotency-Key';
 
-const SKU_CODES = ['QC-PLAIN', 'QC-BATCH', 'QC-EMPTY'] as const;
+const SKU_CODES = ['QC-PLAIN', 'QC-BATCH', 'QC-EMPTY', 'QC-SERIAL'] as const;
 
 /** The machine-readable code of a rejected ProblemException (the contract). */
 function codeOf(error: unknown): string {
@@ -144,6 +144,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
       'QC-PLAIN,QC Item Plain,pcs,,1800,,false,false,,,',
       'QC-BATCH,QC Item Batch,pcs,,1800,,true,false,,,',
       'QC-EMPTY,QC Item Empty,pcs,,1800,,false,false,,,',
+      'QC-SERIAL,QC Item Serial,pcs,,1800,,false,true,,,',
     ].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
@@ -255,13 +256,14 @@ describe('QC hold and release (e2e, story 3.4)', () => {
     binId: string,
     quantity: number,
     batchCode?: string,
+    inWarehouseId: string = warehouseId,
   ): Promise<void> {
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/inventory/adjustments`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
       .send({
-        warehouseId,
+        warehouseId: inWarehouseId,
         skuId,
         binId,
         quantityDelta: quantity,
@@ -459,6 +461,53 @@ describe('QC hold and release (e2e, story 3.4)', () => {
     expect(foreign.body.code).toBe('permission-denied');
   });
 
+  it('place-hold validation arms: whitespace / oversized reason, serial-tracked SKU, and the QC-hold bin as origin are all 400, nothing written', async () => {
+    const skuId = skuIds.get('QC-EMPTY')!;
+
+    // A whitespace-only reason passes the DTO's Length(1, 200) but is not a
+    // reason — the command's trim check refuses it.
+    const blank = await placeHold({ warehouseId, skuId, binId: binA, reason: '   ' }).expect(400);
+    expect(blank.body.code).toBe('validation-failed');
+
+    // Above the documented 200-character ceiling.
+    const oversized = await placeHold({
+      warehouseId,
+      skuId,
+      binId: binA,
+      reason: 'x'.repeat(201),
+    }).expect(400);
+    expect(oversized.body.code).toBe('validation-failed');
+
+    // A serial-tracked SKU cannot be held bulk: its serial location records
+    // would strand at the origin bin while the stock relocates — the command
+    // refuses before any movement is appended (no stock needed to prove it:
+    // this 400 is the serial refusal, not the empty-scope one).
+    const serialSku = skuIds.get('QC-SERIAL')!;
+    const serial = await placeHold({
+      warehouseId,
+      skuId: serialSku,
+      binId: binA,
+      reason: 'serial-tracked scope',
+    }).expect(400);
+    expect(serial.body.code).toBe('validation-failed');
+    expect(serial.body.detail as string).toContain('serial-tracked');
+    const serialRows = await sql`
+      select count(*)::int as n from qc_holds where tenant_id = ${tenantId} and sku_id = ${serialSku}`;
+    expect(Number((serialRows[0] as unknown as { n: number }).n)).toBe(0);
+
+    // The system QC-hold bin itself can never be a hold origin — its
+    // contents are already quarantined.
+    const qcBin = await qcBinId();
+    const reHold = await placeHold({
+      warehouseId,
+      skuId,
+      binId: qcBin,
+      reason: 're-holding the QC bin',
+    }).expect(400);
+    expect(reHold.body.code).toBe('validation-failed');
+    expect(reHold.body.detail as string).toContain('QC-hold bin');
+  });
+
   it('idempotent place: same key+payload re-serves the snapshot; mismatched payload 422', async () => {
     const skuId = skuIds.get('QC-BATCH')!;
     await seedStock(skuId, binB, 4, 'LOT-2026-1');
@@ -593,6 +642,46 @@ describe('QC hold and release (e2e, story 3.4)', () => {
     expect(await onHandAtBin(qcBin, skuId)).toBe(7);
   });
 
+  it('multi-batch scope: one qc.held movement per batch arm, each arm distinct', async () => {
+    const skuId = skuIds.get('QC-BATCH')!;
+    // Two fresh batches on top of the scope's existing released lot — the
+    // hold moves every on-hand batch row of the scope, one arm each.
+    await seedStock(skuId, binA, 2, 'LOT-M1');
+    await seedStock(skuId, binA, 3, 'LOT-M2');
+    const scopeBatches = (await sql`
+      select batch_id, quantity from batch_on_hand
+      where tenant_id = ${tenantId} and warehouse_id = ${warehouseId}
+      and sku_id = ${skuId} and bin_id = ${binA} and quantity > 0
+      order by batch_id`) as unknown as { batch_id: string; quantity: number }[];
+    expect(scopeBatches.length).toBeGreaterThanOrEqual(2);
+
+    const holdId = (await placeHold(
+      { warehouseId, skuId, binId: binA, reason: 'Multi-batch scope held whole' },
+    ).expect(201)).body.qcHold.id as string;
+    const movements = (await holdLedgerRows(holdId)).filter((m) => m.type === 'qc.held');
+
+    // One movement per batch arm, none repeated, magnitudes matching the
+    // batch rows the scope carried.
+    expect(movements.map((m) => m.batch_ref).sort()).toEqual(
+      scopeBatches.map((b) => b.batch_id).sort(),
+    );
+    expect(new Set(movements.map((m) => m.batch_ref)).size).toBe(movements.length);
+    for (const arm of movements) {
+      expect(arm.quantity_delta).toBe(
+        scopeBatches.find((b) => b.batch_id === arm.batch_ref)!.quantity,
+      );
+    }
+    const qcBin = await qcBinId();
+    for (const arm of movements) {
+      expect(arm.from_bin_id).toBe(binA);
+      expect(arm.to_bin_id).toBe(qcBin);
+    }
+    // The QC bin carries exactly the scope's sum.
+    expect(await onHandAtBin(qcBin, skuId)).toBe(
+      scopeBatches.reduce((sum, b) => sum + b.quantity, 0),
+    );
+  });
+
   it('holds list: status filter works; a crafted cursor is 400 invalid-cursor', async () => {
     // Released rows exist from the arms above; filter both ways.
     const openPage = await request(app.getHttpServer())
@@ -613,6 +702,88 @@ describe('QC hold and release (e2e, story 3.4)', () => {
       .set('Authorization', `Bearer ${ownerToken}`)
       .expect(400);
     expect(bad.body.code).toBe('invalid-cursor');
+  });
+
+  it('holds list: the warehouseId filter returns only that warehouse\'s rows, a foreign warehouseId is 404; pages walk without repeats; an oversized limit is clamped', async () => {
+    // A second warehouse with its own held scope — the filter's contrast.
+    const wh2 = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: `QCH2-${ulid().slice(10, 16).toUpperCase()}`, name: `QC WH2 ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zone2 = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${wh2}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A', name: 'Zone A' })
+        .expect(201)
+    ).body.id as string;
+    const bin2 = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${wh2}/zones/${zone2}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ capacity: 1000, type: 'shelf', code: 'A-01-01' })
+        .expect(201)
+    ).body.id as string;
+    const plainSku = skuIds.get('QC-PLAIN')!;
+    await seedStock(plainSku, bin2, 1, undefined, wh2);
+    await placeHold({ warehouseId: wh2, skuId: plainSku, binId: bin2, reason: 'Second warehouse hold' }).expect(201);
+
+    const listUrl = `${API}/${tenantId}/receiving/qc-holds`;
+    const pageOf = async (qs: string): Promise<{ items: Record<string, unknown>[]; nextCursor: string | null }> => {
+      const res = await request(app.getHttpServer())
+        .get(`${listUrl}${qs}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      return {
+        items: res.body.items as Record<string, unknown>[],
+        nextCursor: (res.body.nextCursor ?? null) as string | null,
+      };
+    };
+
+    // Each warehouse's query returns only its own rows.
+    for (const wh of [warehouseId, wh2]) {
+      const page = await pageOf(`?warehouseId=${wh}`);
+      expect(page.items.length).toBeGreaterThan(0);
+      for (const item of page.items) {
+        expect(item.warehouseId).toBe(wh);
+      }
+    }
+    const wh1 = await pageOf(`?warehouseId=${warehouseId}`);
+    const wh2Page = await pageOf(`?warehouseId=${wh2}`);
+    expect(wh1.items.some((it) => it.warehouseId === wh2)).toBe(false);
+    expect(wh2Page.items.every((it) => it.warehouseId === wh2)).toBe(true);
+
+    // A warehouseId belonging to no warehouse of the tenant is 404.
+    const foreign = await request(app.getHttpServer())
+      .get(`${listUrl}?warehouseId=${uuidv7()}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(404);
+    expect(foreign.body.code).toBe('not-found');
+
+    // Pagination: walking the cursor visits every row exactly once.
+    const all = await pageOf('');
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await pageOf(cursor === null ? '?limit=2' : `?limit=2&cursor=${cursor}`);
+      for (const item of page.items) {
+        seen.push(item.id as string);
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(seen.length).toBe(all.items.length);
+
+    // A limit above the documented ceiling is clamped to it, not honored.
+    const clamped = await pageOf('?limit=500');
+    expect(clamped.items.length).toBeLessThanOrEqual(200);
+    expect(clamped.items.length).toBe(all.items.length);
   });
 
   it('RLS: a non-superuser session scoped to one tenant sees no qc_holds rows of another tenant and cannot write foreign rows', async () => {

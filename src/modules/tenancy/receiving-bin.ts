@@ -152,7 +152,17 @@ export async function ensureQcHoldBinInTx(
     .select({ id: bins.id })
     .from(bins)
     .where(
-      and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId), eq(bins.code, QC_HOLD_BIN_CODE)),
+      and(
+        eq(bins.tenantId, tenantId),
+        eq(bins.warehouseId, warehouseId),
+        eq(bins.code, QC_HOLD_BIN_CODE),
+        // The identity that feeds `qcHeldUnits` is code + system-owned: a
+        // user-created bin named `QC-HOLD` is not the QC bin — adopting it
+        // would park stock where the ATP hook counts zero. Refuse loudly
+        // (the insert below collides on the unique (warehouse, code) index)
+        // rather than silently break the hook.
+        eq(bins.systemOwned, true),
+      ),
     )
     .limit(1);
   const bin = binRows[0];

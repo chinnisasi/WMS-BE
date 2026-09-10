@@ -144,12 +144,21 @@ export class QcCommand {
       // warehouse in tenant, SKU in tenant, bin in the tenant's warehouse.
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
       const skuRows = await tx
-        .select({ id: skus.id })
+        .select({ id: skus.id, serialTracked: skus.serialTracked })
         .from(skus)
         .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
         .limit(1);
       if (skuRows[0] === undefined) {
         throw notFound('SKU', command.skuId);
+      }
+      // A serial-tracked scope cannot be held bulk: the movements carry no
+      // serial arms, so the serials' location records would stay at the
+      // origin bin while their stock relocates to the QC bin — divergence
+      // with no repair path. Refuse before any movement is appended.
+      if (skuRows[0].serialTracked) {
+        throw qcValidation(
+          `SKU ${command.skuId} is serial-tracked — a bulk (sku, bin) QC hold would strand its serial location records at the origin bin, so it cannot be quarantined as a whole scope.`,
+        );
       }
       const binRows = await tx
         .select({ id: bins.id, code: bins.code, systemOwned: bins.systemOwned })

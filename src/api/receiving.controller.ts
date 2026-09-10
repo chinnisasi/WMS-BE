@@ -285,7 +285,7 @@ export class ReceivingController {
     type: QcHoldResponse,
     description: 'Hold placed: the open hold row (the idempotency snapshot)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, or an empty scope (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, an empty scope, a serial-tracked SKU, or the system QC-hold bin as the hold origin (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, SKU, or bin does not exist in this tenant (not-found)') })
@@ -323,7 +323,11 @@ export class ReceivingController {
       'Releases a QC hold (qc.manage) — qc.released movements return exactly the held units (the hold\'s own ledger arms) to its recorded origin bin; audited',
   })
   @ApiHeaders(IDEMPOTENCY_HEADER)
-  @ApiResponse({ status: HttpStatus.OK, type: QcHoldResponse })
+  @ApiResponse({
+    status: HttpStatus.OK,
+    type: QcHoldResponse,
+    description: 'Hold released: the released hold row with its releasedBy/releasedAt (the idempotency snapshot)',
+  })
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed holdId (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)') })
@@ -354,7 +358,10 @@ export class ReceivingController {
   @ApiOperation({
     summary: 'Lists QC holds (keyset cursor pagination, warehouse- and status-filterable — open to any member)',
   })
-  @ApiOkResponse({ type: QcHoldListResponse })
+  @ApiOkResponse({
+    type: QcHoldListResponse,
+    description: 'The QC-hold page (newest first — the Inbound surface\'s holds read)',
+  })
   @ApiResponse({ status: 400, ...problemJsonResponse('Malformed status, cursor, warehouseId, or out-of-range limit (validation-failed / invalid-cursor)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
