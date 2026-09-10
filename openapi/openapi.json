@@ -4648,6 +4648,7 @@
             "in": "query",
             "description": "Opaque keyset cursor from the previous page",
             "schema": {
+              "maxLength": 200,
               "type": "string"
             }
           },
@@ -8612,6 +8613,7 @@
             "type": "number",
             "description": "Ordered quantity in base UoM — a positive integer",
             "minimum": 1,
+            "maximum": 2147483647,
             "example": 10
           }
         },

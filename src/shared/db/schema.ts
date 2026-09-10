@@ -1358,8 +1358,11 @@ export type PutawayPlacement = typeof putawayPlacements.$inferSelect;
  * race backstop). `source_payload_hash` is the ingested payload's
  * fingerprint the dedup comparison reads.
  *
- * No FKs anywhere (repo convention): `warehouse_id`, `integration_id`,
- * `external_event_id` asserted in the command transaction.
+ * No FKs anywhere (repo convention): `warehouse_id` is asserted in the
+ * command transaction. `integration_id` is validated only as a uuid — there
+ * is no integrations table until Epic 7 brings the channel adapters, so
+ * nothing yet proves the id names a real integration; `external_event_id`
+ * is an opaque channel ref, length-bounded and never resolved.
  *
  * RLS policy + status CHECKs live **only in the migration SQL** (0017).
  */
@@ -1389,7 +1392,6 @@ export const orders = pgTable(
       table.createdAt,
       table.id,
     ),
-    index('orders_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
     // Channel-order dedup (AD-5): one order per (tenant, integration,
     // external event id) — partial, so manual orders (null channel arms)
     // never participate.

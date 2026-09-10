@@ -53,14 +53,6 @@ export const ORDER_OWNER_TYPE = 'order';
  */
 export const ORDER_RESERVATION_TTL_SECONDS = 7 * 24 * 3600;
 
-/**
- * The v1 backorder policy (the human decision 2026-09-10): an over-ATP
- * line reserves `min(qty, ATP)` and marks its unreserved remainder
- * `backordered` — the shortfall is visible in the response. Per-channel
- * configurable policy (including `block`) arrives with Epic 7.
- */
-export const ORDER_BACKORDER_POLICY = 'backorder' as const;
-
 /** Bounded ATP re-probe attempts when a line's grant loses a stock race. */
 const MAX_GRANT_ATTEMPTS = 4;
 
@@ -70,6 +62,13 @@ const ORDERS_SOURCE_EVENT_UNIQUE = 'orders_source_event_unique';
 
 /** Max length of an ingested order's external event id (a channel ref). */
 const MAX_EXTERNAL_EVENT_ID_LENGTH = 200;
+
+/**
+ * Line quantities are Postgres `integer`s — an input above the int4 ceiling
+ * would pass every other validation and die as a raw 22003 at the INSERT
+ * (after grants were made and released). The typed 400 is the boundary.
+ */
+const MAX_LINE_QUANTITY = 2_147_483_647;
 
 // ── command inputs ───────────────────────────────────────────────────────────
 
@@ -181,6 +180,14 @@ export class OrderCommandService {
    * A reservation-store failure fails the WHOLE creation closed.
    */
   async createOrder(command: CreateOrderCommand, idempotencyKey: string): Promise<OrderSnapshot> {
+    // A manual order carrying channel refs would be silently stripped below —
+    // a believing client would get an order with no dedup protection on
+    // redelivery. 400 before anything else.
+    if (command.source !== 'ingested' && (command.integrationId !== undefined || command.externalEventId !== undefined)) {
+      throw validationFailed(
+        'Channel refs (integrationId/externalEventId) require source: "ingested".',
+      );
+    }
     const integrationId = command.source === 'ingested' ? (command.integrationId ?? null) : null;
     const externalEventId =
       command.source === 'ingested' ? (command.externalEventId ?? null) : null;
@@ -226,6 +233,12 @@ export class OrderCommandService {
           throw validationFailed(
             'An ingested order names its channel — integrationId and externalEventId are required together.',
           );
+        }
+        // Non-HTTP callers (the Epic 7 adapter path) skip the DTO's @IsUUID —
+        // the command is the boundary that keeps a bad ref out of the uuid
+        // column (a raw 22P02 is never an answer).
+        if (!UUID_RE.test(integrationId)) {
+          throw validationFailed('integrationId must be a uuid.');
         }
         if (externalEventId.length > MAX_EXTERNAL_EVENT_ID_LENGTH) {
           throw validationFailed(
@@ -389,12 +402,22 @@ export class OrderCommandService {
 
   /**
    * `POST .../orders/{id}/cancel`: allowed while `accepted` (pre-pick),
-   * idempotent-keyed. Every line's OPEN reservation is released through the
-   * existing release path (each release is a serialized terminal transition
-   * — cancel-vs-dispatch single-winner is the reservation machinery's own
-   * guarantee), the order flips `accepted → cancelled` through one
-   * conditional UPDATE, and `order.cancelled` + the audit row + the
-   * idempotency key commit with the flip.
+   * idempotent-keyed.
+   *
+   * The order flips `accepted → cancelled` through one conditional UPDATE,
+   * and the line reset + `order.cancelled` + the audit row + the idempotency
+   * key commit WITH that flip — the flip's winner alone emits them. Only
+   * then are the holds released, each through the existing path (its own
+   * serialized terminal transition).
+   *
+   * Flip-first is deliberate. Releasing first and flipping after leaves a
+   * crash window where stock is free while the order still reads `accepted`
+   * — units sellable twice. This ordering inverts that: a crash leaves the
+   * order `cancelled` with its holds still live, ATP understated until the
+   * reaper expires them. A consumed (`committed`) hold is refused up front,
+   * before anything is written; one that commits inside the pre-check →
+   * release window can no longer be refused (the cancellation is durable by
+   * then) and is logged as an operational anomaly instead.
    *
    * A replay under the original key re-serves the stored snapshot; a cancel
    * of an already-cancelled order under a NEW key is an idempotent no-op
@@ -451,10 +474,10 @@ export class OrderCommandService {
       });
     }
 
-    // ── phase 2: release every OPEN reservation through the existing path ─
-    // (each release is its own serialized terminal transition; a release that
-    // lost to another terminal writer — expiry, a concurrent cancel — is
-    // already settled and tolerated).
+    // ── phase 2 (read): the pre-check — every line's hold, and the refusal ─
+    // A consumed (committed) hold means a consuming flow won the reservation
+    // first, so the order is no longer purely pre-pick stock: refuse BEFORE
+    // anything is written.
     const lines = await withTenantTransaction(this.db, command.tenantId, (tx) =>
       tx
         .select({ reservationId: orderLines.reservationId })
@@ -476,22 +499,15 @@ export class OrderCommandService {
         `Order "${order.id}" has ${committed.length} committed reservation(s) — a consuming flow already claimed them; the order is not cancellable here.`,
       );
     }
-    for (const hold of live.filter((row) => row.state === 'held')) {
-      try {
-        await this.inventory.releaseReservation(command.tenantId, hold.id);
-      } catch (err) {
-        if (err instanceof ProblemException && err.getStatus() === 409) {
-          // A concurrent terminal writer (a racing cancel, the reaper's
-          // expiry) won the conditional UPDATE — the hold is already
-          // terminal, nothing left to release.
-          continue;
-        }
-        throw err;
-      }
-    }
+    const holds = live.filter((row) => row.state === 'held');
 
-    // ── phase 3 (write tx): the flip + outbox + audit + key ───────────────
-    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+    // ── phase 3 (write tx): the flip + the lines + outbox + audit + key ───
+    // The flip commits BEFORE the releases run. A crash between the two then
+    // leaves the order `cancelled` with its holds still live — ATP
+    // understated until the reaper expires them, never stock freed under an
+    // order that still reads `accepted`. The fail-safe direction is the
+    // whole reason this ordering was chosen over releasing first.
+    const settled = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       const updates = await tx
         .update(orders)
         .set({ status: 'cancelled', updatedAt: nowIso() })
@@ -505,34 +521,91 @@ export class OrderCommandService {
         .returning();
       const winner = updates[0];
       // A lost flip is the concurrent cancel's win — the idempotent no-op.
+      // The WINNER's tx owns the outbox event, the audit row and the line
+      // reset (one flip → one event, one audit line); the loser records only
+      // its idempotency key so its replay contract still holds.
+      if (winner !== undefined) {
+        // The lines stop claiming stock in the same commit as the flip.
+        // `reservation_id` is cleared with `reserved_qty` so no read — the
+        // snapshot below, 4.2's Outbound surface, any roll-up — can report a
+        // hold this order no longer owns. The journal keeps the audit trail:
+        // every hold carries `owner_id` = the line id it was granted for.
+        await tx
+          .update(orderLines)
+          .set({ reservedQty: 0, reservationId: null, updatedAt: nowIso() })
+          .where(and(eq(orderLines.tenantId, command.tenantId), eq(orderLines.orderId, order.id)));
+      }
       const target =
         winner ?? (await tx.select().from(orders).where(eq(orders.id, order.id)).limit(1))[0]!;
       const snapshot = await this.snapshotOf(tx, target);
 
-      // In-transaction outbox append (AD-7) — before the idempotency key.
-      await this.outbox.append(tx, {
-        messageId: uuidv7(),
-        tenantId: command.tenantId,
-        type: 'order.cancelled',
-        occurredAt: nowIso(),
-        payload: { order: snapshot.order },
-      });
+      if (winner !== undefined) {
+        // In-transaction outbox append (AD-7) — before the idempotency key.
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: 'order.cancelled',
+          occurredAt: nowIso(),
+          payload: { order: snapshot.order },
+        });
 
-      await tx.insert(auditEvents).values({
-        id: uuidv7(),
-        tenantId: command.tenantId,
-        actorUserId: command.actorUserId,
-        action: 'order.cancelled',
-        targetType: 'order',
-        targetId: order.id,
-        reference: idempotencyKey,
-        occurredAt: nowIso(),
-      });
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'order.cancelled',
+          targetType: 'order',
+          targetId: order.id,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+      }
 
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
-      return snapshot;
+      return { snapshot, won: winner !== undefined };
     });
+
+    // ── phase 4: release the holds, now that the flip is durable ──────────
+    // Only the flip's winner releases (the loser's holds are the winner's to
+    // settle). Nothing here may throw: the cancellation is already committed
+    // and the caller's answer cannot be retracted, so a release that will not
+    // settle is logged as the operational anomaly it is and left to the
+    // hold's 7-day TTL — the ATP-understating direction.
+    if (settled.won) {
+      for (const hold of holds) {
+        try {
+          await this.inventory.releaseReservation(command.tenantId, hold.id);
+        } catch (err) {
+          if (err instanceof ProblemException && err.getStatus() === 409) {
+            // A terminal writer won the conditional UPDATE between the
+            // pre-check and this release — the 409 alone cannot say WHICH:
+            // a racing cancel or the reaper's expiry is already settled and
+            // nothing is owed, a consuming flow that committed inside that
+            // window claimed stock this cancellation just gave away.
+            const state = (await this.inventory.reservationsByIds(command.tenantId, [hold.id]))[0]
+              ?.state;
+            if (state === 'released' || state === 'expired') {
+              continue;
+            }
+            this.logger.error(
+              `Order cancel ${order.id}: reservation ${hold.id} is ${state ?? 'unknown'} — ` +
+                `a consuming flow claimed it between the pre-check and the release, ` +
+                `after the cancellation had committed. The order is cancelled and the ` +
+                `committed hold stands; reconcile the pick against the cancellation.`,
+            );
+            continue;
+          }
+          this.logger.error(
+            `Order cancel ${order.id}: releasing reservation ${hold.id} failed — ` +
+              `${err instanceof Error ? err.message : String(err)}. The hold is left to ` +
+              `its TTL (ATP understated until the reaper expires it).`,
+          );
+        }
+      }
+    }
+    return settled.snapshot;
   }
+
 
   // ── shared pieces ─────────────────────────────────────────────────────────
 
@@ -567,13 +640,22 @@ export class OrderCommandService {
       } catch (err) {
         const raceLoser =
           err instanceof ProblemException && err.getStatus() === 409 && codeOf(err) === 'unavailable';
-        if (raceLoser && attempt < MAX_GRANT_ATTEMPTS - 1) {
+        if (!raceLoser) {
+          // 503 store-down (and any other fault) propagates — the whole
+          // creation fails closed, nothing accepted half-reserved.
+          throw err;
+        }
+        if (attempt < MAX_GRANT_ATTEMPTS - 1) {
           continue; // re-probe: a concurrent accept consumed units mid-grant
         }
-        throw err; // 503 store-down propagates (fails the whole creation closed)
+        // The bounded retries are exhausted against a contended scope: the
+        // fixed backorder policy's loser outcome, never a whole-creation 409.
+        return null;
       }
     }
-    return null; // exhausted bounded retries against a contended scope: backordered
+    // Unreachable (MAX_GRANT_ATTEMPTS ≥ 1 and every arm returns/continues/
+    // throws) — kept so the compiler sees the loop can end.
+    return null;
   }
 
   /** Releases every reservation this command granted (the nothing-written invariant). */
@@ -767,9 +849,9 @@ export class OrderCommandService {
       if (!UUID_RE.test(line.skuId)) {
         throw validationFailed('Every line names a well-formed skuId.');
       }
-      if (!Number.isInteger(line.quantity) || line.quantity <= 0) {
+      if (!Number.isInteger(line.quantity) || line.quantity <= 0 || line.quantity > MAX_LINE_QUANTITY) {
         throw validationFailed(
-          `Line quantity must be a positive integer in base UoM (got ${String(line.quantity)}).`,
+          `Line quantity must be a positive integer in base UoM, at most ${MAX_LINE_QUANTITY} (got ${String(line.quantity)}).`,
         );
       }
     }

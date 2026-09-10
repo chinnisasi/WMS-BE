@@ -43,8 +43,16 @@ export class ValkeyClient implements OnApplicationShutdown {
     const client = new Redis(url, {
       lazyConnect: true,
       // Fail closed fast: a partitioned Valkey must surface as a rejected
-      // command (→ `unavailable`), not a hung request.
+      // command (→ `unavailable`), not a hung request. `commandTimeout`
+      // covers the harder case `connectTimeout` cannot: a connection that
+      // established and then stopped answering. Story 4.1's A2 re-validation
+      // reads a counter while the journal tx holds `FOR UPDATE` on the
+      // scope's stock rows, so a hung-but-connected store would block every
+      // stock mutation for that scope behind those locks. No blocking
+      // command (BLPOP/SUBSCRIBE/XREAD) is ever issued here, so a flat
+      // per-command deadline is safe.
       connectTimeout: 2_000,
+      commandTimeout: 2_000,
       maxRetriesPerRequest: 2,
       enableOfflineQueue: true,
     });

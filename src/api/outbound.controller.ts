@@ -84,7 +84,10 @@ export class OutboundController {
         warehouseId: dto.warehouseId,
         source: dto.source ?? 'manual',
         lines: dto.lines.map((line) => ({ skuId: line.skuId, quantity: line.quantity })),
-        ...(dto.source === 'ingested'
+        // The channel arms are forwarded VERBATIM (present or not): the
+        // command owns the required-together rule and 400s a manual order
+        // that carries them — stripping them here would silently accept it.
+        ...(dto.integrationId !== undefined || dto.externalEventId !== undefined
           ? { integrationId: dto.integrationId, externalEventId: dto.externalEventId }
           : {}),
       },

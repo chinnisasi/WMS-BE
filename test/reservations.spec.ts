@@ -52,6 +52,7 @@ const SKU_CODES = [
   'RSV-IDEM',
   'RSV-OWNER',
   'RSV-CORRECT',
+  'RSV-CEIL',
 ] as const;
 
 /** The machine-readable code of a rejected ProblemException (the contract). */
@@ -918,6 +919,64 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
       where tenant_id = ${tenantId} and sku_id = ${skuId} and state in ('held','committed')
     `;
     expect(atp.reserved).toBe(Number((sums[0] as unknown as { reserved: number }).reserved));
+  });
+
+  it('ceiling regression mid-grant (A2, deterministic): a committed adjustment shrinking the ceiling under a won script 409s and compensates', async () => {
+    // The forcing technique of the RSV-CORRECT test above, pointed at the A2
+    // arm: the grant winner is held between script win and journal
+    // transaction, and the ceiling shrinks (a negative adjustment commits) in
+    // exactly that gap. The interleaved sibling test passes under BOTH orders
+    // by design; this arm pins the regression interleave deterministically —
+    // the locked re-read sees ceiling 1 < reserved 2, the deterministic 409
+    // `unavailable` fires, no journal row is written, and the compensating
+    // decrement restores the counter (the decrement never outlives a missing
+    // journal row).
+    const skuId = skuIds.get('RSV-CEIL')!;
+    await seedStock(skuId, binA, 5);
+    // Arm the scope's counter before the spies, so the grant decides on the
+    // script directly instead of taking the missing-counter heal arm.
+    await facade.rebuildReservationCounters(tenantId, warehouseId);
+    const client = app.get(ValkeyClient);
+    const owner = ownerId('ceil');
+
+    let releaseGrant: (() => void) | undefined;
+    let scriptWon = false;
+    const grantGate = new Promise<void>((resolve) => {
+      releaseGrant = resolve;
+    });
+    const grantSpy = jest
+      .spyOn(client, 'grantReservation')
+      .mockImplementation(async (...args: Parameters<ValkeyClient['grantReservation']>) => {
+        const reply = await ValkeyClient.prototype.grantReservation.apply(client, args);
+        if (reply[0] === 1) {
+          scriptWon = true;
+          await grantGate; // hold the winner between script win and journal tx
+        }
+        return reply;
+      });
+
+    const grantPromise = grant(skuId, owner, 2);
+    const deadline = Date.now() + 2_000;
+    while (!scriptWon && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(scriptWon).toBe(true);
+    grantSpy.mockRestore();
+
+    // The regression commits while the winner is gated: 5 → 1 on-hand.
+    await seedStock(skuId, binA, -4);
+
+    releaseGrant!();
+
+    await expectProblem(grantPromise, 409, 'unavailable');
+    const rows = await sql`
+      select count(*)::int as n from reservations
+      where tenant_id = ${tenantId} and sku_id = ${skuId} and state = 'held'
+    `;
+    expect(Number((rows[0] as unknown as { n: number }).n)).toBe(0);
+    // The counter mirrors the journal: reserved 0, ATP back to the full 1.
+    const atp = await facade.atp(tenantId, warehouseId, skuId);
+    expect(atp).toMatchObject({ onHand: 1, reserved: 0, atp: 1 });
   });
 
   it('journal parity: the reserved counter always equals the live-state journal sum at rest', async () => {

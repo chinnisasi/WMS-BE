@@ -357,10 +357,19 @@ export class ReservationService implements OnModuleInit {
             'The reservation store became unreachable between the grant script and the journal write — the grant fails closed (nothing journalled).',
           );
         });
-        if (counter === null || counter > lockedCeiling) {
+        if (counter === null) {
+          // A counter the store cannot report (expired mid-grant, not yet
+          // loaded) is a STORE-STATE problem, not a decision — the A8 split:
+          // 503 `reservation-store-unavailable`, retryable, never the
+          // deterministic 409 a lost grant receives.
+          throw reservationStoreUnavailable(
+            `The reservation store could not report the counter for SKU ${skuId} in warehouse ${warehouseId} between the grant script and the journal write — the grant fails closed (nothing journalled).`,
+          );
+        }
+        if (counter > lockedCeiling) {
           throw unavailable(
             `SKU ${skuId} in warehouse ${warehouseId} lost sellable units while the grant was in flight ` +
-              `(ceiling ${probe.ceiling} → ${lockedCeiling}, reserved now ${counter ?? 'unknown'}) — ` +
+              `(ceiling ${probe.ceiling} → ${lockedCeiling}, reserved now ${counter}) — ` +
               `the hold cannot be journalled.`,
           );
         }
@@ -1061,9 +1070,20 @@ export class ReservationService implements OnModuleInit {
     warehouseId: string,
     skuId: string,
   ): Promise<number> {
-    // The lock itself: one statement over the scope's rows (both the storage
-    // bins' rows and the QC-hold bin's rows are stock_on_hand rows of the
-    // scope — the ceiling's only contributors).
+    // The lock itself: one statement over the scope's `stock_on_hand` rows
+    // (the storage bins' and the QC-hold bin's alike). These serialize
+    // grant-vs-adjustment, which is the race epic-2 retro A2 named: every
+    // stock-mutation command must UPDATE these rows to move stock.
+    //
+    // They are NOT the ceiling's only contributors. `committedCeiling`
+    // subtracts `qcHeldUnits` and excludes open `inventory_quarantines`
+    // scopes, and neither is locked here — a QC hold or quarantine opened
+    // between the probe and this re-read lowers the ceiling without touching
+    // a locked row, so grant-vs-quarantine remains a known residual race.
+    // Closing it means widening the lock to those tables, which needs a
+    // lock-ordering audit against the QC and quarantine commands (they take
+    // these locks in the opposite order) — deferred to epic 5, where the
+    // quarantine and variance work lives.
     await tx
       .select({ binId: stockOnHand.binId })
       .from(stockOnHand)

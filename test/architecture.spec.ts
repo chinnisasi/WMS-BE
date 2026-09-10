@@ -145,8 +145,10 @@ describe('architecture: the ledger core is append-only and inventory-module-owne
       // retro A7 — the guard only matched the literal path form before, so
       // a sibling importing `../inventory/reservation.service` slipped
       // through undetected).
+      // The allowed suffixes must END the specifier (the closing quote):
+      // `\\b` would wave through an `inventory.facade.internal` reach-through.
       '(?:modules/inventory|\\.\\./inventory)/' +
-        '(?!inventory\\.(facade|module|dto)\\b)',
+        '(?!inventory\\.(facade|module|dto)[\'"])',
     );
     const inventoryRoot = join(SRC_ROOT, 'modules', 'inventory');
     const siblingModules = files.filter(
@@ -199,9 +201,12 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
   it('no other module reaches into the outbound module past the facade', () => {
     // The mirror of the inventory guard (same regex fix applied — both
     // import forms).
+    // The allowed suffixes must END the specifier (the closing quote), not
+    // merely sit on a word boundary: `\\b` would wave through a
+    // `outbound.facade.internal` that is every bit a reach-through.
     const outboundInternals = new RegExp(
       '(?:modules/outbound|\\.\\./outbound)/' +
-        '(?!outbound\\.(facade|module|dto)\\b)',
+        '(?!outbound\\.(facade|module|dto)[\'"])',
     );
     const siblingModules = files.filter(
       (file) =>
@@ -209,6 +214,29 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
         !file.path.startsWith(outboundRoot) &&
         /(?:modules\/outbound|\.\.\/outbound)\//.test(file.source),
     );
+    // No sibling module consumes outbound YET (4.2 brings the first), so the
+    // inventory twin's `siblingModules.length > 0` meaningfulness assert
+    // cannot be used here — it would fail on an empty-but-correct codebase.
+    // Pin the detector directly instead, so a typo or a regex that stops
+    // matching an import form (the epic-3 retro A7 bug this file just fixed
+    // for inventory) fails HERE rather than going unnoticed until the guard
+    // silently scans nothing forever.
+    for (const reaching of [
+      "from '../outbound/order.command'",
+      "from '../outbound/outbound.facade.internal'",
+      "from '../outbound/outbound.dto.helpers'",
+      "from 'src/modules/outbound/order.command'",
+    ]) {
+      expect(outboundInternals.test(reaching)).toBe(true);
+    }
+    for (const allowed of [
+      "from '../outbound/outbound.facade'",
+      "from '../outbound/outbound.module'",
+      "from '../outbound/outbound.dto'",
+      "from 'src/modules/outbound/outbound.facade'",
+    ]) {
+      expect(outboundInternals.test(allowed)).toBe(false);
+    }
     const offenders: string[] = [];
     for (const file of siblingModules) {
       if (outboundInternals.test(file.source)) {
