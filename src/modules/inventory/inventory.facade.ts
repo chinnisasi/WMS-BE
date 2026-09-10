@@ -644,4 +644,114 @@ export class InventoryFacade {
       }));
     });
   }
+
+  // ── Story 3.4: the QC-hold command's stock reads (read-only passthroughs —
+  // the hold/release movements still append only through the ledger) ───────
+
+  /**
+   * One (sku, bin) scope's on-hand snapshot (Story 3.4): the plain
+   * `stock_on_hand` row's quantity plus its per-batch breakdown (the batch
+   * rows sum to it on a batch-tracked SKU; an untracked SKU carries none —
+   * its single hold/release movement rides `batchRef: null`). The caller's
+   * in-transaction passthrough shape (`appendLedgerEventInTx` precedent) —
+   * the hold command composes this read with its movements in ONE tx.
+   */
+  async qcScopeOnHandInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    binId: string,
+  ): Promise<QcScopeOnHand> {
+    const plain = await tx
+      .select({ quantity: stockOnHand.quantity })
+      .from(stockOnHand)
+      .where(
+        and(
+          eq(stockOnHand.tenantId, tenantId),
+          eq(stockOnHand.warehouseId, warehouseId),
+          eq(stockOnHand.skuId, skuId),
+          eq(stockOnHand.binId, binId),
+        ),
+      )
+      .limit(1);
+    if (plain[0] === undefined) {
+      return { quantity: 0, batches: [] };
+    }
+    const batches = await tx
+      .select({ batchId: batchOnHand.batchId, quantity: batchOnHand.quantity })
+      .from(batchOnHand)
+      .where(
+        and(
+          eq(batchOnHand.tenantId, tenantId),
+          eq(batchOnHand.warehouseId, warehouseId),
+          eq(batchOnHand.skuId, skuId),
+          eq(batchOnHand.binId, binId),
+        ),
+      )
+      .orderBy(asc(batchOnHand.batchId));
+    return { quantity: plain[0].quantity, batches };
+  }
+
+  /**
+   * A hold's own `qc.held` arms (Story 3.4): the events the hold placed,
+   * oldest first — the release replays exactly these (same batch refs, same
+   * magnitudes) so a concurrent hold of the same SKU from another origin bin
+   * never returns with the wrong release. One query over the ledger (the
+   * hash chain is the hold's movement record — no second source of truth);
+   * the caller's in-transaction passthrough shape.
+   */
+  async qcHeldArmsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    holdId: string,
+  ): Promise<QcHeldArm[]> {
+    const rows = await tx
+      .select({
+        seq: ledgerEvents.seq,
+        batchRef: ledgerEvents.batchRef,
+        quantityDelta: ledgerEvents.quantityDelta,
+      })
+      .from(ledgerEvents)
+      .where(
+        and(
+          eq(ledgerEvents.tenantId, tenantId),
+          eq(ledgerEvents.warehouseId, warehouseId),
+          eq(ledgerEvents.type, 'qc.held'),
+          sql`${ledgerEvents.referenceDoc}->>'holdId' = ${holdId}`,
+        ),
+      )
+      .orderBy(asc(ledgerEvents.seq));
+    return rows.map((row) => ({
+      seq: row.seq,
+      batchRef: row.batchRef,
+      quantity: Math.abs(row.quantityDelta),
+    }));
+  }
+}
+
+interface QcScopeBatch {
+  readonly batchId: string | null;
+  readonly quantity: number;
+}
+
+/**
+ * One (sku, bin) scope's on-hand snapshot: the plain `stock_on_hand` row's
+ * quantity plus its per-batch breakdown (the batch rows sum to it on a
+ * batch-tracked SKU; an untracked SKU carries none — its single movement
+ * rides `batchRef: null`). The Story 3.4 hold command's input truth.
+ */
+export interface QcScopeOnHand {
+  readonly quantity: number;
+  readonly batches: readonly QcScopeBatch[];
+}
+
+/** One of a hold's `qc.held` events, as the release replays it. */
+export interface QcHeldArm {
+  readonly seq: number;
+  /** The catalog batch the held units belong to (null on an untracked SKU). */
+  readonly batchRef: string | null;
+  /** The held magnitude (positive) — exactly what release must return. */
+  readonly quantity: number;
 }

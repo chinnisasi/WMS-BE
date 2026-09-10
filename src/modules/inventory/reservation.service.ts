@@ -3,10 +3,11 @@ import { and, eq, inArray, notExists, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { inventoryQuarantines, reservations, stockOnHand } from '../../shared/db/schema';
+import { bins, inventoryQuarantines, reservations, stockOnHand } from '../../shared/db/schema';
 import type { Reservation } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
+import { QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
 import { nowIso } from '../../shared/primitives/time';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { isUniqueViolationOn, ProblemException } from '../../shared/problem-details/problem.exception';
@@ -40,14 +41,38 @@ export const COUNTER_TTL_SECONDS = 7 * 24 * 3600;
 export const REAP_BATCH = 100;
 
 /**
- * Zero-valued named hooks (story 2.3 boundary): QC holds and channel buffers
- * subtract from ATP but have no surface in this story — these are the
- * zero-valued placeholders where Epic 4/7 will plug in their (scope-aware)
- * computations, so the formula `on-hand − reserved − QC-held − buffer` never
- * changes.
+ * The named hooks (story 2.3 boundary): QC holds and channel buffers
+ * subtract from ATP. Story 3.4 populates the QC hook — the held quantity is
+ * exactly the stock sitting in the warehouse's system QC-hold bin (a real
+ * ledger movement put it there), so the computation reads `stock_on_hand`
+ * joined to the `QC-HOLD` system bin — no cross-module hold-table read.
+ * `bufferUnits` stays the zero-valued placeholder Epic 7 plugs in, so the
+ * formula `on-hand − reserved − QC-held − buffer` never changes.
  */
-export function qcHeldUnits(): number {
-  return 0;
+export async function qcHeldUnits(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  skuId: string,
+): Promise<number> {
+  const rows = await tx
+    .select({ held: sql<number>`coalesce(sum(${stockOnHand.quantity}), 0)::int` })
+    .from(stockOnHand)
+    .innerJoin(bins, eq(bins.id, stockOnHand.binId))
+    .where(
+      and(
+        eq(stockOnHand.tenantId, tenantId),
+        eq(stockOnHand.warehouseId, warehouseId),
+        eq(stockOnHand.skuId, skuId),
+        // The QC-hold bin is system master data (tenancy-owned) read here
+        // only to locate the stock scope — no write, ever.
+        eq(bins.tenantId, tenantId),
+        eq(bins.warehouseId, warehouseId),
+        eq(bins.code, QC_HOLD_BIN_CODE),
+        eq(bins.systemOwned, true),
+      ),
+    );
+  return rows[0]?.held ?? 0;
 }
 
 export function bufferUnits(): number {
@@ -91,9 +116,9 @@ export interface AtpSnapshot {
   readonly onHand: number;
   /** The Valkey counter (the live reserved units). */
   readonly reserved: number;
-  /** Named hook — zero in this story. */
+  /** Story 3.4: the units parked in the warehouse's system QC-hold bin. */
   readonly qcHeld: number;
-  /** Named hook — zero in this story. */
+  /** Named hook — zero in this story (Epic 7 populates it). */
   readonly buffer: number;
   /** `max(0, onHand − reserved − qcHeld − buffer)` — never oversells. */
   readonly atp: number;
@@ -255,6 +280,9 @@ export class ReservationService implements OnModuleInit {
     const probe = await withTenantTransaction(this.db, tenantId, async (tx) => ({
       existing: await this.findOpenHold(tx, command),
       ceiling: await this.committedCeiling(tx, tenantId, warehouseId, skuId),
+      // Story 3.4: a refused grant names the QC-held units when any — the
+      // ceiling is lower than plain on-hand because a hold parked stock.
+      qcHeld: await qcHeldUnits(tx, tenantId, warehouseId, skuId),
     }));
     if (probe.existing !== undefined) {
       return this.idempotentHit(probe.existing, command);
@@ -266,8 +294,9 @@ export class ReservationService implements OnModuleInit {
     });
     if (!granted) {
       throw unavailable(
-        `SKU ${skuId} has ${probe.ceiling} sellable unit(s) in warehouse ${warehouseId} — ` +
-          `the request for ${command.quantity} cannot be reserved.`,
+        `SKU ${skuId} has ${probe.ceiling} sellable unit(s) in warehouse ${warehouseId}` +
+          (probe.qcHeld > 0 ? ` (of which ${probe.qcHeld} are QC-held)` : '') +
+          ` — the request for ${command.quantity} cannot be reserved.`,
       );
     }
 
@@ -401,19 +430,23 @@ export class ReservationService implements OnModuleInit {
 
   /**
    * Real-time ATP (story 2.3): `on-hand (open-quarantined scopes excluded) −
-   * reserved − QC-held − buffer` (the hooks are zero-valued). Fails closed
-   * (503) when Valkey is unreachable or its counters are not loaded — a read
-   * that cannot prove the reserved figure never invents one. A missing
-   * counter under a ready marker is divergence: healed from the journal
-   * (Postgres wins) before the read.
+   * reserved − QC-held − buffer` (the QC hook reads its real source since
+   * 3.4; the buffer hook stays zero-valued). Fails closed (503) when Valkey
+   * is unreachable or its counters are not loaded — a read that cannot prove
+   * the reserved figure never invents one. A missing counter under a ready
+   * marker is divergence: healed from the journal (Postgres wins) before the
+   * read.
    */
   async atp(tenantId: string, warehouseId: string, skuId: string): Promise<AtpSnapshot> {
     requireUuid(tenantId, 'tenantId');
     requireUuid(warehouseId, 'warehouseId');
     requireUuid(skuId, 'skuId');
-    const onHand = await withTenantTransaction(this.db, tenantId, (tx) =>
-      this.committedOnHand(tx, tenantId, warehouseId, skuId),
-    );
+    const { onHand, qcHeld } = await withTenantTransaction(this.db, tenantId, async (tx) => ({
+      onHand: await this.committedOnHand(tx, tenantId, warehouseId, skuId),
+      // Story 3.4: the QC hook reads its real source — the stock sitting in
+      // the warehouse's system QC-hold bin (same committed-read tx).
+      qcHeld: await qcHeldUnits(tx, tenantId, warehouseId, skuId),
+    }));
     const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
     const readyKey = reservationReadyKey(tenantId, warehouseId);
 
@@ -451,7 +484,6 @@ export class ReservationService implements OnModuleInit {
       throw this.valkeyDown(err, 'ATP read');
     }
 
-    const qcHeld = qcHeldUnits();
     const buffer = bufferUnits();
     return {
       warehouseId,
@@ -814,8 +846,9 @@ export class ReservationService implements OnModuleInit {
   /**
    * The grant ceiling: committed on-hand for the scope with OPEN-quarantined
    * (sku, bin) rows excluded (the 2.2 flag now gates ATP), minus the named
-   * zero-valued hooks. Read-committed: the committed projection is what a
-   * grant may promise against.
+   * hooks — the QC-held figure reads its real source since 3.4 (the stock
+   * sitting in the system QC-hold bin is unpromisable). Read-committed: the
+   * committed projection is what a grant may promise against.
    */
   private async committedCeiling(
     tx: TenantTx,
@@ -824,7 +857,8 @@ export class ReservationService implements OnModuleInit {
     skuId: string,
   ): Promise<number> {
     const onHand = await this.committedOnHand(tx, tenantId, warehouseId, skuId);
-    return Math.max(0, onHand - qcHeldUnits() - bufferUnits());
+    const qcHeld = await qcHeldUnits(tx, tenantId, warehouseId, skuId);
+    return Math.max(0, onHand - qcHeld - bufferUnits());
   }
 
   /** Committed on-hand, excluding every open-quarantined (sku, bin) scope. */
