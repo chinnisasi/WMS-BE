@@ -185,6 +185,11 @@ export type Zone = typeof zones.$inferSelect;
  * staging. `blocked` marks broken bins (default false). A created bin is
  * immediately usable downstream — no dormant state. `zone_id` → `zones.id` by
  * uuid column (no FK), validated in the command transaction.
+ *
+ * Story 3.3 adds `system_owned` (additive, default false): the tenancy
+ * facade's auto-created system Receiving bin per warehouse is flagged here so
+ * putaway suggestions (3.5) and picking exclude it. Only the tenancy
+ * receiving-bin facade sets it true; user-created bins are always false.
  */
 export const bins = pgTable(
   'bins',
@@ -199,6 +204,7 @@ export const bins = pgTable(
     capacity: integer('capacity').notNull(),
     type: text('type').notNull(),
     blocked: boolean('blocked').notNull().default(false),
+    systemOwned: boolean('system_owned').notNull().default(false),
     ...tenantTimestamps,
   },
   (table) => [
@@ -1061,7 +1067,150 @@ export const devices = pgTable(
       .where(sql`enrollment_code_hash is not null`),
     // The Settings device list (keyset cursor, newest first).
     index('devices_created_at_id_idx').on(table.createdAt, table.id),
+    // Story 3.2 hand-appended in 0012 (the audit_events tenant-led
+    // convention) — recorded here so the next generate run no longer diffs it
+    // away (drizzle cannot see migration-time hand-appends in old snapshots).
+    index('devices_tenant_id_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
   ],
 );
 
 export type Device = typeof devices.$inferSelect;
+
+/**
+ * Goods receipt notes (Story 3.3 — the inbound module's receipt path): one
+ * row per GRN, the physical-truth record of a delivery. `code` is
+ * **server-assigned**, human-readable and unique per tenant
+ * (`GRN-<n>` zero-padded sequence — the receive command allocates it under a
+ * tenant advisory lock; the unique index is the backstop). `po_id` is null on
+ * a blind receipt, which must carry `blind_reason_code` from the fixed enum
+ * (the DB CHECK enforces the pairing both ways); the web Inbound surface
+ * flags blind GRNs for PO-matching.
+ *
+ * `occurred_at` is the **device time** the receipt happened; `recorded_at`
+ * the server ingest instant (AD-1 — queued receipts replay later). The
+ * recording actor is the badge-in operator (`recorded_by`) on the device
+ * (`device_id`); uuid columns, no FKs — asserted in the command transaction.
+ *
+ * RLS policy + status/blind CHECKs live **only in the migration SQL** (0013,
+ * the 0005→0012 pattern).
+ */
+export const goodsReceiptNotes = pgTable(
+  'goods_receipt_notes',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    code: text('code').notNull(),
+    poId: uuid('po_id'),
+    blindReasonCode: text('blind_reason_code'),
+    status: text('status').notNull().default('recorded'),
+    deviceId: uuid('device_id').notNull(),
+    recordedBy: uuid('recorded_by').notNull(),
+    occurredAt: timestamp('occurred_at', { withTimezone: true, mode: 'string' }).notNull(),
+    recordedAt: timestamp('recorded_at', { withTimezone: true, mode: 'string' }).notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('goods_receipt_notes_tenant_id_code_unique').on(table.tenantId, table.code),
+    // GRN-list keyset pagination (the Inbound surface's list read).
+    index('goods_receipt_notes_tenant_created_at_id_idx').on(
+      table.tenantId,
+      table.createdAt,
+      table.id,
+    ),
+    index('goods_receipt_notes_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type GoodsReceiptNote = typeof goodsReceiptNotes.$inferSelect;
+
+/**
+ * GRN lines (Story 3.3): one row per received (sku, batch) line — **physical
+ * truth**: `qty` is everything that physically arrived, `applied_qty` the
+ * within-open-quantity portion that applied immediately (ledger +
+ * `received_qty`); the difference pends as an `over_receipts` row until the
+ * Ops Manager decides. `po_line_id` is null on blind lines; `batch_id` is the
+ * catalog-owned batch identity (`batches.id` — created through
+ * `CatalogFacade.ensureBatches`, never a direct write; null on non-batch-
+ * tracked SKUs). Quantities are positive / non-negative integers in base UoM
+ * (DB CHECKs in 0013).
+ *
+ * RLS policy + quantity CHECKs live **only in the migration SQL** (0013).
+ */
+export const goodsReceiptLines = pgTable(
+  'goods_receipt_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    grnId: uuid('grn_id').notNull(),
+    poLineId: uuid('po_line_id'),
+    skuId: uuid('sku_id').notNull(),
+    batchId: uuid('batch_id'),
+    qty: integer('qty').notNull(),
+    appliedQty: integer('applied_qty').notNull().default(0),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One GRN's lines, in receipt order (the detail/summary read).
+    index('goods_receipt_lines_grn_id_idx').on(table.grnId, table.createdAt, table.id),
+    // Tenant-led list scans (RLS sessions filter tenant_id first).
+    index('goods_receipt_lines_tenant_id_idx').on(table.tenantId),
+  ],
+);
+
+export type GoodsReceiptLine = typeof goodsReceiptLines.$inferSelect;
+
+/**
+ * Pending over-receipts (Story 3.3): one row per GRN line whose physically
+ * received quantity exceeded the PO line's open quantity — the excess held
+ * for Ops Manager (or Owner) approval (FR-8). Applied to inventory ONLY on
+ * approval (a `grn.received` ledger event + `received_qty` bump, one
+ * transaction); rejection leaves it unapplied and audit-trailed. `status` is
+ * `pending → approved | rejected` (conditional UPDATE — a second decision is
+ * a deterministic 409).
+ *
+ * RLS policy + status/quantity CHECKs live **only in the migration SQL** (0013).
+ */
+export const overReceipts = pgTable(
+  'over_receipts',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    grnId: uuid('grn_id').notNull(),
+    grnLineId: uuid('grn_line_id').notNull(),
+    poId: uuid('po_id'),
+    poLineId: uuid('po_line_id'),
+    skuId: uuid('sku_id').notNull(),
+    excessQty: integer('excess_qty').notNull(),
+    status: text('status').notNull().default('pending'),
+    requestedBy: uuid('requested_by').notNull(),
+    requestedAt: timestamp('requested_at', { withTimezone: true, mode: 'string' }).notNull(),
+    decidedBy: uuid('decided_by'),
+    decidedAt: timestamp('decided_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The Conflicts & Reviews queue read (status filter first).
+    index('over_receipts_tenant_status_created_at_id_idx').on(
+      table.tenantId,
+      table.status,
+      table.createdAt,
+      table.id,
+    ),
+    index('over_receipts_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+  ],
+);
+
+export type OverReceipt = typeof overReceipts.$inferSelect;

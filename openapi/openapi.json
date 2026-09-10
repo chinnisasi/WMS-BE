@@ -3985,6 +3985,659 @@
           "inbound"
         ]
       }
+    },
+    "/tenants/{tenantId}/receiving/goods-receipts": {
+      "post": {
+        "operationId": "ReceivingController_submitGoodsReceipt",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitGoodsReceiptDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "GRN recorded: server-assigned code, per-line physical/applied/excess quantities, ledger events for the applied portion (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoodsReceiptResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown or revoked device (device-revoked), or the operator was demoted to accountant (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse, purchase order, or a line's SKU does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The PO is not open (po-not-open, naming the status), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "grn.submit — records a whole goods receipt exactly once (badge-in session required); the excess over a line's open quantity pends for Ops Manager approval",
+        "tags": [
+          "receiving"
+        ]
+      },
+      "get": {
+        "operationId": "ReceivingController_listGoodsReceipts",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Narrow to one warehouse",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The GRN page (headers with line/unit sums — the Inbound surface's list read)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoodsReceiptListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor (invalid-cursor), malformed warehouseId, or out-of-range limit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouseId filter names a warehouse outside this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists goods receipt notes (keyset cursor pagination, warehouse-filterable — open to any member)",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/devices/catalog-snapshot": {
+      "get": {
+        "operationId": "ReceivingController_getCatalogSnapshot",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "query",
+            "description": "Warehouse the snapshot is scoped to",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The warehouse's SKU scan identity + open purchase orders with per-line quantities",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogSnapshotResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed warehouseId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown or revoked device (device-revoked)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The device catalog snapshot (badge-in session required): SKU barcode map + open PO lines for the offline decision mirror (AD-4)",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/over-receipts": {
+      "get": {
+        "operationId": "ReceivingController_listOverReceipts",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "approved",
+                "rejected"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OverReceiptListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed status, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists over-receipts (keyset cursor pagination, status-filterable — the Conflicts & Reviews queue read)",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/over-receipts/{overReceiptId}/approve": {
+      "post": {
+        "operationId": "ReceivingController_approveOverReceipt",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "overReceiptId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OverReceiptDecisionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed overReceiptId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks review.decide (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No over-receipt with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already approved/rejected (over-receipt-decided), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Approves an over-receipt (review.decide) — a grn.received ledger event applies the excess and received_qty bumps; audited",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/over-receipts/{overReceiptId}/reject": {
+      "post": {
+        "operationId": "ReceivingController_rejectOverReceipt",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "overReceiptId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OverReceiptDecisionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed overReceiptId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks review.decide (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No over-receipt with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already approved/rejected (over-receipt-decided), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Rejects an over-receipt (review.decide) — the excess stays unapplied; audited",
+        "tags": [
+          "receiving"
+        ]
+      }
     }
   },
   "info": {
@@ -5541,21 +6194,34 @@
           },
           "reasonCode": {
             "type": "string",
-            "description": "Machine reason for the correction (e.g. stock-count)"
+            "description": "Machine reason for the correction (e.g. stock-count) — manual-adjustment arm only"
           },
           "note": {
             "type": "string",
-            "description": "The Ops Manager's note, carried verbatim"
+            "description": "The Ops Manager's note, carried verbatim — manual-adjustment arm only"
           },
           "overrideReason": {
             "type": "string",
             "description": "The recorded reason when a draw overrode the FEFO default batch (absent on every other adjustment)"
+          },
+          "grnId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The GRN the movement landed under (grn-receipt arm only)"
+          },
+          "poId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The PO received against (grn-receipt arm only — absent on a blind receipt)"
+          },
+          "poLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The exact PO line (grn-receipt arm only — absent on the blind arm)"
           }
         },
         "required": [
-          "kind",
-          "reasonCode",
-          "note"
+          "kind"
         ]
       },
       "LedgerEventDto": {
@@ -6234,8 +6900,7 @@
           },
           "openQty": {
             "type": "number",
-            "description": "Derived: orderedQty − receivedQty",
-            "minimum": 0
+            "description": "Derived: orderedQty − receivedQty (may go negative after an approved over-receipt — Story 3.3 relaxes the 3.1 `minimum: 0` bound)"
           },
           "unitCostPaise": {
             "type": "number",
@@ -6437,6 +7102,600 @@
         "required": [
           "purchaseOrder",
           "successor"
+        ]
+      },
+      "GrnLineInputDto": {
+        "type": "object",
+        "properties": {
+          "poLineId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The PO line received against — null on a blind receipt's lines"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Catalog batch code (required for batch-tracked SKUs, forbidden otherwise)",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "mfgDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "Optional batch mfg date (ISO-8601 UTC, Z-suffixed)",
+            "minLength": 20,
+            "maxLength": 35
+          },
+          "qty": {
+            "type": "number",
+            "description": "Physically received quantity in base UoM (positive integer, at most 2147483647 — the int4 bound of the line table)",
+            "minimum": 1,
+            "maximum": 2147483647
+          }
+        },
+        "required": [
+          "skuId",
+          "qty"
+        ]
+      },
+      "SubmitGoodsReceiptDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Warehouse the receipt lands in"
+          },
+          "poId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The purchase order received against — null on a blind receipt"
+          },
+          "blindReasonCode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "unannounced-delivery",
+              "po-not-found",
+              "other"
+            ],
+            "description": "The blind-receive reason code (required when poId is null, forbidden otherwise)"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time of the receipt (ISO-8601 UTC, Z-suffixed)",
+            "minLength": 20,
+            "maxLength": 35
+          },
+          "lines": {
+            "minItems": 1,
+            "maxItems": 200,
+            "description": "The physically received lines",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GrnLineInputDto"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "occurredAt",
+          "lines"
+        ]
+      },
+      "GrnLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "poLineId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "description": "Physical truth: everything that arrived",
+            "minimum": 1
+          },
+          "appliedQty": {
+            "type": "number",
+            "description": "The within-open portion applied immediately",
+            "minimum": 0
+          },
+          "excessQty": {
+            "type": "number",
+            "description": "The excess pended for approval",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "id",
+          "grnId",
+          "poLineId",
+          "skuId",
+          "batchId",
+          "batchCode",
+          "qty",
+          "appliedQty",
+          "excessQty"
+        ]
+      },
+      "RejectedGrnLineDto": {
+        "type": "object",
+        "properties": {
+          "poLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "qty": {
+            "type": "number",
+            "minimum": 1
+          },
+          "code": {
+            "type": "string",
+            "description": "Machine reason (po-line-not-found | po-line-not-open)"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Human-readable reason naming the line state"
+          }
+        },
+        "required": [
+          "poLineId",
+          "skuId",
+          "qty",
+          "code",
+          "reason"
+        ]
+      },
+      "GoodsReceiptDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "Server-assigned code (GRN-<n>, unique per tenant)"
+          },
+          "poId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "blindReasonCode": {
+            "type": "string",
+            "enum": [
+              "unannounced-delivery",
+              "po-not-found",
+              "other"
+            ],
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "description": "recorded (the v1 terminal state)"
+          },
+          "deviceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "recordedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time (AD-1), ISO-8601 UTC"
+          },
+          "recordedAt": {
+            "type": "string",
+            "description": "Server ingest time (AD-1), ISO-8601 UTC"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GrnLineDto"
+            }
+          },
+          "rejectedLines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RejectedGrnLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "code",
+          "poId",
+          "blindReasonCode",
+          "status",
+          "deviceId",
+          "recordedBy",
+          "occurredAt",
+          "recordedAt",
+          "lines"
+        ]
+      },
+      "GoodsReceiptResponse": {
+        "type": "object",
+        "properties": {
+          "goodsReceipt": {
+            "$ref": "#/components/schemas/GoodsReceiptDto"
+          }
+        },
+        "required": [
+          "goodsReceipt"
+        ]
+      },
+      "CatalogSnapshotSkuDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "barcode": {
+            "type": "string"
+          },
+          "uom": {
+            "type": "string"
+          },
+          "batchTracked": {
+            "type": "boolean"
+          },
+          "serialTracked": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "name",
+          "barcode",
+          "uom",
+          "batchTracked",
+          "serialTracked"
+        ]
+      },
+      "CatalogSnapshotPoDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "vendorId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "lines": {
+            "description": "Per-line ordered / received / open quantities",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PurchaseOrderLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "warehouseId",
+          "vendorId",
+          "lines"
+        ]
+      },
+      "CatalogSnapshotResponse": {
+        "type": "object",
+        "properties": {
+          "generatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC capture time"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skus": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogSnapshotSkuDto"
+            }
+          },
+          "openPurchaseOrders": {
+            "description": "The warehouse's open POs with their lines",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogSnapshotPoDto"
+            }
+          }
+        },
+        "required": [
+          "generatedAt",
+          "warehouseId",
+          "skus",
+          "openPurchaseOrders"
+        ]
+      },
+      "GoodsReceiptEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "Server-assigned code (GRN-<n>)"
+          },
+          "poId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "blindReasonCode": {
+            "type": "string",
+            "enum": [
+              "unannounced-delivery",
+              "po-not-found",
+              "other"
+            ],
+            "nullable": true,
+            "description": "Set only on a blind receipt"
+          },
+          "status": {
+            "type": "string",
+            "description": "recorded (the v1 terminal state)"
+          },
+          "recordedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time (ISO-8601 UTC)"
+          },
+          "recordedAt": {
+            "type": "string",
+            "description": "Server ingest time (ISO-8601 UTC)"
+          },
+          "lineCount": {
+            "type": "number",
+            "description": "Received (sku, batch) lines"
+          },
+          "totalUnits": {
+            "type": "number",
+            "description": "Physical units across all lines"
+          },
+          "appliedUnits": {
+            "type": "number",
+            "description": "Units applied immediately (the excess pends)"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "Row creation time (the keyset cursor field), ISO-8601 UTC"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "code",
+          "poId",
+          "blindReasonCode",
+          "status",
+          "recordedBy",
+          "occurredAt",
+          "recordedAt",
+          "lineCount",
+          "totalUnits",
+          "appliedUnits",
+          "createdAt"
+        ]
+      },
+      "GoodsReceiptListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GoodsReceiptEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "OverReceiptDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnCode": {
+            "type": "string",
+            "description": "The GRN code (server-assigned)"
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "poId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "poLineId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "excessQty": {
+            "type": "number",
+            "description": "The excess held for approval (positive integer)",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "approved",
+              "rejected"
+            ]
+          },
+          "requestedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "requestedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "decidedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "decidedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "Row creation time (the keyset cursor field), ISO-8601 UTC"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "grnId",
+          "grnCode",
+          "grnLineId",
+          "poId",
+          "poLineId",
+          "skuId",
+          "excessQty",
+          "status",
+          "requestedBy",
+          "requestedAt",
+          "decidedBy",
+          "decidedAt",
+          "createdAt"
+        ]
+      },
+      "OverReceiptListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OverReceiptDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "OverReceiptDecisionResponse": {
+        "type": "object",
+        "properties": {
+          "overReceipt": {
+            "$ref": "#/components/schemas/OverReceiptDto"
+          }
+        },
+        "required": [
+          "overReceipt"
         ]
       }
     }

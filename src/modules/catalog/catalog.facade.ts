@@ -127,6 +127,40 @@ export class CatalogFacade {
     });
   }
 
+  /**
+   * The full SKU scan surface (Story 3.3, device catalog snapshot): every
+   * SKU's scan identity — code, barcode, UoM, tracking flags. Barcode is
+   * never null in the catalog (import defaults it to the code), so the
+   * snapshot carries it as a plain string.
+   */
+  async getSkuSummaries(tenantId: string): Promise<
+    ReadonlyArray<{
+      readonly id: string;
+      readonly code: string;
+      readonly name: string;
+      readonly barcode: string;
+      readonly uom: string;
+      readonly batchTracked: boolean;
+      readonly serialTracked: boolean;
+    }>
+  > {
+    return withTenantTransaction(this.db, tenantId, async (tx) =>
+      tx
+        .select({
+          id: skus.id,
+          code: skus.code,
+          name: skus.name,
+          barcode: skus.barcode,
+          uom: skus.uom,
+          batchTracked: skus.batchTracked,
+          serialTracked: skus.serialTracked,
+        })
+        .from(skus)
+        .where(eq(skus.tenantId, tenantId))
+        .orderBy(skus.code),
+    );
+  }
+
   /** Batch identities of one SKU — the expiry half of the api layer's FEFO join. */
   async getBatches(tenantId: string, skuId: string): Promise<BatchIdentity[]> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
@@ -201,55 +235,71 @@ export class CatalogFacade {
    * their ORIGINAL mfg/expiry (a retry with different dates never rewrites
    * identity). Fails closed: 404 unknown SKU, 400 non-batch-tracked SKU.
    * A batch+serial-tracked SKU may carry both arms — the two ensures compose.
+   *
+   * Story 3.3 splits the body into `ensureBatchesInTx` so a caller that
+   * composes batch identity into a larger write (the GRN command: batch
+   * identity + ledger event + relational state in ONE transaction) can run
+   * the same ensure inside its own tenant transaction; this wrapper keeps
+   * the standalone entry exactly as before.
    */
   async ensureBatches(
     tenantId: string,
     skuId: string,
     inputs: readonly EnsureBatchInput[],
   ): Promise<BatchIdentity[]> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      await this.assertSkuTracked(tx, tenantId, skuId, 'batchTracked', 'batch');
-      const codes = [...new Set(inputs.map((input) => input.code))];
-      if (codes.length > 0) {
-        await tx
-          .insert(batches)
-          .values(
-            // Deduplicated: one insert tuple per distinct code (the first
-            // occurrence's dates win — ensure is identity creation, not edit).
-            codes.map((code) => {
-              const input = inputs.find((candidate) => candidate.code === code)!;
-              return {
-                id: uuidv7(),
-                tenantId,
-                skuId,
-                code,
-                mfgDate: input.mfgDate ?? null,
-                expiryDate: input.expiryDate ?? null,
-              };
-            }),
-          )
-          // The unique index is the race backstop; the re-select below is
-          // the source of truth for what exists now.
-          .onConflictDoNothing({
-            target: [batches.tenantId, batches.skuId, batches.code],
-          });
-      }
-      const rows =
-        codes.length === 0
-          ? []
-          : await tx
-              .select({
-                id: batches.id,
-                code: batches.code,
-                mfgDate: batches.mfgDate,
-                expiryDate: batches.expiryDate,
-                status: batches.status,
-              })
-              .from(batches)
-              .where(and(eq(batches.tenantId, tenantId), eq(batches.skuId, skuId), inArray(batches.code, codes)));
-      // Aligned to the caller's input order (duplicates share their row).
-      return inputs.map((input) => rows.find((row) => row.code === input.code)!);
-    });
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.ensureBatchesInTx(tx, tenantId, skuId, inputs),
+    );
+  }
+
+  /** The in-transaction body of `ensureBatches` (see above for the contract). */
+  async ensureBatchesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuId: string,
+    inputs: readonly EnsureBatchInput[],
+  ): Promise<BatchIdentity[]> {
+    await this.assertSkuTracked(tx, tenantId, skuId, 'batchTracked', 'batch');
+    const codes = [...new Set(inputs.map((input) => input.code))];
+    if (codes.length > 0) {
+      await tx
+        .insert(batches)
+        .values(
+          // Deduplicated: one insert tuple per distinct code (the first
+          // occurrence's dates win — ensure is identity creation, not edit).
+          codes.map((code) => {
+            const input = inputs.find((candidate) => candidate.code === code)!;
+            return {
+              id: uuidv7(),
+              tenantId,
+              skuId,
+              code,
+              mfgDate: input.mfgDate ?? null,
+              expiryDate: input.expiryDate ?? null,
+            };
+          }),
+        )
+        // The unique index is the race backstop; the re-select below is
+        // the source of truth for what exists now.
+        .onConflictDoNothing({
+          target: [batches.tenantId, batches.skuId, batches.code],
+        });
+    }
+    const rows =
+      codes.length === 0
+        ? []
+        : await tx
+            .select({
+              id: batches.id,
+              code: batches.code,
+              mfgDate: batches.mfgDate,
+              expiryDate: batches.expiryDate,
+              status: batches.status,
+            })
+            .from(batches)
+            .where(and(eq(batches.tenantId, tenantId), eq(batches.skuId, skuId), inArray(batches.code, codes)));
+    // Aligned to the caller's input order (duplicates share their row).
+    return inputs.map((input) => rows.find((row) => row.code === input.code)!);
   }
 
   /**

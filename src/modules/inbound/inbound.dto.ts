@@ -265,7 +265,9 @@ export class PurchaseOrderLineDto {
   @ApiProperty({ description: 'Received-to-date in base UoM (0 until 3.3 receipts land)', minimum: 0 })
   receivedQty!: number;
 
-  @ApiProperty({ description: 'Derived: orderedQty − receivedQty', minimum: 0 })
+  @ApiProperty({
+    description: 'Derived: orderedQty − receivedQty (may go negative after an approved over-receipt — Story 3.3 relaxes the 3.1 `minimum: 0` bound)',
+  })
   openQty!: number;
 
   @ApiProperty({ description: 'Unit cost as integer paise' })

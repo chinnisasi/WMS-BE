@@ -4,6 +4,7 @@ import { EchoController } from './echo.controller';
 import { DevicesController } from './devices.controller';
 import { InventoryController } from './inventory.controller';
 import { InboundController } from './inbound.controller';
+import { ReceivingController } from './receiving.controller';
 import { OpenApiController } from './openapi.controller';
 import { NotFoundController } from './not-found.controller';
 import { OpenApiDocumentHolder } from './openapi-document.holder';
@@ -30,6 +31,10 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
  * close/list/detail) rides the same shape — `InboundModule` is a
  * spine-singleton already imported by the root; every mutation goes through
  * `InboundFacade`.
+ *
+ * Story 3.3: the receiving surface (device `grn.submit` + catalog snapshot,
+ * web GRN list + over-receipt queue/approvals) rides the same shape —
+ * `ReceivingController` consumes `ReceivingFacade` only.
  */
 @Module({
   imports: [InventoryModule, InboundModule, CatalogModule, TenancyModule],
@@ -39,6 +44,7 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
     DevicesController,
     InventoryController,
     InboundController,
+    ReceivingController,
     OpenApiController,
     NotFoundController,
   ],

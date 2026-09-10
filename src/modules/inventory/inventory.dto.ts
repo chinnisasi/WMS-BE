@@ -237,24 +237,54 @@ export class StockAdjustmentResponse {
 
 /**
  * The typed `reference_doc` union arm as it exists today (AD-11) — the
- * timeline's passthrough. Future event kinds extend the union additively;
- * this DTO documents the shape clients see today.
+ * timeline's passthrough. Story 3.3 adds the additive `grn-receipt` arm
+ * ({kind, grnId, poId?, poLineId?}); future event kinds extend the union
+ * additively — this DTO documents the shape clients see.
  */
 export class LedgerReferenceDocDto {
   @ApiProperty({ example: 'manual-adjustment', description: 'Discriminator of the typed reference union' })
   kind!: string;
 
-  @ApiProperty({ description: 'Machine reason for the correction (e.g. stock-count)' })
-  reasonCode!: string;
+  @ApiProperty({
+    required: false,
+    description: 'Machine reason for the correction (e.g. stock-count) — manual-adjustment arm only',
+  })
+  reasonCode?: string;
 
-  @ApiProperty({ description: "The Ops Manager's note, carried verbatim" })
-  note!: string;
+  @ApiProperty({
+    required: false,
+    description: "The Ops Manager's note, carried verbatim — manual-adjustment arm only",
+  })
+  note?: string;
 
   @ApiProperty({
     required: false,
     description: 'The recorded reason when a draw overrode the FEFO default batch (absent on every other adjustment)',
   })
   overrideReason?: string;
+
+  // ── the grn-receipt arm (Story 3.3, additive) ─────────────────────────────
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'The GRN the movement landed under (grn-receipt arm only)',
+  })
+  grnId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'The PO received against (grn-receipt arm only — absent on a blind receipt)',
+  })
+  poId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'The exact PO line (grn-receipt arm only — absent on the blind arm)',
+  })
+  poLineId?: string;
 }
 
 /** One event-timeline row. */

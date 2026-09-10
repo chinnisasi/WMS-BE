@@ -1,8 +1,12 @@
 import { Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
+import { CatalogModule } from '../catalog/catalog.module';
+import { InventoryModule } from '../inventory/inventory.module';
 import { VendorCommand } from './vendors.command';
 import { PurchaseOrderCommand } from './po.command';
 import { InboundFacade } from './inbound.facade';
+import { ReceivingCommand } from './receiving.command';
+import { ReceivingFacade } from './receiving.facade';
 
 /**
  * Inbound module (Story 3.1): vendor master data and the purchase-order
@@ -15,10 +19,17 @@ import { InboundFacade } from './inbound.facade';
  * and nothing else); the tenancy helpers the commands use at entry
  * (`assertPermission`, `getMemberRoleIn`, `assertWarehouseInTenant`) are the
  * shared command-entry pattern's file-level functions.
+ *
+ * Story 3.3 adds the receipt half: `goods_receipt_notes`, `goods_receipt_lines`,
+ * and `over_receipts` are this module's tables. The `ReceivingCommand`
+ * composes cross-module through the facades only (AD-6) — batch identity via
+ * `CatalogFacade`, ledger events via `InventoryFacade` — so the module
+ * imports `CatalogModule` and `InventoryModule` (both export only their
+ * facades; neither imports back into inbound, so no cycles).
  */
 @Module({
-  imports: [SharedModule],
-  providers: [VendorCommand, PurchaseOrderCommand, InboundFacade],
-  exports: [InboundFacade],
+  imports: [SharedModule, CatalogModule, InventoryModule],
+  providers: [VendorCommand, PurchaseOrderCommand, InboundFacade, ReceivingCommand, ReceivingFacade],
+  exports: [InboundFacade, ReceivingFacade],
 })
 export class InboundModule {}
