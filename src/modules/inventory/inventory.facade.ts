@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { batchOnHand, ledgerEvents, stockOnHand } from '../../shared/db/schema';
@@ -514,6 +514,78 @@ export class InventoryFacade {
     ids: readonly string[],
   ): Promise<ReservationSnapshot[]> {
     return this.reservations.reservationsByIdsInTx(tx, tenantId, ids);
+  }
+
+  /**
+   * Per-bin on-hand for a SET of SKUs, inside the caller's transaction
+   * (story 4.2 — the wave planner's bin walk). The `reservationsByIdsInTx`
+   * shape: the outbound module composes this read with its own writes in ONE
+   * tenant transaction, so the plan it commits is the stock it saw. Only
+   * positive rows come back (a zeroed projection row is not a pick stop).
+   *
+   * This is a READ of the projection, never an allocation: nothing in the
+   * system allocates stock to a bin (a reservation binds to (tenant,
+   * warehouse, sku, owner) and carries no bin), so what the caller does with
+   * these rows is a suggestion re-derived at execution time.
+   */
+  async stockByBinsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuIds: readonly string[],
+  ): Promise<ReadonlyArray<{ skuId: string; binId: string; quantity: number }>> {
+    if (skuIds.length === 0) {
+      return [];
+    }
+    return tx
+      .select({
+        skuId: stockOnHand.skuId,
+        binId: stockOnHand.binId,
+        quantity: stockOnHand.quantity,
+      })
+      .from(stockOnHand)
+      .where(
+        and(
+          eq(stockOnHand.tenantId, tenantId),
+          eq(stockOnHand.warehouseId, warehouseId),
+          inArray(stockOnHand.skuId, [...new Set(skuIds)]),
+          sql`${stockOnHand.quantity} > 0`,
+        ),
+      );
+  }
+
+  /**
+   * The batch-arm sibling of `stockByBinsInTx` (story 4.2): per (sku, bin,
+   * batch) on-hand for a set of SKUs, in the caller's transaction — the
+   * FEFO half of a pick suggestion. A SKU with no batch rows simply comes
+   * back absent (an untracked SKU's pick line names no batch).
+   */
+  async batchOnHandByBinsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuIds: readonly string[],
+  ): Promise<readonly BatchOnHandEntry[]> {
+    if (skuIds.length === 0) {
+      return [];
+    }
+    return tx
+      .select({
+        warehouseId: batchOnHand.warehouseId,
+        skuId: batchOnHand.skuId,
+        binId: batchOnHand.binId,
+        batchId: batchOnHand.batchId,
+        quantity: batchOnHand.quantity,
+      })
+      .from(batchOnHand)
+      .where(
+        and(
+          eq(batchOnHand.tenantId, tenantId),
+          eq(batchOnHand.warehouseId, warehouseId),
+          inArray(batchOnHand.skuId, [...new Set(skuIds)]),
+          sql`${batchOnHand.quantity} > 0`,
+        ),
+      );
   }
 
   /** Real-time ATP: on-hand (quarantine-excluded) − reserved − hooks. */
