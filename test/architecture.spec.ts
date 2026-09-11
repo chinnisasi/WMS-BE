@@ -177,9 +177,22 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
    * inventory-exclusive (AD-6): every other module reads order state
    * through `OutboundFacade` and composes stock through `InventoryFacade`;
    * nothing outside the outbound module writes these tables.
+   *
+   * Story 4.2 extends the same ownership to the wave aggregate
+   * (`wave_policies`, `waves`, `picklists`, `picklist_lines`) — the wave and
+   * picklist state machines are the outbound module's alone, and the pick
+   * path it plans is a SUGGESTION composed from stock the inventory facade
+   * hands over (never a bin-level allocation, never a stock write here).
    */
-  const ORDER_TABLES = ['orders', 'orderLines'] as const;
-  const RAW_ORDER_TABLES = 'orders|order_lines';
+  const ORDER_TABLES = [
+    'orders',
+    'orderLines',
+    'wavePolicies',
+    'waves',
+    'picklists',
+    'picklistLines',
+  ] as const;
+  const RAW_ORDER_TABLES = 'orders|order_lines|wave_policies|waves|picklists|picklist_lines';
   const outboundRoot = join(SRC_ROOT, 'modules', 'outbound');
 
   it('no order-table write happens outside the outbound module', () => {
@@ -250,5 +263,25 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     const source = readFileSync(join(outboundRoot, 'order.command.ts'), 'utf8');
     expect(drizzleWriteOn('orders').test(source)).toBe(true);
     expect(drizzleWriteOn('orderLines').test(source)).toBe(true);
+    // Story 4.2's half of the same meaningfulness guard: the wave tables are
+    // written, and written ONLY from the wave command service.
+    const waveSource = readFileSync(join(outboundRoot, 'wave.command.ts'), 'utf8');
+    for (const table of ['wavePolicies', 'waves', 'picklists', 'picklistLines'] as const) {
+      expect(drizzleWriteOn(table).test(waveSource)).toBe(true);
+    }
+  });
+
+  it('the wave aggregate writes no stock table and journals no ledger event (4.2)', () => {
+    // The boundary the spec draws for this story: a wave PLANS a pick, it
+    // never moves stock. Picking (4.3) is where a movement is journalled —
+    // if this ever fails, a second quantity-mutation path has appeared in
+    // the outbound module.
+    const waveSource = readFileSync(join(outboundRoot, 'wave.command.ts'), 'utf8');
+    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'reservations'] as const) {
+      expect(drizzleWriteOn(table).test(waveSource)).toBe(false);
+    }
+    expect(/appendLedgerEvent|grantReservation|commitReservation|releaseReservation/.test(waveSource)).toBe(
+      false,
+    );
   });
 });
