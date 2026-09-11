@@ -243,7 +243,18 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
   });
 
   afterAll(async () => {
-    await cleanupRows();
+    // The pools close even when the row cleanup fails. These suites share one
+    // Postgres server (max_connections is the shared resource), so a teardown
+    // that throws BEFORE `$client.end()` strands this app's ten connections
+    // for the rest of the run — and the failure then surfaces as an
+    // unrelated, arbitrary suite later on. Cleanup problems must stay this
+    // suite's problem.
+    let cleanupError: unknown;
+    try {
+      await cleanupRows();
+    } catch (err) {
+      cleanupError = err;
+    }
     await valkey.quit().catch(() => valkey.disconnect());
     const rawDb = app.get<unknown>(DATABASE) as { $client?: { end(): Promise<void> } };
     await rawDb.$client?.end();
@@ -251,6 +262,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     await authDb.$client?.end();
     await sql.end();
     await app.close();
+    if (cleanupError !== undefined) throw cleanupError;
   });
 
   async function cleanupRows(): Promise<void> {
@@ -430,19 +442,29 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     return res.body.wave as Wave;
   }
 
+  /**
+   * Posts a body VERBATIM. It deliberately mints nothing of its own: the
+   * server hashes the whole payload for the idempotency contract, so a
+   * helper that stamped a fresh `occurredAt` per call would make two
+   * "same-key replay" requests carry DIFFERENT payloads whenever they
+   * straddled a whole second, and the replay would correctly answer
+   * `422 idempotency-key-reuse` instead of re-serving. A replay test must
+   * send the same bytes twice — which is also what the device does: the
+   * queued op stamps `occurredAt` once at enqueue time and replays that.
+   */
   function pick(body: PickBody, token = operatorToken, key = ulid()): SupertestTest {
     return request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/picks`)
       .set('Authorization', `Bearer ${token}`)
       .set(KEY_HEADER, key)
-      .send({
-        warehouseId,
-        occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
-        ...body,
-      });
+      .send({ warehouseId, ...body });
   }
 
-  /** The pick body a planned line implies (the happy path's "scan what it says"). */
+  /**
+   * The pick body a planned line implies (the happy path's "scan what it
+   * says"), with `occurredAt` stamped ONCE — hold the returned object and
+   * re-post it to replay, exactly as a queued op does.
+   */
   function bodyFor(line: PickLine, overrides: Partial<PickBody> = {}): PickBody {
     return {
       picklistId: line.picklistId,
@@ -450,6 +472,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       skuId: line.skuId,
       binId: line.binId!,
       qty: line.qty,
+      occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
       ...overrides,
     };
   }
@@ -586,17 +609,21 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'replay');
     const line = picklist.lines[0]!;
     const key = ulid();
+    // ONE body, posted twice — the same bytes under the same key is what the
+    // replay contract is about (a re-stamped `occurredAt` would be a
+    // different payload and would rightly 422).
+    const body = bodyFor(line);
 
-    const first = await pick(bodyFor(line), operatorToken, key).expect(201);
+    const first = await pick(body, operatorToken, key).expect(201);
     const drawn = await onHand(skuId, binA);
-    const replay = await pick(bodyFor(line), operatorToken, key).expect(201);
+    const replay = await pick(body, operatorToken, key).expect(201);
     expect(replay.body.pick).toEqual(first.body.pick);
     // The replay re-serves; it never re-draws.
     expect(await onHand(skuId, binA)).toBe(drawn);
     expect(await ledgerFor(line.id)).toHaveLength(1);
 
     // The same key with a DIFFERENT payload is the deterministic 422.
-    const reused = await pick(bodyFor(line, { qty: 4 }), operatorToken, key).expect(422);
+    const reused = await pick({ ...body, qty: 4 }, operatorToken, key).expect(422);
     expect(reused.body.code).toBe('idempotency-key-reuse');
 
     // A NEW key against an already-picked line is a deterministic 409 —
@@ -619,7 +646,9 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(await onHand(skuId, binA)).toBe(0);
 
     const key = ulid();
-    const stale = await pick(bodyFor(line), operatorToken, key).expect(422);
+    // The queued op's bytes, stamped once — the parked op replays verbatim.
+    const body = bodyFor(line);
+    const stale = await pick(body, operatorToken, key).expect(422);
     expect(stale.body.code).toBe('insufficient-on-hand');
     // The rejection names the bin and what it LIVE holds.
     expect(stale.body.detail).toContain('A-01-01');
@@ -638,7 +667,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     // The op is still replayable once the stock is back — the client parks
     // it, it does not lose it.
     await seedStock(skuId, binA, 10);
-    await pick(bodyFor(line), operatorToken, key).expect(201);
+    await pick(body, operatorToken, key).expect(201);
     expect(await lineStatus(line.id)).toBe('picked');
   });
 
@@ -881,7 +910,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       .post(`${API}/${uuidv7()}/outbound/picks`)
       .set('Authorization', `Bearer ${operatorToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ ...bodyFor(line), warehouseId, occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z') })
+      .send({ ...bodyFor(line), warehouseId })
       .expect(403);
     expect(foreign.body.code).toBe('permission-denied');
 

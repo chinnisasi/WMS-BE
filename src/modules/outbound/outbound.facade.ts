@@ -357,8 +357,25 @@ export class OutboundFacade {
    */
   async getPickTasks(tenantId: string, warehouseId: string): Promise<PickTask[]> {
     return withTenantTransaction(this.db, tenantId, (tx) =>
-      this.pickCommand.getPickTasks(tx, tenantId, warehouseId),
+      this.getPickTasksInTx(tx, tenantId, warehouseId),
     );
+  }
+
+  /**
+   * The same read inside the CALLER's transaction — the device catalog
+   * snapshot's in-tx passthrough (the `reservationsByIdsInTx` shape). The
+   * snapshot composes bins, putaway tasks and pick tasks in ONE tenant
+   * transaction: a nested transaction would reserve a SECOND pooled
+   * connection while the outer one is held, and postgres.js queues
+   * connection requests with no timeout, so enough concurrent snapshots
+   * deadlock the pool permanently.
+   */
+  async getPickTasksInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<PickTask[]> {
+    return this.pickCommand.getPickTasks(tx, tenantId, warehouseId);
   }
 
   /**

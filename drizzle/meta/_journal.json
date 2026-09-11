@@ -141,6 +141,13 @@
       "when": 1789166826885,
       "tag": "0019_flippant_komodo",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1789169833577,
+      "tag": "0020_open_wendell_rand",
+      "breakpoints": true
     }
   ]
 }

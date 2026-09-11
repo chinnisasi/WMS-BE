@@ -127,6 +127,21 @@ const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 const PICKS_LINE_UNIQUE = 'picks_line_unique';
 
 /**
+ * The ceiling on pick stops the sealed device snapshot carries (story 4.3).
+ * This read rides the catalog snapshot, which every device fetches on every
+ * refresh — the one endpoint the offline substrate's latency depends on — so
+ * it is bounded rather than "however much open floor work exists". 500 stops
+ * is several full waves (a wave caps at 200 orders) and far more walking than
+ * one shift; past it, a device refreshes again after picking what it has.
+ *
+ * Truncation drops WHOLE picklists, never the tail of one: a half-delivered
+ * walk would make the device's "next walk bin holding this SKU" hint point at
+ * a stop the snapshot does not contain, which is worse than offering fewer
+ * picklists.
+ */
+export const MAX_SNAPSHOT_PICK_TASKS = 500;
+
+/**
  * The scan-verified pick command (Story 4.3): `pick.record`, a
  * device-authenticated idempotent command (the `putaway.place` pattern —
  * DeviceSessionGuard at the shell, badge-in session, real authority re-read
@@ -772,9 +787,15 @@ export class PickCommandService {
    * batch each task names are the plan's SUGGESTION — baked in as advisory
    * data, re-derived server-side at pick time. `unfulfillable` slices carry
    * no bin and are not tasks; picked and cancelled lines drop out.
+   *
+   * Bounded at `MAX_SNAPSHOT_PICK_TASKS` stops, truncated on picklist
+   * boundaries so no walk is ever half-delivered, and served by the partial
+   * `picklist_lines_pickable_walk_idx` (plus the `picklists` warehouse/status
+   * and `waves` status indexes) — this runs inside the device catalog
+   * snapshot, so it must not degrade with picking history.
    */
   async getPickTasks(tx: TenantTx, tenantId: string, warehouseId: string): Promise<PickTask[]> {
-    const rows = await tx
+    const overRead = await tx
       .select({
         waveId: picklistLines.waveId,
         picklistId: picklistLines.picklistId,
@@ -805,7 +826,25 @@ export class PickCommandService {
           sql`${picklistLines.binId} is not null`,
         ),
       )
-      .orderBy(asc(picklistLines.picklistId), asc(picklistLines.walkSeq), asc(picklistLines.id));
+      .orderBy(asc(picklistLines.picklistId), asc(picklistLines.walkSeq), asc(picklistLines.id))
+      // One row over the ceiling: reading it is how we learn the result was
+      // truncated without a second COUNT query.
+      .limit(MAX_SNAPSHOT_PICK_TASKS + 1);
+
+    // Truncate on a PICKLIST boundary (see `MAX_SNAPSHOT_PICK_TASKS`): the
+    // rows are ordered by picklist, so dropping every row of the first
+    // picklist that crosses the ceiling leaves only whole walks.
+    const rows = overRead.length > MAX_SNAPSHOT_PICK_TASKS
+      ? (() => {
+          const kept = overRead.slice(0, MAX_SNAPSHOT_PICK_TASKS);
+          const lastWhole = kept[kept.length - 1]?.picklistId;
+          // The cut fell inside `lastWhole` only if that picklist also has a
+          // row beyond the ceiling; drop it whole when it does.
+          return overRead[MAX_SNAPSHOT_PICK_TASKS]?.picklistId === lastWhole
+            ? kept.filter((row) => row.picklistId !== lastWhole)
+            : kept;
+        })()
+      : overRead;
 
     const batchIds = [...new Set(rows.flatMap((row) => (row.batchId === null ? [] : [row.batchId])))];
     const batchCodes = new Map(

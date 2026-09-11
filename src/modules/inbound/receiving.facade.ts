@@ -387,13 +387,23 @@ export class ReceivingFacade {
       // Story 3.5 (additive): the putaway decision fields ride the same
       // snapshot — the bins (for the wrong-bin/blocked pre-queue checks) and
       // the derived tasks (suggestions advisory; the server re-gates).
-      // Story 4.3 (additive): the pick tasks join the same composition —
-      // the outbound facade is the only seam into the wave aggregate (AD-6).
-      const [binSummaries, putawayTasks, pickTasks] = await Promise.all([
-        this.putaway.getBinSummaries(tenantId, warehouseId),
-        this.putaway.getPutawayTasks(tenantId, warehouseId),
-        this.outbound.getPickTasks(tenantId, warehouseId),
-      ]);
+      // Story 4.3 (additive): the pick tasks join the same composition — the
+      // outbound facade is the only seam into the wave aggregate (AD-6).
+      //
+      // All three ride the IN-TX passthroughs and run on THIS transaction's
+      // connection. The earlier shape called the pool-opening facade methods
+      // inside `Promise.all`, so one snapshot request held four pooled
+      // connections at once (the outer transaction plus one per nested
+      // read). postgres.js queues connection requests with no timeout, so
+      // past `max / 4` concurrent snapshots every outer transaction waited
+      // forever for a nested one that could never be granted — a permanent
+      // deadlock that also stranded the connection at the server, well
+      // beyond the request that caused it. Composing in one transaction is
+      // also what makes the "sealed snapshot" a single consistent read
+      // rather than four MVCC snapshots stitched together.
+      const binSummaries = await this.putaway.getBinSummariesInTx(tx, tenantId, warehouseId);
+      const putawayTasks = await this.putaway.getPutawayTasksInTx(tx, tenantId, warehouseId);
+      const pickTasks = await this.outbound.getPickTasksInTx(tx, tenantId, warehouseId);
       return {
         generatedAt: new Date().toISOString(),
         warehouseId,

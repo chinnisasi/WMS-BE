@@ -15,6 +15,7 @@ import {
   zones,
 } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
@@ -195,7 +196,25 @@ export class PutawayFacade {
    * table in v1.
    */
   async getPutawayTasks(tenantId: string, warehouseId: string): Promise<readonly PutawayTask[]> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.getPutawayTasksInTx(tx, tenantId, warehouseId),
+    );
+  }
+
+  /**
+   * The same derivation inside the CALLER's transaction (story 4.3): the
+   * device catalog snapshot composes this beside its other reads in ONE
+   * tenant transaction — the `reservationsByIdsInTx` / `stockByBinsInTx`
+   * shape. Opening a nested transaction from inside the snapshot's own would
+   * reserve a SECOND pooled connection while the first is held, and enough
+   * concurrent snapshots then deadlock the pool with no timeout.
+   */
+  async getPutawayTasksInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<readonly PutawayTask[]> {
+    {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
 
       // The receiving bin (the from-bin identity) — read-only here: a
@@ -323,7 +342,7 @@ export class PutawayFacade {
         });
       }
       return tasks;
-    });
+    }
   }
 
   /**
@@ -336,7 +355,22 @@ export class PutawayFacade {
    * the server re-gate rejects it).
    */
   async getBinSummaries(tenantId: string, warehouseId: string): Promise<readonly PutawayBinSummary[]> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.getBinSummariesInTx(tx, tenantId, warehouseId),
+    );
+  }
+
+  /**
+   * The same read inside the CALLER's transaction (story 4.3) — the device
+   * catalog snapshot's in-tx passthrough. See `getPutawayTasksInTx` for why
+   * the snapshot must not nest transactions.
+   */
+  async getBinSummariesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<readonly PutawayBinSummary[]> {
+    {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
       const rows = await tx
         .select({
@@ -360,6 +394,6 @@ export class PutawayFacade {
         )
         .orderBy(asc(bins.code));
       return rows;
-    });
+    }
   }
 }

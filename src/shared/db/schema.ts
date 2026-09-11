@@ -1537,6 +1537,8 @@ export const waves = pgTable(
       table.createdAt,
       table.id,
     ),
+    // Story 4.3: the pick-task read's `released` join arm.
+    index('waves_tenant_status_idx').on(table.tenantId, table.status),
   ],
 );
 
@@ -1569,6 +1571,15 @@ export const picklists = pgTable(
   (table) => [
     index('picklists_wave_id_idx').on(table.waveId, table.createdAt, table.id),
     index('picklists_tenant_id_idx').on(table.tenantId),
+    // Story 4.3: the device snapshot's pick-task read narrows to the ready
+    // picklists of one warehouse before it touches any line — this is its
+    // driving index. Without it that read seq-scans every picklist the tenant
+    // has ever had, on the one endpoint every device hits on every refresh.
+    index('picklists_tenant_warehouse_status_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.status,
+    ),
   ],
 );
 
@@ -1653,6 +1664,15 @@ export const picklistLines = pgTable(
     uniqueIndex('picklist_lines_open_order_line_unique')
       .on(table.tenantId, table.orderLineId, table.sliceSeq)
       .where(sql`status <> 'cancelled'`),
+    // Story 4.3: the device snapshot's pick-task read, exactly. PARTIAL on
+    // the predicate (still pickable = a planned line that names a bin) so the
+    // index holds only open floor work — it does not grow with picking
+    // history — and ordered so it also serves the walk-order sort. The
+    // snapshot is the one endpoint the offline substrate's latency depends
+    // on, so this read is index-only work, not a scan of every line.
+    index('picklist_lines_pickable_walk_idx')
+      .on(table.tenantId, table.picklistId, table.walkSeq, table.id)
+      .where(sql`status = 'planned' and bin_id is not null`),
   ],
 );
 
