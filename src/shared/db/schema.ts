@@ -1443,3 +1443,217 @@ export const orderLines = pgTable(
 );
 
 export type OrderLine = typeof orderLines.$inferSelect;
+
+/**
+ * Wave policies (Story 4.2 — the outbound module owns its own policy table):
+ * the configurable grouping rule a wave is generated under. `grouping`
+ * decides the picklist shape (`single` — one picklist per order; `batch` —
+ * one picklist across the wave's orders, grouped by bin); `priority` orders
+ * competing policies for the human eye (never a scheduler — generation is an
+ * operator-triggered command in this story); `max_orders` caps how many
+ * accepted orders one wave draws; `cutoff_local_time` (`HH:MM`) gates
+ * RELEASE, not generation, and is compared in `Asia/Kolkata` (the module
+ * constant `WAVE_CUTOFF_TIMEZONE` — `warehouses` carries no timezone column
+ * and the product is India-only).
+ *
+ * `carrier_ref` is a nullable **unvalidated** uuid — exactly the precedent
+ * `orders.integration_id` set in 4.1: there is no `carriers` table until
+ * story 4.6 / Epic 7, so nothing yet proves the id names a real carrier.
+ *
+ * RLS policy + the CHECKs live **only in the migration SQL** (0018).
+ */
+export const wavePolicies = pgTable(
+  'wave_policies',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    name: text('name').notNull(),
+    /** `single` (one picklist per order) or `batch` (one across the wave). */
+    grouping: text('grouping').notNull().default('single'),
+    priority: integer('priority').notNull().default(0),
+    /**
+     * Cap on the orders one wave draws. Null means the policy names no cap
+     * of its own and the module's `DEFAULT_WAVE_MAX_ORDERS` applies — never
+     * "uncapped": a wave is a unit of floor work.
+     */
+    maxOrders: integer('max_orders'),
+    /** `HH:MM` in Asia/Kolkata; null = release is always allowed. */
+    cutoffLocalTime: text('cutoff_local_time'),
+    /** Unvalidated carrier ref (no carriers table until 4.6 / Epic 7). */
+    carrierRef: uuid('carrier_ref'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('wave_policies_warehouse_name_unique').on(
+      table.tenantId,
+      table.warehouseId,
+      table.name,
+    ),
+    // The warehouse-scoped policy list's keyset index from day one.
+    index('wave_policies_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type WavePolicy = typeof wavePolicies.$inferSelect;
+
+/**
+ * Waves (Story 4.2): the grouping aggregate — accepted orders gathered by
+ * policy into picklists. `status` is the wave state machine the outbound
+ * module exclusively owns (AD-6): `planned → released` (the floor's work) or
+ * `planned|released → cancelled`. Release is the transition that makes a
+ * wave the floor's work; picking itself arrives in 4.3 and writes no stock
+ * here.
+ *
+ * RLS policy + the status CHECK live **only in the migration SQL** (0018).
+ */
+export const waves = pgTable(
+  'waves',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    policyId: uuid('policy_id').notNull(),
+    status: text('status').notNull().default('planned'),
+    releasedAt: timestamp('released_at', { withTimezone: true, mode: 'string' }),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The warehouse-scoped wave list's keyset index from day one (UX-DR25 —
+    // no offset pagination, no late migration).
+    index('waves_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type Wave = typeof waves.$inferSelect;
+
+/**
+ * Picklists (Story 4.2): one wave's units of floor work. A `single` wave
+ * emits one picklist per order (`order_id` set); a `batch` wave emits ONE
+ * picklist across the wave's orders (`order_id` null) whose lines are
+ * grouped by bin, so each bin is visited at most once. `status` tracks the
+ * wave: `planned → ready` at release, `→ cancelled` when the wave is
+ * cancelled (or when release leaves the picklist with nothing to pick).
+ *
+ * RLS policy + the status CHECK live **only in the migration SQL** (0018).
+ */
+export const picklists = pgTable(
+  'picklists',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    waveId: uuid('wave_id').notNull(),
+    /** The single order this picklist serves; null on a batch picklist. */
+    orderId: uuid('order_id'),
+    status: text('status').notNull().default('planned'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    index('picklists_wave_id_idx').on(table.waveId, table.createdAt, table.id),
+    index('picklists_tenant_id_idx').on(table.tenantId),
+  ],
+);
+
+export type Picklist = typeof picklists.$inferSelect;
+
+/**
+ * Picklist lines (Story 4.2): the ordered pick path. One line is ONE slice
+ * of an order line — the units to draw from `bin_id` (and, when the SKU
+ * carries batch stock, from `batch_id`). `slice_seq` numbers the slices of
+ * one order line (an order line whose reserved quantity spans two bins
+ * emits two slices); `walk_seq` is the position on the walk, which is
+ * `bins.code` ascending — bins carry no spatial data, and the grid
+ * generator's `A-01-01` convention sorts naturally, so code order IS the
+ * walk (putaway's capacity-only v1 honesty).
+ *
+ * `bin_id` / `batch_id` are a **suggestion re-derived at pick time** (4.3),
+ * never an allocation: a reservation binds to (tenant, warehouse, sku,
+ * owner) and carries no bin, so a bin-level claim here would invent a
+ * second, weaker reservation the inventory module knows nothing about.
+ *
+ * `qty` is always drawn from the order line's `reserved_qty` — never `qty`:
+ * a backordered line contributes only what acceptance actually held. A line
+ * whose reserved quantity exceeds the pickable on-hand emits one trailing
+ * `unfulfillable` slice with `bin_id` null and the uncovered units in
+ * `shortfall_qty`.
+ *
+ * The one-open-wave-per-order invariant is the partial unique index on
+ * `(tenant_id, order_line_id, slice_seq) WHERE status <> 'cancelled'`:
+ * without it two waves plan the same reserved units and the floor picks the
+ * same stock twice (the reservation cannot catch it — both picks draw
+ * against the same held quantity). A second wave planning the same order
+ * always re-emits `slice_seq` 0 for that order line, so the index refuses
+ * it, which is what makes the concurrent-generate race deterministic.
+ *
+ * RLS policy + the CHECKs live **only in the migration SQL** (0018).
+ */
+export const picklistLines = pgTable(
+  'picklist_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    picklistId: uuid('picklist_id').notNull(),
+    waveId: uuid('wave_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    orderLineId: uuid('order_line_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** The suggested bin; null on an `unfulfillable` slice. */
+    binId: uuid('bin_id'),
+    /** The suggested bin's code — the walk key, denormalized for the read. */
+    binCode: text('bin_code'),
+    /** The suggested batch (FEFO within the bin); null when untracked. */
+    batchId: uuid('batch_id'),
+    /** The order line's journal hold, carried forward (never re-reserved). */
+    reservationId: uuid('reservation_id'),
+    /** Units to draw at this bin (0 on an `unfulfillable` slice). */
+    qty: integer('qty').notNull(),
+    /** Uncovered units — non-zero only on an `unfulfillable` slice. */
+    shortfallQty: integer('shortfall_qty').notNull().default(0),
+    /** The order line's slice index (0-based) — the claim key. */
+    sliceSeq: integer('slice_seq').notNull(),
+    /** Position on the walk (`bins.code` ascending), per picklist. */
+    walkSeq: integer('walk_seq').notNull(),
+    status: text('status').notNull().default('planned'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The picklist detail read: lines in walk order.
+    index('picklist_lines_picklist_walk_idx').on(table.picklistId, table.walkSeq, table.id),
+    // The eligibility read ("is this order already on an open wave?") and
+    // the release-time drop of a cancelled order's lines.
+    index('picklist_lines_tenant_order_idx').on(table.tenantId, table.orderId),
+    index('picklist_lines_tenant_id_idx').on(table.tenantId),
+    // The wave-keyed paths: the detail snapshot's line read, the
+    // release-time drop and the cancel-time flip all key on `wave_id`.
+    index('picklist_lines_tenant_wave_idx').on(table.tenantId, table.waveId),
+    // One order belongs to at most one OPEN wave (the design note): the
+    // database refuses the second claim, so the concurrent-generate race is
+    // deterministic. A cancelled wave's lines drop out of the predicate and
+    // its orders become waveable again.
+    uniqueIndex('picklist_lines_open_order_line_unique')
+      .on(table.tenantId, table.orderLineId, table.sliceSeq)
+      .where(sql`status <> 'cancelled'`),
+  ],
+);
+
+export type PicklistLine = typeof picklistLines.$inferSelect;

@@ -51,6 +51,13 @@ export const CAPABILITIES = [
   // cancellation). Owner and Ops Manager only; Operator and Accountant are
   // read-only. Mirrored into wms-fe `src/lib/users.ts` by the FE story.
   'orders.manage',
+  // Story 4.2 — the outbound module's wave surface (generate a wave from
+  // accepted orders, release it to the floor, cancel it) AND the wave-policy
+  // writes that surface references: a policy IS the wave rule, so gating it
+  // separately would let a role that cannot wave rewrite what waving means.
+  // Owner and Ops Manager only; Operator picks (4.3), it does not plan.
+  // Mirrored into wms-fe `src/lib/users.ts` by the FE story.
+  'waves.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -82,6 +89,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'putaway.execute',
     'bin.retire',
     'orders.manage',
+    'waves.manage',
   ]),
   operator: new Set<Capability>(['putaway.execute']),
   accountant: new Set<Capability>([]),
