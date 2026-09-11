@@ -4727,6 +4727,787 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/wave-policies": {
+      "post": {
+        "operationId": "OutboundController_createWavePolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWavePolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The created policy (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WavePolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or invalid body (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks waves.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A policy of that name already exists in the warehouse, or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Creates a wave policy (waves.manage) — the grouping rule a wave is generated under; its cutoff gates release, never generation",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/outbound/wave-policies": {
+      "get": {
+        "operationId": "OutboundController_listWavePolicies",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "maxLength": 200,
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The warehouse's wave-policy page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WavePolicyListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor or out-of-range limit (invalid-cursor / validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists one warehouse's wave policies, newest first (keyset cursor pagination)",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/waves": {
+      "post": {
+        "operationId": "OutboundController_generateWave",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerateWaveDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The planned wave with its picklists and pick lines in walk order (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WaveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or invalid body (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks waves.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse, policy, or a named order does not exist in this tenant/warehouse (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "An order is already on an open wave — one order belongs to at most one open wave; the problem names the claiming wave (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No accepted order is free to wave (no-eligible-orders), the selection exceeds the policy cap (wave-cap-exceeded), or the idempotency key was reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Generates a wave (waves.manage) — gathers accepted orders by policy into picklists (one per order, or one batched across orders) with the pick path in bins.code order",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/waves/{waveId}/release": {
+      "post": {
+        "operationId": "OutboundController_releaseWave",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "waveId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The released wave (an already-released wave replays as an idempotent no-op — no second wave.released event)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WaveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key or path parameter (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks waves.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Wave does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The policy cutoff has passed for the Kolkata-local day and the wave stays planned (cutoff-passed), the wave is cancelled, or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Releases a wave to the floor (waves.manage) — picklists go ready and a cancelled order's pick lines drop; refused once the policy cutoff has passed in Asia/Kolkata",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/waves/{waveId}/cancel": {
+      "post": {
+        "operationId": "OutboundController_cancelWave",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "waveId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The cancelled wave (idempotent on replay and on an already-cancelled wave)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WaveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key or path parameter (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks waves.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Wave does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Cancels a wave (waves.manage) — its picklists and pick lines go cancelled and its orders become eligible for waving again; no reservation and no stock moves",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/outbound/waves/{waveId}": {
+      "get": {
+        "operationId": "OutboundController_getWave",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "waveId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The wave with its picklists and pick lines in walk order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WaveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed waveId path parameter (validation-failed — it must be a uuid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No wave with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One wave's detail — its picklists and every pick line in walk order (bins.code ascending)",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/outbound/waves": {
+      "get": {
+        "operationId": "OutboundController_listWaves",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "maxLength": 200,
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The warehouse's wave page (headers only — the detail read carries the picklists)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WaveListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor or out-of-range limit (invalid-cursor / validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists one warehouse's waves, newest first (keyset cursor pagination)",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/receiving/goods-receipts": {
       "post": {
         "operationId": "ReceivingController_submitGoodsReceipt",
@@ -8875,6 +9656,483 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/OrderEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "CreateWavePolicyDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse the policy waves in"
+          },
+          "name": {
+            "type": "string",
+            "description": "Policy name — unique per warehouse",
+            "maxLength": 120
+          },
+          "grouping": {
+            "type": "string",
+            "enum": [
+              "single",
+              "batch"
+            ],
+            "description": "'single' — one picklist per order; 'batch' — ONE picklist across the wave's orders, grouped by bin so each bin is visited once"
+          },
+          "priority": {
+            "type": "number",
+            "default": 0,
+            "minimum": 0,
+            "maximum": 1000
+          },
+          "maxOrders": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 500,
+            "description": "Cap on the orders one wave draws (absent = the server default, 200)"
+          },
+          "cutoffLocalTime": {
+            "type": "string",
+            "description": "Carrier cutoff as a 24-hour HH:MM wall clock in Asia/Kolkata. It gates RELEASE, never generation — planning ahead of a cutoff is the point. Absent = release is always allowed. 00:00 is rejected: it would refuse release for the whole day.",
+            "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+            "example": "16:00"
+          },
+          "carrierRef": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Carrier reference — shape-validated only: there is no carriers table until story 4.6 / Epic 7, so nothing yet proves the id names a real carrier"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "name",
+          "grouping"
+        ]
+      },
+      "WavePolicyDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "grouping": {
+            "type": "string",
+            "enum": [
+              "single",
+              "batch"
+            ]
+          },
+          "priority": {
+            "type": "number"
+          },
+          "maxOrders": {
+            "type": "number",
+            "nullable": true
+          },
+          "cutoffLocalTime": {
+            "type": "string",
+            "nullable": true,
+            "description": "HH:MM wall clock, or null"
+          },
+          "cutoffTimezone": {
+            "type": "string",
+            "description": "The IANA zone the cutoff is compared in",
+            "example": "Asia/Kolkata"
+          },
+          "carrierRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "Unvalidated carrier ref (4.6)"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last update"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "name",
+          "grouping",
+          "priority",
+          "maxOrders",
+          "cutoffLocalTime",
+          "cutoffTimezone",
+          "carrierRef",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "WavePolicyResponse": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "$ref": "#/components/schemas/WavePolicyDto"
+          }
+        },
+        "required": [
+          "policy"
+        ]
+      },
+      "WavePolicyListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WavePolicyDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "GenerateWaveDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse being waved"
+          },
+          "policyId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The wave policy this wave is generated under"
+          },
+          "orderIds": {
+            "minItems": 1,
+            "maxItems": 500,
+            "description": "Explicit order selection. Absent = every eligible accepted order in the warehouse, oldest first, capped by the policy.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "policyId"
+        ]
+      },
+      "PicklistLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "picklistId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "nullable": true,
+            "description": "Suggested bin; null when unfulfillable"
+          },
+          "binCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The suggested bin’s code — the walk key"
+          },
+          "batchId": {
+            "type": "string",
+            "nullable": true,
+            "description": "Suggested batch (FEFO within the bin); null when the SKU carries no batch stock"
+          },
+          "reservationId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The order line’s journal hold, carried forward — never re-reserved here"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units to draw at this bin (0 on an unfulfillable slice) — always from the order line’s reservedQty, never its qty"
+          },
+          "shortfallQty": {
+            "type": "number",
+            "description": "Uncovered units — non-zero only on an unfulfillable slice"
+          },
+          "sliceSeq": {
+            "type": "number",
+            "description": "The order line’s slice index (an order line may span bins)"
+          },
+          "walkSeq": {
+            "type": "number",
+            "description": "Position on the walk (bins.code ascending)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "unfulfillable",
+              "cancelled"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          }
+        },
+        "required": [
+          "id",
+          "picklistId",
+          "orderId",
+          "orderLineId",
+          "skuId",
+          "binId",
+          "binCode",
+          "batchId",
+          "reservationId",
+          "qty",
+          "shortfallQty",
+          "sliceSeq",
+          "walkSeq",
+          "status",
+          "createdAt"
+        ]
+      },
+      "PicklistDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "waveId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The single order served; null on a batch picklist"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "ready",
+              "cancelled"
+            ]
+          },
+          "stopCount": {
+            "type": "number",
+            "description": "Distinct bin stops on this walk — the \"steps\" of the batching guarantee"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last update"
+          },
+          "lines": {
+            "description": "Pick lines in walk order",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PicklistLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "waveId",
+          "orderId",
+          "status",
+          "stopCount",
+          "createdAt",
+          "updatedAt",
+          "lines"
+        ]
+      },
+      "WaveDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "policyId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "released",
+              "cancelled"
+            ]
+          },
+          "releasedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "cancelledAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last update"
+          },
+          "picklists": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PicklistDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "policyId",
+          "status",
+          "releasedAt",
+          "cancelledAt",
+          "createdAt",
+          "updatedAt",
+          "picklists"
+        ]
+      },
+      "WaveResponse": {
+        "type": "object",
+        "properties": {
+          "wave": {
+            "$ref": "#/components/schemas/WaveDto"
+          }
+        },
+        "required": [
+          "wave"
+        ]
+      },
+      "WaveEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "policyId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "released",
+              "cancelled"
+            ]
+          },
+          "releasedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "cancelledAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "picklistCount": {
+            "type": "number",
+            "description": "Picklists on this wave"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last update"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "policyId",
+          "status",
+          "releasedAt",
+          "cancelledAt",
+          "picklistCount",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "WaveListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WaveEntryDto"
             }
           },
           "nextCursor": {

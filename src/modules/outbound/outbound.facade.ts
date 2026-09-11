@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { orders } from '../../shared/db/schema';
+import { orders, wavePolicies, waves } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
@@ -19,6 +19,17 @@ import type {
   OrderSource,
   OrderStatus,
 } from './order.command';
+import { WaveCommandService, policySnapshot } from './wave.command';
+import type {
+  CreateWavePolicyCommand,
+  GenerateWaveCommand,
+  WaveGrouping,
+  WavePolicySnapshot,
+  WavePolicySnapshotBody,
+  WaveSnapshot,
+  WaveStatus,
+  WaveTransitionCommand,
+} from './wave.command';
 
 /** One header row of the order-list read (no lines — detail carries them). */
 export interface OrderEntry {
@@ -36,6 +47,21 @@ export interface OrderEntry {
 export interface ListOrdersQuery {
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
+}
+
+/** One header row of the wave-list read (no picklists — detail carries them). */
+export interface WaveEntry {
+  readonly id: string;
+  readonly tenantId: string;
+  readonly warehouseId: string;
+  readonly policyId: string;
+  readonly status: WaveStatus;
+  readonly releasedAt: string | null;
+  readonly cancelledAt: string | null;
+  /** Picklists on this wave (the list's at-a-glance size, no N+1 detail read). */
+  readonly picklistCount: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
 }
 
 export const DEFAULT_OUTBOUND_PAGE_SIZE = 50;
@@ -82,6 +108,7 @@ export class OutboundFacade {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(OrderCommandService) private readonly orderCommand: OrderCommandService,
+    @Inject(WaveCommandService) private readonly waveCommand: WaveCommandService,
   ) {}
 
   /** `POST .../outbound/orders` — manual entry and (adapter-ready) ingestion. */
@@ -165,6 +192,145 @@ export class OutboundFacade {
         updatedAt: canonicalInstant(row.updatedAt),
       }));
       return buildPage(items, pageSize);
+    });
+  }
+
+  // ── waves and picklists (Story 4.2) ───────────────────────────────────────
+
+  /** `POST .../outbound/wave-policies` — the rule a wave is generated under. */
+  async createWavePolicy(
+    command: CreateWavePolicyCommand,
+    idempotencyKey: string,
+  ): Promise<WavePolicySnapshot> {
+    return this.waveCommand.createWavePolicy(command, idempotencyKey);
+  }
+
+  /** `POST .../outbound/waves` — gathers accepted orders into picklists. */
+  async generateWave(command: GenerateWaveCommand, idempotencyKey: string): Promise<WaveSnapshot> {
+    return this.waveCommand.generateWave(command, idempotencyKey);
+  }
+
+  /** `POST .../outbound/waves/{id}/release` — makes the wave the floor's work. */
+  async releaseWave(command: WaveTransitionCommand, idempotencyKey: string): Promise<WaveSnapshot> {
+    return this.waveCommand.releaseWave(command, idempotencyKey);
+  }
+
+  /** `POST .../outbound/waves/{id}/cancel` — frees its orders to be re-waved. */
+  async cancelWave(command: WaveTransitionCommand, idempotencyKey: string): Promise<WaveSnapshot> {
+    return this.waveCommand.cancelWave(command, idempotencyKey);
+  }
+
+  /**
+   * Wave-detail read (Story 4.2): one wave with its picklists and every pick
+   * line in WALK ORDER (`bins.code` ascending — bins carry no spatial data).
+   * The existence check precedes the picklist query (the CHECKPOINT 1
+   * shape): an unknown or foreign wave id is null → the api layer 404s.
+   */
+  async getWave(tenantId: string, waveId: string): Promise<WaveSnapshot['wave'] | null> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select()
+        .from(waves)
+        .where(and(eq(waves.id, waveId), eq(waves.tenantId, tenantId)))
+        .limit(1);
+      const wave = rows[0];
+      if (wave === undefined) {
+        return null;
+      }
+      // One serializer for reads and writes alike (the `snapshotOf` rule).
+      return (await this.waveCommand.snapshotOf(tx, wave)).wave;
+    });
+  }
+
+  /**
+   * Warehouse-scoped wave list (Story 4.2): keyset cursor pagination over
+   * `(created_at, id)` from day one (offset pagination is banned — UX-DR25),
+   * newest first, headers only — the detail read carries the picklists. A
+   * read — never capability-gated; the warehouse must belong to the tenant.
+   */
+  async listWaves(
+    tenantId: string,
+    warehouseId: string,
+    query: ListOrdersQuery = {},
+  ): Promise<Page<WaveEntry>> {
+    const pageSize = query.limit ?? DEFAULT_OUTBOUND_PAGE_SIZE;
+    const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      const rows = await tx
+        .select({
+          id: waves.id,
+          tenantId: waves.tenantId,
+          warehouseId: waves.warehouseId,
+          policyId: waves.policyId,
+          status: waves.status,
+          releasedAt: waves.releasedAt,
+          cancelledAt: waves.cancelledAt,
+          createdAt: waves.createdAt,
+          updatedAt: waves.updatedAt,
+          // Table-qualified by hand: an unqualified `id` inside this
+          // correlated subquery is ambiguous, and Postgres resolves an
+          // ambiguous name against the INNER from list — `pl.id` — which
+          // silently counts nothing rather than erroring. Naming `waves.id`
+          // says which one is meant. (The `where`-clause fragments elsewhere
+          // in this story pass drizzle column references instead, which
+          // render qualified; verified against the pinned 0.45.2.)
+          picklistCount: sql<number>`(
+            select count(*)::int from picklists pl where pl.wave_id = waves.id
+          )`,
+        })
+        .from(waves)
+        .where(
+          and(
+            eq(waves.tenantId, tenantId),
+            eq(waves.warehouseId, warehouseId),
+            before === undefined
+              ? undefined
+              : sql`(${waves.createdAt}, ${waves.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
+          ),
+        )
+        .orderBy(desc(waves.createdAt), desc(waves.id))
+        .limit(pageSize + 1);
+      const items = rows.map((row) => ({
+        ...row,
+        status: row.status as WaveStatus,
+        releasedAt: row.releasedAt === null ? null : canonicalInstant(row.releasedAt),
+        cancelledAt: row.cancelledAt === null ? null : canonicalInstant(row.cancelledAt),
+        createdAt: canonicalInstant(row.createdAt),
+        updatedAt: canonicalInstant(row.updatedAt),
+      }));
+      return buildPage(items, pageSize);
+    });
+  }
+
+  /**
+   * Warehouse-scoped wave-policy list (Story 4.2): the same keyset shape —
+   * a policy must be discoverable to be referenced by a generate call.
+   */
+  async listWavePolicies(
+    tenantId: string,
+    warehouseId: string,
+    query: ListOrdersQuery = {},
+  ): Promise<Page<WavePolicySnapshotBody & { readonly grouping: WaveGrouping }>> {
+    const pageSize = query.limit ?? DEFAULT_OUTBOUND_PAGE_SIZE;
+    const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      const rows = await tx
+        .select()
+        .from(wavePolicies)
+        .where(
+          and(
+            eq(wavePolicies.tenantId, tenantId),
+            eq(wavePolicies.warehouseId, warehouseId),
+            before === undefined
+              ? undefined
+              : sql`(${wavePolicies.createdAt}, ${wavePolicies.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
+          ),
+        )
+        .orderBy(desc(wavePolicies.createdAt), desc(wavePolicies.id))
+        .limit(pageSize + 1);
+      return buildPage(rows.map(policySnapshot), pageSize);
     });
   }
 
