@@ -127,6 +127,13 @@
       "when": 1789062171645,
       "tag": "0017_ambiguous_santa_claus",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1789151683573,
+      "tag": "0018_narrow_lake",
+      "breakpoints": true
     }
   ]
 }

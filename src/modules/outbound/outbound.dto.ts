@@ -9,12 +9,19 @@ import {
   IsString,
   IsUUID,
   Length,
+  Matches,
   Max,
   Min,
   ValidateNested,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { ORDER_SOURCES } from './order.command';
+import {
+  PICKLIST_LINE_STATUSES,
+  PICKLIST_STATUSES,
+  WAVE_GROUPINGS,
+  WAVE_STATUSES,
+} from './wave.command';
 
 /** Trim at the validation boundary (the tenancy DTO pattern). */
 function Trim() {
@@ -222,6 +229,314 @@ export class OrderEntryDto {
 export class OrderListResponse {
   @ApiProperty({ type: [OrderEntryDto] })
   items!: readonly OrderEntryDto[];
+
+  @ApiProperty({ type: String, nullable: true, required: false })
+  nextCursor?: string | null;
+}
+
+// ── Wave inputs (Story 4.2) ─────────────────────────────────────────────────
+
+/** POST /tenants/{tenantId}/outbound/wave-policies body. */
+export class CreateWavePolicyDto {
+  @ApiProperty({ format: 'uuid', description: 'The warehouse the policy waves in' })
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({ description: 'Policy name — unique per warehouse', maxLength: 120 })
+  @Trim()
+  @IsString()
+  @Length(1, 120)
+  name!: string;
+
+  @ApiProperty({
+    enum: [...WAVE_GROUPINGS],
+    description:
+      "'single' — one picklist per order; 'batch' — ONE picklist across the wave's orders, grouped by bin so each bin is visited once",
+  })
+  @IsIn([...WAVE_GROUPINGS])
+  grouping!: 'single' | 'batch';
+
+  @ApiProperty({ required: false, default: 0, minimum: 0, maximum: 1000 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(1000)
+  priority?: number;
+
+  @ApiProperty({
+    required: false,
+    minimum: 1,
+    maximum: 500,
+    description: 'Cap on the orders one wave draws (absent = the server default, 200)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(500)
+  maxOrders?: number;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Carrier cutoff as a 24-hour HH:MM wall clock in Asia/Kolkata. It gates RELEASE, never generation — planning ahead of a cutoff is the point. Absent = release is always allowed. 00:00 is rejected: it would refuse release for the whole day.',
+    pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$',
+    example: '16:00',
+  })
+  @Trim()
+  @IsOptional()
+  @IsString()
+  @Matches(/^([01][0-9]|2[0-3]):[0-5][0-9]$/, {
+    message: 'cutoffLocalTime must be a 24-hour HH:MM wall clock',
+  })
+  // Midnight is the one shape the regex accepts that can never be useful:
+  // the cutoff compares "is the local wall clock past HH:MM", which is true
+  // at every instant of the day except that exact minute — the policy would
+  // refuse release all day, every day. Omit the field to mean "no cutoff".
+  @Matches(/^(?!00:00$)/, {
+    message:
+      'cutoffLocalTime 00:00 would refuse release for the whole day — omit the field for no cutoff',
+  })
+  cutoffLocalTime?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      'Carrier reference — shape-validated only: there is no carriers table until story 4.6 / Epic 7, so nothing yet proves the id names a real carrier',
+  })
+  @IsOptional()
+  @IsUUID()
+  carrierRef?: string;
+}
+
+/** POST /tenants/{tenantId}/outbound/waves body. */
+export class GenerateWaveDto {
+  @ApiProperty({ format: 'uuid', description: 'The warehouse being waved' })
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The wave policy this wave is generated under' })
+  @IsUUID()
+  policyId!: string;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    minItems: 1,
+    maxItems: 500,
+    description:
+      'Explicit order selection. Absent = every eligible accepted order in the warehouse, oldest first, capped by the policy.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(500)
+  @IsUUID(undefined, { each: true })
+  orderIds?: string[];
+}
+
+// ── Wave responses ──────────────────────────────────────────────────────────
+
+export class WavePolicyDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty()
+  name!: string;
+
+  @ApiProperty({ enum: [...WAVE_GROUPINGS] })
+  grouping!: string;
+
+  @ApiProperty()
+  priority!: number;
+
+  @ApiProperty({ type: Number, nullable: true })
+  maxOrders!: number | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'HH:MM wall clock, or null' })
+  cutoffLocalTime!: string | null;
+
+  @ApiProperty({ description: 'The IANA zone the cutoff is compared in', example: 'Asia/Kolkata' })
+  cutoffTimezone!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Unvalidated carrier ref (4.6)' })
+  carrierRef!: string | null;
+
+  @ApiProperty({ description: 'ISO-8601 UTC creation time' })
+  createdAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC last update' })
+  updatedAt!: string;
+}
+
+export class WavePolicyResponse {
+  @ApiProperty({ type: WavePolicyDto })
+  policy!: WavePolicyDto;
+}
+
+export class WavePolicyListResponse {
+  @ApiProperty({ type: [WavePolicyDto] })
+  items!: readonly WavePolicyDto[];
+
+  @ApiProperty({ type: String, nullable: true, required: false })
+  nextCursor?: string | null;
+}
+
+/** One pick line — a bin/batch SUGGESTION re-derived at pick time (4.3). */
+export class PicklistLineDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  picklistId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Suggested bin; null when unfulfillable' })
+  binId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The suggested bin’s code — the walk key' })
+  binCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Suggested batch (FEFO within the bin); null when the SKU carries no batch stock' })
+  batchId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The order line’s journal hold, carried forward — never re-reserved here' })
+  reservationId!: string | null;
+
+  @ApiProperty({ description: 'Units to draw at this bin (0 on an unfulfillable slice) — always from the order line’s reservedQty, never its qty' })
+  qty!: number;
+
+  @ApiProperty({ description: 'Uncovered units — non-zero only on an unfulfillable slice' })
+  shortfallQty!: number;
+
+  @ApiProperty({ description: 'The order line’s slice index (an order line may span bins)' })
+  sliceSeq!: number;
+
+  @ApiProperty({ description: 'Position on the walk (bins.code ascending)' })
+  walkSeq!: number;
+
+  @ApiProperty({ enum: [...PICKLIST_LINE_STATUSES] })
+  status!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC creation time' })
+  createdAt!: string;
+}
+
+export class PicklistDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  waveId!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The single order served; null on a batch picklist' })
+  orderId!: string | null;
+
+  @ApiProperty({ enum: [...PICKLIST_STATUSES] })
+  status!: string;
+
+  @ApiProperty({ description: 'Distinct bin stops on this walk — the "steps" of the batching guarantee' })
+  stopCount!: number;
+
+  @ApiProperty({ description: 'ISO-8601 UTC creation time' })
+  createdAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC last update' })
+  updatedAt!: string;
+
+  @ApiProperty({ type: [PicklistLineDto], description: 'Pick lines in walk order' })
+  lines!: readonly PicklistLineDto[];
+}
+
+export class WaveDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  policyId!: string;
+
+  @ApiProperty({ enum: [...WAVE_STATUSES] })
+  status!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  releasedAt!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  cancelledAt!: string | null;
+
+  @ApiProperty({ description: 'ISO-8601 UTC creation time' })
+  createdAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC last update' })
+  updatedAt!: string;
+
+  @ApiProperty({ type: [PicklistDto] })
+  picklists!: readonly PicklistDto[];
+}
+
+export class WaveResponse {
+  @ApiProperty({ type: WaveDto })
+  wave!: WaveDto;
+}
+
+/** One header row of the wave list (no picklists — the detail read carries them). */
+export class WaveEntryDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  policyId!: string;
+
+  @ApiProperty({ enum: [...WAVE_STATUSES] })
+  status!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  releasedAt!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  cancelledAt!: string | null;
+
+  @ApiProperty({ description: 'Picklists on this wave' })
+  picklistCount!: number;
+
+  @ApiProperty({ description: 'ISO-8601 UTC creation time' })
+  createdAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC last update' })
+  updatedAt!: string;
+}
+
+export class WaveListResponse {
+  @ApiProperty({ type: [WaveEntryDto] })
+  items!: readonly WaveEntryDto[];
 
   @ApiProperty({ type: String, nullable: true, required: false })
   nextCursor?: string | null;

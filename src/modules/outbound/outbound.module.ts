@@ -1,7 +1,10 @@
 import { Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { InventoryModule } from '../inventory/inventory.module';
+import { CatalogModule } from '../catalog/catalog.module';
 import { OrderCommandService } from './order.command';
+import { WaveCommandService } from './wave.command';
+import { WAVE_CLOCK, SystemWaveClock } from './wave.clock';
 import { OutboundFacade } from './outbound.facade';
 
 /**
@@ -18,10 +21,25 @@ import { OutboundFacade } from './outbound.facade';
  * into outbound, so no cycle). The tenancy helpers the command uses at
  * entry (`assertPermission`, `getMemberRoleIn`, `assertWarehouseInTenant`)
  * are the shared command-entry pattern's file-level functions.
+ *
+ * Story 4.2 adds the wave aggregate (`wave_policies`, `waves`, `picklists`,
+ * `picklist_lines`) — module-exclusive in exactly the same way. The wave
+ * planner composes per-bin / per-batch stock through `InventoryFacade` and
+ * batch expiry through `CatalogFacade` (AD-6 — it writes neither module's
+ * tables, and journals no pick movement: picking is 4.3). `CatalogModule`
+ * imports `SharedModule` and `forwardRef(TenancyModule)` only, so this new
+ * edge introduces no cycle. `WAVE_CLOCK` is the injectable "now" a policy
+ * cutoff is compared against (the e2e suite stubs it on both sides of a
+ * boundary rather than sleeping until 16:30 IST).
  */
 @Module({
-  imports: [SharedModule, InventoryModule],
-  providers: [OrderCommandService, OutboundFacade],
+  imports: [SharedModule, InventoryModule, CatalogModule],
+  providers: [
+    OrderCommandService,
+    WaveCommandService,
+    { provide: WAVE_CLOCK, useClass: SystemWaveClock },
+    OutboundFacade,
+  ],
   exports: [OutboundFacade],
 })
 export class OutboundModule {}

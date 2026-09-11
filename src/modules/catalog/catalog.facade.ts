@@ -180,6 +180,35 @@ export class CatalogFacade {
   }
 
   /**
+   * Batch identities of a SET of SKUs, inside the caller's transaction
+   * (Story 4.2 — the wave planner's FEFO half). Catalog owns expiry and the
+   * batch lifecycle flag; inventory owns location and quantity (AD-6), so a
+   * pick suggestion joins the two. The in-tx shape mirrors the inventory
+   * facade's `reservationsByIdsInTx`: one wave generation is ONE tenant
+   * transaction, so the plan it commits is the catalog it saw.
+   */
+  async getBatchesForSkusInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuIds: readonly string[],
+  ): Promise<ReadonlyArray<BatchIdentity & { readonly skuId: string }>> {
+    if (skuIds.length === 0) {
+      return [];
+    }
+    return tx
+      .select({
+        id: batches.id,
+        skuId: batches.skuId,
+        code: batches.code,
+        mfgDate: batches.mfgDate,
+        expiryDate: batches.expiryDate,
+        status: batches.status,
+      })
+      .from(batches)
+      .where(and(eq(batches.tenantId, tenantId), inArray(batches.skuId, [...new Set(skuIds)])));
+  }
+
+  /**
    * The one batch existence read (Story 2.5): null when the id is unknown or
    * foreign — the batch detail route's catalog 404 check, before any
    * inventory read. The `skuId` rides along (a batch's SKU identity).

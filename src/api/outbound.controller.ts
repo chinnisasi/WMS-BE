@@ -16,9 +16,15 @@ import type { OrderLineDto } from '../modules/outbound/outbound.dto';
 import {
   CancelOrderDto,
   CreateOrderDto,
+  CreateWavePolicyDto,
+  GenerateWaveDto,
   OrderListQuery,
   OrderListResponse,
   OrderResponse,
+  WaveListResponse,
+  WavePolicyListResponse,
+  WavePolicyResponse,
+  WaveResponse,
 } from '../modules/outbound/outbound.dto';
 
 const IDEMPOTENCY_HEADER = [
@@ -201,6 +207,246 @@ export class OutboundController {
     const page = await this.outbound.listOrders(tenantId, warehouseId, listQuery);
     return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
   }
+
+  // ── waves and picklists (Story 4.2) ───────────────────────────────────────
+
+  @Post(':tenantId/outbound/wave-policies')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Creates a wave policy (waves.manage) — the grouping rule a wave is generated under; its cutoff gates release, never generation',
+  })
+  @ApiBody({ type: CreateWavePolicyDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: WavePolicyResponse, description: 'The created policy (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks waves.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A policy of that name already exists in the warehouse, or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async createWavePolicy(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: CreateWavePolicyDto,
+  ): Promise<WavePolicyResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.createWavePolicy(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        name: dto.name,
+        grouping: dto.grouping,
+        priority: dto.priority,
+        maxOrders: dto.maxOrders,
+        cutoffLocalTime: dto.cutoffLocalTime,
+        carrierRef: dto.carrierRef,
+      },
+      key,
+    );
+    return { policy: { ...snapshot.policy } };
+  }
+
+  @Get(':tenantId/warehouses/:warehouseId/outbound/wave-policies')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Lists one warehouse's wave policies, newest first (keyset cursor pagination)" })
+  @ApiOkResponse({ type: WavePolicyListResponse, description: "The warehouse's wave-policy page" })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor or out-of-range limit (invalid-cursor / validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async listWavePolicies(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: OrderListQuery,
+  ): Promise<WavePolicyListResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    const page = await this.outbound.listWavePolicies(tenantId, warehouseId, {
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
+  }
+
+  @Post(':tenantId/outbound/waves')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Generates a wave (waves.manage) — gathers accepted orders by policy into picklists (one per order, or one batched across orders) with the pick path in bins.code order',
+  })
+  @ApiBody({ type: GenerateWaveDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: WaveResponse,
+    description: 'The planned wave with its picklists and pick lines in walk order (the idempotency snapshot)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks waves.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, policy, or a named order does not exist in this tenant/warehouse (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('An order is already on an open wave — one order belongs to at most one open wave; the problem names the claiming wave (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('No accepted order is free to wave (no-eligible-orders), the selection exceeds the policy cap (wave-cap-exceeded), or the idempotency key was reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async generateWave(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: GenerateWaveDto,
+  ): Promise<WaveResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.generateWave(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        policyId: dto.policyId,
+        // Forwarded verbatim: absent means "sweep every eligible order",
+        // which is a different command than an empty explicit selection.
+        ...(dto.orderIds === undefined ? {} : { orderIds: dto.orderIds }),
+      },
+      key,
+    );
+    return { wave: snapshot.wave };
+  }
+
+  @Post(':tenantId/outbound/waves/:waveId/release')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Releases a wave to the floor (waves.manage) — picklists go ready and a cancelled order's pick lines drop; refused once the policy cutoff has passed in Asia/Kolkata",
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: WaveResponse, description: 'The released wave (an already-released wave replays as an idempotent no-op — no second wave.released event)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key or path parameter (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks waves.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Wave does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse("The policy cutoff has passed for the Kolkata-local day and the wave stays planned (cutoff-passed), the wave is cancelled, or a concurrent idempotent request (conflict)") })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'waveId', format: 'uuid' })
+  async releaseWave(
+    @Param('tenantId') tenantId: string,
+    @Param('waveId') waveId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<WaveResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(waveId, 'waveId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.releaseWave(
+      { tenantId, actorUserId: session.userId, waveId },
+      key,
+    );
+    return { wave: snapshot.wave };
+  }
+
+  @Post(':tenantId/outbound/waves/:waveId/cancel')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Cancels a wave (waves.manage) — its picklists and pick lines go cancelled and its orders become eligible for waving again; no reservation and no stock moves',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: WaveResponse, description: 'The cancelled wave (idempotent on replay and on an already-cancelled wave)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key or path parameter (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks waves.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Wave does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'waveId', format: 'uuid' })
+  async cancelWave(
+    @Param('tenantId') tenantId: string,
+    @Param('waveId') waveId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<WaveResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(waveId, 'waveId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.cancelWave(
+      { tenantId, actorUserId: session.userId, waveId },
+      key,
+    );
+    return { wave: snapshot.wave };
+  }
+
+  @Get(':tenantId/outbound/waves/:waveId')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "One wave's detail — its picklists and every pick line in walk order (bins.code ascending)" })
+  @ApiOkResponse({ type: WaveResponse, description: 'The wave with its picklists and pick lines in walk order' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed waveId path parameter (validation-failed — it must be a uuid)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No wave with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'waveId', format: 'uuid' })
+  async getWave(
+    @Param('tenantId') tenantId: string,
+    @Param('waveId') waveId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<WaveResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(waveId, 'waveId');
+    const wave = await this.outbound.getWave(tenantId, waveId);
+    if (wave === null) {
+      throw new ProblemException(
+        'not-found',
+        404,
+        'Wave not found',
+        `No wave with id "${waveId}" exists in this tenant.`,
+      );
+    }
+    return { wave };
+  }
+
+  @Get(':tenantId/warehouses/:warehouseId/outbound/waves')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Lists one warehouse's waves, newest first (keyset cursor pagination)" })
+  @ApiOkResponse({ type: WaveListResponse, description: "The warehouse's wave page (headers only — the detail read carries the picklists)" })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor or out-of-range limit (invalid-cursor / validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async listWaves(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: OrderListQuery,
+  ): Promise<WaveListResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    const page = await this.outbound.listWaves(tenantId, warehouseId, {
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
+  }
 }
 
 /** One line serialized for the wire (the facade's snapshot fields, verbatim). */
@@ -209,7 +455,7 @@ function toLineDto(line: OrderLineDto): OrderLineDto {
 }
 
 /** Outbound uuid path params fail 400 (not a 500 from the `::uuid` cast). */
-function assertUuidParam(value: string, name: 'orderId' | 'warehouseId'): void {
+function assertUuidParam(value: string, name: 'orderId' | 'warehouseId' | 'waveId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',
