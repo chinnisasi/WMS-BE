@@ -58,6 +58,10 @@ export const CAPABILITIES = [
   // Owner and Ops Manager only; Operator picks (4.3), it does not plan.
   // Mirrored into wms-fe `src/lib/users.ts` by the FE story.
   'waves.manage',
+  // Story 4.3 — the scan-verified pick command. Owner + Ops Manager +
+  // Operator (the floor executes the walk the planner released); Accountant
+  // stays read-only. Mirrored into wms-fe `src/lib/users.ts` by the FE story.
+  'picks.execute',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -68,7 +72,7 @@ export type Capability = (typeof CAPABILITIES)[number];
  * mutations (warehouses, zones, bins, catalog import, SKU edit) but no user
  * management; Operator holds exactly the floor capabilities a device session
  * needs (`putaway.execute`, Story 3.5 — the first non-empty operator
- * capability, deliberate); Accountant is read-only. Reads stay open to any
+ * capability, deliberate; `picks.execute`, Story 4.3); Accountant is read-only. Reads stay open to any
  * tenant member.
  */
 export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability>>> = {
@@ -90,8 +94,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'bin.retire',
     'orders.manage',
     'waves.manage',
+    'picks.execute',
   ]),
-  operator: new Set<Capability>(['putaway.execute']),
+  operator: new Set<Capability>(['putaway.execute', 'picks.execute']),
   accountant: new Set<Capability>([]),
 };
 

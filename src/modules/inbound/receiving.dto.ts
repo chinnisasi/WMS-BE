@@ -19,6 +19,7 @@ import { PurchaseOrderLineDto } from './inbound.dto';
 // Story 3.5 (additive): the snapshot's putaway decision fields reuse the
 // putaway module's DTOs (one shape on every surface).
 import { PutawayBinDto, PutawayTaskDto } from '../putaway/putaway.dto';
+import { PickTaskDto } from '../outbound/outbound.dto';
 
 /** The fixed blind-receive reason enum (the I/O matrix). */
 export const BLIND_REASON_ENUM = ['unannounced-delivery', 'po-not-found', 'other'] as const;
@@ -461,4 +462,7 @@ export class CatalogSnapshotResponse {
 
   @ApiProperty({ type: [PutawayTaskDto], description: 'Story 3.5 (additive): the derived putaway tasks with the capacity-only suggestions (advisory — the server re-gates at placement)' })
   putawayTasks!: readonly PutawayTaskDto[];
+
+  @ApiProperty({ type: [PickTaskDto], description: 'Story 4.3 (additive): the pick tasks of every ready picklist on a released wave, in walk order (the bin/batch each names is advisory — the server re-derives both at pick time)' })
+  pickTasks!: readonly PickTaskDto[];
 }

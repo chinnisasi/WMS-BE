@@ -41,8 +41,16 @@ export type WaveStatus = (typeof WAVE_STATUSES)[number];
 export const PICKLIST_STATUSES = ['planned', 'ready', 'cancelled'] as const;
 export type PicklistStatus = (typeof PICKLIST_STATUSES)[number];
 
-/** The pick-line arms shipped in story 4.2. */
-export const PICKLIST_LINE_STATUSES = ['planned', 'unfulfillable', 'cancelled'] as const;
+/**
+ * The pick-line arms: 4.2 shipped `planned` / `unfulfillable` / `cancelled`;
+ * story 4.3 appends `picked` (additive — the DB CHECK in migration 0019
+ * mirrors it). `picked` deliberately sits OUTSIDE `'cancelled'`, so a picked
+ * line stays inside the `picklist_lines_open_order_line_unique` partial
+ * index: dropping out of it would free the order to be re-waved while its
+ * units were being picked, and the second wave would plan the same reserved
+ * stock.
+ */
+export const PICKLIST_LINE_STATUSES = ['planned', 'unfulfillable', 'picked', 'cancelled'] as const;
 export type PicklistLineStatus = (typeof PICKLIST_LINE_STATUSES)[number];
 
 /** How a policy shapes a wave's picklists. */
@@ -848,6 +856,13 @@ export class WaveCommandService {
         // The lines stop claiming their orders in the same commit as the
         // flip — the partial unique index's predicate is `status <>
         // 'cancelled'`, so this IS what frees the orders.
+        //
+        // Story 4.3: a `picked` line is NOT freed. Its units have physically
+        // left the bin through a `pick.picked` ledger draw and its hold is
+        // committed; dropping it out of the partial index would let a second
+        // wave plan the same reserved units against stock that is already
+        // gone. The picked slices stay claimed; the rest of the wave is
+        // withdrawn as before.
         await tx
           .update(picklistLines)
           .set({ status: 'cancelled', updatedAt: nowIso() })
@@ -855,6 +870,7 @@ export class WaveCommandService {
             and(
               eq(picklistLines.tenantId, command.tenantId),
               eq(picklistLines.waveId, wave.id),
+              sql`${picklistLines.status} <> 'picked'`,
             ),
           );
         await tx

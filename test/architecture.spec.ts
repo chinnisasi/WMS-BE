@@ -191,8 +191,11 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     'waves',
     'picklists',
     'picklistLines',
+    // Story 4.3 — the pick settlement record joins the same ownership.
+    'picks',
   ] as const;
-  const RAW_ORDER_TABLES = 'orders|order_lines|wave_policies|waves|picklists|picklist_lines';
+  const RAW_ORDER_TABLES =
+    'orders|order_lines|wave_policies|waves|picklists|picklist_lines|picks';
   const outboundRoot = join(SRC_ROOT, 'modules', 'outbound');
 
   it('no order-table write happens outside the outbound module', () => {
@@ -269,6 +272,25 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     for (const table of ['wavePolicies', 'waves', 'picklists', 'picklistLines'] as const) {
       expect(drizzleWriteOn(table).test(waveSource)).toBe(true);
     }
+    // Story 4.3's half: the pick command writes the settlement record and the
+    // line flip, and nothing else writes `picks`.
+    const pickSource = readFileSync(join(outboundRoot, 'pick.command.ts'), 'utf8');
+    expect(drizzleWriteOn('picks').test(pickSource)).toBe(true);
+    expect(drizzleWriteOn('picklistLines').test(pickSource)).toBe(true);
+  });
+
+  it('the pick command moves stock ONLY through the inventory facade (4.3)', () => {
+    // The outbound module's first stock-moving path. It must never write a
+    // stock table or the reservation journal itself: the `pick.picked` draw
+    // and the `held → committed` settlement both ride `InventoryFacade`'s
+    // in-transaction passthroughs, which is what keeps them in ONE
+    // transaction without opening a second quantity-mutation path (AD-6/16).
+    const pickSource = readFileSync(join(outboundRoot, 'pick.command.ts'), 'utf8');
+    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'reservations'] as const) {
+      expect(drizzleWriteOn(table).test(pickSource)).toBe(false);
+    }
+    expect(pickSource).toContain('this.inventory.appendLedgerEventInTx');
+    expect(pickSource).toContain('this.inventory.commitReservationInTx');
   });
 
   it('the wave aggregate writes no stock table and journals no ledger event (4.2)', () => {

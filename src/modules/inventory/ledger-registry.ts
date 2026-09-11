@@ -72,8 +72,27 @@ export type LedgerReferenceDoc =
   | {
       readonly kind: 'bin-merge';
       readonly mergeId: string;
+    }
+  // Story 4.3 — the pick arm: every `pick.picked` movement names the
+  // picklist line whose planned units were drawn, the wave and order it
+  // serves, and the reservation hold the same transaction settled. The
+  // plan's suggested bin rides along when the operator drew somewhere else
+  // (the bin a line names is a SUGGESTION re-derived at pick time), so the
+  // event itself records suggestion-vs-actual. NEW union arm — the earlier
+  // kinds are never reshaped.
+  | {
+      readonly kind: 'pick';
+      readonly picklistId: string;
+      readonly picklistLineId: string;
+      readonly waveId: string;
+      readonly orderId: string;
+      readonly orderLineId: string;
+      /** The order line's journal hold; absent when the line carried none. */
+      readonly reservationId?: string;
+      /** The plan's bin — present only when the draw bin differs from it. */
+      readonly suggestedBinId?: string;
     };
-// Later stories extend this union with NEW kinds (pick, transfer, …) — never
+// Later stories extend this union with NEW kinds (transfer, pack, …) — never
 // by reshaping an existing arm.
 
 /** One registered grammar entry: an event type and what it may carry. */
@@ -196,6 +215,28 @@ registerLedgerEventType({
   type: 'bin.merged',
   sinceVersion: 1,
   referenceKinds: ['bin-merge'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 4.3 — the pick movement: reserved units leaving their
+ * storage bin on a scan-verified pick. Unlike the putaway/merge relocations
+ * this is a pure DRAW — `fromBinId` is the bin the operator scanned and
+ * `toBinId` is null: the units leave stock here, and the order's onward
+ * journey (pack, dispatch) is 4.5/4.6's ledger arms, not a bin this story
+ * invents. One event per (sku, batch) arm of the draw; serial-tracked stock
+ * draws one event per serial unit (magnitude 1, the batch arm carried with
+ * it — the putaway convention, so the serial's location record leaves with
+ * its stock). Never a direct `stock_on_hand` write: the ledger's sufficiency
+ * guard refusing a negative on-hand IS this story's conflict behaviour.
+ * Registers sinceVersion 1: no new grammar version — the reference-doc arm
+ * appends only.
+ */
+registerLedgerEventType({
+  type: 'pick.picked',
+  sinceVersion: 1,
+  referenceKinds: ['pick'],
   allowsBatchArm: true,
   allowsSerialArm: true,
 });

@@ -16,6 +16,7 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { PutawayFacade } from '../putaway/putaway.facade';
+import { OutboundFacade } from '../outbound/outbound.facade';
 import { ReceivingCommand } from './receiving.command';
 import type {
   DecideOverReceiptCommand,
@@ -105,6 +106,32 @@ export interface CatalogSnapshot {
     readonly suggestedBin: { readonly binId: string; readonly binCode: string } | null;
     readonly rationale: string;
   }[];
+  // ── Story 4.3 (additive): the picking decision fields ────────────────────
+  /**
+   * The pick tasks of every ready picklist on a released wave in this
+   * warehouse, in walk order. The bin and batch each task names are the
+   * plan's SUGGESTION — re-derived server-side at pick time — and the WHOLE
+   * walk rides along, so a wrong-bin scan can name the next walk bin holding
+   * the expected SKU without a network call.
+   */
+  readonly pickTasks: readonly {
+    readonly waveId: string;
+    readonly picklistId: string;
+    readonly picklistLineId: string;
+    readonly orderId: string;
+    readonly orderLineId: string;
+    readonly skuId: string;
+    readonly skuCode: string;
+    readonly skuName: string;
+    readonly binId: string;
+    readonly binCode: string;
+    readonly batchId: string | null;
+    readonly batchCode: string | null;
+    readonly qty: number;
+    readonly sliceSeq: number;
+    readonly walkSeq: number;
+    readonly stopCount: number;
+  }[];
 }
 
 export const DEFAULT_RECEIVING_PAGE_SIZE = 50;
@@ -154,6 +181,9 @@ export class ReceivingFacade {
     // module's own tables, bins + putaway tasks through the putaway facade.
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(PutawayFacade) private readonly putaway: PutawayFacade,
+    // Story 4.3 (additive): the pick tasks ride the same snapshot, through
+    // the outbound facade — the wave aggregate stays outbound-exclusive.
+    @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
   ) {}
 
   /** `grn.submit` — the device-authenticated whole-GRN command. */
@@ -357,9 +387,12 @@ export class ReceivingFacade {
       // Story 3.5 (additive): the putaway decision fields ride the same
       // snapshot — the bins (for the wrong-bin/blocked pre-queue checks) and
       // the derived tasks (suggestions advisory; the server re-gates).
-      const [binSummaries, putawayTasks] = await Promise.all([
+      // Story 4.3 (additive): the pick tasks join the same composition —
+      // the outbound facade is the only seam into the wave aggregate (AD-6).
+      const [binSummaries, putawayTasks, pickTasks] = await Promise.all([
         this.putaway.getBinSummaries(tenantId, warehouseId),
         this.putaway.getPutawayTasks(tenantId, warehouseId),
+        this.outbound.getPickTasks(tenantId, warehouseId),
       ]);
       return {
         generatedAt: new Date().toISOString(),
@@ -374,6 +407,7 @@ export class ReceivingFacade {
         })),
         bins: binSummaries,
         putawayTasks: putawayTasks.map((task) => ({ ...task })),
+        pickTasks: pickTasks.map((task) => ({ ...task })),
       };
     });
   }

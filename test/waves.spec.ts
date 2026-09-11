@@ -525,7 +525,10 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
   it('the wave state machines are the outbound module’s own additive arm sets', () => {
     expect([...WAVE_STATUSES]).toEqual(['planned', 'released', 'cancelled']);
     expect([...PICKLIST_STATUSES]).toEqual(['planned', 'ready', 'cancelled']);
-    expect([...PICKLIST_LINE_STATUSES]).toEqual(['planned', 'unfulfillable', 'cancelled']);
+    // Story 4.3 appends `picked` — additive, and deliberately OUTSIDE
+    // `cancelled` so a picked line keeps its claim in the one-open-wave
+    // partial unique index.
+    expect([...PICKLIST_LINE_STATUSES]).toEqual(['planned', 'unfulfillable', 'picked', 'cancelled']);
     expect([...WAVE_GROUPINGS]).toEqual(['single', 'batch']);
     // The cutoff timezone is a named module constant, not a per-warehouse
     // column: `warehouses` carries no timezone and the product is India-only.

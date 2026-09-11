@@ -4,7 +4,8 @@ import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
 import { TenantSessionGuard, CurrentSession } from '../modules/tenancy/tenant-session.guard';
-import type { TenantSession } from '../modules/tenancy/jwt-session';
+import { DeviceSessionGuard, CurrentDeviceSession } from '../modules/tenancy/device-session.guard';
+import type { DeviceSession, TenantSession } from '../modules/tenancy/jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { OutboundFacade } from '../modules/outbound/outbound.facade';
@@ -21,6 +22,8 @@ import {
   OrderListQuery,
   OrderListResponse,
   OrderResponse,
+  PickResponse,
+  RecordPickDto,
   WaveListResponse,
   WavePolicyListResponse,
   WavePolicyResponse,
@@ -392,6 +395,63 @@ export class OutboundController {
     return { wave: snapshot.wave };
   }
 
+  @Post(':tenantId/outbound/picks')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(DeviceSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'pick.record — records one scan-verified pick exactly once (badge-in session required): the pick.picked ledger draw empties the scanned bin and the order line’s reservation settles held → committed in the SAME transaction; the line flips to picked',
+  })
+  @ApiBody({ type: RecordPickDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: PickResponse,
+    description:
+      'Pick recorded: the pick snapshot with suggestion-vs-actual bin/batch (the idempotency snapshot — a replay re-serves it, nothing re-draws)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, a quantity that is not the line’s whole planned quantity, a blocked bin (bin-blocked), a retired bin (bin-retired), a system bin, the wrong item scanned (wrong-item naming the expected SKU), or a serial-arm violation (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), unknown or revoked device (device-revoked), or the operator lacks picks.execute (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, picklist line, order, SKU or bin does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The wave is not released / the picklist is not ready / the line is already picked / the order is not accepted / the hold is already terminal (conflict), a concurrent idempotent request (conflict), or a serial that does not live in the scanned bin (serial-elsewhere)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or the bin drained before this (queued) pick replayed (insufficient-on-hand, naming the bin’s live on-hand — nothing persists)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
+  async recordPick(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentDeviceSession() session: DeviceSession,
+    @Body() dto: RecordPickDto,
+  ): Promise<PickResponse> {
+    assertOwnDeviceTenant(session.tenantId, tenantId);
+    if (session.userId === null) {
+      // A bare enrollment credential has no operator — badge-in first.
+      throw badgeInRequired();
+    }
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.recordPick(
+      {
+        tenantId,
+        deviceId: session.deviceId,
+        operatorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        picklistId: dto.picklistId,
+        picklistLineId: dto.picklistLineId,
+        skuId: dto.skuId,
+        binId: dto.binId,
+        qty: dto.qty,
+        occurredAt: dto.occurredAt,
+        // `@IsOptional()` lets an explicit `"serials": null` through (the
+        // mobile op payload always carries it) — normalize to absent so the
+        // command's payload hash spreads an array, never null.
+        serials: dto.serials ?? undefined,
+      },
+      key,
+    );
+    return { pick: { ...snapshot.pick } };
+  }
+
   @Get(':tenantId/outbound/waves/:waveId')
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
@@ -462,6 +522,27 @@ function assertUuidParam(value: string, name: 'orderId' | 'warehouseId' | 'waveI
       400,
       `${name} must be a uuid`,
       `The "${name}" path parameter must be a uuid (got "${value}").`,
+    );
+  }
+}
+
+function badgeInRequired(): ProblemException {
+  return new ProblemException(
+    'unauthenticated',
+    401,
+    'Badge-in required',
+    'This endpoint requires an operator badge-in session.',
+  );
+}
+
+/** The device-token twin of `assertOwnTenant` (the putaway controller shape). */
+function assertOwnDeviceTenant(tokenTenantId: string, tenantId: string): void {
+  if (tokenTenantId !== tenantId) {
+    throw new ProblemException(
+      'permission-denied',
+      403,
+      'Session belongs to another tenant',
+      'The device token tenant does not own this path.',
     );
   }
 }

@@ -20,6 +20,8 @@ import type {
   OrderStatus,
 } from './order.command';
 import { WaveCommandService, policySnapshot } from './wave.command';
+import { PickCommandService } from './pick.command';
+import type { PickSnapshot, PickTask, RecordPickCommand } from './pick.command';
 import type {
   CreateWavePolicyCommand,
   GenerateWaveCommand,
@@ -109,6 +111,7 @@ export class OutboundFacade {
     @Inject(DATABASE) private readonly db: Database,
     @Inject(OrderCommandService) private readonly orderCommand: OrderCommandService,
     @Inject(WaveCommandService) private readonly waveCommand: WaveCommandService,
+    @Inject(PickCommandService) private readonly pickCommand: PickCommandService,
   ) {}
 
   /** `POST .../outbound/orders` — manual entry and (adapter-ready) ingestion. */
@@ -332,6 +335,30 @@ export class OutboundFacade {
         .limit(pageSize + 1);
       return buildPage(rows.map(policySnapshot), pageSize);
     });
+  }
+
+  // ── picking (Story 4.3) ───────────────────────────────────────────────────
+
+  /**
+   * `POST .../outbound/picks` (device-gated, `picks.execute`): one
+   * scan-verified pick — the `pick.picked` ledger draw and the reservation's
+   * `held → committed` settlement in ONE transaction.
+   */
+  async recordPick(command: RecordPickCommand, idempotencyKey: string): Promise<PickSnapshot> {
+    return this.pickCommand.recordPick(command, idempotencyKey);
+  }
+
+  /**
+   * The device's pick tasks (AD-4): the still-pickable lines of every ready
+   * picklist on a released wave in the warehouse, in walk order. Composed
+   * into the sealed device catalog snapshot additively (the `putawayTasks`
+   * precedent) — the bin and batch each task names are advisory suggestions,
+   * re-derived server-side at pick time.
+   */
+  async getPickTasks(tenantId: string, warehouseId: string): Promise<PickTask[]> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.pickCommand.getPickTasks(tx, tenantId, warehouseId),
+    );
   }
 
   /**

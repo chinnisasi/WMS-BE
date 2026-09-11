@@ -466,6 +466,68 @@ export class ReservationService implements OnModuleInit {
   }
 
   /**
+   * The same terminal transition inside the CALLER's transaction (story
+   * 4.3): a pick draws the reserved units through the ledger and settles
+   * their hold in ONE transaction — split across two, a crash between them
+   * either frees stock that has physically left the bin or holds stock that
+   * was never drawn. `commit` above opens its own transaction and cannot
+   * nest, so this is the `reservationsByIdsInTx` / `appendLedgerEventInTx`
+   * in-tx passthrough of it.
+   *
+   * Committing settles the hold ONLY: no stock moves here (the caller's
+   * ledger event does that) and the Valkey reserved counter is deliberately
+   * untouched — committed units stay deducted from ATP until the consuming
+   * movement, exactly as `commit` leaves them.
+   *
+   * A row lost by the conditional UPDATE throws inside the caller's
+   * transaction, which rolls the whole pick back: 404 when the reservation
+   * is absent, 409 when it is already terminal (AD-12 — exactly one
+   * terminal transition wins).
+   */
+  async commitInTx(
+    tx: TenantTx,
+    tenantId: string,
+    reservationId: string,
+  ): Promise<ReservationSnapshot> {
+    if (!UUID_RE.test(reservationId)) {
+      return this.terminalNotFound(reservationId);
+    }
+    const rows = await tx
+      .update(reservations)
+      .set({ state: 'committed', updatedAt: nowIso() })
+      .where(
+        and(
+          eq(reservations.id, reservationId),
+          eq(reservations.tenantId, tenantId),
+          eq(reservations.state, 'held'),
+        ),
+      )
+      .returning();
+    const row = rows[0];
+    if (row === undefined) {
+      // The state read rides the CALLER's transaction (the standalone
+      // `terminalConflict` opens its own, which would deadlock behind this
+      // one's row locks and could not see its uncommitted writes anyway).
+      const existing = await tx
+        .select({ state: reservations.state })
+        .from(reservations)
+        .where(and(eq(reservations.id, reservationId), eq(reservations.tenantId, tenantId)))
+        .limit(1);
+      const current = existing[0];
+      if (current === undefined) {
+        return this.terminalNotFound(reservationId);
+      }
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Reservation is not held',
+        `The reservation is already terminal (state "${current.state}") — exactly one terminal transition wins (AD-12).`,
+      );
+    }
+    return toSnapshot(row);
+  }
+
+  /**
    * `held → released`: serialized conditional UPDATE first (journal is
    * truth), then the script restores the counter. A non-held row is a
    * deterministic conflict; a missed mirror (Valkey down at restore time)
