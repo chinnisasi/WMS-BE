@@ -541,3 +541,204 @@ export class WaveListResponse {
   @ApiProperty({ type: String, nullable: true, required: false })
   nextCursor?: string | null;
 }
+
+// ── Picking (Story 4.3) ─────────────────────────────────────────────────────
+
+/**
+ * POST /tenants/{tenantId}/outbound/picks body — the `pick.record` op, one
+ * scan-verified pick of one picklist line. The bin is what the operator
+ * SCANNED (the plan's bin is a suggestion re-derived server-side); the batch
+ * is never client-supplied — the server re-derives it FEFO inside the bin
+ * that was actually scanned.
+ */
+export class RecordPickDto {
+  @ApiProperty({ format: 'uuid', description: 'Warehouse the pick draws from' })
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The picklist whose walk is being executed' })
+  @IsUUID()
+  picklistId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The pick line being drawn (one slice of one order line)' })
+  @IsUUID()
+  picklistLineId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The SKU the operator scanned — verified against the line' })
+  @IsUUID()
+  skuId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The bin the operator scanned — checked against live stock, not against the plan' })
+  @IsUUID()
+  binId!: string;
+
+  @ApiProperty({
+    description: 'Units drawn in base UoM — exactly the line’s planned quantity (full-quantity picks only in this release)',
+    minimum: 1,
+    maximum: 2147483647,
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(2147483647)
+  qty!: number;
+
+  @ApiProperty({ description: 'Device time of the pick (ISO-8601 UTC, Z-suffixed)', minLength: 20, maxLength: 35 })
+  @IsString()
+  @Length(20, 35)
+  occurredAt!: string;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    maxItems: 200,
+    description: 'The serial numbers of a serial-tracked pick (one per drawn unit, no duplicates)',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(200)
+  @IsString({ each: true })
+  @Length(1, 64, { each: true })
+  serials?: string[];
+}
+
+/** One pick as every surface returns it (the idempotency snapshot). */
+export class PickDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  waveId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  picklistId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  picklistLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The bin the units were actually drawn from' })
+  binId!: string;
+
+  @ApiProperty()
+  binCode!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The plan’s suggested bin (advisory)' })
+  suggestedBinId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  suggestedBinCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The batch re-derived FEFO in the scanned bin; null when untracked or when the draw spanned several batches' })
+  batchId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  batchCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The plan’s suggested batch (advisory)' })
+  suggestedBatchId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The plan’s suggested batch code — paired with the id, like the bin arms' })
+  suggestedBatchCode!: string | null;
+
+  @ApiProperty({ description: 'Units drawn (base UoM)' })
+  qty!: number;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The order line’s journal hold' })
+  reservationId!: string | null;
+
+  @ApiProperty({ description: 'True when this pick settled the hold (held → committed) in the same transaction as the draw' })
+  reservationCommitted!: boolean;
+
+  @ApiProperty({ enum: [...PICKLIST_LINE_STATUSES], description: 'The pick line’s status after the pick' })
+  lineStatus!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  pickedBy!: string;
+
+  @ApiProperty({ description: 'Device time of the pick (AD-1)' })
+  pickedAt!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  deviceId!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC server record time' })
+  createdAt!: string;
+}
+
+export class PickResponse {
+  @ApiProperty({ type: PickDto })
+  pick!: PickDto;
+}
+
+/**
+ * One pick task of the sealed device snapshot (AD-4): a released wave's
+ * still-unpicked pick line. The bin and batch it names are the plan's
+ * SUGGESTION — the server re-derives both at pick time.
+ */
+export class PickTaskDto {
+  @ApiProperty({ format: 'uuid' })
+  waveId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  picklistId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  picklistLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The suggested bin (the walk stop)' })
+  binId!: string;
+
+  @ApiProperty({ description: 'The suggested bin’s code — the walk key' })
+  binCode!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  batchId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  batchCode!: string | null;
+
+  @ApiProperty({ description: 'Units to draw at this stop' })
+  qty!: number;
+
+  @ApiProperty({ description: 'The order line’s slice index' })
+  sliceSeq!: number;
+
+  @ApiProperty({ description: 'Position on the walk (bins.code ascending)' })
+  walkSeq!: number;
+
+  @ApiProperty({ description: 'Distinct bin stops left on this picklist’s walk' })
+  stopCount!: number;
+}

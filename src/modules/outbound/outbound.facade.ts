@@ -20,6 +20,8 @@ import type {
   OrderStatus,
 } from './order.command';
 import { WaveCommandService, policySnapshot } from './wave.command';
+import { PickCommandService } from './pick.command';
+import type { PickSnapshot, PickTask, RecordPickCommand } from './pick.command';
 import type {
   CreateWavePolicyCommand,
   GenerateWaveCommand,
@@ -109,6 +111,7 @@ export class OutboundFacade {
     @Inject(DATABASE) private readonly db: Database,
     @Inject(OrderCommandService) private readonly orderCommand: OrderCommandService,
     @Inject(WaveCommandService) private readonly waveCommand: WaveCommandService,
+    @Inject(PickCommandService) private readonly pickCommand: PickCommandService,
   ) {}
 
   /** `POST .../outbound/orders` — manual entry and (adapter-ready) ingestion. */
@@ -332,6 +335,52 @@ export class OutboundFacade {
         .limit(pageSize + 1);
       return buildPage(rows.map(policySnapshot), pageSize);
     });
+  }
+
+  // ── picking (Story 4.3) ───────────────────────────────────────────────────
+
+  /**
+   * `POST .../outbound/picks` (device-gated, `picks.execute`): one
+   * scan-verified pick — the `pick.picked` ledger draw and the reservation's
+   * `held → committed` settlement in ONE transaction.
+   */
+  async recordPick(command: RecordPickCommand, idempotencyKey: string): Promise<PickSnapshot> {
+    return this.pickCommand.recordPick(command, idempotencyKey);
+  }
+
+  /**
+   * The device's pick tasks (AD-4): the still-pickable lines of every ready
+   * picklist on a released wave in the warehouse, in walk order — composed
+   * into the sealed device catalog snapshot additively (the `putawayTasks`
+   * precedent). The bin and batch each task names are advisory suggestions,
+   * re-derived server-side at pick time.
+   *
+   * In-tx ONLY, deliberately: the snapshot composes bins, putaway tasks and
+   * pick tasks in ONE tenant transaction. A pool-opening sibling would
+   * reserve a SECOND connection while the outer one is held, and postgres.js
+   * queues connection requests with no timeout, so enough concurrent
+   * snapshots deadlock the pool permanently — which is exactly what a
+   * convenience wrapper here invited last time.
+   */
+  async getPickTasksInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<PickTask[]> {
+    return this.pickCommand.getPickTasksInTx(tx, tenantId, warehouseId);
+  }
+
+  /**
+   * The same read in its OWN tenant transaction — what the api shell calls
+   * when it joins this arm onto the device catalog snapshot. One transaction,
+   * one pooled connection, taken AFTER the snapshot's own has been released:
+   * the shell composes the two facades sequentially rather than nesting, so
+   * neither read can queue behind the other.
+   */
+  async getPickTasks(tenantId: string, warehouseId: string): Promise<PickTask[]> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.getPickTasksInTx(tx, tenantId, warehouseId),
+    );
   }
 
   /**

@@ -744,4 +744,68 @@ describe('users, roles, and permission gating (e2e)', () => {
       ]),
     );
   });
+
+  it('accept-invite replays only within its OWN tenant — a foreign tenant holding the same idempotency key cannot hijack it', async () => {
+    // `idempotency_keys` is unique per (tenant_id, key), NOT per key, so the
+    // same client ULID legitimately exists in two tenants. An auth-time
+    // replay lookup on `key` alone reads the foreign row: with a matching
+    // payload hash it returns that tenant's snapshot as a 200 while flipping
+    // NOBODY — the invitee stays `invited`, and their next sign-in answers
+    // 403 invite-pending with nothing in the response explaining why. This
+    // pins the lookup to the tenant the path names.
+    const foreignEmail = `foreign-${ulid().toLowerCase()}@example.com`;
+    const foreign = await registerTenant(foreignEmail);
+    const ownerEmail = `home-owner-${ulid().toLowerCase()}@example.com`;
+    const home = await registerTenant(ownerEmail);
+    const ownerToken = (await signIn(ownerEmail)).token;
+
+    // The foreign tenant already holds a row under the shared key.
+    const sharedKey = ulid();
+    const seeder = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await seeder`
+        insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+        values (
+          ${uuidv7()}, ${foreign.tenantId}, ${sharedKey}, ${'a'.repeat(64)},
+          ${seeder.json({ user: { id: uuidv7(), email: 'someone-else@example.com', role: 'operator', status: 'active' } })}
+        )
+      `;
+    } finally {
+      await seeder.end();
+    }
+
+    const inviteeEmail = `invitee-${ulid().toLowerCase()}@example.com`;
+    const invited = await invite(ownerToken, home.tenantId, {
+      email: inviteeEmail,
+      role: 'operator',
+    }).expect(201);
+
+    // Scoped to its own tenant this is a FIRST use, so it must do the work —
+    // not replay the foreign snapshot and not 422 on a key this tenant has
+    // never used.
+    await acceptInvite(
+      home.tenantId,
+      { token: invited.body.inviteToken as string, password: 'invitee-password-1' },
+      sharedKey,
+    ).expect(200);
+
+    // The proof the work actually happened: the invitee is active and signs
+    // in. Before the fix this sign-in answered 403 invite-pending.
+    const signedIn = await signIn(inviteeEmail, 'invitee-password-1');
+    expect(signedIn.user.status).toBe('active');
+    expect(signedIn.user.email).toBe(inviteeEmail);
+
+    // And the key is now recorded under the HOME tenant, beside the foreign
+    // one — two rows, same key, which is exactly what the unique index allows.
+    const check = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const rows = await check`select tenant_id from idempotency_keys where key = ${sharedKey}`;
+      expect(rows).toHaveLength(2);
+      expect(rows.map((r) => (r as unknown as { tenant_id: string }).tenant_id).sort()).toEqual(
+        [foreign.tenantId, home.tenantId].sort(),
+      );
+    } finally {
+      await check.end();
+    }
+  });
 });

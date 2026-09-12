@@ -4,6 +4,7 @@ import { InventoryModule } from '../inventory/inventory.module';
 import { CatalogModule } from '../catalog/catalog.module';
 import { OrderCommandService } from './order.command';
 import { WaveCommandService } from './wave.command';
+import { PickCommandService } from './pick.command';
 import { WAVE_CLOCK, SystemWaveClock } from './wave.clock';
 import { OutboundFacade } from './outbound.facade';
 
@@ -31,12 +32,21 @@ import { OutboundFacade } from './outbound.facade';
  * edge introduces no cycle. `WAVE_CLOCK` is the injectable "now" a policy
  * cutoff is compared against (the e2e suite stubs it on both sides of a
  * boundary rather than sleeping until 16:30 IST).
+ *
+ * Story 4.3 adds the pick command (`picks` — module-exclusive in the same
+ * way). It is the module's FIRST stock-moving path: the `pick.picked` ledger
+ * draw and the reservation's `held → committed` settlement commit in ONE
+ * transaction through `InventoryFacade`'s in-tx passthroughs
+ * (`appendLedgerEventInTx`, `lockSerialsInTx`, `commitReservationInTx`) — it
+ * still writes no inventory table itself (AD-6). The batch a pick draws is
+ * re-derived FEFO in the scanned bin through `CatalogFacade`.
  */
 @Module({
   imports: [SharedModule, InventoryModule, CatalogModule],
   providers: [
     OrderCommandService,
     WaveCommandService,
+    PickCommandService,
     { provide: WAVE_CLOCK, useClass: SystemWaveClock },
     OutboundFacade,
   ],

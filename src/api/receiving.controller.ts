@@ -9,6 +9,7 @@ import type { TenantSession, DeviceSession } from '../modules/tenancy/jwt-sessio
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ReceivingFacade } from '../modules/inbound/receiving.facade';
+import { OutboundFacade } from '../modules/outbound/outbound.facade';
 import { QcFacade } from '../modules/inbound/qc.facade';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
@@ -57,6 +58,9 @@ export class ReceivingController {
   constructor(
     @Inject(ReceivingFacade) private readonly receiving: ReceivingFacade,
     @Inject(QcFacade) private readonly qc: QcFacade,
+    // Story 4.3: the snapshot's `pickTasks` arm — cross-facade composition at
+    // the shell, which is where AD-6 puts it.
+    @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
   ) {}
 
   @Post(':tenantId/receiving/goods-receipts')
@@ -142,7 +146,16 @@ export class ReceivingController {
       throw badgeInRequired();
     }
     assertUuidParam(query.warehouseId, 'warehouseId');
-    return this.receiving.getCatalogSnapshot(tenantId, query.warehouseId);
+    // Story 4.3: `pickTasks` is composed HERE, across the two facades, not by
+    // `ReceivingFacade` reaching into the outbound module. The wave aggregate
+    // is outbound-exclusive (AD-6) and the api shell is the sanctioned place
+    // to join two modules' reads — the pattern story 2.4 set when the
+    // adjustment's batch/serial arms needed catalog + inventory together.
+    // Making `InboundModule` import `OutboundModule` instead would pull the
+    // entire outbound graph into inbound's initialization for one array.
+    const snapshot = await this.receiving.getCatalogSnapshot(tenantId, query.warehouseId);
+    const pickTasks = await this.outbound.getPickTasks(tenantId, query.warehouseId);
+    return { ...snapshot, pickTasks: pickTasks.map((task) => ({ ...task })) };
   }
 
   @Get(':tenantId/receiving/goods-receipts')

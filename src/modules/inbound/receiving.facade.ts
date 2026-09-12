@@ -320,10 +320,12 @@ export class ReceivingFacade {
   async getCatalogSnapshot(tenantId: string, warehouseId: string): Promise<CatalogSnapshot> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
-      // Catalog identity through the catalog facade (module-exclusive tables);
-      // it opens its own tenant transaction, so this composition reads the
-      // POs in one tx and the SKUs beside it (a read snapshot, not a gate).
-      const skus = await this.catalog.getSkuSummaries(tenantId);
+      // Catalog identity through the catalog facade (module-exclusive
+      // tables), on THIS transaction — the last of the four snapshot reads to
+      // stop opening its own. The whole endpoint now runs on one connection,
+      // so it cannot queue behind itself, and the snapshot is one consistent
+      // read rather than several MVCC snapshots stitched together.
+      const skus = await this.catalog.getSkuSummariesInTx(tx, tenantId);
       const poRows = await tx
         .select({
           id: purchaseOrders.id,
@@ -357,10 +359,20 @@ export class ReceivingFacade {
       // Story 3.5 (additive): the putaway decision fields ride the same
       // snapshot — the bins (for the wrong-bin/blocked pre-queue checks) and
       // the derived tasks (suggestions advisory; the server re-gates).
-      const [binSummaries, putawayTasks] = await Promise.all([
-        this.putaway.getBinSummaries(tenantId, warehouseId),
-        this.putaway.getPutawayTasks(tenantId, warehouseId),
-      ]);
+      //
+      // All three ride the IN-TX passthroughs and run on THIS transaction's
+      // connection. The earlier shape called the pool-opening facade methods
+      // inside `Promise.all`, so one snapshot request held four pooled
+      // connections at once (the outer transaction plus one per nested
+      // read). postgres.js queues connection requests with no timeout, so
+      // past `max / 4` concurrent snapshots every outer transaction waited
+      // forever for a nested one that could never be granted — a permanent
+      // deadlock that also stranded the connection at the server, well
+      // beyond the request that caused it. Composing in one transaction is
+      // also what makes the "sealed snapshot" a single consistent read
+      // rather than four MVCC snapshots stitched together.
+      const binSummaries = await this.putaway.getBinSummariesInTx(tx, tenantId, warehouseId);
+      const putawayTasks = await this.putaway.getPutawayTasksInTx(tx, tenantId, warehouseId);
       return {
         generatedAt: new Date().toISOString(),
         warehouseId,

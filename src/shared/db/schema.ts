@@ -1537,6 +1537,8 @@ export const waves = pgTable(
       table.createdAt,
       table.id,
     ),
+    // Story 4.3: the pick-task read's `released` join arm.
+    index('waves_tenant_status_idx').on(table.tenantId, table.status),
   ],
 );
 
@@ -1569,6 +1571,15 @@ export const picklists = pgTable(
   (table) => [
     index('picklists_wave_id_idx').on(table.waveId, table.createdAt, table.id),
     index('picklists_tenant_id_idx').on(table.tenantId),
+    // Story 4.3: the device snapshot's pick-task read narrows to the ready
+    // picklists of one warehouse before it touches any line — this is its
+    // driving index. Without it that read seq-scans every picklist the tenant
+    // has ever had, on the one endpoint every device hits on every refresh.
+    index('picklists_tenant_warehouse_status_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.status,
+    ),
   ],
 );
 
@@ -1653,7 +1664,90 @@ export const picklistLines = pgTable(
     uniqueIndex('picklist_lines_open_order_line_unique')
       .on(table.tenantId, table.orderLineId, table.sliceSeq)
       .where(sql`status <> 'cancelled'`),
+    // Story 4.3: the device snapshot's pick-task read, exactly. PARTIAL on
+    // the predicate (still pickable = a planned line that names a bin) so the
+    // index holds only open floor work — it does not grow with picking
+    // history — and ordered so it also serves the walk-order sort. The
+    // snapshot is the one endpoint the offline substrate's latency depends
+    // on, so this read is index-only work, not a scan of every line.
+    index('picklist_lines_pickable_walk_idx')
+      .on(table.tenantId, table.picklistId, table.walkSeq, table.id)
+      .where(sql`status = 'planned' and bin_id is not null`),
   ],
 );
 
 export type PicklistLine = typeof picklistLines.$inferSelect;
+
+/**
+ * Picks (Story 4.3): the settlement record of one scan-verified pick — one
+ * row per picked `picklist_lines` slice, written in the SAME transaction as
+ * the `pick.picked` ledger draw and the reservation's `held → committed`
+ * settlement. The row records what the operator actually scanned
+ * (`bin_id`, and the server's re-derived `batch_id`) against what the plan
+ * suggested (`suggested_bin_id` / `suggested_batch_id`) — the pick line's
+ * bin and batch are a SUGGESTION re-derived server-side at pick time (the
+ * 4.2 decision, the putaway precedent), so a scan against a different bin
+ * is checked against live stock, never against the plan.
+ *
+ * `qty` is always the line's whole planned quantity: full-quantity picks
+ * only in this story (short-pick is 4.4), and reservations are
+ * whole-quantity rows with no partial commit.
+ *
+ * One pick per line is the DB backstop (`picks_line_unique`): the line's
+ * `planned → picked` flip already serializes the command, but a unique
+ * index makes a diverged replay a deterministic loser rather than a second
+ * draw.
+ *
+ * No FKs anywhere (repo convention). RLS policy + CHECKs live **only in the
+ * migration SQL** (0019, the 0018 pattern).
+ */
+export const picks = pgTable(
+  'picks',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    waveId: uuid('wave_id').notNull(),
+    picklistId: uuid('picklist_id').notNull(),
+    picklistLineId: uuid('picklist_line_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    orderLineId: uuid('order_line_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** The bin the operator actually scanned (the draw's from-bin). */
+    binId: uuid('bin_id').notNull(),
+    /** The plan's suggested bin — null when the plan named none. */
+    suggestedBinId: uuid('suggested_bin_id'),
+    /** The batch re-derived FEFO in the scanned bin; null when untracked. */
+    batchId: uuid('batch_id'),
+    suggestedBatchId: uuid('suggested_batch_id'),
+    /** The order line's journal hold; null when the line carried none. */
+    reservationId: uuid('reservation_id'),
+    /** True when this pick settled the hold (`held → committed`). */
+    reservationCommitted: boolean('reservation_committed').notNull().default(false),
+    qty: integer('qty').notNull(),
+    pickedBy: uuid('picked_by').notNull(),
+    /** Device time (AD-1) — the ledger event's and the row's business time. */
+    pickedAt: timestamp('picked_at', { withTimezone: true, mode: 'string' }).notNull(),
+    deviceId: uuid('device_id').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One pick per picklist line — the diverged-replay backstop.
+    uniqueIndex('picks_line_unique').on(table.tenantId, table.picklistLineId),
+    // The picklist's pick history (the walk's settled stops).
+    index('picks_tenant_picklist_idx').on(table.tenantId, table.picklistId),
+    // The order's picked units (4.5's pack verification reads them).
+    index('picks_tenant_order_idx').on(table.tenantId, table.orderId),
+    // The warehouse-scoped keyset list from day one (UX-DR25).
+    index('picks_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type Pick = typeof picks.$inferSelect;

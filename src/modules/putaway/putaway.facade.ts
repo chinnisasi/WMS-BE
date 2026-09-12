@@ -15,6 +15,7 @@ import {
   zones,
 } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
@@ -195,135 +196,151 @@ export class PutawayFacade {
    * table in v1.
    */
   async getPutawayTasks(tenantId: string, warehouseId: string): Promise<readonly PutawayTask[]> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.getPutawayTasksInTx(tx, tenantId, warehouseId),
+    );
+  }
 
-      // The receiving bin (the from-bin identity) — read-only here: a
-      // warehouse that has never received anything has no bin and no tasks.
-      const receivingBinRows = await tx
-        .select({ id: bins.id })
-        .from(bins)
-        .where(
-          and(
-            eq(bins.tenantId, tenantId),
-            eq(bins.warehouseId, warehouseId),
-            eq(bins.code, RECEIVING_BIN_CODE),
-            eq(bins.systemOwned, true),
-          ),
-        )
-        .limit(1);
-      const receivingBin = receivingBinRows[0];
-      if (receivingBin === undefined) {
-        return [];
+  /**
+   * The same derivation inside the CALLER's transaction (story 4.3): the
+   * device catalog snapshot composes this beside its other reads in ONE
+   * tenant transaction — the `reservationsByIdsInTx` / `stockByBinsInTx`
+   * shape. Opening a nested transaction from inside the snapshot's own would
+   * reserve a SECOND pooled connection while the first is held, and enough
+   * concurrent snapshots then deadlock the pool with no timeout.
+   */
+  async getPutawayTasksInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<readonly PutawayTask[]> {
+    await assertWarehouseInTenant(tx, tenantId, warehouseId);
+
+    // The receiving bin (the from-bin identity) — read-only here: a
+    // warehouse that has never received anything has no bin and no tasks.
+    const receivingBinRows = await tx
+      .select({ id: bins.id })
+      .from(bins)
+      .where(
+        and(
+          eq(bins.tenantId, tenantId),
+          eq(bins.warehouseId, warehouseId),
+          eq(bins.code, RECEIVING_BIN_CODE),
+          eq(bins.systemOwned, true),
+        ),
+      )
+      .limit(1);
+    const receivingBin = receivingBinRows[0];
+    if (receivingBin === undefined) {
+      return [];
+    }
+
+    // The applied GRN lines of the warehouse, oldest receipt first.
+    const lineRows = await tx
+      .select({
+        grnId: goodsReceiptLines.grnId,
+        grnCode: goodsReceiptNotes.code,
+        grnLineId: goodsReceiptLines.id,
+        skuId: goodsReceiptLines.skuId,
+        batchId: goodsReceiptLines.batchId,
+        appliedQty: goodsReceiptLines.appliedQty,
+        lineCreatedAt: goodsReceiptLines.createdAt,
+      })
+      .from(goodsReceiptLines)
+      .innerJoin(goodsReceiptNotes, eq(goodsReceiptNotes.id, goodsReceiptLines.grnId))
+      .where(
+        and(
+          eq(goodsReceiptNotes.tenantId, tenantId),
+          eq(goodsReceiptNotes.warehouseId, warehouseId),
+          // A GRN's lines are immutable once recorded; every recorded GRN's
+          // applied stock is putaway work until it lands in a storage bin.
+          sql`${goodsReceiptLines.appliedQty} > 0`,
+        ),
+      )
+      .orderBy(asc(goodsReceiptNotes.code), asc(goodsReceiptLines.createdAt), asc(goodsReceiptLines.id));
+    if (lineRows.length === 0) {
+      return [];
+    }
+
+    // Identity codes (sku + batch) for the task cards.
+    const skuIds = [...new Set(lineRows.map((row) => row.skuId))];
+    const skuRows = await tx
+      .select({ id: skus.id, code: skus.code, batchTracked: skus.batchTracked })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, skuIds)));
+    const skuById = new Map(skuRows.map((row) => [row.id, row]));
+    const batchIds = [
+      ...new Set(lineRows.map((row) => row.batchId).filter((id): id is string => id !== null)),
+    ];
+    const batchRows =
+      batchIds.length === 0
+        ? []
+        : await tx
+            .select({ id: batches.id, code: batches.code })
+            .from(batches)
+            .where(and(eq(batches.tenantId, tenantId), inArray(batches.id, batchIds)));
+    const batchCodeById = new Map(batchRows.map((row) => [row.id, row.code]));
+
+    // The Receiving bin's on-hand (the projections, read-only) — the
+    // remaining-quantity half.
+    const plainRows = await tx
+      .select({ skuId: stockOnHand.skuId, quantity: stockOnHand.quantity })
+      .from(stockOnHand)
+      .where(
+        and(
+          eq(stockOnHand.tenantId, tenantId),
+          eq(stockOnHand.warehouseId, warehouseId),
+          eq(stockOnHand.binId, receivingBin.id),
+        ),
+      );
+    const plainBySku = new Map(plainRows.map((row) => [row.skuId, row.quantity]));
+    const batchRowsOnHand = await tx
+      .select({ skuId: batchOnHand.skuId, batchId: batchOnHand.batchId, quantity: batchOnHand.quantity })
+      .from(batchOnHand)
+      .where(
+        and(
+          eq(batchOnHand.tenantId, tenantId),
+          eq(batchOnHand.warehouseId, warehouseId),
+          eq(batchOnHand.binId, receivingBin.id),
+        ),
+      );
+    const bySkuBatch = new Map(batchRowsOnHand.map((row) => [`${row.skuId}:${row.batchId}`, row.quantity]));
+
+    // The suggestion candidates (capacity-only v1) — one read for the page.
+    const candidates = await binCandidatesInTx(tx, tenantId, warehouseId);
+
+    const tasks: PutawayTask[] = [];
+    for (const row of lineRows) {
+      const sku = skuById.get(row.skuId);
+      if (sku === undefined) {
+        continue; // the GRN line's SKU is gone from the catalog — nothing to place
       }
-
-      // The applied GRN lines of the warehouse, oldest receipt first.
-      const lineRows = await tx
-        .select({
-          grnId: goodsReceiptLines.grnId,
-          grnCode: goodsReceiptNotes.code,
-          grnLineId: goodsReceiptLines.id,
-          skuId: goodsReceiptLines.skuId,
-          batchId: goodsReceiptLines.batchId,
-          appliedQty: goodsReceiptLines.appliedQty,
-          lineCreatedAt: goodsReceiptLines.createdAt,
-        })
-        .from(goodsReceiptLines)
-        .innerJoin(goodsReceiptNotes, eq(goodsReceiptNotes.id, goodsReceiptLines.grnId))
-        .where(
-          and(
-            eq(goodsReceiptNotes.tenantId, tenantId),
-            eq(goodsReceiptNotes.warehouseId, warehouseId),
-            // A GRN's lines are immutable once recorded; every recorded GRN's
-            // applied stock is putaway work until it lands in a storage bin.
-            sql`${goodsReceiptLines.appliedQty} > 0`,
-          ),
-        )
-        .orderBy(asc(goodsReceiptNotes.code), asc(goodsReceiptLines.createdAt), asc(goodsReceiptLines.id));
-      if (lineRows.length === 0) {
-        return [];
+      const onHand =
+        row.batchId !== null
+          ? (bySkuBatch.get(`${row.skuId}:${row.batchId}`) ?? 0)
+          : (plainBySku.get(row.skuId) ?? 0);
+      const remaining = Math.min(row.appliedQty, onHand);
+      if (remaining <= 0) {
+        continue; // already placed (or the stock moved elsewhere) — no task
       }
-
-      // Identity codes (sku + batch) for the task cards.
-      const skuIds = [...new Set(lineRows.map((row) => row.skuId))];
-      const skuRows = await tx
-        .select({ id: skus.id, code: skus.code, batchTracked: skus.batchTracked })
-        .from(skus)
-        .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, skuIds)));
-      const skuById = new Map(skuRows.map((row) => [row.id, row]));
-      const batchIds = [
-        ...new Set(lineRows.map((row) => row.batchId).filter((id): id is string => id !== null)),
-      ];
-      const batchRows =
-        batchIds.length === 0
-          ? []
-          : await tx
-              .select({ id: batches.id, code: batches.code })
-              .from(batches)
-              .where(and(eq(batches.tenantId, tenantId), inArray(batches.id, batchIds)));
-      const batchCodeById = new Map(batchRows.map((row) => [row.id, row.code]));
-
-      // The Receiving bin's on-hand (the projections, read-only) — the
-      // remaining-quantity half.
-      const plainRows = await tx
-        .select({ skuId: stockOnHand.skuId, quantity: stockOnHand.quantity })
-        .from(stockOnHand)
-        .where(
-          and(
-            eq(stockOnHand.tenantId, tenantId),
-            eq(stockOnHand.warehouseId, warehouseId),
-            eq(stockOnHand.binId, receivingBin.id),
-          ),
-        );
-      const plainBySku = new Map(plainRows.map((row) => [row.skuId, row.quantity]));
-      const batchRowsOnHand = await tx
-        .select({ skuId: batchOnHand.skuId, batchId: batchOnHand.batchId, quantity: batchOnHand.quantity })
-        .from(batchOnHand)
-        .where(
-          and(
-            eq(batchOnHand.tenantId, tenantId),
-            eq(batchOnHand.warehouseId, warehouseId),
-            eq(batchOnHand.binId, receivingBin.id),
-          ),
-        );
-      const bySkuBatch = new Map(batchRowsOnHand.map((row) => [`${row.skuId}:${row.batchId}`, row.quantity]));
-
-      // The suggestion candidates (capacity-only v1) — one read for the page.
-      const candidates = await binCandidatesInTx(tx, tenantId, warehouseId);
-
-      const tasks: PutawayTask[] = [];
-      for (const row of lineRows) {
-        const sku = skuById.get(row.skuId);
-        if (sku === undefined) {
-          continue; // the GRN line's SKU is gone from the catalog — nothing to place
-        }
-        const onHand =
-          row.batchId !== null
-            ? (bySkuBatch.get(`${row.skuId}:${row.batchId}`) ?? 0)
-            : (plainBySku.get(row.skuId) ?? 0);
-        const remaining = Math.min(row.appliedQty, onHand);
-        if (remaining <= 0) {
-          continue; // already placed (or the stock moved elsewhere) — no task
-        }
-        const fit = candidates.find((candidate) => candidate.occupancy + remaining <= candidate.capacity);
-        tasks.push({
-          grnId: row.grnId,
-          grnCode: row.grnCode,
-          grnLineId: row.grnLineId,
-          skuId: row.skuId,
-          skuCode: sku.code,
-          batchId: row.batchId,
-          batchCode: row.batchId === null ? null : (batchCodeById.get(row.batchId) ?? null),
-          qty: remaining,
-          suggestedBin: fit === undefined ? null : { binId: fit.binId, binCode: fit.binCode },
-          rationale:
-            fit === undefined
-              ? 'No storage bin has room for these units'
-              : `Lowest occupancy (${fit.occupancy}/${fit.capacity}) — room for ${fit.capacity - fit.occupancy}`,
-        });
-      }
-      return tasks;
-    });
+      const fit = candidates.find((candidate) => candidate.occupancy + remaining <= candidate.capacity);
+      tasks.push({
+        grnId: row.grnId,
+        grnCode: row.grnCode,
+        grnLineId: row.grnLineId,
+        skuId: row.skuId,
+        skuCode: sku.code,
+        batchId: row.batchId,
+        batchCode: row.batchId === null ? null : (batchCodeById.get(row.batchId) ?? null),
+        qty: remaining,
+        suggestedBin: fit === undefined ? null : { binId: fit.binId, binCode: fit.binCode },
+        rationale:
+          fit === undefined
+            ? 'No storage bin has room for these units'
+            : `Lowest occupancy (${fit.occupancy}/${fit.capacity}) — room for ${fit.capacity - fit.occupancy}`,
+      });
+    }
+    return tasks;
   }
 
   /**
@@ -334,32 +351,38 @@ export class PutawayFacade {
    * device never targets it; the sealed snapshot shape is unchanged (the
    * staleness model covers a lingering merged/retired row in a stale cache,
    * the server re-gate rejects it).
+   *
+   * In-tx ONLY (story 4.3): the device catalog snapshot is this read's only
+   * consumer and it composes every part in ONE tenant transaction. See
+   * `getPutawayTasksInTx` for why the snapshot must not nest transactions.
    */
-  async getBinSummaries(tenantId: string, warehouseId: string): Promise<readonly PutawayBinSummary[]> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      await assertWarehouseInTenant(tx, tenantId, warehouseId);
-      const rows = await tx
-        .select({
-          id: bins.id,
-          code: bins.code,
-          zoneId: bins.zoneId,
-          zoneCode: zones.code,
-          type: bins.type,
-          capacity: bins.capacity,
-          blocked: bins.blocked,
-          systemOwned: bins.systemOwned,
-        })
-        .from(bins)
-        .innerJoin(zones, eq(zones.id, bins.zoneId))
-        .where(
-          and(
-            eq(bins.tenantId, tenantId),
-            eq(bins.warehouseId, warehouseId),
-            isNull(bins.retiredAt),
-          ),
-        )
-        .orderBy(asc(bins.code));
-      return rows;
-    });
+  async getBinSummariesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<readonly PutawayBinSummary[]> {
+    await assertWarehouseInTenant(tx, tenantId, warehouseId);
+    const rows = await tx
+      .select({
+        id: bins.id,
+        code: bins.code,
+        zoneId: bins.zoneId,
+        zoneCode: zones.code,
+        type: bins.type,
+        capacity: bins.capacity,
+        blocked: bins.blocked,
+        systemOwned: bins.systemOwned,
+      })
+      .from(bins)
+      .innerJoin(zones, eq(zones.id, bins.zoneId))
+      .where(
+        and(
+          eq(bins.tenantId, tenantId),
+          eq(bins.warehouseId, warehouseId),
+          isNull(bins.retiredAt),
+        ),
+      )
+      .orderBy(asc(bins.code));
+    return rows;
   }
 }

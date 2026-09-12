@@ -486,6 +486,24 @@ export class InventoryFacade {
     return this.reservations.commit(tenantId, reservationId);
   }
 
+  /**
+   * `held → committed` inside the CALLER's transaction (story 4.3): the
+   * pick command draws the reserved units through the ledger and settles
+   * their hold in ONE transaction — `commitReservation` above opens its own
+   * and cannot nest. The `reservationsByIdsInTx` passthrough shape. Settling
+   * moves no stock and leaves the Valkey reserved counter untouched
+   * (committed units stay deducted from ATP); a reservation that is not
+   * `held` throws inside the caller's transaction and rolls the whole pick
+   * back.
+   */
+  async commitReservationInTx(
+    tx: TenantTx,
+    tenantId: string,
+    reservationId: string,
+  ): Promise<ReservationSnapshot> {
+    return this.reservations.commitInTx(tx, tenantId, reservationId);
+  }
+
   /** `held → released` — restores the reserved counter. */
   async releaseReservation(tenantId: string, reservationId: string): Promise<ReservationSnapshot> {
     return this.reservations.release(tenantId, reservationId);
@@ -583,6 +601,41 @@ export class InventoryFacade {
           eq(batchOnHand.tenantId, tenantId),
           eq(batchOnHand.warehouseId, warehouseId),
           inArray(batchOnHand.skuId, [...new Set(skuIds)]),
+          sql`${batchOnHand.quantity} > 0`,
+        ),
+      );
+  }
+
+  /**
+   * Per-batch on-hand for ONE (sku, bin), inside the caller's transaction
+   * (story 4.3 — the pick's FEFO re-derivation). The bin filter belongs in
+   * the query: `batchOnHandByBinsInTx` returns every bin holding the SKU,
+   * and the pick path runs while holding a bin row lock inside the command
+   * transaction, so fetching the warehouse and discarding it in JS is work
+   * done under a lock for nothing. Only positive rows come back.
+   */
+  async batchOnHandForBinInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    binId: string,
+  ): Promise<readonly BatchOnHandEntry[]> {
+    return tx
+      .select({
+        warehouseId: batchOnHand.warehouseId,
+        skuId: batchOnHand.skuId,
+        binId: batchOnHand.binId,
+        batchId: batchOnHand.batchId,
+        quantity: batchOnHand.quantity,
+      })
+      .from(batchOnHand)
+      .where(
+        and(
+          eq(batchOnHand.tenantId, tenantId),
+          eq(batchOnHand.warehouseId, warehouseId),
+          eq(batchOnHand.skuId, skuId),
+          eq(batchOnHand.binId, binId),
           sql`${batchOnHand.quantity} > 0`,
         ),
       );

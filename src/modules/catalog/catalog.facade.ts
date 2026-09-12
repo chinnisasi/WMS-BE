@@ -70,6 +70,17 @@ export interface EnsureBatchInput {
  * `findSerial` existence reads (null when the id is unknown or foreign),
  * checked at the api layer before any detail query (CHECKPOINT 1).
  */
+/** One SKU as the device catalog snapshot carries it (the scan identity). */
+export interface SkuSummary {
+  readonly id: string;
+  readonly code: string;
+  readonly name: string;
+  readonly barcode: string;
+  readonly uom: string;
+  readonly batchTracked: boolean;
+  readonly serialTracked: boolean;
+}
+
 @Injectable()
 export class CatalogFacade {
   constructor(@Inject(DATABASE) private readonly db: Database) {}
@@ -133,32 +144,37 @@ export class CatalogFacade {
    * never null in the catalog (import defaults it to the code), so the
    * snapshot carries it as a plain string.
    */
-  async getSkuSummaries(tenantId: string): Promise<
-    ReadonlyArray<{
-      readonly id: string;
-      readonly code: string;
-      readonly name: string;
-      readonly barcode: string;
-      readonly uom: string;
-      readonly batchTracked: boolean;
-      readonly serialTracked: boolean;
-    }>
-  > {
-    return withTenantTransaction(this.db, tenantId, async (tx) =>
-      tx
-        .select({
-          id: skus.id,
-          code: skus.code,
-          name: skus.name,
-          barcode: skus.barcode,
-          uom: skus.uom,
-          batchTracked: skus.batchTracked,
-          serialTracked: skus.serialTracked,
-        })
-        .from(skus)
-        .where(eq(skus.tenantId, tenantId))
-        .orderBy(skus.code),
+  async getSkuSummaries(tenantId: string): Promise<SkuSummary[]> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.getSkuSummariesInTx(tx, tenantId),
     );
+  }
+
+  /**
+   * The same read inside the CALLER's transaction (story 4.3) — the device
+   * catalog snapshot's in-tx passthrough, the `reservationsByIdsInTx` shape.
+   *
+   * The snapshot composes SKUs, bins, putaway tasks and pick tasks, and it
+   * must do so on ONE connection: a nested transaction reserves a SECOND
+   * pooled connection while the outer one is held, and postgres.js queues
+   * connection requests with no timeout, so concurrent snapshots can exhaust
+   * the pool and wait on each other forever. The other three reads were moved
+   * onto the caller's transaction already; this was the last one left.
+   */
+  async getSkuSummariesInTx(tx: TenantTx, tenantId: string): Promise<SkuSummary[]> {
+    return tx
+      .select({
+        id: skus.id,
+        code: skus.code,
+        name: skus.name,
+        barcode: skus.barcode,
+        uom: skus.uom,
+        batchTracked: skus.batchTracked,
+        serialTracked: skus.serialTracked,
+      })
+      .from(skus)
+      .where(eq(skus.tenantId, tenantId))
+      .orderBy(skus.code);
   }
 
   /** Batch identities of one SKU — the expiry half of the api layer's FEFO join. */

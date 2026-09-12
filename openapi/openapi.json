@@ -5313,6 +5313,126 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/picks": {
+      "post": {
+        "operationId": "OutboundController_recordPick",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordPickDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Pick recorded: the pick snapshot with suggestion-vs-actual bin/batch (the idempotency snapshot — a replay re-serves it, nothing re-draws)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PickResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid body, a quantity that is not the line’s whole planned quantity, a blocked bin (bin-blocked), a retired bin (bin-retired), a system bin, the wrong item scanned (wrong-item naming the expected SKU), or a serial-arm violation (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), unknown or revoked device (device-revoked), or the operator lacks picks.execute (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse, picklist line, order, SKU or bin does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The wave is not released / the picklist is not ready / the line is already picked / the order is not accepted / the hold is already terminal (conflict), a concurrent idempotent request (conflict), or a serial that does not live in the scanned bin (serial-elsewhere)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse), or the bin drained before this (queued) pick replayed (insufficient-on-hand, naming the bin’s live on-hand — nothing persists)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "pick.record — records one scan-verified pick exactly once (badge-in session required): the pick.picked ledger draw empties the scanned bin and the order line’s reservation settles held → committed in the SAME transaction; the line flips to picked",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/outbound/waves/{waveId}": {
       "get": {
         "operationId": "OutboundController_getWave",
@@ -9910,6 +10030,7 @@
             "enum": [
               "planned",
               "unfulfillable",
+              "picked",
               "cancelled"
             ]
           },
@@ -10063,6 +10184,223 @@
         },
         "required": [
           "wave"
+        ]
+      },
+      "RecordPickDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Warehouse the pick draws from"
+          },
+          "picklistId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The picklist whose walk is being executed"
+          },
+          "picklistLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The pick line being drawn (one slice of one order line)"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The SKU the operator scanned — verified against the line"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The bin the operator scanned — checked against live stock, not against the plan"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units drawn in base UoM — exactly the line’s planned quantity (full-quantity picks only in this release)",
+            "minimum": 1,
+            "maximum": 2147483647
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time of the pick (ISO-8601 UTC, Z-suffixed)",
+            "minLength": 20,
+            "maxLength": 35
+          },
+          "serials": {
+            "maxItems": 200,
+            "description": "The serial numbers of a serial-tracked pick (one per drawn unit, no duplicates)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "picklistId",
+          "picklistLineId",
+          "skuId",
+          "binId",
+          "qty",
+          "occurredAt"
+        ]
+      },
+      "PickDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "waveId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "picklistId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "picklistLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The bin the units were actually drawn from"
+          },
+          "binCode": {
+            "type": "string"
+          },
+          "suggestedBinId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The plan’s suggested bin (advisory)"
+          },
+          "suggestedBinCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "batchId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The batch re-derived FEFO in the scanned bin; null when untracked or when the draw spanned several batches"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "suggestedBatchId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The plan’s suggested batch (advisory)"
+          },
+          "suggestedBatchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The plan’s suggested batch code — paired with the id, like the bin arms"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units drawn (base UoM)"
+          },
+          "reservationId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The order line’s journal hold"
+          },
+          "reservationCommitted": {
+            "type": "boolean",
+            "description": "True when this pick settled the hold (held → committed) in the same transaction as the draw"
+          },
+          "lineStatus": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "unfulfillable",
+              "picked",
+              "cancelled"
+            ],
+            "description": "The pick line’s status after the pick"
+          },
+          "pickedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "pickedAt": {
+            "type": "string",
+            "description": "Device time of the pick (AD-1)"
+          },
+          "deviceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC server record time"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "waveId",
+          "picklistId",
+          "picklistLineId",
+          "orderId",
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "binId",
+          "binCode",
+          "suggestedBinId",
+          "suggestedBinCode",
+          "batchId",
+          "batchCode",
+          "suggestedBatchId",
+          "suggestedBatchCode",
+          "qty",
+          "reservationId",
+          "reservationCommitted",
+          "lineStatus",
+          "pickedBy",
+          "pickedAt",
+          "deviceId",
+          "createdAt"
+        ]
+      },
+      "PickResponse": {
+        "type": "object",
+        "properties": {
+          "pick": {
+            "$ref": "#/components/schemas/PickDto"
+          }
+        },
+        "required": [
+          "pick"
         ]
       },
       "WaveEntryDto": {
@@ -10605,6 +10943,92 @@
           "rationale"
         ]
       },
+      "PickTaskDto": {
+        "type": "object",
+        "properties": {
+          "waveId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "picklistId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "picklistLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The suggested bin (the walk stop)"
+          },
+          "binCode": {
+            "type": "string",
+            "description": "The suggested bin’s code — the walk key"
+          },
+          "batchId": {
+            "type": "string",
+            "nullable": true
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units to draw at this stop"
+          },
+          "sliceSeq": {
+            "type": "number",
+            "description": "The order line’s slice index"
+          },
+          "walkSeq": {
+            "type": "number",
+            "description": "Position on the walk (bins.code ascending)"
+          },
+          "stopCount": {
+            "type": "number",
+            "description": "Distinct bin stops left on this picklist’s walk"
+          }
+        },
+        "required": [
+          "waveId",
+          "picklistId",
+          "picklistLineId",
+          "orderId",
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "binId",
+          "binCode",
+          "batchId",
+          "batchCode",
+          "qty",
+          "sliceSeq",
+          "walkSeq",
+          "stopCount"
+        ]
+      },
       "CatalogSnapshotResponse": {
         "type": "object",
         "properties": {
@@ -10642,6 +11066,13 @@
             "items": {
               "$ref": "#/components/schemas/PutawayTaskDto"
             }
+          },
+          "pickTasks": {
+            "description": "Story 4.3 (additive): the pick tasks of every ready picklist on a released wave, in walk order (the bin/batch each names is advisory — the server re-derives both at pick time)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PickTaskDto"
+            }
           }
         },
         "required": [
@@ -10650,7 +11081,8 @@
           "skus",
           "openPurchaseOrders",
           "bins",
-          "putawayTasks"
+          "putawayTasks",
+          "pickTasks"
         ]
       },
       "GoodsReceiptEntryDto": {

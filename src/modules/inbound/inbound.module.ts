@@ -34,6 +34,12 @@ import { QcFacade } from './qc.facade';
  * fields (bins + derived putaway tasks) through `PutawayFacade` — the module
  * imports `PutawayModule` (it exports only its facade; it imports nothing
  * back into inbound, so still no cycles).
+ *
+ * Story 4.3 deliberately does NOT import `OutboundModule` for the snapshot's
+ * `pickTasks`: the api shell composes that field across the two facades
+ * instead (the AD-6 cross-facade-at-the-shell pattern story 2.4 established).
+ * An inbound → outbound module edge buys nothing here and drags the whole
+ * outbound graph into this module's initialization.
  */
 @Module({
   imports: [SharedModule, CatalogModule, InventoryModule, PutawayModule],
