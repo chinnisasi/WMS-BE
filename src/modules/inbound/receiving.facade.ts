@@ -16,7 +16,6 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { PutawayFacade } from '../putaway/putaway.facade';
-import { OutboundFacade } from '../outbound/outbound.facade';
 import { ReceivingCommand } from './receiving.command';
 import type {
   DecideOverReceiptCommand,
@@ -106,32 +105,6 @@ export interface CatalogSnapshot {
     readonly suggestedBin: { readonly binId: string; readonly binCode: string } | null;
     readonly rationale: string;
   }[];
-  // ── Story 4.3 (additive): the picking decision fields ────────────────────
-  /**
-   * The pick tasks of every ready picklist on a released wave in this
-   * warehouse, in walk order. The bin and batch each task names are the
-   * plan's SUGGESTION — re-derived server-side at pick time — and the WHOLE
-   * walk rides along, so a wrong-bin scan can name the next walk bin holding
-   * the expected SKU without a network call.
-   */
-  readonly pickTasks: readonly {
-    readonly waveId: string;
-    readonly picklistId: string;
-    readonly picklistLineId: string;
-    readonly orderId: string;
-    readonly orderLineId: string;
-    readonly skuId: string;
-    readonly skuCode: string;
-    readonly skuName: string;
-    readonly binId: string;
-    readonly binCode: string;
-    readonly batchId: string | null;
-    readonly batchCode: string | null;
-    readonly qty: number;
-    readonly sliceSeq: number;
-    readonly walkSeq: number;
-    readonly stopCount: number;
-  }[];
 }
 
 export const DEFAULT_RECEIVING_PAGE_SIZE = 50;
@@ -181,9 +154,6 @@ export class ReceivingFacade {
     // module's own tables, bins + putaway tasks through the putaway facade.
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(PutawayFacade) private readonly putaway: PutawayFacade,
-    // Story 4.3 (additive): the pick tasks ride the same snapshot, through
-    // the outbound facade — the wave aggregate stays outbound-exclusive.
-    @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
   ) {}
 
   /** `grn.submit` — the device-authenticated whole-GRN command. */
@@ -350,10 +320,12 @@ export class ReceivingFacade {
   async getCatalogSnapshot(tenantId: string, warehouseId: string): Promise<CatalogSnapshot> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
-      // Catalog identity through the catalog facade (module-exclusive tables);
-      // it opens its own tenant transaction, so this composition reads the
-      // POs in one tx and the SKUs beside it (a read snapshot, not a gate).
-      const skus = await this.catalog.getSkuSummaries(tenantId);
+      // Catalog identity through the catalog facade (module-exclusive
+      // tables), on THIS transaction — the last of the four snapshot reads to
+      // stop opening its own. The whole endpoint now runs on one connection,
+      // so it cannot queue behind itself, and the snapshot is one consistent
+      // read rather than several MVCC snapshots stitched together.
+      const skus = await this.catalog.getSkuSummariesInTx(tx, tenantId);
       const poRows = await tx
         .select({
           id: purchaseOrders.id,
@@ -387,8 +359,6 @@ export class ReceivingFacade {
       // Story 3.5 (additive): the putaway decision fields ride the same
       // snapshot — the bins (for the wrong-bin/blocked pre-queue checks) and
       // the derived tasks (suggestions advisory; the server re-gates).
-      // Story 4.3 (additive): the pick tasks join the same composition — the
-      // outbound facade is the only seam into the wave aggregate (AD-6).
       //
       // All three ride the IN-TX passthroughs and run on THIS transaction's
       // connection. The earlier shape called the pool-opening facade methods
@@ -403,7 +373,6 @@ export class ReceivingFacade {
       // rather than four MVCC snapshots stitched together.
       const binSummaries = await this.putaway.getBinSummariesInTx(tx, tenantId, warehouseId);
       const putawayTasks = await this.putaway.getPutawayTasksInTx(tx, tenantId, warehouseId);
-      const pickTasks = await this.outbound.getPickTasksInTx(tx, tenantId, warehouseId);
       return {
         generatedAt: new Date().toISOString(),
         warehouseId,
@@ -417,7 +386,6 @@ export class ReceivingFacade {
         })),
         bins: binSummaries,
         putawayTasks: putawayTasks.map((task) => ({ ...task })),
-        pickTasks: pickTasks.map((task) => ({ ...task })),
       };
     });
   }

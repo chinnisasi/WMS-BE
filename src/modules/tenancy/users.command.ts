@@ -403,11 +403,25 @@ export class UsersCommand {
     const tokenHash = hashInviteToken(command.token);
     const payloadHash = hashCommandPayload({ tenantId: command.tenantId, token: command.token });
 
-    // Auth-time replay lookup (no tenant context yet) — BYPASSRLS connection.
+    // Auth-time replay lookup — BYPASSRLS connection (the invitee has no
+    // session yet), but scoped to the TENANT the path names. Idempotency keys
+    // are unique per `(tenant_id, key)`, not per key, so a lookup on `key`
+    // alone reads another tenant's row: with a matching payload hash it would
+    // return that tenant's snapshot as a 200 while flipping nobody — leaving
+    // this invitee `invited`, so their next sign-in answers 403
+    // `invite-pending` — and with a differing hash it 422s on a key this
+    // tenant never used, which also leaks that the key exists elsewhere.
+    // Registration's twin lookup stays key-only because it genuinely has no
+    // tenant yet; accept-invite always does.
     const existing = await this.authDb
       .select()
       .from(idempotencyKeys)
-      .where(eq(idempotencyKeys.key, idempotencyKey))
+      .where(
+        and(
+          eq(idempotencyKeys.tenantId, command.tenantId),
+          eq(idempotencyKeys.key, idempotencyKey),
+        ),
+      )
       .limit(1);
     if (existing[0]) {
       if (existing[0].payloadHash !== payloadHash) {

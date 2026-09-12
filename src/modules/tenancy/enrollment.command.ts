@@ -326,13 +326,24 @@ export class EnrollmentCommand {
       pin: command.pin,
     });
 
-    // Auth-time replay lookup (no tenant context yet) — BYPASSRLS connection,
-    // the accept-invite pattern. Replays re-serve the original credential
-    // even though the code is now burned.
+    // Auth-time replay lookup — BYPASSRLS connection (the device has no
+    // session yet), but scoped to the TENANT the path pins. Idempotency keys
+    // are unique per `(tenant_id, key)`, not per key: a lookup on `key` alone
+    // reads another tenant's row, and this snapshot is a DEVICE CREDENTIAL
+    // plus its sealed offline-store key — handing it to a caller enrolling
+    // on a different tenant's path is the worst version of that mistake. A
+    // differing payload hash is no better: it 422s on a key this tenant
+    // never used. Replays still re-serve the original credential even though
+    // the code is now burned — within this tenant.
     const existing = await this.authDb
       .select()
       .from(idempotencyKeys)
-      .where(eq(idempotencyKeys.key, idempotencyKey))
+      .where(
+        and(
+          eq(idempotencyKeys.tenantId, command.tenantId),
+          eq(idempotencyKeys.key, idempotencyKey),
+        ),
+      )
       .limit(1);
     if (existing[0]) {
       if (existing[0].payloadHash !== payloadHash) {

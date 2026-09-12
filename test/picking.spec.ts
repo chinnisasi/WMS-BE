@@ -116,7 +116,12 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await admin.begin(async (tx) => {
-        await tx`select pg_advisory_xact_lock(742108)`;
+        // 742107 is the id `orders.spec` and `waves.spec` already take for
+        // this block. The lock exists to serialize creation of the
+        // CLUSTER-GLOBAL probe roles, so a suite taking its own id is not
+        // holding the same mutex as everyone else — harmless while jest runs
+        // one worker, wrong the moment it does not.
+        await tx`select pg_advisory_xact_lock(742107)`;
         await tx.unsafe(`
           do $$ begin
             if not exists (select from pg_roles where rolname = 'wms_auth_probe') then

@@ -371,6 +371,19 @@ export class OutboundFacade {
   }
 
   /**
+   * The same read in its OWN tenant transaction — what the api shell calls
+   * when it joins this arm onto the device catalog snapshot. One transaction,
+   * one pooled connection, taken AFTER the snapshot's own has been released:
+   * the shell composes the two facades sequentially rather than nesting, so
+   * neither read can queue behind the other.
+   */
+  async getPickTasks(tenantId: string, warehouseId: string): Promise<PickTask[]> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.getPickTasksInTx(tx, tenantId, warehouseId),
+    );
+  }
+
+  /**
    * The order + lines as one snapshot (the in-tx seam `OrderCommandService`
    * composes for writes; the detail read composes the same shape for reads —
    * one serializer, no drift between the two).

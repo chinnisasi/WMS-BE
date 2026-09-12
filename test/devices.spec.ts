@@ -718,4 +718,41 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
       ]),
     );
   });
+
+  it('device enroll replays only within its OWN tenant — a foreign tenant holding the same idempotency key cannot hijack the credential', async () => {
+    // The twin of the accept-invite case, and the worse one: this snapshot is
+    // a DEVICE CREDENTIAL plus its sealed offline-store key. `idempotency_keys`
+    // is unique per (tenant_id, key), not per key, so a replay lookup on `key`
+    // alone reads another tenant's row — handing back their credential on a
+    // payload-hash match, or 422-ing on a key this tenant never used.
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const { tenantId } = await registerTenant(email);
+    const ownerToken = await signIn(email);
+
+    const sharedKey = ulid();
+    const seeder = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await seeder`
+        insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+        values (
+          ${uuidv7()}, ${uuidv7()}, ${sharedKey}, ${'b'.repeat(64)},
+          ${seeder.json({ device: { id: uuidv7(), tenantId: uuidv7(), label: 'someone elses scanner' }, deviceToken: 'not-ours' })}
+        )
+      `;
+    } finally {
+      await seeder.end();
+    }
+
+    const minted = await mintCode(ownerToken, tenantId).expect(201);
+    // Scoped to its own tenant this is a FIRST use: it must enroll for real,
+    // not replay the foreign snapshot and not 422.
+    const enrolled = await enroll(
+      tenantId,
+      { code: minted.body.code as string, label: `Shared-key scanner ${ulid()}`, pin: '2468' },
+      sharedKey,
+    ).expect(201);
+    expect(enrolled.body.device.tenantId).toBe(tenantId);
+    expect(enrolled.body.device.label).toContain('Shared-key scanner');
+    expect(enrolled.body.deviceToken).not.toBe('not-ours');
+  });
 });
