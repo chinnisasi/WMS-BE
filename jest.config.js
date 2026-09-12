@@ -13,13 +13,18 @@ module.exports = {
     ],
   },
   roots: ['<rootDir>/src', '<rootDir>/test'],
-  // The e2e suites share one Postgres database, so suites running in parallel
-  // workers race each other's fixtures: a relay drain in one suite consumes
-  // another suite's pending outbox rows (and reconciliation drives real
-  // cross-tenant cycles). One suite at a time keeps the shared-DB e2e
-  // deterministic; the suites are fast enough that this costs little.
+  // infra-1 gave every e2e suite its own database, so the fixture races are
+  // gone, but the suites still share one Postgres SERVER: its connection
+  // budget (two pools per booted app) and its CPU. One suite at a time keeps
+  // that bounded; the suites are fast enough that this costs little.
   maxWorkers: 1,
   // NestJS 12 ships ESM-only packages; transform them to CJS for Jest.
   transformIgnorePatterns: [],
+  // See test/http-agent.setup.ts — keep-alive pooling against per-request
+  // ephemeral servers is a cross-talk hazard, not an optimisation, here.
+  setupFiles: ['<rootDir>/test/http-agent.setup.ts'],
+  // infra-1: builds the `wms_template` database once per run; each e2e suite
+  // clones it so no two suites share state. See test/support/suite-db.ts.
+  globalSetup: '<rootDir>/test/support/global-setup.js',
   restoreMocks: true,
 };

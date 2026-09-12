@@ -16,6 +16,7 @@ import {
   WAVE_STATUSES,
   localTimeOfDay,
 } from '../src/modules/outbound/wave.command';
+import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -105,35 +106,11 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
   let zoneId: string;
   const skuIds = new Map<string, string>();
 
+  let suiteDb: SuiteDatabase;
+
   beforeAll(async () => {
-    // Same deployment-parity probes as the sibling suites (auth + RLS roles,
-    // serialized by the advisory lock).
-    const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
-    try {
-      await admin.begin(async (tx) => {
-        await tx`select pg_advisory_xact_lock(742107)`;
-        await tx.unsafe(`
-          do $$ begin
-            if not exists (select from pg_roles where rolname = 'wms_auth_probe') then
-              create role wms_auth_probe login password 'wms_auth_probe' nosuperuser bypassrls;
-            end if;
-            if not exists (select from pg_roles where rolname = 'wms_rls_probe') then
-              create role wms_rls_probe login password 'wms_rls_probe' nosuperuser;
-            end if;
-          end $$;
-        `);
-        await tx.unsafe('grant usage on schema public to wms_auth_probe, wms_rls_probe');
-        await tx.unsafe(
-          'grant select, insert, update, delete on all tables in schema public to wms_auth_probe, wms_rls_probe',
-        );
-      });
-      const authUrl = new URL(process.env.DATABASE_URL!);
-      authUrl.username = 'wms_auth_probe';
-      authUrl.password = 'wms_auth_probe';
-      process.env.DATABASE_AUTH_URL = authUrl.toString();
-    } finally {
-      await admin.end();
-    }
+    // infra-1: this suite owns its own database (cloned from the template).
+    suiteDb = await useSuiteDatabase('waves');
     app = await createApp(false);
     await app.init();
     sql = postgres(process.env.DATABASE_URL!, { max: 1 });
@@ -264,6 +241,7 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
     await authDb.$client?.end();
     await sql.end();
     await app.close();
+    await suiteDb.drop();
   });
 
   async function cleanupRows(): Promise<void> {

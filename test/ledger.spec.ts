@@ -7,6 +7,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
+import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -53,35 +54,11 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
   let binB: string;
   let skuId: string;
 
+  let suiteDb: SuiteDatabase;
+
   beforeAll(async () => {
-    // Same deployment-parity probes as users.spec.ts (auth + RLS roles,
-    // serialized across parallel jest workers by the advisory lock).
-    const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
-    try {
-      await admin.begin(async (tx) => {
-        await tx`select pg_advisory_xact_lock(742105)`;
-        await tx.unsafe(`
-          do $$ begin
-            if not exists (select from pg_roles where rolname = 'wms_auth_probe') then
-              create role wms_auth_probe login password 'wms_auth_probe' nosuperuser bypassrls;
-            end if;
-            if not exists (select from pg_roles where rolname = 'wms_rls_probe') then
-              create role wms_rls_probe login password 'wms_rls_probe' nosuperuser;
-            end if;
-          end $$;
-        `);
-        await tx.unsafe('grant usage on schema public to wms_auth_probe, wms_rls_probe');
-        await tx.unsafe(
-          'grant select, insert, update, delete on all tables in schema public to wms_auth_probe, wms_rls_probe',
-        );
-      });
-      const authUrl = new URL(process.env.DATABASE_URL!);
-      authUrl.username = 'wms_auth_probe';
-      authUrl.password = 'wms_auth_probe';
-      process.env.DATABASE_AUTH_URL = authUrl.toString();
-    } finally {
-      await admin.end();
-    }
+    // infra-1: this suite owns its own database (cloned from the template).
+    suiteDb = await useSuiteDatabase('ledger');
     app = await createApp(false);
     await app.init();
     facade = app.get(InventoryFacade);
@@ -94,6 +71,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
     const authDb = app.get<unknown>(AUTH_DATABASE) as { $client?: { end(): Promise<void> } };
     await authDb.$client?.end();
     await app.close();
+    await suiteDb.drop();
   });
 
   async function cleanupRows(): Promise<void> {
@@ -769,7 +747,8 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       for (let attempt = 0; attempt < 100 && !blocked; attempt += 1) {
         const rows = await watcher`
           select count(*)::int as n from pg_stat_activity
-          where wait_event_type = 'Lock' and query ilike '%insert into%idempotency_keys%'
+          where datname = current_database()
+          and wait_event_type = 'Lock' and query ilike '%insert into%idempotency_keys%'
         `;
         blocked = Number((rows[0] as { n: number }).n) >= 1;
         if (!blocked) await new Promise((resolve) => setTimeout(resolve, 50));

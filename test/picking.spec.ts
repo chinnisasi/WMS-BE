@@ -9,6 +9,7 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { PICKLIST_LINE_STATUSES } from '../src/modules/outbound/wave.command';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { getLedgerEventType } from '../src/modules/inventory/ledger-registry';
+import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -112,38 +113,11 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
   const BATCH_SPAN_SKU_CODE = 'PCK-FEFO2';
   const SERIAL_SKU_CODE = 'PCK-SERIAL';
 
+  let suiteDb: SuiteDatabase;
+
   beforeAll(async () => {
-    const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
-    try {
-      await admin.begin(async (tx) => {
-        // 742107 is the id `orders.spec` and `waves.spec` already take for
-        // this block. The lock exists to serialize creation of the
-        // CLUSTER-GLOBAL probe roles, so a suite taking its own id is not
-        // holding the same mutex as everyone else — harmless while jest runs
-        // one worker, wrong the moment it does not.
-        await tx`select pg_advisory_xact_lock(742107)`;
-        await tx.unsafe(`
-          do $$ begin
-            if not exists (select from pg_roles where rolname = 'wms_auth_probe') then
-              create role wms_auth_probe login password 'wms_auth_probe' nosuperuser bypassrls;
-            end if;
-            if not exists (select from pg_roles where rolname = 'wms_rls_probe') then
-              create role wms_rls_probe login password 'wms_rls_probe' nosuperuser;
-            end if;
-          end $$;
-        `);
-        await tx.unsafe('grant usage on schema public to wms_auth_probe, wms_rls_probe');
-        await tx.unsafe(
-          'grant select, insert, update, delete on all tables in schema public to wms_auth_probe, wms_rls_probe',
-        );
-      });
-      const authUrl = new URL(process.env.DATABASE_URL!);
-      authUrl.username = 'wms_auth_probe';
-      authUrl.password = 'wms_auth_probe';
-      process.env.DATABASE_AUTH_URL = authUrl.toString();
-    } finally {
-      await admin.end();
-    }
+    // infra-1: this suite owns its own database (cloned from the template).
+    suiteDb = await useSuiteDatabase('picking');
     app = await createApp(false);
     await app.init();
     sql = postgres(process.env.DATABASE_URL!, { max: 1 });
@@ -271,6 +245,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     await authDb.$client?.end();
     await sql.end();
     await app.close();
+    await suiteDb.drop();
     if (cleanupError !== undefined) throw cleanupError;
   });
 
