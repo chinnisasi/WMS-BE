@@ -9,6 +9,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { signTenantSession } from '../src/modules/tenancy/jwt-session';
 import { TenancyService } from '../src/modules/tenancy/tenancy.service';
+import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -34,38 +35,11 @@ describe('tenancy (e2e)', () => {
   let app: INestApplication;
   const createdTenantIds: string[] = [];
 
+  let suiteDb: SuiteDatabase;
+
   beforeAll(async () => {
-    // Deployment parity for the auth connection (review loop 2): point
-    // DATABASE_AUTH_URL at a real non-superuser BYPASSRLS role so sign-in and
-    // the registration replay run under RLS-binding conditions, not the
-    // superuser fallback. The lazy proxy reads the env on first auth query —
-    // set it before the suite touches the endpoints.
-    const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
-    try {
-      // Serialized across parallel jest workers: concurrent CREATE ROLE /
-      // GRANT ON ALL TABLES from sibling suites trips "tuple concurrently
-      // updated" on the shared catalog rows.
-      await admin.begin(async (tx) => {
-        await tx`select pg_advisory_xact_lock(742105)`;
-        await tx.unsafe(`
-          do $$ begin
-            if not exists (select from pg_roles where rolname = 'wms_auth_probe') then
-              create role wms_auth_probe login password 'wms_auth_probe' nosuperuser bypassrls;
-            end if;
-          end $$;
-        `);
-        await tx.unsafe('grant usage on schema public to wms_auth_probe');
-        await tx.unsafe(
-          'grant select, insert, update, delete on all tables in schema public to wms_auth_probe',
-        );
-      });
-      const authUrl = new URL(process.env.DATABASE_URL!);
-      authUrl.username = 'wms_auth_probe';
-      authUrl.password = 'wms_auth_probe';
-      process.env.DATABASE_AUTH_URL = authUrl.toString();
-    } finally {
-      await admin.end();
-    }
+    // infra-1: this suite owns its own database (cloned from the template).
+    suiteDb = await useSuiteDatabase('tenancy');
     app = await createApp(false);
     await app.init();
   });
@@ -78,6 +52,7 @@ describe('tenancy (e2e)', () => {
     const authDb = app.get<unknown>(AUTH_DATABASE) as { $client?: { end(): Promise<void> } };
     await authDb.$client?.end();
     await app.close();
+    await suiteDb.drop();
   });
 
   async function cleanupRows(): Promise<void> {

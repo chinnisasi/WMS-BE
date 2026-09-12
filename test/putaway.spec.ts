@@ -6,6 +6,7 @@ import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
+import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -47,36 +48,11 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
   let binA05: string; // the blocked arm
   let binA06: string; // the full-bin arm (capacity 5)
 
+  let suiteDb: SuiteDatabase;
+
   beforeAll(async () => {
-    // Same deployment-parity probes as the sibling suites (auth + RLS roles,
-    // serialized across parallel jest workers by the advisory lock — no new
-    // advisory lock keys needed).
-    const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
-    try {
-      await admin.begin(async (tx) => {
-        await tx`select pg_advisory_xact_lock(742106)`;
-        await tx.unsafe(`
-          do $$ begin
-            if not exists (select from pg_roles where rolname = 'wms_auth_probe') then
-              create role wms_auth_probe login password 'wms_auth_probe' nosuperuser bypassrls;
-            end if;
-            if not exists (select from pg_roles where rolname = 'wms_rls_probe') then
-              create role wms_rls_probe login password 'wms_rls_probe' nosuperuser;
-            end if;
-          end $$;
-        `);
-        await tx.unsafe('grant usage on schema public to wms_auth_probe, wms_rls_probe');
-        await tx.unsafe(
-          'grant select, insert, update, delete on all tables in schema public to wms_auth_probe, wms_rls_probe',
-        );
-      });
-      const authUrl = new URL(process.env.DATABASE_URL!);
-      authUrl.username = 'wms_auth_probe';
-      authUrl.password = 'wms_auth_probe';
-      process.env.DATABASE_AUTH_URL = authUrl.toString();
-    } finally {
-      await admin.end();
-    }
+    // infra-1: this suite owns its own database (cloned from the template).
+    suiteDb = await useSuiteDatabase('putaway');
     app = await createApp(false);
     await app.init();
 
@@ -174,6 +150,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     const authDb = app.get<unknown>(AUTH_DATABASE) as { $client?: { end(): Promise<void> } };
     await authDb.$client?.end();
     await app.close();
+    await suiteDb.drop();
   });
 
   async function cleanupRows(): Promise<void> {
@@ -444,7 +421,8 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     try {
       const rows = await sql`
         select count(*)::int as n from pg_stat_activity
-        where state = 'active' and wait_event_type = 'Lock'
+        where datname = current_database()
+        and state = 'active' and wait_event_type = 'Lock'
         and query ilike '%pg_advisory_xact_lock%'`;
       return Number((rows[0] as unknown as { n: number }).n);
     } finally {

@@ -4,6 +4,7 @@ import type { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { createApp } from '../src/app.factory';
 import { OpenApiDocumentHolder } from '../src/api/openapi-document.holder';
+import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
 // Boots the AppModule: a host that exports either poll interval would start
 // the background workers and race the other e2e suites for shared rows —
@@ -14,7 +15,14 @@ delete process.env.OUTBOX_RECONCILE_POLL_MS;
 describe('api shell (e2e)', () => {
   let app: INestApplication;
 
+  let suiteDb: SuiteDatabase;
+
   beforeAll(async () => {
+    // infra-1: this suite owns its own database (cloned from the template).
+    // It runs no queries of its own, but booting the app opens both pools —
+    // against a shared database that is connection budget the sibling suites
+    // would be waiting on.
+    suiteDb = await useSuiteDatabase('api');
     // Boots the exact production configuration (prefix, validation,
     // problem-details filter, OpenAPI document).
     app = await createApp(false);
@@ -23,6 +31,7 @@ describe('api shell (e2e)', () => {
 
   afterAll(async () => {
     await app.close();
+    await suiteDb.drop();
   });
 
   test('GET /api/v1/health answers with ISO-UTC timestamp', async () => {
