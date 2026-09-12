@@ -81,6 +81,7 @@ export interface PickSnapshot {
     readonly batchId: string | null;
     readonly batchCode: string | null;
     readonly suggestedBatchId: string | null;
+    readonly suggestedBatchCode: string | null;
     readonly qty: number;
     readonly reservationId: string | null;
     /** True when THIS pick settled the hold (`held → committed`). */
@@ -425,6 +426,21 @@ export class PickCommandService {
         throw binBlocked(drawBin.code);
       }
 
+      // A SKU that is BOTH batch- and serial-tracked cannot be picked here.
+      // The payload carries serial numbers but no batch, `serials` holds no
+      // batch identity, and the ledger's serial guard validates location
+      // only — so pairing FEFO arms to serials by position would happily
+      // draw a unit put away under batch Y while labelling the event batch
+      // X, and `batch_on_hand` would mis-fold with nothing to catch it.
+      // Refused explicitly rather than guessed; resolving each serial's real
+      // batch from its last ledger event is its own change.
+      if (sku.batchTracked && sku.serialTracked) {
+        throw pickValidation(
+          `SKU "${sku.code}" is both batch- and serial-tracked — picking it is not in this release: ` +
+            'the scan carries no batch per serial, so the batch arm cannot be derived without guessing.',
+        );
+      }
+
       // ── the batch arms, RE-DERIVED FEFO in the scanned bin ──────────────
       // The plan's `batch_id` is advisory: the operator may legitimately be
       // standing at a different bin, and the plan's batch may have been drawn
@@ -493,12 +509,12 @@ export class PickCommandService {
         // Lock the whole serial set tenant-wide in sorted order BEFORE the
         // first append (the stock.adjustment deadlock rule), then one event
         // per serial unit — magnitude 1, drawn OUT of the bin (`toBinId`
-        // null: the units leave stock; pack/dispatch are 4.5/4.6). The batch
-        // arm rides the per-serial events too, walking the FEFO allocation
-        // in order, so a batch+serial-tracked pick drains both projections.
+        // null: the units leave stock; pack/dispatch are 4.5/4.6). No batch
+        // arm rides these events: a serial-tracked SKU that is ALSO
+        // batch-tracked is refused above, so `allocation` here is always the
+        // single batch-less arm.
         await this.inventory.lockSerialsInTx(tx, command.tenantId, serialRefs);
-        const batchPerUnit = expandAllocation(allocation);
-        for (const [index, serialRef] of serialRefs.entries()) {
+        for (const serialRef of serialRefs) {
           await this.inventory.appendLedgerEventInTx(tx, {
             tenantId: command.tenantId,
             warehouseId: command.warehouseId,
@@ -507,7 +523,7 @@ export class PickCommandService {
             quantityDelta: signedQuantity(-1),
             fromBinId: drawBin.id,
             toBinId: null,
-            batchRef: batchPerUnit[index] ?? null,
+            batchRef: null,
             serialRef,
             actorUserId: command.operatorUserId,
             occurredAt,
@@ -568,17 +584,24 @@ export class PickCommandService {
       // the first would commit units still sitting in another bin.
       let reservationCommitted = false;
       if (line.reservationId !== null) {
-        const openSiblings = await tx
-          .select({ id: picklistLines.id })
+        // `for('update')` over the ORDER LINE's slices, not just the open
+        // ones: two slices of the same order line picked concurrently would
+        // otherwise each read the other as still `planned` (neither flip is
+        // visible to the other yet) and NEITHER would commit — the hold
+        // would stay `held` forever and ATP would stay short by its
+        // quantity. The lock serializes the two transactions, so the second
+        // one sees the first's flip and settles.
+        const siblings = await tx
+          .select({ id: picklistLines.id, status: picklistLines.status })
           .from(picklistLines)
           .where(
             and(
               eq(picklistLines.tenantId, command.tenantId),
               eq(picklistLines.orderLineId, line.orderLineId),
-              eq(picklistLines.status, 'planned'),
             ),
           )
-          .limit(1);
+          .for('update');
+        const openSiblings = siblings.filter((sibling) => sibling.status === 'planned');
         if (openSiblings[0] === undefined) {
           await this.inventory.commitReservationInTx(tx, command.tenantId, line.reservationId);
           reservationCommitted = true;
@@ -622,7 +645,13 @@ export class PickCommandService {
         throw err;
       }
 
-      const batchCode = batchId === null ? null : await batchCodeInTx(tx, command.tenantId, batchId);
+      // Both batch refs resolve to codes: the receipt pairs id + code on the
+      // bin arms, and a suggestion the operator can read is the whole point
+      // of reporting suggestion-vs-actual.
+      const codesById = await batchCodesInTx(tx, command.tenantId, [batchId, suggestedBatchId]);
+      const batchCode = batchId === null ? null : (codesById.get(batchId) ?? null);
+      const suggestedBatchCode =
+        suggestedBatchId === null ? null : (codesById.get(suggestedBatchId) ?? null);
       const snapshot: PickSnapshot = {
         pick: {
           id: pickId,
@@ -642,6 +671,7 @@ export class PickCommandService {
           batchId,
           batchCode,
           suggestedBatchId,
+          suggestedBatchCode,
           qty: command.qty,
           reservationId: line.reservationId,
           reservationCommitted,
@@ -700,7 +730,16 @@ export class PickCommandService {
     occurredAt: string,
   ): Promise<{ batchId: string | null; qty: number }[]> {
     const [batchStock, identities] = await Promise.all([
-      this.inventory.batchOnHandByBinsInTx(tx, command.tenantId, command.warehouseId, [command.skuId]),
+      // Bin-scoped in SQL: this runs inside the command transaction while
+      // holding the bin row lock, so reading the whole warehouse's batch
+      // stock and discarding it in JS would be work done under a lock.
+      this.inventory.batchOnHandForBinInTx(
+        tx,
+        command.tenantId,
+        command.warehouseId,
+        command.skuId,
+        command.binId,
+      ),
       this.catalog.getBatchesForSkusInTx(tx, command.tenantId, [command.skuId]),
     ]);
     const byId = new Map(identities.map((batch) => [batch.id, batch]));
@@ -708,7 +747,6 @@ export class PickCommandService {
     // later must not be re-judged against the replay instant.
     const at = Date.parse(occurredAt);
     const drawable = batchStock
-      .filter((row) => row.binId === command.binId && row.quantity > 0)
       .filter((row) => {
         const batch = byId.get(row.batchId);
         if (batch === undefined || batch.status !== 'active') return false;
@@ -794,7 +832,7 @@ export class PickCommandService {
    * and `waves` status indexes) — this runs inside the device catalog
    * snapshot, so it must not degrade with picking history.
    */
-  async getPickTasks(tx: TenantTx, tenantId: string, warehouseId: string): Promise<PickTask[]> {
+  async getPickTasksInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<PickTask[]> {
     const overRead = await tx
       .select({
         waveId: picklistLines.waveId,
@@ -831,20 +869,7 @@ export class PickCommandService {
       // truncated without a second COUNT query.
       .limit(MAX_SNAPSHOT_PICK_TASKS + 1);
 
-    // Truncate on a PICKLIST boundary (see `MAX_SNAPSHOT_PICK_TASKS`): the
-    // rows are ordered by picklist, so dropping every row of the first
-    // picklist that crosses the ceiling leaves only whole walks.
-    const rows = overRead.length > MAX_SNAPSHOT_PICK_TASKS
-      ? (() => {
-          const kept = overRead.slice(0, MAX_SNAPSHOT_PICK_TASKS);
-          const lastWhole = kept[kept.length - 1]?.picklistId;
-          // The cut fell inside `lastWhole` only if that picklist also has a
-          // row beyond the ceiling; drop it whole when it does.
-          return overRead[MAX_SNAPSHOT_PICK_TASKS]?.picklistId === lastWhole
-            ? kept.filter((row) => row.picklistId !== lastWhole)
-            : kept;
-        })()
-      : overRead;
+    const rows = truncateToWholePicklists(overRead, MAX_SNAPSHOT_PICK_TASKS);
 
     const batchIds = [...new Set(rows.flatMap((row) => (row.batchId === null ? [] : [row.batchId])))];
     const batchCodes = new Map(
@@ -874,7 +899,12 @@ export class PickCommandService {
       skuCode: row.skuCode,
       skuName: row.skuName,
       binId: row.binId!,
-      binCode: row.binCode ?? '',
+      // A pickable line always names its bin's code: the shape CHECK pairs
+      // `bin_id` with a stop, and 4.2 denormalizes the code beside it. An
+      // empty string here would ship a stop whose bin can never be scanned
+      // (`resolveBinBarcode` matches codes exactly) and which renders blank
+      // on the card, so a null is a corrupt row, not a task.
+      binCode: requireBinCode(row.binCode, row.picklistLineId),
       batchId: row.batchId,
       batchCode: row.batchId === null ? null : (batchCodes.get(row.batchId) ?? null),
       qty: row.qty,
@@ -887,24 +917,73 @@ export class PickCommandService {
 
 // ── shared helpers (module-level, read-only) ─────────────────────────────────
 
-/** One batch id per drawn unit, walking the FEFO allocation in order. */
-function expandAllocation(
-  allocation: readonly { batchId: string | null; qty: number }[],
-): (string | null)[] {
-  const units: (string | null)[] = [];
-  for (const arm of allocation) {
-    for (let i = 0; i < arm.qty; i++) units.push(arm.batchId);
-  }
-  return units;
+/** The shape the truncation needs — the over-read rows carry much more. */
+export interface PicklistOrdered {
+  readonly picklistId: string;
 }
 
-async function batchCodeInTx(tx: TenantTx, tenantId: string, batchId: string): Promise<string | null> {
+/**
+ * Caps the snapshot's pick stops at `max`, cutting only on PICKLIST
+ * boundaries (the rows arrive ordered by picklist, then walk position). A
+ * half-delivered walk would make the device's "next walk bin holding this
+ * SKU" hint point at a stop the snapshot does not contain, so the picklist
+ * straddling the ceiling is dropped whole.
+ *
+ * The one exception is the reason this is a named, testable function: when
+ * a SINGLE picklist is itself larger than `max` — a `batch` wave policy
+ * emits one picklist across up to 200 orders — every kept row belongs to it,
+ * and dropping it whole would hand the warehouse's devices an empty walk
+ * forever. There, a truncated walk beats no walk: the rows are returned as
+ * they are. Pure, and exported so the boundary is unit-testable without
+ * seeding hundreds of pick lines.
+ */
+export function truncateToWholePicklists<T extends PicklistOrdered>(
+  overRead: readonly T[],
+  max: number,
+): T[] {
+  if (overRead.length <= max) {
+    return [...overRead];
+  }
+  const kept = overRead.slice(0, max);
+  const straddling = kept[kept.length - 1]?.picklistId;
+  // The cut fell inside `straddling` only if that picklist also has a row
+  // beyond the ceiling.
+  if (overRead[max]?.picklistId !== straddling) {
+    return kept;
+  }
+  const whole = kept.filter((row) => row.picklistId !== straddling);
+  // Never hand back nothing while pickable work exists.
+  return whole.length === 0 ? kept : whole;
+}
+
+/** A pickable line with no denormalized bin code is a corrupt row. */
+function requireBinCode(binCode: string | null, picklistLineId: string): string {
+  if (binCode === null) {
+    throw new ProblemException(
+      'validation-failed',
+      500,
+      'Pick line names a bin with no code',
+      `Pick line "${picklistLineId}" names a bin but carries no bin code — the row is corrupt and cannot be walked.`,
+    );
+  }
+  return binCode;
+}
+
+/** Batch codes for a set of (possibly null, possibly repeated) batch ids. */
+async function batchCodesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  batchIds: readonly (string | null)[],
+): Promise<Map<string, string>> {
+  const ids = [...new Set(batchIds.filter((id): id is string => id !== null))];
+  if (ids.length === 0) {
+    return new Map();
+  }
   const rows = await tx
-    .select({ code: batches.code })
+    .select({ id: batches.id, code: batches.code })
     .from(batches)
-    .where(and(eq(batches.id, batchId), eq(batches.tenantId, tenantId)))
-    .limit(1);
-  return rows[0]?.code ?? null;
+    .where(and(eq(batches.tenantId, tenantId), inArray(batches.id, ids)));
+  return new Map(rows.map((row) => [row.id, row.code]));
 }
 
 /**

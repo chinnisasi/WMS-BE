@@ -655,6 +655,9 @@ export class PickDto {
   @ApiProperty({ type: String, nullable: true, description: 'The plan’s suggested batch (advisory)' })
   suggestedBatchId!: string | null;
 
+  @ApiProperty({ type: String, nullable: true, description: 'The plan’s suggested batch code — paired with the id, like the bin arms' })
+  suggestedBatchCode!: string | null;
+
   @ApiProperty({ description: 'Units drawn (base UoM)' })
   qty!: number;
 

@@ -350,32 +350,24 @@ export class OutboundFacade {
 
   /**
    * The device's pick tasks (AD-4): the still-pickable lines of every ready
-   * picklist on a released wave in the warehouse, in walk order. Composed
+   * picklist on a released wave in the warehouse, in walk order — composed
    * into the sealed device catalog snapshot additively (the `putawayTasks`
-   * precedent) — the bin and batch each task names are advisory suggestions,
+   * precedent). The bin and batch each task names are advisory suggestions,
    * re-derived server-side at pick time.
-   */
-  async getPickTasks(tenantId: string, warehouseId: string): Promise<PickTask[]> {
-    return withTenantTransaction(this.db, tenantId, (tx) =>
-      this.getPickTasksInTx(tx, tenantId, warehouseId),
-    );
-  }
-
-  /**
-   * The same read inside the CALLER's transaction — the device catalog
-   * snapshot's in-tx passthrough (the `reservationsByIdsInTx` shape). The
-   * snapshot composes bins, putaway tasks and pick tasks in ONE tenant
-   * transaction: a nested transaction would reserve a SECOND pooled
-   * connection while the outer one is held, and postgres.js queues
-   * connection requests with no timeout, so enough concurrent snapshots
-   * deadlock the pool permanently.
+   *
+   * In-tx ONLY, deliberately: the snapshot composes bins, putaway tasks and
+   * pick tasks in ONE tenant transaction. A pool-opening sibling would
+   * reserve a SECOND connection while the outer one is held, and postgres.js
+   * queues connection requests with no timeout, so enough concurrent
+   * snapshots deadlock the pool permanently — which is exactly what a
+   * convenience wrapper here invited last time.
    */
   async getPickTasksInTx(
     tx: TenantTx,
     tenantId: string,
     warehouseId: string,
   ): Promise<PickTask[]> {
-    return this.pickCommand.getPickTasks(tx, tenantId, warehouseId);
+    return this.pickCommand.getPickTasksInTx(tx, tenantId, warehouseId);
   }
 
   /**

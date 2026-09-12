@@ -10318,6 +10318,11 @@
             "nullable": true,
             "description": "The plan’s suggested batch (advisory)"
           },
+          "suggestedBatchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The plan’s suggested batch code — paired with the id, like the bin arms"
+          },
           "qty": {
             "type": "number",
             "description": "Units drawn (base UoM)"
@@ -10376,6 +10381,7 @@
           "batchId",
           "batchCode",
           "suggestedBatchId",
+          "suggestedBatchCode",
           "qty",
           "reservationId",
           "reservationCommitted",

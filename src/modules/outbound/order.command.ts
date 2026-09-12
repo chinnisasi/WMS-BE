@@ -7,6 +7,7 @@ import {
   idempotencyKeys,
   orderLines,
   orders,
+  picklistLines,
   skus,
 } from '../../shared/db/schema';
 import type { Order, OrderLine } from '../../shared/db/schema';
@@ -500,6 +501,36 @@ export class OrderCommandService {
       );
     }
     const holds = live.filter((row) => row.state === 'held');
+
+    // Story 4.3: a COMMITTED hold is not the only way an order stops being
+    // pre-pick stock. A hold settles only when the LAST open slice of its
+    // order line is picked, so an order line split across two bins with one
+    // slice already picked still carries a `held` reservation — and
+    // releasing it here would free stock that has physically left the bin
+    // through a `pick.picked` ledger draw. `cancelWave` refuses picked lines
+    // for exactly this reason; the order's own cancel must refuse them too.
+    const picked = await withTenantTransaction(this.db, command.tenantId, (tx) =>
+      tx
+        .select({ id: picklistLines.id })
+        .from(picklistLines)
+        .where(
+          and(
+            eq(picklistLines.tenantId, command.tenantId),
+            eq(picklistLines.orderId, order.id),
+            eq(picklistLines.status, 'picked'),
+          ),
+        ),
+    );
+    if (picked.length > 0) {
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Order has picked lines',
+        `Order "${order.id}" has ${picked.length} picked pick line(s) (${picked
+          .map((line) => line.id)
+          .join(', ')}) — those units have already left their bins, so the order is not cancellable here.`,
+      );
+    }
 
     // ── phase 3 (write tx): the flip + the lines + outbox + audit + key ───
     // The flip commits BEFORE the releases run. A crash between the two then

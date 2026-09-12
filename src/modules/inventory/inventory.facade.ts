@@ -606,6 +606,41 @@ export class InventoryFacade {
       );
   }
 
+  /**
+   * Per-batch on-hand for ONE (sku, bin), inside the caller's transaction
+   * (story 4.3 — the pick's FEFO re-derivation). The bin filter belongs in
+   * the query: `batchOnHandByBinsInTx` returns every bin holding the SKU,
+   * and the pick path runs while holding a bin row lock inside the command
+   * transaction, so fetching the warehouse and discarding it in JS is work
+   * done under a lock for nothing. Only positive rows come back.
+   */
+  async batchOnHandForBinInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    binId: string,
+  ): Promise<readonly BatchOnHandEntry[]> {
+    return tx
+      .select({
+        warehouseId: batchOnHand.warehouseId,
+        skuId: batchOnHand.skuId,
+        binId: batchOnHand.binId,
+        batchId: batchOnHand.batchId,
+        quantity: batchOnHand.quantity,
+      })
+      .from(batchOnHand)
+      .where(
+        and(
+          eq(batchOnHand.tenantId, tenantId),
+          eq(batchOnHand.warehouseId, warehouseId),
+          eq(batchOnHand.skuId, skuId),
+          eq(batchOnHand.binId, binId),
+          sql`${batchOnHand.quantity} > 0`,
+        ),
+      );
+  }
+
   /** Real-time ATP: on-hand (quarantine-excluded) − reserved − hooks. */
   async atp(tenantId: string, warehouseId: string, skuId: string): Promise<AtpSnapshot> {
     return this.reservations.atp(tenantId, warehouseId, skuId);
