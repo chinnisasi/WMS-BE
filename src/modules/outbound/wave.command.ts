@@ -1,10 +1,9 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
   auditEvents,
-  bins,
   idempotencyKeys,
   orderLines,
   orders,
@@ -26,6 +25,7 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
+import { buildStockPool, pickableBinsInTx } from './replan';
 import { WAVE_CLOCK } from './wave.clock';
 import type { WaveClock } from './wave.clock';
 
@@ -43,14 +43,20 @@ export type PicklistStatus = (typeof PICKLIST_STATUSES)[number];
 
 /**
  * The pick-line arms: 4.2 shipped `planned` / `unfulfillable` / `cancelled`;
- * story 4.3 appends `picked` (additive — the DB CHECK in migration 0019
- * mirrors it). `picked` deliberately sits OUTSIDE `'cancelled'`, so a picked
- * line stays inside the `picklist_lines_open_order_line_unique` partial
- * index: dropping out of it would free the order to be re-waved while its
- * units were being picked, and the second wave would plan the same reserved
- * stock.
+ * story 4.3 appends `picked` and story 4.4 appends `short` (additive — the
+ * DB CHECKs in migrations 0019 and 0022 mirror them). Both deliberately sit
+ * OUTSIDE `'cancelled'`, so the line stays inside the
+ * `picklist_lines_open_order_line_unique` partial index: dropping out of it
+ * would free the order to be re-waved while its units were being picked, and
+ * the second wave would plan the same reserved stock.
+ *
+ * `short` is TERMINAL — a short-picked stop is never re-picked. The
+ * remainder, when it can be re-planned at all, lives on a NEW slice with its
+ * own id, reservation and walk position; this line stays the honest record of
+ * what happened at that bin (`qty` planned, `shortfall_qty` never drawn,
+ * `reason_code` why) — the SM-3 signal.
  */
-export const PICKLIST_LINE_STATUSES = ['planned', 'unfulfillable', 'picked', 'cancelled'] as const;
+export const PICKLIST_LINE_STATUSES = ['planned', 'unfulfillable', 'picked', 'short', 'cancelled'] as const;
 export type PicklistLineStatus = (typeof PICKLIST_LINE_STATUSES)[number];
 
 /** How a policy shapes a wave's picklists. */
@@ -160,8 +166,14 @@ export interface PicklistLineSnapshot {
   readonly reservationId: string | null;
   /** Units to draw at this bin (0 on an `unfulfillable` slice). */
   readonly qty: number;
-  /** Uncovered units — non-zero only on an `unfulfillable` slice. */
+  /**
+   * Uncovered units — non-zero on an `unfulfillable` slice (nothing pickable
+   * was ever found) and on a `short` one (story 4.4: the operator drew fewer
+   * units than the stop planned, so `qty - shortfallQty` is what moved).
+   */
   readonly shortfallQty: number;
+  /** Story 4.4: why a `short` line came up short; null on every other line. */
+  readonly reasonCode: string | null;
   readonly sliceSeq: number;
   readonly walkSeq: number;
   readonly status: PicklistLineStatus;
@@ -197,14 +209,6 @@ export interface WaveSnapshot {
 }
 
 // ── planning shapes (internal) ───────────────────────────────────────────────
-
-/** One drawable unit-bucket of the walk: a (bin, batch) slot in walk order. */
-interface StockSlot {
-  readonly binId: string;
-  readonly binCode: string;
-  readonly batchId: string | null;
-  remaining: number;
-}
 
 /** One planned slice of one order line. */
 interface PlannedSlice {
@@ -863,6 +867,12 @@ export class WaveCommandService {
         // wave plan the same reserved units against stock that is already
         // gone. The picked slices stay claimed; the rest of the wave is
         // withdrawn as before.
+        //
+        // Story 4.4: a `short` line is not freed either, for both halves of
+        // the same reason — its drawn units have left the bin exactly as a
+        // picked line's have, and the row is the terminal record of WHY the
+        // stop came up short (the SM-3 signal). Flipping it to `cancelled`
+        // would erase that record behind a status that says nothing happened.
         await tx
           .update(picklistLines)
           .set({ status: 'cancelled', updatedAt: nowIso() })
@@ -870,7 +880,7 @@ export class WaveCommandService {
             and(
               eq(picklistLines.tenantId, command.tenantId),
               eq(picklistLines.waveId, wave.id),
-              sql`${picklistLines.status} <> 'picked'`,
+              sql`${picklistLines.status} not in ('picked', 'short')`,
             ),
           );
         await tx
@@ -1069,22 +1079,9 @@ export class WaveCommandService {
     // putaway's (`binCandidatesInTx`): a blocked bin, a system-owned bin
     // (Receiving, QC hold) and a retired bin are all unpickable — which is
     // also why QC-held stock never plans: a hold MOVES it into the
-    // system-owned QC bin.
-    const pickableBins = await tx
-      .select({ id: bins.id, code: bins.code })
-      .from(bins)
-      .where(
-        and(
-          eq(bins.tenantId, command.tenantId),
-          eq(bins.warehouseId, command.warehouseId),
-          eq(bins.blocked, false),
-          eq(bins.systemOwned, false),
-          isNull(bins.retiredAt),
-        ),
-      )
-      .orderBy(asc(bins.code), asc(bins.id));
-    const binCodes = new Map(pickableBins.map((bin) => [bin.id, bin.code]));
-    const binRank = new Map(pickableBins.map((bin, index) => [bin.id, index]));
+    // system-owned QC bin. Shared with story 4.4's re-plan lookup so the two
+    // can never disagree about what "pickable" means.
+    const binOrder = await pickableBinsInTx(tx, command.tenantId, command.warehouseId);
 
     // Stock composes through the facades only (AD-6).
     const [stock, batchStock, batchIdentities] = await Promise.all([
@@ -1092,75 +1089,20 @@ export class WaveCommandService {
       this.inventory.batchOnHandByBinsInTx(tx, command.tenantId, command.warehouseId, skuIds),
       this.catalog.getBatchesForSkusInTx(tx, command.tenantId, skuIds),
     ]);
-    const now = this.clock.now().getTime();
-    const batchById = new Map(batchIdentities.map((batch) => [batch.id, batch]));
-    const drawableBatch = (batchId: string): boolean => {
-      const batch = batchById.get(batchId);
-      if (batch === undefined || batch.status !== 'active') {
-        // A blocked batch is never drawn (epic-2 retro a13, draw side); an
-        // identity the catalog does not know is not suggestible either.
-        return false;
-      }
-      return batch.expiryDate === null || Date.parse(batch.expiryDate) >= now;
-    };
-    const expiryOf = (batchId: string): string | null => batchById.get(batchId)?.expiryDate ?? null;
 
-    // The per-SKU walk: (bin in code order) × (batch in FEFO order).
-    const pool = new Map<string, StockSlot[]>();
-    for (const skuId of skuIds) {
-      const slots: StockSlot[] = [];
-      const plainRows = stock
-        .filter((row) => row.skuId === skuId && binRank.has(row.binId))
-        .sort((a, b) => binRank.get(a.binId)! - binRank.get(b.binId)!);
-      for (const row of plainRows) {
-        const binCode = binCodes.get(row.binId)!;
-        const batchRows = batchStock.filter(
-          (batch) => batch.skuId === skuId && batch.binId === row.binId,
-        );
-        if (batchRows.length === 0) {
-          // An untracked SKU (or a bin whose batch projection is empty):
-          // the plain projection row IS the drawable quantity.
-          slots.push({ binId: row.binId, binCode, batchId: null, remaining: row.quantity });
-          continue;
-        }
-        const drawable = batchRows
-          .filter((batch) => drawableBatch(batch.batchId))
-          // FEFO: expiry ASC, nulls LAST (a batch without expiry draws last).
-          .sort((a, b) => {
-            const left = expiryOf(a.batchId);
-            const right = expiryOf(b.batchId);
-            if (left === right) return a.batchId < b.batchId ? -1 : a.batchId > b.batchId ? 1 : 0;
-            if (left === null) return 1;
-            if (right === null) return -1;
-            return left < right ? -1 : 1;
-          });
-        // What the batch projection accounts for in this bin — drawable or
-        // not. Anything ABOVE it is batch-less stock the batch fold has not
-        // (or cannot) attribute: it exists, it is pickable, and stranding it
-        // would plan a shortfall against stock that is right there. It draws
-        // with no batch suggestion and 4.3 re-derives one. Units held by a
-        // blocked or expired batch are accounted for here and therefore
-        // never resurface in this remainder — they stay undrawable.
-        const accounted = batchRows.reduce((sum, batch) => sum + batch.quantity, 0);
-        const uncovered = Math.max(0, row.quantity - accounted);
-        // The bin's plain projection is the ceiling for the WHOLE bin, not
-        // for each batch in it: two batches of 10 in a bin holding 10 plan
-        // 10 drawable units, never 20. One fold maintains both projections
-        // so they normally agree — this budget is what keeps a divergent one
-        // from over-planning instead of trusting it.
-        let binBudget = row.quantity - uncovered;
-        for (const batch of drawable) {
-          if (binBudget <= 0) break;
-          const remaining = Math.min(batch.quantity, binBudget);
-          binBudget -= remaining;
-          slots.push({ binId: row.binId, binCode, batchId: batch.batchId, remaining });
-        }
-        if (uncovered > 0) {
-          slots.push({ binId: row.binId, binCode, batchId: null, remaining: uncovered });
-        }
-      }
-      pool.set(skuId, slots);
-    }
+    // The per-SKU walk: (bin in code order) × (batch in FEFO order). Pure,
+    // shared with the re-plan lookup (`replan.ts`), and consumed
+    // DESTRUCTIVELY below so two lines of the same SKU never both claim the
+    // same units — that honesty is what makes the batch-vs-single stop-count
+    // inequality hold.
+    const pool = buildStockPool({
+      skuIds,
+      binOrder,
+      stock,
+      batchStock,
+      batchIdentities,
+      at: this.clock.now().getTime(),
+    });
 
     const planned: PlannedSlice[] = [];
     for (const line of lines) {
@@ -1421,6 +1363,7 @@ export function lineSnapshot(row: PicklistLine): PicklistLineSnapshot {
     reservationId: row.reservationId,
     qty: row.qty,
     shortfallQty: row.shortfallQty,
+    reasonCode: row.reasonCode,
     sliceSeq: row.sliceSeq,
     walkSeq: row.walkSeq,
     status: row.status as PicklistLineStatus,

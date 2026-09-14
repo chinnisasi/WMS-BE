@@ -1678,8 +1678,23 @@ export const picklistLines = pgTable(
     reservationId: uuid('reservation_id'),
     /** Units to draw at this bin (0 on an `unfulfillable` slice). */
     qty: integer('qty').notNull(),
-    /** Uncovered units — non-zero only on an `unfulfillable` slice. */
+    /**
+     * Uncovered units. Non-zero on an `unfulfillable` slice (nothing
+     * pickable was ever found for them) and on a `short` one (story 4.4 —
+     * the operator drew fewer units than the stop planned, so
+     * `qty - shortfall_qty` is what actually moved).
+     */
     shortfallQty: integer('shortfall_qty').notNull().default(0),
+    /**
+     * Story 4.4: why this stop came up short — one of
+     * `SHORT_PICK_REASON_CODES`, required on every short pick (including a
+     * zero-unit one) and null on every other line. The fixed-enum,
+     * nullable-column, command-layer-400 shape is putaway's
+     * `PUTAWAY_MISMATCH_REASON_CODES` pattern; the CHECK lives in migration
+     * 0022. This column IS the SM-3 slotting/accuracy signal — a queryable
+     * durable row, with the dashboard left to story 9.1.
+     */
+    reasonCode: text('reason_code'),
     /** The order line's slice index (0-based) — the claim key. */
     sliceSeq: integer('slice_seq').notNull(),
     /** Position on the walk (`bins.code` ascending), per picklist. */

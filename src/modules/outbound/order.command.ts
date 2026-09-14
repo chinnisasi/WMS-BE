@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -509,6 +509,11 @@ export class OrderCommandService {
     // releasing it here would free stock that has physically left the bin
     // through a `pick.picked` ledger draw. `cancelWave` refuses picked lines
     // for exactly this reason; the order's own cancel must refuse them too.
+    //
+    // Story 4.4: a `short` line that actually DREW units is the same problem
+    // — the drawn units left the bin through the same ledger event. A
+    // zero-unit short pick is not: nothing moved, so the order is still
+    // cancellable, and `shortfall_qty < qty` is exactly the difference.
     const picked = await withTenantTransaction(this.db, command.tenantId, (tx) =>
       tx
         .select({ id: picklistLines.id })
@@ -517,7 +522,7 @@ export class OrderCommandService {
           and(
             eq(picklistLines.tenantId, command.tenantId),
             eq(picklistLines.orderId, order.id),
-            eq(picklistLines.status, 'picked'),
+            sql`(${picklistLines.status} = 'picked' or (${picklistLines.status} = 'short' and ${picklistLines.shortfallQty} < ${picklistLines.qty}))`,
           ),
         ),
     );
@@ -526,7 +531,7 @@ export class OrderCommandService {
         'conflict',
         409,
         'Order has picked lines',
-        `Order "${order.id}" has ${picked.length} picked pick line(s) (${picked
+        `Order "${order.id}" has ${picked.length} drawn pick line(s) (${picked
           .map((line) => line.id)
           .join(', ')}) — those units have already left their bins, so the order is not cancellable here.`,
       );

@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
+import type { PicklistLine } from '../../shared/db/schema';
 import {
   auditEvents,
   batches,
@@ -30,6 +31,34 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
+import { findReplanSlices, type ReplanSlice } from './replan';
+import { ORDER_OWNER_TYPE, ORDER_RESERVATION_TTL_SECONDS } from './order.command';
+
+/**
+ * The fixed short-pick reason enum (story 4.4): required on EVERY short pick,
+ * including a zero-unit one, and refused outside the set with a 400 that
+ * names the whole set — the `PUTAWAY_MISMATCH_REASON_CODES` pattern (TS `as
+ * const`, nullable text column, DB CHECK as the backstop in migration 0022).
+ *
+ * The arms are what an operator can actually tell the difference between
+ * while standing at the bin, because a reason nobody can pick correctly is
+ * worse than no reason at all: the shelf is empty, it holds fewer units than
+ * the task says, the units there are damaged, or the SKU is nowhere in the
+ * bin (mis-slotted). `other` is the honest escape hatch. This column is the
+ * SM-3 slotting/accuracy signal — story 9.1 aggregates it.
+ */
+export const SHORT_PICK_REASON_CODES = [
+  'bin-empty',
+  'fewer-units-than-planned',
+  'damaged-units',
+  'stock-not-found',
+  'other',
+] as const;
+export type ShortPickReasonCode = (typeof SHORT_PICK_REASON_CODES)[number];
+
+function isShortPickReason(value: string): value is ShortPickReasonCode {
+  return (SHORT_PICK_REASON_CODES as readonly string[]).includes(value);
+}
 
 // ── command inputs ───────────────────────────────────────────────────────────
 
@@ -47,7 +76,11 @@ export interface RecordPickCommand {
   readonly skuId: string;
   /** The bin the operator scanned — a SUGGESTION is what the plan named. */
   readonly binId: string;
-  /** The units drawn — this story picks a line for exactly its planned qty. */
+  /**
+   * The units actually drawn. Equal to the line's planned quantity for an
+   * ordinary pick; BELOW it (down to zero) for a short pick, which must
+   * carry a `reasonCode`. Above it is always a 400.
+   */
   readonly qty: number;
   /** Device time (AD-1) — the ledger event's and the pick row's business time. */
   readonly occurredAt: string;
@@ -66,14 +99,45 @@ export interface RecordPickCommand {
    * for the absence of a field its cache predates.
    */
   readonly binStateEpoch?: number | null | undefined;
+  /**
+   * Story 4.4: why this stop came up short — one of
+   * `SHORT_PICK_REASON_CODES`. REQUIRED whenever `qty` is below the line's
+   * planned quantity (including zero), refused outside the set, and ignored
+   * on a full-quantity pick (the matrix's "short pick equal to the plan is an
+   * ordinary pick"). Unlike `binStateEpoch` it IS part of the payload hash:
+   * the reason is the operator's intent, not an observation of the world.
+   */
+  readonly reasonCode?: string | null | undefined;
 }
 
 // ── snapshots ────────────────────────────────────────────────────────────────
 
+/**
+ * One re-planned stop as the short-pick receipt reports it (story 4.4): the
+ * new `planned` pick line the remainder moved to, on the SAME picklist, with
+ * its own id, bin, batch suggestion and walk position. Empty when nothing was
+ * re-planned — the partial-order path.
+ */
+export interface ReplannedSliceSnapshot {
+  readonly picklistLineId: string;
+  readonly binId: string;
+  readonly binCode: string;
+  readonly batchId: string | null;
+  readonly qty: number;
+  readonly sliceSeq: number;
+  readonly walkSeq: number;
+}
+
 /** One pick as every surface returns it (the idempotency snapshot). */
 export interface PickSnapshot {
   readonly pick: {
-    readonly id: string;
+    /**
+     * The `picks` row's id — NULL on a zero-unit short pick, which writes no
+     * `picks` row at all (nothing moved, so there is no ledger event and no
+     * settlement record; `picks_qty_positive` is the constraint that says
+     * so). Every other pick, short or whole, has one.
+     */
+    readonly id: string | null;
     readonly tenantId: string;
     readonly warehouseId: string;
     readonly waveId: string;
@@ -95,8 +159,31 @@ export interface PickSnapshot {
     readonly reservationId: string | null;
     /** True when THIS pick settled the hold (`held → committed`). */
     readonly reservationCommitted: boolean;
-    /** The line's status after the pick — always `picked` on a fresh settle. */
+    /**
+     * The line's status after the pick — `picked` on a whole-quantity draw,
+     * `short` (story 4.4, terminal) when the operator drew fewer units than
+     * the stop planned.
+     */
     readonly lineStatus: string;
+    /** Units the stop planned but never moved — 0 on a whole-quantity pick. */
+    readonly shortfallQty: number;
+    /** Why it came up short (`SHORT_PICK_REASON_CODES`); null otherwise. */
+    readonly reasonCode: string | null;
+    /**
+     * True when this command RELEASED the order line's hold (story 4.4): a
+     * short pick releases the whole hold and re-grants the remainder, because
+     * reservations are whole-quantity rows with no partial commit.
+     */
+    readonly reservationReleased: boolean;
+    /**
+     * The fresh hold covering everything still owed on the order line after
+     * the release — null when there was no remainder, or when it could not be
+     * re-held (the partial-order path). The re-planned slices, and every
+     * still-open sibling slice of the same order line, carry it.
+     */
+    readonly replanReservationId: string | null;
+    /** The new slices the remainder was re-planned onto (empty when none). */
+    readonly replanned: readonly ReplannedSliceSnapshot[];
     /**
      * Story 4.3b: which arm of the AD-14 taxonomy this pick settled under —
      * `none` (the op carried no epoch, or the bin's epoch still matched),
@@ -252,6 +339,12 @@ export class PickCommandService {
       // The RAW serial numbers fingerprint (never the resolved ids) — a
       // retry of the same request body replays regardless of current state.
       serials: command.serials === undefined ? undefined : [...command.serials],
+      // Story 4.4: the short-pick reason IS intent — two picks of the same
+      // line for the same quantity with different reasons are two different
+      // commands, and one key must not serve both. `undefined` when absent,
+      // so a full-quantity pick hashes byte-identically to a pre-4.4 one and
+      // every key already in flight still replays.
+      reasonCode: command.reasonCode ?? undefined,
       // `binStateEpoch` is DELIBERATELY absent (story 4.3b). The hash exists
       // to catch a client reusing one key for two different INTENTS; the
       // epoch is not intent, it is what the device observed of the world at
@@ -261,7 +354,14 @@ export class PickCommandService {
       // ran — the exact undifferentiated rejection this story replaces.
     });
 
-    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+    // The ONE Valkey counter mutation a short pick owes its scope, carried out
+    // of the transaction and applied after it commits (story 4.4). Journal
+    // first, mirror second: a decrement that outlived a rollback would read as
+    // ATP the journal still holds — the overselling direction — and a mirror
+    // that never lands only leaves ATP understated until the next rebuild.
+    let pendingCounterRestore: { skuId: string; units: number } | null = null;
+
+    const snapshot = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── device re-authorization (fail-closed, the putaway mirror) ────────
       const deviceRows = await tx
         .select()
@@ -298,13 +398,40 @@ export class PickCommandService {
         // what it would have been classified as — the default is the honest
         // value, not a placeholder.
         const stored = existing[0].responseSnapshot as PickSnapshot;
-        return { pick: { ...stored.pick, conflictClass: stored.pick.conflictClass ?? 'none' } };
+        return {
+          pick: {
+            ...stored.pick,
+            conflictClass: stored.pick.conflictClass ?? 'none',
+            // Story 4.4: a key stored before this story described a
+            // whole-quantity pick, which is exactly what these defaults say.
+            // The honest value, not a placeholder.
+            shortfallQty: stored.pick.shortfallQty ?? 0,
+            reasonCode: stored.pick.reasonCode ?? null,
+            reservationReleased: stored.pick.reservationReleased ?? false,
+            replanReservationId: stored.pick.replanReservationId ?? null,
+            replanned: stored.pick.replanned ?? [],
+          },
+        };
       }
 
       // ── input validation (400 before any write) ─────────────────────────
       const occurredAt = assertUtc(command.occurredAt, 'occurredAt');
-      if (!Number.isInteger(command.qty) || command.qty < 1) {
-        throw pickValidation(`Pick quantity must be a positive integer (got ${command.qty}).`);
+      // Story 4.4 widens the floor from 1 to 0: a zero-unit short pick is how
+      // an operator reports an EMPTY bin, and it is the one pick that draws
+      // nothing at all. It still needs a reason, like every other short pick.
+      if (!Number.isInteger(command.qty) || command.qty < 0) {
+        throw pickValidation(`Pick quantity must be a non-negative integer (got ${command.qty}).`);
+      }
+      const reasonCode = command.reasonCode ?? null;
+      if (reasonCode !== null && !isShortPickReason(reasonCode)) {
+        throw pickValidation(
+          `reasonCode must be one of ${JSON.stringify(SHORT_PICK_REASON_CODES)} (got "${reasonCode}").`,
+        );
+      }
+      if (command.qty === 0 && reasonCode === null) {
+        throw pickValidation(
+          `A pick of 0 unit(s) is a short pick — it needs a reasonCode from ${JSON.stringify(SHORT_PICK_REASON_CODES)}.`,
+        );
       }
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
 
@@ -407,6 +534,16 @@ export class PickCommandService {
           `Pick line "${command.picklistLineId}" is already picked — a line is drawn exactly once.`,
         );
       }
+      if (line.status === 'short') {
+        // Story 4.4: `short` is TERMINAL — the stop was reported, its
+        // shortfall is recorded, and the remainder (when there was anywhere
+        // to put it) lives on a different line with a different id. A second
+        // op against this one is not a retry of anything.
+        throw pickUnresolvable(
+          'Pick line was already short-picked',
+          `Pick line "${command.picklistLineId}" was already short-picked — a short stop is terminal and is never re-picked; the remainder, if any, is a new slice.`,
+        );
+      }
       if (line.status !== 'planned') {
         // `cancelled` and `unfulfillable` are both terminal: neither ever
         // returns to `planned`, so a queued op against one can only be
@@ -483,12 +620,24 @@ export class PickCommandService {
         );
       }
 
-      // ── full-quantity picks only (4.4 brings the short-pick) ────────────
-      if (command.qty !== line.qty) {
+      // ── whole pick or short pick (story 4.4) ───────────────────────────
+      // Above the plan is still a hard 400: a stop draws what it planned or
+      // less, and units nobody reserved are not this line's to take. EQUAL to
+      // the plan is an ordinary full pick even when a reason rides along —
+      // the operator reported the whole quantity, so nothing came up short.
+      if (command.qty > line.qty) {
         throw pickValidation(
-          `Pick line "${command.picklistLineId}" plans ${line.qty} unit(s) — a line is picked whole; short-picking is not in this release.`,
+          `Pick line "${command.picklistLineId}" plans ${line.qty} unit(s) — a pick of ${command.qty} draws more than the stop holds for this order.`,
         );
       }
+      const shortPick = command.qty < line.qty;
+      if (shortPick && reasonCode === null) {
+        throw pickValidation(
+          `Pick line "${command.picklistLineId}" plans ${line.qty} unit(s) and this pick draws ${command.qty} — ` +
+            `a short pick needs a reasonCode from ${JSON.stringify(SHORT_PICK_REASON_CODES)}.`,
+        );
+      }
+      const shortfallQty = shortPick ? line.qty - command.qty : 0;
 
       // ── the scanned bin (server-side truth, mirrored on-device) ─────────
       // `for('update')` mutexes the bin's draw against a concurrent pick of
@@ -553,22 +702,28 @@ export class PickCommandService {
       // ── the serial arm (serial-tracked SKUs, the putaway mirror) ────────
       let serialNumbers: readonly string[] = [];
       if (sku.serialTracked) {
-        if (command.serials === undefined || command.serials.length === 0) {
+        // A zero-unit short pick draws nothing, so it names no serials —
+        // demanding "one serial per unit" for zero units would make an empty
+        // bin unreportable on precisely the SKUs whose units are tracked
+        // individually.
+        if (command.qty > 0 && (command.serials === undefined || command.serials.length === 0)) {
           throw pickValidation(
             `SKU "${sku.code}" is serial-tracked — its pick needs one serial per unit (${command.qty}).`,
           );
         }
-        if (new Set(command.serials).size !== command.serials.length) {
-          throw pickValidation(
-            'serials contains duplicates — a serial-tracked pick draws one ledger event per serial unit; the same serial cannot appear twice.',
-          );
+        if (command.serials !== undefined) {
+          if (new Set(command.serials).size !== command.serials.length) {
+            throw pickValidation(
+              'serials contains duplicates — a serial-tracked pick draws one ledger event per serial unit; the same serial cannot appear twice.',
+            );
+          }
+          if (command.serials.length !== command.qty) {
+            throw pickValidation(
+              `A serial-tracked pick draws one ledger event per serial unit — ${command.serials.length} serials cannot draw ${command.qty} units.`,
+            );
+          }
+          serialNumbers = command.serials;
         }
-        if (command.serials.length !== command.qty) {
-          throw pickValidation(
-            `A serial-tracked pick draws one ledger event per serial unit — ${command.serials.length} serials cannot draw ${command.qty} units.`,
-          );
-        }
-        serialNumbers = command.serials;
       } else if (command.serials !== undefined && command.serials.length > 0) {
         throw pickValidation(`SKU "${sku.code}" is not serial-tracked — its pick carries no serials.`);
       }
@@ -669,9 +824,17 @@ export class PickCommandService {
       // The plan's `batch_id` is advisory: the operator may legitimately be
       // standing at a different bin, and the plan's batch may have been drawn
       // since. The draw is composed here against LIVE per-batch stock.
-      const batchDraw = sku.batchTracked
-        ? await this.deriveBatchArms(tx, command, occurredAt)
-        : { arms: [{ batchId: null, qty: command.qty }] };
+      //
+      // Story 4.4: a ZERO-unit short pick derives nothing. There is no draw
+      // to compose arms for, and running the FEFO derivation against an empty
+      // bin would refuse the one report the operator is standing there to
+      // make ("this shelf has nothing on it").
+      const batchDraw =
+        command.qty === 0
+          ? { arms: [] as { batchId: string | null; qty: number }[] }
+          : sku.batchTracked
+            ? await this.deriveBatchArms(tx, command, occurredAt)
+            : { arms: [{ batchId: null, qty: command.qty }] };
       if ('drawable' in batchDraw) {
         // Cases 3 vs today: a bin that cannot cover the draw is `409
         // pick-bin-short` when the epoch proves it MOVED (re-plannable — 4.4
@@ -686,9 +849,12 @@ export class PickCommandService {
       // The ledger's own fold guard is the backstop; this check exists so the
       // outcome names the bin CODE and what it actually holds rather than a
       // raw id.
-      const onHand = await this.binOnHandInTx(tx, command, drawBin.id);
-      if (onHand < command.qty) {
-        throw binCannotCover(epochMoved, drawBin.code, onHand, command.qty);
+      // Skipped at zero: nothing can fail to cover a draw of nothing.
+      if (command.qty > 0) {
+        const onHand = await this.binOnHandInTx(tx, command, drawBin.id);
+        if (onHand < command.qty) {
+          throw binCannotCover(epochMoved, drawBin.code, onHand, command.qty);
+        }
       }
 
       // ── the draw (one event per batch arm, or per serial unit) ──────────
@@ -709,6 +875,11 @@ export class PickCommandService {
         // Suggestion-vs-actual on the event itself: recorded only when the
         // operator drew somewhere other than the plan's bin.
         ...(suggestedBinId === null || suggestedBinId === drawBin.id ? {} : { suggestedBinId }),
+        // Story 4.4: a short draw carries WHY on the event itself — the
+        // putaway `mismatchReasonCode` precedent. The ledger is the one
+        // record that outlives every projection, so a draw that did not match
+        // its plan says so where it can never be re-derived away.
+        ...(shortPick ? { shortPick: true, shortfallQty, reasonCode } : {}),
       };
 
       if (serialRefs.length > 0) {
@@ -755,13 +926,24 @@ export class PickCommandService {
         }
       }
 
-      // ── the line flip (planned → picked, in the same commit) ────────────
-      // `picked` stays OUTSIDE `'cancelled'`, so the line keeps its claim in
+      // ── the line flip (planned → picked / short, in the same commit) ────
+      // Both arms stay OUTSIDE `'cancelled'`, so the line keeps its claim in
       // `picklist_lines_open_order_line_unique` — dropping out would free the
       // order to be re-waved against stock that has already left the bin.
+      //
+      // Story 4.4: a short pick flips to `short` and records BOTH what it
+      // planned (`qty`, untouched — the plan is a record, not a running
+      // total) and what never moved (`shortfall_qty`, so `qty -
+      // shortfall_qty` is what did). `short` is terminal: this line is never
+      // re-picked, and the remainder lives on a new slice below.
       const flipped = await tx
         .update(picklistLines)
-        .set({ status: 'picked', updatedAt: nowIso() })
+        .set({
+          status: shortPick ? 'short' : 'picked',
+          shortfallQty,
+          reasonCode: shortPick ? reasonCode : null,
+          updatedAt: nowIso(),
+        })
         .where(
           and(
             eq(picklistLines.id, line.id),
@@ -780,30 +962,133 @@ export class PickCommandService {
         );
       }
 
-      // ── the hold settlement (same transaction as the draw) ──────────────
-      // A reservation is a whole-quantity row with no partial commit, and an
-      // order line may span several bins (several slices). The hold settles
-      // when the LAST open slice of its order line is picked — settling on
-      // the first would commit units still sitting in another bin.
+      // ── the hold: settled whole, or released and re-granted (4.4) ───────
+      // `for('update')` over the ORDER LINE's slices, not just the open ones:
+      // two slices of the same order line picked concurrently would otherwise
+      // each read the other as still `planned` (neither flip is visible to
+      // the other yet) and NEITHER would commit — the hold would stay `held`
+      // forever and ATP would stay short by its quantity. The lock serializes
+      // the two transactions, so the second one sees the first's flip and
+      // settles. Story 4.4 needs the same lock for a second reason: the new
+      // slice's `slice_seq` is `max + 1` over exactly these rows, and two
+      // concurrent short picks of one order line would otherwise mint the
+      // same one and lose to the partial unique index.
       let reservationCommitted = false;
-      if (line.reservationId !== null) {
-        // `for('update')` over the ORDER LINE's slices, not just the open
-        // ones: two slices of the same order line picked concurrently would
-        // otherwise each read the other as still `planned` (neither flip is
-        // visible to the other yet) and NEITHER would commit — the hold
-        // would stay `held` forever and ATP would stay short by its
-        // quantity. The lock serializes the two transactions, so the second
-        // one sees the first's flip and settles.
-        const siblings = await tx
-          .select({ id: picklistLines.id, status: picklistLines.status })
-          .from(picklistLines)
-          .where(
-            and(
-              eq(picklistLines.tenantId, command.tenantId),
-              eq(picklistLines.orderLineId, line.orderLineId),
-            ),
-          )
-          .for('update');
+      let reservationReleased = false;
+      let replanReservationId: string | null = null;
+      let replanned: ReplannedSliceSnapshot[] = [];
+      // The net units this command owes back to the scope's Valkey counter,
+      // applied ONCE after the transaction commits (never inside it: a
+      // decrement that outlives a rollback would read as ATP the journal
+      // still holds — the overselling direction).
+      let counterRestoreUnits = 0;
+
+      const siblings =
+        line.reservationId === null && !shortPick
+          ? []
+          : await tx
+              .select({
+                id: picklistLines.id,
+                status: picklistLines.status,
+                sliceSeq: picklistLines.sliceSeq,
+              })
+              .from(picklistLines)
+              .where(
+                and(
+                  eq(picklistLines.tenantId, command.tenantId),
+                  eq(picklistLines.orderLineId, line.orderLineId),
+                ),
+              )
+              .for('update');
+
+      if (shortPick) {
+        if (line.reservationId !== null) {
+          // Release the WHOLE hold and re-grant the remainder. A reservation
+          // is a whole-quantity row with no partial commit (AD-12), and
+          // `grant` treats a different quantity on the same owner as a hard
+          // 409 — so the release MUST precede the re-grant, and both must
+          // ride this transaction with the draw. The end state is reached
+          // using only transitions that already exist.
+          const released = await this.inventory.releaseReservationInTx(
+            tx,
+            command.tenantId,
+            line.reservationId,
+          );
+          reservationReleased = true;
+          // Everything the order line still needs: the hold covered every
+          // undrawn slice, not just this stop, so the remainder is what is
+          // left after THIS draw — the shortfall here plus every sibling slice
+          // still waiting to be picked.
+          const remainder = released.quantity - command.qty;
+          counterRestoreUnits = released.quantity;
+          if (remainder > 0) {
+            const regranted = await this.inventory.grantReservationInTx(tx, {
+              tenantId: command.tenantId,
+              warehouseId: command.warehouseId,
+              skuId: command.skuId,
+              ownerType: ORDER_OWNER_TYPE,
+              ownerId: line.orderLineId,
+              quantity: remainder,
+              ttlSeconds: ORDER_RESERVATION_TTL_SECONDS,
+            });
+            if (regranted !== null) {
+              replanReservationId = regranted.id;
+              // The net: released `quantity`, re-took `remainder`. One
+              // mutation, so the scope never momentarily reads as if the
+              // whole hold were free.
+              counterRestoreUnits = released.quantity - remainder;
+            }
+          }
+          // Every still-open slice of this order line was pointing at the
+          // hold this command just released. Left alone they would replay
+          // into `pick-unresolvable` ("hold is already terminal") — a pick
+          // the operator can physically perform, refused because a DIFFERENT
+          // stop came up short. They follow the hold to its successor (or to
+          // null when there is none, which is the same "no hold" shape a
+          // fully backordered line has carried since 4.2).
+          const openSiblingIds = siblings
+            .filter((sibling) => sibling.status === 'planned' && sibling.id !== line.id)
+            .map((sibling) => sibling.id);
+          if (openSiblingIds.length > 0) {
+            await tx
+              .update(picklistLines)
+              .set({ reservationId: replanReservationId, updatedAt: nowIso() })
+              .where(
+                and(
+                  eq(picklistLines.tenantId, command.tenantId),
+                  inArray(picklistLines.id, openSiblingIds),
+                ),
+              );
+          }
+        }
+
+        // ── the re-plan: the remainder onto an alternate bin (FR-15) ──────
+        // Only with a live hold behind it. Planning a stop whose units
+        // nothing reserves would hand the floor a task the next wave is free
+        // to promise away underneath it — the partial-order path is the
+        // honest answer instead.
+        if (replanReservationId !== null) {
+          const candidates = await findReplanSlices(
+            tx,
+            { inventory: this.inventory, catalog: this.catalog },
+            {
+              tenantId: command.tenantId,
+              warehouseId: command.warehouseId,
+              skuId: command.skuId,
+              excludeBinId: drawBin.id,
+              need: shortfallQty,
+              at: Date.parse(occurredAt),
+            },
+          );
+          replanned = await this.insertReplanSlices(tx, {
+            command,
+            line,
+            siblings,
+            reservationId: replanReservationId,
+            candidates,
+          });
+        }
+      } else if (line.reservationId !== null) {
         const openSiblings = siblings.filter((sibling) => sibling.status === 'planned');
         if (openSiblings[0] === undefined) {
           // Story 4.3b, case 4's expiry arm — HERE, not at the classification
@@ -848,8 +1133,14 @@ export class PickCommandService {
           : 'applied';
 
       // ── the pick row (the settlement record) ────────────────────────────
-      const pickId = uuidv7();
+      // A ZERO-unit short pick writes NO row (story 4.4). Nothing moved, so
+      // there is no ledger event to settle and nothing for `picks` to record
+      // — and `picks_qty_positive` says as much at the database. `picks`
+      // keeps meaning "units that actually moved"; the report of an empty bin
+      // lives on the LINE, which is what SM-3 needs anyway.
+      const pickId = command.qty === 0 ? null : uuidv7();
       const batchId = allocation.length === 1 ? allocation[0]!.batchId : null;
+      if (pickId !== null) {
       try {
         await tx.insert(picks).values({
           id: pickId,
@@ -882,6 +1173,7 @@ export class PickCommandService {
         }
         throw err;
       }
+      }
 
       // Both batch refs resolve to codes: the receipt pairs id + code on the
       // bin arms, and a suggestion the operator can read is the whole point
@@ -913,7 +1205,12 @@ export class PickCommandService {
           qty: command.qty,
           reservationId: line.reservationId,
           reservationCommitted,
-          lineStatus: 'picked',
+          lineStatus: shortPick ? 'short' : 'picked',
+          shortfallQty,
+          reasonCode: shortPick ? reasonCode : null,
+          reservationReleased,
+          replanReservationId,
+          replanned,
           conflictClass,
           pickedBy: command.operatorUserId,
           pickedAt,
@@ -936,9 +1233,14 @@ export class PickCommandService {
         id: uuidv7(),
         tenantId: command.tenantId,
         actorUserId: command.operatorUserId,
-        action: 'pick.picked',
-        targetType: 'pick',
-        targetId: pickId,
+        // A short pick is its own auditable act — "why did this order go out
+        // under-filled" is a different question from "who picked this line",
+        // and one action name for both would make it unanswerable. A
+        // zero-unit short pick has no `picks` row to point at, so the audit
+        // targets the LINE, which is where its whole record lives.
+        action: shortPick ? 'pick.short-picked' : 'pick.picked',
+        targetType: pickId === null ? 'picklist_line' : 'pick',
+        targetId: pickId ?? line.id,
         reference: idempotencyKey,
         occurredAt: pickedAt,
       });
@@ -950,8 +1252,104 @@ export class PickCommandService {
         .where(eq(devices.id, command.deviceId));
 
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      // Last statement in the transaction, so a failure anywhere above leaves
+      // nothing to mirror — and a failed COMMIT rejects before the mirror runs.
+      if (counterRestoreUnits > 0) {
+        pendingCounterRestore = { skuId: command.skuId, units: counterRestoreUnits };
+      }
       return snapshot;
     });
+
+    if (pendingCounterRestore !== null) {
+      const restore: { skuId: string; units: number } = pendingCounterRestore;
+      await this.inventory.restoreReservedUnits(
+        command.tenantId,
+        command.warehouseId,
+        restore.skuId,
+        restore.units,
+      );
+    }
+    return snapshot;
+  }
+
+  /**
+   * The re-planned slices of a short pick (story 4.4): new `planned` pick
+   * lines on the SAME picklist, for the same order line, at the alternate
+   * bins the lookup found.
+   *
+   * A re-plan is a NEW LINE, never a mutated one. `picks_line_unique` allows
+   * one pick row per picklist line and the short-picked line already has one
+   * (unless nothing moved at all); a new line gives the remainder its own
+   * identity, its own reservation, its own walk position and its own pick
+   * row, and leaves the short-picked line as an honest terminal record of
+   * what happened at that bin.
+   *
+   * `slice_seq` continues the order line's sequence (`max + 1` over every
+   * slice it has ever had, cancelled ones included) because
+   * `picklist_lines_open_order_line_unique` keys on it — re-using a seq would
+   * lose to the index and roll the whole pick back. `walk_seq` lands after
+   * every stop the picklist already has: the operator is somewhere along this
+   * walk, and a re-planned stop inserted BEHIND them is a stop they have
+   * already passed. The caller holds the order line's slices `FOR UPDATE`, so
+   * two concurrent short picks cannot mint the same `slice_seq`.
+   */
+  private async insertReplanSlices(
+    tx: TenantTx,
+    input: {
+      readonly command: RecordPickCommand;
+      readonly line: PicklistLine;
+      readonly siblings: readonly { id: string; status: string; sliceSeq: number }[];
+      readonly reservationId: string;
+      readonly candidates: readonly ReplanSlice[];
+    },
+  ): Promise<ReplannedSliceSnapshot[]> {
+    if (input.candidates.length === 0) {
+      return [];
+    }
+    const { command, line } = input;
+    let nextSliceSeq =
+      input.siblings.reduce((max, sibling) => Math.max(max, sibling.sliceSeq), -1) + 1;
+
+    const walkRows = await tx
+      .select({ walkSeq: picklistLines.walkSeq })
+      .from(picklistLines)
+      .where(
+        and(
+          eq(picklistLines.tenantId, command.tenantId),
+          eq(picklistLines.picklistId, command.picklistId),
+        ),
+      );
+    let nextWalkSeq = walkRows.reduce((max, row) => Math.max(max, row.walkSeq), -1) + 1;
+
+    const rows = input.candidates.map((candidate) => ({
+      id: uuidv7(),
+      tenantId: command.tenantId,
+      picklistId: command.picklistId,
+      waveId: line.waveId,
+      orderId: line.orderId,
+      orderLineId: line.orderLineId,
+      skuId: command.skuId,
+      binId: candidate.binId,
+      binCode: candidate.binCode,
+      batchId: candidate.batchId,
+      reservationId: input.reservationId,
+      qty: candidate.qty,
+      shortfallQty: 0,
+      reasonCode: null,
+      sliceSeq: nextSliceSeq++,
+      walkSeq: nextWalkSeq++,
+      status: 'planned',
+    }));
+    await tx.insert(picklistLines).values(rows);
+    return rows.map((row) => ({
+      picklistLineId: row.id,
+      binId: row.binId,
+      binCode: row.binCode,
+      batchId: row.batchId,
+      qty: row.qty,
+      sliceSeq: row.sliceSeq,
+      walkSeq: row.walkSeq,
+    }));
   }
 
   /**

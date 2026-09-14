@@ -1216,6 +1216,192 @@ export class ReservationService implements OnModuleInit {
     return rows[0] ?? null;
   }
 
+  /**
+   * `held → released` inside the CALLER's transaction (story 4.4) — the
+   * journal half only. `release` above opens its own transaction and mirrors
+   * the counter itself; a short pick cannot use it, because the release, the
+   * ledger draw, the re-grant, the line flip and the new slice must either
+   * all land or none of them do.
+   *
+   * The Valkey mirror is deliberately NOT touched here. Decrementing the
+   * reserved counter while the transaction that justifies it can still roll
+   * back would leave the counter LOW against a journal that still holds the
+   * units — ATP too high, which is the overselling direction. The caller
+   * therefore applies ONE net mirror mutation after its commit
+   * (`restoreReservedUnits`), and a mirror that never lands leaves the
+   * counter high (ATP understated — the fail-safe direction) until the next
+   * rebuild, exactly like every other counter path in this service.
+   *
+   * A row lost by the conditional UPDATE throws inside the caller's
+   * transaction, which rolls the whole command back: 404 when the
+   * reservation is absent, 409 when it is already terminal (AD-12).
+   */
+  async releaseInTx(
+    tx: TenantTx,
+    tenantId: string,
+    reservationId: string,
+  ): Promise<ReservationSnapshot> {
+    if (!UUID_RE.test(reservationId)) {
+      return this.terminalNotFound(reservationId);
+    }
+    const rows = await tx
+      .update(reservations)
+      .set({ state: 'released', updatedAt: nowIso() })
+      .where(
+        and(
+          eq(reservations.id, reservationId),
+          eq(reservations.tenantId, tenantId),
+          eq(reservations.state, 'held'),
+        ),
+      )
+      .returning();
+    const row = rows[0];
+    if (row === undefined) {
+      // The state read rides the CALLER's transaction — the standalone
+      // `terminalConflict` opens its own, which would deadlock behind this
+      // one's row locks and could not see its uncommitted writes anyway.
+      const existing = await tx
+        .select({ state: reservations.state })
+        .from(reservations)
+        .where(and(eq(reservations.id, reservationId), eq(reservations.tenantId, tenantId)))
+        .limit(1);
+      const current = existing[0];
+      if (current === undefined) {
+        return this.terminalNotFound(reservationId);
+      }
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Reservation is not held',
+        `The reservation is already terminal (state "${current.state}") — exactly one terminal transition wins (AD-12).`,
+      );
+    }
+    return toSnapshot(row);
+  }
+
+  /**
+   * A fresh hold inside the CALLER's transaction (story 4.4) — the journal
+   * half only, and the RE-GRANT half of a release-then-re-grant pair.
+   *
+   * It is deliberately NOT the general `grant`. `grant` arbitrates
+   * grant-vs-grant through the Valkey script because two independent callers
+   * may both be trying to create ATP; this one only ever re-grants a STRICT
+   * SUBSET of a hold the same transaction just released for the same owner
+   * scope, so it creates no ATP and can no more oversell than the release
+   * that preceded it could. What it still owes is honesty about a scope whose
+   * stock moved underneath: the ceiling is re-read here, in this transaction,
+   * AFTER the caller's own draw has folded into `stock_on_hand`, and against
+   * the journal's own live-state sum rather than the mirror.
+   *
+   * Returns `null` — never throws — when the remainder cannot be held. That
+   * is not an error: it is FR-15's partial-order path (the caller records the
+   * line short and plans nothing), and a 5xx there would turn an
+   * under-fulfilled order into a lost pick.
+   */
+  async grantInTx(
+    tx: TenantTx,
+    command: GrantReservationCommand,
+  ): Promise<ReservationSnapshot | null> {
+    const { tenantId, warehouseId, skuId, ownerType, ownerId } = command;
+    if (!Number.isInteger(command.quantity) || command.quantity <= 0) {
+      return null;
+    }
+    const ttlSeconds = command.ttlSeconds ?? DEFAULT_RESERVATION_TTL_SECONDS;
+    // An open hold for this owner scope means the caller did not release
+    // first — `reservations_open_owner_scope_unique` would refuse the insert
+    // anyway, and answering null keeps that a partial-order path rather than
+    // a unique-violation 500.
+    const existing = await this.findOpenHold(tx, command);
+    if (existing !== undefined) {
+      return null;
+    }
+    const ceiling = await this.committedCeiling(tx, tenantId, warehouseId, skuId);
+    const reserved = await this.journalReservedSumInTx(tx, tenantId, warehouseId, skuId);
+    if (reserved + command.quantity > ceiling) {
+      return null;
+    }
+    const rows = await tx
+      .insert(reservations)
+      .values({
+        id: uuidv7(),
+        tenantId,
+        warehouseId,
+        skuId,
+        ownerType,
+        ownerId,
+        quantity: command.quantity,
+        state: 'held',
+        expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+      })
+      .returning();
+    return toSnapshot(rows[0]!);
+  }
+
+  /**
+   * The post-commit counter mirror for a release-then-re-grant pair (story
+   * 4.4): ONE net restore of `units` to the scope's reserved counter.
+   *
+   * One mutation, not two. Restoring the released hold and then re-taking the
+   * remainder would open a window — however short — in which the scope reads
+   * as if the WHOLE hold were free, and a concurrent `grant` landing inside
+   * it would promise units this order still holds. The net is always a
+   * restore (the pair never reserves more than it released), so a single
+   * `releaseReservation` script call is both atomic and monotone in the safe
+   * direction.
+   *
+   * A mirror that cannot be written leaves the counter too HIGH — ATP
+   * understated, never oversold — and is repaired toward Postgres by the next
+   * rebuild. It is therefore logged, never thrown: the journal has already
+   * committed, and failing the caller here would make a settled short pick
+   * look unrecorded.
+   */
+  async restoreReservedUnits(
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    units: number,
+  ): Promise<void> {
+    if (units <= 0) {
+      return;
+    }
+    const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
+    try {
+      const reply = await this.valkey.releaseReservation(counterKey, units, COUNTER_TTL_SECONDS);
+      if (reply[1] === 'missing-counter') {
+        this.logger.warn(
+          `Reservation re-plan found a missing counter (rebuild will repair): ${counterKey}`,
+        );
+      }
+    } catch (err) {
+      this.logger.error(
+        `Reservation re-plan counter restore failed — counter over-counts until the next ` +
+          `rebuild (scope ${counterKey}, ${units} unit(s)): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /** The journal's live-state reserved sum for one scope, in the caller's tx. */
+  private async journalReservedSumInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+  ): Promise<number> {
+    const rows = await tx
+      .select({ reserved: sql<number>`coalesce(sum(${reservations.quantity}), 0)::int` })
+      .from(reservations)
+      .where(
+        and(
+          eq(reservations.tenantId, tenantId),
+          eq(reservations.warehouseId, warehouseId),
+          eq(reservations.skuId, skuId),
+          inArray(reservations.state, ['held', 'committed']),
+        ),
+      );
+    return rows[0]?.reserved ?? 0;
+  }
+
   async reservationsByIdsInTx(
     tx: TenantTx,
     tenantId: string,

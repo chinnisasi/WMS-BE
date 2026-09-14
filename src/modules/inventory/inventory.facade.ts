@@ -515,6 +515,56 @@ export class InventoryFacade {
   }
 
   /**
+   * `held → released` inside the CALLER's transaction (story 4.4) — the
+   * journal half only, for a short pick whose draw, hold release, re-grant,
+   * line flip and new slice must all land together. The Valkey mirror is NOT
+   * applied here: the caller applies one net `restoreReservedUnits` AFTER its
+   * commit, so a rolled-back transaction can never leave the counter low
+   * (ATP high — the overselling direction) against a journal that still holds
+   * the units.
+   */
+  async releaseReservationInTx(
+    tx: TenantTx,
+    tenantId: string,
+    reservationId: string,
+  ): Promise<ReservationSnapshot> {
+    return this.reservations.releaseInTx(tx, tenantId, reservationId);
+  }
+
+  /**
+   * The RE-GRANT half of that pair (story 4.4), in the caller's transaction:
+   * a fresh hold for the remainder of a hold this same transaction released
+   * for the same owner scope. It creates no ATP — the quantity is always a
+   * strict subset of what was just released — so it needs no Valkey
+   * arbitration; it re-reads the ceiling in-transaction, after the caller's
+   * own draw has folded into `stock_on_hand`.
+   *
+   * `null` (never a throw) when the remainder cannot be held: that is FR-15's
+   * partial-order path, not a fault.
+   */
+  async grantReservationInTx(
+    tx: TenantTx,
+    command: GrantReservationCommand,
+  ): Promise<ReservationSnapshot | null> {
+    return this.reservations.grantInTx(tx, command);
+  }
+
+  /**
+   * The post-commit counter mirror for that pair (story 4.4): one net restore
+   * of `units` to the scope's reserved counter. Journal first, mirror second
+   * — a mirror that never lands leaves ATP understated and is repaired by the
+   * next rebuild.
+   */
+  async restoreReservedUnits(
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    units: number,
+  ): Promise<void> {
+    return this.reservations.restoreReservedUnits(tenantId, warehouseId, skuId, units);
+  }
+
+  /**
    * The live journal rows for a set of reservation ids (story 4.1): the
    * outbound module's per-line reservation-state read rides this passthrough
    * — AD-6 keeps `reservations` inventory-owned, and cross-module state

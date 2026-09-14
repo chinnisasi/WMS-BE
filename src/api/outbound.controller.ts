@@ -401,7 +401,7 @@ export class OutboundController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'pick.record — records one scan-verified pick exactly once (badge-in session required): the pick.picked ledger draw empties the scanned bin and the order line’s reservation settles held → committed in the SAME transaction; the line flips to picked. Story 4.3b: the optional binStateEpoch is compared under the bin’s row lock before any write and classifies a conflict by the AD-14 taxonomy — apply/settle answer 201, pick-bin-short is re-plannable, pick-unresolvable is terminal',
+      'pick.record — records one scan-verified pick exactly once (badge-in session required): the pick.picked ledger draw empties the scanned bin and the order line’s reservation settles held → committed in the SAME transaction; the line flips to picked. Story 4.3b: the optional binStateEpoch is compared under the bin’s row lock before any write and classifies a conflict by the AD-14 taxonomy — apply/settle answer 201, pick-bin-short is re-plannable, pick-unresolvable is terminal. Story 4.4: a qty BELOW the line’s plan is a short pick and needs a reasonCode — the draw, the whole hold’s release, the re-grant of the remainder, the line’s flip to short and the re-planned slice all commit together; a zero-unit short pick reports an empty bin and writes no ledger event and no picks row',
   })
   @ApiBody({ type: RecordPickDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
@@ -409,9 +409,9 @@ export class OutboundController {
     status: HttpStatus.CREATED,
     type: PickResponse,
     description:
-      'Pick recorded: the pick snapshot with suggestion-vs-actual bin/batch (the idempotency snapshot — a replay re-serves it, nothing re-draws)',
+      'Pick recorded: the pick snapshot with suggestion-vs-actual bin/batch (the idempotency snapshot — a replay re-serves it, nothing re-draws). On a short pick it also carries the shortfall, the reason, whether the hold was released and re-granted, and the slices the remainder was re-planned onto (empty on the partial-order path)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, a quantity that is not the line’s whole planned quantity, a blocked bin (bin-blocked), a retired bin (bin-retired), a system bin, the wrong item scanned (wrong-item naming the expected SKU), or a serial-arm violation (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, a quantity ABOVE the line’s planned quantity, a short pick with no reasonCode or one outside the fixed set (the 400 names the whole set), a blocked bin (bin-blocked), a retired bin (bin-retired), a system bin, the wrong item scanned (wrong-item naming the expected SKU), or a serial-arm violation (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), unknown or revoked device (device-revoked), or the operator lacks picks.execute (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, picklist line, order, SKU or bin does not exist in this tenant (not-found)') })
@@ -451,6 +451,11 @@ export class OutboundController {
         // replay carrying a different epoch still re-serves rather than
         // failing `idempotency-key-reuse` before the taxonomy can run.
         binStateEpoch: dto.binStateEpoch ?? null,
+        // Story 4.4: `@IsOptional()` lets an explicit `"reasonCode": null`
+        // through (a full-quantity pick from the device always carries it) —
+        // normalized to absent so the payload hash of a whole pick stays
+        // byte-identical to a pre-4.4 one.
+        reasonCode: dto.reasonCode ?? undefined,
       },
       key,
     );
