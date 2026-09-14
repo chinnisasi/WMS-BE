@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -22,6 +22,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
+import { picklistLineDrewUnits } from './wave.command';
 import type { ReservationSnapshot } from '../inventory/inventory.facade';
 
 // ── state machine + policy constants (the outbound module exclusively owns
@@ -522,7 +523,7 @@ export class OrderCommandService {
           and(
             eq(picklistLines.tenantId, command.tenantId),
             eq(picklistLines.orderId, order.id),
-            sql`(${picklistLines.status} = 'picked' or (${picklistLines.status} = 'short' and ${picklistLines.shortfallQty} < ${picklistLines.qty}))`,
+            picklistLineDrewUnits(),
           ),
         ),
     );
@@ -530,7 +531,7 @@ export class OrderCommandService {
       throw new ProblemException(
         'conflict',
         409,
-        'Order has picked lines',
+        'Order has drawn pick lines',
         `Order "${order.id}" has ${picked.length} drawn pick line(s) (${picked
           .map((line) => line.id)
           .join(', ')}) — those units have already left their bins, so the order is not cancellable here.`,

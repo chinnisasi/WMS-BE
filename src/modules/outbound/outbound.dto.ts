@@ -640,8 +640,11 @@ export class RecordPickDto {
       'Story 4.4: why this stop came up short. REQUIRED whenever qty is below the line’s planned quantity (including 0), refused outside the fixed set with a 400 naming the whole set, and ignored when qty equals the plan (that is an ordinary full pick). It is part of the idempotency payload hash — the reason is intent, not an observation.',
   })
   @IsOptional()
-  @IsString()
-  @Length(1, 64)
+  // `@IsIn` over the same tuple the `enum` above documents: a generated client
+  // gets a closed type, so the pipe must refuse anything outside it too —
+  // otherwise the contract says one thing and the validator accepts another,
+  // and the command's own 400 becomes the only real gate.
+  @IsIn([...SHORT_PICK_REASON_CODES])
   reasonCode?: string | null;
 }
 

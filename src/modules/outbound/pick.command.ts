@@ -30,6 +30,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
+import type { LedgerReferenceDoc } from '../inventory/ledger-registry';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { findReplanSlices, type ReplanSlice } from './replan';
 import { ORDER_OWNER_TYPE, ORDER_RESERVATION_TTL_SECONDS } from './order.command';
@@ -354,14 +355,15 @@ export class PickCommandService {
       // ran — the exact undifferentiated rejection this story replaces.
     });
 
-    // The ONE Valkey counter mutation a short pick owes its scope, carried out
-    // of the transaction and applied after it commits (story 4.4). Journal
-    // first, mirror second: a decrement that outlived a rollback would read as
-    // ATP the journal still holds — the overselling direction — and a mirror
-    // that never lands only leaves ATP understated until the next rebuild.
-    let pendingCounterRestore: { skuId: string; units: number } | null = null;
-
-    const snapshot = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+    // The ONE Valkey counter mutation a short pick owes its scope is RETURNED
+    // by the transaction callback (story 4.4), never staged in a closure
+    // variable. Journal first, mirror second: a mirror that never lands only
+    // leaves ATP understated until the next rebuild, but one applied for a
+    // transaction that did NOT commit reads as ATP the journal still holds —
+    // the overselling direction. An outer `let` would do exactly that if
+    // `withTenantTransaction` ever retried the callback: a value staged by a
+    // failed attempt would survive into a successful attempt that staged none.
+    const committed = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── device re-authorization (fail-closed, the putaway mirror) ────────
       const deviceRows = await tx
         .select()
@@ -398,18 +400,23 @@ export class PickCommandService {
         // what it would have been classified as — the default is the honest
         // value, not a placeholder.
         const stored = existing[0].responseSnapshot as PickSnapshot;
+        // A replay re-serves and mirrors NOTHING — the original command
+        // already applied its counter restore.
         return {
-          pick: {
-            ...stored.pick,
-            conflictClass: stored.pick.conflictClass ?? 'none',
-            // Story 4.4: a key stored before this story described a
-            // whole-quantity pick, which is exactly what these defaults say.
-            // The honest value, not a placeholder.
-            shortfallQty: stored.pick.shortfallQty ?? 0,
-            reasonCode: stored.pick.reasonCode ?? null,
-            reservationReleased: stored.pick.reservationReleased ?? false,
-            replanReservationId: stored.pick.replanReservationId ?? null,
-            replanned: stored.pick.replanned ?? [],
+          counterRestoreUnits: 0,
+          snapshot: {
+            pick: {
+              ...stored.pick,
+              conflictClass: stored.pick.conflictClass ?? 'none',
+              // Story 4.4: a key stored before this story described a
+              // whole-quantity pick, which is exactly what these defaults
+              // say. The honest value, not a placeholder.
+              shortfallQty: stored.pick.shortfallQty ?? 0,
+              reasonCode: stored.pick.reasonCode ?? null,
+              reservationReleased: stored.pick.reservationReleased ?? false,
+              replanReservationId: stored.pick.replanReservationId ?? null,
+              replanned: stored.pick.replanned ?? [],
+            },
           },
         };
       }
@@ -864,8 +871,12 @@ export class PickCommandService {
       const pickedAt = occurredAt;
       const suggestedBinId = line.binId;
       const suggestedBatchId = line.batchId;
-      const referenceDoc = {
-        kind: 'pick' as const,
+      // ANNOTATED, not inferred: an object literal assigned to a typed
+      // binding is excess-property checked, so a key the grammar's `pick` arm
+      // does not declare is a compile error rather than a field the ledger
+      // quietly persists outside its own declared shape.
+      const referenceDoc: LedgerReferenceDoc = {
+        kind: 'pick',
         picklistId: command.picklistId,
         picklistLineId: command.picklistLineId,
         waveId: line.waveId,
@@ -879,7 +890,9 @@ export class PickCommandService {
         // putaway `mismatchReasonCode` precedent. The ledger is the one
         // record that outlives every projection, so a draw that did not match
         // its plan says so where it can never be re-derived away.
-        ...(shortPick ? { shortPick: true, shortfallQty, reasonCode } : {}),
+        ...(shortPick && reasonCode !== null
+          ? { shortPick: true as const, shortfallQty, reasonCode }
+          : {}),
       };
 
       if (serialRefs.length > 0) {
@@ -991,6 +1004,8 @@ export class PickCommandService {
                 id: picklistLines.id,
                 status: picklistLines.status,
                 sliceSeq: picklistLines.sliceSeq,
+                qty: picklistLines.qty,
+                shortfallQty: picklistLines.shortfallQty,
               })
               .from(picklistLines)
               .where(
@@ -1015,11 +1030,29 @@ export class PickCommandService {
             line.reservationId,
           );
           reservationReleased = true;
-          // Everything the order line still needs: the hold covered every
-          // undrawn slice, not just this stop, so the remainder is what is
-          // left after THIS draw — the shortfall here plus every sibling slice
-          // still waiting to be picked.
-          const remainder = released.quantity - command.qty;
+          // What the order line still OWES — NOT `quantity - command.qty`.
+          // Nothing ever shrinks `reservations.quantity` as slices are drawn:
+          // a hold is a whole-quantity row whose only mutation is `state`, so
+          // on a multi-slice order line `released.quantity` is still the WHOLE
+          // original hold even after a sibling was picked in full. An 8-unit
+          // line with a 4-unit slice already picked and this one short at 1
+          // owes 3, not 7 — re-granting 7 would either hold four phantom units
+          // against ATP forever or fail the ceiling and drop a perfectly
+          // re-plannable line onto the partial-order path.
+          //
+          // So the units every TERMINAL sibling already drew come off first: a
+          // `picked` slice drew its whole `qty`, a `short` one drew
+          // `qty - shortfall_qty` (zero on the report of an empty bin). This
+          // line itself is excluded — it was flipped to `short` just above and
+          // its own draw is `command.qty`.
+          const drawnBySiblings = siblings
+            .filter((sibling) => sibling.id !== line.id)
+            .reduce((sum, sibling) => {
+              if (sibling.status === 'picked') return sum + sibling.qty;
+              if (sibling.status === 'short') return sum + (sibling.qty - sibling.shortfallQty);
+              return sum;
+            }, 0);
+          const remainder = released.quantity - drawnBySiblings - command.qty;
           counterRestoreUnits = released.quantity;
           if (remainder > 0) {
             const regranted = await this.inventory.grantReservationInTx(tx, {
@@ -1030,12 +1063,21 @@ export class PickCommandService {
               ownerId: line.orderLineId,
               quantity: remainder,
               ttlSeconds: ORDER_RESERVATION_TTL_SECONDS,
-            });
+            },
+            // The hold this transaction just released, passed so the
+            // re-grant can PROVE it takes no more than that hold gave back,
+            // rather than being a second unarbitrated grant path (see
+            // `grantInTx`).
+            released);
             if (regranted !== null) {
               replanReservationId = regranted.id;
               // The net: released `quantity`, re-took `remainder`. One
-              // mutation, so the scope never momentarily reads as if the
-              // whole hold were free.
+              // mutation, so the scope never momentarily reads as if the whole
+              // hold were free. On a line whose siblings had already drawn,
+              // this restore exceeds this command's own draw — deliberately:
+              // those units left the building under a hold that went on
+              // counting them, and the re-grant is the first moment the
+              // journal can say so.
               counterRestoreUnits = released.quantity - remainder;
             }
           }
@@ -1252,24 +1294,18 @@ export class PickCommandService {
         .where(eq(devices.id, command.deviceId));
 
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
-      // Last statement in the transaction, so a failure anywhere above leaves
-      // nothing to mirror — and a failed COMMIT rejects before the mirror runs.
-      if (counterRestoreUnits > 0) {
-        pendingCounterRestore = { skuId: command.skuId, units: counterRestoreUnits };
-      }
-      return snapshot;
+      return { snapshot, counterRestoreUnits };
     });
 
-    if (pendingCounterRestore !== null) {
-      const restore: { skuId: string; units: number } = pendingCounterRestore;
+    if (committed.counterRestoreUnits > 0) {
       await this.inventory.restoreReservedUnits(
         command.tenantId,
         command.warehouseId,
-        restore.skuId,
-        restore.units,
+        command.skuId,
+        committed.counterRestoreUnits,
       );
     }
-    return snapshot;
+    return committed.snapshot;
   }
 
   /**
@@ -1287,11 +1323,21 @@ export class PickCommandService {
    * `slice_seq` continues the order line's sequence (`max + 1` over every
    * slice it has ever had, cancelled ones included) because
    * `picklist_lines_open_order_line_unique` keys on it — re-using a seq would
-   * lose to the index and roll the whole pick back. `walk_seq` lands after
-   * every stop the picklist already has: the operator is somewhere along this
-   * walk, and a re-planned stop inserted BEHIND them is a stop they have
-   * already passed. The caller holds the order line's slices `FOR UPDATE`, so
-   * two concurrent short picks cannot mint the same `slice_seq`.
+   * lose to the index and roll the whole pick back. The caller holds the
+   * ORDER LINE's slices `FOR UPDATE`, which is what serializes that.
+   *
+   * `walk_seq` lands after every stop the picklist already has: the operator
+   * is somewhere along this walk, and a re-planned stop inserted BEHIND them
+   * is a stop they have already passed. Its `max` is read across the whole
+   * PICKLIST, which the order-line lock does NOT cover — two short picks on
+   * different order lines of one picklist would read the same max. What
+   * serializes them is the per-warehouse advisory xact lock every pick takes
+   * at its AD-14 classification and holds to commit: a picklist belongs to
+   * exactly one warehouse, so two picks that could collide here are already
+   * queued behind each other. `walk_seq` carries no uniqueness constraint in
+   * any case — a duplicate would only order two stops arbitrarily — so this
+   * is a tidiness guarantee, not a correctness one, and it is recorded here
+   * rather than claimed for the wrong lock.
    */
   private async insertReplanSlices(
     tx: TenantTx,
@@ -1311,7 +1357,7 @@ export class PickCommandService {
       input.siblings.reduce((max, sibling) => Math.max(max, sibling.sliceSeq), -1) + 1;
 
     const walkRows = await tx
-      .select({ walkSeq: picklistLines.walkSeq })
+      .select({ maxWalkSeq: sql<number | null>`max(${picklistLines.walkSeq})` })
       .from(picklistLines)
       .where(
         and(
@@ -1319,7 +1365,7 @@ export class PickCommandService {
           eq(picklistLines.picklistId, command.picklistId),
         ),
       );
-    let nextWalkSeq = walkRows.reduce((max, row) => Math.max(max, row.walkSeq), -1) + 1;
+    let nextWalkSeq = (walkRows[0]?.maxWalkSeq ?? -1) + 1;
 
     const rows = input.candidates.map((candidate) => ({
       id: uuidv7(),

@@ -533,20 +533,23 @@ export class InventoryFacade {
 
   /**
    * The RE-GRANT half of that pair (story 4.4), in the caller's transaction:
-   * a fresh hold for the remainder of a hold this same transaction released
-   * for the same owner scope. It creates no ATP — the quantity is always a
-   * strict subset of what was just released — so it needs no Valkey
-   * arbitration; it re-reads the ceiling in-transaction, after the caller's
-   * own draw has folded into `stock_on_hand`.
+   * a fresh hold for the remainder of `releasedFrom` — a hold this SAME
+   * transaction released for the SAME owner scope. It creates no ATP (the
+   * quantity is never more than what was just released), which is why it
+   * needs no Valkey grant-vs-grant arbitration and why the precondition
+   * rides the signature: see `ReservationService.grantInTx` for the full
+   * argument and for what would break without it. Callers must also hold the
+   * per-warehouse advisory lock.
    *
    * `null` (never a throw) when the remainder cannot be held: that is FR-15's
-   * partial-order path, not a fault.
+   * partial-order path, not a fault. A violated precondition DOES throw.
    */
   async grantReservationInTx(
     tx: TenantTx,
     command: GrantReservationCommand,
+    releasedFrom: ReservationSnapshot,
   ): Promise<ReservationSnapshot | null> {
-    return this.reservations.grantInTx(tx, command);
+    return this.reservations.grantInTx(tx, command, releasedFrom);
   }
 
   /**

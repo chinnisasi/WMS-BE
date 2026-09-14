@@ -1040,11 +1040,19 @@ export class ReservationService implements OnModuleInit {
     return sums[0]?.reserved ?? 0;
   }
 
-  /** Per-sku journal sums over the live states (`held` + `committed`). */
+  /**
+   * Per-sku journal sums over the live states (`held` + `committed`).
+   *
+   * `tx` is optional: passed, the sum rides the CALLER's transaction and
+   * therefore sees its uncommitted writes — which is the whole point for
+   * `grantInTx`, whose release must already be visible. Omitted, it opens its
+   * own read transaction, as the rebuild and repair paths need.
+   */
   private async journalReservedSums(
     tenantId: string,
     warehouseId: string,
     skuId?: string,
+    tx?: TenantTx,
   ): Promise<{ skuId: string; reserved: number }[]> {
     const conditions: SQL[] = [
       eq(reservations.tenantId, tenantId),
@@ -1054,13 +1062,13 @@ export class ReservationService implements OnModuleInit {
     if (skuId !== undefined) {
       conditions.push(eq(reservations.skuId, skuId));
     }
-    return withTenantTransaction(this.db, tenantId, (tx) =>
-      tx
+    const read = (scoped: TenantTx) =>
+      scoped
         .select({ skuId: reservations.skuId, reserved: sql<number>`coalesce(sum(${reservations.quantity}), 0)::int` })
         .from(reservations)
         .where(and(...conditions))
-        .groupBy(reservations.skuId),
-    );
+        .groupBy(reservations.skuId);
+    return tx === undefined ? withTenantTransaction(this.db, tenantId, read) : read(tx);
   }
 
   /** A row lost by the conditional UPDATE: 404 when absent, else 409 conflict. */
@@ -1280,31 +1288,77 @@ export class ReservationService implements OnModuleInit {
   }
 
   /**
-   * A fresh hold inside the CALLER's transaction (story 4.4) — the journal
-   * half only, and the RE-GRANT half of a release-then-re-grant pair.
+   * The RE-GRANT half of a release-then-re-grant pair (story 4.4), inside the
+   * CALLER's transaction: a fresh hold for part of a hold that the SAME
+   * transaction has already released for the SAME owner scope.
    *
-   * It is deliberately NOT the general `grant`. `grant` arbitrates
-   * grant-vs-grant through the Valkey script because two independent callers
-   * may both be trying to create ATP; this one only ever re-grants a STRICT
-   * SUBSET of a hold the same transaction just released for the same owner
-   * scope, so it creates no ATP and can no more oversell than the release
-   * that preceded it could. What it still owes is honesty about a scope whose
-   * stock moved underneath: the ceiling is re-read here, in this transaction,
-   * AFTER the caller's own draw has folded into `stock_on_hand`, and against
-   * the journal's own live-state sum rather than the mirror.
+   * ── why this does not use the Valkey grant script ────────────────────────
+   *
+   * `grant` runs `runGrantScript` because two independent callers may both be
+   * trying to create ATP out of the same last units, and only an atomic
+   * decrement of one authoritative counter can arbitrate that. This path
+   * creates NO ATP: `releasedFrom` is a hold this transaction just released
+   * for this owner scope, and `quantity` is never more than it, so the
+   * scope's journal-reserved total never RISES across the commit (M → R,
+   * R ≤ M — equality is the zero-unit report, which draws nothing and re-holds
+   * what it released). A total that cannot rise cannot oversell and cannot
+   * starve a concurrent grant: it can only hand one MORE room than it had.
+   * The mirror follows after the commit as a single net restore
+   * (`restoreReservedUnits`), which is why no Valkey call belongs inside the
+   * caller's transaction at all: one that outlived a rollback would read as
+   * ATP the journal still holds.
+   *
+   * The ceiling re-read below is therefore not arbitration — it is the one
+   * question a decrease can still get wrong: has the scope's stock vanished
+   * underneath, so that even the reduced hold is no longer coverable? It is
+   * answered from Postgres (the committed projection and the journal's own
+   * live-state sum) inside the caller's transaction, which sees this
+   * transaction's own draw, and under the per-warehouse advisory xact lock
+   * the pick command already holds — the same key `appendMovement` takes, so
+   * adjustments, receipts, putaway and the reconciliation rebuild cannot move
+   * `stock_on_hand` between the read and the insert.
+   *
+   * ── what would break without those preconditions ─────────────────────────
+   *
+   * Used to mint a NEW hold (no `releasedFrom`), or without the warehouse
+   * lock, this would be a second grant path with no arbitration at all: two
+   * such callers — or one racing the public `grant`, which takes no warehouse
+   * lock and decides in Valkey — could both pass this Postgres ceiling read
+   * and both insert, overselling by the smaller quantity, and the counter
+   * would then disagree with the journal until the next rebuild. Both
+   * preconditions are therefore structural rather than documentary:
+   * `releasedFrom` is a required argument and is validated below, and the
+   * caller's warehouse lock is asserted in the pick command's own invariant
+   * order.
    *
    * Returns `null` — never throws — when the remainder cannot be held. That
    * is not an error: it is FR-15's partial-order path (the caller records the
    * line short and plans nothing), and a 5xx there would turn an
-   * under-fulfilled order into a lost pick.
+   * under-fulfilled order into a lost pick. A VIOLATED PRECONDITION is a
+   * different thing and does throw: it is a programming error, not a stock
+   * condition, and swallowing it as "no ATP" would hide the oversell.
    */
   async grantInTx(
     tx: TenantTx,
     command: GrantReservationCommand,
+    releasedFrom: ReservationSnapshot,
   ): Promise<ReservationSnapshot | null> {
     const { tenantId, warehouseId, skuId, ownerType, ownerId } = command;
     if (!Number.isInteger(command.quantity) || command.quantity <= 0) {
       return null;
+    }
+    const sameScope =
+      releasedFrom.tenantId === tenantId &&
+      releasedFrom.warehouseId === warehouseId &&
+      releasedFrom.skuId === skuId &&
+      releasedFrom.ownerType === ownerType &&
+      releasedFrom.ownerId === ownerId;
+    if (!sameScope || releasedFrom.state !== 'released' || command.quantity > releasedFrom.quantity) {
+      throw new Error(
+        'grantInTx re-grants NO MORE than a hold released for the same owner scope in the same ' +
+          'transaction — it has no grant-vs-grant arbitration and must never create ATP ' +
+          `(asked ${command.quantity} against a ${releasedFrom.state} hold of ${releasedFrom.quantity}).`,
+      );
     }
     const ttlSeconds = command.ttlSeconds ?? DEFAULT_RESERVATION_TTL_SECONDS;
     // An open hold for this owner scope means the caller did not release
@@ -1316,7 +1370,8 @@ export class ReservationService implements OnModuleInit {
       return null;
     }
     const ceiling = await this.committedCeiling(tx, tenantId, warehouseId, skuId);
-    const reserved = await this.journalReservedSumInTx(tx, tenantId, warehouseId, skuId);
+    const sums = await this.journalReservedSums(tenantId, warehouseId, skuId, tx);
+    const reserved = sums[0]?.reserved ?? 0;
     if (reserved + command.quantity > ceiling) {
       return null;
     }
@@ -1379,27 +1434,6 @@ export class ReservationService implements OnModuleInit {
           `${err instanceof Error ? err.message : String(err)}`,
       );
     }
-  }
-
-  /** The journal's live-state reserved sum for one scope, in the caller's tx. */
-  private async journalReservedSumInTx(
-    tx: TenantTx,
-    tenantId: string,
-    warehouseId: string,
-    skuId: string,
-  ): Promise<number> {
-    const rows = await tx
-      .select({ reserved: sql<number>`coalesce(sum(${reservations.quantity}), 0)::int` })
-      .from(reservations)
-      .where(
-        and(
-          eq(reservations.tenantId, tenantId),
-          eq(reservations.warehouseId, warehouseId),
-          eq(reservations.skuId, skuId),
-          inArray(reservations.state, ['held', 'committed']),
-        ),
-      );
-    return rows[0]?.reserved ?? 0;
   }
 
   async reservationsByIdsInTx(

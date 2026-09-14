@@ -1,5 +1,5 @@
-import { and, asc, eq, isNull } from 'drizzle-orm';
-import { bins } from '../../shared/db/schema';
+import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { bins, picklistLines } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { InventoryFacade } from '../inventory/inventory.facade';
 import type { CatalogFacade } from '../catalog/catalog.facade';
@@ -179,6 +179,15 @@ export interface ReplanSlice {
  * operator the same empty shelf a second time. (Its projection may well still
  * read positive: a partly-drawn bin covers SOMETHING, just not this line.)
  *
+ * Units that ANOTHER open `planned` pick line already plans to draw from a
+ * bin are subtracted before anything is taken. `planSlices` gets this for
+ * free by consuming its pool destructively within one wave; a re-plan runs
+ * long after that wave committed, so it must read the outstanding claims back
+ * out of `picklist_lines`. Without it a re-plan happily routes the operator
+ * to units a sibling slice — or another order's stop on another picklist —
+ * is already walking towards, and the second of the two picks fails at the
+ * bin with nothing left to draw.
+ *
  * An empty result is not an error — it is the partial-order path: the line
  * stays short with its shortfall recorded and the order is under-fulfilled
  * honestly. A result that covers only PART of `need` is the same answer for
@@ -211,10 +220,16 @@ export async function findReplanSlices(
   if (binOrder.length === 0) {
     return [];
   }
-  const [stock, batchStock, batchIdentities] = await Promise.all([
+  const [stock, batchStock, batchIdentities, claimed] = await Promise.all([
     deps.inventory.stockByBinsInTx(tx, scope.tenantId, scope.warehouseId, [scope.skuId]),
     deps.inventory.batchOnHandByBinsInTx(tx, scope.tenantId, scope.warehouseId, [scope.skuId]),
     deps.catalog.getBatchesForSkusInTx(tx, scope.tenantId, [scope.skuId]),
+    openClaimsInTx(
+      tx,
+      scope.tenantId,
+      scope.skuId,
+      binOrder.map((bin) => bin.id),
+    ),
   ]);
   const pool = buildStockPool({
     skuIds: [scope.skuId],
@@ -224,10 +239,26 @@ export async function findReplanSlices(
     batchIdentities,
     at: scope.at,
   });
+  const slots = pool.get(scope.skuId) ?? [];
+
+  // Spend the outstanding claims against each bin's slots FIRST, in the same
+  // FEFO order a pick would draw them: what is left is what is genuinely
+  // unspoken for. Claims can exceed a bin's live stock (a bin drained after
+  // its wave was planned), which simply zeroes it — never a negative slot.
+  for (const [binId, units] of claimed) {
+    let outstanding = units;
+    for (const slot of slots) {
+      if (outstanding === 0) break;
+      if (slot.binId !== binId) continue;
+      const spent = Math.min(outstanding, slot.remaining);
+      slot.remaining -= spent;
+      outstanding -= spent;
+    }
+  }
 
   const slices: ReplanSlice[] = [];
   let need = scope.need;
-  for (const slot of pool.get(scope.skuId) ?? []) {
+  for (const slot of slots) {
     if (need === 0) break;
     if (slot.remaining <= 0) continue;
     const take = Math.min(need, slot.remaining);
@@ -235,4 +266,44 @@ export async function findReplanSlices(
     slices.push({ binId: slot.binId, binCode: slot.binCode, batchId: slot.batchId, qty: take });
   }
   return slices;
+}
+
+/**
+ * Units of one SKU that still-open `planned` pick lines plan to draw, per bin
+ * — the claims a re-plan must not plan a second time. Keyed on the bin alone
+ * (the caller passes only this warehouse's pickable bins, and a bin belongs to
+ * exactly one warehouse), and summed in SQL so a busy warehouse's whole
+ * picklist history never crosses the wire.
+ *
+ * `planned` is the only status that claims anything: `picked` and `short`
+ * lines are terminal records of draws that already happened, `unfulfillable`
+ * names no bin, and `cancelled` lines were withdrawn.
+ */
+async function openClaimsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  skuId: string,
+  binIds: readonly string[],
+): Promise<Map<string, number>> {
+  if (binIds.length === 0) {
+    return new Map();
+  }
+  const rows = await tx
+    .select({
+      binId: picklistLines.binId,
+      claimed: sql<number>`coalesce(sum(${picklistLines.qty}), 0)::int`,
+    })
+    .from(picklistLines)
+    .where(
+      and(
+        eq(picklistLines.tenantId, tenantId),
+        eq(picklistLines.skuId, skuId),
+        eq(picklistLines.status, 'planned'),
+        inArray(picklistLines.binId, [...binIds]),
+      ),
+    )
+    .groupBy(picklistLines.binId);
+  return new Map(
+    rows.flatMap((row) => (row.binId === null ? [] : [[row.binId, row.claimed] as const])),
+  );
 }

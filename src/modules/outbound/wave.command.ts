@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -58,6 +58,21 @@ export type PicklistStatus = (typeof PICKLIST_STATUSES)[number];
  */
 export const PICKLIST_LINE_STATUSES = ['planned', 'unfulfillable', 'picked', 'short', 'cancelled'] as const;
 export type PicklistLineStatus = (typeof PICKLIST_LINE_STATUSES)[number];
+
+/**
+ * "This slice actually drew units through the ledger" — the predicate BOTH
+ * cancel paths key on, kept in one place so they can never drift apart.
+ *
+ * A `picked` line always drew its whole quantity. A `short` line drew
+ * `qty - shortfall_qty`, which is ZERO on the report of an empty bin: nothing
+ * left that shelf, so nothing about it should stop an order being cancelled
+ * or stop its order line being waved again once stock arrives. Keying either
+ * path on `status = 'short'` alone would strand a zero-unit report forever
+ * inside `picklist_lines_open_order_line_unique`.
+ */
+export function picklistLineDrewUnits(): SQL {
+  return sql`(${picklistLines.status} = 'picked' or (${picklistLines.status} = 'short' and ${picklistLines.shortfallQty} < ${picklistLines.qty}))`;
+}
 
 /** How a policy shapes a wave's picklists. */
 export const WAVE_GROUPINGS = ['single', 'batch'] as const;
@@ -868,11 +883,12 @@ export class WaveCommandService {
         // gone. The picked slices stay claimed; the rest of the wave is
         // withdrawn as before.
         //
-        // Story 4.4: a `short` line is not freed either, for both halves of
-        // the same reason — its drawn units have left the bin exactly as a
-        // picked line's have, and the row is the terminal record of WHY the
-        // stop came up short (the SM-3 signal). Flipping it to `cancelled`
-        // would erase that record behind a status that says nothing happened.
+        // Story 4.4: a `short` line that actually DREW units is not freed
+        // either — those units have left the bin exactly as a picked line's
+        // have. A ZERO-unit short report is a different case: nothing moved,
+        // so keeping its claim would wedge the order line out of every future
+        // wave even after stock arrives. `picklistLineDrewUnits` is the one
+        // predicate both cancel paths key on.
         await tx
           .update(picklistLines)
           .set({ status: 'cancelled', updatedAt: nowIso() })
@@ -880,7 +896,7 @@ export class WaveCommandService {
             and(
               eq(picklistLines.tenantId, command.tenantId),
               eq(picklistLines.waveId, wave.id),
-              sql`${picklistLines.status} not in ('picked', 'short')`,
+              sql`not ${picklistLineDrewUnits()}`,
             ),
           );
         await tx
