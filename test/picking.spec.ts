@@ -70,6 +70,8 @@ interface PickBody {
   qty: number;
   occurredAt?: string;
   serials?: string[] | null;
+  /** Story 4.3b: the bin state epoch the device captured at task start. */
+  binStateEpoch?: number | null;
 }
 
 describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)', () => {
@@ -107,8 +109,20 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     'PCK-WHOLE', // the full-quantity-only arm
     'PCK-SNAP', // the sealed device snapshot's pickTasks
     'PCK-ORDCXL', // order-cancel refused once a line is picked
+    'PCK-EPOCH', // 4.3b: the snapshot's bin epoch and its movement
+    'PCK-EPOCH-APPLY', // 4.3b: case 1 — the epoch moved, the draw still stands
+    'PCK-EPOCH-SETTLE', // 4.3b: case 2 — the moved-on bin still covers
+    'PCK-EPOCH-SHORT', // 4.3b: case 3 — the moved-on bin is short
+    'PCK-EPOCH-DEAD', // 4.3b: case 4 — the hold's premises are gone
+    'PCK-EPOCH-NONE', // 4.3b: the no-epoch and unknown-bin arms
+    'PCK-EPOCH-HASH', // 4.3b: the epoch is outside the payload hash
+    'PCK-EPOCH-NOISE', // 4.3b: the OTHER SKU whose movement bumps a bin epoch
+    'PCK-EPOCH-TTL', // 4.3b: expiry is a premise only of the settling slice
+    'PCK-EPOCH-BACKSTOP', // 4.3b: the commitInTx guard beneath the case-4 gate
   ] as const;
   const BATCH_SKU_CODE = 'PCK-FEFO';
+  /** 4.3b: the batch-arm shortfall, routed by the epoch to 409 or 422. */
+  const BATCH_SHORT_SKU_CODE = 'PCK-FEFO3';
   /** Its own batch-tracked SKU: the two-arm draw must be the only claim on its bins. */
   const BATCH_SPAN_SKU_CODE = 'PCK-FEFO2';
   const SERIAL_SKU_CODE = 'PCK-SERIAL';
@@ -171,6 +185,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       ...SKU_CODES.map((code) => `${code},Pick SKU ${code},pcs,,1800,,false,false,,,`),
       `${BATCH_SKU_CODE},Pick SKU ${BATCH_SKU_CODE},pcs,,1800,,true,false,,,`,
       `${BATCH_SPAN_SKU_CODE},Pick SKU ${BATCH_SPAN_SKU_CODE},pcs,,1800,,true,false,,,`,
+      `${BATCH_SHORT_SKU_CODE},Pick SKU ${BATCH_SHORT_SKU_CODE},pcs,,1800,,true,false,,,`,
       `${SERIAL_SKU_CODE},Pick SKU ${SERIAL_SKU_CODE},pcs,,1800,,false,true,,,`,
     ].join('\n');
     await request(app.getHttpServer())
@@ -187,7 +202,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     for (const item of skus.body.items as { code: string; id: string }[]) {
       skuIds.set(item.code, item.id);
     }
-    expect(skuIds.size).toBeGreaterThanOrEqual(SKU_CODES.length + 3);
+    expect(skuIds.size).toBeGreaterThanOrEqual(SKU_CODES.length + 4);
 
     // ── the floor device + its badge-in operator ──────────────────────────
     const minted = await request(app.getHttpServer())
@@ -462,7 +477,14 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
   }
 
   async function snapshotTasks(): Promise<
-    { picklistLineId: string; binCode: string; skuCode: string; qty: number; walkSeq: number }[]
+    {
+      picklistLineId: string;
+      binCode: string;
+      skuCode: string;
+      qty: number;
+      walkSeq: number;
+      binStateEpoch: number | null;
+    }[]
   > {
     const res = await request(app.getHttpServer())
       .get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`)
@@ -474,7 +496,44 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       skuCode: string;
       qty: number;
       walkSeq: number;
+      binStateEpoch: number | null;
     }[];
+  }
+
+  /**
+   * The bin's live state epoch (story 4.3b). Read straight from the table
+   * rather than from the snapshot so the epoch tests can force and observe it
+   * independently of the projection that serves it.
+   */
+  async function binEpoch(binId: string): Promise<number | null> {
+    const rows = await sql`
+      select epoch from bin_state_epochs
+      where tenant_id = ${tenantId} and warehouse_id = ${warehouseId} and bin_id = ${binId}
+    `;
+    const row = rows[0] as unknown as { epoch: string | number } | undefined;
+    return row === undefined ? null : Number(row.epoch);
+  }
+
+  /** The epoch of one snapshot task, as the DEVICE would have captured it. */
+  async function capturedEpoch(picklistLineId: string): Promise<number> {
+    const task = (await snapshotTasks()).find(
+      (candidate) => candidate.picklistLineId === picklistLineId,
+    );
+    if (task === undefined) throw new Error(`no snapshot task for line ${picklistLineId}`);
+    if (task.binStateEpoch === null) throw new Error('snapshot task carried no bin epoch');
+    return task.binStateEpoch;
+  }
+
+  async function pickRow(
+    picklistLineId: string,
+  ): Promise<{ conflict_class: string; reservation_committed: boolean } | undefined> {
+    const rows = await sql`
+      select conflict_class, reservation_committed from picks
+      where tenant_id = ${tenantId} and picklist_line_id = ${picklistLineId}
+    `;
+    return rows[0] as unknown as
+      | { conflict_class: string; reservation_committed: boolean }
+      | undefined;
   }
 
   async function ledgerFor(picklistLineId: string): Promise<
@@ -611,13 +670,16 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(reused.body.code).toBe('idempotency-key-reuse');
 
     // A NEW key against an already-picked line is a deterministic 409 —
-    // never a second draw.
+    // never a second draw. Story 4.3b classifies it as case 4: the line is
+    // drawn and no retry undraws it, so the op is held for review rather than
+    // deleted from the device's outbox.
     const second = await pick(bodyFor(line)).expect(409);
+    expect(second.body.code).toBe('pick-unresolvable');
     expect(second.body.detail).toMatch(/already picked/i);
     expect(await ledgerFor(line.id)).toHaveLength(1);
   });
 
-  // ── the conflict arm (the whole of 4.3's conflict behaviour) ──────────────
+  // ── the undifferentiated conflict arm (4.3; 4.3b differentiates it) ──────
 
   it('a queued pick whose bin drained before replay fails 422 insufficient-on-hand, persists NOTHING, and leaves its key unconsumed', async () => {
     const skuId = sku('PCK-STALE');
@@ -632,6 +694,11 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     const key = ulid();
     // The queued op's bytes, stamped once — the parked op replays verbatim.
     const body = bodyFor(line);
+    // No `binStateEpoch` on the body: a device whose cache predates story
+    // 4.3b. The bin's epoch HAS moved (the drain folded through the ledger),
+    // but with nothing to compare it against the outcome is exactly the
+    // pre-4.3b one — an op is never refused for a field its cache predates.
+    expect(body.binStateEpoch).toBeUndefined();
     const stale = await pick(body, operatorToken, key).expect(422);
     expect(stale.body.code).toBe('insufficient-on-hand');
     // The rejection names the bin and what it LIVE holds.
@@ -653,6 +720,355 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     await seedStock(skuId, binA, 10);
     await pick(body, operatorToken, key).expect(201);
     expect(await lineStatus(line.id)).toBe('picked');
+  });
+
+  // ── story 4.3b: state_epoch and the AD-14 conflict taxonomy ───────────────
+
+  it('the sealed snapshot stitches each stop’s bin state epoch onto the task, and the epoch moves when — and only when — the bin does', async () => {
+    const skuId = sku('PCK-EPOCH');
+    const noiseSkuId = sku('PCK-EPOCH-NOISE');
+    const binE = await createBin('A-10-01');
+    const binIdle = await createBin('A-10-02');
+    await seedStock(skuId, binE, 5);
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'epochsnap');
+    const line = picklist.lines[0]!;
+
+    // The task's epoch comes from the same read as the task (not from the
+    // snapshot's `bins` array, which is stitched on another transaction).
+    const captured = await capturedEpoch(line.id);
+    expect(captured).toBe(await binEpoch(binE));
+    expect(captured).toBeGreaterThan(0);
+
+    // A movement in ANOTHER SKU still moves the BIN's epoch: the epoch is a
+    // fact about the bin, not about one SKU inside it.
+    const idleBefore = await binEpoch(binIdle);
+    await seedStock(noiseSkuId, binE, 1);
+    const moved = await capturedEpoch(line.id);
+    expect(moved).not.toBe(captured);
+    // A bin nothing touched is unchanged — and a bin nothing has EVER
+    // touched simply has no epoch (null), which the server reads as a match.
+    expect(await binEpoch(binIdle)).toBe(idleBefore);
+    expect(idleBefore).toBeNull();
+  });
+
+  it('case 1 (apply) and case 2 (settle): a moved-on bin that still covers the draw answers 201, and the pick row records which arm it settled under', async () => {
+    // Two slices of ONE order line across two bins: the hold settles only on
+    // the LAST open slice, so the first pick is `applied` and the second —
+    // the one that flips `held → committed` — is `settled`.
+    const skuId = sku('PCK-EPOCH-APPLY');
+    const noiseSkuId = sku('PCK-EPOCH-NOISE');
+    const binP = await createBin('A-11-01');
+    const binQ = await createBin('A-11-02');
+    await seedStock(skuId, binP, 4);
+    await seedStock(skuId, binQ, 4);
+    const { picklist } = await releasedWave([{ skuId, quantity: 8 }], 'epochapply');
+    const slices = picklist.lines.filter((candidate) => candidate.status === 'planned');
+    expect(slices).toHaveLength(2);
+    const [first, second] = slices as [PickLine, PickLine];
+    const firstEpoch = await capturedEpoch(first.id);
+    const secondEpoch = await capturedEpoch(second.id);
+
+    // Both bins move on under the queued ops — another SKU lands in each —
+    // but neither draw's own stock is touched, so both still cover.
+    await seedStock(noiseSkuId, first.binId!, 2);
+    await seedStock(noiseSkuId, second.binId!, 2);
+
+    const applied = await pick(bodyFor(first, { binStateEpoch: firstEpoch })).expect(201);
+    expect(applied.body.pick.conflictClass).toBe('applied');
+    expect(applied.body.pick.reservationCommitted).toBe(false);
+    expect(await reservationState(first.reservationId!)).toBe('held');
+    expect(await pickRow(first.id)).toEqual({ conflict_class: 'applied', reservation_committed: false });
+
+    const settled = await pick(bodyFor(second, { binStateEpoch: secondEpoch })).expect(201);
+    expect(settled.body.pick.conflictClass).toBe('settled');
+    expect(settled.body.pick.reservationCommitted).toBe(true);
+    expect(await reservationState(second.reservationId!)).toBe('committed');
+  });
+
+  it('a pick whose epoch still matches is classified `none` — the taxonomy only fires on a real mismatch', async () => {
+    const skuId = sku('PCK-EPOCH-SETTLE');
+    const binM = await createBin('A-12-01');
+    await seedStock(skuId, binM, 3);
+    const { picklist } = await releasedWave([{ skuId, quantity: 3 }], 'epochmatch');
+    const line = picklist.lines[0]!;
+    const captured = await capturedEpoch(line.id);
+
+    const res = await pick(bodyFor(line, { binStateEpoch: captured })).expect(201);
+    expect(res.body.pick.conflictClass).toBe('none');
+    expect(res.body.pick.reservationCommitted).toBe(true);
+  });
+
+  it('case 3 (re-plan): a moved-on bin that is short answers 409 pick-bin-short, writes NOTHING, leaves the key unconsumed — and the op replays once the stock is back', async () => {
+    const skuId = sku('PCK-EPOCH-SHORT');
+    const binS = await createBin('A-13-01');
+    await seedStock(skuId, binS, 7);
+    const { picklist } = await releasedWave([{ skuId, quantity: 7 }], 'epochshort');
+    const line = picklist.lines[0]!;
+    const captured = await capturedEpoch(line.id);
+
+    // Another wave drains the bin while the op sits in the device queue —
+    // the same deterministic driver as the 4.3 stale-replay test: a real
+    // `stock.adjusted` movement, so the epoch changes by construction.
+    await drainStock(skuId, binS, 7);
+    expect(await onHand(skuId, binS)).toBe(0);
+    expect(await binEpoch(binS)).not.toBe(captured);
+
+    const key = ulid();
+    const body = bodyFor(line, { binStateEpoch: captured });
+    const short = await pick(body, operatorToken, key).expect(409);
+    expect(short.body.code).toBe('pick-bin-short');
+    // The refusal names the bin and what it LIVE holds, and says re-planning.
+    expect(short.body.detail).toContain('A-13-01');
+    expect(short.body.detail).toContain('0');
+    expect(short.body.detail).toMatch(/re-planning/i);
+
+    // Nothing persisted: no pick row, no ledger event, the line still
+    // planned, the hold still held, and the key never consumed — the op is
+    // re-plannable, which is only meaningful if the client can still hold it.
+    expect(await pickRow(line.id)).toBeUndefined();
+    expect(await ledgerFor(line.id)).toHaveLength(0);
+    expect(await lineStatus(line.id)).toBe('planned');
+    expect(await reservationState(line.reservationId!)).toBe('held');
+    const keys = await sql`select id from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`;
+    expect(keys).toHaveLength(0);
+
+    // The SAME bytes replay once the bin covers again — including the now
+    // doubly-stale epoch, which no longer matters because the bin covers.
+    await seedStock(skuId, binS, 7);
+    const recovered = await pick(body, operatorToken, key).expect(201);
+    expect(recovered.body.pick.conflictClass).toBe('settled');
+    expect(await lineStatus(line.id)).toBe('picked');
+  });
+
+  it('case 4 (quarantine) beats case 3: a hold that is past its TTL but not yet reaped is unresolvable, even in a bin that still covers', async () => {
+    // `state = 'held'` and `expires_at > now` are NOT the same test — the
+    // reaper is a job, so a hold can be past its TTL and still read `held`.
+    // Settling one would commit units nobody is holding any more.
+    const skuId = sku('PCK-EPOCH-DEAD');
+    const binD = await createBin('A-14-01');
+    await seedStock(skuId, binD, 6);
+    const { picklist } = await releasedWave([{ skuId, quantity: 6 }], 'epochdead');
+    const line = picklist.lines[0]!;
+    const captured = await capturedEpoch(line.id);
+    const before = await onHand(skuId, binD);
+
+    await sql`
+      update reservations set expires_at = now() - interval '1 minute'
+      where id = ${line.reservationId!}
+    `;
+    expect(await reservationState(line.reservationId!)).toBe('held');
+
+    const key = ulid();
+    const dead = await pick(bodyFor(line, { binStateEpoch: captured }), operatorToken, key).expect(409);
+    expect(dead.body.code).toBe('pick-unresolvable');
+    expect(dead.body.detail).toMatch(/expired/i);
+
+    // Nothing written, key unconsumed — the client quarantines, it does not
+    // silently drop a pick the operator physically performed.
+    expect(await pickRow(line.id)).toBeUndefined();
+    expect(await ledgerFor(line.id)).toHaveLength(0);
+    expect(await onHand(skuId, binD)).toBe(before);
+    expect(await lineStatus(line.id)).toBe('planned');
+    const keys = await sql`select id from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`;
+    expect(keys).toHaveLength(0);
+  });
+
+  it('a bin with no epoch row is treated as a match — a bin no movement has ever touched is nothing to be stale against', async () => {
+    const skuId = sku('PCK-EPOCH-NONE');
+    const binN = await createBin('A-15-01');
+    await seedStock(skuId, binN, 4);
+    const { picklist } = await releasedWave([{ skuId, quantity: 4 }], 'epochnone');
+    const line = picklist.lines[0]!;
+    const captured = await capturedEpoch(line.id);
+
+    // Force the "unknown bin" arm of the I/O matrix directly: no epoch row at
+    // all, while the op still quotes one. Absence of the row is not evidence
+    // of change, so the pick proceeds exactly as it would without the field.
+    await sql`
+      delete from bin_state_epochs
+      where tenant_id = ${tenantId} and warehouse_id = ${warehouseId} and bin_id = ${binN}
+    `;
+    expect(await binEpoch(binN)).toBeNull();
+
+    const res = await pick(bodyFor(line, { binStateEpoch: captured })).expect(201);
+    expect(res.body.pick.conflictClass).toBe('none');
+  });
+
+  it('the epoch is OUTSIDE the idempotency payload hash: a replay carrying a different epoch re-serves the snapshot instead of failing idempotency-key-reuse', async () => {
+    // The whole story depends on this. The hash catches a client reusing one
+    // key for two different INTENTS; the epoch is an observation, not an
+    // intent, and two replays of the same physical pick may legitimately
+    // carry different ones. Hashing it would turn every stale replay into a
+    // 422 before the taxonomy ever ran.
+    const skuId = sku('PCK-EPOCH-HASH');
+    const binH = await createBin('A-16-01');
+    await seedStock(skuId, binH, 2);
+    const { picklist } = await releasedWave([{ skuId, quantity: 2 }], 'epochhash');
+    const line = picklist.lines[0]!;
+    const captured = await capturedEpoch(line.id);
+
+    const key = ulid();
+    const body = bodyFor(line, { binStateEpoch: captured });
+    const first = await pick(body, operatorToken, key).expect(201);
+
+    const replayed = await pick({ ...body, binStateEpoch: captured + 99 }, operatorToken, key).expect(201);
+    expect(replayed.body.pick).toEqual(first.body.pick);
+    expect(await ledgerFor(line.id)).toHaveLength(1);
+
+    // A payload field that IS intent still diverges the hash.
+    const reused = await pick({ ...body, qty: 1 }, operatorToken, key).expect(422);
+    expect(reused.body.code).toBe('idempotency-key-reuse');
+  });
+
+  it('the BATCH-arm shortfall is routed by the epoch too: 422 without a moved epoch, 409 pick-bin-short with one', async () => {
+    // The FEFO derivation reports its shortfall rather than throwing it, so
+    // the caller can route it — the plain whole-bin check is not the only
+    // producer. Blocking the batch empties the DRAWABLE pool while leaving
+    // `stock_on_hand` untouched, so the batch arm is provably the branch
+    // under test: the whole-bin check below it would pass.
+    const skuId = sku(BATCH_SHORT_SKU_CODE);
+    const noiseSkuId = sku('PCK-EPOCH-NOISE');
+    const binF = await createBin('A-17-01');
+    const batchCode = `PCK-SHORT-${ulid().slice(10, 16)}`;
+    const expiryDate = new Date(Date.now() + 400 * 86_400_000).toISOString();
+    await seedStock(skuId, binF, 5, { batch: { code: batchCode, expiryDate } });
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'batchshort');
+    const line = picklist.lines[0]!;
+    const captured = await capturedEpoch(line.id);
+
+    // A blocked batch is never drawn (epic-2 retro a13's draw side). The bin
+    // still HOLDS the units — only the drawable pool is empty.
+    await sql`update batches set status = 'blocked' where tenant_id = ${tenantId} and code = ${batchCode}`;
+    expect(await onHand(skuId, binF)).toBe(5);
+
+    // No epoch movement: the pre-4.3b outcome, unchanged.
+    expect(await binEpoch(binF)).toBe(captured);
+    const stale = await pick(bodyFor(line, { binStateEpoch: captured })).expect(422);
+    expect(stale.body.code).toBe('insufficient-on-hand');
+    expect(stale.body.detail).toContain('A-17-01');
+
+    // Now move the bin's epoch — another SKU lands in it — and the SAME
+    // shortfall becomes the re-plannable 409 the client keeps.
+    await seedStock(noiseSkuId, binF, 1);
+    expect(await binEpoch(binF)).not.toBe(captured);
+    const short = await pick(bodyFor(line, { binStateEpoch: captured })).expect(409);
+    expect(short.body.code).toBe('pick-bin-short');
+    expect(short.body.detail).toContain('A-17-01');
+
+    // Neither arm wrote anything.
+    expect(await pickRow(line.id)).toBeUndefined();
+    expect(await ledgerFor(line.id)).toHaveLength(0);
+    expect(await lineStatus(line.id)).toBe('planned');
+  });
+
+  it('case 4 covers every terminal premise: a cancelled wave, a cancelled picklist, a cancelled line and an unfulfillable one', async () => {
+    const skuId = sku('PCK-EPOCH-DEAD');
+    const binT = await createBin('A-18-01');
+    await seedStock(skuId, binT, 12);
+
+    // ── the wave arm: cancelling the wave is the floor-visible path ───────
+    const cancelledWave = await releasedWave([{ skuId, quantity: 3 }], 'deadwave');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/waves/${cancelledWave.waveId}/cancel`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+    const waveArm = await pick(bodyFor(cancelledWave.picklist.lines[0]!)).expect(409);
+    expect(waveArm.body.code).toBe('pick-unresolvable');
+    expect(waveArm.body.detail).toMatch(/wave .* was cancelled while this pick was queued/i);
+
+    // ── the picklist arm ─────────────────────────────────────────────────
+    // Forced directly: a wave cancel cancels the wave FIRST, so the wave gate
+    // above would shadow this one and the arm would never be reached.
+    const picklistCancelled = await releasedWave([{ skuId, quantity: 3 }], 'deadlist');
+    await sql`update picklists set status = 'cancelled' where id = ${picklistCancelled.picklist.id}`;
+    const listArm = await pick(bodyFor(picklistCancelled.picklist.lines[0]!)).expect(409);
+    expect(listArm.body.code).toBe('pick-unresolvable');
+    expect(listArm.body.detail).toMatch(/picklist .* was cancelled while this pick was queued/i);
+
+    // ── the line arms: cancelled, and unfulfillable ──────────────────────
+    const lineCancelled = await releasedWave([{ skuId, quantity: 3 }], 'deadline');
+    const cancelledLine = lineCancelled.picklist.lines[0]!;
+    await sql`update picklist_lines set status = 'cancelled' where id = ${cancelledLine.id}`;
+    const lineArm = await pick(bodyFor(cancelledLine)).expect(409);
+    expect(lineArm.body.code).toBe('pick-unresolvable');
+    expect(lineArm.body.detail).toMatch(/was cancelled while this pick was queued/i);
+
+    const unfulfillable = await releasedWave([{ skuId, quantity: 3 }], 'deadunfil');
+    const shortfallLine = unfulfillable.picklist.lines[0]!;
+    // `unfulfillable` never returns to `planned`, so a queued op against one
+    // is terminal — routing it to the plain `conflict` would have the device
+    // DELETE a pick the operator physically performed.
+    await sql`update picklist_lines set status = 'unfulfillable' where id = ${shortfallLine.id}`;
+    const unfilArm = await pick(bodyFor(shortfallLine)).expect(409);
+    expect(unfilArm.body.code).toBe('pick-unresolvable');
+    expect(unfilArm.body.detail).toMatch(/unfulfillable/i);
+
+    // Nothing was drawn by any of the four.
+    expect(await onHand(skuId, binT)).toBe(12);
+  });
+
+  it('a multi-slice order line whose hold is past TTL still draws its NON-settling slices — expiry is a premise only of the pick that settles', async () => {
+    // The regression this guards: judging expiry at the classification point
+    // refuses the FIRST slice of a multi-bin line, which previously drew
+    // fine. The hold settles only on the LAST open slice, so that is the only
+    // pick whose premises include the TTL.
+    const skuId = sku('PCK-EPOCH-TTL');
+    const binU = await createBin('A-19-01');
+    const binV = await createBin('A-19-02');
+    await seedStock(skuId, binU, 4);
+    await seedStock(skuId, binV, 4);
+    const { picklist } = await releasedWave([{ skuId, quantity: 8 }], 'ttlslices');
+    const slices = picklist.lines.filter((candidate) => candidate.status === 'planned');
+    expect(slices).toHaveLength(2);
+    const [first, second] = slices as [PickLine, PickLine];
+
+    await sql`
+      update reservations set expires_at = now() - interval '1 minute'
+      where id = ${first.reservationId!}
+    `;
+
+    // The non-settling slice draws: its own premise (the hold is still
+    // `held`) holds, and the TTL is not its business.
+    const drew = await pick(bodyFor(first)).expect(201);
+    expect(drew.body.pick.reservationCommitted).toBe(false);
+    expect(await lineStatus(first.id)).toBe('picked');
+
+    // The SETTLING slice is the one the expiry refuses — and refuses whole:
+    // the draw it would have made rolls back with it.
+    const refused = await pick(bodyFor(second)).expect(409);
+    expect(refused.body.code).toBe('pick-unresolvable');
+    expect(refused.body.detail).toMatch(/hold expired at/i);
+    expect(await lineStatus(second.id)).toBe('planned');
+    expect(await ledgerFor(second.id)).toHaveLength(0);
+    expect(await onHand(skuId, second.binId!)).toBe(4);
+  });
+
+  it('the reservation backstop under the classification still refuses a terminal hold (the 4.3 `commitInTx` guard)', async () => {
+    // Story 4.3b's case-4 gate now refuses a terminal hold BEFORE the pick
+    // reaches settlement, so the command can no longer drive `commitInTx`
+    // into its own refusal. That refusal is the backstop beneath the gate —
+    // if it ever stopped refusing, a classification bug would silently
+    // re-commit a hold nobody is holding — so it is asserted directly.
+    const skuId = sku('PCK-EPOCH-BACKSTOP');
+    const binW = await createBin('A-20-01');
+    await seedStock(skuId, binW, 5);
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'backstop');
+    const line = picklist.lines[0]!;
+    await sql`update reservations set state = 'expired' where id = ${line.reservationId!}`;
+
+    const facade = app.get(InventoryFacade);
+    await expect(facade.commitReservation(tenantId, line.reservationId!)).rejects.toMatchObject({
+      status: 409,
+    });
+    expect(await reservationState(line.reservationId!)).toBe('expired');
+
+    // …and the command's own gate refuses first, naming the state.
+    const refused = await pick(bodyFor(line)).expect(409);
+    expect(refused.body.code).toBe('pick-unresolvable');
+    expect(refused.body.detail).toMatch(/a terminal hold is never re-settled/i);
+    expect(await ledgerFor(line.id)).toHaveLength(0);
   });
 
   // ── the on-device mirror's server-side backstops ──────────────────────────
@@ -814,8 +1230,13 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       .set(KEY_HEADER, ulid())
       .send({})
       .expect(200);
+    // Story 4.3b: a CANCELLED order has moved terminally — AD-14 case 4, so
+    // the queued op quarantines for a human rather than being dropped. The
+    // unreleased-wave arm above is NOT terminal (releasing it later makes the
+    // op replayable) and stays the plain retryable `conflict`.
+    expect(early.body.code).toBe('conflict');
     const cancelled = await pick(bodyFor(planned)).expect(409);
-    expect(cancelled.body.code).toBe('conflict');
+    expect(cancelled.body.code).toBe('pick-unresolvable');
     expect(cancelled.body.detail).toMatch(/its units are not picked/i);
     expect(cancelled.body.detail).toContain('cancelled');
     expect(await lineStatus(planned.id)).toBe('planned');
@@ -1048,12 +1469,13 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(await ledgerFor(line.id)).toHaveLength(1);
   });
 
-  it('a queued pick whose hold expired before replay is a deterministic 409 and persists nothing', async () => {
+  it('a queued pick whose hold expired before replay is case 4 — 409 pick-unresolvable, and it persists nothing', async () => {
     // The normal offline case: the op sat in the device queue past the
     // hold's TTL, the reaper expired it, and the replay lands on a
-    // non-`held` reservation. `commitInTx` is the conditional UPDATE that
-    // must refuse it — a silent re-commit of an expired hold would settle
-    // stock nobody is holding any more.
+    // non-`held` reservation. Story 4.3b classifies it as AD-14 case 4 —
+    // unresolvable — so the client QUARANTINES it with the session that made
+    // it instead of deleting it: the hold, the line's own premise, is gone
+    // and no retry recovers it. `commitInTx` stays the backstop underneath.
     const skuId = sku('PCK-AUTH');
     await seedStock(skuId, binA, 9);
     const { picklist } = await releasedWave([{ skuId, quantity: 9 }], 'expired');
@@ -1065,7 +1487,9 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
 
     const key = ulid();
     const refused = await pick(bodyFor(line), operatorToken, key).expect(409);
-    expect(refused.body.detail).toMatch(/already terminal/i);
+    expect(refused.body.code).toBe('pick-unresolvable');
+    expect(refused.body.detail).toMatch(/expired/i);
+    expect(refused.body.detail).toMatch(/held for review/i);
 
     // The whole transaction rolled back: no draw, no pick row, the line still
     // planned, and the key unconsumed so the op stays replayable.
@@ -1081,7 +1505,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
 
   // ── the schema contract: RLS + the 0019 CHECKs ────────────────────────────
 
-  it('RLS on `picks`: foreign rows are invisible, own rows are visible, a foreign insert is 42501; the qty and reservation-pairing CHECKs hold', async () => {
+  it('RLS on `picks` and `bin_state_epochs`: foreign rows are invisible, own rows are visible, a foreign insert is 42501; the four CHECKs hold', async () => {
     // A real foreign tenant with a REAL `picks` row — counting a table that
     // holds nothing returns 0 with RLS on or off.
     const foreignEmail = `foreign-${ulid().toLowerCase()}@example.com`;
@@ -1129,6 +1553,34 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
            ${uuidv7()}, ${uuidv7()}, ${uuidv7()}, ${binA}, 1, null, true, ${uuidv7()}, now(), ${uuidv7()})
       `,
     ).rejects.toThrow(/picks_reservation_pairing/i);
+    // Story 4.3b's two: the taxonomy's stored classes, and the epoch's
+    // monotonic-and-never-zero floor (a 0 on the wire would be
+    // indistinguishable from "this bin has no epoch").
+    await expect(
+      sql`
+        insert into picks
+          (id, tenant_id, warehouse_id, wave_id, picklist_id, picklist_line_id, order_id, order_line_id,
+           sku_id, bin_id, qty, conflict_class, picked_by, picked_at, device_id)
+        values
+          (${uuidv7()}, ${tenantId}, ${warehouseId}, ${uuidv7()}, ${uuidv7()}, ${uuidv7()},
+           ${uuidv7()}, ${uuidv7()}, ${uuidv7()}, ${binA}, 1, 'pick-bin-short', ${uuidv7()}, now(), ${uuidv7()})
+      `,
+    ).rejects.toThrow(/picks_conflict_class_check/i);
+    await expect(
+      sql`
+        insert into bin_state_epochs (id, tenant_id, warehouse_id, bin_id, epoch)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${uuidv7()}, 0)
+      `,
+    ).rejects.toThrow(/bin_state_epochs_epoch_positive/i);
+
+    // Story 4.3b seeded `bin_state_epochs` for this tenant many times over
+    // (every fixture adjustment folds through the ledger), so the "own rows
+    // are visible" half of the probe is non-vacuous for it too.
+    const foreignEpochBin = uuidv7();
+    await sql`
+      insert into bin_state_epochs (id, tenant_id, warehouse_id, bin_id, epoch)
+      values (${uuidv7()}, ${foreignTenantId}, ${warehouseId}, ${foreignEpochBin}, 1)
+    `;
 
     const url = new URL(process.env.DATABASE_URL!);
     url.username = 'wms_rls_probe';
@@ -1136,31 +1588,41 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     const rls = postgres(url.toString(), { max: 1 });
     try {
       await rls.unsafe(`select set_config('app.tenant_id', '${tenantId}', false)`);
-      // The foreign row exists through the privileged connection…
-      const seeded = await sql`select count(*)::int as n from picks where tenant_id = ${foreignTenantId}`;
-      expect(Number((seeded[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
-      // …and is invisible through the scoped role.
-      const foreignRows = await rls.unsafe(
-        `select count(*)::int as n from picks where tenant_id = '${foreignTenantId}'::uuid`,
-      );
-      expect(Number((foreignRows[0] as unknown as { n: number }).n)).toBe(0);
-      // …while our own rows are visible through it.
-      const own = await rls.unsafe(
-        `select count(*)::int as n from picks where tenant_id = '${tenantId}'::uuid`,
-      );
-      expect(Number((own[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
-      // The write side fails closed too (the WITH CHECK arm).
-      await expect(
-        rls.unsafe(
-          `insert into picks
+      // Both tenant-bearing tables this story touches get the same probe.
+      // Looping is the point: `bin_state_epochs`'s policy is hand-written in
+      // 0021, and without this arm dropping it from the migration would leave
+      // the suite green while every tenant could read every other tenant's
+      // bin state.
+      const foreignInsertSql: Record<string, string> = {
+        picks: `insert into picks
              (id, tenant_id, warehouse_id, wave_id, picklist_id, picklist_line_id, order_id, order_line_id,
               sku_id, bin_id, qty, picked_by, picked_at, device_id)
            values
              ('${uuidv7()}'::uuid, '${foreignTenantId}'::uuid, '${warehouseId}'::uuid, '${uuidv7()}'::uuid,
               '${uuidv7()}'::uuid, '${uuidv7()}'::uuid, '${uuidv7()}'::uuid, '${uuidv7()}'::uuid,
               '${uuidv7()}'::uuid, '${binA}'::uuid, 1, '${uuidv7()}'::uuid, now(), '${uuidv7()}'::uuid)`,
-        ),
-      ).rejects.toMatchObject({ code: '42501' });
+        bin_state_epochs: `insert into bin_state_epochs (id, tenant_id, warehouse_id, bin_id, epoch)
+           values ('${uuidv7()}'::uuid, '${foreignTenantId}'::uuid, '${warehouseId}'::uuid, '${uuidv7()}'::uuid, 1)`,
+      };
+      for (const table of ['picks', 'bin_state_epochs'] as const) {
+        // The foreign row exists through the privileged connection…
+        const seeded = await sql.unsafe(
+          `select count(*)::int as n from ${table} where tenant_id = '${foreignTenantId}'::uuid`,
+        );
+        expect(Number((seeded[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
+        // …and is invisible through the scoped role.
+        const foreignRows = await rls.unsafe(
+          `select count(*)::int as n from ${table} where tenant_id = '${foreignTenantId}'::uuid`,
+        );
+        expect(Number((foreignRows[0] as unknown as { n: number }).n)).toBe(0);
+        // …while our own rows are visible through it.
+        const own = await rls.unsafe(
+          `select count(*)::int as n from ${table} where tenant_id = '${tenantId}'::uuid`,
+        );
+        expect(Number((own[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
+        // The write side fails closed too (the WITH CHECK arm).
+        await expect(rls.unsafe(foreignInsertSql[table]!)).rejects.toMatchObject({ code: '42501' });
+      }
     } finally {
       await rls.end();
     }

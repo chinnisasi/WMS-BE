@@ -600,6 +600,20 @@ export class RecordPickDto {
   @IsString({ each: true })
   @Length(1, 64, { each: true })
   serials?: string[];
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: Number,
+    minimum: 1,
+    description:
+      'Story 4.3b (AD-14): the scanned bin’s state_epoch as the device read it from the sealed snapshot at task start. Opaque and compared only for equality — never interpreted. Omit it (or send null) and the replay behaves exactly as it did before this story: a device whose cache predates the field is never refused for the absence of it.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  binStateEpoch?: number | null;
 }
 
 /** One pick as every surface returns it (the idempotency snapshot). */
@@ -681,6 +695,13 @@ export class PickDto {
 
   @ApiProperty({ description: 'ISO-8601 UTC server record time' })
   createdAt!: string;
+
+  @ApiProperty({
+    enum: ['none', 'applied', 'settled'],
+    description:
+      'Story 4.3b (AD-14): the taxonomy arm this pick settled under — none (no epoch sent, or the bin’s epoch still matched), applied (the epoch had moved and the draw stood on its own), settled (the moved-on bin still covered the draw and this pick settled the order line’s hold). The taxonomy’s two refusal arms write nothing, so they never appear here.',
+  })
+  conflictClass!: 'none' | 'applied' | 'settled';
 }
 
 export class PickResponse {
@@ -741,4 +762,12 @@ export class PickTaskDto {
 
   @ApiProperty({ description: 'Distinct bin stops left on this picklist’s walk' })
   stopCount!: number;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description:
+      'Story 4.3b (AD-14): the stop bin’s state_epoch at snapshot time — opaque, compared only for equality. The device carries it back on the queued pick so the server can classify a conflict instead of rejecting blindly. Null when the bin has no epoch row yet (no movement has ever touched it).',
+  })
+  binStateEpoch!: number | null;
 }

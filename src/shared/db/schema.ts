@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { boolean, index, integer, jsonb, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, index, integer, jsonb, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
 /**
@@ -648,6 +648,46 @@ export const batchOnHand = pgTable(
 );
 
 export type BatchOnHand = typeof batchOnHand.$inferSelect;
+
+/**
+ * Per-bin state epoch (Story 4.3b, AD-14): one opaque, monotonic counter per
+ * (tenant, warehouse, bin), bumped inside the ledger fold — in the SAME
+ * transaction and under the SAME per-warehouse advisory lock as the movement
+ * that changed the bin. A device captures the epoch of a pick task's bin at
+ * task start and carries it on the queued op; at replay the server compares
+ * it for EQUALITY only and, on a mismatch, classifies the conflict by the
+ * AD-14 taxonomy instead of rejecting blindly.
+ *
+ * The value is opaque: never a quantity, never a timestamp, never a global
+ * sequence. Its only contract is "a different value means this bin changed".
+ * A bin with no row has never been touched by a movement, and an op naming it
+ * is treated as a match (there is nothing it could be stale against).
+ *
+ * The table is INVENTORY-owned, beside the projections it rides with — a
+ * column on the tenancy-owned `bins` would have the inventory ledger writing
+ * another module's table, which AD-6 forbids. RLS lives only in the migration
+ * SQL (0021, the 0006-0010 pattern); the only write path is
+ * `modules/inventory/ledger.service.ts` (the architecture test pins it).
+ */
+export const binStateEpochs = pgTable(
+  'bin_state_epochs',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    binId: uuid('bin_id').notNull(),
+    /** Monotonic, opaque; compared only for equality. */
+    epoch: bigint('epoch', { mode: 'number' }).notNull().default(1),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('bin_state_epochs_scope_unique').on(table.tenantId, table.warehouseId, table.binId),
+  ],
+);
+
+export type BinStateEpoch = typeof binStateEpochs.$inferSelect;
 
 /**
  * Chain anchors (Story 2.1, AD-16 — the human Option A decision): chain
@@ -1726,6 +1766,16 @@ export const picks = pgTable(
     reservationId: uuid('reservation_id'),
     /** True when this pick settled the hold (`held → committed`). */
     reservationCommitted: boolean('reservation_committed').notNull().default(false),
+    /**
+     * The AD-14 conflict classification this pick settled under (Story
+     * 4.3b): `none` when the op carried no bin epoch or the epoch matched,
+     * `applied` when the bin's epoch had moved and the draw still stood on
+     * its own, `settled` when the moved-on bin still covered the draw and
+     * THIS pick settled the order line's hold. The two refusal arms
+     * (`pick-bin-short`, `pick-unresolvable`) write nothing, so they never
+     * reach a row. The CHECK lives in the migration SQL (0021).
+     */
+    conflictClass: text('conflict_class').notNull().default('none'),
     qty: integer('qty').notNull(),
     pickedBy: uuid('picked_by').notNull(),
     /** Device time (AD-1) — the ledger event's and the row's business time. */

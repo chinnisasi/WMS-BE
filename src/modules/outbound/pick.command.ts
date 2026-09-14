@@ -57,6 +57,15 @@ export interface RecordPickCommand {
    * the command transaction.
    */
   readonly serials?: readonly string[] | undefined;
+  /**
+   * Story 4.3b (AD-14): the scanned bin's `state_epoch` as the device read it
+   * from the sealed snapshot when the task started — an OBSERVATION of the
+   * world, never an intent, which is why it stays out of the payload hash
+   * below. Absent (a device whose cache predates this field, or a scan of a
+   * bin the walk does not name) is treated as a match: an op is never refused
+   * for the absence of a field its cache predates.
+   */
+  readonly binStateEpoch?: number | null | undefined;
 }
 
 // ── snapshots ────────────────────────────────────────────────────────────────
@@ -88,6 +97,15 @@ export interface PickSnapshot {
     readonly reservationCommitted: boolean;
     /** The line's status after the pick — always `picked` on a fresh settle. */
     readonly lineStatus: string;
+    /**
+     * Story 4.3b: which arm of the AD-14 taxonomy this pick settled under —
+     * `none` (the op carried no epoch, or the bin's epoch still matched),
+     * `applied` (the epoch had moved and the draw stood on its own), or
+     * `settled` (the moved-on bin still covered the draw and this pick
+     * settled the order line's hold). The taxonomy's two refusal arms write
+     * nothing, so they never reach a snapshot.
+     */
+    readonly conflictClass: PickConflictClass;
     readonly pickedBy: string;
     readonly pickedAt: string;
     readonly deviceId: string;
@@ -121,7 +139,20 @@ export interface PickTask {
   readonly walkSeq: number;
   /** Distinct bin stops on this picklist's walk (the card's at-a-glance size). */
   readonly stopCount: number;
+  /**
+   * Story 4.3b (AD-14): the stop's bin `state_epoch` at the instant this
+   * snapshot was read. The device carries it back on the queued pick, and the
+   * server compares it for EQUALITY at replay to classify the conflict. It
+   * rides the pick-task read (not the snapshot's `bins` array) so a task and
+   * its epoch always come from ONE consistent read — the two are stitched on
+   * different transactions in the api shell. Null when the bin has no epoch
+   * row yet; the server treats that as a match.
+   */
+  readonly binStateEpoch: number | null;
 }
+
+/** The AD-14 taxonomy's two SUCCESS arms, plus "no conflict at all". */
+export type PickConflictClass = 'none' | 'applied' | 'settled';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 /** One pick per picklist line — the diverged-replay backstop. */
@@ -160,16 +191,32 @@ export const MAX_SNAPSHOT_PICK_TASKS = 500;
  *
  * Invariant order inside `withTenantTransaction`: device re-read fail-closed
  * → role re-read → `assertPermission('picks.execute')` → idempotency replay
- * → validation → bin row lock → ledger draw + hold settlement → line flip →
- * pick row → in-tx outbox → audit → `writeIdempotencyKey` last.
+ * → validation → bin row lock → **AD-14 classification** → ledger draw + hold
+ * settlement → line flip → pick row → in-tx outbox → audit →
+ * `writeIdempotencyKey` last.
  *
  * Guards are server-side truth (AD-4/AD-10): the plan's bin and batch are a
  * SUGGESTION re-derived here (the batch is chosen FEFO within the bin the
  * operator actually scanned), and a draw that would drive the bin below zero
- * is the 422 `insufficient-on-hand` quarantine — nothing persists, the
- * idempotency key is never consumed, and the client parks the op. That is
- * this story's entire conflict behaviour: no `state_epoch`, no taxonomy
- * (4.3b), no short-pick re-planning (4.4).
+ * never persists — the idempotency key is not consumed and the client keeps
+ * its op.
+ *
+ * Story 4.3b makes that refusal DIFFERENTIATED (AD-14). The device captures
+ * each walk stop's bin `state_epoch` from the sealed snapshot and carries it
+ * on the queued op; at replay, under the bin's row lock and before any write,
+ * the server compares it for equality and classifies:
+ *
+ *   1. apply     — the epoch moved but the draw still stands → `201`
+ *   2. settle    — the epoch moved, the bin covers, this pick settles the
+ *                  hold → `201`
+ *   3. re-plan   — the epoch moved and the bin is short → `409
+ *                  pick-bin-short`; the client KEEPS the op (4.4 re-plans it)
+ *   4. quarantine— a premise moved terminally → `409 pick-unresolvable`; the
+ *                  client quarantines with session attribution
+ *
+ * An op with no epoch is treated as a match and behaves exactly as it did
+ * before this story (`422 insufficient-on-hand`). Short-pick re-planning
+ * itself is still 4.4, and the web review queue is Epic 5's story 5.5.
  */
 @Injectable()
 export class PickCommandService {
@@ -205,6 +252,13 @@ export class PickCommandService {
       // The RAW serial numbers fingerprint (never the resolved ids) — a
       // retry of the same request body replays regardless of current state.
       serials: command.serials === undefined ? undefined : [...command.serials],
+      // `binStateEpoch` is DELIBERATELY absent (story 4.3b). The hash exists
+      // to catch a client reusing one key for two different INTENTS; the
+      // epoch is not intent, it is what the device observed of the world at
+      // task start. Two replays of the same physical pick carry the same
+      // intent and may legitimately carry different epochs, so hashing it
+      // would answer `422 idempotency-key-reuse` before the taxonomy ever
+      // ran — the exact undifferentiated rejection this story replaces.
     });
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
@@ -238,7 +292,13 @@ export class PickCommandService {
         if (existing[0].payloadHash !== payloadHash) {
           throw idempotencyKeyReuse();
         }
-        return existing[0].responseSnapshot as PickSnapshot;
+        // Story 4.3b: a key written BEFORE this story stored a snapshot with
+        // no `conflictClass`, and the field is required on the wire. A
+        // pre-4.3b pick ran with no epoch comparison at all, so `none` is
+        // what it would have been classified as — the default is the honest
+        // value, not a placeholder.
+        const stored = existing[0].responseSnapshot as PickSnapshot;
+        return { pick: { ...stored.pick, conflictClass: stored.pick.conflictClass ?? 'none' } };
       }
 
       // ── input validation (400 before any write) ─────────────────────────
@@ -288,38 +348,76 @@ export class PickCommandService {
       }
 
       // ── the pick line's state gates (409 before any write) ──────────────
+      // Story 4.3b: a premise that moved TERMINALLY is case 4 of the AD-14
+      // taxonomy — `pick-unresolvable`, which the client quarantines with
+      // session attribution rather than deleting. A premise that is merely
+      // not-yet-ready (a wave still `planned`, a picklist still `planned`
+      // rather than `ready` — those are the only non-terminal arms either
+      // status machine has) is not terminal: releasing it later makes the
+      // queued op replayable, so it stays the plain `conflict` it has always
+      // been.
+      //
+      // These four codes changed for EVERY caller, including a device whose
+      // cache predates the epoch, which the acceptance criteria say should
+      // behave exactly as before. The deviation is deliberate and narrow.
+      // Terminality is a fact about the wave, the line and the order — it has
+      // nothing to do with what the device observed of a bin — so gating the
+      // code on whether an epoch was sent would hand two devices different
+      // answers to the same question, and would misroute a 4.3b device that
+      // legitimately carries no epoch (a bin the walk does not name, or one
+      // no movement has ever touched) into deleting an op it should hold. A
+      // pre-4.3b client's observable behaviour is unchanged regardless: it
+      // has no branch for `pick-unresolvable`, so the code falls through to
+      // the same `rejected` default that `conflict` reached. What the AC
+      // protects — that an epoch-less replay is never refused for the absence
+      // of the field, and that its shortfall stays the `422` it always was —
+      // is preserved exactly; see `binCannotCover`.
       if (found.waveStatus !== 'released') {
-        throw new ProblemException(
-          'conflict',
-          409,
-          'Wave is not released',
-          `Wave "${line.waveId}" reads "${found.waveStatus}" — only a released wave is the floor's work.`,
-        );
+        throw found.waveStatus === 'cancelled'
+          ? pickUnresolvable(
+              'Wave was cancelled',
+              `Wave "${line.waveId}" was cancelled while this pick was queued.`,
+            )
+          : new ProblemException(
+              'conflict',
+              409,
+              'Wave is not released',
+              `Wave "${line.waveId}" reads "${found.waveStatus}" — only a released wave is the floor's work.`,
+            );
       }
       if (found.picklistStatus !== 'ready') {
-        throw new ProblemException(
-          'conflict',
-          409,
-          'Picklist is not ready',
-          `Picklist "${command.picklistId}" reads "${found.picklistStatus}" — only a ready picklist is picked.`,
-        );
+        throw found.picklistStatus === 'cancelled'
+          ? pickUnresolvable(
+              'Picklist was cancelled',
+              `Picklist "${command.picklistId}" was cancelled while this pick was queued.`,
+            )
+          : new ProblemException(
+              'conflict',
+              409,
+              'Picklist is not ready',
+              `Picklist "${command.picklistId}" reads "${found.picklistStatus}" — only a ready picklist is picked.`,
+            );
       }
       if (line.status === 'picked') {
         // A DIFFERENT key against an already-picked line: the pick happened,
-        // this command is not it. Deterministic 409 — never a second draw.
-        throw new ProblemException(
-          'conflict',
-          409,
+        // this command is not it, and nothing recovers it — terminal, so the
+        // op is quarantined for a human rather than dropped.
+        throw pickUnresolvable(
           'Pick line is already picked',
           `Pick line "${command.picklistLineId}" is already picked — a line is drawn exactly once.`,
         );
       }
       if (line.status !== 'planned') {
-        throw new ProblemException(
-          'conflict',
-          409,
-          'Pick line is not pickable',
-          `Pick line "${command.picklistLineId}" reads "${line.status}" — only a planned line is picked.`,
+        // `cancelled` and `unfulfillable` are both terminal: neither ever
+        // returns to `planned`, so a queued op against one can only be
+        // resolved by a human. Routing `unfulfillable` to the plain
+        // `conflict` would have the device DELETE a pick the operator
+        // physically performed — the exact loss this story exists to stop.
+        throw pickUnresolvable(
+          line.status === 'cancelled' ? 'Pick line was cancelled' : 'Pick line is unfulfillable',
+          line.status === 'cancelled'
+            ? `Pick line "${command.picklistLineId}" was cancelled while this pick was queued.`
+            : `Pick line "${command.picklistLineId}" reads "unfulfillable" — it names a shortfall, not pickable stock, and never returns to planned.`,
         );
       }
       if (line.binId === null) {
@@ -347,12 +445,23 @@ export class PickCommandService {
         );
       }
       if (order.status !== 'accepted') {
-        throw new ProblemException(
-          'conflict',
-          409,
-          'Order is not accepted',
-          `Order "${line.orderId}" reads "${order.status}" — its units are not picked.`,
-        );
+        // A cancelled order has moved terminally — the queued pick's premise
+        // is gone (case 4). `accepted` and `cancelled` are the only arms the
+        // `orders_status_check` CHECK allows today, so the else branch below
+        // is unreachable: it is kept FORWARD-LOOKING for the statuses 4.6
+        // adds (a dispatched order is terminal and belongs above; anything
+        // an order can still leave belongs below).
+        throw order.status === 'cancelled'
+          ? pickUnresolvable(
+              'Order was cancelled',
+              `Order "${line.orderId}" reads "${order.status}" — its units are not picked.`,
+            )
+          : new ProblemException(
+              'conflict',
+              409,
+              'Order is not accepted',
+              `Order "${line.orderId}" reads "${order.status}" — its units are not picked.`,
+            );
       }
 
       // ── the scanned item (the wrong-item rejection, mirrored on-device) ──
@@ -441,23 +550,6 @@ export class PickCommandService {
         );
       }
 
-      // ── the batch arms, RE-DERIVED FEFO in the scanned bin ──────────────
-      // The plan's `batch_id` is advisory: the operator may legitimately be
-      // standing at a different bin, and the plan's batch may have been drawn
-      // since. The draw is composed here against LIVE per-batch stock.
-      const allocation = sku.batchTracked
-        ? await this.deriveBatchArms(tx, command, drawBin.code, occurredAt)
-        : [{ batchId: null, qty: command.qty }];
-
-      // ── the sufficiency pre-check (the 422 that names the live on-hand) ─
-      // The ledger's own fold guard is the backstop; this check exists so the
-      // stale-replay outcome names the bin CODE and what it actually holds
-      // rather than a raw id.
-      const onHand = await this.binOnHandInTx(tx, command, drawBin.id);
-      if (onHand < command.qty) {
-        throw insufficientOnHand(drawBin.code, onHand, command.qty);
-      }
-
       // ── the serial arm (serial-tracked SKUs, the putaway mirror) ────────
       let serialNumbers: readonly string[] = [];
       if (sku.serialTracked) {
@@ -484,6 +576,120 @@ export class PickCommandService {
         serialNumbers.length === 0
           ? []
           : await resolveSerialRefsInTx(tx, command.tenantId, command.skuId, serialNumbers);
+      if (serialRefs.length > 0) {
+        // The whole serial set, tenant-wide and in sorted order, BEFORE the
+        // warehouse lock below and before the first append (the
+        // stock.adjustment deadlock rule). Taking it here rather than at the
+        // draw is what keeps this path on putaway's documented acyclic
+        // bins-row → serial → warehouse order now that the classification
+        // needs the warehouse lock; each append's own serial lock (same key)
+        // is then a re-entrant no-op.
+        await this.inventory.lockSerialsInTx(tx, command.tenantId, serialRefs);
+      }
+
+      // ── the AD-14 conflict classification (story 4.3b) ──────────────────
+      // The per-warehouse advisory xact lock — the SAME key the ledger's
+      // `appendMovement` takes — is acquired here, before the epoch is read.
+      // The bins-row lock above mutexes other PICKS and nothing else:
+      // adjustments, putaway, receiving and the reconciliation rebuild all
+      // bump this bin's epoch and quantity under the warehouse lock without
+      // ever touching that row. Without this, an adjustment committing
+      // between the epoch read and the on-hand read below would show an
+      // unmoved epoch against a drained bin, and the refusal would be the
+      // `422` a device DELETES instead of the `409` it keeps.
+      //
+      // Lock order stays putaway's documented acyclic bins-row → serial →
+      // warehouse: the bins row is locked above, the whole serial set is
+      // pre-locked just above this, and the warehouse comes last. Every
+      // append inside this transaction then re-acquires both as no-ops.
+      await this.inventory.lockWarehouseInTx(tx, command.tenantId, command.warehouseId);
+
+      // Everything from here to the draw runs under that lock and writes
+      // nothing, so a classification can neither race the state it
+      // classified nor leave a half-classified write behind.
+      //
+      // The epoch is compared for EQUALITY only. Three inputs read as "no
+      // conflict": an op that carries none (a device whose cache predates
+      // this field — never refused for a field it could not have sent), a bin
+      // that has no epoch row (no movement has ever touched it, so there is
+      // nothing to be stale against), and an epoch that still matches.
+      //
+      // A SELF-INFLICTED bump counts as movement, deliberately. Two queued
+      // stops on the same bin mean the first pick's own draw moves the epoch
+      // the second one quotes. That is not a false positive: the bin really
+      // did change, the device's sealed snapshot really no longer describes
+      // it, and if the second stop is now short then re-planning it is
+      // exactly the right outcome — `pick-bin-short` keeps the op where the
+      // undifferentiated 422 would have deleted it. On the success path the
+      // only consequence is that the pick row is labelled `applied`/`settled`
+      // rather than `none`, which is a classification of a real change.
+      // Subtracting the transaction's own bumps would need the epoch to carry
+      // provenance, which is precisely the interpretation AD-14 forbids.
+      const liveBinEpoch = await this.inventory.binStateEpochInTx(
+        tx,
+        command.tenantId,
+        command.warehouseId,
+        drawBin.id,
+      );
+      const opBinEpoch = command.binStateEpoch ?? null;
+      const epochMoved =
+        opBinEpoch !== null && liveBinEpoch !== null && liveBinEpoch !== opBinEpoch;
+
+      // Case 4 — UNRESOLVABLE. The task's own premises are gone and no amount
+      // of retrying recovers it, so it is checked whether or not the bin
+      // moved: a terminal hold is unresolvable in a bin nobody touched. The
+      // terminal wave / picklist / line / order arms are the gates above.
+      //
+      // Only the hold's STATE is judged here. Expiry is judged later, at the
+      // settlement point, because it is only a premise of the pick that
+      // actually settles: an order line spanning several bins keeps its hold
+      // `held` until the last slice is drawn, and refusing the first slice
+      // over a TTL that slice never reaches would fail a pick that used to
+      // succeed for a reason that has nothing to do with it.
+      const hold =
+        line.reservationId === null
+          ? null
+          : await this.inventory.holdLivenessInTx(tx, command.tenantId, line.reservationId);
+      if (line.reservationId !== null) {
+        if (hold === null) {
+          throw pickUnresolvable(
+            'Hold no longer exists',
+            `The order line's hold "${line.reservationId}" no longer exists — nothing holds these units.`,
+          );
+        }
+        if (hold.state !== 'held') {
+          throw pickUnresolvable(
+            'Hold is already terminal',
+            `The order line's hold reads "${hold.state}" — a terminal hold is never re-settled.`,
+          );
+        }
+      }
+
+      // ── the batch arms, RE-DERIVED FEFO in the scanned bin ──────────────
+      // The plan's `batch_id` is advisory: the operator may legitimately be
+      // standing at a different bin, and the plan's batch may have been drawn
+      // since. The draw is composed here against LIVE per-batch stock.
+      const batchDraw = sku.batchTracked
+        ? await this.deriveBatchArms(tx, command, occurredAt)
+        : { arms: [{ batchId: null, qty: command.qty }] };
+      if ('drawable' in batchDraw) {
+        // Cases 3 vs today: a bin that cannot cover the draw is `409
+        // pick-bin-short` when the epoch proves it MOVED (re-plannable — 4.4
+        // turns it into an alternate bin or a partial order, and the client
+        // keeps the op), and the unchanged `422 insufficient-on-hand` when it
+        // did not (which is also every pre-upgrade device's behaviour).
+        throw binCannotCover(epochMoved, drawBin.code, batchDraw.drawable, command.qty);
+      }
+      const allocation = batchDraw.arms;
+
+      // ── the sufficiency pre-check (the refusal that names the on-hand) ──
+      // The ledger's own fold guard is the backstop; this check exists so the
+      // outcome names the bin CODE and what it actually holds rather than a
+      // raw id.
+      const onHand = await this.binOnHandInTx(tx, command, drawBin.id);
+      if (onHand < command.qty) {
+        throw binCannotCover(epochMoved, drawBin.code, onHand, command.qty);
+      }
 
       // ── the draw (one event per batch arm, or per serial unit) ──────────
       // AD-1: the row's pickedAt is the DEVICE time; the ledger's recordedAt
@@ -506,14 +712,12 @@ export class PickCommandService {
       };
 
       if (serialRefs.length > 0) {
-        // Lock the whole serial set tenant-wide in sorted order BEFORE the
-        // first append (the stock.adjustment deadlock rule), then one event
-        // per serial unit — magnitude 1, drawn OUT of the bin (`toBinId`
-        // null: the units leave stock; pack/dispatch are 4.5/4.6). No batch
-        // arm rides these events: a serial-tracked SKU that is ALSO
-        // batch-tracked is refused above, so `allocation` here is always the
-        // single batch-less arm.
-        await this.inventory.lockSerialsInTx(tx, command.tenantId, serialRefs);
+        // One event per serial unit — magnitude 1, drawn OUT of the bin
+        // (`toBinId` null: the units leave stock; pack/dispatch are
+        // 4.5/4.6). No batch arm rides these events: a serial-tracked SKU
+        // that is ALSO batch-tracked is refused above, so `allocation` here
+        // is always the single batch-less arm. The serial set was pre-locked
+        // above, before the warehouse lock.
         for (const serialRef of serialRefs) {
           await this.inventory.appendLedgerEventInTx(tx, {
             tenantId: command.tenantId,
@@ -568,10 +772,9 @@ export class PickCommandService {
         .returning({ id: picklistLines.id });
       if (flipped[0] === undefined) {
         // A concurrent pick of the same line won the flip — this transaction
-        // carries no new state and rolls back whole.
-        throw new ProblemException(
-          'conflict',
-          409,
+        // carries no new state and rolls back whole. Terminal like the gate
+        // above it (story 4.3b): the line is drawn, and no retry undraws it.
+        throw pickUnresolvable(
           'Pick line is already picked',
           `Pick line "${command.picklistLineId}" was picked concurrently — a line is drawn exactly once.`,
         );
@@ -603,10 +806,46 @@ export class PickCommandService {
           .for('update');
         const openSiblings = siblings.filter((sibling) => sibling.status === 'planned');
         if (openSiblings[0] === undefined) {
+          // Story 4.3b, case 4's expiry arm — HERE, not at the classification
+          // point, because expiry is a premise only of the pick that actually
+          // settles. `state === 'held'` and "not expired" are two different
+          // facts (`expireDue` is a job, so a hold can be past its TTL and
+          // still read `held`), and settling a hold nobody is holding any
+          // more would commit units the reaper has already given up on. The
+          // comparison was made by the DATABASE's clock, not this node's.
+          //
+          // Re-read under the warehouse lock this transaction now holds: the
+          // classification's read happened before the siblings were locked.
+          const settling = await this.inventory.holdLivenessInTx(
+            tx,
+            command.tenantId,
+            line.reservationId,
+          );
+          if (settling !== null && settling.expired) {
+            throw pickUnresolvable(
+              'Hold expired before this pick replayed',
+              `The order line's hold expired at ${settling.expiresAt} — its units are no longer held for this order.`,
+            );
+          }
           await this.inventory.commitReservationInTx(tx, command.tenantId, line.reservationId);
           reservationCommitted = true;
         }
       }
+
+      // ── the AD-14 classification this pick settled under (story 4.3b) ───
+      // Cases 1 and 2 both answer 201 exactly as before; what differs is the
+      // LABEL the pick row carries, and the label names what the server can
+      // actually prove. The device sends no observed quantity and the epoch
+      // is opaque per BIN, so "this SKU's on-hand was unchanged" is not
+      // derivable from stored state — the spine's `apply` / `settle` split is
+      // therefore drawn where the server has real evidence: a draw that stood
+      // on its own against a moved-on bin is `applied`, and one that also
+      // settled the order line's hold (`held → committed`) is `settled`.
+      const conflictClass: PickConflictClass = !epochMoved
+        ? 'none'
+        : reservationCommitted
+          ? 'settled'
+          : 'applied';
 
       // ── the pick row (the settlement record) ────────────────────────────
       const pickId = uuidv7();
@@ -628,6 +867,7 @@ export class PickCommandService {
           suggestedBatchId,
           reservationId: line.reservationId,
           reservationCommitted,
+          conflictClass,
           qty: command.qty,
           pickedBy: command.operatorUserId,
           pickedAt,
@@ -635,9 +875,7 @@ export class PickCommandService {
         });
       } catch (err) {
         if (isUniqueViolationOn(err, PICKS_LINE_UNIQUE)) {
-          throw new ProblemException(
-            'conflict',
-            409,
+          throw pickUnresolvable(
             'Pick line is already picked',
             `Pick line "${command.picklistLineId}" already carries a pick — a line is drawn exactly once.`,
           );
@@ -676,6 +914,7 @@ export class PickCommandService {
           reservationId: line.reservationId,
           reservationCommitted,
           lineStatus: 'picked',
+          conflictClass,
           pickedBy: command.operatorUserId,
           pickedAt,
           deviceId: command.deviceId,
@@ -720,15 +959,18 @@ export class PickCommandService {
    * actually scanned (never the plan's bin): drawable batches only (a
    * blocked batch is never drawn — epic-2 retro a13's draw side; an expired
    * batch is never drawn), expiry ascending with no-expiry last, taking from
-   * each until the quantity is covered. A bin that cannot cover the line is
-   * the 422 that names what it holds.
+   * each until the quantity is covered. A bin that cannot cover the line comes
+   * back as `{ drawable }` — the drawable unit count — and the CALLER picks
+   * the refusal (story 4.3b: re-plannable when the bin's epoch moved, the
+   * unchanged 422 when it did not).
    */
   private async deriveBatchArms(
     tx: TenantTx,
     command: RecordPickCommand,
-    binCode: string,
     occurredAt: string,
-  ): Promise<{ batchId: string | null; qty: number }[]> {
+  ): Promise<
+    { arms: { batchId: string | null; qty: number }[] } | { drawable: number }
+  > {
     const [batchStock, identities] = await Promise.all([
       // Bin-scoped in SQL: this runs inside the command transaction while
       // holding the bin row lock, so reading the whole warehouse's batch
@@ -770,13 +1012,18 @@ export class PickCommandService {
       arms.push({ batchId: row.batchId, qty: take });
     }
     if (need > 0) {
-      const drawableUnits = command.qty - need;
-      throw insufficientOnHand(binCode, drawableUnits, command.qty);
+      // A shortfall is REPORTED, never thrown from here: story 4.3b's caller
+      // decides between the re-plannable 409 and the unchanged 422 by whether
+      // the bin's epoch moved, and that is not this helper's business.
+      return { drawable: command.qty - need };
     }
-    return arms;
+    return { arms };
   }
 
-  /** The scanned bin's live on-hand for the picked SKU (the 422's figure). */
+  /**
+   * The scanned bin's live on-hand for the picked SKU — the figure the
+   * cannot-cover refusal names, whichever arm `binCannotCover` routes it to.
+   */
   private async binOnHandInTx(
     tx: TenantTx,
     command: RecordPickCommand,
@@ -889,6 +1136,16 @@ export class PickCommandService {
       set.add(row.binId!);
       stops.set(row.picklistId, set);
     }
+    // Story 4.3b: the stops' bin epochs, read on THIS transaction so a task
+    // and the epoch the device will quote back come from one consistent read.
+    // The snapshot's `bins` array is stitched on a different transaction in
+    // the api shell, so the epoch deliberately does not ride there.
+    const binEpochs = await this.inventory.binStateEpochsInTx(
+      tx,
+      tenantId,
+      warehouseId,
+      rows.map((row) => row.binId!),
+    );
     return rows.map((row) => ({
       waveId: row.waveId,
       picklistId: row.picklistId,
@@ -911,6 +1168,7 @@ export class PickCommandService {
       sliceSeq: row.sliceSeq,
       walkSeq: row.walkSeq,
       stopCount: stops.get(row.picklistId)?.size ?? 0,
+      binStateEpoch: binEpochs.get(row.binId!) ?? null,
     }));
   }
 }
@@ -1044,11 +1302,16 @@ export function wrongItem(expectedSkuId: string, scannedSkuId: string): ProblemE
 }
 
 /**
- * The stale-replay conflict (the I/O matrix): the bin drained before the
- * queued pick replayed. 422, naming the bin and its LIVE on-hand — nothing
- * persists, the idempotency key is never consumed, and the client parks the
- * op with session attribution. This is the whole of 4.3's conflict behaviour
- * (the ledger's fold guard is the backstop below it).
+ * The undifferentiated stale-replay conflict (story 4.3): the bin drained
+ * before the queued pick replayed, and nothing proves WHEN. 422, naming the
+ * bin and its LIVE on-hand — nothing persists, the idempotency key is never
+ * consumed, and the client parks the op with session attribution.
+ *
+ * Since story 4.3b this is the arm for ops that carry NO bin epoch (a device
+ * whose cache predates the field, a bin no movement has ever touched, or an
+ * epoch that still matches): they behave exactly as they did before. An op
+ * whose epoch proves the bin moved gets `pick-bin-short` instead. The
+ * ledger's own fold guard is the backstop below both.
  */
 export function insufficientOnHand(
   binCode: string,
@@ -1061,6 +1324,75 @@ export function insufficientOnHand(
     'Bin cannot cover this pick',
     `Bin "${binCode}" holds ${onHand} drawable unit(s) of this SKU; the pick draws ${requested}. Nothing was recorded.`,
   );
+}
+
+/**
+ * Case 3 of the AD-14 taxonomy (story 4.3b) — RE-PLANNABLE, not terminal.
+ * The bin's epoch proves it moved on while the op sat in the device queue,
+ * and it no longer covers the draw. 409, naming the bin and its live drawable
+ * on-hand; nothing is written and the idempotency key is never consumed. The
+ * client KEEPS the op and surfaces it for re-planning — story 4.4 turns it
+ * into an alternate bin or a partial order, and the operator's physical pick
+ * is still real. Deleting it (today's behaviour for every refusal) is exactly
+ * the loss this story exists to stop.
+ */
+export function pickBinShort(
+  binCode: string,
+  onHand: number,
+  requested: number,
+): ProblemException {
+  return new ProblemException(
+    'pick-bin-short',
+    409,
+    'Bin moved on and is short for this pick',
+    `Bin "${binCode}" changed while this pick was queued and now holds ${onHand} drawable unit(s) of this SKU; the pick draws ${requested}. Nothing was recorded — the pick needs re-planning.`,
+  );
+}
+
+/**
+ * Case 4 of the AD-14 taxonomy (story 4.3b) — TERMINAL. The task's own
+ * premises are gone: its hold, its line, its picklist, its wave or its order
+ * moved somewhere no retry recovers. 409, naming what moved; nothing is
+ * written and the key is never consumed. The client quarantines the op with
+ * the badge-in session that created it, for a human to review (Epic 5's story
+ * 5.5 adds the web review queue).
+ */
+export function pickUnresolvable(title: string, detail: string): ProblemException {
+  return new ProblemException(
+    'pick-unresolvable',
+    409,
+    // The title names WHICH premise moved. The code stays one — clients
+    // branch on `pick-unresolvable` and nothing else — but collapsing an
+    // expired hold, a cancelled wave and an already-picked line into a single
+    // "Pick cannot be resolved" would make "unresolvable picks are up" an
+    // unanswerable alert. NOTE: the shared `ProblemDetailsFilter` currently
+    // renders the wire `title` from the exception message, which
+    // `ProblemException` sets to the DETAIL — so today this title is the
+    // in-process name of the cause (logs, stack context, the switch a reader
+    // has to make sense of) rather than a wire field. Fixing that filter is
+    // repo-wide and not this story's; the causes stay distinguishable on the
+    // wire through `detail` either way.
+    title,
+    `${detail} Nothing was recorded — the pick is held for review.`,
+  );
+}
+
+/**
+ * The bin-cannot-cover refusal, routed by the epoch (story 4.3b). With a
+ * moved-on bin it is case 3's re-plannable 409; without one — a device whose
+ * cache predates the epoch, a bin no movement has ever touched, or an epoch
+ * that still matches — it is the unchanged `422 insufficient-on-hand`, so a
+ * pre-upgrade device behaves exactly as it did before this story.
+ */
+function binCannotCover(
+  epochMoved: boolean,
+  binCode: string,
+  onHand: number,
+  requested: number,
+): ProblemException {
+  return epochMoved
+    ? pickBinShort(binCode, onHand, requested)
+    : insufficientOnHand(binCode, onHand, requested);
 }
 
 /** The blocked-bin rejection (FR-10): a blocked bin is unpickable. */
