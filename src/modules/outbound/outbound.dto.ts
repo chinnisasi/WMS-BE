@@ -16,6 +16,7 @@ import {
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { ORDER_SOURCES } from './order.command';
+import { SHORT_PICK_REASON_CODES } from './pick.command';
 import {
   PICKLIST_LINE_STATUSES,
   PICKLIST_STATUSES,
@@ -422,8 +423,23 @@ export class PicklistLineDto {
   @ApiProperty({ description: 'Units to draw at this bin (0 on an unfulfillable slice) — always from the order line’s reservedQty, never its qty' })
   qty!: number;
 
-  @ApiProperty({ description: 'Uncovered units — non-zero only on an unfulfillable slice' })
+  @ApiProperty({
+    description:
+      'Uncovered units — non-zero on an unfulfillable slice (nothing pickable was ever found) and on a short one (story 4.4: qty − shortfallQty is what actually moved)',
+  })
   shortfallQty!: number;
+
+  // `null` rides INSIDE the enum deliberately: OAS 3.0's sibling `nullable`
+  // is dropped by the client generator when an `enum` is present, which
+  // would hand every consumer a non-null type for a field that is null on
+  // every line except a short-picked one.
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    enum: [...SHORT_PICK_REASON_CODES, null],
+    description: 'Story 4.4: why a short line came up short; null on every other line',
+  })
+  reasonCode!: string | null;
 
   @ApiProperty({ description: 'The order line’s slice index (an order line may span bins)' })
   sliceSeq!: number;
@@ -573,13 +589,14 @@ export class RecordPickDto {
   binId!: string;
 
   @ApiProperty({
-    description: 'Units drawn in base UoM — exactly the line’s planned quantity (full-quantity picks only in this release)',
-    minimum: 1,
+    description:
+      'Units actually drawn in base UoM. Equal to the line’s planned quantity for an ordinary pick; BELOW it (down to 0, an empty bin) for a short pick, which must carry a reasonCode. Above the plan is always a 400.',
+    minimum: 0,
     maximum: 2147483647,
   })
   @Type(() => Number)
   @IsInt()
-  @Min(1)
+  @Min(0)
   @Max(2147483647)
   qty!: number;
 
@@ -614,12 +631,57 @@ export class RecordPickDto {
   @IsInt()
   @Min(1)
   binStateEpoch?: number | null;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    enum: [...SHORT_PICK_REASON_CODES],
+    description:
+      'Story 4.4: why this stop came up short. REQUIRED whenever qty is below the line’s planned quantity (including 0), refused outside the fixed set with a 400 naming the whole set, and ignored when qty equals the plan (that is an ordinary full pick). It is part of the idempotency payload hash — the reason is intent, not an observation.',
+  })
+  @IsOptional()
+  // `@IsIn` over the same tuple the `enum` above documents: a generated client
+  // gets a closed type, so the pipe must refuse anything outside it too —
+  // otherwise the contract says one thing and the validator accepts another,
+  // and the command's own 400 becomes the only real gate.
+  @IsIn([...SHORT_PICK_REASON_CODES])
+  reasonCode?: string | null;
+}
+
+/** One slice a short pick re-planned the remainder onto (story 4.4). */
+export class ReplannedSliceDto {
+  @ApiProperty({ format: 'uuid', description: 'The NEW pick line carrying the remainder' })
+  picklistLineId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The alternate bin — never the bin that came up short' })
+  binId!: string;
+
+  @ApiProperty({ description: 'The alternate bin’s code — the walk key' })
+  binCode!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'FEFO batch suggestion; null when untracked' })
+  batchId!: string | null;
+
+  @ApiProperty({ description: 'Units to draw at the alternate bin' })
+  qty!: number;
+
+  @ApiProperty({ description: 'The order line’s next unused slice index' })
+  sliceSeq!: number;
+
+  @ApiProperty({ description: 'Walk position — after every stop the picklist already had' })
+  walkSeq!: number;
 }
 
 /** One pick as every surface returns it (the idempotency snapshot). */
 export class PickDto {
-  @ApiProperty({ format: 'uuid' })
-  id!: string;
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    format: 'uuid',
+    description:
+      'The picks row id — NULL on a zero-unit short pick (story 4.4), which writes no picks row at all: nothing moved, so there is no ledger event and no settlement record. Every other pick, short or whole, has one.',
+  })
+  id!: string | null;
 
   @ApiProperty({ format: 'uuid' })
   tenantId!: string;
@@ -681,8 +743,45 @@ export class PickDto {
   @ApiProperty({ description: 'True when this pick settled the hold (held → committed) in the same transaction as the draw' })
   reservationCommitted!: boolean;
 
-  @ApiProperty({ enum: [...PICKLIST_LINE_STATUSES], description: 'The pick line’s status after the pick' })
+  @ApiProperty({
+    enum: [...PICKLIST_LINE_STATUSES],
+    description:
+      'The pick line’s status after the pick — picked on a whole-quantity draw, short (story 4.4, terminal) when the operator drew fewer units than the stop planned',
+  })
   lineStatus!: string;
+
+  @ApiProperty({ description: 'Units the stop planned but never moved — 0 on a whole-quantity pick' })
+  shortfallQty!: number;
+
+  // The same null-inside-the-enum reason as `PicklistLineDto.reasonCode`.
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    enum: [...SHORT_PICK_REASON_CODES, null],
+    description: 'Why the stop came up short (story 4.4); null on a whole-quantity pick',
+  })
+  reasonCode!: string | null;
+
+  @ApiProperty({
+    description:
+      'True when this command RELEASED the order line’s hold (story 4.4): a short pick releases the whole hold and re-grants the remainder, because reservations are whole-quantity rows with no partial commit',
+  })
+  reservationReleased!: boolean;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    format: 'uuid',
+    description:
+      'The fresh hold covering everything the order line still owes after the release — null when there was no remainder, or when it could not be re-held (the partial-order path). The re-planned slices and every still-open sibling slice carry it.',
+  })
+  replanReservationId!: string | null;
+
+  @ApiProperty({
+    type: [ReplannedSliceDto],
+    description: 'The new slices the remainder was re-planned onto — empty on the partial-order path',
+  })
+  replanned!: readonly ReplannedSliceDto[];
 
   @ApiProperty({ format: 'uuid' })
   pickedBy!: string;

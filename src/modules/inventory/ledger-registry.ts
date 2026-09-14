@@ -91,6 +91,19 @@ export type LedgerReferenceDoc =
       readonly reservationId?: string;
       /** The plan's bin — present only when the draw bin differs from it. */
       readonly suggestedBinId?: string;
+      /**
+       * Story 4.4 — the short-pick facts, present ONLY on a draw the
+       * operator reported short (absent on every whole-quantity pick, so
+       * older events' canonical bytes are unchanged). The ledger is the one
+       * record that outlives every projection, so a draw that did not match
+       * its plan says so where it can never be re-derived away: how many
+       * units the stop planned but never moved, and why. The putaway arm's
+       * `reasonCode` is the precedent — a fixed enum, declared here so the
+       * grammar names every key the event carries.
+       */
+      readonly shortPick?: true;
+      readonly shortfallQty?: number;
+      readonly reasonCode?: string;
     };
 // Later stories extend this union with NEW kinds (transfer, pack, …) — never
 // by reshaping an existing arm.

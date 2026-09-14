@@ -1040,11 +1040,19 @@ export class ReservationService implements OnModuleInit {
     return sums[0]?.reserved ?? 0;
   }
 
-  /** Per-sku journal sums over the live states (`held` + `committed`). */
+  /**
+   * Per-sku journal sums over the live states (`held` + `committed`).
+   *
+   * `tx` is optional: passed, the sum rides the CALLER's transaction and
+   * therefore sees its uncommitted writes — which is the whole point for
+   * `grantInTx`, whose release must already be visible. Omitted, it opens its
+   * own read transaction, as the rebuild and repair paths need.
+   */
   private async journalReservedSums(
     tenantId: string,
     warehouseId: string,
     skuId?: string,
+    tx?: TenantTx,
   ): Promise<{ skuId: string; reserved: number }[]> {
     const conditions: SQL[] = [
       eq(reservations.tenantId, tenantId),
@@ -1054,13 +1062,13 @@ export class ReservationService implements OnModuleInit {
     if (skuId !== undefined) {
       conditions.push(eq(reservations.skuId, skuId));
     }
-    return withTenantTransaction(this.db, tenantId, (tx) =>
-      tx
+    const read = (scoped: TenantTx) =>
+      scoped
         .select({ skuId: reservations.skuId, reserved: sql<number>`coalesce(sum(${reservations.quantity}), 0)::int` })
         .from(reservations)
         .where(and(...conditions))
-        .groupBy(reservations.skuId),
-    );
+        .groupBy(reservations.skuId);
+    return tx === undefined ? withTenantTransaction(this.db, tenantId, read) : read(tx);
   }
 
   /** A row lost by the conditional UPDATE: 404 when absent, else 409 conflict. */
@@ -1214,6 +1222,218 @@ export class ReservationService implements OnModuleInit {
       .where(and(eq(reservations.tenantId, tenantId), eq(reservations.id, reservationId)))
       .limit(1);
     return rows[0] ?? null;
+  }
+
+  /**
+   * `held → released` inside the CALLER's transaction (story 4.4) — the
+   * journal half only. `release` above opens its own transaction and mirrors
+   * the counter itself; a short pick cannot use it, because the release, the
+   * ledger draw, the re-grant, the line flip and the new slice must either
+   * all land or none of them do.
+   *
+   * The Valkey mirror is deliberately NOT touched here. Decrementing the
+   * reserved counter while the transaction that justifies it can still roll
+   * back would leave the counter LOW against a journal that still holds the
+   * units — ATP too high, which is the overselling direction. The caller
+   * therefore applies ONE net mirror mutation after its commit
+   * (`restoreReservedUnits`), and a mirror that never lands leaves the
+   * counter high (ATP understated — the fail-safe direction) until the next
+   * rebuild, exactly like every other counter path in this service.
+   *
+   * A row lost by the conditional UPDATE throws inside the caller's
+   * transaction, which rolls the whole command back: 404 when the
+   * reservation is absent, 409 when it is already terminal (AD-12).
+   */
+  async releaseInTx(
+    tx: TenantTx,
+    tenantId: string,
+    reservationId: string,
+  ): Promise<ReservationSnapshot> {
+    if (!UUID_RE.test(reservationId)) {
+      return this.terminalNotFound(reservationId);
+    }
+    const rows = await tx
+      .update(reservations)
+      .set({ state: 'released', updatedAt: nowIso() })
+      .where(
+        and(
+          eq(reservations.id, reservationId),
+          eq(reservations.tenantId, tenantId),
+          eq(reservations.state, 'held'),
+        ),
+      )
+      .returning();
+    const row = rows[0];
+    if (row === undefined) {
+      // The state read rides the CALLER's transaction — the standalone
+      // `terminalConflict` opens its own, which would deadlock behind this
+      // one's row locks and could not see its uncommitted writes anyway.
+      const existing = await tx
+        .select({ state: reservations.state })
+        .from(reservations)
+        .where(and(eq(reservations.id, reservationId), eq(reservations.tenantId, tenantId)))
+        .limit(1);
+      const current = existing[0];
+      if (current === undefined) {
+        return this.terminalNotFound(reservationId);
+      }
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Reservation is not held',
+        `The reservation is already terminal (state "${current.state}") — exactly one terminal transition wins (AD-12).`,
+      );
+    }
+    return toSnapshot(row);
+  }
+
+  /**
+   * The RE-GRANT half of a release-then-re-grant pair (story 4.4), inside the
+   * CALLER's transaction: a fresh hold for part of a hold that the SAME
+   * transaction has already released for the SAME owner scope.
+   *
+   * ── why this does not use the Valkey grant script ────────────────────────
+   *
+   * `grant` runs `runGrantScript` because two independent callers may both be
+   * trying to create ATP out of the same last units, and only an atomic
+   * decrement of one authoritative counter can arbitrate that. This path
+   * creates NO ATP: `releasedFrom` is a hold this transaction just released
+   * for this owner scope, and `quantity` is never more than it, so the
+   * scope's journal-reserved total never RISES across the commit (M → R,
+   * R ≤ M — equality is the zero-unit report, which draws nothing and re-holds
+   * what it released). A total that cannot rise cannot oversell and cannot
+   * starve a concurrent grant: it can only hand one MORE room than it had.
+   * The mirror follows after the commit as a single net restore
+   * (`restoreReservedUnits`), which is why no Valkey call belongs inside the
+   * caller's transaction at all: one that outlived a rollback would read as
+   * ATP the journal still holds.
+   *
+   * The ceiling re-read below is therefore not arbitration — it is the one
+   * question a decrease can still get wrong: has the scope's stock vanished
+   * underneath, so that even the reduced hold is no longer coverable? It is
+   * answered from Postgres (the committed projection and the journal's own
+   * live-state sum) inside the caller's transaction, which sees this
+   * transaction's own draw, and under the per-warehouse advisory xact lock
+   * the pick command already holds — the same key `appendMovement` takes, so
+   * adjustments, receipts, putaway and the reconciliation rebuild cannot move
+   * `stock_on_hand` between the read and the insert.
+   *
+   * ── what would break without those preconditions ─────────────────────────
+   *
+   * Used to mint a NEW hold (no `releasedFrom`), or without the warehouse
+   * lock, this would be a second grant path with no arbitration at all: two
+   * such callers — or one racing the public `grant`, which takes no warehouse
+   * lock and decides in Valkey — could both pass this Postgres ceiling read
+   * and both insert, overselling by the smaller quantity, and the counter
+   * would then disagree with the journal until the next rebuild. Both
+   * preconditions are therefore structural rather than documentary:
+   * `releasedFrom` is a required argument and is validated below, and the
+   * caller's warehouse lock is asserted in the pick command's own invariant
+   * order.
+   *
+   * Returns `null` — never throws — when the remainder cannot be held. That
+   * is not an error: it is FR-15's partial-order path (the caller records the
+   * line short and plans nothing), and a 5xx there would turn an
+   * under-fulfilled order into a lost pick. A VIOLATED PRECONDITION is a
+   * different thing and does throw: it is a programming error, not a stock
+   * condition, and swallowing it as "no ATP" would hide the oversell.
+   */
+  async grantInTx(
+    tx: TenantTx,
+    command: GrantReservationCommand,
+    releasedFrom: ReservationSnapshot,
+  ): Promise<ReservationSnapshot | null> {
+    const { tenantId, warehouseId, skuId, ownerType, ownerId } = command;
+    if (!Number.isInteger(command.quantity) || command.quantity <= 0) {
+      return null;
+    }
+    const sameScope =
+      releasedFrom.tenantId === tenantId &&
+      releasedFrom.warehouseId === warehouseId &&
+      releasedFrom.skuId === skuId &&
+      releasedFrom.ownerType === ownerType &&
+      releasedFrom.ownerId === ownerId;
+    if (!sameScope || releasedFrom.state !== 'released' || command.quantity > releasedFrom.quantity) {
+      throw new Error(
+        'grantInTx re-grants NO MORE than a hold released for the same owner scope in the same ' +
+          'transaction — it has no grant-vs-grant arbitration and must never create ATP ' +
+          `(asked ${command.quantity} against a ${releasedFrom.state} hold of ${releasedFrom.quantity}).`,
+      );
+    }
+    const ttlSeconds = command.ttlSeconds ?? DEFAULT_RESERVATION_TTL_SECONDS;
+    // An open hold for this owner scope means the caller did not release
+    // first — `reservations_open_owner_scope_unique` would refuse the insert
+    // anyway, and answering null keeps that a partial-order path rather than
+    // a unique-violation 500.
+    const existing = await this.findOpenHold(tx, command);
+    if (existing !== undefined) {
+      return null;
+    }
+    const ceiling = await this.committedCeiling(tx, tenantId, warehouseId, skuId);
+    const sums = await this.journalReservedSums(tenantId, warehouseId, skuId, tx);
+    const reserved = sums[0]?.reserved ?? 0;
+    if (reserved + command.quantity > ceiling) {
+      return null;
+    }
+    const rows = await tx
+      .insert(reservations)
+      .values({
+        id: uuidv7(),
+        tenantId,
+        warehouseId,
+        skuId,
+        ownerType,
+        ownerId,
+        quantity: command.quantity,
+        state: 'held',
+        expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+      })
+      .returning();
+    return toSnapshot(rows[0]!);
+  }
+
+  /**
+   * The post-commit counter mirror for a release-then-re-grant pair (story
+   * 4.4): ONE net restore of `units` to the scope's reserved counter.
+   *
+   * One mutation, not two. Restoring the released hold and then re-taking the
+   * remainder would open a window — however short — in which the scope reads
+   * as if the WHOLE hold were free, and a concurrent `grant` landing inside
+   * it would promise units this order still holds. The net is always a
+   * restore (the pair never reserves more than it released), so a single
+   * `releaseReservation` script call is both atomic and monotone in the safe
+   * direction.
+   *
+   * A mirror that cannot be written leaves the counter too HIGH — ATP
+   * understated, never oversold — and is repaired toward Postgres by the next
+   * rebuild. It is therefore logged, never thrown: the journal has already
+   * committed, and failing the caller here would make a settled short pick
+   * look unrecorded.
+   */
+  async restoreReservedUnits(
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    units: number,
+  ): Promise<void> {
+    if (units <= 0) {
+      return;
+    }
+    const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
+    try {
+      const reply = await this.valkey.releaseReservation(counterKey, units, COUNTER_TTL_SECONDS);
+      if (reply[1] === 'missing-counter') {
+        this.logger.warn(
+          `Reservation re-plan found a missing counter (rebuild will repair): ${counterKey}`,
+        );
+      }
+    } catch (err) {
+      this.logger.error(
+        `Reservation re-plan counter restore failed — counter over-counts until the next ` +
+          `rebuild (scope ${counterKey}, ${units} unit(s)): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   async reservationsByIdsInTx(

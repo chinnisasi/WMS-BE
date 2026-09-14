@@ -503,10 +503,16 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
   it('the wave state machines are the outbound module’s own additive arm sets', () => {
     expect([...WAVE_STATUSES]).toEqual(['planned', 'released', 'cancelled']);
     expect([...PICKLIST_STATUSES]).toEqual(['planned', 'ready', 'cancelled']);
-    // Story 4.3 appends `picked` — additive, and deliberately OUTSIDE
-    // `cancelled` so a picked line keeps its claim in the one-open-wave
-    // partial unique index.
-    expect([...PICKLIST_LINE_STATUSES]).toEqual(['planned', 'unfulfillable', 'picked', 'cancelled']);
+    // Story 4.3 appends `picked` and 4.4 appends `short` — additive, and
+    // both deliberately OUTSIDE `cancelled` so a drawn line keeps its claim
+    // in the one-open-wave partial unique index.
+    expect([...PICKLIST_LINE_STATUSES]).toEqual([
+      'planned',
+      'unfulfillable',
+      'picked',
+      'short',
+      'cancelled',
+    ]);
     expect([...WAVE_GROUPINGS]).toEqual(['single', 'batch']);
     // The cutoff timezone is a named module constant, not a per-warehouse
     // column: `warehouses` carries no timezone and the product is India-only.
@@ -1210,22 +1216,42 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
       qty: number,
       shortfall: number,
       status: string,
+      reasonCode: string | null = null,
     ) => sql`
       insert into picklist_lines
-        (id, tenant_id, picklist_id, wave_id, order_id, order_line_id, sku_id, bin_id, qty, shortfall_qty, slice_seq, walk_seq, status)
+        (id, tenant_id, picklist_id, wave_id, order_id, order_line_id, sku_id, bin_id, qty, shortfall_qty, reason_code, slice_seq, walk_seq, status)
       values
-        (${uuidv7()}, ${tenantId}, ${picklistId}, ${waveId}, ${uuidv7()}, ${uuidv7()}, ${uuidv7()}, ${binId}, ${qty}, ${shortfall}, 0, 0, ${status})
+        (${uuidv7()}, ${tenantId}, ${picklistId}, ${waveId}, ${uuidv7()}, ${uuidv7()}, ${uuidv7()}, ${binId}, ${qty}, ${shortfall}, ${reasonCode}, 0, 0, ${status})
     `;
     // The line status arm.
     await expect(lineValues(binA, 1, 0, 'bogus')).rejects.toMatchObject({ code: '23514' });
     // The slice shape: a bin-less slice may not name units…
     await expect(lineValues(null, 3, 0, 'unfulfillable')).rejects.toMatchObject({ code: '23514' });
-    // …and a binned slice may not carry a shortfall, nor zero units.
-    await expect(lineValues(binA, 3, 2, 'planned')).rejects.toMatchObject({ code: '23514' });
+    // …and a binned slice may not carry zero units.
     await expect(lineValues(binA, 0, 0, 'planned')).rejects.toMatchObject({ code: '23514' });
-    // Both legal shapes insert cleanly.
+    // Story 4.4 opened the THIRD arm, and it is STATUS-AWARE: a `planned`
+    // slice must never record a shortfall it has not experienced — the floor
+    // has not opened that bin yet.
+    await expect(lineValues(binA, 3, 2, 'planned')).rejects.toMatchObject({ code: '23514' });
+    // A shortfall ABOVE the plan describes nothing real either.
+    await expect(lineValues(binA, 3, 4, 'short', 'bin-empty')).rejects.toMatchObject({ code: '23514' });
+    // A short line without BOTH halves of what it reports is useless to SM-3:
+    // no shortfall, or no reason, is refused.
+    await expect(lineValues(binA, 3, 0, 'short', 'bin-empty')).rejects.toMatchObject({ code: '23514' });
+    await expect(lineValues(binA, 3, 2, 'short')).rejects.toMatchObject({ code: '23514' });
+    // …and the reason belongs only to a short (or withdrawn) line.
+    await expect(lineValues(binA, 3, 0, 'planned', 'bin-empty')).rejects.toMatchObject({ code: '23514' });
+    // The enum itself is the database's backstop under the command's 400.
+    await expect(lineValues(binA, 3, 2, 'short', 'made-up')).rejects.toMatchObject({ code: '23514' });
+    // All three legal shapes insert cleanly.
     await lineValues(binA, 3, 0, 'planned');
     await lineValues(null, 0, 4, 'unfulfillable');
+    await lineValues(binA, 3, 2, 'short', 'fewer-units-than-planned');
+    // …including the zero-unit report of an empty bin (shortfall == qty)…
+    await lineValues(binA, 3, 3, 'short', 'bin-empty');
+    // …and a short line that a wave cancel has since withdrawn, which keeps
+    // the shape and the reason it had rather than being rewritten.
+    await lineValues(binA, 3, 3, 'cancelled', 'bin-empty');
 
     // The policy bounds, for completeness.
     await expect(

@@ -22,6 +22,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
+import { picklistLineDrewUnits } from './wave.command';
 import type { ReservationSnapshot } from '../inventory/inventory.facade';
 
 // ── state machine + policy constants (the outbound module exclusively owns
@@ -509,6 +510,11 @@ export class OrderCommandService {
     // releasing it here would free stock that has physically left the bin
     // through a `pick.picked` ledger draw. `cancelWave` refuses picked lines
     // for exactly this reason; the order's own cancel must refuse them too.
+    //
+    // Story 4.4: a `short` line that actually DREW units is the same problem
+    // — the drawn units left the bin through the same ledger event. A
+    // zero-unit short pick is not: nothing moved, so the order is still
+    // cancellable, and `shortfall_qty < qty` is exactly the difference.
     const picked = await withTenantTransaction(this.db, command.tenantId, (tx) =>
       tx
         .select({ id: picklistLines.id })
@@ -517,7 +523,7 @@ export class OrderCommandService {
           and(
             eq(picklistLines.tenantId, command.tenantId),
             eq(picklistLines.orderId, order.id),
-            eq(picklistLines.status, 'picked'),
+            picklistLineDrewUnits(),
           ),
         ),
     );
@@ -525,8 +531,8 @@ export class OrderCommandService {
       throw new ProblemException(
         'conflict',
         409,
-        'Order has picked lines',
-        `Order "${order.id}" has ${picked.length} picked pick line(s) (${picked
+        'Order has drawn pick lines',
+        `Order "${order.id}" has ${picked.length} drawn pick line(s) (${picked
           .map((line) => line.id)
           .join(', ')}) — those units have already left their bins, so the order is not cancellable here.`,
       );

@@ -7,6 +7,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { PICKLIST_LINE_STATUSES } from '../src/modules/outbound/wave.command';
+import { SHORT_PICK_REASON_CODES } from '../src/modules/outbound/pick.command';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { getLedgerEventType } from '../src/modules/inventory/ledger-registry';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -41,6 +42,7 @@ interface PickLine {
   reservationId: string | null;
   qty: number;
   shortfallQty: number;
+  reasonCode: string | null;
   sliceSeq: number;
   walkSeq: number;
   status: string;
@@ -72,6 +74,8 @@ interface PickBody {
   serials?: string[] | null;
   /** Story 4.3b: the bin state epoch the device captured at task start. */
   binStateEpoch?: number | null;
+  /** Story 4.4: why the stop came up short — required below the plan. */
+  reasonCode?: string | null;
 }
 
 describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)', () => {
@@ -119,6 +123,21 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     'PCK-EPOCH-NOISE', // 4.3b: the OTHER SKU whose movement bumps a bin epoch
     'PCK-EPOCH-TTL', // 4.3b: expiry is a premise only of the settling slice
     'PCK-EPOCH-BACKSTOP', // 4.3b: the commitInTx guard beneath the case-4 gate
+    'PCK-SHORT', // 4.4: short pick with stock elsewhere — the re-planned slice
+    'PCK-SHORT-ATP', // 4.4: the ATP invariant, measured either side of a short pick
+    'PCK-SHORT-NONE', // 4.4: short pick with the SKU nowhere else — no new slice
+    'PCK-SHORT-DEAD', // 4.4: the remainder cannot be re-held — no slice, no hold
+    'PCK-SHORT-ZERO', // 4.4: the zero-unit report of an empty bin
+    'PCK-SHORT-REPLAY', // 4.4: the short pick's idempotent replay
+    'PCK-SHORT-SPLIT', // 4.4: a multi-slice order line's siblings follow the hold
+    'PCK-SHORT-OWED', // 4.4: the remainder nets out what siblings already drew
+    'PCK-SHORT-CLAIM', // 4.4: a re-plan never plans units another open line claims
+    'PCK-SHORT-CXL', // 4.4: order cancel against a short line that DREW units
+    'PCK-SHORT-CXL0', // 4.4: …and against a ZERO-unit report, which drew nothing
+    'PCK-SHORT-WCXL', // 4.4: wave cancel against a short line that DREW units
+    'PCK-SHORT-WCXL0', // 4.4: …and against a ZERO-unit report (its own SKU:
+    //                         a leftover pool would re-plan the next scenario)
+    'PCK-SHORT-LEGACY', // 4.4: a pre-4.4 stored snapshot replays with the defaults
   ] as const;
   const BATCH_SKU_CODE = 'PCK-FEFO';
   /** 4.3b: the batch-arm shortfall, routed by the epoch to 409 or 422. */
@@ -126,6 +145,8 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
   /** Its own batch-tracked SKU: the two-arm draw must be the only claim on its bins. */
   const BATCH_SPAN_SKU_CODE = 'PCK-FEFO2';
   const SERIAL_SKU_CODE = 'PCK-SERIAL';
+  /** 4.4: the serial arm's short and ZERO-unit reports. */
+  const SERIAL_SHORT_SKU_CODE = 'PCK-SERIAL-SHORT';
 
   let suiteDb: SuiteDatabase;
 
@@ -187,6 +208,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       `${BATCH_SPAN_SKU_CODE},Pick SKU ${BATCH_SPAN_SKU_CODE},pcs,,1800,,true,false,,,`,
       `${BATCH_SHORT_SKU_CODE},Pick SKU ${BATCH_SHORT_SKU_CODE},pcs,,1800,,true,false,,,`,
       `${SERIAL_SKU_CODE},Pick SKU ${SERIAL_SKU_CODE},pcs,,1800,,false,true,,,`,
+      `${SERIAL_SHORT_SKU_CODE},Pick SKU ${SERIAL_SHORT_SKU_CODE},pcs,,1800,,false,true,,,`,
     ].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
@@ -537,10 +559,10 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
   }
 
   async function ledgerFor(picklistLineId: string): Promise<
-    { type: string; quantity_delta: number; from_bin_id: string | null; to_bin_id: string | null; batch_ref: string | null; serial_ref: string | null }[]
+    { type: string; quantity_delta: number; from_bin_id: string | null; to_bin_id: string | null; batch_ref: string | null; serial_ref: string | null; reference_doc: Record<string, unknown> }[]
   > {
     return (await sql`
-      select type, quantity_delta, from_bin_id, to_bin_id, batch_ref, serial_ref
+      select type, quantity_delta, from_bin_id, to_bin_id, batch_ref, serial_ref, reference_doc
       from ledger_events
       where tenant_id = ${tenantId}
         and reference_doc->>'picklistLineId' = ${picklistLineId}
@@ -552,6 +574,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       to_bin_id: string | null;
       batch_ref: string | null;
       serial_ref: string | null;
+      reference_doc: Record<string, unknown>;
     }[];
   }
 
@@ -573,13 +596,108 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     return (rows[0] as unknown as { quantity: number } | undefined)?.quantity ?? 0;
   }
 
+  /** The line as the DATABASE holds it — the short-pick record, not a view. */
+  async function lineRow(lineId: string): Promise<{
+    status: string;
+    qty: number;
+    shortfall_qty: number;
+    reason_code: string | null;
+    reservation_id: string | null;
+    bin_id: string | null;
+    slice_seq: number;
+    walk_seq: number;
+  }> {
+    const rows = await sql`
+      select status, qty, shortfall_qty, reason_code, reservation_id, bin_id, slice_seq, walk_seq
+      from picklist_lines where id = ${lineId}
+    `;
+    const row = rows[0];
+    if (row === undefined) throw new Error(`no picklist line ${lineId}`);
+    return row as unknown as {
+      status: string;
+      qty: number;
+      shortfall_qty: number;
+      reason_code: string | null;
+      reservation_id: string | null;
+      bin_id: string | null;
+      slice_seq: number;
+      walk_seq: number;
+    };
+  }
+
+  /** Every slice of one order line, in creation order (re-plans land last). */
+  async function slicesOf(orderLineId: string): Promise<
+    { id: string; status: string; qty: number; shortfall_qty: number; slice_seq: number; walk_seq: number; bin_id: string | null; reservation_id: string | null }[]
+  > {
+    return (await sql`
+      select id, status, qty, shortfall_qty, slice_seq, walk_seq, bin_id, reservation_id
+      from picklist_lines
+      where tenant_id = ${tenantId} and order_line_id = ${orderLineId}
+      order by slice_seq
+    `) as unknown as {
+      id: string;
+      status: string;
+      qty: number;
+      shortfall_qty: number;
+      slice_seq: number;
+      walk_seq: number;
+      bin_id: string | null;
+      reservation_id: string | null;
+    }[];
+  }
+
+  /**
+   * The THREE numbers the ATP invariant is made of, each read from the place
+   * that actually persists it: on-hand from the Postgres projection, the
+   * reserved figure from the Valkey counter AND from the reservation journal
+   * (they must agree — a short pick that drifts them apart is the exact bug
+   * this story can introduce), and ATP from the real `ReservationService`
+   * read the rest of the system promises against.
+   */
+  async function atpFacts(skuId: string): Promise<{
+    onHand: number;
+    counter: number;
+    journal: number;
+    atp: number;
+  }> {
+    const snapshot = await app.get(InventoryFacade).atp(tenantId, warehouseId, skuId);
+    const counterRaw = await valkey.get(`wms:{${tenantId}}:wh:${warehouseId}:res:${skuId}`);
+    const journalRows = await sql`
+      select coalesce(sum(quantity), 0)::int as reserved from reservations
+      where tenant_id = ${tenantId} and warehouse_id = ${warehouseId} and sku_id = ${skuId}
+        and state in ('held', 'committed')
+    `;
+    return {
+      onHand: snapshot.onHand,
+      counter: counterRaw === null ? Number.NaN : Number(counterRaw),
+      journal: Number((journalRows[0] as unknown as { reserved: number }).reserved),
+      atp: snapshot.atp,
+    };
+  }
+
   // ── the module's registries ────────────────────────────────────────────────
 
   it('the pick arms are additive: the line status machine gains `picked`, the grammar gains `pick.picked`, the role matrix gains `picks.execute`', () => {
-    // `picked` sits OUTSIDE `cancelled` — the partial unique index keys on
-    // `status <> 'cancelled'`, so a picked line KEEPS its claim on the order.
-    expect([...PICKLIST_LINE_STATUSES]).toEqual(['planned', 'unfulfillable', 'picked', 'cancelled']);
+    // `picked` and (story 4.4) `short` sit OUTSIDE `cancelled` — the partial
+    // unique index keys on `status <> 'cancelled'`, so a drawn line KEEPS its
+    // claim on the order.
+    expect([...PICKLIST_LINE_STATUSES]).toEqual([
+      'planned',
+      'unfulfillable',
+      'picked',
+      'short',
+      'cancelled',
+    ]);
     expect((PICKLIST_LINE_STATUSES as readonly string[]).includes('picked')).toBe(true);
+    expect((PICKLIST_LINE_STATUSES as readonly string[]).includes('short')).toBe(true);
+    // The reason enum is fixed and command-validated (the putaway pattern).
+    expect([...SHORT_PICK_REASON_CODES]).toEqual([
+      'bin-empty',
+      'fewer-units-than-planned',
+      'damaged-units',
+      'stock-not-found',
+      'other',
+    ]);
 
     const definition = getLedgerEventType('pick.picked');
     expect(definition).toBeDefined();
@@ -629,6 +747,11 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(events[0]!.quantity_delta).toBe(-12);
     expect(events[0]!.from_bin_id).toBe(binA);
     expect(events[0]!.to_bin_id).toBeNull();
+    // A WHOLE draw carries none of story 4.4's short-pick keys — the arm is
+    // additive, so a pre-4.4 event's canonical bytes are unchanged.
+    expect(events[0]!.reference_doc.shortPick).toBeUndefined();
+    expect(events[0]!.reference_doc.shortfallQty).toBeUndefined();
+    expect(events[0]!.reference_doc.reasonCode).toBeUndefined();
 
     // The outbox event and the audit row ride the same commit.
     const outbox = await sql`
@@ -1159,7 +1282,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
 
   // ── quantity + lifecycle gates ────────────────────────────────────────────
 
-  it('a line is picked WHOLE — a partial quantity is refused (short-picking is 4.4)', async () => {
+  it('a quantity ABOVE the plan is refused, and a partial one without a reason is too (story 4.4)', async () => {
     // Its own SKU: a leftover pool in the walk's first bin would let the
     // planner cover the next scenario's order from there instead of the two
     // bins that scenario seeds.
@@ -1167,10 +1290,606 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     await seedStock(skuId, binA, 30);
     const { picklist } = await releasedWave([{ skuId, quantity: 9 }], 'whole');
     const line = picklist.lines[0]!;
+
+    // Above the plan: units nobody reserved are not this line's to take.
+    const over = await pick(bodyFor(line, { qty: 10 })).expect(400);
+    expect(over.body.code).toBe('validation-failed');
+    expect(over.body.detail).toMatch(/draws more than the stop holds/i);
+
+    // Below the plan with no reason: a short pick names WHY or it is nothing.
     const short = await pick(bodyFor(line, { qty: 4 })).expect(400);
     expect(short.body.code).toBe('validation-failed');
-    expect(short.body.detail).toMatch(/picked whole/i);
+    expect(short.body.detail).toMatch(/reasonCode/);
+    expect(short.body.detail).toMatch(/fewer-units-than-planned/);
+
+    // A reason outside the fixed set names the whole set too.
+    const bogus = await pick(bodyFor(line, { qty: 4, reasonCode: 'ran-out-of-time' })).expect(400);
+    expect(bogus.body.code).toBe('validation-failed');
+    expect(bogus.body.detail).toMatch(/bin-empty/);
+
+    // A zero-unit pick is a short pick and needs a reason as well.
+    const zero = await pick(bodyFor(line, { qty: 0 })).expect(400);
+    expect(zero.body.code).toBe('validation-failed');
+    expect(zero.body.detail).toMatch(/reasonCode/);
+
+    // Nothing wrote: the line is still the floor's work.
     expect(await lineStatus(line.id)).toBe('planned');
+    const picks = await sql`select id from picks where tenant_id = ${tenantId} and picklist_line_id = ${line.id}`;
+    expect(picks).toHaveLength(0);
+
+    // Equal to the plan WITH a reason is an ordinary full pick — the
+    // operator reported the whole quantity, so nothing came up short.
+    const whole = await pick(bodyFor(line, { qty: 9, reasonCode: 'bin-empty' })).expect(201);
+    expect(whole.body.pick.lineStatus).toBe('picked');
+    expect(whole.body.pick.shortfallQty).toBe(0);
+    expect(whole.body.pick.reasonCode).toBeNull();
+    expect(whole.body.pick.replanned).toEqual([]);
+  });
+
+
+  // ── story 4.4: short-pick re-planning ─────────────────────────────────────
+
+  it('a short pick draws what was there, records the shortfall with its reason, releases the hold and re-plans the remainder onto an alternate bin', async () => {
+    const skuId = sku('PCK-SHORT');
+    const planBin = await createBin('A-40-01'); // first in code order — the plan's stop
+    const altBin = await createBin('A-40-02'); // where the remainder goes
+    await seedStock(skuId, planBin, 5);
+    await seedStock(skuId, altBin, 6);
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'short');
+    const line = picklist.lines[0]!;
+    expect(line.binId).toBe(planBin);
+    expect(line.qty).toBe(5);
+    const originalHold = line.reservationId!;
+    const planBinBefore = await onHand(skuId, planBin);
+
+    const res = await pick(
+      bodyFor(line, { qty: 3, reasonCode: 'fewer-units-than-planned' }),
+    ).expect(201);
+    const settled = res.body.pick as Record<string, unknown>;
+    expect(settled.qty).toBe(3);
+    expect(settled.lineStatus).toBe('short');
+    expect(settled.shortfallQty).toBe(2);
+    expect(settled.reasonCode).toBe('fewer-units-than-planned');
+    expect(settled.reservationReleased).toBe(true);
+    expect(settled.reservationCommitted).toBe(false);
+    expect(settled.replanReservationId).not.toBeNull();
+
+    // The draw: three units, out of the bin the operator scanned.
+    expect(await onHand(skuId, planBin)).toBe(planBinBefore - 3);
+    const events = await ledgerFor(line.id);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.quantity_delta).toBe(-3);
+    expect(events[0]!.from_bin_id).toBe(planBin);
+    // The ledger is the one record that outlives every projection, so the
+    // draw itself says it did not match its plan (the putaway precedent).
+    expect(events[0]!.reference_doc).toMatchObject({
+      kind: 'pick',
+      shortPick: true,
+      shortfallQty: 2,
+      reasonCode: 'fewer-units-than-planned',
+    });
+
+    // The line: terminal `short`, planned quantity untouched, shortfall and
+    // reason on the row — the SM-3 signal, queryable without a surface.
+    const row = await lineRow(line.id);
+    expect(row.status).toBe('short');
+    expect(row.qty).toBe(5);
+    expect(row.shortfall_qty).toBe(2);
+    expect(row.reason_code).toBe('fewer-units-than-planned');
+
+    // The hold: the M-unit row is released and a fresh one holds M − N.
+    expect(await reservationState(originalHold)).toBe('released');
+    const replanHold = settled.replanReservationId as string;
+    expect(replanHold).not.toBe(originalHold);
+    expect(await reservationState(replanHold)).toBe('held');
+    const holdRows = await sql`select quantity, owner_type, owner_id from reservations where id = ${replanHold}`;
+    expect(Number((holdRows[0] as unknown as { quantity: number }).quantity)).toBe(2);
+    expect((holdRows[0] as unknown as { owner_id: string }).owner_id).toBe(line.orderLineId);
+
+    // The re-plan: a NEW slice on the SAME picklist, at the alternate bin,
+    // with the next unused slice_seq and a walk position after every
+    // existing stop.
+    const replanned = settled.replanned as Record<string, unknown>[];
+    expect(replanned).toHaveLength(1);
+    expect(replanned[0]!.binId).toBe(altBin);
+    expect(replanned[0]!.qty).toBe(2);
+
+    const slices = await slicesOf(line.orderLineId);
+    expect(slices).toHaveLength(2);
+    expect(slices[1]!.id).toBe(replanned[0]!.picklistLineId);
+    expect(slices[1]!.status).toBe('planned');
+    expect(slices[1]!.slice_seq).toBe(slices[0]!.slice_seq + 1);
+    expect(slices[1]!.walk_seq).toBeGreaterThan(slices[0]!.walk_seq);
+    expect(slices[1]!.reservation_id).toBe(replanHold);
+    // Never the bin that just came up short.
+    expect(slices[1]!.bin_id).not.toBe(planBin);
+
+    // It is ordinary floor work: it arrives as a new task card, and picking
+    // it settles the re-granted hold like any other last open slice.
+    const tasks = await snapshotTasks();
+    const replanTask = tasks.find((task) => task.picklistLineId === slices[1]!.id);
+    expect(replanTask).toBeDefined();
+    expect(replanTask!.qty).toBe(2);
+    expect(tasks.some((task) => task.picklistLineId === line.id)).toBe(false);
+
+    const wave = await getWave(picklist.waveId);
+    const replanLine = wave.picklists
+      .flatMap((list) => list.lines)
+      .find((candidate) => candidate.id === slices[1]!.id)!;
+    const finished = await pick(bodyFor(replanLine)).expect(201);
+    expect(finished.body.pick.reservationCommitted).toBe(true);
+    expect(await reservationState(replanHold)).toBe('committed');
+  });
+
+  it('ATP after a short pick is exactly what it was before it — the released hold, the draw and the re-grant net to nothing', async () => {
+    const skuId = sku('PCK-SHORT-ATP');
+    const planBin = await createBin('A-41-01');
+    const altBin = await createBin('A-41-02');
+    await seedStock(skuId, planBin, 4);
+    await seedStock(skuId, altBin, 9);
+    const { picklist } = await releasedWave([{ skuId, quantity: 4 }], 'short-atp');
+    const line = picklist.lines[0]!;
+    expect(line.binId).toBe(planBin);
+
+    const before = await atpFacts(skuId);
+    // The mirror and the journal agree before the command — otherwise the
+    // "after" comparison would be measuring a drift that was already there.
+    expect(before.counter).toBe(before.journal);
+    expect(before.journal).toBe(4);
+    expect(before.onHand).toBe(13);
+    expect(before.atp).toBe(9);
+
+    await pick(bodyFor(line, { qty: 1, reasonCode: 'damaged-units' })).expect(201);
+
+    const after = await atpFacts(skuId);
+    // The invariant: one unit left the building for this order, and the hold
+    // shrank by exactly that one unit. Everything else is unchanged, so what
+    // the warehouse can still promise to OTHER orders has not moved.
+    expect(after.onHand).toBe(before.onHand - 1);
+    expect(after.journal).toBe(before.journal - 1);
+    // The Valkey counter is the figure every grant and every ATP read
+    // actually decides against. A short pick touches it through TWO journal
+    // transitions (a release of 4, a re-grant of 3); mirroring only one of
+    // them leaves it wrong by exactly the shortfall, and nothing else in the
+    // system would notice.
+    expect(after.counter).toBe(after.journal);
+    expect(after.atp).toBe(before.atp);
+  });
+
+  it('a short pick with the SKU nowhere else pickable leaves the line short with no new slice — the partial-order path', async () => {
+    const skuId = sku('PCK-SHORT-NONE');
+    const onlyBin = await createBin('A-42-01');
+    await seedStock(skuId, onlyBin, 5);
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'short-none');
+    const line = picklist.lines[0]!;
+    const before = await atpFacts(skuId);
+
+    const res = await pick(bodyFor(line, { qty: 3, reasonCode: 'stock-not-found' })).expect(201);
+    expect(res.body.pick.lineStatus).toBe('short');
+    expect(res.body.pick.shortfallQty).toBe(2);
+    expect(res.body.pick.replanned).toEqual([]);
+
+    const slices = await slicesOf(line.orderLineId);
+    expect(slices).toHaveLength(1);
+    expect(slices[0]!.status).toBe('short');
+
+    const after = await atpFacts(skuId);
+    expect(after.counter).toBe(after.journal);
+    expect(after.atp).toBe(before.atp);
+  });
+
+  it('a remainder that cannot be re-held is the same partial-order path — no slice, no hold, and never a 5xx', async () => {
+    const skuId = sku('PCK-SHORT-DEAD');
+    const onlyBin = await createBin('A-43-01');
+    await seedStock(skuId, onlyBin, 5);
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'short-dead');
+    const line = picklist.lines[0]!;
+    // The bin really drained while the op sat in the queue: after the draw
+    // below there is nothing left in the warehouse to re-hold.
+    await drainStock(skuId, onlyBin, 2);
+
+    const res = await pick(bodyFor(line, { qty: 3, reasonCode: 'bin-empty' })).expect(201);
+    expect(res.body.pick.reservationReleased).toBe(true);
+    expect(res.body.pick.replanReservationId).toBeNull();
+    expect(res.body.pick.replanned).toEqual([]);
+    expect(await reservationState(line.reservationId!)).toBe('released');
+    expect(await lineStatus(line.id)).toBe('short');
+
+    const after = await atpFacts(skuId);
+    expect(after.onHand).toBe(0);
+    expect(after.journal).toBe(0);
+    expect(after.counter).toBe(after.journal);
+  });
+
+  it('a zero-unit short pick writes no ledger event and no picks row, and still carries the reason and the whole shortfall', async () => {
+    const skuId = sku('PCK-SHORT-ZERO');
+    const planBin = await createBin('A-44-01');
+    const altBin = await createBin('A-44-02');
+    await seedStock(skuId, planBin, 5);
+    await seedStock(skuId, altBin, 5);
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'short-zero');
+    const line = picklist.lines[0]!;
+    expect(line.binId).toBe(planBin);
+    // The shelf is bare by the time the operator reaches it.
+    await drainStock(skuId, planBin, 5);
+    const before = await atpFacts(skuId);
+
+    const res = await pick(bodyFor(line, { qty: 0, reasonCode: 'bin-empty' })).expect(201);
+    const settled = res.body.pick as Record<string, unknown>;
+    // Nothing moved, so there is no settlement record to point at.
+    expect(settled.id).toBeNull();
+    expect(settled.qty).toBe(0);
+    expect(settled.shortfallQty).toBe(5);
+    expect(settled.reasonCode).toBe('bin-empty');
+    expect(await ledgerFor(line.id)).toHaveLength(0);
+    const rows = await sql`select id from picks where tenant_id = ${tenantId} and picklist_line_id = ${line.id}`;
+    expect(rows).toHaveLength(0);
+
+    // The line still carries the whole story.
+    const row = await lineRow(line.id);
+    expect(row.status).toBe('short');
+    expect(row.qty).toBe(5);
+    expect(row.shortfall_qty).toBe(5);
+    expect(row.reason_code).toBe('bin-empty');
+
+    // …and the remainder re-plans, because the SKU does live somewhere else.
+    const replanned = settled.replanned as Record<string, unknown>[];
+    expect(replanned).toHaveLength(1);
+    expect(replanned[0]!.binId).toBe(altBin);
+    expect(replanned[0]!.qty).toBe(5);
+
+    const after = await atpFacts(skuId);
+    expect(after.onHand).toBe(before.onHand);
+    expect(after.counter).toBe(after.journal);
+    expect(after.atp).toBe(before.atp);
+
+    // The audit row names the act, and targets the LINE (there is no pick).
+    const audit = await sql`
+      select target_type, target_id from audit_events
+      where tenant_id = ${tenantId} and action = 'pick.short-picked' and target_id = ${line.id}
+    `;
+    expect(audit).toHaveLength(1);
+    expect((audit[0] as unknown as { target_type: string }).target_type).toBe('picklist_line');
+  });
+
+  it('a short pick replays exactly once: the same key re-serves the snapshot, a changed payload is 422, and the line is terminal at `short`', async () => {
+    const skuId = sku('PCK-SHORT-REPLAY');
+    const planBin = await createBin('A-45-01');
+    const altBin = await createBin('A-45-02');
+    await seedStock(skuId, planBin, 6);
+    await seedStock(skuId, altBin, 6);
+    const { picklist } = await releasedWave([{ skuId, quantity: 6 }], 'short-replay');
+    const line = picklist.lines[0]!;
+    const key = ulid();
+    const body = bodyFor(line, { qty: 2, reasonCode: 'damaged-units' });
+
+    const first = await pick(body, operatorToken, key).expect(201);
+    const second = await pick(body, operatorToken, key).expect(201);
+    expect(second.body.pick).toEqual(first.body.pick);
+
+    // No second draw and no second slice.
+    expect(await ledgerFor(line.id)).toHaveLength(1);
+    expect(await slicesOf(line.orderLineId)).toHaveLength(2);
+
+    // The reason is INTENT, so re-using the key for a different one is the
+    // deterministic 422 — not a silently re-served snapshot.
+    const diverged = await pick(
+      { ...body, reasonCode: 'stock-not-found' },
+      operatorToken,
+      key,
+    ).expect(422);
+    expect(diverged.body.code).toBe('idempotency-key-reuse');
+
+    // `short` is terminal: a FRESH key against the same line is unresolvable,
+    // never a second draw.
+    const again = await pick(bodyFor(line, { qty: 1, reasonCode: 'other' })).expect(409);
+    expect(again.body.code).toBe('pick-unresolvable');
+    expect(await ledgerFor(line.id)).toHaveLength(1);
+  });
+
+  it('a short pick on a multi-slice order line takes its sibling slices with it: they follow the hold to its successor', async () => {
+    const skuId = sku('PCK-SHORT-SPLIT');
+    const binOne = await createBin('A-46-01');
+    const binTwo = await createBin('A-46-02');
+    const binThree = await createBin('A-46-03');
+    await seedStock(skuId, binOne, 4);
+    await seedStock(skuId, binTwo, 4);
+    await seedStock(skuId, binThree, 5);
+    const { picklist } = await releasedWave([{ skuId, quantity: 8 }], 'short-split');
+    const planned = picklist.lines.filter((candidate) => candidate.status === 'planned');
+    expect(planned).toHaveLength(2);
+    const [first, second] = planned;
+    const originalHold = first!.reservationId!;
+    expect(second!.reservationId).toBe(originalHold);
+    const before = await atpFacts(skuId);
+
+    const res = await pick(
+      bodyFor(first!, { qty: 1, reasonCode: 'damaged-units' }),
+    ).expect(201);
+    const replanHold = res.body.pick.replanReservationId as string;
+    // The whole hold (8) released; the remainder (8 − 1 drawn) re-granted.
+    expect(await reservationState(originalHold)).toBe('released');
+    const holdRows = await sql`select quantity from reservations where id = ${replanHold}`;
+    expect(Number((holdRows[0] as unknown as { quantity: number }).quantity)).toBe(7);
+
+    // The untouched sibling must not be left pointing at a released hold —
+    // it would replay into `pick-unresolvable` for a stop that is perfectly
+    // pickable.
+    expect((await lineRow(second!.id)).reservation_id).toBe(replanHold);
+
+    const after = await atpFacts(skuId);
+    expect(after.counter).toBe(after.journal);
+    expect(after.atp).toBe(before.atp);
+
+    // The re-plan must NOT route the remainder to binTwo: the sibling slice
+    // above already plans binTwo's whole 4 units, and planning them twice
+    // would send the operator to a shelf the sibling has emptied. binThree is
+    // the only bin with units nothing else claims.
+    const slices = await slicesOf(first!.orderLineId);
+    const replanSlice = slices.find((slice) => slice.status === 'planned' && slice.id !== second!.id)!;
+    expect(replanSlice.bin_id).toBe(binThree);
+    expect(replanSlice.qty).toBe(3);
+
+    // …and BOTH still draw, which is the assertion that would fail if the
+    // re-plan had double-claimed binTwo: the sibling empties it first.
+    const wave = await getWave(picklist.waveId);
+    const replanLine = wave.picklists
+      .flatMap((list) => list.lines)
+      .find((candidate) => candidate.id === replanSlice.id)!;
+    await pick(bodyFor(second!)).expect(201);
+    expect(await reservationState(replanHold)).toBe('held');
+    const last = await pick(bodyFor(replanLine)).expect(201);
+    expect(last.body.pick.reservationCommitted).toBe(true);
+    expect(await reservationState(replanHold)).toBe('committed');
+    expect(await onHand(skuId, binTwo)).toBe(0);
+  });
+
+  it('the remainder re-granted is what the order still OWES — units a sibling already drew come off first', async () => {
+    const skuId = sku('PCK-SHORT-OWED');
+    const binOne = await createBin('A-47-01');
+    const binTwo = await createBin('A-47-02');
+    const binThree = await createBin('A-47-03');
+    await seedStock(skuId, binOne, 4);
+    await seedStock(skuId, binTwo, 4);
+    await seedStock(skuId, binThree, 6);
+    const { picklist } = await releasedWave([{ skuId, quantity: 8 }], 'short-owed');
+    const planned = picklist.lines.filter((candidate) => candidate.status === 'planned');
+    expect(planned).toHaveLength(2);
+    const [first, second] = planned;
+
+    // Slice one is picked WHOLE (4 of 8). Nothing shrinks `reservations.
+    // quantity` — only `state` is ever mutated — so the hold still reads 8.
+    await pick(bodyFor(first!)).expect(201);
+    expect(await reservationState(first!.reservationId!)).toBe('held');
+
+    // Slice two then comes up short at 1 of 4. The order owes 3, NOT 7:
+    // 8 held − 4 already drawn by the picked sibling − 1 drawn here.
+    const res = await pick(bodyFor(second!, { qty: 1, reasonCode: 'damaged-units' })).expect(201);
+    const replanHold = res.body.pick.replanReservationId as string;
+    expect(replanHold).not.toBeNull();
+    const holdRows = await sql`select quantity from reservations where id = ${replanHold}`;
+    expect(Number((holdRows[0] as unknown as { quantity: number }).quantity)).toBe(3);
+
+    // Re-granting 7 would hold four phantom units against ATP forever; the
+    // mirror is derived from the same figure, so counter and journal would
+    // agree while BOTH were wrong. The journal is what pins it down.
+    const after = await atpFacts(skuId);
+    expect(after.journal).toBe(3);
+    expect(after.counter).toBe(after.journal);
+    // 5 of the 14 seeded units have left the building (4 + 1).
+    expect(after.onHand).toBe(9);
+    expect(after.atp).toBe(6);
+
+    // …and the re-planned slice carries exactly those 3 owed units.
+    const replanned = res.body.pick.replanned as { qty: number; binId: string }[];
+    expect(replanned).toHaveLength(1);
+    expect(replanned[0]!.qty).toBe(3);
+    expect(replanned[0]!.binId).toBe(binThree);
+  });
+
+  it('cancelling an order is refused by a short line that DREW units, and allowed by a zero-unit report that drew none', async () => {
+    // The arm that drew units: cancelling would free a hold for stock that
+    // has physically left the bin.
+    const drewSku = sku('PCK-SHORT-CXL');
+    const drewBin = await createBin('A-48-01');
+    await seedStock(drewSku, drewBin, 5);
+    const drew = await releasedWave([{ skuId: drewSku, quantity: 5 }], 'short-cxl');
+    await pick(bodyFor(drew.picklist.lines[0]!, { qty: 3, reasonCode: 'damaged-units' })).expect(201);
+    const refused = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/orders/${drew.orderId}/cancel`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(409);
+    expect(refused.body.detail).toMatch(/drawn pick line/i);
+
+    // The ZERO-unit arm: nothing moved, so the order is still cancellable —
+    // keying either cancel path on `status = 'short'` alone would wedge it.
+    const emptySku = sku('PCK-SHORT-CXL0');
+    const emptyBin = await createBin('A-48-02');
+    await seedStock(emptySku, emptyBin, 5);
+    const empty = await releasedWave([{ skuId: emptySku, quantity: 5 }], 'short-cxl0');
+    const emptyLine = empty.picklist.lines[0]!;
+    await drainStock(emptySku, emptyBin, 5);
+    await pick(bodyFor(emptyLine, { qty: 0, reasonCode: 'bin-empty' })).expect(201);
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/orders/${empty.orderId}/cancel`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+  });
+
+  it('cancelling a WAVE never withdraws a short line that drew units — the shortfall and the reason survive — but a zero-unit report is freed', async () => {
+    const drewSku = sku('PCK-SHORT-WCXL');
+    const drewBin = await createBin('A-49-01');
+    await seedStock(drewSku, drewBin, 6);
+    const drew = await releasedWave([{ skuId: drewSku, quantity: 6 }], 'short-wave-cxl');
+    const drewLine = drew.picklist.lines[0]!;
+    await pick(bodyFor(drewLine, { qty: 2, reasonCode: 'stock-not-found' })).expect(201);
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/waves/${drew.waveId}/cancel`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+    // Still `short`, with BOTH halves of what it reported intact: flipping it
+    // to `cancelled` would erase the SM-3 signal behind a status that says
+    // nothing happened.
+    const kept = await lineRow(drewLine.id);
+    expect(kept.status).toBe('short');
+    expect(kept.shortfall_qty).toBe(4);
+    expect(kept.reason_code).toBe('stock-not-found');
+
+    // A ZERO-unit report drew nothing, so it keeps no claim: it is withdrawn
+    // with the rest of the wave, which is what lets its order line be waved
+    // again once stock arrives.
+    const emptySku = sku('PCK-SHORT-WCXL0');
+    const emptyBin = await createBin('A-49-02');
+    await seedStock(emptySku, emptyBin, 4);
+    const empty = await releasedWave([{ skuId: emptySku, quantity: 4 }], 'short-wave-cxl0');
+    const emptyLine = empty.picklist.lines[0]!;
+    await drainStock(emptySku, emptyBin, 4);
+    await pick(bodyFor(emptyLine, { qty: 0, reasonCode: 'bin-empty' })).expect(201);
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/waves/${empty.waveId}/cancel`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+    expect((await lineRow(emptyLine.id)).status).toBe('cancelled');
+  });
+
+  it('a serial-tracked stop short-picks with one serial per DRAWN unit, and reports an empty bin with no serials at all', async () => {
+    const skuId = sku(SERIAL_SHORT_SKU_CODE);
+    const planBin = await createBin('A-50-01');
+    const altBin = await createBin('A-50-02');
+    const tag = ulid().slice(10, 16);
+    await seedStock(skuId, planBin, 3, {
+      serials: [`SS-${tag}-1`, `SS-${tag}-2`, `SS-${tag}-3`],
+    });
+    await seedStock(skuId, altBin, 2, { serials: [`SS-${tag}-4`, `SS-${tag}-5`] });
+    const { picklist } = await releasedWave([{ skuId, quantity: 3 }], 'short-serial');
+    const line = picklist.lines.find((candidate) => candidate.binId === planBin)!;
+    expect(line.qty).toBe(3);
+
+    // One serial per DRAWN unit — not per planned unit.
+    await pick(bodyFor(line, { qty: 2, reasonCode: 'damaged-units', serials: [`SS-${tag}-1`] }))
+      .expect(400);
+    const res = await pick(
+      bodyFor(line, {
+        qty: 2,
+        reasonCode: 'damaged-units',
+        serials: [`SS-${tag}-1`, `SS-${tag}-2`],
+      }),
+    ).expect(201);
+    expect(res.body.pick.shortfallQty).toBe(1);
+    const events = await ledgerFor(line.id);
+    expect(events).toHaveLength(2);
+    expect(events.every((event) => event.quantity_delta === -1)).toBe(true);
+    expect(await onHand(skuId, planBin)).toBe(1);
+
+    // …and the ZERO-unit report of an empty bin names NO serials, on exactly
+    // the SKUs whose units are tracked individually. Demanding "one serial
+    // per unit" for zero units would make an empty shelf unreportable here.
+    const zeroBin = await createBin('A-50-03');
+    await seedStock(skuId, zeroBin, 2, { serials: [`SS-${tag}-6`, `SS-${tag}-7`] });
+    const second = await releasedWave([{ skuId, quantity: 2 }], 'short-serial-zero');
+    const zeroLine = second.picklist.lines.find((candidate) => candidate.qty > 0)!;
+    const emptied = await pick(
+      bodyFor(zeroLine, { qty: 0, reasonCode: 'bin-empty', serials: [] }),
+    ).expect(201);
+    expect(emptied.body.pick.id).toBeNull();
+    expect(await ledgerFor(zeroLine.id)).toHaveLength(0);
+    expect((await lineRow(zeroLine.id)).reason_code).toBe('bin-empty');
+    // A serial on a zero-unit report is still a 400 — the count must match.
+    const other = await releasedWave([{ skuId, quantity: 1 }], 'short-serial-zero2');
+    await pick(
+      bodyFor(other.picklist.lines[0]!, {
+        qty: 0,
+        reasonCode: 'bin-empty',
+        serials: [`SS-${tag}-6`],
+      }),
+    ).expect(400);
+  });
+
+  it('a key written BEFORE story 4.4 replays with the honest defaults, not with fields the response type says are required', async () => {
+    // The bin-admin precedent: a stored snapshot from the previous deploy is
+    // inserted directly, because a snapshot written through today's code
+    // could never exercise the fallbacks.
+    const skuId = sku('PCK-SHORT-LEGACY');
+    await seedStock(skuId, binA, 3);
+    const { picklist } = await releasedWave([{ skuId, quantity: 3 }], 'short-legacy');
+    const line = picklist.lines[0]!;
+    const key = ulid();
+    const body = bodyFor(line);
+    const legacy = {
+      pick: {
+        id: uuidv7(),
+        tenantId,
+        warehouseId,
+        waveId: picklist.waveId,
+        picklistId: line.picklistId,
+        picklistLineId: line.id,
+        orderId: line.orderId,
+        orderLineId: line.orderLineId,
+        skuId,
+        skuCode: 'PCK-SHORT-LEGACY',
+        binId: binA,
+        binCode: 'A-01-01',
+        suggestedBinId: binA,
+        suggestedBinCode: 'A-01-01',
+        batchId: null,
+        batchCode: null,
+        suggestedBatchId: null,
+        suggestedBatchCode: null,
+        qty: 3,
+        reservationId: line.reservationId,
+        reservationCommitted: true,
+        lineStatus: 'picked',
+        pickedBy: operatorUserId,
+        pickedAt: body.occurredAt,
+        deviceId,
+        createdAt: body.occurredAt,
+        // Deliberately absent: `conflictClass` (pre-4.3b) and every 4.4 field.
+      },
+    };
+    const { createHash } = await import('node:crypto');
+    const payloadHash = createHash('sha256')
+      .update(
+        JSON.stringify({
+          tenantId,
+          deviceId,
+          operatorUserId,
+          warehouseId,
+          picklistId: body.picklistId,
+          picklistLineId: body.picklistLineId,
+          skuId: body.skuId,
+          binId: body.binId,
+          qty: body.qty,
+          occurredAt: body.occurredAt,
+        }),
+        'utf8',
+      )
+      .digest('hex');
+    await sql`
+      insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+      values (${uuidv7()}, ${tenantId}, ${key}, ${payloadHash}, ${sql.json(legacy)})
+    `;
+
+    const replayed = await pick(body, operatorToken, key).expect(201);
+    const served = replayed.body.pick as Record<string, unknown>;
+    // Every field the wire contract declares non-optional comes back filled,
+    // and filled with what a whole-quantity pick actually means.
+    expect(served.conflictClass).toBe('none');
+    expect(served.shortfallQty).toBe(0);
+    expect(served.reasonCode).toBeNull();
+    expect(served.reservationReleased).toBe(false);
+    expect(served.replanReservationId).toBeNull();
+    expect(served.replanned).toEqual([]);
+    // …and the replay drew nothing: the line is untouched.
+    expect(await lineStatus(line.id)).toBe('planned');
+    expect(await ledgerFor(line.id)).toHaveLength(0);
   });
 
   it('an order line spanning two bins settles its hold only when the LAST slice is picked', async () => {
