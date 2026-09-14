@@ -24,6 +24,10 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 // never from the ledger service internals. Story 4.1 adds the reservation
 // shapes the same way — the order module reads grant/ATP/snapshot types here.
 export type { LedgerMovement, AppendedMovement } from './ledger.service';
+// AD-6: siblings may import ONLY this facade, so the reference-doc grammar
+// they must satisfy to append an event is re-exported here rather than
+// reached for in `ledger-registry` directly.
+export type { LedgerReferenceDoc } from './ledger-registry';
 export type {
   AtpSnapshot,
   GrantReservationCommand,
