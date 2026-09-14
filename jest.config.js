@@ -22,7 +22,7 @@ module.exports = {
   transformIgnorePatterns: [],
   // See test/http-agent.setup.ts — keep-alive pooling against per-request
   // ephemeral servers is a cross-talk hazard, not an optimisation, here.
-  setupFiles: ['<rootDir>/test/http-agent.setup.ts'],
+  setupFiles: ['<rootDir>/test/support/stable-ports.setup.ts', '<rootDir>/test/http-agent.setup.ts'],
   // infra-1: builds the `wms_template` database once per run; each e2e suite
   // clones it so no two suites share state. See test/support/suite-db.ts.
   globalSetup: '<rootDir>/test/support/global-setup.js',
