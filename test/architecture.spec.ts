@@ -21,8 +21,14 @@ const SRC_ROOT = join(__dirname, '..', 'src');
 
 /** The append-only tables: no UPDATE/DELETE from code, ever. */
 const LEDGER_TABLES = ['ledgerEvents', 'ledgerAnchors'] as const;
-/** All stock-state tables: writes are inventory-module-exclusive. */
-const STOCK_TABLES = [...LEDGER_TABLES, 'stockOnHand', 'batchOnHand'] as const;
+/**
+ * All stock-state tables: writes are inventory-module-exclusive. Story 4.3b
+ * adds `bin_state_epochs` — the per-bin state epoch is minted inside the
+ * ledger fold, so it belongs to the same single write path as the quantities
+ * it shadows (a column on the tenancy-owned `bins` would have had the ledger
+ * writing another module's table, which AD-6 forbids).
+ */
+const STOCK_TABLES = [...LEDGER_TABLES, 'stockOnHand', 'batchOnHand', 'binStateEpochs'] as const;
 /**
  * The one file allowed to mutate `stock_on_hand` / `batch_on_hand` (the
  * projection points — Story 2.4 folds the batch arm beside the plain fold,
@@ -59,7 +65,7 @@ function rawWriteOn(physical: string): RegExp {
   return new RegExp(`\\b(insert into|update|delete from)\\s+${physical}\\b`, 'i');
 }
 
-const RAW_STOCK_TABLES = 'ledger_events|ledger_anchors|stock_on_hand|batch_on_hand';
+const RAW_STOCK_TABLES = 'ledger_events|ledger_anchors|stock_on_hand|batch_on_hand|bin_state_epochs';
 
 describe('architecture: the ledger core is append-only and inventory-module-owned', () => {
   it(
@@ -120,6 +126,8 @@ describe('architecture: the ledger core is append-only and inventory-module-owne
         rawWriteOn('stock_on_hand'),
         drizzleWriteOn('batchOnHand'),
         rawWriteOn('batch_on_hand'),
+        drizzleWriteOn('binStateEpochs'),
+        rawWriteOn('bin_state_epochs'),
       ]) {
         if (pattern.test(file.source)) {
           offenders.push(`${file.path}: /${pattern.source}/`);
@@ -133,6 +141,7 @@ describe('architecture: the ledger core is append-only and inventory-module-owne
     const projectionOwner = readFileSync(PROJECTION_OWNER, 'utf8');
     expect(drizzleWriteOn('stockOnHand').test(projectionOwner)).toBe(true);
     expect(drizzleWriteOn('batchOnHand').test(projectionOwner)).toBe(true);
+    expect(drizzleWriteOn('binStateEpochs').test(projectionOwner)).toBe(true);
   });
 
   it('no other module reaches into the inventory module past the facade', () => {

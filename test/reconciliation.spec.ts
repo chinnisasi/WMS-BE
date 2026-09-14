@@ -269,6 +269,15 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     return rows.length === 0 ? null : Number(rows[0]!.quantity);
   }
 
+  /** One bin's opaque state epoch (story 4.3b) — null when never touched. */
+  async function binEpoch(binId: string, warehouse = warehouseId): Promise<number | null> {
+    const rows = await sql`
+      select epoch from bin_state_epochs
+      where tenant_id = ${tenantId} and warehouse_id = ${warehouse} and bin_id = ${binId}
+    `;
+    return rows.length === 0 ? null : Number(rows[0]!.epoch);
+  }
+
   /** The deliberate projection tamper (no trigger guards stock_on_hand). */
   async function tamperProjection(binId: string, delta: number, warehouse = warehouseId): Promise<void> {
     await sql`
@@ -727,6 +736,13 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
 
     // The SCOPED repair: only the requested scope is proven divergent
     // (replay proves it — never a blind rewrite) and rewritten.
+    // Story 4.3b: a repaired bin has genuinely changed, so the repair path
+    // must move its state epoch too — a device holding a pre-repair epoch has
+    // to be told. Bumping only in the fold would make the one path that
+    // exists BECAUSE state diverged the one path that cannot report it.
+    const epochBBefore = await binEpoch(binB);
+    const epochABefore = await binEpoch(binA);
+    expect(epochBBefore).not.toBeNull();
     const beforeScoped = (await outboxRows(RECONCILIATION_DIVERGENCE_EVENT)).length;
     const scoped = await facade.rebuildProjections(tenantId, warehouseId, { skuId, binId: binB });
     expect(scoped.divergences).toEqual([
@@ -737,6 +753,9 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     ]);
     expect(await onHandFor(binB)).toBe(6);
     expect(await onHandFor(binA)).toBe(16); // the sibling tamper is untouched
+    // The repaired bin's epoch moved; the untouched sibling's did not.
+    expect(await binEpoch(binB)).not.toBe(epochBBefore);
+    expect(await binEpoch(binA)).toBe(epochABefore);
     const scopedAlerts = await outboxRows(RECONCILIATION_DIVERGENCE_EVENT);
     expect(scopedAlerts).toHaveLength(beforeScoped + 1);
     expect(scopedAlerts[scopedAlerts.length - 1]!.payload).toEqual({
@@ -754,6 +773,7 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
       { skuId, binId: binA, projectedQuantity: 16, quantity: 11, deleted: false },
     ]);
     expect(await onHandFor(binA)).toBe(11);
+    expect(await binEpoch(binA)).not.toBe(epochABefore);
     const fullAlerts = await outboxRows(RECONCILIATION_DIVERGENCE_EVENT);
     expect(fullAlerts).toHaveLength(beforeFull + 1);
     expect(fullAlerts[fullAlerts.length - 1]!.payload).toEqual({
@@ -766,9 +786,13 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     // The CLEAN scope: a proven-clean replay writes nothing and alerts
     // nothing (silence is the outcome for a scope that matches).
     const beforeClean = (await outboxRows(RECONCILIATION_DIVERGENCE_EVENT)).length;
+    const epochACleanBefore = await binEpoch(binA);
     const clean = await facade.rebuildProjections(tenantId, warehouseId);
     expect(clean).toEqual({ warehouseId, repaired: [], divergences: [] });
     expect(await outboxRows(RECONCILIATION_DIVERGENCE_EVENT)).toHaveLength(beforeClean);
+    // A repair that rewrote nothing moved no epoch either: the epoch tracks
+    // real change, never the fact that a check ran.
+    expect(await binEpoch(binA)).toBe(epochACleanBefore);
   });
 
   it('verify-before-anchor: a tampered ledger range refuses the anchor, commits nothing, and fires the severity-1 alert', async () => {

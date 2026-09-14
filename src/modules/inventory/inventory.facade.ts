@@ -9,7 +9,7 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
-import { canonicalInstant, LedgerService } from './ledger.service';
+import { binStateEpochsInTx, canonicalInstant, LedgerService } from './ledger.service';
 import type { LedgerMovement } from './ledger.service';
 import type { LedgerReferenceDoc } from './ledger-registry';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -570,6 +570,43 @@ export class InventoryFacade {
           sql`${stockOnHand.quantity} > 0`,
         ),
       );
+  }
+
+  /**
+   * One bin's state epoch inside the caller's transaction (story 4.3b,
+   * AD-14) — the pick command's classification read. `null` means the bin has
+   * no epoch row at all: no movement has ever touched it, so there is nothing
+   * an op could be stale against and the caller treats it as a match.
+   *
+   * The value is OPAQUE — compare it for equality and nothing else. It is not
+   * a quantity, a timestamp or a sequence, and the only guarantee is that it
+   * differs from every value the bin carried before its contents changed.
+   * Callers hold the bin's row lock before reading it, so the classification
+   * cannot race the state it classifies.
+   */
+  async binStateEpochInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    binId: string,
+  ): Promise<number | null> {
+    const epochs = await binStateEpochsInTx(tx, tenantId, warehouseId, [binId]);
+    return epochs.get(binId) ?? null;
+  }
+
+  /**
+   * The same read for a SET of bins (story 4.3b): the device snapshot's
+   * pick-task projection stitches an epoch onto every walk stop, so the task
+   * and the epoch the device will quote back come from ONE consistent read.
+   * Bins with no epoch row are absent from the map.
+   */
+  async binStateEpochsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    binIds: readonly string[],
+  ): Promise<ReadonlyMap<string, number>> {
+    return binStateEpochsInTx(tx, tenantId, warehouseId, binIds);
   }
 
   /**

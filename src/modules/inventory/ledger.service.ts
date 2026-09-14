@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, asc, desc, eq, gte, lte, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lte, or, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { batchOnHand, ledgerEvents, stockOnHand } from '../../shared/db/schema';
+import { batchOnHand, binStateEpochs, ledgerEvents, stockOnHand } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { SignedQuantity } from '../../shared/primitives/quantity';
@@ -667,6 +667,11 @@ export class LedgerService {
       })
       .returning({ binId: stockOnHand.binId, quantity: stockOnHand.quantity });
     const row = rows[0]!;
+    // Story 4.3b: the bin's state epoch moves with its contents, in THIS
+    // transaction and under the same per-warehouse advisory lock the caller
+    // already holds. A bin's quantity and its epoch can never disagree,
+    // because there is no ordering in which one commits without the other.
+    await bumpBinEpochInTx(tx, tenantId, warehouseId, binId);
     return { binId: row.binId, quantity: row.quantity };
   }
 
@@ -729,6 +734,14 @@ export class LedgerService {
       })
       .returning({ binId: batchOnHand.binId, batchId: batchOnHand.batchId, quantity: batchOnHand.quantity });
     const row = rows[0]!;
+    // Story 4.3b: the batch fold moves the bin's contents too, so it moves
+    // the epoch too. It always rides beside an `addToOnHand` on the same bin
+    // (a batch arm only fires for a bin the plain fold already touched), so
+    // this is usually the epoch's second bump inside one transaction — which
+    // is harmless: the value is opaque and compared only for equality, and
+    // bumping in BOTH folds is what keeps the invariant local to each fold
+    // rather than dependent on their call order.
+    await bumpBinEpochInTx(tx, tenantId, warehouseId, binId);
     return { binId: row.binId, batchId: row.batchId, quantity: row.quantity };
   }
 
@@ -1360,6 +1373,66 @@ export async function reconcileScanInTx(
 }
 
 /**
+ * Moves one bin's state epoch forward (Story 4.3b, AD-14), inside the
+ * caller's transaction. Called from the folds in this file and from the
+ * rebuild below — the single write path, beside the stock projections it
+ * shadows (the architecture test pins it there).
+ *
+ * The value is OPAQUE: a consumer compares it for equality and nothing else.
+ * `epoch + 1` is simply the cheapest monotonic generator; it is deliberately
+ * not a quantity, a timestamp, or the ledger's own sequence, so no caller can
+ * be tempted to read meaning into the distance between two values. A bin
+ * touched for the first time starts at 1 (never 0: on the wire a 0 would be
+ * indistinguishable from "this bin has no epoch").
+ */
+export async function bumpBinEpochInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  binId: string,
+): Promise<number> {
+  const rows = await tx
+    .insert(binStateEpochs)
+    .values({ id: uuidv7(), tenantId, warehouseId, binId, epoch: 1 })
+    .onConflictDoUpdate({
+      target: [binStateEpochs.tenantId, binStateEpochs.warehouseId, binStateEpochs.binId],
+      set: { epoch: sql`${binStateEpochs.epoch} + 1`, updatedAt: nowIso() },
+    })
+    .returning({ epoch: binStateEpochs.epoch });
+  return rows[0]!.epoch;
+}
+
+/**
+ * The state epochs of a set of bins, inside the caller's transaction (Story
+ * 4.3b): the read half of the epoch, consumed by the pick command's
+ * classification and by the device snapshot's pick-task projection through
+ * `InventoryFacade`. A bin with no row is simply absent from the map — a bin
+ * no movement has ever touched has no epoch to be stale against.
+ */
+export async function binStateEpochsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  binIds: readonly string[],
+): Promise<Map<string, number>> {
+  const ids = [...new Set(binIds)];
+  if (ids.length === 0) {
+    return new Map();
+  }
+  const rows = await tx
+    .select({ binId: binStateEpochs.binId, epoch: binStateEpochs.epoch })
+    .from(binStateEpochs)
+    .where(
+      and(
+        eq(binStateEpochs.tenantId, tenantId),
+        eq(binStateEpochs.warehouseId, warehouseId),
+        inArray(binStateEpochs.binId, ids),
+      ),
+    );
+  return new Map(rows.map((row) => [row.binId, row.epoch]));
+}
+
+/**
  * Derived-state repair inside an existing transaction (Story 2.2): rewrites
  * `stock_on_hand` rows to the replayed quantities for the requested scopes —
  * the single sanctioned stock write, beside the append path's `addToOnHand`
@@ -1453,6 +1526,14 @@ export async function rebuildProjectionsInTx(
       deleted: false,
     });
     await rebuildBatchArmInTx(tx, tenantId, warehouseId, scope, batchReplayed, repaired);
+  }
+  // Story 4.3b: the repair path bumps the epoch of every bin it actually
+  // rewrote. This path rewrites quantities ABSOLUTELY and appends no event,
+  // so bumping only in the fold would make the one path that exists BECAUSE
+  // state diverged the one path that cannot report divergence — a device
+  // holding a pre-repair epoch would read a repaired bin as unchanged.
+  for (const binId of new Set(repaired.map((entry) => entry.binId))) {
+    await bumpBinEpochInTx(tx, tenantId, warehouseId, binId);
   }
   return repaired;
 }

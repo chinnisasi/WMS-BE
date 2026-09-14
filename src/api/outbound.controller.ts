@@ -401,7 +401,7 @@ export class OutboundController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'pick.record — records one scan-verified pick exactly once (badge-in session required): the pick.picked ledger draw empties the scanned bin and the order line’s reservation settles held → committed in the SAME transaction; the line flips to picked',
+      'pick.record — records one scan-verified pick exactly once (badge-in session required): the pick.picked ledger draw empties the scanned bin and the order line’s reservation settles held → committed in the SAME transaction; the line flips to picked. Story 4.3b: the optional binStateEpoch is compared under the bin’s row lock before any write and classifies a conflict by the AD-14 taxonomy — apply/settle answer 201, pick-bin-short is re-plannable, pick-unresolvable is terminal',
   })
   @ApiBody({ type: RecordPickDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
@@ -415,8 +415,8 @@ export class OutboundController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), unknown or revoked device (device-revoked), or the operator lacks picks.execute (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, picklist line, order, SKU or bin does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The wave is not released / the picklist is not ready / the line is already picked / the order is not accepted / the hold is already terminal (conflict), a concurrent idempotent request (conflict), or a serial that does not live in the scanned bin (serial-elsewhere)') })
-  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or the bin drained before this (queued) pick replayed (insufficient-on-hand, naming the bin’s live on-hand — nothing persists)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('AD-14 case 3 — the bin’s state_epoch moved and it no longer covers the draw (pick-bin-short, naming the bin and its live on-hand; RE-PLANNABLE, the client keeps the op). AD-14 case 4 — a premise moved terminally: the hold is expired/terminal, or the line, picklist, wave or order was cancelled or already picked (pick-unresolvable; TERMINAL, the client quarantines with session attribution). Also: the wave is not yet released / the picklist is not yet ready (conflict, retryable), a concurrent idempotent request (conflict), or a serial that does not live in the scanned bin (serial-elsewhere). None of these persist anything and none consume the idempotency key') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or the bin drained before this (queued) pick replayed with NO bin epoch to prove it moved (insufficient-on-hand, naming the bin’s live on-hand — nothing persists; this is the pre-4.3b behaviour a device that has not refreshed still gets)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
   async recordPick(
     @Param('tenantId') tenantId: string,
@@ -446,6 +446,11 @@ export class OutboundController {
         // mobile op payload always carries it) — normalize to absent so the
         // command's payload hash spreads an array, never null.
         serials: dto.serials ?? undefined,
+        // Story 4.3b: the captured bin epoch rides straight through. It is
+        // NOT part of the payload hash (an observation, not an intent), so a
+        // replay carrying a different epoch still re-serves rather than
+        // failing `idempotency-key-reuse` before the taxonomy can run.
+        binStateEpoch: dto.binStateEpoch ?? null,
       },
       key,
     );
