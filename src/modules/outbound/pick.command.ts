@@ -292,7 +292,13 @@ export class PickCommandService {
         if (existing[0].payloadHash !== payloadHash) {
           throw idempotencyKeyReuse();
         }
-        return existing[0].responseSnapshot as PickSnapshot;
+        // Story 4.3b: a key written BEFORE this story stored a snapshot with
+        // no `conflictClass`, and the field is required on the wire. A
+        // pre-4.3b pick ran with no epoch comparison at all, so `none` is
+        // what it would have been classified as — the default is the honest
+        // value, not a placeholder.
+        const stored = existing[0].responseSnapshot as PickSnapshot;
+        return { pick: { ...stored.pick, conflictClass: stored.pick.conflictClass ?? 'none' } };
       }
 
       // ── input validation (400 before any write) ─────────────────────────
@@ -345,12 +351,33 @@ export class PickCommandService {
       // Story 4.3b: a premise that moved TERMINALLY is case 4 of the AD-14
       // taxonomy — `pick-unresolvable`, which the client quarantines with
       // session attribution rather than deleting. A premise that is merely
-      // not-yet-ready (a wave still `planned`, a picklist still `draft`) is
-      // not terminal: releasing it later makes the queued op replayable, so
-      // it stays the plain `conflict` it has always been.
+      // not-yet-ready (a wave still `planned`, a picklist still `planned`
+      // rather than `ready` — those are the only non-terminal arms either
+      // status machine has) is not terminal: releasing it later makes the
+      // queued op replayable, so it stays the plain `conflict` it has always
+      // been.
+      //
+      // These four codes changed for EVERY caller, including a device whose
+      // cache predates the epoch, which the acceptance criteria say should
+      // behave exactly as before. The deviation is deliberate and narrow.
+      // Terminality is a fact about the wave, the line and the order — it has
+      // nothing to do with what the device observed of a bin — so gating the
+      // code on whether an epoch was sent would hand two devices different
+      // answers to the same question, and would misroute a 4.3b device that
+      // legitimately carries no epoch (a bin the walk does not name, or one
+      // no movement has ever touched) into deleting an op it should hold. A
+      // pre-4.3b client's observable behaviour is unchanged regardless: it
+      // has no branch for `pick-unresolvable`, so the code falls through to
+      // the same `rejected` default that `conflict` reached. What the AC
+      // protects — that an epoch-less replay is never refused for the absence
+      // of the field, and that its shortfall stays the `422` it always was —
+      // is preserved exactly; see `binCannotCover`.
       if (found.waveStatus !== 'released') {
         throw found.waveStatus === 'cancelled'
-          ? pickUnresolvable(`Wave "${line.waveId}" was cancelled while this pick was queued.`)
+          ? pickUnresolvable(
+              'Wave was cancelled',
+              `Wave "${line.waveId}" was cancelled while this pick was queued.`,
+            )
           : new ProblemException(
               'conflict',
               409,
@@ -360,7 +387,10 @@ export class PickCommandService {
       }
       if (found.picklistStatus !== 'ready') {
         throw found.picklistStatus === 'cancelled'
-          ? pickUnresolvable(`Picklist "${command.picklistId}" was cancelled while this pick was queued.`)
+          ? pickUnresolvable(
+              'Picklist was cancelled',
+              `Picklist "${command.picklistId}" was cancelled while this pick was queued.`,
+            )
           : new ProblemException(
               'conflict',
               409,
@@ -373,20 +403,22 @@ export class PickCommandService {
         // this command is not it, and nothing recovers it — terminal, so the
         // op is quarantined for a human rather than dropped.
         throw pickUnresolvable(
+          'Pick line is already picked',
           `Pick line "${command.picklistLineId}" is already picked — a line is drawn exactly once.`,
         );
       }
       if (line.status !== 'planned') {
-        throw line.status === 'cancelled'
-          ? pickUnresolvable(
-              `Pick line "${command.picklistLineId}" was cancelled while this pick was queued.`,
-            )
-          : new ProblemException(
-              'conflict',
-              409,
-              'Pick line is not pickable',
-              `Pick line "${command.picklistLineId}" reads "${line.status}" — only a planned line is picked.`,
-            );
+        // `cancelled` and `unfulfillable` are both terminal: neither ever
+        // returns to `planned`, so a queued op against one can only be
+        // resolved by a human. Routing `unfulfillable` to the plain
+        // `conflict` would have the device DELETE a pick the operator
+        // physically performed — the exact loss this story exists to stop.
+        throw pickUnresolvable(
+          line.status === 'cancelled' ? 'Pick line was cancelled' : 'Pick line is unfulfillable',
+          line.status === 'cancelled'
+            ? `Pick line "${command.picklistLineId}" was cancelled while this pick was queued.`
+            : `Pick line "${command.picklistLineId}" reads "unfulfillable" — it names a shortfall, not pickable stock, and never returns to planned.`,
+        );
       }
       if (line.binId === null) {
         // An `unfulfillable` slice has no units to draw (it names the
@@ -414,10 +446,14 @@ export class PickCommandService {
       }
       if (order.status !== 'accepted') {
         // A cancelled order has moved terminally — the queued pick's premise
-        // is gone (case 4). Any other non-accepted status is one the order
-        // can still leave, so it stays the plain retryable conflict.
+        // is gone (case 4). `accepted` and `cancelled` are the only arms the
+        // `orders_status_check` CHECK allows today, so the else branch below
+        // is unreachable: it is kept FORWARD-LOOKING for the statuses 4.6
+        // adds (a dispatched order is terminal and belongs above; anything
+        // an order can still leave belongs below).
         throw order.status === 'cancelled'
           ? pickUnresolvable(
+              'Order was cancelled',
               `Order "${line.orderId}" reads "${order.status}" — its units are not picked.`,
             )
           : new ProblemException(
@@ -514,16 +550,81 @@ export class PickCommandService {
         );
       }
 
+      // ── the serial arm (serial-tracked SKUs, the putaway mirror) ────────
+      let serialNumbers: readonly string[] = [];
+      if (sku.serialTracked) {
+        if (command.serials === undefined || command.serials.length === 0) {
+          throw pickValidation(
+            `SKU "${sku.code}" is serial-tracked — its pick needs one serial per unit (${command.qty}).`,
+          );
+        }
+        if (new Set(command.serials).size !== command.serials.length) {
+          throw pickValidation(
+            'serials contains duplicates — a serial-tracked pick draws one ledger event per serial unit; the same serial cannot appear twice.',
+          );
+        }
+        if (command.serials.length !== command.qty) {
+          throw pickValidation(
+            `A serial-tracked pick draws one ledger event per serial unit — ${command.serials.length} serials cannot draw ${command.qty} units.`,
+          );
+        }
+        serialNumbers = command.serials;
+      } else if (command.serials !== undefined && command.serials.length > 0) {
+        throw pickValidation(`SKU "${sku.code}" is not serial-tracked — its pick carries no serials.`);
+      }
+      const serialRefs =
+        serialNumbers.length === 0
+          ? []
+          : await resolveSerialRefsInTx(tx, command.tenantId, command.skuId, serialNumbers);
+      if (serialRefs.length > 0) {
+        // The whole serial set, tenant-wide and in sorted order, BEFORE the
+        // warehouse lock below and before the first append (the
+        // stock.adjustment deadlock rule). Taking it here rather than at the
+        // draw is what keeps this path on putaway's documented acyclic
+        // bins-row → serial → warehouse order now that the classification
+        // needs the warehouse lock; each append's own serial lock (same key)
+        // is then a re-entrant no-op.
+        await this.inventory.lockSerialsInTx(tx, command.tenantId, serialRefs);
+      }
+
       // ── the AD-14 conflict classification (story 4.3b) ──────────────────
-      // Placed HERE deliberately: after the bin row is locked `for update`
-      // and before anything is written, so a classification can neither race
-      // the state it classified nor leave a half-classified write behind.
+      // The per-warehouse advisory xact lock — the SAME key the ledger's
+      // `appendMovement` takes — is acquired here, before the epoch is read.
+      // The bins-row lock above mutexes other PICKS and nothing else:
+      // adjustments, putaway, receiving and the reconciliation rebuild all
+      // bump this bin's epoch and quantity under the warehouse lock without
+      // ever touching that row. Without this, an adjustment committing
+      // between the epoch read and the on-hand read below would show an
+      // unmoved epoch against a drained bin, and the refusal would be the
+      // `422` a device DELETES instead of the `409` it keeps.
+      //
+      // Lock order stays putaway's documented acyclic bins-row → serial →
+      // warehouse: the bins row is locked above, the whole serial set is
+      // pre-locked just above this, and the warehouse comes last. Every
+      // append inside this transaction then re-acquires both as no-ops.
+      await this.inventory.lockWarehouseInTx(tx, command.tenantId, command.warehouseId);
+
+      // Everything from here to the draw runs under that lock and writes
+      // nothing, so a classification can neither race the state it
+      // classified nor leave a half-classified write behind.
       //
       // The epoch is compared for EQUALITY only. Three inputs read as "no
       // conflict": an op that carries none (a device whose cache predates
       // this field — never refused for a field it could not have sent), a bin
       // that has no epoch row (no movement has ever touched it, so there is
       // nothing to be stale against), and an epoch that still matches.
+      //
+      // A SELF-INFLICTED bump counts as movement, deliberately. Two queued
+      // stops on the same bin mean the first pick's own draw moves the epoch
+      // the second one quotes. That is not a false positive: the bin really
+      // did change, the device's sealed snapshot really no longer describes
+      // it, and if the second stop is now short then re-planning it is
+      // exactly the right outcome — `pick-bin-short` keeps the op where the
+      // undifferentiated 422 would have deleted it. On the success path the
+      // only consequence is that the pick row is labelled `applied`/`settled`
+      // rather than `none`, which is a classification of a real change.
+      // Subtracting the transaction's own bumps would need the epoch to carry
+      // provenance, which is precisely the interpretation AD-14 forbids.
       const liveBinEpoch = await this.inventory.binStateEpochInTx(
         tx,
         command.tenantId,
@@ -536,30 +637,30 @@ export class PickCommandService {
 
       // Case 4 — UNRESOLVABLE. The task's own premises are gone and no amount
       // of retrying recovers it, so it is checked whether or not the bin
-      // moved: an expired hold is unresolvable in a bin nobody touched. The
+      // moved: a terminal hold is unresolvable in a bin nobody touched. The
       // terminal wave / picklist / line / order arms are the gates above.
       //
-      // `state === 'held'` and `expires_at > now` are NOT the same test: the
-      // reaper (`expireDue`) is a job, so a hold can be past its TTL and
-      // still read `held`. Settling one would commit units nobody is holding
-      // any more — the reaper is a cleaner, never the authority.
+      // Only the hold's STATE is judged here. Expiry is judged later, at the
+      // settlement point, because it is only a premise of the pick that
+      // actually settles: an order line spanning several bins keeps its hold
+      // `held` until the last slice is drawn, and refusing the first slice
+      // over a TTL that slice never reaches would fail a pick that used to
+      // succeed for a reason that has nothing to do with it.
+      const hold =
+        line.reservationId === null
+          ? null
+          : await this.inventory.holdLivenessInTx(tx, command.tenantId, line.reservationId);
       if (line.reservationId !== null) {
-        const [hold] = await this.inventory.reservationsByIdsInTx(tx, command.tenantId, [
-          line.reservationId,
-        ]);
-        if (hold === undefined) {
+        if (hold === null) {
           throw pickUnresolvable(
+            'Hold no longer exists',
             `The order line's hold "${line.reservationId}" no longer exists — nothing holds these units.`,
           );
         }
         if (hold.state !== 'held') {
           throw pickUnresolvable(
+            'Hold is already terminal',
             `The order line's hold reads "${hold.state}" — a terminal hold is never re-settled.`,
-          );
-        }
-        if (Date.parse(hold.expiresAt) <= Date.now()) {
-          throw pickUnresolvable(
-            `The order line's hold expired at ${hold.expiresAt} — its units are no longer held for this order.`,
           );
         }
       }
@@ -590,33 +691,6 @@ export class PickCommandService {
         throw binCannotCover(epochMoved, drawBin.code, onHand, command.qty);
       }
 
-      // ── the serial arm (serial-tracked SKUs, the putaway mirror) ────────
-      let serialNumbers: readonly string[] = [];
-      if (sku.serialTracked) {
-        if (command.serials === undefined || command.serials.length === 0) {
-          throw pickValidation(
-            `SKU "${sku.code}" is serial-tracked — its pick needs one serial per unit (${command.qty}).`,
-          );
-        }
-        if (new Set(command.serials).size !== command.serials.length) {
-          throw pickValidation(
-            'serials contains duplicates — a serial-tracked pick draws one ledger event per serial unit; the same serial cannot appear twice.',
-          );
-        }
-        if (command.serials.length !== command.qty) {
-          throw pickValidation(
-            `A serial-tracked pick draws one ledger event per serial unit — ${command.serials.length} serials cannot draw ${command.qty} units.`,
-          );
-        }
-        serialNumbers = command.serials;
-      } else if (command.serials !== undefined && command.serials.length > 0) {
-        throw pickValidation(`SKU "${sku.code}" is not serial-tracked — its pick carries no serials.`);
-      }
-      const serialRefs =
-        serialNumbers.length === 0
-          ? []
-          : await resolveSerialRefsInTx(tx, command.tenantId, command.skuId, serialNumbers);
-
       // ── the draw (one event per batch arm, or per serial unit) ──────────
       // AD-1: the row's pickedAt is the DEVICE time; the ledger's recordedAt
       // and the row's createdAt stay the server commit time.
@@ -638,14 +712,12 @@ export class PickCommandService {
       };
 
       if (serialRefs.length > 0) {
-        // Lock the whole serial set tenant-wide in sorted order BEFORE the
-        // first append (the stock.adjustment deadlock rule), then one event
-        // per serial unit — magnitude 1, drawn OUT of the bin (`toBinId`
-        // null: the units leave stock; pack/dispatch are 4.5/4.6). No batch
-        // arm rides these events: a serial-tracked SKU that is ALSO
-        // batch-tracked is refused above, so `allocation` here is always the
-        // single batch-less arm.
-        await this.inventory.lockSerialsInTx(tx, command.tenantId, serialRefs);
+        // One event per serial unit — magnitude 1, drawn OUT of the bin
+        // (`toBinId` null: the units leave stock; pack/dispatch are
+        // 4.5/4.6). No batch arm rides these events: a serial-tracked SKU
+        // that is ALSO batch-tracked is refused above, so `allocation` here
+        // is always the single batch-less arm. The serial set was pre-locked
+        // above, before the warehouse lock.
         for (const serialRef of serialRefs) {
           await this.inventory.appendLedgerEventInTx(tx, {
             tenantId: command.tenantId,
@@ -703,6 +775,7 @@ export class PickCommandService {
         // carries no new state and rolls back whole. Terminal like the gate
         // above it (story 4.3b): the line is drawn, and no retry undraws it.
         throw pickUnresolvable(
+          'Pick line is already picked',
           `Pick line "${command.picklistLineId}" was picked concurrently — a line is drawn exactly once.`,
         );
       }
@@ -733,6 +806,27 @@ export class PickCommandService {
           .for('update');
         const openSiblings = siblings.filter((sibling) => sibling.status === 'planned');
         if (openSiblings[0] === undefined) {
+          // Story 4.3b, case 4's expiry arm — HERE, not at the classification
+          // point, because expiry is a premise only of the pick that actually
+          // settles. `state === 'held'` and "not expired" are two different
+          // facts (`expireDue` is a job, so a hold can be past its TTL and
+          // still read `held`), and settling a hold nobody is holding any
+          // more would commit units the reaper has already given up on. The
+          // comparison was made by the DATABASE's clock, not this node's.
+          //
+          // Re-read under the warehouse lock this transaction now holds: the
+          // classification's read happened before the siblings were locked.
+          const settling = await this.inventory.holdLivenessInTx(
+            tx,
+            command.tenantId,
+            line.reservationId,
+          );
+          if (settling !== null && settling.expired) {
+            throw pickUnresolvable(
+              'Hold expired before this pick replayed',
+              `The order line's hold expired at ${settling.expiresAt} — its units are no longer held for this order.`,
+            );
+          }
           await this.inventory.commitReservationInTx(tx, command.tenantId, line.reservationId);
           reservationCommitted = true;
         }
@@ -782,6 +876,7 @@ export class PickCommandService {
       } catch (err) {
         if (isUniqueViolationOn(err, PICKS_LINE_UNIQUE)) {
           throw pickUnresolvable(
+            'Pick line is already picked',
             `Pick line "${command.picklistLineId}" already carries a pick — a line is drawn exactly once.`,
           );
         }
@@ -925,7 +1020,10 @@ export class PickCommandService {
     return { arms };
   }
 
-  /** The scanned bin's live on-hand for the picked SKU (the 422's figure). */
+  /**
+   * The scanned bin's live on-hand for the picked SKU — the figure the
+   * cannot-cover refusal names, whichever arm `binCannotCover` routes it to.
+   */
   private async binOnHandInTx(
     tx: TenantTx,
     command: RecordPickCommand,
@@ -1259,11 +1357,22 @@ export function pickBinShort(
  * the badge-in session that created it, for a human to review (Epic 5's story
  * 5.5 adds the web review queue).
  */
-export function pickUnresolvable(detail: string): ProblemException {
+export function pickUnresolvable(title: string, detail: string): ProblemException {
   return new ProblemException(
     'pick-unresolvable',
     409,
-    'Pick cannot be resolved',
+    // The title names WHICH premise moved. The code stays one — clients
+    // branch on `pick-unresolvable` and nothing else — but collapsing an
+    // expired hold, a cancelled wave and an already-picked line into a single
+    // "Pick cannot be resolved" would make "unresolvable picks are up" an
+    // unanswerable alert. NOTE: the shared `ProblemDetailsFilter` currently
+    // renders the wire `title` from the exception message, which
+    // `ProblemException` sets to the DETAIL — so today this title is the
+    // in-process name of the cause (logs, stack context, the switch a reader
+    // has to make sense of) rather than a wire field. Fixing that filter is
+    // repo-wide and not this story's; the causes stay distinguishable on the
+    // wire through `detail` either way.
+    title,
     `${detail} Nothing was recorded — the pick is held for review.`,
   );
 }

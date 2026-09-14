@@ -9,7 +9,12 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
-import { binStateEpochsInTx, canonicalInstant, LedgerService } from './ledger.service';
+import {
+  canonicalInstant,
+  LedgerService,
+  readBinStateEpochsInTx,
+  warehouseAdvisoryLock,
+} from './ledger.service';
 import type { LedgerMovement } from './ledger.service';
 import type { LedgerReferenceDoc } from './ledger-registry';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -521,6 +526,22 @@ export class InventoryFacade {
   }
 
   /**
+   * One hold's liveness inside the caller's transaction (story 4.3b): its
+   * state, and whether it has already expired **by the database's clock**.
+   * The pick command's AD-14 case 4 needs both, and needs the expiry judged
+   * in SQL — `expires_at` is written and reaped Postgres-side, so comparing
+   * it against the app node's clock lets skew refuse a live hold or settle a
+   * dead one. Null when the id names no row.
+   */
+  async holdLivenessInTx(
+    tx: TenantTx,
+    tenantId: string,
+    reservationId: string,
+  ): Promise<{ state: string; expiresAt: string; expired: boolean } | null> {
+    return this.reservations.holdLivenessInTx(tx, tenantId, reservationId);
+  }
+
+  /**
    * The same read inside the caller's transaction (story 4.1): a sibling
    * command that composes the reservation-state read with its own writes in
    * ONE tenant transaction (the order snapshot) rides this in-tx passthrough
@@ -590,7 +611,7 @@ export class InventoryFacade {
     warehouseId: string,
     binId: string,
   ): Promise<number | null> {
-    const epochs = await binStateEpochsInTx(tx, tenantId, warehouseId, [binId]);
+    const epochs = await readBinStateEpochsInTx(tx, tenantId, warehouseId, [binId]);
     return epochs.get(binId) ?? null;
   }
 
@@ -606,7 +627,23 @@ export class InventoryFacade {
     warehouseId: string,
     binIds: readonly string[],
   ): Promise<ReadonlyMap<string, number>> {
-    return binStateEpochsInTx(tx, tenantId, warehouseId, binIds);
+    return readBinStateEpochsInTx(tx, tenantId, warehouseId, binIds);
+  }
+
+  /**
+   * The per-warehouse advisory xact lock, taken inside the CALLER's
+   * transaction (story 4.3b) — the same key `appendMovement` takes, so a
+   * caller that must READ stock state and then act on what it read holds the
+   * writers off for the whole decision rather than for the append alone.
+   *
+   * The pick command's AD-14 classification is the first such caller: the
+   * epoch and the on-hand it compares are bumped by adjustments, putaway,
+   * receiving and the reconciliation rebuild, none of which touch the `bins`
+   * row a pick locks. Callers own the lock ORDER (putaway's documented
+   * acyclic bins-row → serial → warehouse); this seam only takes the lock.
+   */
+  async lockWarehouseInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<void> {
+    await tx.execute(warehouseAdvisoryLock(tenantId, warehouseId));
   }
 
   /**

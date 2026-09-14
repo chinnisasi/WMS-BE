@@ -117,8 +117,12 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     'PCK-EPOCH-NONE', // 4.3b: the no-epoch and unknown-bin arms
     'PCK-EPOCH-HASH', // 4.3b: the epoch is outside the payload hash
     'PCK-EPOCH-NOISE', // 4.3b: the OTHER SKU whose movement bumps a bin epoch
+    'PCK-EPOCH-TTL', // 4.3b: expiry is a premise only of the settling slice
+    'PCK-EPOCH-BACKSTOP', // 4.3b: the commitInTx guard beneath the case-4 gate
   ] as const;
   const BATCH_SKU_CODE = 'PCK-FEFO';
+  /** 4.3b: the batch-arm shortfall, routed by the epoch to 409 or 422. */
+  const BATCH_SHORT_SKU_CODE = 'PCK-FEFO3';
   /** Its own batch-tracked SKU: the two-arm draw must be the only claim on its bins. */
   const BATCH_SPAN_SKU_CODE = 'PCK-FEFO2';
   const SERIAL_SKU_CODE = 'PCK-SERIAL';
@@ -181,6 +185,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       ...SKU_CODES.map((code) => `${code},Pick SKU ${code},pcs,,1800,,false,false,,,`),
       `${BATCH_SKU_CODE},Pick SKU ${BATCH_SKU_CODE},pcs,,1800,,true,false,,,`,
       `${BATCH_SPAN_SKU_CODE},Pick SKU ${BATCH_SPAN_SKU_CODE},pcs,,1800,,true,false,,,`,
+      `${BATCH_SHORT_SKU_CODE},Pick SKU ${BATCH_SHORT_SKU_CODE},pcs,,1800,,true,false,,,`,
       `${SERIAL_SKU_CODE},Pick SKU ${SERIAL_SKU_CODE},pcs,,1800,,false,true,,,`,
     ].join('\n');
     await request(app.getHttpServer())
@@ -197,7 +202,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     for (const item of skus.body.items as { code: string; id: string }[]) {
       skuIds.set(item.code, item.id);
     }
-    expect(skuIds.size).toBeGreaterThanOrEqual(SKU_CODES.length + 3);
+    expect(skuIds.size).toBeGreaterThanOrEqual(SKU_CODES.length + 4);
 
     // ── the floor device + its badge-in operator ──────────────────────────
     const minted = await request(app.getHttpServer())
@@ -915,6 +920,157 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(reused.body.code).toBe('idempotency-key-reuse');
   });
 
+  it('the BATCH-arm shortfall is routed by the epoch too: 422 without a moved epoch, 409 pick-bin-short with one', async () => {
+    // The FEFO derivation reports its shortfall rather than throwing it, so
+    // the caller can route it — the plain whole-bin check is not the only
+    // producer. Blocking the batch empties the DRAWABLE pool while leaving
+    // `stock_on_hand` untouched, so the batch arm is provably the branch
+    // under test: the whole-bin check below it would pass.
+    const skuId = sku(BATCH_SHORT_SKU_CODE);
+    const noiseSkuId = sku('PCK-EPOCH-NOISE');
+    const binF = await createBin('A-17-01');
+    const batchCode = `PCK-SHORT-${ulid().slice(10, 16)}`;
+    const expiryDate = new Date(Date.now() + 400 * 86_400_000).toISOString();
+    await seedStock(skuId, binF, 5, { batch: { code: batchCode, expiryDate } });
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'batchshort');
+    const line = picklist.lines[0]!;
+    const captured = await capturedEpoch(line.id);
+
+    // A blocked batch is never drawn (epic-2 retro a13's draw side). The bin
+    // still HOLDS the units — only the drawable pool is empty.
+    await sql`update batches set status = 'blocked' where tenant_id = ${tenantId} and code = ${batchCode}`;
+    expect(await onHand(skuId, binF)).toBe(5);
+
+    // No epoch movement: the pre-4.3b outcome, unchanged.
+    expect(await binEpoch(binF)).toBe(captured);
+    const stale = await pick(bodyFor(line, { binStateEpoch: captured })).expect(422);
+    expect(stale.body.code).toBe('insufficient-on-hand');
+    expect(stale.body.detail).toContain('A-17-01');
+
+    // Now move the bin's epoch — another SKU lands in it — and the SAME
+    // shortfall becomes the re-plannable 409 the client keeps.
+    await seedStock(noiseSkuId, binF, 1);
+    expect(await binEpoch(binF)).not.toBe(captured);
+    const short = await pick(bodyFor(line, { binStateEpoch: captured })).expect(409);
+    expect(short.body.code).toBe('pick-bin-short');
+    expect(short.body.detail).toContain('A-17-01');
+
+    // Neither arm wrote anything.
+    expect(await pickRow(line.id)).toBeUndefined();
+    expect(await ledgerFor(line.id)).toHaveLength(0);
+    expect(await lineStatus(line.id)).toBe('planned');
+  });
+
+  it('case 4 covers every terminal premise: a cancelled wave, a cancelled picklist, a cancelled line and an unfulfillable one', async () => {
+    const skuId = sku('PCK-EPOCH-DEAD');
+    const binT = await createBin('A-18-01');
+    await seedStock(skuId, binT, 12);
+
+    // ── the wave arm: cancelling the wave is the floor-visible path ───────
+    const cancelledWave = await releasedWave([{ skuId, quantity: 3 }], 'deadwave');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/waves/${cancelledWave.waveId}/cancel`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+    const waveArm = await pick(bodyFor(cancelledWave.picklist.lines[0]!)).expect(409);
+    expect(waveArm.body.code).toBe('pick-unresolvable');
+    expect(waveArm.body.detail).toMatch(/wave .* was cancelled while this pick was queued/i);
+
+    // ── the picklist arm ─────────────────────────────────────────────────
+    // Forced directly: a wave cancel cancels the wave FIRST, so the wave gate
+    // above would shadow this one and the arm would never be reached.
+    const picklistCancelled = await releasedWave([{ skuId, quantity: 3 }], 'deadlist');
+    await sql`update picklists set status = 'cancelled' where id = ${picklistCancelled.picklist.id}`;
+    const listArm = await pick(bodyFor(picklistCancelled.picklist.lines[0]!)).expect(409);
+    expect(listArm.body.code).toBe('pick-unresolvable');
+    expect(listArm.body.detail).toMatch(/picklist .* was cancelled while this pick was queued/i);
+
+    // ── the line arms: cancelled, and unfulfillable ──────────────────────
+    const lineCancelled = await releasedWave([{ skuId, quantity: 3 }], 'deadline');
+    const cancelledLine = lineCancelled.picklist.lines[0]!;
+    await sql`update picklist_lines set status = 'cancelled' where id = ${cancelledLine.id}`;
+    const lineArm = await pick(bodyFor(cancelledLine)).expect(409);
+    expect(lineArm.body.code).toBe('pick-unresolvable');
+    expect(lineArm.body.detail).toMatch(/was cancelled while this pick was queued/i);
+
+    const unfulfillable = await releasedWave([{ skuId, quantity: 3 }], 'deadunfil');
+    const shortfallLine = unfulfillable.picklist.lines[0]!;
+    // `unfulfillable` never returns to `planned`, so a queued op against one
+    // is terminal — routing it to the plain `conflict` would have the device
+    // DELETE a pick the operator physically performed.
+    await sql`update picklist_lines set status = 'unfulfillable' where id = ${shortfallLine.id}`;
+    const unfilArm = await pick(bodyFor(shortfallLine)).expect(409);
+    expect(unfilArm.body.code).toBe('pick-unresolvable');
+    expect(unfilArm.body.detail).toMatch(/unfulfillable/i);
+
+    // Nothing was drawn by any of the four.
+    expect(await onHand(skuId, binT)).toBe(12);
+  });
+
+  it('a multi-slice order line whose hold is past TTL still draws its NON-settling slices — expiry is a premise only of the pick that settles', async () => {
+    // The regression this guards: judging expiry at the classification point
+    // refuses the FIRST slice of a multi-bin line, which previously drew
+    // fine. The hold settles only on the LAST open slice, so that is the only
+    // pick whose premises include the TTL.
+    const skuId = sku('PCK-EPOCH-TTL');
+    const binU = await createBin('A-19-01');
+    const binV = await createBin('A-19-02');
+    await seedStock(skuId, binU, 4);
+    await seedStock(skuId, binV, 4);
+    const { picklist } = await releasedWave([{ skuId, quantity: 8 }], 'ttlslices');
+    const slices = picklist.lines.filter((candidate) => candidate.status === 'planned');
+    expect(slices).toHaveLength(2);
+    const [first, second] = slices as [PickLine, PickLine];
+
+    await sql`
+      update reservations set expires_at = now() - interval '1 minute'
+      where id = ${first.reservationId!}
+    `;
+
+    // The non-settling slice draws: its own premise (the hold is still
+    // `held`) holds, and the TTL is not its business.
+    const drew = await pick(bodyFor(first)).expect(201);
+    expect(drew.body.pick.reservationCommitted).toBe(false);
+    expect(await lineStatus(first.id)).toBe('picked');
+
+    // The SETTLING slice is the one the expiry refuses — and refuses whole:
+    // the draw it would have made rolls back with it.
+    const refused = await pick(bodyFor(second)).expect(409);
+    expect(refused.body.code).toBe('pick-unresolvable');
+    expect(refused.body.detail).toMatch(/hold expired at/i);
+    expect(await lineStatus(second.id)).toBe('planned');
+    expect(await ledgerFor(second.id)).toHaveLength(0);
+    expect(await onHand(skuId, second.binId!)).toBe(4);
+  });
+
+  it('the reservation backstop under the classification still refuses a terminal hold (the 4.3 `commitInTx` guard)', async () => {
+    // Story 4.3b's case-4 gate now refuses a terminal hold BEFORE the pick
+    // reaches settlement, so the command can no longer drive `commitInTx`
+    // into its own refusal. That refusal is the backstop beneath the gate —
+    // if it ever stopped refusing, a classification bug would silently
+    // re-commit a hold nobody is holding — so it is asserted directly.
+    const skuId = sku('PCK-EPOCH-BACKSTOP');
+    const binW = await createBin('A-20-01');
+    await seedStock(skuId, binW, 5);
+    const { picklist } = await releasedWave([{ skuId, quantity: 5 }], 'backstop');
+    const line = picklist.lines[0]!;
+    await sql`update reservations set state = 'expired' where id = ${line.reservationId!}`;
+
+    const facade = app.get(InventoryFacade);
+    await expect(facade.commitReservation(tenantId, line.reservationId!)).rejects.toMatchObject({
+      status: 409,
+    });
+    expect(await reservationState(line.reservationId!)).toBe('expired');
+
+    // …and the command's own gate refuses first, naming the state.
+    const refused = await pick(bodyFor(line)).expect(409);
+    expect(refused.body.code).toBe('pick-unresolvable');
+    expect(refused.body.detail).toMatch(/a terminal hold is never re-settled/i);
+    expect(await ledgerFor(line.id)).toHaveLength(0);
+  });
+
   // ── the on-device mirror's server-side backstops ──────────────────────────
 
   it('a wrong item is refused naming the expected SKU; a wrong bin is checked against LIVE stock, not against the plan', async () => {
@@ -1349,7 +1505,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
 
   // ── the schema contract: RLS + the 0019 CHECKs ────────────────────────────
 
-  it('RLS on `picks`: foreign rows are invisible, own rows are visible, a foreign insert is 42501; the qty and reservation-pairing CHECKs hold', async () => {
+  it('RLS on `picks` and `bin_state_epochs`: foreign rows are invisible, own rows are visible, a foreign insert is 42501; the four CHECKs hold', async () => {
     // A real foreign tenant with a REAL `picks` row — counting a table that
     // holds nothing returns 0 with RLS on or off.
     const foreignEmail = `foreign-${ulid().toLowerCase()}@example.com`;
@@ -1397,6 +1553,34 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
            ${uuidv7()}, ${uuidv7()}, ${uuidv7()}, ${binA}, 1, null, true, ${uuidv7()}, now(), ${uuidv7()})
       `,
     ).rejects.toThrow(/picks_reservation_pairing/i);
+    // Story 4.3b's two: the taxonomy's stored classes, and the epoch's
+    // monotonic-and-never-zero floor (a 0 on the wire would be
+    // indistinguishable from "this bin has no epoch").
+    await expect(
+      sql`
+        insert into picks
+          (id, tenant_id, warehouse_id, wave_id, picklist_id, picklist_line_id, order_id, order_line_id,
+           sku_id, bin_id, qty, conflict_class, picked_by, picked_at, device_id)
+        values
+          (${uuidv7()}, ${tenantId}, ${warehouseId}, ${uuidv7()}, ${uuidv7()}, ${uuidv7()},
+           ${uuidv7()}, ${uuidv7()}, ${uuidv7()}, ${binA}, 1, 'pick-bin-short', ${uuidv7()}, now(), ${uuidv7()})
+      `,
+    ).rejects.toThrow(/picks_conflict_class_check/i);
+    await expect(
+      sql`
+        insert into bin_state_epochs (id, tenant_id, warehouse_id, bin_id, epoch)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${uuidv7()}, 0)
+      `,
+    ).rejects.toThrow(/bin_state_epochs_epoch_positive/i);
+
+    // Story 4.3b seeded `bin_state_epochs` for this tenant many times over
+    // (every fixture adjustment folds through the ledger), so the "own rows
+    // are visible" half of the probe is non-vacuous for it too.
+    const foreignEpochBin = uuidv7();
+    await sql`
+      insert into bin_state_epochs (id, tenant_id, warehouse_id, bin_id, epoch)
+      values (${uuidv7()}, ${foreignTenantId}, ${warehouseId}, ${foreignEpochBin}, 1)
+    `;
 
     const url = new URL(process.env.DATABASE_URL!);
     url.username = 'wms_rls_probe';
@@ -1404,31 +1588,41 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     const rls = postgres(url.toString(), { max: 1 });
     try {
       await rls.unsafe(`select set_config('app.tenant_id', '${tenantId}', false)`);
-      // The foreign row exists through the privileged connection…
-      const seeded = await sql`select count(*)::int as n from picks where tenant_id = ${foreignTenantId}`;
-      expect(Number((seeded[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
-      // …and is invisible through the scoped role.
-      const foreignRows = await rls.unsafe(
-        `select count(*)::int as n from picks where tenant_id = '${foreignTenantId}'::uuid`,
-      );
-      expect(Number((foreignRows[0] as unknown as { n: number }).n)).toBe(0);
-      // …while our own rows are visible through it.
-      const own = await rls.unsafe(
-        `select count(*)::int as n from picks where tenant_id = '${tenantId}'::uuid`,
-      );
-      expect(Number((own[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
-      // The write side fails closed too (the WITH CHECK arm).
-      await expect(
-        rls.unsafe(
-          `insert into picks
+      // Both tenant-bearing tables this story touches get the same probe.
+      // Looping is the point: `bin_state_epochs`'s policy is hand-written in
+      // 0021, and without this arm dropping it from the migration would leave
+      // the suite green while every tenant could read every other tenant's
+      // bin state.
+      const foreignInsertSql: Record<string, string> = {
+        picks: `insert into picks
              (id, tenant_id, warehouse_id, wave_id, picklist_id, picklist_line_id, order_id, order_line_id,
               sku_id, bin_id, qty, picked_by, picked_at, device_id)
            values
              ('${uuidv7()}'::uuid, '${foreignTenantId}'::uuid, '${warehouseId}'::uuid, '${uuidv7()}'::uuid,
               '${uuidv7()}'::uuid, '${uuidv7()}'::uuid, '${uuidv7()}'::uuid, '${uuidv7()}'::uuid,
               '${uuidv7()}'::uuid, '${binA}'::uuid, 1, '${uuidv7()}'::uuid, now(), '${uuidv7()}'::uuid)`,
-        ),
-      ).rejects.toMatchObject({ code: '42501' });
+        bin_state_epochs: `insert into bin_state_epochs (id, tenant_id, warehouse_id, bin_id, epoch)
+           values ('${uuidv7()}'::uuid, '${foreignTenantId}'::uuid, '${warehouseId}'::uuid, '${uuidv7()}'::uuid, 1)`,
+      };
+      for (const table of ['picks', 'bin_state_epochs'] as const) {
+        // The foreign row exists through the privileged connection…
+        const seeded = await sql.unsafe(
+          `select count(*)::int as n from ${table} where tenant_id = '${foreignTenantId}'::uuid`,
+        );
+        expect(Number((seeded[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
+        // …and is invisible through the scoped role.
+        const foreignRows = await rls.unsafe(
+          `select count(*)::int as n from ${table} where tenant_id = '${foreignTenantId}'::uuid`,
+        );
+        expect(Number((foreignRows[0] as unknown as { n: number }).n)).toBe(0);
+        // …while our own rows are visible through it.
+        const own = await rls.unsafe(
+          `select count(*)::int as n from ${table} where tenant_id = '${tenantId}'::uuid`,
+        );
+        expect(Number((own[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
+        // The write side fails closed too (the WITH CHECK arm).
+        await expect(rls.unsafe(foreignInsertSql[table]!)).rejects.toMatchObject({ code: '42501' });
+      }
     } finally {
       await rls.end();
     }

@@ -1409,7 +1409,7 @@ export async function bumpBinEpochInTx(
  * `InventoryFacade`. A bin with no row is simply absent from the map — a bin
  * no movement has ever touched has no epoch to be stale against.
  */
-export async function binStateEpochsInTx(
+export async function readBinStateEpochsInTx(
   tx: TenantTx,
   tenantId: string,
   warehouseId: string,

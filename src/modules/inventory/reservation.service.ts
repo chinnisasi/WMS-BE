@@ -1185,6 +1185,37 @@ export class ReservationService implements OnModuleInit {
    * ledger. `withTenantTransaction` opens the facade's own when the caller
    * has none (`reservationsByIds`).
    */
+  /**
+   * One hold's liveness, judged by the DATABASE's clock (story 4.3b): its
+   * state plus whether `expires_at` has already passed according to `now()`.
+   *
+   * The comparison belongs in SQL. `expires_at` is written from, and reaped
+   * by, Postgres-side time; judging it against the app node's clock means any
+   * skew either refuses a hold that is still live or settles one the reaper
+   * has already given up on. Null when the id names no row at all.
+   *
+   * `state === 'held'` and "not expired" stay two separate answers, because
+   * they are two separate facts: `expireDue` is a job, so a hold can be past
+   * its TTL and still read `held`. The reaper is a cleaner, never the
+   * authority.
+   */
+  async holdLivenessInTx(
+    tx: TenantTx,
+    tenantId: string,
+    reservationId: string,
+  ): Promise<{ state: string; expiresAt: string; expired: boolean } | null> {
+    const rows = await tx
+      .select({
+        state: reservations.state,
+        expiresAt: reservations.expiresAt,
+        expired: sql<boolean>`${reservations.expiresAt} <= now()`,
+      })
+      .from(reservations)
+      .where(and(eq(reservations.tenantId, tenantId), eq(reservations.id, reservationId)))
+      .limit(1);
+    return rows[0] ?? null;
+  }
+
   async reservationsByIdsInTx(
     tx: TenantTx,
     tenantId: string,
