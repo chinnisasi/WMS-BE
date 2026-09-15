@@ -599,6 +599,31 @@ export class InventoryFacade {
   }
 
   /**
+   * The still-`held` holds owned by a set of owner ids in one warehouse
+   * (story 4.5) — the pack command's read before it releases the holds a
+   * packed order can no longer reach. Owner-keyed because a short pick's
+   * re-granted remainder may be referenced by no outbound column at all; see
+   * `ReservationService.heldReservationsByOwnerInTx`. The
+   * `reservationsByIdsInTx` passthrough shape (AD-6: `reservations` stays
+   * inventory-owned and cross-module reads go through the facade).
+   */
+  async heldReservationsByOwnerInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    ownerType: string,
+    ownerIds: readonly string[],
+  ): Promise<ReservationSnapshot[]> {
+    return this.reservations.heldReservationsByOwnerInTx(
+      tx,
+      tenantId,
+      warehouseId,
+      ownerType,
+      ownerIds,
+    );
+  }
+
+  /**
    * The same read inside the caller's transaction (story 4.1): a sibling
    * command that composes the reservation-state read with its own writes in
    * ONE tenant transaction (the order snapshot) rides this in-tx passthrough

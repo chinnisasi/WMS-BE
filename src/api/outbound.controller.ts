@@ -22,6 +22,8 @@ import {
   OrderListQuery,
   OrderListResponse,
   OrderResponse,
+  PackOrderDto,
+  PackResponse,
   PickResponse,
   RecordPickDto,
   WaveListResponse,
@@ -143,6 +145,56 @@ export class OutboundController {
       key,
     );
     return { order: { ...snapshot.order, lines: snapshot.order.lines.map(toLineDto) } };
+  }
+
+  @Post(':tenantId/outbound/orders/:orderId/pack')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'pack.execute — verifies a fully-picked order’s parcel at the bench and moves it to Ready-to-Dispatch. The scan is compared against what was actually PICKED (never against what was ordered — after story 4.4 a short-picked order legitimately carries fewer units), and a discrepancy is refused naming the SKU, the picked quantity and the scanned quantity before anything is written. On a match, one zero-quantity pack.packed ledger event per order line, the accepted → ready_to_dispatch flip, the outbox event, the audit row and the idempotency key all commit in ONE transaction, and the packing-slip payload is returned. Weight and dimensions are optional.',
+  })
+  @ApiBody({ type: PackOrderDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: PackResponse,
+    description:
+      'The packing slip: per line the ordered / packed / shortfall quantities with the SKU code and name, the parcel’s measurements, and the pack.packed event each line was journalled as (the idempotency snapshot — a replay re-serves it, nothing re-packs)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key or path parameter, a malformed scan line, or a non-positive weight/dimension (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks pack.execute (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Order, or a scanned SKU, does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is already packed, is cancelled, was never waved, had its whole plan withdrawn by a wave cancel (re-wave it), or still has a planned pick line (conflict, naming the outstanding line); or a concurrent idempotent request (conflict). Nothing is written') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('The scanned contents differ from what was picked — an extra SKU, a missing SKU or a wrong quantity (pack-mismatch, naming every divergent SKU with both quantities; nothing written). Also: idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async packOrder(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: PackOrderDto,
+  ): Promise<PackResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.packOrder(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        orderId,
+        scanned: dto.scanned.map((line) => ({ skuId: line.skuId, qty: line.qty })),
+        // `@IsOptional()` lets an explicit `null` through — normalized to
+        // absent so an unmeasured parcel hashes identically either way.
+        weightGrams: dto.weightGrams ?? undefined,
+        dimensionsMm: dto.dimensionsMm ?? undefined,
+      },
+      key,
+    );
+    return { pack: { ...snapshot.pack, lines: snapshot.pack.lines.map((line) => ({ ...line })) } };
   }
 
   @Get(':tenantId/outbound/orders/:orderId')

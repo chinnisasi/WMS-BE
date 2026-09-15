@@ -909,7 +909,11 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       const row = defs.find((item) => (item as unknown as { conname: string }).conname === conname);
       expect(row).toBeDefined();
       const def = (row as unknown as { def: string }).def;
-      const arms = [...def.matchAll(/'([a-z]+)'/g)].map((match) => match[1]!);
+      // Story 4.5: `[a-z]+` stopped at the first underscore, so the widened
+      // `orders_status_check` would have parsed `ready_to_dispatch` as
+      // `ready` and this guard would have failed for the wrong reason (or,
+      // worse, silently agreed with a TS constant that had drifted).
+      const arms = [...def.matchAll(/'([a-z_]+)'/g)].map((match) => match[1]!);
       expect(arms.length).toBeGreaterThan(0); // every arm is a quoted literal
       return arms.sort();
     };

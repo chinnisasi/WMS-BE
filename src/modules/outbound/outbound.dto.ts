@@ -15,8 +15,18 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
-import { ORDER_SOURCES } from './order.command';
+import { ORDER_SOURCES, ORDER_STATUSES } from './order.command';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
+// The pack bounds are the COMMAND's constants, imported rather than copied:
+// a literal here and a constant there drift silently, and the DTO is the
+// gate every HTTP caller actually hits. (`order.command` / `pick.command`
+// set the precedent above; `pack.command` imports no DTO, so no cycle.)
+import {
+  MAX_DIMENSION_MM,
+  MAX_SCAN_LINES,
+  MAX_SCAN_QUANTITY,
+  MAX_WEIGHT_GRAMS,
+} from './pack.command';
 import {
   PICKLIST_LINE_STATUSES,
   PICKLIST_STATUSES,
@@ -147,7 +157,11 @@ export class OrderDto {
   @ApiProperty({ format: 'uuid' })
   warehouseId!: string;
 
-  @ApiProperty({ description: "'accepted' or 'cancelled'", enum: ['accepted', 'cancelled'] })
+  @ApiProperty({
+    description:
+      "The order's lifecycle arm. 'ready_to_dispatch' (story 4.5) is a packed order: verified at the bench against what was picked and waiting for dispatch.",
+    enum: [...ORDER_STATUSES],
+  })
   status!: string;
 
   @ApiProperty({ description: "'manual' or 'ingested'", enum: ['manual', 'ingested'] })
@@ -208,7 +222,7 @@ export class OrderEntryDto {
   @ApiProperty({ format: 'uuid' })
   warehouseId!: string;
 
-  @ApiProperty({ enum: ['accepted', 'cancelled'] })
+  @ApiProperty({ enum: [...ORDER_STATUSES] })
   status!: string;
 
   @ApiProperty({ enum: ['manual', 'ingested'] })
@@ -869,4 +883,178 @@ export class PickTaskDto {
       'Story 4.3b (AD-14): the stop bin’s state_epoch at snapshot time — opaque, compared only for equality. The device carries it back on the queued pick so the server can classify a conflict instead of rejecting blindly. Null when the bin has no epoch row yet (no movement has ever touched it).',
   })
   binStateEpoch!: number | null;
+}
+
+// ── Packing (Story 4.5) ─────────────────────────────────────────────────────
+
+/**
+ * The parcel's measured box. All three arms are required INSIDE the object —
+ * a box with two sides is not a measurement — and the whole object is
+ * optional, which is what makes "weight and dimensions are optional" a shape
+ * rather than a rule someone has to remember.
+ */
+export class PackDimensionsDto {
+  @ApiProperty({ description: 'Length in millimetres', minimum: 1, maximum: MAX_DIMENSION_MM })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_DIMENSION_MM)
+  lengthMm!: number;
+
+  @ApiProperty({ description: 'Width in millimetres', minimum: 1, maximum: MAX_DIMENSION_MM })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_DIMENSION_MM)
+  widthMm!: number;
+
+  @ApiProperty({ description: 'Height in millimetres', minimum: 1, maximum: MAX_DIMENSION_MM })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_DIMENSION_MM)
+  heightMm!: number;
+}
+
+/** One scanned line at the bench: a SKU and the units counted into the parcel. */
+export class PackScanLineDto {
+  @ApiProperty({ format: 'uuid', description: 'The SKU the operator scanned' })
+  @IsUUID()
+  skuId!: string;
+
+  @ApiProperty({
+    description:
+      'Units of this SKU counted into the parcel, in base UoM. Two lines naming the same SKU sum — the bench scans items, not lines.',
+    minimum: 1,
+    maximum: MAX_SCAN_QUANTITY,
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_SCAN_QUANTITY)
+  qty!: number;
+}
+
+/**
+ * POST /tenants/{tenantId}/outbound/orders/{orderId}/pack body — the scanned
+ * contents of the parcel, verified against what the order actually had
+ * PICKED (never against what it ordered: after story 4.4 a short-picked order
+ * legitimately reaches the bench with fewer units than its lines asked for).
+ */
+export class PackOrderDto {
+  @ApiProperty({
+    type: [PackScanLineDto],
+    description:
+      'What the operator scanned into the parcel. May be empty only when the order picked nothing at all (every stop reported an empty bin).',
+    maxItems: MAX_SCAN_LINES,
+  })
+  @IsArray()
+  @ArrayMaxSize(MAX_SCAN_LINES)
+  @ValidateNested({ each: true })
+  @Type(() => PackScanLineDto)
+  scanned!: PackScanLineDto[];
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: Number,
+    minimum: 1,
+    maximum: MAX_WEIGHT_GRAMS,
+    description: 'Optional parcel weight in grams. Absence is never an error; a non-positive value is a 400.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_WEIGHT_GRAMS)
+  weightGrams?: number | null;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: PackDimensionsDto,
+    description: 'Optional parcel dimensions in millimetres — all three sides together, or the object omitted.',
+  })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => PackDimensionsDto)
+  dimensionsMm?: PackDimensionsDto | null;
+}
+
+/** One line of the packing slip. */
+export class PackedLineDto {
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({ description: 'What the order asked for' })
+  orderedQty!: number;
+
+  @ApiProperty({ description: 'What is actually in the parcel — the PICKED units' })
+  packedQty!: number;
+
+  @ApiProperty({ description: 'Derived: orderedQty − packedQty (non-zero on a short-picked line)' })
+  shortfallQty!: number;
+
+  @ApiProperty({ format: 'uuid', description: 'The pack.packed event this line’s verification was journalled as' })
+  ledgerEventId!: string;
+}
+
+/**
+ * The packing slip as a STRUCTURED PAYLOAD — the repo has no PDF, template or
+ * download machinery, so rendering belongs to whichever surface prints it.
+ * This is also the idempotency snapshot: a replay re-serves the same slip.
+ */
+export class PackDto {
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ enum: [...ORDER_STATUSES], description: 'Always ready_to_dispatch on a successful pack' })
+  orderStatus!: string;
+
+  @ApiProperty({ enum: [...ORDER_SOURCES] })
+  source!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  integrationId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  externalEventId!: string | null;
+
+  @ApiProperty({ format: 'uuid', description: 'The operator who packed it' })
+  packedBy!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC pack time' })
+  packedAt!: string;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'Parcel weight in grams; null when unmeasured' })
+  weightGrams!: number | null;
+
+  @ApiProperty({ type: PackDimensionsDto, nullable: true, description: 'Parcel dimensions in millimetres; null when unmeasured' })
+  dimensionsMm!: PackDimensionsDto | null;
+
+  @ApiProperty({ description: 'Total units in the parcel — the sum of every line’s packedQty' })
+  totalUnits!: number;
+
+  @ApiProperty({ type: [PackedLineDto] })
+  lines!: readonly PackedLineDto[];
+}
+
+export class PackResponse {
+  @ApiProperty({ type: PackDto })
+  pack!: PackDto;
 }

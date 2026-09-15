@@ -4532,6 +4532,135 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/pack": {
+      "post": {
+        "operationId": "OutboundController_packOrder",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PackOrderDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The packing slip: per line the ordered / packed / shortfall quantities with the SKU code and name, the parcel’s measurements, and the pack.packed event each line was journalled as (the idempotency snapshot — a replay re-serves it, nothing re-packs)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key or path parameter, a malformed scan line, or a non-positive weight/dimension (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks pack.execute (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Order, or a scanned SKU, does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is already packed, is cancelled, was never waved, had its whole plan withdrawn by a wave cancel (re-wave it), or still has a planned pick line (conflict, naming the outstanding line); or a concurrent idempotent request (conflict). Nothing is written",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The scanned contents differ from what was picked — an extra SKU, a missing SKU or a wrong quantity (pack-mismatch, naming every divergent SKU with both quantities; nothing written). Also: idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "pack.execute — verifies a fully-picked order’s parcel at the bench and moves it to Ready-to-Dispatch. The scan is compared against what was actually PICKED (never against what was ordered — after story 4.4 a short-picked order legitimately carries fewer units), and a discrepancy is refused naming the SKU, the picked quantity and the scanned quantity before anything is written. On a match, one zero-quantity pack.packed ledger event per order line, the accepted → ready_to_dispatch flip, the outbox event, the audit row and the idempotency key all commit in ONE transaction, and the packing-slip payload is returned. Weight and dimensions are optional.",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/outbound/orders/{orderId}": {
       "get": {
         "operationId": "OutboundController_getOrder",
@@ -9644,9 +9773,10 @@
           },
           "status": {
             "type": "string",
-            "description": "'accepted' or 'cancelled'",
+            "description": "The order's lifecycle arm. 'ready_to_dispatch' (story 4.5) is a packed order: verified at the bench against what was picked and waiting for dispatch.",
             "enum": [
               "accepted",
+              "ready_to_dispatch",
               "cancelled"
             ]
           },
@@ -9711,6 +9841,234 @@
         "type": "object",
         "properties": {}
       },
+      "PackScanLineDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The SKU the operator scanned"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units of this SKU counted into the parcel, in base UoM. Two lines naming the same SKU sum — the bench scans items, not lines.",
+            "minimum": 1,
+            "maximum": 2147483647
+          }
+        },
+        "required": [
+          "skuId",
+          "qty"
+        ]
+      },
+      "PackDimensionsDto": {
+        "type": "object",
+        "properties": {
+          "lengthMm": {
+            "type": "number",
+            "description": "Length in millimetres",
+            "minimum": 1,
+            "maximum": 100000
+          },
+          "widthMm": {
+            "type": "number",
+            "description": "Width in millimetres",
+            "minimum": 1,
+            "maximum": 100000
+          },
+          "heightMm": {
+            "type": "number",
+            "description": "Height in millimetres",
+            "minimum": 1,
+            "maximum": 100000
+          }
+        },
+        "required": [
+          "lengthMm",
+          "widthMm",
+          "heightMm"
+        ]
+      },
+      "PackOrderDto": {
+        "type": "object",
+        "properties": {
+          "scanned": {
+            "description": "What the operator scanned into the parcel. May be empty only when the order picked nothing at all (every stop reported an empty bin).",
+            "maxItems": 500,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackScanLineDto"
+            }
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 1000000,
+            "description": "Optional parcel weight in grams. Absence is never an error; a non-positive value is a 400."
+          },
+          "dimensionsMm": {
+            "nullable": true,
+            "description": "Optional parcel dimensions in millimetres — all three sides together, or the object omitted.",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PackDimensionsDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "scanned"
+        ]
+      },
+      "PackedLineDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "orderedQty": {
+            "type": "number",
+            "description": "What the order asked for"
+          },
+          "packedQty": {
+            "type": "number",
+            "description": "What is actually in the parcel — the PICKED units"
+          },
+          "shortfallQty": {
+            "type": "number",
+            "description": "Derived: orderedQty − packedQty (non-zero on a short-picked line)"
+          },
+          "ledgerEventId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The pack.packed event this line’s verification was journalled as"
+          }
+        },
+        "required": [
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "orderedQty",
+          "packedQty",
+          "shortfallQty",
+          "ledgerEventId"
+        ]
+      },
+      "PackDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderStatus": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "ready_to_dispatch",
+              "cancelled"
+            ],
+            "description": "Always ready_to_dispatch on a successful pack"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "ingested"
+            ]
+          },
+          "integrationId": {
+            "type": "string",
+            "nullable": true
+          },
+          "externalEventId": {
+            "type": "string",
+            "nullable": true
+          },
+          "packedBy": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The operator who packed it"
+          },
+          "packedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC pack time"
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "Parcel weight in grams; null when unmeasured"
+          },
+          "dimensionsMm": {
+            "nullable": true,
+            "description": "Parcel dimensions in millimetres; null when unmeasured",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PackDimensionsDto"
+              }
+            ]
+          },
+          "totalUnits": {
+            "type": "number",
+            "description": "Total units in the parcel — the sum of every line’s packedQty"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackedLineDto"
+            }
+          }
+        },
+        "required": [
+          "orderId",
+          "tenantId",
+          "warehouseId",
+          "orderStatus",
+          "source",
+          "integrationId",
+          "externalEventId",
+          "packedBy",
+          "packedAt",
+          "weightGrams",
+          "dimensionsMm",
+          "totalUnits",
+          "lines"
+        ]
+      },
+      "PackResponse": {
+        "type": "object",
+        "properties": {
+          "pack": {
+            "$ref": "#/components/schemas/PackDto"
+          }
+        },
+        "required": [
+          "pack"
+        ]
+      },
       "OrderEntryDto": {
         "type": "object",
         "properties": {
@@ -9730,6 +10088,7 @@
             "type": "string",
             "enum": [
               "accepted",
+              "ready_to_dispatch",
               "cancelled"
             ]
           },

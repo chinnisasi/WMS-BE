@@ -104,9 +104,37 @@ export type LedgerReferenceDoc =
       readonly shortPick?: true;
       readonly shortfallQty?: number;
       readonly reasonCode?: string;
+    }
+  // Story 4.5 — the pack arm: the first NON-MOVEMENT event in the system.
+  // Picking already drew the units out of stock entirely (`toBinId: null` on
+  // `pick.picked`), so a pack has no bin to move between: the event carries
+  // `quantityDelta: 0` with BOTH bin arms null and folds no projection at
+  // all. What it records is the verification — this order line's picked
+  // units were counted at the bench and matched — which is why one event is
+  // written per ORDER LINE (`LedgerMovement` requires a non-null `skuId`, and
+  // the per-SKU chain is what keeps an item's history reconstructible).
+  //
+  // The optional measurements ride here because there is nowhere else
+  // durable for them: a Pack Station is not an entity in this story and the
+  // packing slip is a response payload, not a document. Units are explicit
+  // in the key names — a bare `weight` would be a unit nobody can recover
+  // from the ledger later. NEW union arm — the earlier kinds are never
+  // reshaped.
+  | {
+      readonly kind: 'pack';
+      readonly orderId: string;
+      readonly orderLineId: string;
+      /** Units verified at the bench for this line — what was PICKED, not ordered. */
+      readonly packedQty: number;
+      /** Optional parcel weight; absent when the bench recorded none. */
+      readonly weightGrams?: number;
+      /** Optional parcel dimensions — all three present together, or none. */
+      readonly lengthMm?: number;
+      readonly widthMm?: number;
+      readonly heightMm?: number;
     };
-// Later stories extend this union with NEW kinds (transfer, pack, …) — never
-// by reshaping an existing arm.
+// Later stories extend this union with NEW kinds (transfer, dispatch, …) —
+// never by reshaping an existing arm.
 
 /** One registered grammar entry: an event type and what it may carry. */
 export interface LedgerEventTypeDefinition {
@@ -252,6 +280,30 @@ registerLedgerEventType({
   referenceKinds: ['pick'],
   allowsBatchArm: true,
   allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 4.5 — the pack verification: one ZERO-quantity event per
+ * order line, recording that the line's picked units were counted at the
+ * bench and matched. It is the first registered type that moves nothing:
+ * both bin arms are null, so `appendMovement` folds neither `stock_on_hand`
+ * nor `batch_on_hand`, and the event exists purely as the durable record of
+ * the verification (plus the optional weight/dimensions on its reference
+ * doc). The hash chain still covers it like every other event.
+ *
+ * Both arms stay CLOSED. A pack verifies an order line against what was
+ * picked, in base units; it re-counts neither batches nor serials, and
+ * opening an arm this story does not write would let a future caller record
+ * a batch/serial claim the verification never made. 4.6's dispatch arm is
+ * where per-unit identity next matters. Registers sinceVersion 1: no new
+ * grammar version — the reference-doc arm appends only.
+ */
+registerLedgerEventType({
+  type: 'pack.packed',
+  sinceVersion: 1,
+  referenceKinds: ['pack'],
+  allowsBatchArm: false,
+  allowsSerialArm: false,
 });
 
 /** The registered definition — `undefined` for an unregistered type. */

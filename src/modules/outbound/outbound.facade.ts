@@ -22,6 +22,8 @@ import type {
 import { WaveCommandService, policySnapshot } from './wave.command';
 import { PickCommandService } from './pick.command';
 import type { PickSnapshot, PickTask, RecordPickCommand } from './pick.command';
+import { PackCommandService } from './pack.command';
+import type { PackOrderCommand, PackSnapshot } from './pack.command';
 import type {
   CreateWavePolicyCommand,
   GenerateWaveCommand,
@@ -112,6 +114,7 @@ export class OutboundFacade {
     @Inject(OrderCommandService) private readonly orderCommand: OrderCommandService,
     @Inject(WaveCommandService) private readonly waveCommand: WaveCommandService,
     @Inject(PickCommandService) private readonly pickCommand: PickCommandService,
+    @Inject(PackCommandService) private readonly packCommand: PackCommandService,
   ) {}
 
   /** `POST .../outbound/orders` — manual entry and (adapter-ready) ingestion. */
@@ -346,6 +349,19 @@ export class OutboundFacade {
    */
   async recordPick(command: RecordPickCommand, idempotencyKey: string): Promise<PickSnapshot> {
     return this.pickCommand.recordPick(command, idempotencyKey);
+  }
+
+  // ── packing (Story 4.5) ───────────────────────────────────────────────────
+
+  /**
+   * `POST .../outbound/orders/{orderId}/pack` (`pack.execute`): verifies the
+   * parcel's scanned contents against what the order actually had PICKED,
+   * journals one zero-quantity `pack.packed` event per order line, flips the
+   * order to `ready_to_dispatch` and returns the packing-slip payload — all
+   * in ONE transaction. A discrepancy is refused before anything is written.
+   */
+  async packOrder(command: PackOrderCommand, idempotencyKey: string): Promise<PackSnapshot> {
+    return this.packCommand.packOrder(command, idempotencyKey);
   }
 
   /**
