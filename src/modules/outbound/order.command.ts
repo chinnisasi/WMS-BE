@@ -29,8 +29,19 @@ import type { ReservationSnapshot } from '../inventory/inventory.facade';
 // the order state machine, AD-6 — no other module may add or transition
 // order states; the additive arms below are the module's registry) ───────────
 
-/** The order lifecycle arms shipped in story 4.1 (additive: 4.3/4.5/4.6 extend). */
-export const ORDER_STATUSES = ['accepted', 'cancelled'] as const;
+/**
+ * The order lifecycle arms. Story 4.1 shipped `accepted` / `cancelled`;
+ * story 4.5 adds `ready_to_dispatch` — the order has been verified at the
+ * pack bench against what was actually picked and is waiting for 4.6 to rate,
+ * label and dispatch it. Additive only, mirrored by `orders_status_check`
+ * (migration 0023; `orders.spec.ts` pins the two together).
+ *
+ * `ready_to_dispatch` is TERMINAL for every pre-dispatch flow: cancel refuses
+ * it below, both wave-selection paths exclude it (they select `accepted`
+ * only), and a queued pick against it quarantines. 4.6 extends the union
+ * again with the dispatched arm.
+ */
+export const ORDER_STATUSES = ['accepted', 'ready_to_dispatch', 'cancelled'] as const;
 export type OrderStatus = (typeof ORDER_STATUSES)[number];
 
 /** The line fulfillment arms shipped in story 4.1. */
@@ -474,6 +485,24 @@ export class OrderCommandService {
         await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
         return snapshot;
       });
+    }
+
+    // Story 4.5: `accepted` is no longer the only non-cancelled arm. A
+    // `ready_to_dispatch` order has been packed — its units left their bins
+    // through `pick.picked` draws and its pack is journalled — so there is
+    // nothing here to cancel. Without this gate the conditional flip below
+    // (`where status = 'accepted'`) would simply match no row and the caller
+    // would get a 200 carrying an UNCANCELLED order: a silent no-op dressed
+    // as success. Refuse it explicitly, before anything is read or written,
+    // and name the arm. Every future non-`accepted` arm (4.6's dispatched)
+    // lands here by default rather than in the silent no-op.
+    if (order.status !== 'accepted') {
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Order is not cancellable',
+        `Order "${order.id}" reads "${order.status}" — only an accepted order is cancelled here; its units have already left their bins.`,
+      );
     }
 
     // ── phase 2 (read): the pre-check — every line's hold, and the refusal ─

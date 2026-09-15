@@ -590,14 +590,21 @@ export class PickCommandService {
       }
       if (order.status !== 'accepted') {
         // A cancelled order has moved terminally — the queued pick's premise
-        // is gone (case 4). `accepted` and `cancelled` are the only arms the
-        // `orders_status_check` CHECK allows today, so the else branch below
-        // is unreachable: it is kept FORWARD-LOOKING for the statuses 4.6
-        // adds (a dispatched order is terminal and belongs above; anything
-        // an order can still leave belongs below).
-        throw order.status === 'cancelled'
+        // is gone (case 4). Story 4.5 fills in the first arm this branch was
+        // written for: `ready_to_dispatch` is TERMINAL too. A packed order
+        // was verified at the bench against what was already picked, so a
+        // queued op arriving after it can never be applied — no retry
+        // recovers it and the device must QUARANTINE with session
+        // attribution, which is exactly what `pick-unresolvable` buys and
+        // what a plain retryable `conflict` would have thrown away.
+        //
+        // The `else` stays forward-looking for 4.6 under the rule this
+        // branch already carries: a terminal arm belongs above, anything an
+        // order can still leave belongs below.
+        const terminal = order.status === 'cancelled' || order.status === 'ready_to_dispatch';
+        throw terminal
           ? pickUnresolvable(
-              'Order was cancelled',
+              order.status === 'cancelled' ? 'Order was cancelled' : 'Order was already packed',
               `Order "${line.orderId}" reads "${order.status}" — its units are not picked.`,
             )
           : new ProblemException(

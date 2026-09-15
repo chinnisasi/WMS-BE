@@ -742,6 +742,16 @@ export class WaveCommandService {
         // They are FLIPPED, not deleted — `cancelWave` frees claims the same
         // way, and one disposal semantic beats two; the row also keeps the
         // record that those units were once planned onto this wave.
+        //
+        // Story 4.5 audit: this predicate used to read `status <> 'accepted'`
+        // — a deny-list that, the moment the order machine grew a third arm,
+        // would have swept a `ready_to_dispatch` order's lines too, flipping
+        // already-PICKED lines to `cancelled` and dropping them out of
+        // `picklist_lines_open_order_line_unique` — freeing the order to be
+        // re-waved against units that had physically left the bin, the exact
+        // hazard 0019 documents. It is now the `cancelled` allow-list it
+        // always meant, so the drop says what it does and no future arm
+        // joins it by accident.
         await tx
           .update(picklistLines)
           .set({ status: 'cancelled', updatedAt: nowIso() })
@@ -750,7 +760,7 @@ export class WaveCommandService {
               eq(picklistLines.tenantId, command.tenantId),
               eq(picklistLines.waveId, wave.id),
               sql`${picklistLines.status} <> 'cancelled'`,
-              sql`exists (select 1 from ${orders} o where o.id = ${picklistLines.orderId} and o.tenant_id = ${picklistLines.tenantId} and o.status <> 'accepted')`,
+              sql`exists (select 1 from ${orders} o where o.id = ${picklistLines.orderId} and o.tenant_id = ${picklistLines.tenantId} and o.status = 'cancelled')`,
             ),
           );
         // A picklist with nothing PICKABLE left is not the floor's work: a
@@ -975,6 +985,11 @@ export class WaveCommandService {
             `No order with id "${orderId}" exists in this warehouse.`,
           );
         }
+        // Story 4.5 audit: the guard is an ALLOW-LIST on `accepted`, not a
+        // deny-list on `cancelled`, so the new `ready_to_dispatch` arm is
+        // excluded here for free — a packed order is named and refused
+        // rather than re-waved against units that have already left their
+        // bins. Keep it an allow-list: 4.6's arms inherit the same refusal.
         if (row.status !== 'accepted') {
           throw noEligibleOrders(
             `Order "${orderId}" is ${row.status} — a wave draws only accepted orders.`,
@@ -1005,6 +1020,9 @@ export class WaveCommandService {
         and(
           eq(orders.tenantId, command.tenantId),
           eq(orders.warehouseId, command.warehouseId),
+          // Story 4.5 audit: the auto-selection filter is the same allow-list
+          // as the explicit path above — a `ready_to_dispatch` (packed) order
+          // is simply not swept, with no new clause needed.
           eq(orders.status, 'accepted'),
           sql`not exists (select 1 from ${picklistLines} pl where pl.tenant_id = ${orders.tenantId} and pl.order_id = ${orders.id} and pl.status <> 'cancelled')`,
         ),

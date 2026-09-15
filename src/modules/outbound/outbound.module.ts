@@ -5,6 +5,7 @@ import { CatalogModule } from '../catalog/catalog.module';
 import { OrderCommandService } from './order.command';
 import { WaveCommandService } from './wave.command';
 import { PickCommandService } from './pick.command';
+import { PackCommandService } from './pack.command';
 import { WAVE_CLOCK, SystemWaveClock } from './wave.clock';
 import { OutboundFacade } from './outbound.facade';
 
@@ -40,6 +41,13 @@ import { OutboundFacade } from './outbound.facade';
  * (`appendLedgerEventInTx`, `lockSerialsInTx`, `commitReservationInTx`) — it
  * still writes no inventory table itself (AD-6). The batch a pick draws is
  * re-derived FEFO in the scanned bin through `CatalogFacade`.
+ *
+ * Story 4.5 adds the pack command. It writes no new table: the verification
+ * is a read of `picklist_lines` (completeness) and `picks` (quantities), the
+ * record is one zero-quantity `pack.packed` ledger event per order line
+ * through `appendLedgerEventInTx`, and the only relational write is the
+ * order's own `accepted → ready_to_dispatch` flip — a state machine this
+ * module exclusively owns (AD-6).
  */
 @Module({
   imports: [SharedModule, InventoryModule, CatalogModule],
@@ -47,6 +55,7 @@ import { OutboundFacade } from './outbound.facade';
     OrderCommandService,
     WaveCommandService,
     PickCommandService,
+    PackCommandService,
     { provide: WAVE_CLOCK, useClass: SystemWaveClock },
     OutboundFacade,
   ],
