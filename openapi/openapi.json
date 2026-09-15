@@ -4661,6 +4661,135 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/dispatch": {
+      "post": {
+        "operationId": "OutboundController_dispatchOrder",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DispatchOrderDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The dispatch record: per line the ordered / dispatched / shortfall quantities with the SKU code and name and the dispatch.dispatched event it was journalled as, the carrier arms, and the reservation holds this dispatch retired (the idempotency snapshot — a replay re-serves it, nothing re-dispatches)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DispatchResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key or path parameter, or an over-long carrier / tracking value (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks dispatch.execute (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Order does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is already dispatched under a different key, or is not packed — it reads accepted or cancelled (conflict, naming the status); or a concurrent idempotent request (conflict). Nothing is written",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "dispatch.execute — closes a packed order: the TERMINAL transition of the order state machine. One zero-quantity dispatch.dispatched ledger event per order line records the shipment (the units left stock at pick, so nothing moves), the order flips ready_to_dispatch → dispatched, and every committed reservation the order still owns is retired to released — the transition that finally restores the reserved counter and corrects ATP. The flip, the events, the retirements, the outbox event, the audit row and the idempotency key all commit in ONE transaction; the Valkey counter mirror follows the commit. Carrier and tracking number are optional free text. There is no un-dispatch: the arm is terminal.",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/outbound/orders/{orderId}": {
       "get": {
         "operationId": "OutboundController_getOrder",
@@ -9773,10 +9902,11 @@
           },
           "status": {
             "type": "string",
-            "description": "The order's lifecycle arm. 'ready_to_dispatch' (story 4.5) is a packed order: verified at the bench against what was picked and waiting for dispatch.",
+            "description": "The order's lifecycle arm. 'ready_to_dispatch' (story 4.5) is a packed order: verified at the bench against what was picked and waiting for dispatch. 'dispatched' (story 4.6) is terminal — the order shipped, its shipment is journalled and its reservations are retired; there is no un-dispatch.",
             "enum": [
               "accepted",
               "ready_to_dispatch",
+              "dispatched",
               "cancelled"
             ]
           },
@@ -9988,6 +10118,7 @@
             "enum": [
               "accepted",
               "ready_to_dispatch",
+              "dispatched",
               "cancelled"
             ],
             "description": "Always ready_to_dispatch on a successful pack"
@@ -10069,6 +10200,175 @@
           "pack"
         ]
       },
+      "DispatchOrderDto": {
+        "type": "object",
+        "properties": {
+          "carrierName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "Optional free-text carrier (e.g. a manual courier). Absence is never an error; a blank string is treated as absent."
+          },
+          "trackingNumber": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "Optional free-text tracking or consignment reference. Absence is never an error; a blank string is treated as absent."
+          }
+        }
+      },
+      "DispatchedLineDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "orderedQty": {
+            "type": "number",
+            "description": "What the order asked for"
+          },
+          "dispatchedQty": {
+            "type": "number",
+            "description": "What actually shipped for this line — the PICKED units"
+          },
+          "shortfallQty": {
+            "type": "number",
+            "description": "Derived: orderedQty − dispatchedQty (non-zero on a short-picked line)"
+          },
+          "ledgerEventId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The dispatch.dispatched event this line’s shipment was journalled as"
+          }
+        },
+        "required": [
+          "orderLineId",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "orderedQty",
+          "dispatchedQty",
+          "shortfallQty",
+          "ledgerEventId"
+        ]
+      },
+      "DispatchDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderStatus": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "ready_to_dispatch",
+              "dispatched",
+              "cancelled"
+            ],
+            "description": "Always dispatched on a successful dispatch"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "ingested"
+            ]
+          },
+          "integrationId": {
+            "type": "string",
+            "nullable": true
+          },
+          "externalEventId": {
+            "type": "string",
+            "nullable": true
+          },
+          "dispatchedBy": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The operator who dispatched it"
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC dispatch time"
+          },
+          "carrierName": {
+            "type": "string",
+            "nullable": true,
+            "description": "Free-text carrier; null when none was recorded"
+          },
+          "trackingNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "Free-text tracking reference; null when none was recorded"
+          },
+          "totalUnits": {
+            "type": "number",
+            "description": "Total units shipped — the sum of every line’s dispatchedQty"
+          },
+          "retiredReservationIds": {
+            "description": "The reservation holds this dispatch retired committed → released — the ATP correction. Empty when the order had none left to retire.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DispatchedLineDto"
+            }
+          }
+        },
+        "required": [
+          "orderId",
+          "tenantId",
+          "warehouseId",
+          "orderStatus",
+          "source",
+          "integrationId",
+          "externalEventId",
+          "dispatchedBy",
+          "dispatchedAt",
+          "carrierName",
+          "trackingNumber",
+          "totalUnits",
+          "retiredReservationIds",
+          "lines"
+        ]
+      },
+      "DispatchResponse": {
+        "type": "object",
+        "properties": {
+          "dispatch": {
+            "$ref": "#/components/schemas/DispatchDto"
+          }
+        },
+        "required": [
+          "dispatch"
+        ]
+      },
       "OrderEntryDto": {
         "type": "object",
         "properties": {
@@ -10089,6 +10389,7 @@
             "enum": [
               "accepted",
               "ready_to_dispatch",
+              "dispatched",
               "cancelled"
             ]
           },

@@ -6,6 +6,7 @@ import { OrderCommandService } from './order.command';
 import { WaveCommandService } from './wave.command';
 import { PickCommandService } from './pick.command';
 import { PackCommandService } from './pack.command';
+import { DispatchCommandService } from './dispatch.command';
 import { WAVE_CLOCK, SystemWaveClock } from './wave.clock';
 import { OutboundFacade } from './outbound.facade';
 
@@ -48,6 +49,16 @@ import { OutboundFacade } from './outbound.facade';
  * through `appendLedgerEventInTx`, and the only relational write is the
  * order's own `accepted → ready_to_dispatch` flip — a state machine this
  * module exclusively owns (AD-6).
+ *
+ * Story 4.6 adds the dispatch command — the state machine's TERMINAL
+ * transition, and the story that closes Epic 2's open loop: besides the
+ * `ready_to_dispatch → dispatched` flip and one zero-quantity
+ * `dispatch.dispatched` event per order line, it retires every `committed`
+ * hold the order still owns to `released` through
+ * `retireCommittedReservationInTx`, which is what finally takes the shipped
+ * units off the reserved counter and corrects ATP. It writes no new table and
+ * no inventory table (AD-6); the Valkey mirror rides `restoreReservedUnits`
+ * after the commit, journal-first (4.4's ordering).
  */
 @Module({
   imports: [SharedModule, InventoryModule, CatalogModule],
@@ -56,6 +67,7 @@ import { OutboundFacade } from './outbound.facade';
     WaveCommandService,
     PickCommandService,
     PackCommandService,
+    DispatchCommandService,
     { provide: WAVE_CLOCK, useClass: SystemWaveClock },
     OutboundFacade,
   ],

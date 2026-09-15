@@ -24,6 +24,8 @@ import { PickCommandService } from './pick.command';
 import type { PickSnapshot, PickTask, RecordPickCommand } from './pick.command';
 import { PackCommandService } from './pack.command';
 import type { PackOrderCommand, PackSnapshot } from './pack.command';
+import { DispatchCommandService } from './dispatch.command';
+import type { DispatchOrderCommand, DispatchSnapshot } from './dispatch.command';
 import type {
   CreateWavePolicyCommand,
   GenerateWaveCommand,
@@ -115,6 +117,7 @@ export class OutboundFacade {
     @Inject(WaveCommandService) private readonly waveCommand: WaveCommandService,
     @Inject(PickCommandService) private readonly pickCommand: PickCommandService,
     @Inject(PackCommandService) private readonly packCommand: PackCommandService,
+    @Inject(DispatchCommandService) private readonly dispatchCommand: DispatchCommandService,
   ) {}
 
   /** `POST .../outbound/orders` — manual entry and (adapter-ready) ingestion. */
@@ -362,6 +365,24 @@ export class OutboundFacade {
    */
   async packOrder(command: PackOrderCommand, idempotencyKey: string): Promise<PackSnapshot> {
     return this.packCommand.packOrder(command, idempotencyKey);
+  }
+
+  // ── dispatch (Story 4.6) ──────────────────────────────────────────────────
+
+  /**
+   * `POST .../outbound/orders/{orderId}/dispatch` (`dispatch.execute`): the
+   * order's TERMINAL transition. The `ready_to_dispatch → dispatched` flip,
+   * one zero-quantity `dispatch.dispatched` event per order line, and the
+   * retirement of every `committed` hold the order owns to `released` — the
+   * transition that finally restores the reserved counter and corrects ATP —
+   * all in ONE transaction. The optional free-text carrier and tracking
+   * reference ride the events' reference doc.
+   */
+  async dispatchOrder(
+    command: DispatchOrderCommand,
+    idempotencyKey: string,
+  ): Promise<DispatchSnapshot> {
+    return this.dispatchCommand.dispatchOrder(command, idempotencyKey);
   }
 
   /**

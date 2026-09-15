@@ -1249,6 +1249,54 @@ export class ReservationService implements OnModuleInit {
     tenantId: string,
     reservationId: string,
   ): Promise<ReservationSnapshot> {
+    return this.releaseFromStateInTx(tx, tenantId, reservationId, 'held');
+  }
+
+  /**
+   * `committed → released` inside the CALLER's transaction (story 4.6) — the
+   * hold's documented EXIT, and the transition that finally takes a shipped
+   * order's units off the reserved counter.
+   *
+   * Why this arm exists at all: a pick settles its hold to `committed` and
+   * leaves the units deducted from ATP "until the consuming ledger movement"
+   * (`schema.ts`), but nothing ever performed that retirement — so a picked
+   * order's units were subtracted from ATP TWICE, once as on-hand the draw
+   * removed and once as reserved nobody restored. Dispatch is where the
+   * architecture put the retirement; this is its journal half.
+   *
+   * Why `released` and not a new state: `held → committed → released/expired`
+   * is the declared lifecycle, the counter rebuild already sums only `held`
+   * and `committed`, and what distinguishes "shipped" from "cancelled" is the
+   * ORDER's status and the ledger, never the hold's state.
+   *
+   * Conditional on `state = 'committed'`, so AD-12's exactly-one-terminal-
+   * transition still holds: exactly one dispatch retires a hold and a second
+   * is a deterministic conflict — cancel-vs-dispatch double-release stays
+   * impossible. The Valkey mirror is NOT applied here for the same reason as
+   * `releaseInTx`: the caller applies one net `restoreReservedUnits` AFTER
+   * its commit.
+   */
+  async retireCommittedInTx(
+    tx: TenantTx,
+    tenantId: string,
+    reservationId: string,
+  ): Promise<ReservationSnapshot> {
+    return this.releaseFromStateInTx(tx, tenantId, reservationId, 'committed');
+  }
+
+  /**
+   * The shared body of both in-tx retirements: a conditional UPDATE off ONE
+   * named source state, whose rowcount is the single-winner proof. A row lost
+   * by it throws inside the caller's transaction, which rolls the whole
+   * command back: 404 when the reservation is absent, 409 when it is already
+   * terminal (AD-12).
+   */
+  private async releaseFromStateInTx(
+    tx: TenantTx,
+    tenantId: string,
+    reservationId: string,
+    fromState: 'held' | 'committed',
+  ): Promise<ReservationSnapshot> {
     if (!UUID_RE.test(reservationId)) {
       return this.terminalNotFound(reservationId);
     }
@@ -1259,7 +1307,7 @@ export class ReservationService implements OnModuleInit {
         and(
           eq(reservations.id, reservationId),
           eq(reservations.tenantId, tenantId),
-          eq(reservations.state, 'held'),
+          eq(reservations.state, fromState),
         ),
       )
       .returning();
@@ -1280,7 +1328,7 @@ export class ReservationService implements OnModuleInit {
       throw new ProblemException(
         'conflict',
         409,
-        'Reservation is not held',
+        `Reservation is not ${fromState}`,
         `The reservation is already terminal (state "${current.state}") — exactly one terminal transition wins (AD-12).`,
       );
     }
@@ -1458,6 +1506,44 @@ export class ReservationService implements OnModuleInit {
     ownerType: string,
     ownerIds: readonly string[],
   ): Promise<ReservationSnapshot[]> {
+    return this.ownedReservationsInTx(tx, tenantId, warehouseId, ownerType, ownerIds, 'held');
+  }
+
+  /**
+   * The same read for the `committed` holds (story 4.6) — what a dispatch
+   * retires. Owner-keyed for the same reason: a short pick's re-granted
+   * remainder may be referenced by no outbound column at all, and an order's
+   * hold set is only reliably reachable through `owner_id`.
+   *
+   * A partially short-picked order returns FEWER rows than it has lines, and
+   * that is correct: a line whose hold was already released (4.4's re-grant
+   * path, or 4.5's dead-hold sweep) has nothing left to retire, so nothing is
+   * double-restored.
+   *
+   * `reservations_open_owner_scope_unique` is partial on `state = 'held'`, so
+   * it does NOT serve this read; `reservations_tenant_state_expires_at_idx`
+   * does the tenant/state narrowing and the owner set is filtered on top. The
+   * set is one order's lines — single digits — so no index is added for it
+   * (4.6 writes no `reservations` migration by design).
+   */
+  async committedReservationsByOwnerInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    ownerType: string,
+    ownerIds: readonly string[],
+  ): Promise<ReservationSnapshot[]> {
+    return this.ownedReservationsInTx(tx, tenantId, warehouseId, ownerType, ownerIds, 'committed');
+  }
+
+  private async ownedReservationsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    ownerType: string,
+    ownerIds: readonly string[],
+    state: 'held' | 'committed',
+  ): Promise<ReservationSnapshot[]> {
     if (ownerIds.length === 0) {
       return [];
     }
@@ -1470,7 +1556,7 @@ export class ReservationService implements OnModuleInit {
           eq(reservations.warehouseId, warehouseId),
           eq(reservations.ownerType, ownerType),
           inArray(reservations.ownerId, [...ownerIds]),
-          eq(reservations.state, 'held'),
+          eq(reservations.state, state),
         ),
       )
       .orderBy(asc(reservations.id));

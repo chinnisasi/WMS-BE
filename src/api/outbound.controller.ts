@@ -18,6 +18,8 @@ import {
   CancelOrderDto,
   CreateOrderDto,
   CreateWavePolicyDto,
+  DispatchOrderDto,
+  DispatchResponse,
   GenerateWaveDto,
   OrderListQuery,
   OrderListResponse,
@@ -195,6 +197,61 @@ export class OutboundController {
       key,
     );
     return { pack: { ...snapshot.pack, lines: snapshot.pack.lines.map((line) => ({ ...line })) } };
+  }
+
+  @Post(':tenantId/outbound/orders/:orderId/dispatch')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'dispatch.execute — closes a packed order: the TERMINAL transition of the order state machine. One zero-quantity dispatch.dispatched ledger event per order line records the shipment (the units left stock at pick, so nothing moves), the order flips ready_to_dispatch → dispatched, and every committed reservation the order still owns is retired to released — the transition that finally restores the reserved counter and corrects ATP. The flip, the events, the retirements, the outbox event, the audit row and the idempotency key all commit in ONE transaction; the Valkey counter mirror follows the commit. Carrier and tracking number are optional free text. There is no un-dispatch: the arm is terminal.',
+  })
+  @ApiBody({ type: DispatchOrderDto, required: false })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: DispatchResponse,
+    description:
+      'The dispatch record: per line the ordered / dispatched / shortfall quantities with the SKU code and name and the dispatch.dispatched event it was journalled as, the carrier arms, and the reservation holds this dispatch retired (the idempotency snapshot — a replay re-serves it, nothing re-dispatches)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key or path parameter, or an over-long carrier / tracking value (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks dispatch.execute (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Order does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is already dispatched under a different key, or is not packed — it reads accepted or cancelled (conflict, naming the status); or a concurrent idempotent request (conflict). Nothing is written') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async dispatchOrder(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: DispatchOrderDto,
+  ): Promise<DispatchResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.dispatchOrder(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        orderId,
+        // `@IsOptional()` lets an explicit `null` through — normalized to
+        // absent so a dispatch with no carrier hashes identically either way.
+        carrierName: dto.carrierName ?? undefined,
+        trackingNumber: dto.trackingNumber ?? undefined,
+      },
+      key,
+    );
+    return {
+      dispatch: {
+        ...snapshot.dispatch,
+        retiredReservationIds: [...snapshot.dispatch.retiredReservationIds],
+        lines: snapshot.dispatch.lines.map((line) => ({ ...line })),
+      },
+    };
   }
 
   @Get(':tenantId/outbound/orders/:orderId')

@@ -494,7 +494,12 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
   // ── the grammar, the constants and the capability ─────────────────────────
 
   it('the order arm, the ledger grammar and the capability are registered (the drift guards)', async () => {
-    expect([...ORDER_STATUSES]).toEqual(['accepted', 'ready_to_dispatch', 'cancelled']);
+    expect([...ORDER_STATUSES]).toEqual([
+      'accepted',
+      'ready_to_dispatch',
+      'dispatched',
+      'cancelled',
+    ]);
 
     // The DB CHECK is the additive backstop to the TS constant (0023).
     const defs = await sql`

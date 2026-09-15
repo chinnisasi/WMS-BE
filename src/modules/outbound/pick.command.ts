@@ -34,6 +34,7 @@ import type { LedgerReferenceDoc } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { findReplanSlices, type ReplanSlice } from './replan';
 import { ORDER_OWNER_TYPE, ORDER_RESERVATION_TTL_SECONDS } from './order.command';
+import type { OrderStatus } from './order.command';
 
 /**
  * The fixed short-pick reason enum (story 4.4): required on EVERY short pick,
@@ -598,26 +599,19 @@ export class PickCommandService {
         // attribution, which is exactly what `pick-unresolvable` buys and
         // what a plain retryable `conflict` would have thrown away.
         //
-        // The `else` stays forward-looking for 4.6 under the rule this
-        // branch already carries: a terminal arm belongs above, anything an
-        // order can still leave belongs below.
-        const terminal = order.status === 'cancelled' || order.status === 'ready_to_dispatch';
-        throw terminal
-          ? pickUnresolvable(
-              order.status === 'cancelled' ? 'Order was cancelled' : 'Order was already packed',
-              order.status === 'cancelled'
-                ? `Order "${line.orderId}" reads "cancelled" — its units are not picked.`
-                : // A packed order's units WERE picked — that is why it is
-                  // packed. Saying otherwise sends the operator looking for
-                  // stock that is already in a parcel on the bench.
-                  `Order "${line.orderId}" reads "ready_to_dispatch" — it was verified at the pack bench and its picking is closed; this stop is not drawn again.`,
-            )
-          : new ProblemException(
-              'conflict',
-              409,
-              'Order is not accepted',
-              `Order "${line.orderId}" reads "${order.status}" — its units are not picked.`,
-            );
+        // Story 4.6 fills in the LAST arm: `dispatched`. A dispatched order
+        // has shipped — its shipment is journalled and its holds are retired
+        // — so a queued pick arriving after it can never be applied by any
+        // retry. Left out of the classification it would fall through to the
+        // RETRYABLE `conflict`, and the device would retry a terminally-dead
+        // op forever instead of quarantining it: an AD-14 taxonomy defect,
+        // not a cosmetic one.
+        //
+        // The classification now lives in `orderNotAcceptedRefusal`, which is
+        // EXHAUSTIVE over `ORDER_STATUSES` by construction — a new arm that
+        // nobody classifies is a compile error, not a silent fall-through
+        // back into this same defect.
+        throw orderNotAcceptedRefusal(line.orderId, order.status as OrderStatus);
       }
 
       // ── the scanned item (the wrong-item rejection, mirrored on-device) ──
@@ -1813,6 +1807,69 @@ export function pickBinShort(
  * the badge-in session that created it, for a human to review (Epic 5's story
  * 5.5 adds the web review queue).
  */
+/**
+ * The AD-14 classification of a non-`accepted` order a queued pick landed on:
+ * TERMINAL (`pick-unresolvable` — the device quarantines the op with session
+ * attribution and never retries it) versus retryable (`conflict`).
+ *
+ * It is a `switch` over `OrderStatus` with a `never` default on purpose. The
+ * previous shape was a hand-maintained `cancelled || ready_to_dispatch` list,
+ * and story 4.6 had to fix it precisely because `dispatched` was added to the
+ * state machine and nothing forced anyone to classify it: the new arm fell
+ * silently into the RETRYABLE branch, which is a device retrying a dead op
+ * forever. Adding an `ORDER_STATUSES` arm now fails `tsc` at the `never`
+ * assignment below, so the next author must decide which side it belongs on
+ * rather than discovering it in production.
+ *
+ * Behaviour for every arm that exists today is unchanged.
+ */
+function orderNotAcceptedRefusal(orderId: string, status: OrderStatus): ProblemException {
+  switch (status) {
+    case 'cancelled':
+      return pickUnresolvable(
+        'Order was cancelled',
+        `Order "${orderId}" reads "cancelled" — its units are not picked.`,
+      );
+    case 'ready_to_dispatch':
+      // A packed order's units WERE picked — that is why it is packed. Saying
+      // otherwise sends the operator looking for stock that is already in a
+      // parcel on the bench.
+      return pickUnresolvable(
+        'Order was already packed',
+        `Order "${orderId}" reads "ready_to_dispatch" — it was verified at the pack bench and its picking is closed; this stop is not drawn again.`,
+      );
+    case 'dispatched':
+      // A dispatched order's units WERE picked, packed and shipped. Saying
+      // otherwise sends the operator looking for stock that has left the
+      // building.
+      return pickUnresolvable(
+        'Order was already dispatched',
+        `Order "${orderId}" reads "dispatched" — it has shipped and its picking is closed; this stop is not drawn again.`,
+      );
+    // Unreachable — the caller classifies only a NON-accepted order — but
+    // named so the switch stays exhaustive and `default` below sees `never`.
+    case 'accepted':
+      return orderNotAcceptedConflict(orderId, status);
+    default: {
+      // A new `ORDER_STATUSES` arm makes this assignment fail to compile.
+      // At RUNTIME (a status the DB somehow holds outside `orders_status_check`)
+      // the answer stays the retryable conflict this branch always gave.
+      const unclassified: never = status;
+      return orderNotAcceptedConflict(orderId, unclassified);
+    }
+  }
+}
+
+/** The retryable arm: an order that may yet return to `accepted`. */
+function orderNotAcceptedConflict(orderId: string, status: string): ProblemException {
+  return new ProblemException(
+    'conflict',
+    409,
+    'Order is not accepted',
+    `Order "${orderId}" reads "${status}" — its units are not picked.`,
+  );
+}
+
 export function pickUnresolvable(title: string, detail: string): ProblemException {
   return new ProblemException(
     'pick-unresolvable',
