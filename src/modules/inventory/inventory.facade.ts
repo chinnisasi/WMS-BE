@@ -599,12 +599,6 @@ export class InventoryFacade {
   }
 
   /**
-   * The same read inside the caller's transaction (story 4.1): a sibling
-   * command that composes the reservation-state read with its own writes in
-   * ONE tenant transaction (the order snapshot) rides this in-tx passthrough
-   * — the `appendLedgerEventInTx` shape. Missing ids come back absent.
-   */
-  /**
    * The still-`held` holds owned by a set of owner ids in one warehouse
    * (story 4.5) — the pack command's read before it releases the holds a
    * packed order can no longer reach. Owner-keyed because a short pick's
@@ -629,6 +623,12 @@ export class InventoryFacade {
     );
   }
 
+  /**
+   * The same read inside the caller's transaction (story 4.1): a sibling
+   * command that composes the reservation-state read with its own writes in
+   * ONE tenant transaction (the order snapshot) rides this in-tx passthrough
+   * — the `appendLedgerEventInTx` shape. Missing ids come back absent.
+   */
   async reservationsByIdsInTx(
     tx: TenantTx,
     tenantId: string,
