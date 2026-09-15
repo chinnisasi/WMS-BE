@@ -24,6 +24,7 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerReferenceDoc } from '../inventory/inventory.facade';
+import { ORDER_OWNER_TYPE } from './order.command';
 import type { OrderSource, OrderStatus } from './order.command';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
@@ -35,11 +36,21 @@ const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
  * weight is a fat-fingered scale, not a parcel. The typed 400 is the
  * boundary (the 4.1 `MAX_LINE_QUANTITY` precedent).
  */
-const MAX_SCAN_QUANTITY = 2_147_483_647;
+export const MAX_SCAN_QUANTITY = 2_147_483_647;
+
+/**
+ * The ceiling on scan LINES in one pack. A parcel is one order's contents and
+ * an order's lines are already bounded; this bounds the aggregation and the
+ * problem-detail enumeration with it.
+ */
+export const MAX_SCAN_LINES = 500;
+
+/** The no-op mirror a replay owes (the original command already applied its own). */
+const EMPTY_RESTORES: ReadonlyMap<string, number> = new Map<string, number>();
 /** 1000 kg — past this the bench is reporting grams as milligrams. */
-const MAX_WEIGHT_GRAMS = 1_000_000;
+export const MAX_WEIGHT_GRAMS = 1_000_000;
 /** 100 m — past this the bench is reporting millimetres as micrometres. */
-const MAX_DIMENSION_MM = 100_000;
+export const MAX_DIMENSION_MM = 100_000;
 
 // ── command inputs ───────────────────────────────────────────────────────────
 
@@ -177,7 +188,12 @@ export class PackCommandService {
       dimensionsMm: command.dimensionsMm ?? undefined,
     });
 
-    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+    // The Valkey counter restores the released holds owe are RETURNED by the
+    // transaction callback, never staged in a closure variable (the 4.4
+    // rule): a mirror applied for a transaction that did not commit reads as
+    // ATP the journal still holds — the overselling direction — and an outer
+    // `let` would do exactly that if the callback were ever retried.
+    const committed = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── authority: the role is re-read from the DB per command (AD-10) ──
       assertPermission(
         await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
@@ -187,7 +203,9 @@ export class PackCommandService {
       // ── idempotency replay (before any read of state, before any write) ─
       const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replay !== null) {
-        return replay;
+        // A replay re-serves and mirrors NOTHING — the original command
+        // already applied its counter restore.
+        return { snapshot: replay, counterRestores: EMPTY_RESTORES, warehouseId: null };
       }
 
       // ── input shape (400 before anything is read) ───────────────────────
@@ -214,6 +232,21 @@ export class PackCommandService {
         );
       }
       if (order.status === 'ready_to_dispatch') {
+        // Two requests under the SAME key both pass the replay read above
+        // (neither key row exists yet), then serialize on this row lock. The
+        // loser must not be told to "replay the original Idempotency-Key" —
+        // that is precisely what it sent. Re-read the key HERE, under the
+        // lock, where the winner's row is now visible: if it holds a snapshot
+        // for this key, this IS the replay and the stored slip is the
+        // answer. (The generic `Concurrent idempotent request` 409 on the key
+        // insert is unreachable for a same-order race, because the order lock
+        // routes the loser through here first.)
+        const raced = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+        if (raced !== null) {
+          return { snapshot: raced, counterRestores: EMPTY_RESTORES, warehouseId: null };
+        }
+        // A DIFFERENT key against a packed order stays a 409 — the frozen
+        // matrix row: an order reaches Ready-to-Dispatch once.
         throw packConflict(
           'Order is already packed',
           `Order "${order.id}" already reads "ready_to_dispatch" — an order reaches Ready-to-Dispatch once. Replay the original Idempotency-Key to re-read its packing slip.`,
@@ -248,13 +281,34 @@ export class PackCommandService {
           `Order "${order.id}" is on no picklist — an unwaved order has not been picked, so there is nothing at the bench to verify.`,
         );
       }
+      // The FLOOR clause (spec amendment, review loop 1). `cancelWave` flips
+      // every non-drawing line to `cancelled` and DELIBERATELY leaves the
+      // order `accepted` and re-wavable (`waves.spec.ts` pins that). Such an
+      // order has rows, none `planned`, and no `picks` row at all — so
+      // without this it would pass completeness, match an empty scan, and
+      // flip to `ready_to_dispatch` holding nothing. It would then be
+      // WEDGED: cancel refuses a non-`accepted` order and both wave paths
+      // exclude it, so no path exists back. A wholly-withdrawn plan is the
+      // same "never picked" state that zero rows already refuses, and it
+      // gets the same answer.
+      //
+      // Only a WHOLLY withdrawn plan. A mixed order — some lines picked, one
+      // withdrawn by a wave cancel — stays packable, which is why `cancelled`
+      // is not dropped from the settled set generally: no path un-cancels a
+      // line, so excluding it there would strand the mixed case forever.
+      if (planLines.every((line) => line.status === 'cancelled')) {
+        throw packConflict(
+          'Order has not been picked',
+          `Order "${order.id}" has ${planLines.length} pick line(s) and every one was withdrawn (its wave was cancelled) — nothing was ever picked for it. Wave it again before packing.`,
+        );
+      }
       const outstanding = planLines.filter((line) => line.status === 'planned');
       if (outstanding.length > 0) {
         throw packConflict(
           'Order is not fully picked',
-          `Order "${order.id}" still has ${outstanding.length} planned pick line(s) (${outstanding
-            .map((line) => line.id)
-            .join(', ')}) — every stop settles before the order is packed.`,
+          `Order "${order.id}" still has ${outstanding.length} planned pick line(s) (${namedSample(
+            outstanding.map((line) => line.id),
+          )}) — every stop settles before the order is packed.`,
         );
       }
 
@@ -381,11 +435,16 @@ export class PackCommandService {
           referenceDoc,
         });
         const sku = skuById.get(line.skuId);
+        // A SKU the read did not return falls back to its ID, never to an
+        // empty string: this slip is durable (it IS the idempotency
+        // snapshot), and a blank code on a printed packing slip is a line
+        // nobody can identify afterwards. `assertScanMatchesPicked` already
+        // falls back the same way.
         packedLines.push({
           orderLineId: line.id,
           skuId: line.skuId,
-          skuCode: sku?.code ?? '',
-          skuName: sku?.name ?? '',
+          skuCode: sku?.code ?? line.skuId,
+          skuName: sku?.name ?? line.skuId,
           orderedQty: line.qty,
           packedQty,
           shortfallQty: line.qty - packedQty,
@@ -393,6 +452,50 @@ export class PackCommandService {
         });
         totalUnits += packedQty;
       }
+
+      // ── the dead holds this pack is the last chance to release ──────────
+      // (Spec amendment, review loop 1 — the one ATP carve-out.)
+      //
+      // After 4.4 a short pick releases an order line's whole hold and
+      // re-grants the REMAINDER as a fresh `held` row. When that remainder
+      // could not be re-planned anywhere, the new hold is referenced by no
+      // `order_lines` and no `picklist_lines` column — its only link back is
+      // `owner_id` — and it goes on counting against ATP for units that will
+      // never ship. 4.5 is what makes it unreachable: cancel, which used to
+      // be the path that released it, now refuses a `ready_to_dispatch`
+      // order. So the leak is one this story created, and this is where it
+      // closes; leaving it to the 7-day TTL would hide sellable stock, the
+      // exact failure ATP exists to prevent.
+      //
+      // Owner-keyed through the facade (AD-6), for the id-vs-owner reason
+      // above. In the SAME transaction as the flip and the events: the
+      // frozen "commit in one transaction" clause covers it, and the
+      // warehouse advisory lock the appends above took is still held.
+      //
+      // The Valkey mirror is NOT applied here — `releaseReservationInTx` is
+      // the journal half only. The counter restore rides OUT of the
+      // transaction and is applied after the commit (the 4.4 pattern): a
+      // decrement that outlived a rollback would read as ATP the journal
+      // still holds, the overselling direction.
+      const deadHolds = await this.inventory.heldReservationsByOwnerInTx(
+        tx,
+        command.tenantId,
+        order.warehouseId,
+        ORDER_OWNER_TYPE,
+        lines.map((line) => line.id),
+      );
+      const counterRestores = new Map<string, number>();
+      for (const hold of deadHolds) {
+        await this.inventory.releaseReservationInTx(tx, command.tenantId, hold.id);
+        counterRestores.set(hold.skuId, (counterRestores.get(hold.skuId) ?? 0) + hold.quantity);
+      }
+      // `order_lines.reservation_id` / `reserved_qty` are deliberately NOT
+      // cleared. Unlike a cancel, a pack does not undo the acceptance: a
+      // fully-picked line's hold is `committed`, which is a fact the order
+      // detail read should keep reporting, and the dead holds released above
+      // are typically referenced by no line column at all. The journal is the
+      // state authority (the snapshot reads it live through the facade), so a
+      // released hold already reads `released` everywhere.
 
       const snapshot: PackSnapshot = {
         pack: {
@@ -433,8 +536,25 @@ export class PackCommandService {
       });
 
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
-      return snapshot;
+      return { snapshot, counterRestores, warehouseId: order.warehouseId };
     });
+
+    // ── the counter mirror, now that the journal half is durable ──────────
+    // Journal first, mirror second (the 4.4 ordering): a mirror that never
+    // lands only leaves ATP understated until the next rebuild, which is the
+    // fail-safe direction; one applied for a rolled-back transaction would
+    // hand out stock the journal still holds.
+    if (committed.warehouseId !== null) {
+      for (const [skuId, units] of committed.counterRestores) {
+        await this.inventory.restoreReservedUnits(
+          command.tenantId,
+          committed.warehouseId,
+          skuId,
+          units,
+        );
+      }
+    }
+    return committed.snapshot;
   }
 
   // ── the verification ───────────────────────────────────────────────────────
@@ -472,7 +592,9 @@ export class PackCommandService {
       'pack-mismatch',
       422,
       'Scanned contents do not match what was picked',
-      `Order "${orderId}" was not packed — ${discrepancies.length} discrepancy(ies): ${discrepancies.join('; ')}. Nothing was written.`,
+      `Order "${orderId}" was not packed — ${discrepancies.length} discrepancy(ies): ${namedSample(
+        discrepancies,
+      )}. Nothing was written.`,
     );
   }
 
@@ -571,6 +693,11 @@ export class PackCommandService {
  * the command opens its transaction.
  */
 function aggregateScan(scanned: readonly PackScanLineInput[]): Map<string, number> {
+  if (scanned.length > MAX_SCAN_LINES) {
+    throw packValidation(
+      `A pack carries at most ${MAX_SCAN_LINES} scan line(s) (got ${scanned.length}).`,
+    );
+  }
   const totals = new Map<string, number>();
   for (const line of scanned) {
     if (!UUID_RE.test(line.skuId)) {
@@ -581,9 +708,37 @@ function aggregateScan(scanned: readonly PackScanLineInput[]): Map<string, numbe
         `Scanned quantity must be a positive integer in base UoM, at most ${MAX_SCAN_QUANTITY} (got ${String(line.qty)}).`,
       );
     }
-    totals.set(line.skuId, (totals.get(line.skuId) ?? 0) + line.qty);
+    const running = (totals.get(line.skuId) ?? 0) + line.qty;
+    // The per-LINE cap above is not the whole bound: 500 lines naming one
+    // SKU aggregate past the int4 ceiling and would die as a raw 22003 at
+    // the comparison against `picks`, which is exactly what the constant
+    // exists to prevent. The AGGREGATE carries the same cap (review loop 1).
+    if (running > MAX_SCAN_QUANTITY) {
+      throw packValidation(
+        `Scanned quantity for a SKU must total at most ${MAX_SCAN_QUANTITY} in base UoM across every line naming it.`,
+      );
+    }
+    totals.set(line.skuId, running);
   }
   return totals;
+}
+
+/**
+ * The cap on how many items a problem-detail string enumerates (review loop
+ * 1). Both enumerations below are caller-shaped — a 500-line scan can produce
+ * 500 discrepancies, and a wave can leave hundreds of stops outstanding — and
+ * a multi-kilobyte `detail` is unreadable to the operator AND a payload
+ * amplification an unauthenticated-adjacent caller controls. The COUNT is
+ * what tells them the size; the sample tells them where to start.
+ */
+const MAX_ENUMERATED_IN_DETAIL = 20;
+
+function namedSample(items: readonly string[]): string {
+  if (items.length <= MAX_ENUMERATED_IN_DETAIL) {
+    return items.join('; ');
+  }
+  const shown = items.slice(0, MAX_ENUMERATED_IN_DETAIL).join('; ');
+  return `${shown}; … and ${items.length - MAX_ENUMERATED_IN_DETAIL} more`;
 }
 
 function packValidation(detail: string): ProblemException {

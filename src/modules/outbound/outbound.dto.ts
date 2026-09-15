@@ -17,6 +17,16 @@ import {
 import { ApiProperty } from '@nestjs/swagger';
 import { ORDER_SOURCES, ORDER_STATUSES } from './order.command';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
+// The pack bounds are the COMMAND's constants, imported rather than copied:
+// a literal here and a constant there drift silently, and the DTO is the
+// gate every HTTP caller actually hits. (`order.command` / `pick.command`
+// set the precedent above; `pack.command` imports no DTO, so no cycle.)
+import {
+  MAX_DIMENSION_MM,
+  MAX_SCAN_LINES,
+  MAX_SCAN_QUANTITY,
+  MAX_WEIGHT_GRAMS,
+} from './pack.command';
 import {
   PICKLIST_LINE_STATUSES,
   PICKLIST_STATUSES,
@@ -884,25 +894,25 @@ export class PickTaskDto {
  * rather than a rule someone has to remember.
  */
 export class PackDimensionsDto {
-  @ApiProperty({ description: 'Length in millimetres', minimum: 1, maximum: 100000 })
+  @ApiProperty({ description: 'Length in millimetres', minimum: 1, maximum: MAX_DIMENSION_MM })
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(100000)
+  @Max(MAX_DIMENSION_MM)
   lengthMm!: number;
 
-  @ApiProperty({ description: 'Width in millimetres', minimum: 1, maximum: 100000 })
+  @ApiProperty({ description: 'Width in millimetres', minimum: 1, maximum: MAX_DIMENSION_MM })
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(100000)
+  @Max(MAX_DIMENSION_MM)
   widthMm!: number;
 
-  @ApiProperty({ description: 'Height in millimetres', minimum: 1, maximum: 100000 })
+  @ApiProperty({ description: 'Height in millimetres', minimum: 1, maximum: MAX_DIMENSION_MM })
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(100000)
+  @Max(MAX_DIMENSION_MM)
   heightMm!: number;
 }
 
@@ -916,12 +926,12 @@ export class PackScanLineDto {
     description:
       'Units of this SKU counted into the parcel, in base UoM. Two lines naming the same SKU sum — the bench scans items, not lines.',
     minimum: 1,
-    maximum: 2147483647,
+    maximum: MAX_SCAN_QUANTITY,
   })
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(2147483647)
+  @Max(MAX_SCAN_QUANTITY)
   qty!: number;
 }
 
@@ -936,10 +946,10 @@ export class PackOrderDto {
     type: [PackScanLineDto],
     description:
       'What the operator scanned into the parcel. May be empty only when the order picked nothing at all (every stop reported an empty bin).',
-    maxItems: 500,
+    maxItems: MAX_SCAN_LINES,
   })
   @IsArray()
-  @ArrayMaxSize(500)
+  @ArrayMaxSize(MAX_SCAN_LINES)
   @ValidateNested({ each: true })
   @Type(() => PackScanLineDto)
   scanned!: PackScanLineDto[];
@@ -949,14 +959,14 @@ export class PackOrderDto {
     nullable: true,
     type: Number,
     minimum: 1,
-    maximum: 1000000,
+    maximum: MAX_WEIGHT_GRAMS,
     description: 'Optional parcel weight in grams. Absence is never an error; a non-positive value is a 400.',
   })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(1)
-  @Max(1000000)
+  @Max(MAX_WEIGHT_GRAMS)
   weightGrams?: number | null;
 
   @ApiProperty({

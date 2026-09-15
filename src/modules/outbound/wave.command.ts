@@ -899,6 +899,23 @@ export class WaveCommandService {
         // so keeping its claim would wedge the order line out of every future
         // wave even after stock arrives. `picklistLineDrewUnits` is the one
         // predicate both cancel paths key on.
+        //
+        // Story 4.5, DEFENSIVE: the disposal is additionally scoped to the
+        // order statuses whose lines may still be withdrawn. The consequence
+        // is unreachable today — only non-drawing lines flip, and a
+        // `ready_to_dispatch` order cannot be re-waved, so no packed order's
+        // lines can be sitting on an open wave — but without the clause this
+        // statement is free to flip lines a `pack.packed` event has already
+        // journalled, which is the same trap `releaseWave`'s drop carried
+        // until this story narrowed it, and 4.6's `dispatched` arm would walk
+        // straight into it.
+        //
+        // An ALLOW-LIST, like every other order-status guard this story
+        // audited, so a new arm must be admitted deliberately rather than
+        // inheriting withdrawal by default. `cancelled` rides it beside
+        // `accepted`: a cancelled order's lines are exactly what a wave
+        // cancel is meant to free, and dropping them would leave `planned`
+        // rows holding `picklist_lines_open_order_line_unique` forever.
         await tx
           .update(picklistLines)
           .set({ status: 'cancelled', updatedAt: nowIso() })
@@ -907,6 +924,7 @@ export class WaveCommandService {
               eq(picklistLines.tenantId, command.tenantId),
               eq(picklistLines.waveId, wave.id),
               sql`not ${picklistLineDrewUnits()}`,
+              sql`exists (select 1 from ${orders} o where o.id = ${picklistLines.orderId} and o.tenant_id = ${picklistLines.tenantId} and o.status in ('accepted','cancelled'))`,
             ),
           );
         await tx

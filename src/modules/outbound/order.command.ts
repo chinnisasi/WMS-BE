@@ -603,6 +603,24 @@ export class OrderCommandService {
       }
       const target =
         winner ?? (await tx.select().from(orders).where(eq(orders.id, order.id)).limit(1))[0]!;
+      // Story 4.5: a lost flip is only the concurrent CANCEL's win when the
+      // order actually reads `cancelled` now. The phase-1 status guard above
+      // ran in its own transaction and released its `FOR UPDATE` at that
+      // commit, so a pack can land in the window between the two — and then
+      // the flip matches no row for a completely different reason. Serving
+      // the no-op here would answer 200 with a `ready_to_dispatch` order and
+      // record an idempotency snapshot of it: the very "silent no-op dressed
+      // as success" the phase-1 guard exists to prevent, reached by the back
+      // door. Re-check under THIS transaction's own read and throw the same
+      // refusal the guard would have.
+      if (winner === undefined && target.status !== 'cancelled') {
+        throw new ProblemException(
+          'conflict',
+          409,
+          'Order is not cancellable',
+          `Order "${order.id}" reads "${target.status}" — only an accepted order is cancelled here; its units have already left their bins.`,
+        );
+      }
       const snapshot = await this.snapshotOf(tx, target);
 
       if (winner !== undefined) {

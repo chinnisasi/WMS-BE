@@ -98,6 +98,11 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
     'PAK-REPICK', // …and must not accept a queued pick
     'PAK-CANCEL', // …and must not silently cancel
     'PAK-CHAIN', // the zero-quantity event and the ledger's own invariants
+    'PAK-WCXL', // review loop 1: a wave cancelled before any pick
+    'PAK-MIXA', // …and the MIXED order that must stay packable (picked line)
+    'PAK-MIXB', // …its sibling line, withdrawn by the same wave cancel
+    'PAK-HOLD', // review loop 1: the short pick's orphaned remainder hold
+    'PAK-KEYS', // review loop 1: replay with reordered dimension keys
   ] as const;
 
   let suiteDb: SuiteDatabase;
@@ -417,6 +422,34 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
     return { orderId, skuId, line };
   }
 
+  function cancelWave(waveId: string): SupertestTest {
+    return request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/waves/${waveId}/cancel`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({});
+  }
+
+  async function atp(skuId: string): Promise<{ onHand: number; reserved: number; atp: number }> {
+    return app.get(InventoryFacade).atp(tenantId, warehouseId, skuId);
+  }
+
+  /** Every journal hold owned by one order's LINES — id-free, like the command's read. */
+  async function holdsOfOrder(
+    orderId: string,
+  ): Promise<{ id: string; state: string; quantity: number }[]> {
+    return (await sql`
+      select r.id, r.state, r.quantity from reservations r
+      where r.tenant_id = ${tenantId}
+        and r.owner_type = 'order'
+        and r.owner_id in (
+          select ol.id::text from order_lines ol
+          where ol.tenant_id = ${tenantId} and ol.order_id = ${orderId}
+        )
+      order by r.id
+    `) as unknown as { id: string; state: string; quantity: number }[];
+  }
+
   async function orderStatus(orderId: string): Promise<string> {
     const rows = await sql`select status from orders where id = ${orderId}`;
     return (rows[0] as unknown as { status: string }).status;
@@ -613,6 +646,18 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
       const res = await packOrder(orderId, body).expect(400);
       expect(res.body.code).toBe('validation-failed');
     }
+    // The per-LINE cap is not the whole bound: duplicate lines AGGREGATE, and
+    // 500 of them naming one SKU would sail past int4 and die as a raw 22003
+    // at the comparison against `picks`. The aggregate carries the same cap.
+    const overflow = await packOrder(orderId, {
+      scanned: [
+        { skuId, qty: 2_000_000_000 },
+        { skuId, qty: 2_000_000_000 },
+      ],
+    }).expect(400);
+    expect(overflow.body.code).toBe('validation-failed');
+    expect(overflow.body.detail).toContain('across every line naming it');
+
     expect(await orderStatus(orderId)).toBe('accepted');
     expect(await packEvents(orderId)).toHaveLength(0);
 
@@ -693,6 +738,122 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
     expect(res.body.detail).toContain('on no picklist');
     expect(await orderStatus(orderId)).toBe('accepted');
     expect(await packEvents(orderId)).toHaveLength(0);
+  });
+
+  it('refuses an order whose plan was wholly withdrawn by a wave cancel — and it stays re-wavable', async () => {
+    // The wedge review loop 1 found. `cancelWave` flips every non-drawing
+    // line to `cancelled` and deliberately leaves the order `accepted` and
+    // re-wavable. Without the floor clause this order has rows, none
+    // `planned`, and no `picks` row — so an empty scan verified clean and it
+    // flipped to `ready_to_dispatch` holding nothing, after which cancel
+    // refuses it and both wave paths exclude it: unrecoverable.
+    const skuId = sku('PAK-WCXL');
+    await seedStock(skuId, binA, 20);
+    const { orderId, waveId } = await releasedWave([{ skuId, quantity: 3 }], 'wcxl');
+    await cancelWave(waveId).expect(200);
+    const statuses = await sql`
+      select status from picklist_lines where tenant_id = ${tenantId} and order_id = ${orderId}
+    `;
+    expect(statuses.map((row) => (row as unknown as { status: string }).status)).toEqual([
+      'cancelled',
+    ]);
+
+    const res = await packOrder(orderId, { scanned: [] }).expect(409);
+    expect(res.body.code).toBe('conflict');
+    expect(res.body.detail).toContain('withdrawn');
+    expect(await orderStatus(orderId)).toBe('accepted');
+    expect(await packEvents(orderId)).toHaveLength(0);
+
+    // …and the refusal keeps the order RECOVERABLE, which is the whole point:
+    // it waves again, picks, and packs.
+    const policy = await policyId(`wcxl2-${ulid().slice(10, 18)}`);
+    const generated = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/waves`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ warehouseId, policyId: policy, orderIds: [orderId] })
+      .expect(201);
+    const reWaveId = generated.body.wave.id as string;
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/waves/${reWaveId}/release`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+    const reWave = await getWave(reWaveId);
+    await pick(reWave.picklists[0]!.lines[0]!).expect(201);
+    await packOrder(orderId, { scanned: [{ skuId, qty: 3 }] }).expect(201);
+  });
+
+  it('a MIXED order — one line picked, one withdrawn by the same wave cancel — still packs', async () => {
+    // The floor clause refuses only a WHOLLY withdrawn plan. `cancelled` is
+    // not dropped from the settled set generally: no path un-cancels a line,
+    // so excluding it there would strand this order forever.
+    const pickedSkuId = sku('PAK-MIXA');
+    const withdrawnSkuId = sku('PAK-MIXB');
+    await seedStock(pickedSkuId, binA, 20);
+    await seedStock(withdrawnSkuId, binB, 20);
+    const { orderId, waveId, picklist } = await releasedWave(
+      [
+        { skuId: pickedSkuId, quantity: 2 },
+        { skuId: withdrawnSkuId, quantity: 4 },
+      ],
+      'mixed',
+    );
+    const pickedLine = picklist.lines.find((line) => line.skuId === pickedSkuId)!;
+    await pick(pickedLine).expect(201);
+    // The drawn line keeps its claim; the untouched one is withdrawn.
+    await cancelWave(waveId).expect(200);
+    const rows = await sql`
+      select status from picklist_lines
+      where tenant_id = ${tenantId} and order_id = ${orderId} order by sku_id
+    `;
+    const settled = rows.map((row) => (row as unknown as { status: string }).status).sort();
+    expect(settled).toEqual(['cancelled', 'picked']);
+
+    // Only the picked line's units are on the bench.
+    const res = await packOrder(orderId, { scanned: [{ skuId: pickedSkuId, qty: 2 }] }).expect(201);
+    expect(res.body.pack.totalUnits).toBe(2);
+    expect(res.body.pack.lines).toHaveLength(2);
+    const withdrawn = (res.body.pack.lines as Record<string, unknown>[]).find(
+      (line) => line.skuId === withdrawnSkuId,
+    )!;
+    expect(withdrawn.packedQty).toBe(0);
+    expect(withdrawn.shortfallQty).toBe(4);
+    expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
+  });
+
+  it('releases the dead holds a packed order can no longer reach, and ATP recovers', async () => {
+    // Story 4.4 releases a short-picked line's whole hold and re-grants the
+    // REMAINDER. With the SKU in exactly one bin there is nowhere to re-plan
+    // onto, so that fresh hold is referenced by no `order_lines` and no
+    // `picklist_lines` column — its only link back is `owner_id`. 4.5 is what
+    // makes it unreachable (cancel now refuses a packed order), so the pack
+    // is where it must be released.
+    const skuId = sku('PAK-HOLD');
+    await seedStock(skuId, binA, 20);
+    const { orderId, picklist } = await releasedWave([{ skuId, quantity: 5 }], 'hold');
+    await pick(picklist.lines[0]!, { qty: 3, reasonCode: 'fewer-units-than-planned' }).expect(201);
+
+    // The leak, before the pack: a live hold for the 2 units that never
+    // shipped, counted against ATP and reachable by no order column.
+    const before = await holdsOfOrder(orderId);
+    const live = before.filter((hold) => hold.state === 'held');
+    expect(live).toHaveLength(1);
+    expect(live[0]!.quantity).toBe(2);
+    const atpBefore = await atp(skuId);
+    expect(atpBefore.reserved).toBe(2);
+
+    await packOrder(orderId, { scanned: [{ skuId, qty: 3 }] }).expect(201);
+
+    // The journal half…
+    const after = await holdsOfOrder(orderId);
+    expect(after.filter((hold) => hold.state === 'held')).toHaveLength(0);
+    expect(after.find((hold) => hold.id === live[0]!.id)!.state).toBe('released');
+    // …and the Valkey mirror, applied after the commit.
+    const atpAfter = await atp(skuId);
+    expect(atpAfter.reserved).toBe(0);
+    expect(atpAfter.atp).toBe(atpBefore.atp + 2);
   });
 
   it('refuses a cancelled order', async () => {
@@ -895,6 +1056,11 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
     // forever against an order that will never go back to `accepted`.
     expect(res.body.code).toBe('pick-unresolvable');
     expect(res.body.detail).toContain('ready_to_dispatch');
+    // …and the reason it gives is the true one. A packed order's units WERE
+    // picked — that is why it is packed — so "its units are not picked" sent
+    // the operator hunting for stock already sitting in a parcel.
+    expect(res.body.detail).toContain('verified at the pack bench');
+    expect(res.body.detail).not.toContain('its units are not picked');
     expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
   });
 
@@ -921,7 +1087,40 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
     expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
   });
 
-  it('the order read and the order list report the new arm', async () => {
+  it('replays under the same key when the dimension keys arrive in a different order', async () => {
+    // Pinning an IMPLICIT guarantee, not fixing a bug: `plainToInstance`
+    // yields the DTO's declaration order regardless of the order the client
+    // sent, so `{heightMm, widthMm, lengthMm}` and `{lengthMm, widthMm,
+    // heightMm}` reach the command — and the payload hash — identically. The
+    // replay contract rests on that and nothing asserted it, so a future
+    // change to the transform would break a retrying pack bench silently.
+    const { orderId, skuId } = await pickedOrder('PAK-KEYS', 5, 'keys');
+    const key = ulid();
+    const first = await packOrder(
+      orderId,
+      {
+        scanned: [{ skuId, qty: 5 }],
+        dimensionsMm: { lengthMm: 400, widthMm: 250, heightMm: 120 },
+      },
+      operatorWebToken,
+      key,
+    ).expect(201);
+
+    const reordered = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/orders/${orderId}/pack`)
+      .set('Authorization', `Bearer ${operatorWebToken}`)
+      .set(KEY_HEADER, key)
+      // The SAME measurements, the keys transmitted in a different order.
+      .send({
+        scanned: [{ skuId, qty: 5 }],
+        dimensionsMm: { heightMm: 120, widthMm: 250, lengthMm: 400 },
+      })
+      .expect(201);
+    expect(reordered.body).toEqual(first.body);
+    expect(await packEvents(orderId)).toHaveLength(1);
+  });
+
+  it('the order detail read reports the new arm', async () => {
     const { orderId, skuId } = await pickedOrder('PAK-EXTRA', 2, 'read');
     await packOrder(orderId, { scanned: [{ skuId, qty: 2 }] }).expect(201);
     const detail = await request(app.getHttpServer())

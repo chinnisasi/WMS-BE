@@ -605,7 +605,12 @@ export class PickCommandService {
         throw terminal
           ? pickUnresolvable(
               order.status === 'cancelled' ? 'Order was cancelled' : 'Order was already packed',
-              `Order "${line.orderId}" reads "${order.status}" — its units are not picked.`,
+              order.status === 'cancelled'
+                ? `Order "${line.orderId}" reads "cancelled" — its units are not picked.`
+                : // A packed order's units WERE picked — that is why it is
+                  // packed. Saying otherwise sends the operator looking for
+                  // stock that is already in a parcel on the bench.
+                  `Order "${line.orderId}" reads "ready_to_dispatch" — it was verified at the pack bench and its picking is closed; this stop is not drawn again.`,
             )
           : new ProblemException(
               'conflict',

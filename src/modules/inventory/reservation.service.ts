@@ -1436,6 +1436,46 @@ export class ReservationService implements OnModuleInit {
     }
   }
 
+  /**
+   * Every still-`held` hold owned by a set of owner ids inside one warehouse,
+   * in the CALLER's transaction (story 4.5).
+   *
+   * Owner-keyed, not id-keyed, deliberately. Story 4.4's short pick releases
+   * an order line's whole hold and re-grants the remainder as a NEW row; when
+   * nothing could be re-planned onto, that new row is referenced by no
+   * `order_lines` or `picklist_lines` column at all — its only link back to
+   * the order is `owner_id`. A caller that collected ids from those columns
+   * would miss exactly the hold that leaks.
+   *
+   * `reservations_open_owner_scope_unique` is partial on `state = 'held'` and
+   * leads with (tenant, warehouse, sku, owner_type, owner_id), so the filter
+   * below is index-served and yields at most one row per (sku, owner).
+   */
+  async heldReservationsByOwnerInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    ownerType: string,
+    ownerIds: readonly string[],
+  ): Promise<ReservationSnapshot[]> {
+    if (ownerIds.length === 0) {
+      return [];
+    }
+    return tx
+      .select()
+      .from(reservations)
+      .where(
+        and(
+          eq(reservations.tenantId, tenantId),
+          eq(reservations.warehouseId, warehouseId),
+          eq(reservations.ownerType, ownerType),
+          inArray(reservations.ownerId, [...ownerIds]),
+          eq(reservations.state, 'held'),
+        ),
+      )
+      .orderBy(asc(reservations.id));
+  }
+
   async reservationsByIdsInTx(
     tx: TenantTx,
     tenantId: string,
