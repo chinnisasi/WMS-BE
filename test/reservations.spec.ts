@@ -47,6 +47,8 @@ const SKU_CODES = [
   'RSV-COMMIT',
   'RSV-RELEASE',
   'RSV-TTL',
+  'RSV-TTL-COMMITTED',
+  'RSV-TTL-INSIDE',
   'RSV-Q',
   'RSV-REBUILD',
   'RSV-ADJ',
@@ -495,6 +497,48 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     // The terminal transition serialized: a second cycle finds nothing to do.
     expect(await facade.expireDueReservations()).toBe(0);
     expect(await reservationRow(granted.id)).toMatchObject({ state: 'expired' });
+  });
+
+  it('TTL reaper: a COMMITTED row past TTL is reclaimed too — the stalled-order ATP leak', async () => {
+    // Story 4.6 made dispatch the only `committed → released` writer, and an
+    // order packed but never dispatched can reach neither it nor cancel. Its
+    // units left `stock_on_hand` at pick AND stayed on the reserved counter,
+    // so ATP was understated for them until someone noticed — which nothing
+    // does: a committed hold appears in no DTO and ATP only ever drifts down.
+    const skuId = skuIds.get('RSV-TTL-COMMITTED')!;
+    await seedStock(skuId, binA, 2);
+    const granted = await grant(skuId, ownerId('ttl-committed'), 1);
+    await facade.commitReservation(tenantId, granted.id);
+    expect(await reservationRow(granted.id)).toMatchObject({ state: 'committed' });
+
+    // `expires_at` is set at GRANT and never refreshed by the commit, so the
+    // bound is the acceptance TTL: an order dispatched inside it never meets
+    // this path at all.
+    await sql`update reservations set expires_at = now() - interval '1 second' where id = ${granted.id}`;
+
+    expect(await facade.expireDueReservations()).toBe(1);
+    expect(await reservationRow(granted.id)).toMatchObject({ state: 'expired' });
+
+    // The point of the whole change: the counter gave the units back.
+    const after = await facade.atp(tenantId, warehouseId, skuId);
+    expect(after.reserved).toBe(0);
+    expect(after.atp).toBe(after.onHand);
+
+    // Still exactly one terminal transition — a second cycle finds nothing.
+    expect(await facade.expireDueReservations()).toBe(0);
+    expect(await reservationRow(granted.id)).toMatchObject({ state: 'expired' });
+  });
+
+  it('TTL reaper: a committed row INSIDE its TTL is left alone', async () => {
+    // The guard that keeps a normally-dispatched order untouched. Without it
+    // this change would race every pick→dispatch window in the system.
+    const skuId = skuIds.get('RSV-TTL-INSIDE')!;
+    await seedStock(skuId, binA, 2);
+    const granted = await grant(skuId, ownerId('ttl-inside'), 1);
+    await facade.commitReservation(tenantId, granted.id);
+
+    expect(await facade.expireDueReservations()).toBe(0);
+    expect(await reservationRow(granted.id)).toMatchObject({ state: 'committed' });
   });
 
   it('quarantined scope: an open quarantine (sku, bin) excludes that on-hand from ATP — the flag now gates grants', async () => {

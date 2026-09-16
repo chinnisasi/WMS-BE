@@ -112,6 +112,7 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
     'DSP-RECXL', // …and must not be cancelled
     'DSP-ZERO', // a ZERO-unit short pick — nothing to retire, still dispatches
     'DSP-KEY', // one Idempotency-Key reused across cancel and dispatch
+    'DSP-REAPED', // the reaper reclaimed its hold before dispatch ran
     'DSP-MULTIA', // a fully-picked TWO-line order — both holds must retire
     'DSP-MULTIB', // …its second line
     'DSP-SAME', // TWO lines naming the SAME sku — the per-sku accumulation
@@ -761,8 +762,9 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
   it('retires EVERY committed hold of a fully-picked two-line order, not just the first', async () => {
     // One committed hold is indistinguishable from a loop that retires only
     // `committedHolds[0]`. A second unretired hold would count against ATP
-    // forever: `expireDue` sweeps `held` rows only, so nothing else on the
-    // system ever reaches a stranded `committed` one.
+    // until the reaper's acceptance TTL elapsed — days, not never (the reaper
+    // now sweeps `committed` too), but dispatch is still what closes it at
+    // the moment the units actually ship.
     const skuA = sku('DSP-MULTIA');
     const skuB = sku('DSP-MULTIB');
     await seedStock(skuA, binA, 20);
@@ -1196,6 +1198,40 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
     expect(await orderStatus(orderId)).toBe('dispatched');
     expect(await holdsOfOrder(orderId)).toEqual(holdsAfterDispatch);
     expect(await dispatchEvents(orderId)).toHaveLength(1);
+  });
+
+  it('dispatches cleanly when the reaper already reclaimed the hold — no double restore, no 409', async () => {
+    // The reaper now sweeps `committed` rows past their acceptance TTL, so a
+    // stalled order's hold can be `expired` BEFORE a late dispatch arrives.
+    // The retirement loop reads `state = 'committed'`, so such a row is
+    // simply invisible to it: nothing to retire, nothing to restore twice,
+    // and no conditional-update 409 rolling the dispatch back.
+    const skuId = sku('DSP-REAPED');
+    const { orderId } = await packedOrder('DSP-REAPED', 4, 'reaped');
+
+    const before = await holdsOfOrder(orderId);
+    expect(before.filter((hold) => hold.state === 'committed')).toHaveLength(1);
+
+    await sql`
+      update reservations set expires_at = now() - interval '1 second'
+      where tenant_id = ${tenantId} and state = 'committed'
+        and owner_id in (
+          select ol.id::text from order_lines ol
+          where ol.tenant_id = ${tenantId} and ol.order_id = ${orderId}
+        )`;
+    expect(await app.get(InventoryFacade).expireDueReservations()).toBe(1);
+
+    // The counter was already given back by the expiry.
+    const reaped = await atp(skuId);
+    expect(reaped.reserved).toBe(0);
+
+    // The dispatch still succeeds and honestly reports retiring nothing.
+    const res = await dispatchOrder(orderId).expect(201);
+    expect(res.body.dispatch.retiredReservationIds).toEqual([]);
+    expect(await orderStatus(orderId)).toBe('dispatched');
+
+    // And ATP did not move again — no second restore.
+    expect(await atp(skuId)).toMatchObject({ reserved: 0, atp: reaped.atp });
   });
 
   it('the dispatched order still reads back through the order surface, with its hold states intact', async () => {

@@ -709,16 +709,30 @@ export class ReservationService implements OnModuleInit {
 
   /**
    * The reaper's entry (driven through the facade by the jobs shell): every
-   * held row past `expires_at` transitions to `expired` via the conditional
-   * UPDATE (exactly one winner, whatever else races it) and its counter is
-   * restored. Returns the number of rows this cycle expired.
+   * held OR COMMITTED row past `expires_at` transitions to `expired` via the
+   * conditional UPDATE (exactly one winner, whatever else races it) and its
+   * counter is restored. Returns the number of rows this cycle expired.
+   *
+   * Why `committed` is swept too: story 4.6 made dispatch the only
+   * `committed → released` writer, and an order packed but never dispatched
+   * (sale cancelled after packing, parcel lost, operator walked away) can
+   * reach neither — cancel refuses a non-`accepted` order and there is no
+   * un-pack. Its units left `stock_on_hand` at pick AND stayed on the
+   * reserved counter, so ATP was understated for them permanently. `expires_at`
+   * is set at GRANT and never refreshed, so the bound is the acceptance TTL:
+   * an order dispatched inside it is untouched, a stalled one self-heals.
+   *
+   * The two terminal states stay informative rather than interchangeable —
+   * `released` is a hold a dispatch closed, `expired` is one that stalled.
+   * Dispatch reads `state = 'committed'`, so a row this reaper already
+   * expired never reaches its retirement loop: no double restore, no 409.
    */
   async expireDue(): Promise<number> {
     const due = (await this.authDb.execute(sql`
       select id, tenant_id as "tenantId", warehouse_id as "warehouseId",
              sku_id as "skuId", quantity
       from reservations
-      where state = 'held' and expires_at <= now()
+      where state in ('held', 'committed') and expires_at <= now()
       order by expires_at asc
       limit ${REAP_BATCH}
     `)) as unknown as DueHold[];
@@ -737,7 +751,9 @@ export class ReservationService implements OnModuleInit {
               and(
                 eq(reservations.id, hold.id),
                 eq(reservations.tenantId, hold.tenantId),
-                eq(reservations.state, 'held'),
+                // Still single-winner: a dispatch that retired this row to
+                // `released` first leaves rowcount 0 and we skip it below.
+                inArray(reservations.state, ['held', 'committed']),
               ),
             )
             .returning(),
