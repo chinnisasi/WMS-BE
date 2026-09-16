@@ -1,4 +1,5 @@
 import { ProblemException } from '../../shared/problem-details/problem.exception';
+import { MAX_CREDENTIAL_FIELDS, MAX_CREDENTIAL_VALUE_LENGTH } from './carrier-credentials';
 import type { CredentialValidationFailure } from './carrier-credentials';
 
 /**
@@ -43,18 +44,27 @@ export function credentialRejected(
         return `Carrier "${carrierCode}" declares no credential field named "${failure.field}".`;
       case 'non-string-value':
         return `The credential field "${failure.field}" must be a string.`;
+      case 'value-too-long':
+        return `The credential field "${failure.field}" exceeds the ${MAX_CREDENTIAL_VALUE_LENGTH}-character maximum.`;
+      case 'too-many-fields':
+        return `A credential carries at most ${MAX_CREDENTIAL_FIELDS} fields.`;
     }
   })();
   return new ProblemException('validation-failed', 400, 'Credential rejected', detail);
 }
 
-/** 400 `validation-failed` — the account label is required and non-blank. */
+/**
+ * 400 `validation-failed` — the account label is required, non-blank and
+ * bounded. The DTO's `@Length(1, 100)` counts characters, so `'   '` clears
+ * it; this is the arm that actually holds the invariant (and keeps a blank
+ * label off the DB CHECK, which would surface as a 500).
+ */
 export function accountLabelRequired(): ProblemException {
   return new ProblemException(
     'validation-failed',
     400,
     'accountLabel is required',
-    'A carrier connection carries a non-blank accountLabel (1-100 characters).',
+    'A carrier connection carries a non-blank accountLabel of at most 100 characters.',
   );
 }
 
@@ -97,6 +107,21 @@ export function carrierEncryptionUnavailable(): ProblemException {
   );
 }
 
+/**
+ * 503 `carrier-credential-unreadable` — the sealed blob will not open under
+ * the current master key. AES-GCM authenticates, so this fails closed instead
+ * of handing back garbage; the cause is a key changed after the material was
+ * sealed, and the fix is a rotation under the current key.
+ */
+export function carrierCredentialUnreadable(connectionId: string): ProblemException {
+  return new ProblemException(
+    'carrier-credential-unreadable',
+    503,
+    'Carrier credential cannot be opened',
+    `The stored credential for connection ${connectionId} does not open under the current CARRIER_ENCRYPTION_KEY — rotate the connection to re-seal it under the current key.`,
+  );
+}
+
 /** 409 — the same Idempotency-Key is being processed concurrently. */
 export function concurrentIdempotency(): ProblemException {
   return new ProblemException(
@@ -117,7 +142,11 @@ export function invalidCursor(): ProblemException {
   );
 }
 
-/** 400 `validation-failed` — a uuid path param that is not a uuid. */
+/**
+ * 400 `validation-failed` — a uuid path param that is not a uuid. Called from
+ * `carriers.controller.ts`, so the refusal is stated once (this file's rule)
+ * rather than re-implemented at the boundary.
+ */
 export function invalidUuidParam(name: string, value: string): ProblemException {
   return new ProblemException(
     'validation-failed',

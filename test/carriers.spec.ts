@@ -364,6 +364,55 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
     }).expect(400);
     expect(undeclared.body.detail).toContain('licenceKey');
 
+    // `credential` must be an OBJECT of fields — a bare string would reach
+    // `seal()` as something no adapter could ever read back.
+    const notAnObject = await connect(token, tenantId, {
+      carrierCode: 'delhivery',
+      accountLabel: 'Delhivery — Mumbai',
+      credential: 'canary-delhivery-token-f3a91c',
+    }).expect(400);
+    expect(notAnObject.body).toMatchObject({ code: 'validation-failed' });
+    expect(JSON.stringify(notAnObject.body)).not.toContain(DELHIVERY_CREDENTIAL.apiToken);
+
+    // …and every value in it must be a string (a number would serialize into
+    // the sealed JSON as something the adapter contract does not allow).
+    const nonString = await connect(token, tenantId, {
+      carrierCode: 'delhivery',
+      accountLabel: 'Delhivery — Mumbai',
+      credential: { ...DELHIVERY_CREDENTIAL, apiToken: 123 },
+    }).expect(400);
+    expect(nonString.body.detail).toContain('apiToken');
+
+    // Values are bounded: without a ceiling a `carrier.manage` holder could
+    // seal megabytes into a row every list query carries.
+    const huge = 'x'.repeat(513);
+    const tooLong = await connect(token, tenantId, {
+      carrierCode: 'delhivery',
+      accountLabel: 'Delhivery — Mumbai',
+      credential: { ...DELHIVERY_CREDENTIAL, apiToken: huge },
+    }).expect(400);
+    expect(tooLong.body.detail).toContain('apiToken');
+    // Naming the field, never echoing it.
+    expect(JSON.stringify(tooLong.body)).not.toContain(huge);
+
+    // The account label: `@Length(1, 100)` counts characters, so a blank one
+    // clears the DTO and must be caught in the command — otherwise it reaches
+    // the DB CHECK and renders as a 500.
+    const blankLabel = await connect(token, tenantId, {
+      carrierCode: 'delhivery',
+      accountLabel: '   ',
+      credential: { ...DELHIVERY_CREDENTIAL },
+    }).expect(400);
+    expect(blankLabel.body).toMatchObject({ code: 'validation-failed' });
+    expect(blankLabel.body.title).toContain('accountLabel');
+
+    const longLabel = await connect(token, tenantId, {
+      carrierCode: 'delhivery',
+      accountLabel: 'L'.repeat(101),
+      credential: { ...DELHIVERY_CREDENTIAL },
+    }).expect(400);
+    expect(longLabel.body).toMatchObject({ code: 'validation-failed' });
+
     const sql = db();
     try {
       const rows = await sql`select count(*)::int as n from carrier_connections where tenant_id = ${tenantId}`;
@@ -539,6 +588,18 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
       await disconnect(member.token, tenantId, connectionId).expect(403);
     }
 
+    // **Authority precedes validation.** A body this role could never have
+    // submitted anyway — an unknown carrier code — must still answer 403, not
+    // the 400 that would disclose which codes the registry holds. Without
+    // this arm the ordering in `connect` could silently revert.
+    const disclosing = await connect(operator.token, tenantId, {
+      carrierCode: 'shiprocket',
+      accountLabel: 'Aggregator',
+      credential: {},
+    }).expect(403);
+    expect(disclosing.body).toMatchObject({ code: 'role-denied' });
+    expect(JSON.stringify(disclosing.body)).not.toContain('delhivery');
+
     // Reads stay open to any member (the repo never gates a read) — and they
     // still carry no secret.
     const listed = await listConnections(accountant.token, tenantId).expect(200);
@@ -548,6 +609,12 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
     // Another tenant's session on this path is 403; its own path cannot see
     // this connection at all (404, not 403 — the id simply does not exist
     // there).
+    // No session at all is the documented 401 on every route here.
+    const anonymous = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/carriers`)
+      .expect(401);
+    expect(anonymous.body).toMatchObject({ code: 'unauthenticated' });
+
     const other = await freshTenant();
     const foreign = await listConnections(other.token, tenantId).expect(403);
     expect(foreign.body).toMatchObject({ code: 'permission-denied' });
@@ -565,7 +632,7 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
 
   // ── the master key ─────────────────────────────────────────────────────────
 
-  it('with CARRIER_ENCRYPTION_KEY unset every command answers 503 and writes nothing', async () => {
+  it('with CARRIER_ENCRYPTION_KEY unset CONNECT and ROTATE answer 503 and write nothing — disconnect is exempt', async () => {
     const { tenantId, token } = await freshTenant();
     const created = await connect(token, tenantId, delhiveryBody()).expect(201);
     const connectionId = created.body.id as string;
@@ -573,6 +640,7 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
     const saved = process.env.CARRIER_ENCRYPTION_KEY;
     delete process.env.CARRIER_ENCRYPTION_KEY;
     try {
+      // The two commands that must SEAL something cannot proceed.
       const connectRes = await connect(token, tenantId, {
         carrierCode: 'ecom_express',
         accountLabel: 'Ecom Express — Pune',
@@ -591,17 +659,30 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
       } finally {
         await sql.end();
       }
+
+      // A too-short key is the same fault as no key at all.
+      process.env.CARRIER_ENCRYPTION_KEY = 'too-short';
+      await rotate(token, tenantId, connectionId, DELHIVERY_ROTATED).expect(503);
+      delete process.env.CARRIER_ENCRYPTION_KEY;
+
+      // **Disconnect is deliberately key-free** (human decision): it seals
+      // nothing, and a lost or rotated-away master key must never strand a
+      // tenant with credential rows that nothing can remove — the one case
+      // where being unable to read the secret is precisely the reason to
+      // delete it. Pinned here so the exemption stays a decision rather than
+      // an accident of where the key happens to be touched.
+      const removed = await disconnect(token, tenantId, connectionId).expect(200);
+      expect(removed.body.id).toBe(connectionId);
+
+      const after = db();
+      try {
+        const rows = await after`select count(*)::int as n from carrier_connections where tenant_id = ${tenantId}`;
+        expect(Number((rows[0] as unknown as { n: number }).n)).toBe(0);
+      } finally {
+        await after.end();
+      }
     } finally {
       process.env.CARRIER_ENCRYPTION_KEY = saved;
-    }
-
-    // A too-short key is the same fault as no key at all.
-    const shortKey = process.env.CARRIER_ENCRYPTION_KEY;
-    process.env.CARRIER_ENCRYPTION_KEY = 'too-short';
-    try {
-      await rotate(token, tenantId, connectionId, DELHIVERY_ROTATED).expect(503);
-    } finally {
-      process.env.CARRIER_ENCRYPTION_KEY = shortKey;
     }
   });
 
@@ -649,6 +730,67 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
     expect(craftedRes.body).toMatchObject({ code: 'invalid-cursor' });
 
     await listConnections(token, tenantId, '?limit=0').expect(400);
+  });
+
+  // ── persistence guards ─────────────────────────────────────────────────────
+
+  it('0025 CHECK constraints: a non-envelope blob, a non-positive version, a blank label and a half-stamped rotation are rejected (23514)', async () => {
+    // Nothing in the application layer attempts any of these, so without this
+    // probe the four hand-appended `ADD CONSTRAINT` lines in the migration
+    // could be deleted and the whole suite would still pass. The CHECKs are
+    // the DB-side backstop to the command's own refusals — most of all the
+    // envelope one, which is what makes "plaintext in this column" a failed
+    // write rather than a quietly kept secret.
+    const { tenantId, ownerId } = await freshTenant();
+    const sql = db();
+    try {
+      const row = (overrides: Record<string, unknown>): Record<string, unknown> => ({
+        id: uuidv7(),
+        tenant_id: tenantId,
+        carrier_code: 'delhivery',
+        account_label: 'Delhivery — Mumbai',
+        credential_sealed: 'v1:aXY=:dGFn:Y3Q=',
+        credential_version: 1,
+        connected_by: ownerId,
+        rotated_at: null,
+        rotated_by: null,
+        ...overrides,
+      });
+      const insert = (overrides: Record<string, unknown>) => {
+        const values = row(overrides);
+        return sql.unsafe(
+          `insert into carrier_connections
+             (id, tenant_id, carrier_code, account_label, credential_sealed,
+              credential_version, connected_by, rotated_at, rotated_by)
+           values ($1::uuid, $2::uuid, $3, $4, $5, $6, $7::uuid, $8::timestamptz, $9::uuid)`,
+          Object.values(values) as never[],
+        );
+      };
+
+      // …_credential_sealed_envelope: raw material can never be stored.
+      await expect(
+        insert({ credential_sealed: 'canary-delhivery-token-f3a91c' }),
+      ).rejects.toMatchObject({ code: '23514' });
+      // …_credential_version_positive: the generation counter starts at 1.
+      await expect(insert({ credential_version: 0 })).rejects.toMatchObject({ code: '23514' });
+      // …_account_label_nonblank: whitespace is not a label.
+      await expect(insert({ account_label: '   ' })).rejects.toMatchObject({ code: '23514' });
+      // …_rotation_stamp_paired: WHEN and BY WHOM are stamped together.
+      await expect(
+        insert({ rotated_at: new Date().toISOString(), rotated_by: null }),
+      ).rejects.toMatchObject({ code: '23514' });
+      await expect(insert({ rotated_at: null, rotated_by: ownerId })).rejects.toMatchObject({
+        code: '23514',
+      });
+
+      // Meaningfulness: the same statement with nothing violated inserts
+      // cleanly, so each rejection above is the CHECK and not a typo.
+      await insert({});
+      const stored = await sql`select count(*)::int as n from carrier_connections where tenant_id = ${tenantId}`;
+      expect(Number((stored[0] as unknown as { n: number }).n)).toBe(1);
+    } finally {
+      await sql.end();
+    }
   });
 
   // ── tenant isolation ───────────────────────────────────────────────────────

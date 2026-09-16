@@ -78,7 +78,11 @@ export const CAPABILITIES = [
   // rotate its material, disconnect it). A SETTINGS capability, mirroring
   // `device.manage` / `vendor.manage`: Owner and Ops Manager only, absent
   // from `operator` and `accountant` — an API key is not a floor verb.
-  // Mirrored into wms-fe `src/lib/users.ts`.
+  // Deliberately NOT on the carrier reads: the registry catalogue and the
+  // connection list are open to any tenant member, because reads are never
+  // gated here (the rule at the top of this file) — and those rows carry the
+  // connection's public face only, never credential material, so there is
+  // nothing for a gate to protect. Mirrored into wms-fe `src/lib/users.ts`.
   'carrier.manage',
 ] as const;
 

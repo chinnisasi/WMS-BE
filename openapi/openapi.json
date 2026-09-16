@@ -7433,7 +7433,7 @@
             }
           },
           "409": {
-            "description": "This carrier is already connected for the tenant — rotate instead (carrier-already-connected)",
+            "description": "This carrier is already connected for the tenant — rotate instead (carrier-already-connected), or the same Idempotency-Key is in flight concurrently (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7532,7 +7532,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, malformed connectionId, or credential material missing a required field (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, malformed connectionId, credential material missing a required field, or a connection whose carrier this build no longer registers (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7563,6 +7563,16 @@
           },
           "404": {
             "description": "No such connection in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The same Idempotency-Key is being processed concurrently (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7682,6 +7692,16 @@
           },
           "404": {
             "description": "No such connection in this tenant, or it was already disconnected (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The same Idempotency-Key is being processed concurrently (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {

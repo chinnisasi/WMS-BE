@@ -356,6 +356,8 @@ describe('architecture: carrier credentials are carriers-module-owned (story 4.6
   const RAW_CARRIER_TABLES = 'carrier_connections';
   const carriersRoot = join(SRC_ROOT, 'modules', 'carriers');
   const CREDENTIAL_OWNER = join(carriersRoot, 'carrier-credentials.ts');
+  /** Any import of the envelope primitives, at any depth and via any alias. */
+  const ENVELOPE_IMPORT = /from\s+['"][^'"]*crypto\/envelope['"]/;
 
   it('no carrier-connection write happens outside the carriers module', () => {
     const outside = files.filter((file) => !file.path.startsWith(carriersRoot));
@@ -439,11 +441,11 @@ describe('architecture: carrier credentials are carriers-module-owned (story 4.6
         offenders.push(`${file.path}: reads process.env.CARRIER_ENCRYPTION_KEY`);
       }
       // Only the credential owner may reach the raw seal/open primitives with
-      // carrier material; everything else handles the public face.
-      if (
-        file.path.startsWith(carriersRoot) &&
-        /from '\.\.\/\.\.\/shared\/crypto\/envelope'/.test(file.source)
-      ) {
+      // carrier material; everything else handles the public face. Matched on
+      // the specifier SUFFIX, not an exact relative prefix: a file one
+      // directory deeper (`../../../shared/...`) or an aliased import would
+      // otherwise walk straight past a guard that claims to confine this.
+      if (file.path.startsWith(carriersRoot) && ENVELOPE_IMPORT.test(file.source)) {
         offenders.push(`${file.path}: imports the envelope primitives`);
       }
     }
@@ -452,7 +454,17 @@ describe('architecture: carrier credentials are carriers-module-owned (story 4.6
     // asserting the absence of something that exists nowhere.
     const owner = readFileSync(CREDENTIAL_OWNER, 'utf8');
     expect(owner).toContain('process.env.CARRIER_ENCRYPTION_KEY');
-    expect(owner).toContain("from '../../shared/crypto/envelope'");
+    expect(ENVELOPE_IMPORT.test(owner)).toBe(true);
+    // The matcher itself: suffix, any depth, any quote style — and it does
+    // not fire on a neighbouring module whose name merely ends the same way.
+    for (const reaching of [
+      "from '../../shared/crypto/envelope'",
+      'from "../../../../shared/crypto/envelope"',
+      "from 'src/shared/crypto/envelope'",
+    ]) {
+      expect(ENVELOPE_IMPORT.test(reaching)).toBe(true);
+    }
+    expect(ENVELOPE_IMPORT.test("from '../../shared/crypto/envelope-registry'")).toBe(false);
   });
 
   it('no carrier response shape, outbox payload or audit row can carry the sealed blob', () => {

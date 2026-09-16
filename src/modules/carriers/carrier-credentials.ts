@@ -3,11 +3,16 @@ import { open, seal } from '../../shared/crypto/envelope';
 import type { CarrierAdapter } from './carrier-registry';
 
 /**
- * Carrier credential sealing (Story 4.6b, AD-15) — **the only file in the
- * repo that touches carrier plaintext.** Everything downstream (the command,
- * the facade, the DTOs, the outbox, the audit trail) handles either the
- * sealed blob or the connection's public face, and the architecture test
- * pins that confinement.
+ * Carrier credential sealing (Story 4.6b, AD-15) — **the only file that holds
+ * the master key or produces and opens the sealed blob.** Plaintext itself
+ * does travel: the DTO carries it inbound (write-only) and the command holds
+ * the validated record long enough to seal it. What is confined here, and
+ * what the architecture test pins, is narrower and is the part that matters —
+ * `process.env.CARRIER_ENCRYPTION_KEY` and the `envelope.ts` primitives live
+ * nowhere else, so there is exactly one place that can turn material into
+ * storage or storage back into material. Everything past the seal (the
+ * outbox, the audit trail, the snapshot, every response) handles the
+ * connection's public face only.
  *
  * The master key is `CARRIER_ENCRYPTION_KEY`, deliberately NOT
  * `DEVICE_ENCRYPTION_KEY` (human decision, 2026-09-16): carrier secrets and
@@ -92,10 +97,33 @@ export function credentialHmac(credential: CarrierCredential): string {
     .digest('hex');
 }
 
+/**
+ * Per-value ceiling. Credential material is API tokens, licence keys and
+ * login ids — none of them long. Without a bound, a `carrier.manage` holder
+ * could seal a multi-megabyte value into a row that every list query and
+ * every future adapter call has to carry; story 4.6 bounded its carrier and
+ * tracking strings at 200 characters on exactly this reasoning, and 512
+ * leaves generous headroom for a long signed token.
+ */
+export const MAX_CREDENTIAL_VALUE_LENGTH = 512;
+
+/**
+ * Ceiling on how many fields a caller may supply. Undeclared fields are
+ * refused one at a time, so this bounds the work done before that refusal —
+ * no adapter declares anything close to it.
+ */
+export const MAX_CREDENTIAL_FIELDS = 16;
+
 /** What `validateCredential` refuses, and why — the caller maps it to a 400. */
 export interface CredentialValidationFailure {
-  readonly reason: 'not-an-object' | 'missing-field' | 'unknown-field' | 'non-string-value';
-  /** The offending field name (absent only for `not-an-object`). */
+  readonly reason:
+    | 'not-an-object'
+    | 'missing-field'
+    | 'unknown-field'
+    | 'non-string-value'
+    | 'value-too-long'
+    | 'too-many-fields';
+  /** The offending field name (absent on `not-an-object`/`too-many-fields`). */
   readonly field?: string;
 }
 
@@ -107,7 +135,9 @@ export interface CredentialValidationFailure {
  *  - every field the adapter marks `required` must be present and non-blank;
  *  - no field the adapter does not declare may be stored — a typo'd field
  *    name would otherwise seal a useless credential that only fails much
- *    later, at the first real carrier call.
+ *    later, at the first real carrier call;
+ *  - no value exceeds `MAX_CREDENTIAL_VALUE_LENGTH` and no request supplies
+ *    more than `MAX_CREDENTIAL_FIELDS` of them.
  *
  * Values are trimmed: a credential pasted with trailing whitespace is the
  * same credential, and a whitespace-only value is no value at all.
@@ -121,12 +151,21 @@ export function validateCredential(
   }
   const declared = new Map(adapter.credentialFields.map((field) => [field.name, field]));
   const record = supplied as Record<string, unknown>;
-  for (const key of Object.keys(record)) {
+  const keys = Object.keys(record);
+  if (keys.length > MAX_CREDENTIAL_FIELDS) {
+    return { failure: { reason: 'too-many-fields' } };
+  }
+  for (const key of keys) {
     if (!declared.has(key)) {
       return { failure: { reason: 'unknown-field', field: key } };
     }
-    if (typeof record[key] !== 'string') {
+    const value = record[key];
+    if (typeof value !== 'string') {
       return { failure: { reason: 'non-string-value', field: key } };
+    }
+    // Bounded before the trim, so padding cannot smuggle length past it.
+    if (value.length > MAX_CREDENTIAL_VALUE_LENGTH) {
+      return { failure: { reason: 'value-too-long', field: key } };
     }
   }
   const credential: Record<string, string> = {};

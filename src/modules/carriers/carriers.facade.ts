@@ -16,9 +16,14 @@ import type {
 } from './carrier.command';
 import { listCarrierAdapters } from './carrier-registry';
 import type { CarrierAdapter } from './carrier-registry';
-import { openCredential } from './carrier-credentials';
+import { MissingCarrierEncryptionKeyError, openCredential } from './carrier-credentials';
 import type { CarrierCredential } from './carrier-credentials';
-import { carrierConnectionNotFound, invalidCursor } from './carriers.errors';
+import {
+  carrierConnectionNotFound,
+  carrierCredentialUnreadable,
+  carrierEncryptionUnavailable,
+  invalidCursor,
+} from './carriers.errors';
 
 // The facade is the only sibling-facing seam (AD-6, architecture test): the
 // shapes a consumer needs ride along here so nothing imports the module's
@@ -209,6 +214,19 @@ export class CarriersFacade {
     if (sealed === null) {
       throw carrierConnectionNotFound();
     }
-    return openCredential(sealed);
+    try {
+      return openCredential(sealed);
+    } catch (err) {
+      if (err instanceof MissingCarrierEncryptionKeyError) {
+        // Same fault, same answer as connect/rotate — never a raw 500.
+        throw carrierEncryptionUnavailable();
+      }
+      // The blob is there and the key is there, but the envelope will not
+      // open: the realistic trigger is a key that was changed after this
+      // material was sealed (AES-GCM authenticates, so it fails closed rather
+      // than handing back garbage). The operator's way out is to rotate the
+      // connection under the current key, which the detail says.
+      throw carrierCredentialUnreadable(connectionId);
+    }
   }
 }

@@ -10,6 +10,7 @@ import type { TenantSession } from '../modules/tenancy/jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { CarriersFacade } from '../modules/carriers/carriers.facade';
+import { invalidUuidParam } from '../modules/carriers/carriers.errors';
 import type { CarrierConnectionView } from '../modules/carriers/carriers.facade';
 import {
   CarrierCatalogueResponse,
@@ -133,7 +134,7 @@ export class CarriersController {
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an unknown carrierCode, or credential material missing a required field (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks carrier.manage (role-denied)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('This carrier is already connected for the tenant — rotate instead (carrier-already-connected)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('This carrier is already connected for the tenant — rotate instead (carrier-already-connected), or the same Idempotency-Key is in flight concurrently (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiResponse({ status: 503, ...problemJsonResponse('The deployment has no CARRIER_ENCRYPTION_KEY (carrier-encryption-unavailable)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
@@ -169,10 +170,11 @@ export class CarriersController {
   @ApiBody({ type: RotateCarrierCredentialDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.OK, type: CarrierConnectionResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, malformed connectionId, or credential material missing a required field (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, malformed connectionId, credential material missing a required field, or a connection whose carrier this build no longer registers (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks carrier.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No such connection in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The same Idempotency-Key is being processed concurrently (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiResponse({ status: 503, ...problemJsonResponse('The deployment has no CARRIER_ENCRYPTION_KEY (carrier-encryption-unavailable)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
@@ -208,6 +210,7 @@ export class CarriersController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks carrier.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No such connection in this tenant, or it was already disconnected (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The same Idempotency-Key is being processed concurrently (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'connectionId', format: 'uuid' })
@@ -241,12 +244,7 @@ function toConnectionResponse(connection: CarrierConnectionView): CarrierConnect
 /** Connection uuid path params fail 400 (not a 500 from the `::uuid` cast). */
 function assertUuidParam(value: string): void {
   if (!UUID_RE.test(value)) {
-    throw new ProblemException(
-      'validation-failed',
-      400,
-      'connectionId must be a uuid',
-      `The "connectionId" path parameter must be a uuid (got "${value}").`,
-    );
+    throw invalidUuidParam('connectionId', value);
   }
 }
 

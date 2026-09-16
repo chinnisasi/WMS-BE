@@ -192,36 +192,42 @@ export class CarrierCommandService {
     command: ConnectCarrierCommand,
     idempotencyKey: string,
   ): Promise<CarrierConnectionView> {
-    // Registry + shape refusals run BEFORE anything is sealed or written: an
-    // unknown carrier and a missing field are 400s that touch no state.
-    const adapter = getCarrierAdapter(command.carrierCode);
-    if (adapter === undefined) {
-      throw unknownCarrierCode(command.carrierCode, knownCarrierCodes());
-    }
-    const accountLabel = acceptAccountLabel(command.accountLabel);
-    const credential = acceptCredential(adapter, command.credential);
-
-    // The hash takes the credential as a MASTER-KEY HMAC, never the secret:
-    // `payload_hash` is persisted, and a bare sha256 of a low-entropy API key
-    // is a crackable digest of that key. Replay detection is unchanged —
-    // identical material hmacs identically, different material 422s.
-    const { sealed, hmac } = withCarrierKey(() => ({
-      sealed: sealCredential(credential),
-      hmac: credentialHmac(credential),
-    }));
-    const payloadHash = hashCommandPayload({
-      tenantId: command.tenantId,
-      carrierCode: adapter.code,
-      accountLabel,
-      credentialHmac: hmac,
-    });
-
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
-      // Authority at command-service entry (Story 1.5) — DB read, same tx.
+      // Authority at command-service entry (Story 1.5) — DB read, same tx —
+      // and it precedes EVERYTHING (the `inventory.controller.ts:127-129`
+      // convention): before any validation 400, before the master key is
+      // touched, before the replay pre-check. A caller without the capability
+      // must not learn which carrier codes the registry holds or whether the
+      // deployment has an encryption key, and must not be able to drive
+      // AES work by sending material it was never allowed to store.
       assertPermission(
         await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
         'carrier.manage',
       );
+
+      // Registry + shape refusals run BEFORE anything is sealed or written:
+      // an unknown carrier and a missing field are 400s that touch no state.
+      const adapter = getCarrierAdapter(command.carrierCode);
+      if (adapter === undefined) {
+        throw unknownCarrierCode(command.carrierCode, knownCarrierCodes());
+      }
+      const accountLabel = acceptAccountLabel(command.accountLabel);
+      const credential = acceptCredential(adapter, command.credential);
+
+      // The hash takes the credential as a MASTER-KEY HMAC, never the secret:
+      // `payload_hash` is persisted, and a bare sha256 of a low-entropy API
+      // key is a crackable digest of that key. Replay detection is unchanged
+      // — identical material hmacs identically, different material 422s.
+      const { sealed, hmac } = withCarrierKey(() => ({
+        sealed: sealCredential(credential),
+        hmac: credentialHmac(credential),
+      }));
+      const payloadHash = hashCommandPayload({
+        tenantId: command.tenantId,
+        carrierCode: adapter.code,
+        accountLabel,
+        credentialHmac: hmac,
+      });
 
       const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replayed !== null) {
@@ -275,21 +281,24 @@ export class CarrierCommandService {
     command: RotateCarrierCredentialCommand,
     idempotencyKey: string,
   ): Promise<CarrierConnectionView> {
-    // The adapter is only known once the row is read, so the material is
-    // validated inside the transaction; the HMAC only needs the master key,
-    // so the payload hash is still computed before it (the landmark order).
-    const hmac = withCarrierKey(() => credentialHmac(asStringRecord(command.credential)));
-    const payloadHash = hashCommandPayload({
-      tenantId: command.tenantId,
-      connectionId: command.connectionId,
-      credentialHmac: hmac,
-    });
-
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      // Authority before everything, connect's rule (a caller without the
+      // capability must not learn whether the deployment holds a key).
       assertPermission(
         await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
         'carrier.manage',
       );
+
+      // The adapter is only known once the row is read, so the material is
+      // validated further down; the HMAC needs only the master key, so the
+      // payload hash is still computed before the replay pre-check (the
+      // landmark order).
+      const hmac = withCarrierKey(() => credentialHmac(asStringRecord(command.credential)));
+      const payloadHash = hashCommandPayload({
+        tenantId: command.tenantId,
+        connectionId: command.connectionId,
+        credentialHmac: hmac,
+      });
 
       const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replayed !== null) {
@@ -501,10 +510,19 @@ export class CarrierCommandService {
 }
 
 /**
- * The HMAC input for a rotation, computed before the adapter is known: the
- * digest only has to be STABLE for identical material, so a non-object body
- * hashes as the empty record and is rejected by `acceptCredential` inside the
- * transaction a moment later.
+ * The HMAC input for a rotation, computed before the adapter is known — so it
+ * normalizes COARSELY where connect's hash normalizes exactly: it keeps every
+ * string-valued key, declared or not, and drops everything else, whereas
+ * connect hashes the adapter-validated record.
+ *
+ * That coarseness is deliberate (the digest only has to be STABLE for
+ * identical material, and the adapter is not known yet), and this is what it
+ * costs: a caller that retries the SAME key after adding an undeclared field
+ * — or after fixing a non-string value — hashes differently, so it gets
+ * `422 idempotency-key-reuse` instead of the 400 that would name the field.
+ * A fresh key gets the naming 400. The alternative, dropping the credential
+ * from the hash, would make a key reused with genuinely different secret
+ * material look like a replay, which is the worse failure by far.
  */
 function asStringRecord(supplied: unknown): CarrierCredential {
   if (typeof supplied !== 'object' || supplied === null || Array.isArray(supplied)) {
