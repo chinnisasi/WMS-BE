@@ -7,6 +7,7 @@ import { InboundController } from './inbound.controller';
 import { OutboundController } from './outbound.controller';
 import { ReceivingController } from './receiving.controller';
 import { PutawayController } from './putaway.controller';
+import { CarriersController } from './carriers.controller';
 import { OpenApiController } from './openapi.controller';
 import { NotFoundController } from './not-found.controller';
 import { OpenApiDocumentHolder } from './openapi-document.holder';
@@ -14,6 +15,7 @@ import { InventoryModule } from '../modules/inventory/inventory.module';
 import { InboundModule } from '../modules/inbound/inbound.module';
 import { OutboundModule } from '../modules/outbound/outbound.module';
 import { PutawayModule } from '../modules/putaway/putaway.module';
+import { CarriersModule } from '../modules/carriers/carriers.module';
 import { CatalogModule } from '../modules/catalog/catalog.module';
 import { TenancyModule } from '../modules/tenancy/tenancy.module';
 
@@ -44,9 +46,15 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
  * placement reads) rides the same shape — `PutawayController` consumes
  * `PutawayFacade` only; the device snapshot gains the bins + putawayTasks
  * fields through the receiving facade's additive composition.
+ *
+ * Story 4.6b: the carriers surface (adapter catalogue + the tenant
+ * credential vault — connect/list/rotate/disconnect) rides the same shape.
+ * `CarriersModule` is a spine-singleton already imported by the root and
+ * exports only `CarriersFacade`; the sealed credential never reaches a
+ * response DTO, so the shell has nothing to redact.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CatalogModule, TenancyModule],
+  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule],
   controllers: [
     HealthController,
     EchoController,
@@ -56,6 +64,7 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
     OutboundController,
     ReceivingController,
     PutawayController,
+    CarriersController,
     OpenApiController,
     NotFoundController,
   ],

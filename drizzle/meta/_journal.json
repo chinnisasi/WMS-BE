@@ -176,6 +176,13 @@
       "when": 1789572676240,
       "tag": "0024_dispatched_order_arm",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1789581307215,
+      "tag": "0025_carrier_connections",
+      "breakpoints": true
     }
   ]
 }
