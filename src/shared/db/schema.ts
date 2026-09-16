@@ -1816,3 +1816,67 @@ export const picks = pgTable(
 );
 
 export type Pick = typeof picks.$inferSelect;
+
+/**
+ * Tenant carrier credentials (Story 4.6b, AD-15): one row per configured
+ * carrier account — the *credential vault* half of the carrier substrate.
+ * The adapter registry half (`modules/carriers/carrier-registry.ts`) names
+ * which `carrier_code` values exist and what credential fields each one
+ * requires; this table holds the material for exactly those carriers.
+ *
+ * `credential_sealed` is the AES-256-GCM envelope blob
+ * (`v1:<iv>:<tag>:<ct>`, the `envelope.ts` KMS stand-in) over the canonical
+ * credential JSON, sealed under `CARRIER_ENCRYPTION_KEY` — a key of its own,
+ * NOT the device key, so carrier secrets and device offline-store keys have
+ * independent blast radii. **The blob never leaves the module**: no response
+ * DTO, no list row, no outbox payload, no audit row, no log line carries it
+ * or the plaintext (the architecture test pins the confinement).
+ *
+ * Rotation replaces the material IN PLACE — the row id is the stable handle
+ * AD-15 means by "referenced by id" (what rating and 4-6c's labels will
+ * store), so a rotation that minted a new id would orphan every reference;
+ * `credential_version` increments and `rotated_at`/`rotated_by` stamp the
+ * row. Disconnect is a hard DELETE (AD-15: "disconnect deletes") — a status
+ * flip would leave sealed secret material at rest after the operator asked
+ * for it to be gone; the audit row survives to record it.
+ *
+ * One active connection per (tenant, carrier), enforced by the unique index
+ * rather than a read-then-write: a concurrent double-connect is a
+ * deterministic constraint violation mapped to 409, never two live
+ * credential rows for one account. RLS and the CHECKs live only in the
+ * migration SQL (0025, the 0019/0021 pattern); no FKs (repo convention).
+ */
+export const carrierConnections = pgTable(
+  'carrier_connections',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    /** The registry's adapter code (`delhivery`, `blue_dart`, …). */
+    carrierCode: text('carrier_code').notNull(),
+    /** The operator's name for this account ("Delhivery — Mumbai"). */
+    accountLabel: text('account_label').notNull(),
+    /** The sealed envelope blob. Never selected onto any wire shape. */
+    credentialSealed: text('credential_sealed').notNull(),
+    /** 1 at connect, +1 per rotation — the material's generation counter. */
+    credentialVersion: integer('credential_version').notNull().default(1),
+    connectedBy: uuid('connected_by').notNull(),
+    rotatedAt: timestamp('rotated_at', { withTimezone: true, mode: 'string' }),
+    rotatedBy: uuid('rotated_by'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One live connection per carrier per tenant — re-configuring is
+    // `rotate`, and a second `connect` is a 409 off THIS index.
+    uniqueIndex('carrier_connections_tenant_carrier_unique').on(table.tenantId, table.carrierCode),
+    // The tenant-first keyset list from day one (UX-DR25 — offset is banned).
+    index('carrier_connections_tenant_created_at_id_idx').on(
+      table.tenantId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type CarrierConnection = typeof carrierConnections.$inferSelect;

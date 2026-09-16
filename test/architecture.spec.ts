@@ -336,3 +336,150 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     );
   });
 });
+
+describe('architecture: carrier credentials are carriers-module-owned (story 4.6b)', () => {
+  /**
+   * Story 4.6b stands up the carrier substrate: the adapter registry and the
+   * tenant credential vault. `carrier_connections` is carriers-module-
+   * exclusive exactly as the stock tables are inventory-exclusive (AD-6) —
+   * every other module reads carrier state through `CarriersFacade`.
+   *
+   * The second guard here is the one this story exists for. The sealed
+   * credential (and the master key that opens it) must stay inside
+   * `carrier-credentials.ts`: the moment another file imports the envelope
+   * primitives or reads `CARRIER_ENCRYPTION_KEY`, secret material has a
+   * second handling path — and the whole invariant ("secret material leaves
+   * the system exactly never") is one careless response DTO away from
+   * breaking. A source scan catches that at build time, before any e2e cost.
+   */
+  const CARRIER_TABLES = ['carrierConnections'] as const;
+  const RAW_CARRIER_TABLES = 'carrier_connections';
+  const carriersRoot = join(SRC_ROOT, 'modules', 'carriers');
+  const CREDENTIAL_OWNER = join(carriersRoot, 'carrier-credentials.ts');
+  /** Any import of the envelope primitives, at any depth and via any alias. */
+  const ENVELOPE_IMPORT = /from\s+['"][^'"]*crypto\/envelope['"]/;
+
+  it('no carrier-connection write happens outside the carriers module', () => {
+    const outside = files.filter((file) => !file.path.startsWith(carriersRoot));
+    const offenders: string[] = [];
+    for (const file of outside) {
+      for (const pattern of [
+        ...CARRIER_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_CARRIER_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) {
+          offenders.push(`${file.path}: /${pattern.source}/`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no other module reaches into the carriers module past the facade', () => {
+    // The mirror of the inventory/outbound guards (both import forms; the
+    // allowed suffixes must END the specifier, so a `carriers.facade.internal`
+    // is caught rather than waved through on a word boundary).
+    const carrierInternals = new RegExp(
+      '(?:modules/carriers|\\.\\./carriers)/' + '(?!carriers\\.(facade|module|dto)[\'"])',
+    );
+    const siblingModules = files.filter(
+      (file) =>
+        file.path.startsWith(join(SRC_ROOT, 'modules')) &&
+        !file.path.startsWith(carriersRoot) &&
+        /(?:modules\/carriers|\.\.\/carriers)\//.test(file.source),
+    );
+    // No sibling module consumes carriers YET (4-6c's labels bring the
+    // first), so the inventory twin's `siblingModules.length > 0`
+    // meaningfulness assert cannot carry this one — it would fail on an
+    // empty-but-correct codebase. Pin the detector directly instead (the
+    // outbound block's precedent), so a typo or a regex that stops matching
+    // an import form fails HERE rather than going unnoticed while the guard
+    // silently scans nothing forever.
+    for (const reaching of [
+      "from '../carriers/carrier.command'",
+      "from '../carriers/carrier-credentials'",
+      "from '../carriers/carrier-registry'",
+      "from '../carriers/carriers.facade.internal'",
+      "from 'src/modules/carriers/carrier.command'",
+    ]) {
+      expect(carrierInternals.test(reaching)).toBe(true);
+    }
+    for (const allowed of [
+      "from '../carriers/carriers.facade'",
+      "from '../carriers/carriers.module'",
+      "from '../carriers/carriers.dto'",
+      "from 'src/modules/carriers/carriers.facade'",
+    ]) {
+      expect(carrierInternals.test(allowed)).toBe(false);
+    }
+    const offenders: string[] = [];
+    for (const file of siblingModules) {
+      if (carrierInternals.test(file.source)) {
+        offenders.push(file.path);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the carriers module itself writes the table (the test is meaningful)', () => {
+    const source = readFileSync(join(carriersRoot, 'carrier.command.ts'), 'utf8');
+    expect(drizzleWriteOn('carrierConnections').test(source)).toBe(true);
+    // Disconnect is a hard DELETE (AD-15) — the story's one destructive path,
+    // pinned so a later "soft delete" refactor has to argue with this test.
+    expect(/\.delete\(\s*carrierConnections\b/.test(source)).toBe(true);
+  });
+
+  it('the carrier master key and the envelope live ONLY in carrier-credentials.ts', () => {
+    const offenders: string[] = [];
+    for (const file of files) {
+      if (file.path === CREDENTIAL_OWNER) continue;
+      // The READ of the env var, not the name in prose: the .env.example
+      // pointer and the 503 problem detail both mention the variable, and a
+      // guard that banned the string would only teach people to stop naming
+      // it in comments.
+      if (/process\.env\.CARRIER_ENCRYPTION_KEY/.test(file.source)) {
+        offenders.push(`${file.path}: reads process.env.CARRIER_ENCRYPTION_KEY`);
+      }
+      // Only the credential owner may reach the raw seal/open primitives with
+      // carrier material; everything else handles the public face. Matched on
+      // the specifier SUFFIX, not an exact relative prefix: a file one
+      // directory deeper (`../../../shared/...`) or an aliased import would
+      // otherwise walk straight past a guard that claims to confine this.
+      if (file.path.startsWith(carriersRoot) && ENVELOPE_IMPORT.test(file.source)) {
+        offenders.push(`${file.path}: imports the envelope primitives`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningfulness: the owner really does both, so the scan above is not
+    // asserting the absence of something that exists nowhere.
+    const owner = readFileSync(CREDENTIAL_OWNER, 'utf8');
+    expect(owner).toContain('process.env.CARRIER_ENCRYPTION_KEY');
+    expect(ENVELOPE_IMPORT.test(owner)).toBe(true);
+    // The matcher itself: suffix, any depth, any quote style — and it does
+    // not fire on a neighbouring module whose name merely ends the same way.
+    for (const reaching of [
+      "from '../../shared/crypto/envelope'",
+      'from "../../../../shared/crypto/envelope"',
+      "from 'src/shared/crypto/envelope'",
+    ]) {
+      expect(ENVELOPE_IMPORT.test(reaching)).toBe(true);
+    }
+    expect(ENVELOPE_IMPORT.test("from '../../shared/crypto/envelope-registry'")).toBe(false);
+  });
+
+  it('no carrier response shape, outbox payload or audit row can carry the sealed blob', () => {
+    // `credentialSealed` is the column name; it may appear ONLY where the row
+    // is written and where the envelope is opened. It must never reach the
+    // api shell (a response DTO), which is what a leak would look like.
+    const apiRoot = join(SRC_ROOT, 'api');
+    const offenders = files
+      .filter((file) => file.path.startsWith(apiRoot) && /credentialSealed/.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+    // And the select list every read uses does not name the column.
+    const command = readFileSync(join(carriersRoot, 'carrier.command.ts'), 'utf8');
+    const columnList = /export const CONNECTION_COLUMNS = \{[\s\S]*?\} as const;/.exec(command);
+    expect(columnList).not.toBeNull();
+    expect(columnList![0]).not.toContain('credentialSealed');
+  });
+});

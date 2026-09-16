@@ -7209,6 +7209,528 @@
           "putaway"
         ]
       }
+    },
+    "/tenants/{tenantId}/carriers": {
+      "get": {
+        "operationId": "CarriersController_catalogue",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CarrierCatalogueResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The carrier adapter catalogue: supported carrier codes, display names and the credential fields each one requires (open to any member)",
+        "tags": [
+          "carriers"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/carriers/connections": {
+      "get": {
+        "operationId": "CarriersController_listConnections",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CarrierConnectionListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor (invalid-cursor) or out-of-range limit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's configured carrier accounts (keyset cursor pagination — public faces only, never credential material)",
+        "tags": [
+          "carriers"
+        ]
+      },
+      "post": {
+        "operationId": "CarriersController_connect",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectCarrierDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CarrierConnectionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an unknown carrierCode, or credential material missing a required field (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks carrier.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "This carrier is already connected for the tenant — rotate instead (carrier-already-connected), or the same Idempotency-Key is in flight concurrently (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The deployment has no CARRIER_ENCRYPTION_KEY (carrier-encryption-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Connects a carrier account (carrier.manage) — the credential is sealed under CARRIER_ENCRYPTION_KEY and never returned; one connection per carrier per tenant",
+        "tags": [
+          "carriers"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/carriers/connections/{connectionId}/rotate": {
+      "post": {
+        "operationId": "CarriersController_rotate",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "connectionId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RotateCarrierCredentialDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CarrierConnectionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, malformed connectionId, credential material missing a required field, or a connection whose carrier this build no longer registers (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks carrier.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such connection in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The same Idempotency-Key is being processed concurrently (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The deployment has no CARRIER_ENCRYPTION_KEY (carrier-encryption-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Rotates a connection’s credential (carrier.manage) — same id, credentialVersion + 1, rotatedAt/rotatedBy stamped; the old material is overwritten",
+        "tags": [
+          "carriers"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/carriers/connections/{connectionId}/disconnect": {
+      "post": {
+        "operationId": "CarriersController_disconnect",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "connectionId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CarrierConnectionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or malformed connectionId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks carrier.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such connection in this tenant, or it was already disconnected (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The same Idempotency-Key is being processed concurrently (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Disconnects a carrier account (carrier.manage) — a hard delete (AD-15): the row and its sealed material are gone, the audit row records it; a repeat is 404",
+        "tags": [
+          "carriers"
+        ]
+      }
     }
   },
   "info": {
@@ -12486,6 +13008,208 @@
         },
         "required": [
           "items"
+        ]
+      },
+      "CarrierCredentialFieldResponse": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Wire name inside the `credential` object",
+            "example": "apiToken"
+          },
+          "label": {
+            "type": "string",
+            "description": "Human label for the field",
+            "example": "API token"
+          },
+          "required": {
+            "type": "boolean",
+            "description": "A required field absent or blank is a 400"
+          },
+          "description": {
+            "type": "string",
+            "description": "What the operator should paste here"
+          }
+        },
+        "required": [
+          "name",
+          "label",
+          "required",
+          "description"
+        ]
+      },
+      "CarrierCatalogueEntryResponse": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Registry code — the `carrierCode` connect takes",
+            "example": "delhivery"
+          },
+          "displayName": {
+            "type": "string",
+            "example": "Delhivery"
+          },
+          "credentialFields": {
+            "description": "What this carrier needs to be configured with (declaration order)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CarrierCredentialFieldResponse"
+            }
+          }
+        },
+        "required": [
+          "code",
+          "displayName",
+          "credentialFields"
+        ]
+      },
+      "CarrierCatalogueResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CarrierCatalogueEntryResponse"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "CarrierConnectionResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The stable handle rotation preserves"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "carrierCode": {
+            "type": "string",
+            "example": "delhivery"
+          },
+          "carrierName": {
+            "type": "string",
+            "description": "The registry display name for the code",
+            "example": "Delhivery"
+          },
+          "accountLabel": {
+            "type": "string",
+            "example": "Delhivery — Mumbai"
+          },
+          "credentialVersion": {
+            "type": "number",
+            "description": "1 at connect, +1 per rotation",
+            "example": 1
+          },
+          "connectedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "rotatedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "rotatedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "carrierCode",
+          "carrierName",
+          "accountLabel",
+          "credentialVersion",
+          "connectedBy",
+          "rotatedAt",
+          "rotatedBy",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "CarrierConnectionListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CarrierConnectionResponse"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "ConnectCarrierDto": {
+        "type": "object",
+        "properties": {
+          "carrierCode": {
+            "type": "string",
+            "description": "A code the adapter registry knows",
+            "example": "delhivery"
+          },
+          "accountLabel": {
+            "type": "string",
+            "description": "The operator's name for this account",
+            "example": "Delhivery — Mumbai"
+          },
+          "credential": {
+            "type": "object",
+            "description": "The carrier credential fields, as declared by GET /carriers for this code. Write-only: sealed under CARRIER_ENCRYPTION_KEY and never returned, listed or logged.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "example": {
+              "apiToken": "dl_live_…",
+              "clientName": "PRIYA SPICES"
+            }
+          }
+        },
+        "required": [
+          "carrierCode",
+          "accountLabel",
+          "credential"
+        ]
+      },
+      "RotateCarrierCredentialDto": {
+        "type": "object",
+        "properties": {
+          "credential": {
+            "type": "object",
+            "description": "The replacement credential fields for this connection’s carrier. The connection id is unchanged; credentialVersion increments.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "example": {
+              "apiToken": "dl_live_rotated_…",
+              "clientName": "PRIYA SPICES"
+            }
+          }
+        },
+        "required": [
+          "credential"
         ]
       }
     }

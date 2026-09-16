@@ -74,6 +74,16 @@ export const CAPABILITIES = [
   // Accountant stays read-only. Mirrored into wms-fe `src/lib/users.ts` by
   // the 4.2b FE story with the other outbound capabilities.
   'dispatch.execute',
+  // Story 4.6b — the carrier credential vault (connect a carrier account,
+  // rotate its material, disconnect it). A SETTINGS capability, mirroring
+  // `device.manage` / `vendor.manage`: Owner and Ops Manager only, absent
+  // from `operator` and `accountant` — an API key is not a floor verb.
+  // Deliberately NOT on the carrier reads: the registry catalogue and the
+  // connection list are open to any tenant member, because reads are never
+  // gated here (the rule at the top of this file) — and those rows carry the
+  // connection's public face only, never credential material, so there is
+  // nothing for a gate to protect. Mirrored into wms-fe `src/lib/users.ts`.
+  'carrier.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -109,6 +119,7 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'picks.execute',
     'pack.execute',
     'dispatch.execute',
+    'carrier.manage',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
