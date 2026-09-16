@@ -132,9 +132,39 @@ export type LedgerReferenceDoc =
       readonly lengthMm?: number;
       readonly widthMm?: number;
       readonly heightMm?: number;
+    }
+  // Story 4.6 — the dispatch arm: the SHIPMENT record, and the terminal
+  // event of an order's life. Like `pack`, it moves nothing (`pick.picked`
+  // already drew the units out of stock with `toBinId: null`), so the event
+  // carries `quantityDelta: 0` with both bin arms null and folds no
+  // projection; one is written per ORDER LINE because `LedgerMovement`
+  // requires a non-null `skuId`.
+  //
+  // What makes it more than a status flip is what commits WITH it: every
+  // `committed` hold the order owned is retired to `released` in the same
+  // transaction, which is the transition that finally takes the shipped
+  // units off the reserved counter and corrects ATP.
+  //
+  // The carrier arms are OPTIONAL FREE TEXT, deliberately (the human
+  // decision, 2026-09-15) — the same place 4.5 put weight and dimensions, so
+  // an operator shipping by a manual courier can record a consignment today,
+  // before the carrier-adapter arc exists. The carrier stories replace them
+  // with a real carrier id and an adapter-issued tracking number; these
+  // fields are their migration target, not their final shape. NEW union arm
+  // — the earlier kinds are never reshaped.
+  | {
+      readonly kind: 'dispatch';
+      readonly orderId: string;
+      readonly orderLineId: string;
+      /** Units shipped for this line — what was PICKED, not ordered. */
+      readonly dispatchedQty: number;
+      /** Optional free-text carrier; absent when the operator named none. */
+      readonly carrierName?: string;
+      /** Optional free-text tracking reference; absent when none was given. */
+      readonly trackingNumber?: string;
     };
-// Later stories extend this union with NEW kinds (transfer, dispatch, …) —
-// never by reshaping an existing arm.
+// Later stories extend this union with NEW kinds (transfer, …) — never by
+// reshaping an existing arm.
 
 /** One registered grammar entry: an event type and what it may carry. */
 export interface LedgerEventTypeDefinition {
@@ -302,6 +332,31 @@ registerLedgerEventType({
   type: 'pack.packed',
   sinceVersion: 1,
   referenceKinds: ['pack'],
+  allowsBatchArm: false,
+  allowsSerialArm: false,
+});
+
+/**
+ * Grammar v1, Story 4.6 — the dispatch: one ZERO-quantity event per order
+ * line recording that the order shipped. The second non-movement type, for
+ * the same reason as the first: the units left `stock_on_hand` at pick, so
+ * both bin arms are null and `appendMovement` folds nothing. What the event
+ * durably records is the SHIPMENT — the terminal fact of the order's life —
+ * plus the optional free-text carrier and tracking reference on its
+ * reference doc, which have nowhere else durable to live until the carrier
+ * adapter arrives.
+ *
+ * Both identity arms stay CLOSED, like `pack.packed`. Dispatch re-counts
+ * nothing: it ships exactly the units `pick.picked` already drew, and those
+ * events carry the batch/serial identity. Opening an arm here would let a
+ * caller record a batch or serial claim the dispatch never verified.
+ * Registers sinceVersion 1 — no new grammar version; the reference-doc union
+ * appends only.
+ */
+registerLedgerEventType({
+  type: 'dispatch.dispatched',
+  sinceVersion: 1,
+  referenceKinds: ['dispatch'],
   allowsBatchArm: false,
   allowsSerialArm: false,
 });

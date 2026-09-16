@@ -1,0 +1,25 @@
+-- Story 4.6 hand-append (the 0019/0022/0023 CHECK pattern): CHECKs are
+-- declared only in migration SQL, never in schema.ts.
+--
+-- The ORDER state machine gains its terminal arm: `dispatched`. A dispatched
+-- order has shipped — one zero-quantity `dispatch.dispatched` ledger event
+-- per order line records the shipment (the units already left
+-- `stock_on_hand` at pick, so there is nothing left to move), and every
+-- `committed` reservation the order still owned has been retired to
+-- `released`, which is what finally takes those units off the reserved
+-- counter and corrects ATP.
+--
+-- `dispatched` is TERMINAL and has no exit: no un-dispatch, no return, no
+-- re-open. 4.1's cancel refuses it (its `status <> 'accepted'` guard), both
+-- of 4.2's wave-selection paths are allow-lists on `accepted`, 4.5's pack
+-- keys its conditional flip on `accepted`, and 4.3's queued pick classifies
+-- it as unresolvable (quarantine, never a retry). The dispatch command's own
+-- conditional flip keys on `status = 'ready_to_dispatch'`, so a second
+-- dispatch under a new key finds nothing to flip and is refused before it
+-- writes — an order dispatches once.
+--
+-- Drop-then-re-add with the widened set is the additive precedent 0019, 0022
+-- and 0023 set; the command-layer constant `ORDER_STATUSES` mirrors it and
+-- `orders.spec.ts` / `packing.spec.ts` pin the two together.
+ALTER TABLE "orders" DROP CONSTRAINT "orders_status_check";--> statement-breakpoint
+ALTER TABLE "orders" ADD CONSTRAINT "orders_status_check" CHECK ("status" IN ('accepted','ready_to_dispatch','dispatched','cancelled'));

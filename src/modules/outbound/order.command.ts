@@ -31,17 +31,26 @@ import type { ReservationSnapshot } from '../inventory/inventory.facade';
 
 /**
  * The order lifecycle arms. Story 4.1 shipped `accepted` / `cancelled`;
- * story 4.5 adds `ready_to_dispatch` — the order has been verified at the
- * pack bench against what was actually picked and is waiting for 4.6 to rate,
- * label and dispatch it. Additive only, mirrored by `orders_status_check`
- * (migration 0023; `orders.spec.ts` pins the two together).
+ * story 4.5 added `ready_to_dispatch` — the order has been verified at the
+ * pack bench against what was actually picked; story 4.6 adds `dispatched`,
+ * the arm that closes the order. Additive only, mirrored by
+ * `orders_status_check` (migrations 0023 / 0024; `orders.spec.ts` pins the
+ * two together).
  *
  * `ready_to_dispatch` is TERMINAL for every pre-dispatch flow: cancel refuses
  * it below, both wave-selection paths exclude it (they select `accepted`
- * only), and a queued pick against it quarantines. 4.6 extends the union
- * again with the dispatched arm.
+ * only), and a queued pick against it quarantines.
+ *
+ * `dispatched` is TERMINAL outright — the order shipped, its shipment is
+ * journalled as one zero-quantity `dispatch.dispatched` event per line, and
+ * every `committed` hold it owned has been retired to `released` (which is
+ * what finally corrects ATP). There is no un-dispatch, no return and no
+ * re-open: every guard in the module is an allow-list, so the new arm is
+ * refused everywhere by construction — the ONE exception audited in 4.6 was
+ * `pick.command.ts`'s terminal CLASSIFICATION, which had to learn the arm to
+ * quarantine a queued pick instead of retrying it forever.
  */
-export const ORDER_STATUSES = ['accepted', 'ready_to_dispatch', 'cancelled'] as const;
+export const ORDER_STATUSES = ['accepted', 'ready_to_dispatch', 'dispatched', 'cancelled'] as const;
 export type OrderStatus = (typeof ORDER_STATUSES)[number];
 
 /** The line fulfillment arms shipped in story 4.1. */

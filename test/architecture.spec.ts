@@ -302,6 +302,26 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     expect(pickSource).toContain('this.inventory.commitReservationInTx');
   });
 
+  it('the dispatch command writes no inventory table — the ledger events AND the hold retirements ride the facade (4.6)', () => {
+    // The outbound module's terminal command touches BOTH halves of the
+    // inventory module: it journals `dispatch.dispatched` events and it
+    // retires every `committed` reservation the order owns. Both must ride
+    // `InventoryFacade`'s in-transaction passthroughs — that is what keeps
+    // them in ONE transaction with the order flip without opening a second
+    // quantity-mutation path or a second writer of the reservation journal
+    // (AD-6/12/16). A direct `reservations` write here would be exactly the
+    // cancel-vs-dispatch double-release the lifecycle forbids.
+    const dispatchSource = readFileSync(join(outboundRoot, 'dispatch.command.ts'), 'utf8');
+    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'reservations'] as const) {
+      expect(drizzleWriteOn(table).test(dispatchSource)).toBe(false);
+    }
+    expect(dispatchSource).toContain('this.inventory.appendLedgerEventInTx');
+    expect(dispatchSource).toContain('this.inventory.retireCommittedReservationInTx');
+    // The order flip itself IS this module's own write (the meaningfulness
+    // half — the assertions above are vacuous if the file writes nothing).
+    expect(drizzleWriteOn('orders').test(dispatchSource)).toBe(true);
+  });
+
   it('the wave aggregate writes no stock table and journals no ledger event (4.2)', () => {
     // The boundary the spec draws for this story: a wave PLANS a pick, it
     // never moves stock. Picking (4.3) is where a movement is journalled —

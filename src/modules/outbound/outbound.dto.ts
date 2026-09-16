@@ -27,6 +27,7 @@ import {
   MAX_SCAN_QUANTITY,
   MAX_WEIGHT_GRAMS,
 } from './pack.command';
+import { MAX_CARRIER_NAME_LENGTH, MAX_TRACKING_NUMBER_LENGTH } from './dispatch.command';
 import {
   PICKLIST_LINE_STATUSES,
   PICKLIST_STATUSES,
@@ -159,7 +160,7 @@ export class OrderDto {
 
   @ApiProperty({
     description:
-      "The order's lifecycle arm. 'ready_to_dispatch' (story 4.5) is a packed order: verified at the bench against what was picked and waiting for dispatch.",
+      "The order's lifecycle arm. 'ready_to_dispatch' (story 4.5) is a packed order: verified at the bench against what was picked and waiting for dispatch. 'dispatched' (story 4.6) is terminal — the order shipped, its shipment is journalled and its reservations are retired; there is no un-dispatch.",
     enum: [...ORDER_STATUSES],
   })
   status!: string;
@@ -1057,4 +1058,130 @@ export class PackDto {
 export class PackResponse {
   @ApiProperty({ type: PackDto })
   pack!: PackDto;
+}
+
+// ── Dispatch (Story 4.6) ────────────────────────────────────────────────────
+
+/**
+ * POST /tenants/{tenantId}/outbound/orders/{orderId}/dispatch body — the
+ * order's terminal transition. Both fields are OPTIONAL free text (the human
+ * decision, 2026-09-15): an operator shipping by a manual courier records
+ * what they have today, and the carrier-adapter stories later replace them
+ * with a real carrier id and an adapter-issued tracking number. An empty
+ * body is a complete, valid dispatch.
+ */
+export class DispatchOrderDto {
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: String,
+    maxLength: MAX_CARRIER_NAME_LENGTH,
+    description:
+      'Optional free-text carrier (e.g. a manual courier). Absence is never an error; a blank string is treated as absent.',
+  })
+  @IsOptional()
+  @IsString()
+  @Trim()
+  @Length(0, MAX_CARRIER_NAME_LENGTH)
+  carrierName?: string | null;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: String,
+    maxLength: MAX_TRACKING_NUMBER_LENGTH,
+    description:
+      'Optional free-text tracking or consignment reference. Absence is never an error; a blank string is treated as absent.',
+  })
+  @IsOptional()
+  @IsString()
+  @Trim()
+  @Length(0, MAX_TRACKING_NUMBER_LENGTH)
+  trackingNumber?: string | null;
+}
+
+/** One line of the dispatch record. */
+export class DispatchedLineDto {
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({ description: 'What the order asked for' })
+  orderedQty!: number;
+
+  @ApiProperty({ description: 'What actually shipped for this line — the PICKED units' })
+  dispatchedQty!: number;
+
+  @ApiProperty({ description: 'Derived: orderedQty − dispatchedQty (non-zero on a short-picked line)' })
+  shortfallQty!: number;
+
+  @ApiProperty({ format: 'uuid', description: 'The dispatch.dispatched event this line’s shipment was journalled as' })
+  ledgerEventId!: string;
+}
+
+/**
+ * The dispatch record — also the idempotency snapshot, so a replay re-serves
+ * it unchanged. `dispatched` is terminal: there is no un-dispatch, no return
+ * and no re-open.
+ */
+export class DispatchDto {
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ enum: [...ORDER_STATUSES], description: 'Always dispatched on a successful dispatch' })
+  orderStatus!: string;
+
+  @ApiProperty({ enum: [...ORDER_SOURCES] })
+  source!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  integrationId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  externalEventId!: string | null;
+
+  @ApiProperty({ format: 'uuid', description: 'The operator who dispatched it' })
+  dispatchedBy!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC dispatch time' })
+  dispatchedAt!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Free-text carrier; null when none was recorded' })
+  carrierName!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Free-text tracking reference; null when none was recorded' })
+  trackingNumber!: string | null;
+
+  @ApiProperty({ description: 'Total units shipped — the sum of every line’s dispatchedQty' })
+  totalUnits!: number;
+
+  @ApiProperty({
+    type: [String],
+    format: 'uuid',
+    description:
+      'The reservation holds this dispatch retired committed → released — the ATP correction. Empty when the order had none left to retire.',
+  })
+  retiredReservationIds!: readonly string[];
+
+  @ApiProperty({ type: [DispatchedLineDto] })
+  lines!: readonly DispatchedLineDto[];
+}
+
+export class DispatchResponse {
+  @ApiProperty({ type: DispatchDto })
+  dispatch!: DispatchDto;
 }

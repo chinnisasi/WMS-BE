@@ -536,6 +536,27 @@ export class InventoryFacade {
   }
 
   /**
+   * `committed → released` inside the CALLER's transaction (story 4.6) — the
+   * retirement a dispatch performs on every hold its order still owns. This
+   * is the transition `schema.ts` always promised at "the consuming ledger
+   * movement": until it runs, a picked order's units are deducted from ATP
+   * twice (once as on-hand the draw removed, once as reserved nobody
+   * restored).
+   *
+   * Conditional on `state = 'committed'` (AD-12), so exactly one dispatch
+   * retires a hold and a second is a deterministic conflict. Journal half
+   * only, like `releaseReservationInTx`: the caller applies one net
+   * `restoreReservedUnits` AFTER its commit.
+   */
+  async retireCommittedReservationInTx(
+    tx: TenantTx,
+    tenantId: string,
+    reservationId: string,
+  ): Promise<ReservationSnapshot> {
+    return this.reservations.retireCommittedInTx(tx, tenantId, reservationId);
+  }
+
+  /**
    * The RE-GRANT half of that pair (story 4.4), in the caller's transaction:
    * a fresh hold for the remainder of `releasedFrom` — a hold this SAME
    * transaction released for the SAME owner scope. It creates no ATP (the
@@ -615,6 +636,29 @@ export class InventoryFacade {
     ownerIds: readonly string[],
   ): Promise<ReservationSnapshot[]> {
     return this.reservations.heldReservationsByOwnerInTx(
+      tx,
+      tenantId,
+      warehouseId,
+      ownerType,
+      ownerIds,
+    );
+  }
+
+  /**
+   * The `committed` holds owned by a set of owner ids in one warehouse
+   * (story 4.6) — the dispatch command's read of everything it must retire.
+   * Owner-keyed for the same reason as the `held` sibling above. A
+   * partially short-picked order simply returns fewer rows: a hold already
+   * `released` has nothing left to retire.
+   */
+  async committedReservationsByOwnerInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    ownerType: string,
+    ownerIds: readonly string[],
+  ): Promise<ReservationSnapshot[]> {
+    return this.reservations.committedReservationsByOwnerInTx(
       tx,
       tenantId,
       warehouseId,
