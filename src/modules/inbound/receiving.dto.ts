@@ -1,10 +1,12 @@
 import { Type } from 'class-transformer';
+import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
 import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
   IsIn,
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   IsUUID,
@@ -71,14 +73,14 @@ export class GrnLineInputDto {
   mfgDate?: string | null;
 
   @ApiProperty({
-    description: 'Physically received quantity in base UoM (positive integer, at most 2147483647 — the int4 bound of the line table)',
-    minimum: 1,
-    maximum: 2147483647,
+    description: `Physically received quantity. ${QUANTITY_FIELD_DESCRIPTION}`,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
   })
   @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(2_147_483_647)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
   qty!: number;
 }
 

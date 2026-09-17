@@ -4,6 +4,7 @@ import postgres from 'postgres';
 import request from 'supertest';
 import Redis from 'ioredis';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { fromMilli, toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import type { Database } from '../src/shared/db/db';
@@ -180,13 +181,29 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     ttlSeconds?: number,
   ): Parameters<InventoryFacade['grantReservation']>[0] {
     // `exactOptionalPropertyTypes`: an omitted TTL stays absent (never undefined).
+    // Story 10.1: the service speaks milli-units; this suite speaks base
+    // units, so the helper is the edge (the API controllers are, in prod).
+    const q = toMilli(quantity);
     return ttlSeconds === undefined
-      ? { tenantId, warehouseId, skuId, ownerType: OWNER_TYPE, ownerId, quantity }
-      : { tenantId, warehouseId, skuId, ownerType: OWNER_TYPE, ownerId, quantity, ttlSeconds };
+      ? { tenantId, warehouseId, skuId, ownerType: OWNER_TYPE, ownerId, quantity: q }
+      : { tenantId, warehouseId, skuId, ownerType: OWNER_TYPE, ownerId, quantity: q, ttlSeconds };
   }
 
-  function grant(skuId: string, ownerId: string, quantity: number, ttlSeconds?: number) {
-    return facade.grantReservation(grantCommand(skuId, ownerId, quantity, ttlSeconds));
+  async function grant(skuId: string, ownerId: string, quantity: number, ttlSeconds?: number) {
+    const snapshot = await facade.grantReservation(grantCommand(skuId, ownerId, quantity, ttlSeconds));
+    return { ...snapshot, quantity: fromMilli(snapshot.quantity) };
+  }
+
+  /** ATP in BASE units — the suite's own `fromMilli` edge (story 10.1). */
+  async function atpUnits(skuId: string) {
+    const snapshot = await facade.atp(tenantId, warehouseId, skuId);
+    return {
+      onHand: fromMilli(snapshot.onHand),
+      reserved: fromMilli(snapshot.reserved),
+      qcHeld: fromMilli(snapshot.qcHeld),
+      buffer: fromMilli(snapshot.buffer),
+      atp: fromMilli(snapshot.atp),
+    };
   }
 
   function ownerId(prefix: string): string {
@@ -197,7 +214,9 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     const rows = await sql`
       select id, state, quantity, owner_type, owner_id, expires_at from reservations where id = ${id}
     `;
-    return rows[0] as unknown as Record<string, unknown> | undefined;
+    const row = rows[0] as unknown as Record<string, unknown> | undefined;
+    // The column holds milli-units (story 10.1); the suite asserts base units.
+    return row === undefined ? undefined : { ...row, quantity: fromMilli(Number(row.quantity)) };
   }
 
   beforeAll(async () => {
@@ -298,7 +317,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
   it('healthy grant: counter decremented, journal row held with TTL, ATP drops by the qty', async () => {
     const skuId = skuIds.get('RSV-HEALTHY')!;
     await seedStock(skuId, binA, 5);
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(5);
+    expect((await atpUnits(skuId)).atp).toBe(5);
 
     const granted = await grant(skuId, ownerId('healthy-1'), 2);
     expect(granted.state).toBe('held');
@@ -308,7 +327,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     expect(Date.parse(granted.expiresAt)).toBeGreaterThan(Date.now() + 800_000);
     expect(Date.parse(granted.expiresAt)).toBeLessThanOrEqual(Date.now() + 1_000_000);
 
-    const atp = await facade.atp(tenantId, warehouseId, skuId);
+    const atp = await atpUnits(skuId);
     expect(atp).toMatchObject({ onHand: 5, reserved: 2, qcHeld: 0, buffer: 0, atp: 3 });
 
     const row = await reservationRow(granted.id);
@@ -322,7 +341,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     const repeat = await grant(skuId, owner, 1);
     expect(repeat.id).toBe(first.id);
     // The counter moved once, not twice.
-    expect((await facade.atp(tenantId, warehouseId, skuId)).reserved).toBe(3); // 2 + 1
+    expect((await atpUnits(skuId)).reserved).toBe(3); // 2 + 1
   });
 
   it('quantity-mismatch replay: a repeat grant with a different quantity is a deterministic 409 conflict', async () => {
@@ -341,7 +360,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
       where tenant_id = ${tenantId} and owner_type = ${OWNER_TYPE} and owner_id = ${owner} and state = 'held'
     `;
     expect(Number((rows[0] as unknown as { n: number }).n)).toBe(1);
-    expect((await facade.atp(tenantId, warehouseId, skuId)).reserved).toBe(2);
+    expect((await atpUnits(skuId)).reserved).toBe(2);
   });
 
   it('last-unit race: two concurrent grants, one unit — exactly one wins, the loser gets deterministic unavailable', async () => {
@@ -366,7 +385,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
       where tenant_id = ${tenantId} and sku_id = ${skuId} and state = 'held'
     `;
     expect(Number((rows[0] as unknown as { n: number }).n)).toBe(1);
-    const atp = await facade.atp(tenantId, warehouseId, skuId);
+    const atp = await atpUnits(skuId);
     expect(atp).toMatchObject({ onHand: 1, reserved: 1, atp: 0 });
 
     // The winner's hold is visible; a third grant is rejected deterministically too.
@@ -398,11 +417,11 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
       for (const code of burstSkus) {
         const skuId = skuIds.get(code)!;
         const rows = await sql`
-          select coalesce(sum(quantity), 0)::int as reserved from reservations
+          select coalesce(sum(quantity), 0)::bigint as reserved from reservations
           where tenant_id = ${tenantId} and sku_id = ${skuId} and state = 'held'
         `;
-        expect(Number((rows[0] as unknown as { reserved: number }).reserved)).toBe(2);
-        const atp = await facade.atp(tenantId, warehouseId, skuId);
+        expect(fromMilli(Number((rows[0] as unknown as { reserved: number }).reserved))).toBe(2);
+        const atp = await atpUnits(skuId);
         expect(atp.atp).toBe(0);
       }
     },
@@ -419,7 +438,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     expect(await reservationRow(granted.id)).toMatchObject({ state: 'committed' });
 
     // Committed units stay deducted: the counter is untouched by commit.
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(1);
+    expect((await atpUnits(skuId)).atp).toBe(1);
 
     // Second commit: deterministic conflict (the conditional UPDATE found no held row).
     const second = await facade.commitReservation(tenantId, granted.id).then(
@@ -454,7 +473,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     const skuId = skuIds.get('RSV-RELEASE')!;
     await seedStock(skuId, binA, 2);
     const granted = await grant(skuId, ownerId('rel'), 1);
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(1);
+    expect((await atpUnits(skuId)).atp).toBe(1);
 
     const outcomes = await Promise.allSettled([
       facade.releaseReservation(tenantId, granted.id),
@@ -469,7 +488,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
 
     // The journal is released; the counter restored exactly once (ATP back to 2).
     expect(await reservationRow(granted.id)).toMatchObject({ state: 'released' });
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(2);
+    expect((await atpUnits(skuId)).atp).toBe(2);
   });
 
   it('release: a released hold restores the counter; a repeat release is a deterministic conflict', async () => {
@@ -478,7 +497,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     const granted = await grant(skuId, ownerId('rel2'), 1);
     const released = await facade.releaseReservation(tenantId, granted.id);
     expect(released.state).toBe('released');
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(2);
+    expect((await atpUnits(skuId)).atp).toBe(2);
     await expectProblem(facade.releaseReservation(tenantId, granted.id), 409, 'conflict');
   });
 
@@ -487,12 +506,12 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     // F11 (story 4.1): ttlSeconds 0 is no longer a valid hold (400) — age a
     // normally-granted hold past its TTL directly instead.
     const granted = await grant(skuId, ownerId('ttl'), 1);
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(1);
+    expect((await atpUnits(skuId)).atp).toBe(1);
     await sql`update reservations set expires_at = now() - interval '1 second' where id = ${granted.id}`;
 
     expect(await facade.expireDueReservations()).toBe(1);
     expect(await reservationRow(granted.id)).toMatchObject({ state: 'expired' });
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(2);
+    expect((await atpUnits(skuId)).atp).toBe(2);
 
     // The terminal transition serialized: a second cycle finds nothing to do.
     expect(await facade.expireDueReservations()).toBe(0);
@@ -520,7 +539,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     expect(await reservationRow(granted.id)).toMatchObject({ state: 'expired' });
 
     // The point of the whole change: the counter gave the units back.
-    const after = await facade.atp(tenantId, warehouseId, skuId);
+    const after = await atpUnits(skuId);
     expect(after.reserved).toBe(0);
     expect(after.atp).toBe(after.onHand);
 
@@ -545,7 +564,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     const skuId = skuIds.get('RSV-Q')!;
     await seedStock(skuId, binA, 3);
     await seedStock(skuId, binB, 2);
-    expect((await facade.atp(tenantId, warehouseId, skuId)).onHand).toBe(5);
+    expect((await atpUnits(skuId)).onHand).toBe(5);
 
     // An open quarantine on binA, exactly the row 2.2's reconcile path
     // produces (same table, same shape) — inserted through a tenant
@@ -565,7 +584,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     );
 
     // binA's 3 units are excluded: ATP = 2, and granting over the remainder rejects.
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(2);
+    expect((await atpUnits(skuId)).atp).toBe(2);
     const granted = await grant(skuId, ownerId('q'), 2);
     expect(granted.state).toBe('held');
     await expectProblem(grant(skuId, ownerId('q2'), 1), 409, 'unavailable');
@@ -575,7 +594,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     const skuId = skuIds.get('RSV-REBUILD')!;
     await seedStock(skuId, binA, 2);
     await grant(skuId, ownerId('rb'), 1);
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(1);
+    expect((await atpUnits(skuId)).atp).toBe(1);
 
     const counterKey = `wms:{${tenantId}}:wh:${warehouseId}:res:${skuId}`;
     const readyKey = `wms:{${tenantId}}:wh:${warehouseId}:res:__ready__`;
@@ -584,7 +603,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     // goes down with the counters — grants and ATP reads fail closed during
     // the gap, never oversell.
     await valkey.del(counterKey, readyKey);
-    const duringGap = await facade.atp(tenantId, warehouseId, skuId).then(
+    const duringGap = await atpUnits(skuId).then(
       () => {
         throw new Error('expected the ATP read to fail closed during the rebuild gap');
       },
@@ -599,21 +618,21 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
 
     // The not-ready grant above triggered a rebuild from the journal —
     // Postgres won: the counter came back at the journal's live sum.
-    const afterHeal = await facade.atp(tenantId, warehouseId, skuId);
+    const afterHeal = await atpUnits(skuId);
     expect(afterHeal).toMatchObject({ onHand: 2, reserved: 1, atp: 1 });
     // And a follow-up grant now proceeds against the restored counter.
     const second = await grant(skuId, ownerId('rb3'), 1);
     expect(second.state).toBe('held');
 
     // Divergent (not missing) counter: Postgres wins on an explicit rebuild.
-    await valkey.set(counterKey, '99');
-    expect((await facade.atp(tenantId, warehouseId, skuId)).reserved).toBe(99);
+    await valkey.set(counterKey, String(toMilli(99)));
+    expect((await atpUnits(skuId)).reserved).toBe(99);
     const report = await facade.rebuildReservationCounters(tenantId, warehouseId);
     expect(report).toHaveLength(1);
     expect(report[0]!.warehouseId).toBe(warehouseId);
     const rebuiltScope = report[0]!.scopes.find((scope) => scope.skuId === skuId);
-    expect(rebuiltScope).toMatchObject({ reserved: 2 }); // held(1) + committed(0)… + the second hold = 2
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(0);
+    expect(rebuiltScope).toMatchObject({ reserved: toMilli(2) }); // held(1) + committed(0)… + the second hold = 2
+    expect((await atpUnits(skuId)).atp).toBe(0);
   });
 
   it('missing counter under a ready marker: healed from the journal before the read, then the grant proceeds', async () => {
@@ -621,7 +640,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     // Drop ONLY the counter (the ready marker stays armed — divergence).
     const counterKey = `wms:{${tenantId}}:wh:${warehouseId}:res:${skuId}`;
     await valkey.del(counterKey);
-    expect((await facade.atp(tenantId, warehouseId, skuId)).reserved).toBe(2); // journal sum, not 0
+    expect((await atpUnits(skuId)).reserved).toBe(2); // journal sum, not 0
     // The grant heals-then-decides: reserved(2) + 1 > ceiling(2) → unavailable.
     await expectProblem(grant(skuId, ownerId('rb4'), 1), 409, 'unavailable');
   });
@@ -637,13 +656,13 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
       await expectProblem(grant(skuId, ownerId('down'), 1), 503, 'reservation-store-unavailable');
       grantSpy.mockRestore();
       const readSpy = jest.spyOn(valkeyClient, 'isReady').mockRejectedValue(new Error('connection refused'));
-      await expectProblem(facade.atp(tenantId, warehouseId, skuId), 503, 'reservation-store-unavailable');
+      await expectProblem(atpUnits(skuId), 503, 'reservation-store-unavailable');
       readSpy.mockRestore();
     } finally {
       jest.restoreAllMocks();
     }
     // Healthy again: the client was only mocked, the store untouched.
-    expect((await facade.atp(tenantId, warehouseId, skuId)).atp).toBe(2); // 5 on-hand − (2 + 1) reserved
+    expect((await atpUnits(skuId)).atp).toBe(2); // 5 on-hand − (2 + 1) reserved
   });
 
   it('boot rebuild: onModuleInit reseeds every counter from the journal with no explicit rebuild', async () => {
@@ -651,15 +670,15 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     // Valkey keyspace goes down (a `docker compose restart valkey`), the
     // module's init hook re-runs, and ATP reads the journal-reseeded counters.
     const skuId = skuIds.get('RSV-HEALTHY')!;
-    expect((await facade.atp(tenantId, warehouseId, skuId)).reserved).toBe(3);
+    expect((await atpUnits(skuId)).reserved).toBe(3);
     const keys = await valkey.keys(`wms:{${tenantId}}:*`);
     expect(keys.length).toBeGreaterThan(0);
     await valkey.del(...keys);
-    expect(await facade.atp(tenantId, warehouseId, skuId).then(() => true, () => false)).toBe(false);
+    expect(await atpUnits(skuId).then(() => true, () => false)).toBe(false);
 
     await app.get(ReservationService).onModuleInit();
 
-    const after = await facade.atp(tenantId, warehouseId, skuId);
+    const after = await atpUnits(skuId);
     expect(after).toMatchObject({ onHand: 5, reserved: 3, atp: 2 });
   });
 
@@ -811,14 +830,14 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
       expect(codeOf(loser.reason)).toBe('unavailable');
     }
     const rows = await sql`
-      select count(*)::int as n, coalesce(sum(quantity), 0)::int as q from reservations
+      select count(*)::int as n, coalesce(sum(quantity), 0)::bigint as q from reservations
       where tenant_id = ${tenantId} and owner_type = ${OWNER_TYPE} and owner_id = ${owner} and state = 'held'
     `;
     const row = rows[0] as unknown as { n: number; q: number };
     expect(Number(row.n)).toBe(1);
-    expect(Number(row.q)).toBe(1);
+    expect(fromMilli(Number(row.q))).toBe(1);
     // The compensated decrement never lingers: counter mirrors the journal.
-    const atp = await facade.atp(tenantId, warehouseId, skuId);
+    const atp = await atpUnits(skuId);
     expect(atp).toMatchObject({ onHand: 2, reserved: 1, atp: 1 });
   });
 
@@ -893,7 +912,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     setCounterSpy.mockRestore();
 
     // The correction pass restored the hold: the counter equals the journal.
-    const after = await facade.atp(tenantId, warehouseId, skuId);
+    const after = await atpUnits(skuId);
     expect(after).toMatchObject({ onHand: 2, reserved: 1, atp: 1 });
   });
 
@@ -917,11 +936,11 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     // Either interleave is a valid outcome; the invariant below pins both.
     // Wait (bounded) for the adjustment's commit to land before asserting —
     // the grant's own decision is already settled by then.
-    let atp = await facade.atp(tenantId, warehouseId, skuId);
+    let atp = await atpUnits(skuId);
     const deadline = Date.now() + 5_000;
     while (atp.onHand !== 1 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 50));
-      atp = await facade.atp(tenantId, warehouseId, skuId);
+      atp = await atpUnits(skuId);
     }
     expect(atp.onHand).toBe(1);
     expect(atp.qcHeld).toBe(0);
@@ -937,10 +956,10 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     }
     // Journal parity across the interleave: the counter mirrors the journal.
     const sums = await sql`
-      select coalesce(sum(quantity), 0)::int as reserved from reservations
+      select coalesce(sum(quantity), 0)::bigint as reserved from reservations
       where tenant_id = ${tenantId} and sku_id = ${skuId} and state in ('held','committed')
     `;
-    expect(atp.reserved).toBe(Number((sums[0] as unknown as { reserved: number }).reserved));
+    expect(atp.reserved).toBe(fromMilli(Number((sums[0] as unknown as { reserved: number }).reserved)));
   });
 
   it('ceiling regression mid-grant (A2, deterministic): a committed adjustment shrinking the ceiling under a won script 409s and compensates', async () => {
@@ -997,7 +1016,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     `;
     expect(Number((rows[0] as unknown as { n: number }).n)).toBe(0);
     // The counter mirrors the journal: reserved 0, ATP back to the full 1.
-    const atp = await facade.atp(tenantId, warehouseId, skuId);
+    const atp = await atpUnits(skuId);
     expect(atp).toMatchObject({ onHand: 1, reserved: 0, atp: 1 });
   });
 
@@ -1007,11 +1026,11 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     for (const code of ['RSV-HEALTHY', 'RSV-RACE', 'RSV-REBUILD', 'RSV-COMMIT', 'RSV-IDEM', 'RSV-OWNER', 'RSV-CORRECT']) {
       const skuId = skuIds.get(code)!;
       const sums = await sql`
-        select coalesce(sum(quantity), 0)::int as reserved from reservations
+        select coalesce(sum(quantity), 0)::bigint as reserved from reservations
         where tenant_id = ${tenantId} and sku_id = ${skuId} and state in ('held','committed')
       `;
-      const journal = Number((sums[0] as unknown as { reserved: number }).reserved);
-      const atp = await facade.atp(tenantId, warehouseId, skuId);
+      const journal = fromMilli(Number((sums[0] as unknown as { reserved: number }).reserved));
+      const atp = await atpUnits(skuId);
       expect(atp.reserved).toBe(journal);
     }
   });
@@ -1022,13 +1041,43 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     // repaired toward Postgres by the next reaper cycle.
     const skuId = skuIds.get('RSV-REBUILD')!;
     const counterKey = `wms:{${tenantId}}:wh:${warehouseId}:res:${skuId}`;
-    expect((await facade.atp(tenantId, warehouseId, skuId)).reserved).toBe(2); // quiet before
-    await valkey.set(counterKey, '99');
+    expect((await atpUnits(skuId)).reserved).toBe(2); // quiet before
+    await valkey.set(counterKey, String(toMilli(99)));
 
     expect(await facade.expireDueReservations()).toBe(0); // nothing due — the parity pass ran
 
-    const after = await facade.atp(tenantId, warehouseId, skuId);
+    const after = await atpUnits(skuId);
     expect(after).toMatchObject({ onHand: 2, reserved: 2, atp: 0 }); // journal sum, not 99
+  });
+
+  it('parity pass: a counter that AGREES with the journal is left alone — no rebuild, no disarm', async () => {
+    // The other half of the parity contract, and the one nothing watched: a
+    // quiet scope must produce NO repair. A rebuild that fires on every cycle
+    // is not a harmless extra write — `rebuildCounters` disarms the warehouse's
+    // ready marker first, so grants and ATP reads fail closed with a 503 for
+    // the whole window. That is exactly what a `number !== string` compare
+    // over a `::bigint` sum caused, and it shipped green because every parity
+    // test asserted the counter ENDED correct, which a rebuild also achieves.
+    const skuId = skuIds.get('RSV-REBUILD')!;
+    const counterKey = `wms:{${tenantId}}:wh:${warehouseId}:res:${skuId}`;
+    const before = await atpUnits(skuId);
+    // Precondition: the counter already equals the journal for this scope.
+    expect(Number(await valkey.get(counterKey))).toBe(toMilli(before.reserved));
+
+    const valkeyClient = app.get(ValkeyClient);
+    const disarmSpy = jest.spyOn(valkeyClient, 'disarmReady');
+    const setSpy = jest.spyOn(valkeyClient, 'setCounter');
+    try {
+      expect(await facade.expireDueReservations()).toBe(0); // the parity pass ran
+      expect(disarmSpy).not.toHaveBeenCalled();
+      expect(setSpy).not.toHaveBeenCalled();
+    } finally {
+      disarmSpy.mockRestore();
+      setSpy.mockRestore();
+    }
+    // …and nothing moved, which a rebuild would also have achieved — the spies
+    // above are what tell the two apart.
+    expect(await atpUnits(skuId)).toMatchObject(before);
   });
 
   it('0009 CHECK constraints: a bogus state and a zero quantity are rejected by the database (23514)', async () => {
@@ -1073,11 +1122,11 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     // walks the journal's live scopes) does not re-seed it here — a rebuild
     // does; the journal-committed results above are what the caller saw.
     const sums = await sql`
-      select coalesce(sum(quantity), 0)::int as reserved from reservations
+      select coalesce(sum(quantity), 0)::bigint as reserved from reservations
       where tenant_id = ${tenantId} and sku_id = ${skuId} and state in ('held','committed')
     `;
-    expect(Number((sums[0] as unknown as { reserved: number }).reserved)).toBe(0); // journal truth
-    const atp = await facade.atp(tenantId, warehouseId, skuId);
+    expect(fromMilli(Number((sums[0] as unknown as { reserved: number }).reserved))).toBe(0); // journal truth
+    const atp = await atpUnits(skuId);
     expect(atp.atp).toBeLessThanOrEqual(atp.onHand - atp.qcHeld - atp.buffer); // never oversells
     expect(atp.reserved).toBeGreaterThanOrEqual(0);
   });

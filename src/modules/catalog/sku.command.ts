@@ -17,6 +17,8 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
+import { fromMilli } from '../../shared/primitives/quantity';
+import { isFractionalUom, serialTrackedFractionalUomDetail } from './uom-precision';
 
 export const DEFAULT_SKU_PAGE_SIZE = 50;
 export const MAX_SKU_PAGE_SIZE = 200;
@@ -196,6 +198,20 @@ export class SkuCommand {
           throw skuNotFound();
         }
 
+        // Story 10.1: turning serial tracking ON is catalog entry for the
+        // rule's purposes — a serialized unit is discrete by definition, so a
+        // SKU measured to three decimals can never carry serials. Refused
+        // here, naming the UoM and the rule, rather than converted at the four
+        // sites that compare a unit count to `serials.length`.
+        if (fields.serialTracked === true && isFractionalUom(current.uom)) {
+          throw new ProblemException(
+            'validation-failed',
+            400,
+            'Serial tracking needs a whole-unit UoM',
+            serialTrackedFractionalUomDetail(current.uom),
+          );
+        }
+
         // Barcode uniqueness per tenant: another SKU already holding the new
         // barcode is a 409 naming it (the same conflict code the import
         // reports row-level).
@@ -288,8 +304,10 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     hsn: row.hsn,
     batchTracked: row.batchTracked,
     serialTracked: row.serialTracked,
-    reorderPoint: row.reorderPoint,
-    reorderQty: row.reorderQty,
+    // Story 10.1: `toSnapshot` is the module's only SKU read shape — base
+    // units leave here, milli-units stay in the column.
+    reorderPoint: fromMilli(row.reorderPoint),
+    reorderQty: fromMilli(row.reorderQty),
     barcode: row.barcode,
     uomConversions: [],
     createdAt: row.createdAt,

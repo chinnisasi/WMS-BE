@@ -20,6 +20,7 @@ import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.ser
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
+import { fromMilli } from '../../shared/primitives/quantity';
 
 export interface PoLineInput {
   readonly skuId: string;
@@ -270,7 +271,7 @@ export class PurchaseOrderCommand {
       // the unknown id); entries without an id are new lines. A repeated id
       // is ambiguous under full-line-set semantics — 400 (mirrors close's
       // duplicate-disposition rule).
-      const existingLines = await this.linesOf(tx, po.id);
+      const existingLines = await this.lineRowsOf(tx, po.id);
       const existingById = new Set(existingLines.map((line) => line.id));
       const seenLineIds = new Set<string>();
       for (const line of command.lines) {
@@ -378,7 +379,10 @@ export class PurchaseOrderCommand {
       // Already closed → 409 `po-not-open` naming the status (the stored
       // replay above re-serves the original close's snapshot first).
       const po = await this.loadOpenPo(tx, command.tenantId, command.poId);
-      const existingLines = await this.linesOf(tx, po.id);
+      // Story 10.1: the RAW rows — close does quantity arithmetic on them
+      // (`ordered − received` becomes the successor's ordered quantity), so it
+      // must stay in the domain's milli-units the whole way.
+      const existingLines = await this.lineRowsOf(tx, po.id);
 
       // Close is total: one disposition per line, no duplicates, no unknown
       // ids, no missing lines.
@@ -675,14 +679,27 @@ export class PurchaseOrderCommand {
     };
   }
 
-  /** The PO's lines, oldest first (the detail read's order — the (po_id, created_at, id) index). */
+  /**
+   * The PO's lines, oldest first (the detail read's order — the
+   * (po_id, created_at, id) index), as the READ shape: quantities converted
+   * out of milli-units for the response.
+   *
+   * Story 10.1: anything that does ARITHMETIC on a quantity must use
+   * `lineRowsOf` instead. Handing an edge-converted snapshot to an internal
+   * caller is the trap that made a carried PO line land on its successor a
+   * thousand times too small.
+   */
   private async linesOf(tx: TenantTx, poId: string): Promise<PurchaseOrderLineSnapshot[]> {
-    const rows = await tx
+    return (await this.lineRowsOf(tx, poId)).map(lineSnapshot);
+  }
+
+  /** The same lines as stored — quantities in milli-units, for the command paths. */
+  private async lineRowsOf(tx: TenantTx, poId: string): Promise<PurchaseOrderLine[]> {
+    return tx
       .select()
       .from(purchaseOrderLines)
       .where(eq(purchaseOrderLines.poId, poId))
       .orderBy(purchaseOrderLines.createdAt, purchaseOrderLines.id);
-    return rows.map(lineSnapshot);
   }
 
   /** One line insert row (received ships at 0; expected date UTC-normalized). */
@@ -717,9 +734,12 @@ export function lineSnapshot(row: PurchaseOrderLine): PurchaseOrderLineSnapshot 
     id: row.id,
     poId: row.poId,
     skuId: row.skuId,
-    orderedQty: row.orderedQty,
-    receivedQty: row.receivedQty,
-    openQty: row.orderedQty - row.receivedQty,
+    // Story 10.1: `lineSnapshot` is the module's ONLY read shape — every
+    // response body and every outbox payload carrying a PO line comes through
+    // here, so this is where milli-units become the base UoM again.
+    orderedQty: fromMilli(row.orderedQty),
+    receivedQty: fromMilli(row.receivedQty),
+    openQty: fromMilli(row.orderedQty - row.receivedQty),
     unitCostPaise: row.unitCostPaise,
     expectedDate: row.expectedDate === null ? null : canonicalInstant(row.expectedDate),
     status: row.status,

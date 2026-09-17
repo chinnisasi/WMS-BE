@@ -1,5 +1,10 @@
 import { Transform, Type } from 'class-transformer';
 import {
+  MAX_QUANTITY_BASE,
+  MIN_QUANTITY_BASE,
+  QUANTITY_FIELD_DESCRIPTION,
+} from '../../shared/primitives/quantity';
+import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
@@ -12,6 +17,7 @@ import {
   Matches,
   Max,
   Min,
+  IsNumber,
   ValidateNested,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
@@ -21,12 +27,7 @@ import { SHORT_PICK_REASON_CODES } from './pick.command';
 // a literal here and a constant there drift silently, and the DTO is the
 // gate every HTTP caller actually hits. (`order.command` / `pick.command`
 // set the precedent above; `pack.command` imports no DTO, so no cycle.)
-import {
-  MAX_DIMENSION_MM,
-  MAX_SCAN_LINES,
-  MAX_SCAN_QUANTITY,
-  MAX_WEIGHT_GRAMS,
-} from './pack.command';
+import { MAX_DIMENSION_MM, MAX_SCAN_LINES, MAX_WEIGHT_GRAMS } from './pack.command';
 import { MAX_CARRIER_NAME_LENGTH, MAX_TRACKING_NUMBER_LENGTH } from './dispatch.command';
 import {
   PICKLIST_LINE_STATUSES,
@@ -52,15 +53,15 @@ export class OrderLineInputDto {
   skuId!: string;
 
   @ApiProperty({
-    description: 'Ordered quantity in base UoM — a positive integer',
-    minimum: 1,
-    maximum: 2147483647,
+    description: `Ordered quantity. ${QUANTITY_FIELD_DESCRIPTION}`,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
     example: 10,
   })
   @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(2147483647)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
   quantity!: number;
 }
 
@@ -605,14 +606,15 @@ export class RecordPickDto {
 
   @ApiProperty({
     description:
-      'Units actually drawn in base UoM. Equal to the line’s planned quantity for an ordinary pick; BELOW it (down to 0, an empty bin) for a short pick, which must carry a reasonCode. Above the plan is always a 400.',
+      'Units actually drawn in base UoM. Equal to the line’s planned quantity for an ordinary pick; BELOW it (down to 0, an empty bin) for a short pick, which must carry a reasonCode. Above the plan is always a 400. ' +
+      `A non-zero value below ${MIN_QUANTITY_BASE} is refused rather than rounded to zero — zero means an empty bin, which is a different report.`,
     minimum: 0,
-    maximum: 2147483647,
+    maximum: MAX_QUANTITY_BASE,
   })
   @Type(() => Number)
-  @IsInt()
+  @IsNumber({ allowNaN: false, allowInfinity: false })
   @Min(0)
-  @Max(2147483647)
+  @Max(MAX_QUANTITY_BASE)
   qty!: number;
 
   @ApiProperty({ description: 'Device time of the pick (ISO-8601 UTC, Z-suffixed)', minLength: 20, maxLength: 35 })
@@ -926,13 +928,13 @@ export class PackScanLineDto {
   @ApiProperty({
     description:
       'Units of this SKU counted into the parcel, in base UoM. Two lines naming the same SKU sum — the bench scans items, not lines.',
-    minimum: 1,
-    maximum: MAX_SCAN_QUANTITY,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
   })
   @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(MAX_SCAN_QUANTITY)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
   qty!: number;
 }
 

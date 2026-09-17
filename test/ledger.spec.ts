@@ -3,6 +3,7 @@ import { Logger } from '@nestjs/common';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { MAX_QUANTITY_BASE, fromMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
@@ -151,7 +152,9 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
         select quantity from stock_on_hand
         where tenant_id = ${tenantId} and bin_id = ${targetBinId}
       `;
-      return Number(rows[0]!.quantity);
+      // Story 10.1: the column holds milli-units (`bigint`, so postgres.js
+      // hands it back as a string); this suite reads in base units.
+      return fromMilli(Number(rows[0]!.quantity));
     } finally {
       await sql.end();
     }
@@ -279,7 +282,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       const event = events[0] as {
         seq: number;
         type: string;
-        quantity_delta: number;
+        quantity_delta: string;
         prev_hash: string;
         event_hash: string;
         from_bin_id: string | null;
@@ -287,7 +290,8 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       };
       expect(event.seq).toBe(1);
       expect(event.type).toBe('stock.adjusted');
-      expect(event.quantity_delta).toBe(5);
+      // Story 10.1: the stored delta is milli-units; the movement is 5.
+      expect(fromMilli(Number(event.quantity_delta))).toBe(5);
       expect(event.to_bin_id).toBe(binA);
       expect(event.from_bin_id).toBeNull();
       // Genesis linkage + a real hash over the canonical bytes.
@@ -416,11 +420,11 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       `;
       const row = rows[0] as {
         seq: number;
-        quantity_delta: number;
+        quantity_delta: string;
         event_hash: string;
       };
       const update = sql`
-        update ledger_events set quantity_delta = ${row.quantity_delta + 1}
+        update ledger_events set quantity_delta = ${Number(row.quantity_delta) + 1}
         where tenant_id = ${tenantId} and seq = ${row.seq}
       `;
       await expect(update).rejects.toThrow(/append-only/i);
@@ -432,7 +436,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
         select quantity_delta, event_hash from ledger_events
         where tenant_id = ${tenantId} and seq = ${row.seq}
       `;
-      const intact = after[0] as { quantity_delta: number; event_hash: string };
+      const intact = after[0] as { quantity_delta: string; event_hash: string };
       expect(intact.quantity_delta).toBe(row.quantity_delta);
       expect(intact.event_hash).toBe(row.event_hash);
     } finally {
@@ -704,9 +708,15 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
     expect(await eventCount()).toBe(before);
   });
 
-  it('quantityDelta beyond int4 is 400 validation-failed at the route bounds, never a 500', async () => {
+  it('quantityDelta beyond the exact-quantity ceiling is 400 validation-failed at the route bounds, never a 500', async () => {
     const before = await eventCount();
-    const res = await adjust(opsToken, adjustmentBody({ quantityDelta: 2147483648 })).expect(400);
+    // Story 10.1 moved the bound: the int4 ceiling (2147483647) is gone —
+    // the route now refuses above MAX_QUANTITY_BASE, the largest base-unit
+    // quantity the milli-unit representation carries exactly.
+    const res = await adjust(
+      opsToken,
+      adjustmentBody({ quantityDelta: MAX_QUANTITY_BASE + 1 }),
+    ).expect(400);
     expect(res.body).toMatchObject({ status: 400, code: 'validation-failed' });
     expect(await eventCount()).toBe(before);
   });

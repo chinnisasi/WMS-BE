@@ -12,7 +12,7 @@ import {
   skus,
 } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
-import { signedQuantity } from '../../shared/primitives/quantity';
+import { MAX_QUANTITY_MILLI, assertExactQuantity, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
 import { canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -30,13 +30,18 @@ import type { OrderSource, OrderStatus } from './order.command';
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 /**
- * Measurements are Postgres-free (they live on the ledger's reference doc,
- * which is jsonb) but still bounded: a scanned quantity above the int4
- * ceiling would die as a raw 22003 at the `picks` comparison, and an absurd
- * weight is a fat-fingered scale, not a parcel. The typed 400 is the
- * boundary (the 4.1 `MAX_LINE_QUANTITY` precedent).
+ * The scan ceiling, in milli-units (story 10.1 — the constant moves with the
+ * quantities it bounds). Measurements are Postgres-free (they live on the
+ * ledger's reference doc, which is jsonb) but still bounded: a scanned
+ * quantity past the 2⁵³ exact-integer ceiling would round silently at the
+ * `picks` comparison, and an absurd weight is a fat-fingered scale, not a
+ * parcel. The typed 400 is the boundary (the 4.1 `MAX_LINE_QUANTITY`
+ * precedent).
  */
-export const MAX_SCAN_QUANTITY = 2_147_483_647;
+export const MAX_SCAN_QUANTITY = MAX_QUANTITY_MILLI;
+// (`MAX_QUANTITY_MILLI` IS the DTO's `@Max(MAX_QUANTITY_BASE)` expressed in
+// the units a command sees, so the two gates cannot disagree — this file's own
+// header warns that a literal here and a constant there drift silently.)
 
 /**
  * The ceiling on scan LINES in one pack. A parcel is one order's contents and
@@ -323,7 +328,10 @@ export class PackCommandService {
         .select({
           orderLineId: picks.orderLineId,
           skuId: picks.skuId,
-          qty: sql<number>`sum(${picks.qty})::int`,
+          // Story 10.1: `::bigint` — an int4 sum of milli-units overflows at
+          // ~2.1M base units. `int8` comes back as a string; `Number(...)`
+          // below is the boundary coercion.
+          qty: sql<string>`sum(${picks.qty})::bigint`,
         })
         .from(picks)
         .where(and(eq(picks.tenantId, command.tenantId), eq(picks.orderId, order.id)))
@@ -407,7 +415,9 @@ export class PackCommandService {
           kind: 'pack',
           orderId: order.id,
           orderLineId: line.id,
-          packedQty,
+          // Story 10.1: the reference doc is a DOCUMENT — it ships verbatim
+          // on the ledger timeline, so it speaks base units.
+          packedQty: fromMilli(packedQty),
           // Optional and additive: the keys serialize only when present, so
           // an unmeasured parcel's canonical bytes carry neither.
           ...(weightGrams === null ? {} : { weightGrams }),
@@ -445,12 +455,13 @@ export class PackCommandService {
           skuId: line.skuId,
           skuCode: sku?.code ?? line.skuId,
           skuName: sku?.name ?? line.skuId,
-          orderedQty: line.qty,
-          packedQty,
-          shortfallQty: line.qty - packedQty,
+          // Base units at the response/outbox edge (story 10.1).
+          orderedQty: fromMilli(line.qty),
+          packedQty: fromMilli(packedQty),
+          shortfallQty: fromMilli(line.qty - packedQty),
           ledgerEventId: appended.eventId,
         });
-        totalUnits += packedQty;
+        totalUnits = assertExactQuantity(totalUnits + packedQty, 'pack total units');
       }
 
       // ── the dead holds this pack is the last chance to release ──────────
@@ -487,7 +498,15 @@ export class PackCommandService {
       const counterRestores = new Map<string, number>();
       for (const hold of deadHolds) {
         await this.inventory.releaseReservationInTx(tx, command.tenantId, hold.id);
-        counterRestores.set(hold.skuId, (counterRestores.get(hold.skuId) ?? 0) + hold.quantity);
+        counterRestores.set(
+          hold.skuId,
+          // The sum reaches the Valkey counter (story 10.1) — asserted exact
+          // before it can round its way into ATP.
+          assertExactQuantity(
+            (counterRestores.get(hold.skuId) ?? 0) + hold.quantity,
+            `pack counter restore for sku ${hold.skuId}`,
+          ),
+        );
       }
       // `order_lines.reservation_id` / `reserved_qty` are deliberately NOT
       // cleared. Unlike a cancel, a pack does not undo the acceptance: a
@@ -510,7 +529,7 @@ export class PackCommandService {
           packedAt: canonicalInstant(packedAt),
           weightGrams,
           dimensionsMm,
-          totalUnits,
+          totalUnits: fromMilli(totalUnits),
           lines: packedLines,
         },
       };
@@ -583,7 +602,10 @@ export class PackCommandService {
         continue;
       }
       const code = skuById.get(skuId)?.code ?? skuId;
-      discrepancies.push(`SKU ${code} (${skuId}): picked ${pickedQty}, scanned ${scannedQty}`);
+      // Operator-facing text speaks base units (story 10.1).
+      discrepancies.push(
+        `SKU ${code} (${skuId}): picked ${fromMilli(pickedQty)}, scanned ${fromMilli(scannedQty)}`,
+      );
     }
     if (discrepancies.length === 0) {
       return;
@@ -703,9 +725,10 @@ function aggregateScan(scanned: readonly PackScanLineInput[]): Map<string, numbe
     if (!UUID_RE.test(line.skuId)) {
       throw packValidation('Every scanned line names a well-formed skuId.');
     }
+    // `line.qty` is in milli-units — the API edge scaled it.
     if (!Number.isInteger(line.qty) || line.qty <= 0 || line.qty > MAX_SCAN_QUANTITY) {
       throw packValidation(
-        `Scanned quantity must be a positive integer in base UoM, at most ${MAX_SCAN_QUANTITY} (got ${String(line.qty)}).`,
+        `Scanned quantity must be a positive quantity in base UoM, at most ${fromMilli(MAX_SCAN_QUANTITY)} (got ${String(fromMilli(line.qty))}).`,
       );
     }
     const running = (totals.get(line.skuId) ?? 0) + line.qty;
@@ -715,7 +738,7 @@ function aggregateScan(scanned: readonly PackScanLineInput[]): Map<string, numbe
     // exists to prevent. The AGGREGATE carries the same cap (review loop 1).
     if (running > MAX_SCAN_QUANTITY) {
       throw packValidation(
-        `Scanned quantity for a SKU must total at most ${MAX_SCAN_QUANTITY} in base UoM across every line naming it.`,
+        `Scanned quantity for a SKU must total at most ${fromMilli(MAX_SCAN_QUANTITY)} in base UoM across every line naming it.`,
       );
     }
     totals.set(line.skuId, running);

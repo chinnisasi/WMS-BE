@@ -55,6 +55,24 @@ const files: ScannedFile[] = tsFilesUnder(SRC_ROOT)
   .sort()
   .map((path) => ({ path, source: readFileSync(path, 'utf8') }));
 
+/**
+ * The quantity scans below cover the SUITES too. A test that sums a quantity
+ * column through an int4 cast raises 22003 the moment its fixture grows past
+ * ~2,147 base units — and a guard that only watched `src/` would let that
+ * land, then present as a mystery failure in whichever suite grew first.
+ */
+const TEST_ROOT = join(__dirname);
+const quantityScanFiles: ScannedFile[] = [
+  ...files,
+  ...tsFilesUnder(TEST_ROOT)
+    .sort()
+    // This file is excluded from its own scan: it carries the counterexamples
+    // the matchers are proved against, and a guard that fails on its own
+    // evidence proves nothing.
+    .filter((path) => path !== __filename)
+    .map((path) => ({ path, source: readFileSync(path, 'utf8') })),
+];
+
 /** Drizzle write calls on a table object, e.g. `.insert(stockOnHand)`. */
 function drizzleWriteOn(table: string): RegExp {
   return new RegExp(`\\.(insert|update|delete)\\(\\s*${table}\\b`);
@@ -481,5 +499,93 @@ describe('architecture: carrier credentials are carriers-module-owned (story 4.6
     const columnList = /export const CONNECTION_COLUMNS = \{[\s\S]*?\} as const;/.exec(command);
     expect(columnList).not.toBeNull();
     expect(columnList![0]).not.toContain('credentialSealed');
+  });
+});
+
+/**
+ * Story 10.1: quantities are scaled integers in milli-units, which puts two
+ * int4 traps in the way of anything that touches them in raw SQL. Both are
+ * silent until a warehouse is large enough, and both are 500s rather than
+ * refusals when they finally fire — so they are scanned for here rather than
+ * left to be found in production.
+ */
+describe('architecture: no int4 trap sits over a milli-unit quantity (story 10.1)', () => {
+  /** The quantity columns, in both their Drizzle and physical spellings. */
+  const QUANTITY_COLUMN =
+    '(quantity|quantityDelta|quantity_delta|qty|appliedQty|applied_qty|orderedQty|ordered_qty' +
+    '|receivedQty|received_qty|excessQty|excess_qty|reservedQty|reserved_qty' +
+    '|shortfallQty|shortfall_qty|capacity|reorderPoint|reorder_point|reorderQty|reorder_qty)';
+
+  it('no `::int` cast sits over a quantity column, in src or in the suites', () => {
+    // Aggregates AND the bare column: `sum(quantity)::int` overflows at ~2.1
+    // million base units, and `quantity::int` at the same place. `count(*)`,
+    // a parsed document number and an epoch extraction are not quantities, so
+    // the scan keys on the COLUMN, never on the cast alone.
+    const CAST_OVER_QUANTITY = new RegExp(
+      `(?:(?:sum|max|min|avg)\\s*\\(\\s*)?(?:\\$\\{[A-Za-z]+\\.)?${QUANTITY_COLUMN}\\}?\\s*\\)?[^;\`\n]{0,40}?::int\\b`,
+    );
+    const offenders: string[] = [];
+    for (const file of quantityScanFiles) {
+      const hit = CAST_OVER_QUANTITY.exec(file.source);
+      if (hit !== null) {
+        offenders.push(`${file.path}: ${hit[0]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningfulness: the matcher fires on every shape it forbids…
+    for (const forbidden of [
+      'sql`coalesce(sum(${stockOnHand.quantity}), 0)::int`',
+      'coalesce(sum(quantity), 0)::int as reserved',
+      'select max(qty)::int from picks',
+      'select quantity::int from stock_on_hand',
+      'sql`avg(${picks.qty})::int`',
+      'coalesce(sum(shortfall_qty), 0)::int',
+    ]) {
+      expect(`${forbidden} -> ${CAST_OVER_QUANTITY.test(forbidden)}`).toBe(`${forbidden} -> true`);
+    }
+    // …and on none of the casts that are not quantities.
+    for (const allowed of [
+      'sql`count(*)::int`',
+      "count(*)::int as n from skus",
+      "extract(epoch from expires_at - created_at)::int as ttl",
+      "coalesce(max(substring(code from '^GRN-([0-9]{1,9})$')::int), 0)",
+      "select count(*)::int from picklists pl where pl.wave_id = waves.id",
+    ]) {
+      expect(`${allowed} -> ${CAST_OVER_QUANTITY.test(allowed)}`).toBe(`${allowed} -> false`);
+    }
+  });
+
+  it('every quantity bound into a raw-SQL expression carries an explicit `::bigint`', () => {
+    // The second trap, and the one that actually shipped: Postgres resolves an
+    // untyped bound parameter beside an integer literal as int4, so
+    // `greatest(${delta}, 0)` died with a raw 22003 against a `bigint` column
+    // that could hold the value perfectly well. The fix is a cast on the
+    // PARAMETER; this is the guard that keeps the next one from going in
+    // without it, since the comment calling the cast load-bearing cannot.
+    // A Drizzle COLUMN reference (`${stockOnHand.quantity}`) is typed by the
+    // column and needs nothing; what needs the cast is a scalar VALUE bound
+    // into the statement. The two are told apart by their prefix: a column
+    // reference names a schema table object, a value names a local binding.
+    const UNTYPED_QUANTITY_PARAM = new RegExp(
+      'sql`[^`]*\\$\\{\\s*' +
+        '(?:(?:row|entry|command|line|hold|arm|input|slice|candidate|current|existing)\\.)?' +
+        '(?:delta|applied|magnitude|remainder|excessQty|quantity|qty)' +
+        '\\s*\\}(?!::bigint)',
+    );
+    const offenders: string[] = [];
+    for (const file of files) {
+      const hit = UNTYPED_QUANTITY_PARAM.exec(file.source);
+      if (hit !== null) {
+        offenders.push(`${file.path}: ${hit[0]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningfulness: the shape that shipped is caught, the fixed one is not.
+    expect(UNTYPED_QUANTITY_PARAM.test('sql`greatest(${delta}, 0)`')).toBe(true);
+    expect(UNTYPED_QUANTITY_PARAM.test('sql`greatest(${delta}::bigint, 0)`')).toBe(false);
+    expect(UNTYPED_QUANTITY_PARAM.test('sql`${purchaseOrderLines.receivedQty} + ${applied}`')).toBe(true);
+    expect(UNTYPED_QUANTITY_PARAM.test('sql`${purchaseOrderLines.receivedQty} + ${applied}::bigint`')).toBe(false);
+    // A column reference is typed by the column, not by the parameter.
+    expect(UNTYPED_QUANTITY_PARAM.test('sql`${stockOnHand.quantity} > 0`')).toBe(false);
   });
 });

@@ -13,6 +13,7 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
+import { fromMilli } from '../../shared/primitives/quantity';
 
 /** What other modules get from the tenancy spine (module boundary — AD-6). */
 export interface ActiveWarehouse {
@@ -324,7 +325,11 @@ export class TenancyService {
         .orderBy(desc(bins.createdAt), desc(bins.id))
         .limit(pageSize + 1);
     });
-    const page = buildPage(rows, pageSize);
+    // Story 10.1: a read model hands out BASE units; the column holds milli.
+    const page = buildPage(
+      rows.map((row) => ({ ...row, capacity: fromMilli(row.capacity) })),
+      pageSize,
+    );
     return { items: page.items, nextCursor: page.nextCursor };
   }
 

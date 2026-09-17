@@ -2,6 +2,7 @@ import type { INestApplication } from '@nestjs/common';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { MAX_QUANTITY_BASE, MAX_QUANTITY_MILLI, fromMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -364,10 +365,15 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
   async function ledgerRows(grnId: string): Promise<{ type: string; quantity_delta: number; reference_doc: Record<string, unknown>; to_bin_id: string | null }[]> {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
-      return await sql`
+      const rows = await sql`
         select type, quantity_delta, reference_doc, to_bin_id from ledger_events
         where tenant_id = ${tenantId} and reference_doc->>'grnId' = ${grnId}
         order by seq`;
+      // Story 10.1: the column holds milli-units; this suite reads base units.
+      return rows.map((row) => ({
+        ...(row as unknown as { quantity_delta: number }),
+        quantity_delta: fromMilli(Number((row as unknown as { quantity_delta: number }).quantity_delta)),
+      })) as unknown as Awaited<ReturnType<typeof ledgerRows>>;
     } finally {
       await sql.end();
     }
@@ -377,9 +383,10 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       const rows = await sql`
-        select coalesce(sum(quantity), 0)::int as n from stock_on_hand
+        select coalesce(sum(quantity), 0)::bigint as n from stock_on_hand
         where tenant_id = ${tenantId} and bin_id = ${binId} and sku_id = ${skuId}`;
-      return Number((rows[0] as unknown as { n: number }).n);
+      // Milli-units in the column (story 10.1) — base units out of the helper.
+      return fromMilli(Number((rows[0] as unknown as { n: number }).n));
     } finally {
       await sql.end();
     }
@@ -530,6 +537,11 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     // The pending over-receipt row + its requested outbox event.
     const pending = await outboxRows('over_receipt.requested', grn.id);
     expect(pending).toHaveLength(1);
+    // Story 10.1: the payload is an EXTERNAL contract and speaks base units —
+    // 20, not the 20000 the column holds. Reading only `overReceiptId` here
+    // would let a dropped `fromMilli` ship a 1000× quantity to every
+    // subscriber with this suite still green.
+    expect(pending[0]!.payload).toMatchObject({ excessQty: 20 });
     const overReceiptId = (pending[0]!.payload as { overReceiptId: string }).overReceiptId;
     // Within-open only: exactly the +100 from this receipt landed.
     expect(await onHandAtBin(binId, batchSkuId)).toBe(baseline + 100);
@@ -616,6 +628,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     }
     const approvedEvents = await outboxRows('over_receipt.approved', grn.id);
     expect(approvedEvents).toHaveLength(1);
+    expect(approvedEvents[0]!.payload).toMatchObject({ excessQty: 20 });
 
     // ── the reject arm ───────────────────────────────────────────────────
     const second = await createOpenPo(10);
@@ -647,6 +660,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
 
     const rejectedEvents = await outboxRows('over_receipt.rejected', rejectGrn.id);
     expect(rejectedEvents).toHaveLength(1);
+    expect(rejectedEvents[0]!.payload).toMatchObject({ excessQty: 5 });
   });
 
   it('over-receipt decision authorization: an operator member (no review.decide) is 403 role-denied; an unknown id is 404; a malformed id is 400', async () => {
@@ -1096,11 +1110,14 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     expect(Number(grn.code.slice(4))).toBeGreaterThan(0);
   });
 
-  it('a line quantity above the int4 bound of goods_receipt_lines is a 400 before any write — never an insert-time 500', async () => {
+  it('a line quantity above the exact-integer quantity ceiling is a 400 before any write — never an insert-time 500', async () => {
     const { poId, lineId } = await createOpenPo(10, plainSkuId);
+    // Story 10.1: the line column is `bigint` milli-units, so the bound is no
+    // longer int4 but `MAX_QUANTITY_BASE` — one base unit past it still has to
+    // be a typed 400, never an insert-time 500.
     await submitGrn(
       grnBody(
-        [{ poLineId: lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 2_147_483_648 }],
+        [{ poLineId: lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: MAX_QUANTITY_BASE + 1 }],
         poId,
       ),
     )
@@ -1327,13 +1344,15 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     expect(await outboxRows('over_receipt.requested', grn.id)).toHaveLength(0);
   });
 
-  it('the cumulative received-qty ceiling: approving an excess past the int4 bound is a 400 and the row stays pending', async () => {
+  it('the cumulative received-qty ceiling: approving an excess past the exact-integer bound is a 400 and the row stays pending', async () => {
     const open = await createOpenPo(10);
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
-      // Seed the PO line's received_qty at its int4 ceiling directly (the
-      // overflow is otherwise unreachable in a suite of realistic sizes).
-      await sql`update purchase_order_lines set received_qty = 2147483647 where id = ${open.lineId}`;
+      // Seed the PO line's received_qty at its ceiling directly (the overflow
+      // is otherwise unreachable in a suite of realistic sizes). Story 10.1
+      // moved that ceiling off int4 onto `MAX_QUANTITY_MILLI` — the column is
+      // `bigint` milli-units, so the seed is written in milli-units.
+      await sql`update purchase_order_lines set received_qty = ${MAX_QUANTITY_MILLI} where id = ${open.lineId}`;
       const created = await submitGrn(
         grnBody([{ poLineId: open.lineId, skuId: batchSkuId, batchCode: 'LOT-CEIL', mfgDate: null, qty: 2 }], open.poId),
       ).expect(201);

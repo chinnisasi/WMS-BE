@@ -2,6 +2,7 @@ import type { INestApplication } from '@nestjs/common';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { fromMilli, toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
@@ -244,7 +245,8 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       `;
       const event = eventRows[0] as { batch_ref: string; reference_doc: Record<string, unknown>; quantity_delta: number };
       expect(event.batch_ref).toBe(batch.id);
-      expect(event.quantity_delta).toBe(5);
+      // `quantity_delta` is milli-units (story 10.1); assert in base units.
+      expect(fromMilli(Number(event.quantity_delta))).toBe(5);
       // Intake is not an override — the reference doc carries no reason.
       expect(event.reference_doc).toMatchObject({ kind: 'manual-adjustment', reasonCode: 'cycle-count' });
       expect('overrideReason' in event.reference_doc).toBe(false);
@@ -253,7 +255,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
         select quantity from batch_on_hand
         where tenant_id = ${tenantId} and batch_id = ${batch.id} and bin_id = ${binA}
       `;
-      expect(Number((bohRows[0] as { quantity: number }).quantity)).toBe(5);
+      expect(fromMilli(Number((bohRows[0] as { quantity: number }).quantity))).toBe(5);
     } finally {
       await sql.end();
     }
@@ -292,7 +294,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
         select quantity from batch_on_hand
         where tenant_id = ${tenantId} and batch_id = ${batch.id} and bin_id = ${binA}
       `;
-      expect(Number((boh[0] as { quantity: number }).quantity)).toBe(8);
+      expect(fromMilli(Number((boh[0] as { quantity: number }).quantity))).toBe(8);
     } finally {
       await sql.end();
     }
@@ -362,7 +364,8 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
         where tenant_id = ${tenantId} and sku_id = ${skuIds.get('ST-1')!} order by seq
       `;
       expect(events).toHaveLength(2);
-      const deltas = events.map((e) => Number((e as { quantity_delta: number }).quantity_delta));
+      // The column is milli-units (story 10.1); read the deltas in base units.
+      const deltas = events.map((e) => fromMilli(Number((e as { quantity_delta: number }).quantity_delta)));
       expect(deltas).toEqual([1, 1]);
       const refs = new Set(events.map((e) => (e as { serial_ref: string }).serial_ref));
       expect(refs.size).toBe(2);
@@ -499,7 +502,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       const boh = await sql`
         select quantity from batch_on_hand where tenant_id = ${tenantId} and batch_id = ${event.batch_ref} and bin_id = ${binA}
       `;
-      expect(Number((boh[0] as { quantity: number }).quantity)).toBe(1);
+      expect(fromMilli(Number((boh[0] as { quantity: number }).quantity))).toBe(1);
       const history = await facade.batchHistory(tenantId, event.batch_ref);
       expect(history).toHaveLength(1);
       expect(history[0]).toMatchObject({ serialRef: event.serial_ref, toBinId: binA });
@@ -537,7 +540,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       const boh = await sql`
         select quantity from batch_on_hand where tenant_id = ${tenantId} and batch_id = ${event.batch_ref} and bin_id = ${binA}
       `;
-      expect(Number((boh[0] as { quantity: number }).quantity)).toBe(7); // 8 − 1
+      expect(fromMilli(Number((boh[0] as { quantity: number }).quantity))).toBe(7); // 8 − 1
     } finally {
       await sql.end();
     }
@@ -645,7 +648,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
 
       // The tamper: batch_on_hand is a mutable projection — no trigger guards it.
       await sql`
-        update batch_on_hand set quantity = 99
+        update batch_on_hand set quantity = ${toMilli(99)}
         where tenant_id = ${tenantId} and batch_id = ${batchId} and bin_id = ${binA}
       `;
 
@@ -653,18 +656,24 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       expect(report.matches).toBe(false);
       const batchDivergence = report.divergences.find((d) => d.batchRef === batchId);
       expect(batchDivergence).toBeDefined();
-      expect(batchDivergence).toMatchObject({ skuId: sku, binId: binA, projectedQuantity: 99, replayedQuantity: 7 });
+      // The replay report speaks milli-units (story 10.1); the scenario stays human-scale.
+      expect(batchDivergence).toMatchObject({
+        skuId: sku,
+        binId: binA,
+        projectedQuantity: toMilli(99),
+        replayedQuantity: toMilli(7),
+      });
 
       const rebuilt = await facade.rebuildProjections(tenantId, warehouseId, { skuId: sku, binId: binA });
       const batchRepair = rebuilt.repaired.find((r) => r.batchRef === batchId);
-      expect(batchRepair).toMatchObject({ quantity: 7, deleted: false });
+      expect(batchRepair).toMatchObject({ quantity: toMilli(7), deleted: false });
 
       const after = await facade.replay(tenantId, warehouseId);
       expect(after.matches).toBe(true);
       expect(after.divergences).toEqual([]);
 
       const boh = await sql`select quantity from batch_on_hand where tenant_id = ${tenantId} and batch_id = ${batchId} and bin_id = ${binA}`;
-      expect(Number((boh[0] as { quantity: number }).quantity)).toBe(7);
+      expect(fromMilli(Number((boh[0] as { quantity: number }).quantity))).toBe(7);
     } finally {
       await sql.end();
     }
@@ -872,7 +881,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       `;
       const batchId = (batchRows[0] as { id: string }).id;
       await sql`
-        update batch_on_hand set quantity = 99
+        update batch_on_hand set quantity = ${toMilli(99)}
         where tenant_id = ${tenantId} and batch_id = ${batchId} and bin_id = ${binA}
       `;
 
@@ -884,12 +893,12 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
         skuId: sku,
         binId: binA,
         batchRef: batchId,
-        projectedQuantity: 99,
-        replayedQuantity: 3,
+        projectedQuantity: toMilli(99),
+        replayedQuantity: toMilli(3),
       });
       expect(second.divergences[0]?.fromSeq).toBeGreaterThan(first.watermark);
       const repair = second.repaired.find((r) => r.batchRef === batchId);
-      expect(repair).toMatchObject({ quantity: 3, deleted: false });
+      expect(repair).toMatchObject({ quantity: toMilli(3), deleted: false });
       expect(seeded.body.event.seq).toBeGreaterThan(first.watermark);
 
       // Cycle 3: clean again.

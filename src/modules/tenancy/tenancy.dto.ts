@@ -1,6 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
+import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsEmail, IsIn, IsInt, IsString, IsUUID, Length, Matches, Max, Min } from 'class-validator';
+import { IsBoolean, IsEmail, IsIn, IsInt, IsNumber, IsString, IsUUID, Length, Matches, Max, Min } from 'class-validator';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -228,11 +229,17 @@ export class CreateBinDto {
   @Length(1, 32)
   code!: string;
 
-  @ApiProperty({ example: 120, minimum: 1, description: 'Positive integer, base-UoM units' })
-  @IsInt()
-  @Min(1)
-  // Postgres `integer` ceiling — a bigger number would 500 on the column, not 400.
-  @Max(2147483647)
+  @ApiProperty({
+    example: 120,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
+    description: `Bin capacity. ${QUANTITY_FIELD_DESCRIPTION}`,
+  })
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  // The exact-integer ceiling (story 10.1) — a bigger number would round
+  // silently rather than 400.
+  @Max(MAX_QUANTITY_BASE)
   capacity!: number;
 
   @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
@@ -267,10 +274,15 @@ export class GenerateBinsDto {
   @Max(99)
   levelsPerBay!: number;
 
-  @ApiProperty({ example: 120, minimum: 1, description: 'Capacity per bin, base-UoM units' })
-  @IsInt()
-  @Min(1)
-  @Max(2147483647)
+  @ApiProperty({
+    example: 120,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
+    description: `Capacity per bin. ${QUANTITY_FIELD_DESCRIPTION}`,
+  })
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
   capacity!: number;
 
   @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })

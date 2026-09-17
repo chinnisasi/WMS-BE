@@ -15,6 +15,7 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import type { BinSnapshot } from '../tenancy/bin.command';
 import { IDEMPOTENCY_TENANT_KEY, binNotFound, binRetired409 } from '../tenancy/bin.errors';
+import { fromMilli } from '../../shared/primitives/quantity';
 
 /**
  * The bin's blocking state, re-homed from the tenancy module (Story 3.6):
@@ -131,7 +132,8 @@ export class BinStateCommand {
           warehouseId: updated.warehouseId,
           zoneId: updated.zoneId,
           code: updated.code,
-          capacity: updated.capacity,
+          // Story 10.1: base units at the response edge.
+          capacity: fromMilli(updated.capacity),
           type: updated.type,
           blocked: updated.blocked,
           systemOwned: updated.systemOwned,

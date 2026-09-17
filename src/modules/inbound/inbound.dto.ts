@@ -1,4 +1,5 @@
 import { Transform, Type } from 'class-transformer';
+import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
 import {
   ArrayMaxSize,
   ArrayMinSize,
@@ -6,6 +7,7 @@ import {
   IsBoolean,
   IsIn,
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   IsUUID,
@@ -118,10 +120,15 @@ export class PurchaseOrderLineInputDto {
   @IsUUID()
   skuId!: string;
 
-  @ApiProperty({ description: 'Ordered quantity in base UoM (positive integer)', minimum: 1 })
+  @ApiProperty({
+    description: `Ordered quantity. ${QUANTITY_FIELD_DESCRIPTION}`,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
+  })
   @Type(() => Number)
-  @IsInt()
-  @Min(1)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
   orderedQty!: number;
 
   @ApiProperty({

@@ -4,7 +4,7 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, idempotencyKeys, orderLines, orders, picks, skus } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { signedQuantity } from '../../shared/primitives/quantity';
+import { assertExactQuantity, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
 import { canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -295,7 +295,8 @@ export class DispatchCommandService {
         .where(and(eq(orderLines.tenantId, command.tenantId), eq(orderLines.orderId, order.id)))
         .orderBy(asc(orderLines.createdAt), asc(orderLines.id));
       const pickRows = await tx
-        .select({ orderLineId: picks.orderLineId, qty: sql<number>`sum(${picks.qty})::int` })
+        // Story 10.1: `::bigint`; `int8` returns as a string, coerced below.
+        .select({ orderLineId: picks.orderLineId, qty: sql<string>`sum(${picks.qty})::bigint` })
         .from(picks)
         .where(and(eq(picks.tenantId, command.tenantId), eq(picks.orderId, order.id)))
         .groupBy(picks.orderLineId);
@@ -329,7 +330,9 @@ export class DispatchCommandService {
           kind: 'dispatch',
           orderId: order.id,
           orderLineId: line.id,
-          dispatchedQty,
+          // Story 10.1: the reference doc is a DOCUMENT — it ships verbatim
+          // on the ledger timeline, so it speaks base units.
+          dispatchedQty: fromMilli(dispatchedQty),
           // Optional and additive: the keys serialize only when present, so
           // a dispatch with no carrier recorded carries neither.
           ...(carrierName === null ? {} : { carrierName }),
@@ -359,12 +362,13 @@ export class DispatchCommandService {
           skuId: line.skuId,
           skuCode: sku?.code ?? line.skuId,
           skuName: sku?.name ?? line.skuId,
-          orderedQty: line.qty,
-          dispatchedQty,
-          shortfallQty: line.qty - dispatchedQty,
+          // Base units at the response/outbox edge (story 10.1).
+          orderedQty: fromMilli(line.qty),
+          dispatchedQty: fromMilli(dispatchedQty),
+          shortfallQty: fromMilli(line.qty - dispatchedQty),
           ledgerEventId: appended.eventId,
         });
-        totalUnits += dispatchedQty;
+        totalUnits = assertExactQuantity(totalUnits + dispatchedQty, 'dispatch total units');
       }
 
       // ── the ATP correction: every `committed` hold retires ──────────────
@@ -393,7 +397,15 @@ export class DispatchCommandService {
       const retiredReservationIds: string[] = [];
       for (const hold of committedHolds) {
         await this.inventory.retireCommittedReservationInTx(tx, command.tenantId, hold.id);
-        counterRestores.set(hold.skuId, (counterRestores.get(hold.skuId) ?? 0) + hold.quantity);
+        counterRestores.set(
+          hold.skuId,
+          // The sum reaches the Valkey counter, where a rounded value is a
+          // permanently wrong ATP nobody notices (story 10.1).
+          assertExactQuantity(
+            (counterRestores.get(hold.skuId) ?? 0) + hold.quantity,
+            `dispatch counter restore for sku ${hold.skuId}`,
+          ),
+        );
         retiredReservationIds.push(hold.id);
       }
       // `order_lines.reservation_id` / `reserved_qty` are deliberately NOT
@@ -415,7 +427,7 @@ export class DispatchCommandService {
           dispatchedAt: canonicalInstant(dispatchedAt),
           carrierName,
           trackingNumber,
-          totalUnits,
+          totalUnits: fromMilli(totalUnits),
           retiredReservationIds,
           lines: dispatchedLines,
         },

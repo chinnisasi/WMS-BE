@@ -9,6 +9,7 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/
 import { assertPermission } from '../modules/tenancy/permissions';
 import { TenancyService } from '../modules/tenancy/tenancy.service';
 import { assertUtcIso } from '../shared/primitives/time';
+import { MIN_QUANTITY_BASE, scalesToZero, toMilli } from '../shared/primitives/quantity';
 import { UUID_RE } from '../shared/primitives/ids';
 import { CatalogFacade } from '../modules/catalog/catalog.facade';
 import { InventoryFacade } from '../modules/inventory/inventory.facade';
@@ -110,7 +111,11 @@ export class InventoryController {
       warehouseId: dto.warehouseId,
       skuId: dto.skuId,
       binId: dto.binId,
-      quantityDelta: dto.quantityDelta,
+      // Story 10.1: the API edge is where the decimal becomes the domain's
+      // milli-unit integer. Everything below this line speaks milli-units;
+      // everything above it — the DTO, the refusal texts, the pre-checks that
+      // compare against facade READ MODELS — speaks base units.
+      quantityDelta: assertRecordable(dto.quantityDelta, 'quantityDelta'),
       reasonCode: dto.reasonCode,
       note: dto.note,
       occurredAt: dto.occurredAt,
@@ -710,4 +715,24 @@ function assertBatchInstant(value: string | undefined, field: 'mfgDate' | 'expir
       `batch.${field} must be a Z-suffixed ISO-8601 UTC timestamp (got "${value}").`,
     );
   }
+}
+
+/**
+ * Story 10.1: a positive quantity finer than half a milli-unit would scale to
+ * zero and be recorded as "nothing happened" — a real pick filed as an
+ * empty-bin short pick, a real adjustment written as a zero-delta event. The
+ * story rounds a value that is merely too precise; it refuses one that would
+ * disappear.
+ */
+function assertRecordable(value: number, field: string): number {
+  if (scalesToZero(value)) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      `${field} is finer than the smallest recordable quantity`,
+      `${field} must be at least ${MIN_QUANTITY_BASE} in the SKU's base UoM (got ${value}) — ` +
+        'a smaller value would be recorded as zero, which means something else entirely.',
+    );
+  }
+  return toMilli(value);
 }

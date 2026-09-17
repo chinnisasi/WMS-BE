@@ -24,6 +24,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { picklistLineDrewUnits } from './wave.command';
 import type { ReservationSnapshot } from '../inventory/inventory.facade';
+import { MAX_QUANTITY_MILLI, fromMilli } from '../../shared/primitives/quantity';
 
 // ── state machine + policy constants (the outbound module exclusively owns
 // the order state machine, AD-6 — no other module may add or transition
@@ -86,11 +87,13 @@ const ORDERS_SOURCE_EVENT_UNIQUE = 'orders_source_event_unique';
 const MAX_EXTERNAL_EVENT_ID_LENGTH = 200;
 
 /**
- * Line quantities are Postgres `integer`s — an input above the int4 ceiling
- * would pass every other validation and die as a raw 22003 at the INSERT
- * (after grants were made and released). The typed 400 is the boundary.
+ * The line-quantity ceiling, in milli-units (story 10.1). The column is
+ * `bigint` now, so the binding limit is the 2⁵³ exact-integer ceiling every
+ * quantity crosses in JavaScript and in the Valkey script's Lua. An input
+ * above it would pass every other validation and then round silently — after
+ * grants were made and released. The typed 400 is the boundary.
  */
-const MAX_LINE_QUANTITY = 2_147_483_647;
+const MAX_LINE_QUANTITY = MAX_QUANTITY_MILLI;
 
 // ── command inputs ───────────────────────────────────────────────────────────
 
@@ -942,9 +945,11 @@ export class OrderCommandService {
       if (!UUID_RE.test(line.skuId)) {
         throw validationFailed('Every line names a well-formed skuId.');
       }
+      // `line.quantity` is in milli-units — the API edge scaled it; the
+      // operator-facing text speaks base units.
       if (!Number.isInteger(line.quantity) || line.quantity <= 0 || line.quantity > MAX_LINE_QUANTITY) {
         throw validationFailed(
-          `Line quantity must be a positive integer in base UoM, at most ${MAX_LINE_QUANTITY} (got ${String(line.quantity)}).`,
+          `Line quantity must be a positive quantity in base UoM, at most ${fromMilli(MAX_LINE_QUANTITY)} (got ${String(fromMilli(line.quantity))}).`,
         );
       }
     }
@@ -961,9 +966,12 @@ export function lineSnapshot(
     id: row.id,
     orderId: row.orderId,
     skuId: row.skuId,
-    qty: row.qty,
-    reservedQty: row.reservedQty,
-    shortfallQty: row.qty - row.reservedQty,
+    // Story 10.1: `lineSnapshot` is the module's only order-line read shape —
+    // every response body and outbox payload comes through here, so base units
+    // leave and milli-units stay below.
+    qty: fromMilli(row.qty),
+    reservedQty: fromMilli(row.reservedQty),
+    shortfallQty: fromMilli(row.qty - row.reservedQty),
     status: row.status,
     reservationId: row.reservationId,
     reservationState: reservation?.state ?? null,

@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
+import { fromMilli } from '../../shared/primitives/quantity';
 import { and, asc, eq, inArray, notExists, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
@@ -55,8 +56,12 @@ export async function qcHeldUnits(
   warehouseId: string,
   skuId: string,
 ): Promise<number> {
+  // Story 10.1: `::bigint`, never `::int` — under milli-units an int4 sum
+  // raises `integer out of range` at ~2.1 million base units, which a real
+  // warehouse reaches. postgres.js hands `int8` back as a JS string, so the
+  // boundary coerces with `Number(...)` (the `binOccupancyInTx` pattern).
   const rows = await tx
-    .select({ held: sql<number>`coalesce(sum(${stockOnHand.quantity}), 0)::int` })
+    .select({ held: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint` })
     .from(stockOnHand)
     .innerJoin(bins, eq(bins.id, stockOnHand.binId))
     .where(
@@ -72,9 +77,14 @@ export async function qcHeldUnits(
         eq(bins.systemOwned, true),
       ),
     );
-  return rows[0]?.held ?? 0;
+  return Number(rows[0]?.held ?? 0);
 }
 
+/**
+ * The Epic 7 channel-buffer placeholder. It subtracts from ATP alongside the
+ * QC-held figure, so it is denominated in the same units they are — story
+ * 10.1 milli-units — the moment it stops being zero.
+ */
 export function bufferUnits(): number {
   return 0;
 }
@@ -279,12 +289,16 @@ export class ReservationService implements OnModuleInit {
         'A reservation names its holder — ownerType/ownerId must be non-empty.',
       );
     }
+    // `command.quantity` is in milli-units — the API edge scaled it. The
+    // refusal text speaks base units, because that is the number the caller
+    // sent and the only one they can act on.
     if (!Number.isInteger(command.quantity) || command.quantity <= 0) {
       throw new ProblemException(
         'validation-failed',
         400,
-        'quantity must be a positive integer',
-        `Reservation quantity must be a positive integer in base UoM (got ${command.quantity}).`,
+        'quantity must be a positive quantity',
+        `Reservation quantity must be a positive quantity in the SKU's base UoM ` +
+          `(got ${fromMilli(command.quantity)}).`,
       );
     }
     const ttlSeconds = command.ttlSeconds ?? DEFAULT_RESERVATION_TTL_SECONDS;
@@ -329,9 +343,9 @@ export class ReservationService implements OnModuleInit {
     }
     if (outcome !== 'granted') {
       throw unavailable(
-        `SKU ${skuId} has ${probe.ceiling} sellable unit(s) in warehouse ${warehouseId}` +
-          (probe.qcHeld > 0 ? ` (of which ${probe.qcHeld} are QC-held)` : '') +
-          ` — the request for ${command.quantity} cannot be reserved.`,
+        `SKU ${skuId} has ${fromMilli(probe.ceiling)} sellable unit(s) in warehouse ${warehouseId}` +
+          (probe.qcHeld > 0 ? ` (of which ${fromMilli(probe.qcHeld)} are QC-held)` : '') +
+          ` — the request for ${fromMilli(command.quantity)} cannot be reserved.`,
       );
     }
 
@@ -426,8 +440,8 @@ export class ReservationService implements OnModuleInit {
         'conflict',
         409,
         'Reservation quantity mismatch',
-        `This owner scope already holds ${existing.quantity} unit(s); a repeat grant for ` +
-          `${command.quantity} would change the hold — release the existing one first.`,
+        `This owner scope already holds ${fromMilli(existing.quantity)} unit(s); a repeat grant for ` +
+          `${fromMilli(command.quantity)} would change the hold — release the existing one first.`,
       );
     }
     return toSnapshot(existing);
@@ -788,11 +802,13 @@ export class ReservationService implements OnModuleInit {
    * cannot reach Valkey must not fail the expiry cycle.
    */
   private async parityPass(): Promise<void> {
-    let live: { tenantId: string; warehouseId: string; skuId: string; reserved: number }[];
+    // `reserved` is typed as the driver delivers it: `::bigint` arrives as a
+    // string, and calling it a number here is what hid the compare bug.
+    let live: { tenantId: string; warehouseId: string; skuId: string; reserved: string }[];
     try {
       live = (await this.authDb.execute(sql`
         select tenant_id as "tenantId", warehouse_id as "warehouseId",
-               sku_id as "skuId", coalesce(sum(quantity), 0)::int as reserved
+               sku_id as "skuId", coalesce(sum(quantity), 0)::bigint as reserved
         from reservations
         where state in ('held', 'committed')
         group by tenant_id, warehouse_id, sku_id
@@ -813,7 +829,15 @@ export class ReservationService implements OnModuleInit {
     for (const { tenantId, warehouseId, skuId, reserved } of live) {
       const warehouseMap = scopes.get(tenantId) ?? new Map<string, Map<string, number>>();
       const skuSums = warehouseMap.get(warehouseId) ?? new Map<string, number>();
-      skuSums.set(skuId, reserved);
+      // Story 10.1: the sum is cast `::bigint`, and postgres.js hands `int8`
+      // back as a STRING through this raw read — no Drizzle mapper is in the
+      // way. Without this coercion the parity compare below is `number !==
+      // string`, which is ALWAYS true: every cycle would declare the first
+      // scope divergent and rebuild, and `rebuildCounters` disarms the ready
+      // marker first, so grants and ATP reads fail closed with a 503 for the
+      // whole window. The bug is silent in every test that does not watch for
+      // a rebuild that should not happen.
+      skuSums.set(skuId, Number(reserved));
       warehouseMap.set(warehouseId, skuSums);
       scopes.set(tenantId, warehouseMap);
     }
@@ -1040,10 +1064,10 @@ export class ReservationService implements OnModuleInit {
       );
     conditions.push(notExists(quarantined));
     const rows = await tx
-      .select({ onHand: sql<number>`coalesce(sum(${stockOnHand.quantity}), 0)::int` })
+      .select({ onHand: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint` })
       .from(stockOnHand)
       .where(and(...conditions));
-    return rows[0]?.onHand ?? 0;
+    return Number(rows[0]?.onHand ?? 0);
   }
 
   /** The journal's live-state reserved sum for one scope. */
@@ -1080,11 +1104,17 @@ export class ReservationService implements OnModuleInit {
     }
     const read = (scoped: TenantTx) =>
       scoped
-        .select({ skuId: reservations.skuId, reserved: sql<number>`coalesce(sum(${reservations.quantity}), 0)::int` })
+        .select({
+          skuId: reservations.skuId,
+          reserved: sql<string>`coalesce(sum(${reservations.quantity}), 0)::bigint`,
+        })
         .from(reservations)
         .where(and(...conditions))
         .groupBy(reservations.skuId);
-    return tx === undefined ? withTenantTransaction(this.db, tenantId, read) : read(tx);
+    const rows =
+      tx === undefined ? await withTenantTransaction(this.db, tenantId, read) : await read(tx);
+    // `int8` arrives as a JS string; the sum is a quantity from here on.
+    return rows.map((row) => ({ skuId: row.skuId, reserved: Number(row.reserved) }));
   }
 
   /** A row lost by the conditional UPDATE: 404 when absent, else 409 conflict. */
@@ -1421,7 +1451,7 @@ export class ReservationService implements OnModuleInit {
       throw new Error(
         'grantInTx re-grants NO MORE than a hold released for the same owner scope in the same ' +
           'transaction — it has no grant-vs-grant arbitration and must never create ATP ' +
-          `(asked ${command.quantity} against a ${releasedFrom.state} hold of ${releasedFrom.quantity}).`,
+          `(asked ${fromMilli(command.quantity)} against a ${releasedFrom.state} hold of ${fromMilli(releasedFrom.quantity)}).`,
       );
     }
     const ttlSeconds = command.ttlSeconds ?? DEFAULT_RESERVATION_TTL_SECONDS;

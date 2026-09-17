@@ -18,7 +18,7 @@ import {
   waves,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { signedQuantity } from '../../shared/primitives/quantity';
+import { QUANTITY_SCALE, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -427,8 +427,12 @@ export class PickCommandService {
       // Story 4.4 widens the floor from 1 to 0: a zero-unit short pick is how
       // an operator reports an EMPTY bin, and it is the one pick that draws
       // nothing at all. It still needs a reason, like every other short pick.
+      // `command.qty` is in milli-units — the API edge scaled it; the operator
+      // -facing text speaks base units.
       if (!Number.isInteger(command.qty) || command.qty < 0) {
-        throw pickValidation(`Pick quantity must be a non-negative integer (got ${command.qty}).`);
+        throw pickValidation(
+          `Pick quantity must be a non-negative quantity (got ${fromMilli(command.qty)}).`,
+        );
       }
       const reasonCode = command.reasonCode ?? null;
       if (reasonCode !== null && !isShortPickReason(reasonCode)) {
@@ -640,13 +644,13 @@ export class PickCommandService {
       // the operator reported the whole quantity, so nothing came up short.
       if (command.qty > line.qty) {
         throw pickValidation(
-          `Pick line "${command.picklistLineId}" plans ${line.qty} unit(s) — a pick of ${command.qty} draws more than the stop holds for this order.`,
+          `Pick line "${command.picklistLineId}" plans ${fromMilli(line.qty)} unit(s) — a pick of ${fromMilli(command.qty)} draws more than the stop holds for this order.`,
         );
       }
       const shortPick = command.qty < line.qty;
       if (shortPick && reasonCode === null) {
         throw pickValidation(
-          `Pick line "${command.picklistLineId}" plans ${line.qty} unit(s) and this pick draws ${command.qty} — ` +
+          `Pick line "${command.picklistLineId}" plans ${fromMilli(line.qty)} unit(s) and this pick draws ${fromMilli(command.qty)} — ` +
             `a short pick needs a reasonCode from ${JSON.stringify(SHORT_PICK_REASON_CODES)}.`,
         );
       }
@@ -721,7 +725,7 @@ export class PickCommandService {
         // individually.
         if (command.qty > 0 && (command.serials === undefined || command.serials.length === 0)) {
           throw pickValidation(
-            `SKU "${sku.code}" is serial-tracked — its pick needs one serial per unit (${command.qty}).`,
+            `SKU "${sku.code}" is serial-tracked — its pick needs one serial per unit (${fromMilli(command.qty)}).`,
           );
         }
         if (command.serials !== undefined) {
@@ -730,9 +734,11 @@ export class PickCommandService {
               'serials contains duplicates — a serial-tracked pick draws one ledger event per serial unit; the same serial cannot appear twice.',
             );
           }
-          if (command.serials.length !== command.qty) {
+          // Story 10.1: an array length is a UNIT count — the comparison is
+          // made in units, never in milli-units.
+          if (command.serials.length !== fromMilli(command.qty)) {
             throw pickValidation(
-              `A serial-tracked pick draws one ledger event per serial unit — ${command.serials.length} serials cannot draw ${command.qty} units.`,
+              `A serial-tracked pick draws one ledger event per serial unit — ${command.serials.length} serials cannot draw ${fromMilli(command.qty)} units.`,
             );
           }
           serialNumbers = command.serials;
@@ -896,8 +902,11 @@ export class PickCommandService {
         // putaway `mismatchReasonCode` precedent. The ledger is the one
         // record that outlives every projection, so a draw that did not match
         // its plan says so where it can never be re-derived away.
+        // Story 10.1: the reference doc is a DOCUMENT — it ships verbatim on
+        // the ledger timeline, so its quantities are in base units like every
+        // other value that leaves the domain.
         ...(shortPick && reasonCode !== null
-          ? { shortPick: true as const, shortfallQty, reasonCode }
+          ? { shortPick: true as const, shortfallQty: fromMilli(shortfallQty), reasonCode }
           : {}),
       };
 
@@ -914,7 +923,8 @@ export class PickCommandService {
             warehouseId: command.warehouseId,
             type: 'pick.picked',
             skuId: command.skuId,
-            quantityDelta: signedQuantity(-1),
+            // One serial is one whole unit — `QUANTITY_SCALE` milli-units.
+            quantityDelta: signedQuantity(-QUANTITY_SCALE),
             fromBinId: drawBin.id,
             toBinId: null,
             batchRef: null,
@@ -1250,11 +1260,13 @@ export class PickCommandService {
           batchCode,
           suggestedBatchId,
           suggestedBatchCode,
-          qty: command.qty,
+          // Story 10.1: the snapshot IS the HTTP body, the stored idempotent
+          // replay and the outbox payload — base units on the way out.
+          qty: fromMilli(command.qty),
           reservationId: line.reservationId,
           reservationCommitted,
           lineStatus: shortPick ? 'short' : 'picked',
-          shortfallQty,
+          shortfallQty: fromMilli(shortfallQty),
           reasonCode: shortPick ? reasonCode : null,
           reservationReleased,
           replanReservationId,
@@ -1398,7 +1410,8 @@ export class PickCommandService {
       binId: row.binId,
       binCode: row.binCode,
       batchId: row.batchId,
-      qty: row.qty,
+      // Base units at the response edge (story 10.1).
+      qty: fromMilli(row.qty),
       sliceSeq: row.sliceSeq,
       walkSeq: row.walkSeq,
     }));
@@ -1614,7 +1627,8 @@ export class PickCommandService {
       binCode: requireBinCode(row.binCode, row.picklistLineId),
       batchId: row.batchId,
       batchCode: row.batchId === null ? null : (batchCodes.get(row.batchId) ?? null),
-      qty: row.qty,
+      // Base units at the response edge (story 10.1).
+      qty: fromMilli(row.qty),
       sliceSeq: row.sliceSeq,
       walkSeq: row.walkSeq,
       stopCount: stops.get(row.picklistId)?.size ?? 0,
@@ -1772,7 +1786,7 @@ export function insufficientOnHand(
     'insufficient-on-hand',
     422,
     'Bin cannot cover this pick',
-    `Bin "${binCode}" holds ${onHand} drawable unit(s) of this SKU; the pick draws ${requested}. Nothing was recorded.`,
+    `Bin "${binCode}" holds ${fromMilli(onHand)} drawable unit(s) of this SKU; the pick draws ${fromMilli(requested)}. Nothing was recorded.`,
   );
 }
 
@@ -1795,7 +1809,7 @@ export function pickBinShort(
     'pick-bin-short',
     409,
     'Bin moved on and is short for this pick',
-    `Bin "${binCode}" changed while this pick was queued and now holds ${onHand} drawable unit(s) of this SKU; the pick draws ${requested}. Nothing was recorded — the pick needs re-planning.`,
+    `Bin "${binCode}" changed while this pick was queued and now holds ${fromMilli(onHand)} drawable unit(s) of this SKU; the pick draws ${fromMilli(requested)}. Nothing was recorded — the pick needs re-planning.`,
   );
 }
 

@@ -64,6 +64,21 @@ export class ValkeyClient implements OnApplicationShutdown {
     return client;
   }
 
+  /**
+   * Story 10.1: every milli-unit value crossing into Lua is asserted exact
+   * first. Lua 5.1 numbers are IEEE doubles, so `tonumber(ARGV[n])` and the
+   * `reserved + qty > ceiling` comparison are exact only to 2⁵³ — and past it
+   * the script does not fail, it silently decides against a rounded number.
+   * `setCounter` failed fast already; the INCRBY path is the one that decides.
+   */
+  private assertCounterValue(label: string, value: number): void {
+    if (!Number.isSafeInteger(value)) {
+      throw new Error(
+        `Reservation ${label} must be an exact integer in milli-units: ${value}`,
+      );
+    }
+  }
+
   /** The grant decision (see `RESERVATION_GRANT_SCRIPT`). */
   async grantReservation(
     counterKey: string,
@@ -72,6 +87,8 @@ export class ValkeyClient implements OnApplicationShutdown {
     ceiling: number,
     counterTtlSeconds: number,
   ): Promise<GrantReply> {
+    this.assertCounterValue('grant quantity', quantity);
+    this.assertCounterValue('grant ceiling', ceiling);
     const client = this.redis() as unknown as Record<
       string,
       (...args: (string | number)[]) => Promise<[number, string]>
@@ -86,6 +103,7 @@ export class ValkeyClient implements OnApplicationShutdown {
     quantity: number,
     counterTtlSeconds: number,
   ): Promise<ReleaseReply> {
+    this.assertCounterValue('release quantity', quantity);
     const client = this.redis() as unknown as Record<
       string,
       (...args: (string | number)[]) => Promise<[number, string]>
@@ -100,6 +118,16 @@ export class ValkeyClient implements OnApplicationShutdown {
    * winning script is never clobbered by a stale journal read).
    */
   async setCounter(key: string, value: number, ttlSeconds: number, overwrite: boolean): Promise<void> {
+    // Story 10.1: the counter holds milli-units, and `String(value)` must stay
+    // an INCRBY-parsable decimal integer — never exponential notation, never a
+    // float. Past 2⁵³ neither JavaScript here nor Lua inside the scripts can
+    // represent the value exactly, so a fail-fast beats a counter that drifts
+    // silently and takes ATP with it.
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(
+        `Reserved counter must be a non-negative exact integer in milli-units: ${value}`,
+      );
+    }
     if (overwrite) {
       await this.redis().set(key, String(value), 'EX', ttlSeconds);
     } else {

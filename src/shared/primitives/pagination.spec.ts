@@ -1,4 +1,12 @@
-import { baseQuantity, gstBps } from './quantity';
+import {
+  MAX_QUANTITY_BASE,
+  assertExactQuantity,
+  fromMilli,
+  gstBps,
+  milliQuantity,
+  signedQuantity,
+  toMilli,
+} from './quantity';
 import { paise, rupees, addPaise, isPaise } from './money';
 import { nowIso, assertUtcIso } from './time';
 import { buildPage, decodeCursor, encodeCursor } from './pagination';
@@ -14,14 +22,54 @@ describe('deterministic primitives (AD-9)', () => {
     expect(() => paise(1e308)).toThrow(); // rounds to Infinity — must not brand it
   });
 
-  test('quantities are non-negative integers in base UoM; GST is basis points', () => {
-    expect(baseQuantity(144)).toBe(144);
-    expect(() => baseQuantity(1.5)).toThrow();
-    expect(() => baseQuantity(-1)).toThrow();
+  test('quantities are non-negative integers in milli-units; GST is basis points', () => {
+    expect(milliQuantity(144)).toBe(144);
+    expect(() => milliQuantity(1.5)).toThrow();
+    expect(() => milliQuantity(-1)).toThrow();
+    expect(() => milliQuantity(Number.MAX_SAFE_INTEGER + 2)).toThrow(); // past 2⁵³ nothing is exact
+    expect(signedQuantity(-144)).toBe(-144);
+    expect(() => signedQuantity(-1.5)).toThrow();
     expect(gstBps(18)).toBe(1800);
     expect(gstBps(0)).toBe(0);
     expect(() => gstBps(101)).toThrow();
     expect(() => gstBps(Number.NaN)).toThrow(); // NaN passes range comparisons
+  });
+
+  test('the quantity edge converters round-trip base UoM through milli-units (story 10.1)', () => {
+    // An each-counted quantity comes back exactly as it went in — the whole
+    // "no user-visible behaviour change" claim in one line.
+    expect(toMilli(500)).toBe(500_000);
+    expect(fromMilli(500_000)).toBe(500);
+    // Three declared decimals, exactly.
+    expect(toMilli(18.4)).toBe(18_400);
+    expect(fromMilli(18_400)).toBe(18.4);
+    expect(toMilli(0.001)).toBe(1);
+    expect(fromMilli(1)).toBe(0.001);
+    // Finer than the scale rounds AT THE EDGE (story 10.2 refuses instead).
+    expect(toMilli(18.4567)).toBe(18_457);
+    expect(fromMilli(18_457)).toBe(18.457);
+    // Signed deltas convert the same way.
+    expect(toMilli(-2.5)).toBe(-2_500);
+    expect(fromMilli(-2_500)).toBe(-2.5);
+    // `fromMilli` refuses what it cannot convert: a raw `int8` read that
+    // missed its `Number(...)` coercion is a string, and a silent NaN in a
+    // response body is worse than a loud failure at the boundary.
+    expect(() => fromMilli('18400' as unknown as number)).toThrow();
+    expect(() => fromMilli(Number.NaN)).toThrow();
+    // No float dust on the values that used to produce it.
+    expect(toMilli(0.1) + toMilli(0.2)).toBe(300);
+    expect(fromMilli(toMilli(0.1) + toMilli(0.2))).toBe(0.3);
+    // The range refusal is typed, never a silent wrap.
+    expect(() => toMilli(MAX_QUANTITY_BASE * 2)).toThrow();
+    expect(() => toMilli(Number.NaN)).toThrow();
+  });
+
+  test('the fold accumulator guard fails loudly rather than rounding (story 10.1)', () => {
+    expect(assertExactQuantity(1_000, 'ok')).toBe(1_000);
+    // Past 2⁵³ the replay fold would round and manufacture a false quarantine.
+    expect(() => assertExactQuantity(Number.MAX_SAFE_INTEGER + 2, 'replay fold')).toThrow(
+      /exact integer range/,
+    );
   });
 
   test('timestamps are ISO-8601 UTC', () => {

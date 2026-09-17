@@ -208,7 +208,8 @@ export const bins = pgTable(
     warehouseId: uuid('warehouse_id').notNull(),
     zoneId: uuid('zone_id').notNull(),
     code: text('code').notNull(),
-    capacity: integer('capacity').notNull(),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    capacity: bigint('capacity', { mode: 'number' }).notNull(),
     type: text('type').notNull(),
     blocked: boolean('blocked').notNull().default(false),
     systemOwned: boolean('system_owned').notNull().default(false),
@@ -282,8 +283,9 @@ export const skus = pgTable(
     hsn: text('hsn'),
     batchTracked: boolean('batch_tracked').notNull().default(false),
     serialTracked: boolean('serial_tracked').notNull().default(false),
-    reorderPoint: integer('reorder_point').notNull().default(0),
-    reorderQty: integer('reorder_qty').notNull().default(0),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    reorderPoint: bigint('reorder_point', { mode: 'number' }).notNull().default(0),
+    reorderQty: bigint('reorder_qty', { mode: 'number' }).notNull().default(0),
     barcode: text('barcode').notNull(),
     ...tenantTimestamps,
   },
@@ -474,8 +476,9 @@ export type CatalogImportError = typeof catalogImportErrors.$inferSelect;
  * - `type` + `schema_version` — the versioned event grammar: event types
  *   exist only by registration in `modules/inventory/ledger-registry.ts`
  *   (additive changes only — arms are never renumbered or repurposed).
- * - `sku_id` + `quantity_delta` — the movement: a **signed** base-UoM
- *   integer (`SignedQuantity`); positive deltas carry `to_bin_id`, negative
+ * - `sku_id` + `quantity_delta` — the movement: a **signed** integer in
+ *   milli-units, base UoM × 10³ (`SignedQuantity`, story 10.1); positive
+ *   deltas carry `to_bin_id`, negative
  *   deltas `from_bin_id` (both nullable — a transfer later story carries
  *   both).
  * - `batch_ref` / `serial_ref` — the Story 2.4 batch/serial arms: the
@@ -506,7 +509,8 @@ export const ledgerEvents = pgTable(
     type: text('type').notNull(),
     schemaVersion: integer('schema_version').notNull(),
     skuId: uuid('sku_id').notNull(),
-    quantityDelta: integer('quantity_delta').notNull(),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    quantityDelta: bigint('quantity_delta', { mode: 'number' }).notNull(),
     fromBinId: uuid('from_bin_id'),
     toBinId: uuid('to_bin_id'),
     batchRef: text('batch_ref'),
@@ -582,7 +586,8 @@ export const stockOnHand = pgTable(
     warehouseId: uuid('warehouse_id').notNull(),
     skuId: uuid('sku_id').notNull(),
     binId: uuid('bin_id').notNull(),
-    quantity: integer('quantity').notNull(),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    quantity: bigint('quantity', { mode: 'number' }).notNull(),
     ...tenantTimestamps,
   },
   (table) => [
@@ -628,7 +633,8 @@ export const batchOnHand = pgTable(
     skuId: uuid('sku_id').notNull(),
     binId: uuid('bin_id').notNull(),
     batchId: uuid('batch_id').notNull(),
-    quantity: integer('quantity').notNull(),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    quantity: bigint('quantity', { mode: 'number' }).notNull(),
     ...tenantTimestamps,
   },
   (table) => [
@@ -913,7 +919,8 @@ export const reservations = pgTable(
     skuId: uuid('sku_id').notNull(),
     ownerType: text('owner_type').notNull(),
     ownerId: text('owner_id').notNull(),
-    quantity: integer('quantity').notNull(),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    quantity: bigint('quantity', { mode: 'number' }).notNull(),
     state: text('state').notNull().default('held'),
     expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
     ...tenantTimestamps,
@@ -1050,8 +1057,9 @@ export const purchaseOrderLines = pgTable(
     tenantId: uuid('tenant_id').notNull(),
     poId: uuid('po_id').notNull(),
     skuId: uuid('sku_id').notNull(),
-    orderedQty: integer('ordered_qty').notNull(),
-    receivedQty: integer('received_qty').notNull().default(0),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    orderedQty: bigint('ordered_qty', { mode: 'number' }).notNull(),
+    receivedQty: bigint('received_qty', { mode: 'number' }).notNull().default(0),
     unitCostPaise: integer('unit_cost_paise').notNull(),
     expectedDate: timestamp('expected_date', { withTimezone: true, mode: 'string' }),
     status: text('status').notNull().default('open'),
@@ -1204,8 +1212,9 @@ export const goodsReceiptLines = pgTable(
     poLineId: uuid('po_line_id'),
     skuId: uuid('sku_id').notNull(),
     batchId: uuid('batch_id'),
-    qty: integer('qty').notNull(),
-    appliedQty: integer('applied_qty').notNull().default(0),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
+    appliedQty: bigint('applied_qty', { mode: 'number' }).notNull().default(0),
     ...tenantTimestamps,
   },
   (table) => [
@@ -1242,7 +1251,8 @@ export const overReceipts = pgTable(
     poId: uuid('po_id'),
     poLineId: uuid('po_line_id'),
     skuId: uuid('sku_id').notNull(),
-    excessQty: integer('excess_qty').notNull(),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    excessQty: bigint('excess_qty', { mode: 'number' }).notNull(),
     status: text('status').notNull().default('pending'),
     requestedBy: uuid('requested_by').notNull(),
     requestedAt: timestamp('requested_at', { withTimezone: true, mode: 'string' }).notNull(),
@@ -1349,7 +1359,8 @@ export const putawayPlacements = pgTable(
     skuId: uuid('sku_id').notNull(),
     /** The catalog batch identity — null on non-batch-tracked SKUs. */
     batchId: uuid('batch_id'),
-    qty: integer('qty').notNull(),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
     /** The system Receiving bin the units left (the from-bin identity). */
     fromBinId: uuid('from_bin_id').notNull(),
     /** The target bin the operator placed into. */
@@ -1468,8 +1479,9 @@ export const orderLines = pgTable(
     tenantId: uuid('tenant_id').notNull(),
     orderId: uuid('order_id').notNull(),
     skuId: uuid('sku_id').notNull(),
-    qty: integer('qty').notNull(),
-    reservedQty: integer('reserved_qty').notNull().default(0),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
+    reservedQty: bigint('reserved_qty', { mode: 'number' }).notNull().default(0),
     /** The line's reservation hold (null when nothing could be reserved). */
     reservationId: uuid('reservation_id'),
     status: text('status').notNull().default('open'),
@@ -1676,15 +1688,15 @@ export const picklistLines = pgTable(
     batchId: uuid('batch_id'),
     /** The order line's journal hold, carried forward (never re-reserved). */
     reservationId: uuid('reservation_id'),
-    /** Units to draw at this bin (0 on an `unfulfillable` slice). */
-    qty: integer('qty').notNull(),
+    /** Units to draw at this bin, in milli-units (0 on an `unfulfillable` slice). */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
     /**
-     * Uncovered units. Non-zero on an `unfulfillable` slice (nothing
+     * Uncovered units, in milli-units. Non-zero on an `unfulfillable` slice (nothing
      * pickable was ever found for them) and on a `short` one (story 4.4 —
      * the operator drew fewer units than the stop planned, so
      * `qty - shortfall_qty` is what actually moved).
      */
-    shortfallQty: integer('shortfall_qty').notNull().default(0),
+    shortfallQty: bigint('shortfall_qty', { mode: 'number' }).notNull().default(0),
     /**
      * Story 4.4: why this stop came up short — one of
      * `SHORT_PICK_REASON_CODES`, required on every short pick (including a
@@ -1791,7 +1803,8 @@ export const picks = pgTable(
      * reach a row. The CHECK lives in the migration SQL (0021).
      */
     conflictClass: text('conflict_class').notNull().default('none'),
-    qty: integer('qty').notNull(),
+    /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
     pickedBy: uuid('picked_by').notNull(),
     /** Device time (AD-1) — the ledger event's and the row's business time. */
     pickedAt: timestamp('picked_at', { withTimezone: true, mode: 'string' }).notNull(),

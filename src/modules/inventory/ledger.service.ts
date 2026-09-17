@@ -7,6 +7,7 @@ import type { Database } from '../../shared/db/db';
 import { batchOnHand, binStateEpochs, ledgerEvents, stockOnHand } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { assertExactQuantity, fromMilli } from '../../shared/primitives/quantity';
 import type { SignedQuantity } from '../../shared/primitives/quantity';
 import { nowIso } from '../../shared/primitives/time';
 import { uuidv7 } from '../../shared/primitives/ids';
@@ -231,6 +232,18 @@ function canonicalEventBytes(event: {
 // consumers so the import path stays stable.
 export { canonicalInstant } from '../../shared/primitives/time';
 
+/**
+ * The event's hash: sha256 over its canonical bytes (AD-16). The ONE place
+ * that composition lives — `appendMovement` mints a hash with it and
+ * `verifyChainInTx` recomputes one with it, so the two can never drift into
+ * hashing slightly different things. Exported so a test can build a genuinely
+ * valid chain rather than re-implementing the canonical form, which is the
+ * one thing a hash test must never do.
+ */
+export function eventHashOf(event: Parameters<typeof canonicalEventBytes>[0]): string {
+  return sha256Hex(canonicalEventBytes(event));
+}
+
 function sha256Hex(bytes: string): string {
   return createHash('sha256').update(bytes, 'utf8').digest('hex');
 }
@@ -268,7 +281,7 @@ function insufficientOnHand(binCode: string, current: number, delta: number): Pr
     'insufficient-on-hand',
     422,
     'Adjustment would drive on-hand below zero',
-    `Bin "${binCode}" currently holds ${current}; this movement of ${delta} would take it below zero.`,
+    `Bin "${binCode}" currently holds ${fromMilli(current)}; this movement of ${fromMilli(delta)} would take it below zero.`,
   );
 }
 
@@ -278,7 +291,7 @@ function insufficientBatchOnHand(batchRef: string, current: number, delta: numbe
     'insufficient-on-hand',
     422,
     'Adjustment would drive the batch on-hand below zero',
-    `Batch "${batchRef}" currently holds ${current} in this bin; this movement of ${delta} would take it below zero.`,
+    `Batch "${batchRef}" currently holds ${fromMilli(current)} in this bin; this movement of ${fromMilli(delta)} would take it below zero.`,
   );
 }
 
@@ -485,8 +498,7 @@ export class LedgerService {
 
     const eventId = uuidv7();
     const schemaVersion = LEDGER_GRAMMAR_VERSION;
-    const eventHash = sha256Hex(
-      canonicalEventBytes({
+    const eventHash = eventHashOf({
         id: eventId,
         tenantId: movement.tenantId,
         warehouseId: movement.warehouseId,
@@ -504,8 +516,7 @@ export class LedgerService {
         recordedAt: movement.recordedAt,
         referenceDoc: movement.referenceDoc,
         prevHash,
-      }),
-    );
+    });
 
     await tx.insert(ledgerEvents).values({
       id: eventId,
@@ -659,11 +670,16 @@ export class LedgerService {
         // insufficient-on-hand guard above already guarantees delta > 0 — so
         // clamping the speculative tuple at 0 changes nothing real and keeps
         // negative adjustments off the CHECK.
-        quantity: sql`greatest(${delta}, 0)`,
+        // Story 10.1: the `::bigint` cast is load-bearing, not decoration.
+        // `greatest($1, 0)` gives Postgres an untyped parameter beside an
+        // integer literal, so it resolves BOTH to int4 — and a milli-unit
+        // delta past ~2.1 million base units dies as a raw 22003 here,
+        // nowhere near the column that is perfectly able to hold it.
+        quantity: sql`greatest(${delta}::bigint, 0)`,
       })
       .onConflictDoUpdate({
         target: [stockOnHand.tenantId, stockOnHand.warehouseId, stockOnHand.skuId, stockOnHand.binId],
-        set: { quantity: sql`${stockOnHand.quantity} + ${delta}`, updatedAt: nowIso() },
+        set: { quantity: sql`${stockOnHand.quantity} + ${delta}::bigint`, updatedAt: nowIso() },
       })
       .returning({ binId: stockOnHand.binId, quantity: stockOnHand.quantity });
     const row = rows[0]!;
@@ -720,7 +736,9 @@ export class LedgerService {
         binId,
         batchId,
         // Same speculative-tuple CHECK clamp as `addToOnHand` above.
-        quantity: sql`greatest(${delta}, 0)`,
+        // See `addToOnHand` — the parameter must be typed, or int4 inference
+        // caps the batch fold at ~2.1 million base units.
+        quantity: sql`greatest(${delta}::bigint, 0)`,
       })
       .onConflictDoUpdate({
         target: [
@@ -730,7 +748,7 @@ export class LedgerService {
           batchOnHand.binId,
           batchOnHand.batchId,
         ],
-        set: { quantity: sql`${batchOnHand.quantity} + ${delta}`, updatedAt: nowIso() },
+        set: { quantity: sql`${batchOnHand.quantity} + ${delta}::bigint`, updatedAt: nowIso() },
       })
       .returning({ binId: batchOnHand.binId, batchId: batchOnHand.batchId, quantity: batchOnHand.quantity });
     const row = rows[0]!;
@@ -816,8 +834,11 @@ export class LedgerService {
           divergences: report.divergences.map((divergence) => ({
             skuId: divergence.skuId,
             binId: divergence.binId,
-            projected: divergence.projectedQuantity,
-            replayed: divergence.replayedQuantity,
+            // Story 10.1: the alert leaves the domain, so it speaks base
+            // units like every other outbound quantity.
+            projected:
+              divergence.projectedQuantity === null ? null : fromMilli(divergence.projectedQuantity),
+            replayed: fromMilli(divergence.replayedQuantity),
             fromSeq: divergence.fromSeq ?? 1,
             toSeq: divergence.toSeq ?? headRows[0]?.seq ?? 0,
           })),
@@ -1126,18 +1147,46 @@ async function foldLedgerInTx(
       toSeq: Math.max(range?.toSeq ?? seq, seq),
     });
   };
+  /**
+   * Story 10.1: the fold is the migration's own oracle, and it is the
+   * riskiest line in the change. Both sides of `replayInTx`'s `!==` scale by
+   * 1000 together, so the COMPARISON stays valid — but this accumulator's
+   * headroom does not: a warehouse whose ledger sums to 10¹⁰ base units now
+   * accumulates 10¹³ milli-units, still inside 2⁵³ but a thousand times
+   * closer to it. Past the safe range the fold rounds, the compare fails, and
+   * `reconcile.ts` quarantines stock that is perfectly fine. That failure mode
+   * is worse than corrupt data: it is the correctness oracle crying wolf, and
+   * it trains people to ignore it. So every accumulation is asserted exact,
+   * and the fold fails loudly and by name instead.
+   */
+  const accumulate = (
+    bucket: Map<string, number>,
+    key: string,
+    delta: number,
+    scope: string,
+  ): void => {
+    bucket.set(
+      key,
+      assertExactQuantity((bucket.get(key) ?? 0) + delta, `replay fold ${scope} ${key}`),
+    );
+  };
   for (const row of rows) {
-    const magnitude = Math.abs(row.quantityDelta);
+    // postgres.js hands `int8` back as a JS string on a raw read; the Drizzle
+    // column mapper (`mode: 'number'`) has already coerced it here, and the
+    // magnitude is asserted exact before it ever enters an accumulator.
+    const magnitude = Math.abs(
+      assertExactQuantity(row.quantityDelta, `ledger event seq ${row.seq} quantity_delta`),
+    );
     const inWindow = options.windowFromSeq !== undefined && row.seq > options.windowFromSeq;
     if (row.toBinId !== null) {
       const key = replayKey(row.skuId, row.toBinId);
-      replayed.set(key, (replayed.get(key) ?? 0) + magnitude);
+      accumulate(replayed, key, magnitude, 'sku/bin');
       if (inWindow) {
         recordWindowScope(windowScopes, key, row.seq);
       }
       if (row.batchRef !== null) {
         const batchKey = batchReplayKey(row.skuId, row.toBinId, row.batchRef);
-        batchReplayed.set(batchKey, (batchReplayed.get(batchKey) ?? 0) + magnitude);
+        accumulate(batchReplayed, batchKey, magnitude, 'sku/bin/batch');
         if (inWindow) {
           recordWindowScope(batchWindowScopes, batchKey, row.seq);
         }
@@ -1145,13 +1194,13 @@ async function foldLedgerInTx(
     }
     if (row.fromBinId !== null) {
       const key = replayKey(row.skuId, row.fromBinId);
-      replayed.set(key, (replayed.get(key) ?? 0) - magnitude);
+      accumulate(replayed, key, -magnitude, 'sku/bin');
       if (inWindow) {
         recordWindowScope(windowScopes, key, row.seq);
       }
       if (row.batchRef !== null) {
         const batchKey = batchReplayKey(row.skuId, row.fromBinId, row.batchRef);
-        batchReplayed.set(batchKey, (batchReplayed.get(batchKey) ?? 0) - magnitude);
+        accumulate(batchReplayed, batchKey, -magnitude, 'sku/bin/batch');
         if (inWindow) {
           recordWindowScope(batchWindowScopes, batchKey, row.seq);
         }
@@ -1699,8 +1748,7 @@ export async function verifyChainInTx(
   for (const row of rows) {
     let recomputed: string;
     try {
-      recomputed = sha256Hex(
-        canonicalEventBytes({
+      recomputed = eventHashOf({
         id: row.id,
         tenantId: row.tenantId,
         warehouseId: row.warehouseId,
@@ -1718,8 +1766,7 @@ export async function verifyChainInTx(
         recordedAt: row.recordedAt,
         referenceDoc: row.referenceDoc as LedgerReferenceDoc,
         prevHash: row.prevHash,
-      }),
-      );
+      });
     } catch {
       return {
         ok: false,

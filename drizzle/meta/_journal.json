@@ -183,6 +183,13 @@
       "when": 1789581307215,
       "tag": "0025_carrier_connections",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1789667505485,
+      "tag": "0026_fractional_quantity_milli_units",
+      "breakpoints": true
     }
   ]
 }
