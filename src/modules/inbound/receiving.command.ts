@@ -15,7 +15,7 @@ import {
   users,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { signedQuantity } from '../../shared/primitives/quantity';
+import { MAX_QUANTITY_MILLI, assertExactQuantity, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -151,10 +151,13 @@ export interface OverReceiptDecisionSnapshot {
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 /**
- * The line-quantity ceiling: `goods_receipt_lines.qty` is int4, so a larger
- * (but typable) quantity must be a 400, never an insert-time 500.
+ * The line-quantity ceiling, in milli-units (story 10.1). The column is
+ * `bigint`, so the binding limit is no longer int4 but the 2⁵³ exact-integer
+ * ceiling every quantity crosses in JavaScript and in Lua — a larger (but
+ * typable) quantity must be a 400, never an insert-time 500 or a silent
+ * rounding.
  */
-export const MAX_GRN_LINE_QTY = 2_147_483_647;
+export const MAX_GRN_LINE_QTY = MAX_QUANTITY_MILLI;
 
 /** GRN codes are `GRN-<n>`, zero-padded to 4 digits, unique per tenant. */
 function grnCode(n: number): string {
@@ -286,11 +289,15 @@ export class ReceivingCommand {
       const occurredAt = assertUtc(command.occurredAt, 'occurredAt');
       const blindReasonCode = this.validateBlindPairing(command.poId, command.blindReasonCode);
       for (const line of command.lines) {
+        // `line.qty` is in milli-units — the API edge scaled it; the
+        // operator-facing text speaks base units.
         if (!Number.isInteger(line.qty) || line.qty < 1) {
-          throw grnValidation(`Line quantity must be a positive integer (got ${line.qty}).`);
+          throw grnValidation(`Line quantity must be a positive quantity (got ${fromMilli(line.qty)}).`);
         }
         if (line.qty > MAX_GRN_LINE_QTY) {
-          throw grnValidation(`Line quantity must be at most ${MAX_GRN_LINE_QTY} (got ${line.qty}).`);
+          throw grnValidation(
+            `Line quantity must be at most ${fromMilli(MAX_GRN_LINE_QTY)} (got ${fromMilli(line.qty)}).`,
+          );
         }
         if (line.mfgDate !== null) {
           assertUtc(line.mfgDate, 'mfgDate');
@@ -408,7 +415,7 @@ export class ReceivingCommand {
           rejected.push({
             poLineId: input.poLineId,
             skuId: input.skuId,
-            qty: input.qty,
+            qty: fromMilli(input.qty),
             code: 'po-line-not-found',
             reason: `No line with id "${input.poLineId}" exists on purchase order "${po!.code}".`,
           });
@@ -419,7 +426,7 @@ export class ReceivingCommand {
           rejected.push({
             poLineId: input.poLineId,
             skuId: input.skuId,
-            qty: input.qty,
+            qty: fromMilli(input.qty),
             code: 'po-line-not-open',
             reason: `Purchase order line "${input.poLineId}" is ${poLine.status} — it cannot receive.`,
           });
@@ -503,7 +510,12 @@ export class ReceivingCommand {
         }
         appliedByPoLine.set(
           entry.input.poLineId,
-          (appliedByPoLine.get(entry.input.poLineId) ?? 0) + entry.applied,
+          // Compared against the received-quantity ceiling below, so a sum
+          // that rounded would compare against the wrong number (story 10.1).
+          assertExactQuantity(
+            (appliedByPoLine.get(entry.input.poLineId) ?? 0) + entry.applied,
+            `received quantity for po line ${entry.input.poLineId}`,
+          ),
         );
       }
       for (const [poLineId, applied] of appliedByPoLine) {
@@ -512,12 +524,15 @@ export class ReceivingCommand {
         // overflow 500 (and an approve arm that can never land).
         if (poLineById.get(poLineId)!.receivedQty + applied > MAX_GRN_LINE_QTY) {
           throw grnValidation(
-            `Purchase order line "${poLineId}" would exceed its received-quantity ceiling of ${MAX_GRN_LINE_QTY}.`,
+            `Purchase order line "${poLineId}" would exceed its received-quantity ceiling of ${fromMilli(MAX_GRN_LINE_QTY)}.`,
           );
         }
         await tx
           .update(purchaseOrderLines)
-          .set({ receivedQty: sql`${purchaseOrderLines.receivedQty} + ${applied}` })
+          // Typed parameter (story 10.1): the column is `bigint`, and the
+          // bound value must be too — an untyped literal beside it invites
+          // int4 inference and a 22003 at silo scale.
+          .set({ receivedQty: sql`${purchaseOrderLines.receivedQty} + ${applied}::bigint` })
           .where(eq(purchaseOrderLines.id, poLineId));
       }
       if (appliedByPoLine.size > 0) {
@@ -569,9 +584,11 @@ export class ReceivingCommand {
             skuId: entry.input.skuId,
             batchId: entry.batchId,
             batchCode: entry.batchCode,
-            qty: entry.input.qty,
-            appliedQty: entry.applied,
-            excessQty: entry.input.qty - entry.applied,
+            // Story 10.1: the snapshot is the HTTP body and the outbox
+            // payload — base units on the way out.
+            qty: fromMilli(entry.input.qty),
+            appliedQty: fromMilli(entry.applied),
+            excessQty: fromMilli(entry.input.qty - entry.applied),
           })),
           ...(rejected.length === 0 ? {} : { rejectedLines: rejected }),
         },
@@ -598,7 +615,7 @@ export class ReceivingCommand {
             poId: pending.request.poId,
             poLineId: pending.request.poLineId,
             skuId: pending.request.skuId,
-            excessQty: pending.request.excessQty,
+            excessQty: fromMilli(pending.request.excessQty),
             requestedBy: command.operatorUserId,
             requestedAt: recordedAt,
           },
@@ -737,13 +754,13 @@ export class ReceivingCommand {
           }
           if (poLineRows[0].receivedQty + row.excessQty > MAX_GRN_LINE_QTY) {
             throw grnValidation(
-              `Approving would push purchase order line "${row.poLineId}" past its received-quantity ceiling of ${MAX_GRN_LINE_QTY}.`,
+              `Approving would push purchase order line "${row.poLineId}" past its received-quantity ceiling of ${fromMilli(MAX_GRN_LINE_QTY)}.`,
             );
           }
           await tx
             .update(purchaseOrderLines)
             .set({
-              receivedQty: sql`${purchaseOrderLines.receivedQty} + ${row.excessQty}`,
+              receivedQty: sql`${purchaseOrderLines.receivedQty} + ${row.excessQty}::bigint`,
               updatedAt: decidedAt,
             })
             .where(eq(purchaseOrderLines.id, row.poLineId));
@@ -778,7 +795,7 @@ export class ReceivingCommand {
           poId: row.poId,
           poLineId: row.poLineId,
           skuId: row.skuId,
-          excessQty: row.excessQty,
+          excessQty: fromMilli(row.excessQty),
           decidedBy: command.actorUserId,
           decidedAt,
         },
@@ -795,7 +812,7 @@ export class ReceivingCommand {
           poId: row.poId,
           poLineId: row.poLineId,
           skuId: row.skuId,
-          excessQty: row.excessQty,
+          excessQty: fromMilli(row.excessQty),
           status: status as OverReceiptEntry['status'],
           requestedBy: row.requestedBy,
           requestedAt: canonicalInstant(row.requestedAt),

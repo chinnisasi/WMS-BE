@@ -5,6 +5,7 @@ import { HttpException } from '@nestjs/common';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { MAX_QUANTITY_BASE } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { signTenantSession } from '../src/modules/tenancy/jwt-session';
@@ -804,11 +805,13 @@ describe('tenancy (e2e)', () => {
     const binReuse = await createBin(token, tenantId, warehouseId, zoneId, { ...binBody, capacity: 5 }, binKey).expect(422);
     expect(binReuse.body).toMatchObject({ code: 'idempotency-key-reuse' });
 
-    // Capacity beyond the Postgres integer ceiling is 400 at the boundary,
-    // not an unhandled 500 at the column.
+    // Capacity beyond the quantity ceiling is 400 at the boundary, not an
+    // unhandled 500 at the column. Story 10.1 moved that ceiling off the int4
+    // bound: capacity is milli-units in a bigint now, so the boundary is
+    // MAX_QUANTITY_BASE base units.
     await createBin(token, tenantId, warehouseId, zoneId, {
       code: 'A-01-99',
-      capacity: 2147483648,
+      capacity: MAX_QUANTITY_BASE + 1,
       type: 'shelf',
     }).expect(400);
 

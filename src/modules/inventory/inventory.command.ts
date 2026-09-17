@@ -3,7 +3,7 @@ import { and, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { bins, idempotencyKeys, skus } from '../../shared/db/schema';
-import { signedQuantity } from '../../shared/primitives/quantity';
+import { QUANTITY_SCALE, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
 import type { SignedQuantity } from '../../shared/primitives/quantity';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
@@ -213,13 +213,19 @@ export class StockAdjustmentCommand {
     // Serial-tracked movements move exactly one unit per event: the serial
     // count must equal the movement's magnitude (400 otherwise — the api
     // layer's DTO validation composes, this is the command's own backstop).
+    // Story 10.1: `delta` is in milli-units; `serialRefs.length` is an array
+    // length, which is a UNIT count and can never be anything else. The
+    // comparison is made in units, not milli-units — a serialized unit is
+    // discrete by definition (catalog entry refuses a serial-tracked SKU on a
+    // fractional UoM), so `fromMilli` here is always a whole number.
     const serialRefs = command.serialRefs ?? [];
-    if (serialRefs.length > 0 && serialRefs.length !== Math.abs(delta)) {
+    const deltaUnits = fromMilli(Math.abs(delta));
+    if (serialRefs.length > 0 && serialRefs.length !== deltaUnits) {
       throw new ProblemException(
         'validation-failed',
         400,
         'quantityDelta must match the serial count',
-        `A serial-tracked movement writes one ledger event per serial unit — ${serialRefs.length} serials cannot move ${delta} units.`,
+        `A serial-tracked movement writes one ledger event per serial unit — ${serialRefs.length} serials cannot move ${fromMilli(delta)} units.`,
       );
     }
 
@@ -289,7 +295,11 @@ export class StockAdjustmentCommand {
             warehouseId: command.warehouseId,
             skuId: command.skuId,
             binId: command.binId,
-            quantityDelta: command.quantityDelta,
+            // Story 10.1: a quantity leaves the domain in BASE units. The
+            // outbox contract is unchanged by the representation migration —
+            // an each-counted subscriber sees the identical number it always
+            // saw.
+            quantityDelta: fromMilli(command.quantityDelta),
             seq: snapshot.event.seq,
             eventId: snapshot.event.id,
           },
@@ -321,7 +331,10 @@ export class StockAdjustmentCommand {
     return { snapshot, replayed };
   }
 
-  /** Signed, non-zero integer delta (a zero-delta event is pure noise). */
+  /**
+   * Signed, non-zero delta in milli-units (a zero-delta event is pure noise).
+   * `raw` has already been scaled at the API edge.
+   */
   private assertNonZeroDelta(raw: number): SignedQuantity {
     if (raw === 0) {
       throw new ProblemException(
@@ -439,7 +452,11 @@ export class StockAdjustmentCommand {
     }
     // One unit per serial event; a fieldless/batch-only movement moves the
     // whole delta on one event.
-    const perEventDelta = (serialRefs.length > 0 ? Math.sign(delta) : delta) as SignedQuantity;
+    // One serial is one whole unit — `QUANTITY_SCALE` milli-units, carrying
+    // the movement's direction.
+    const perEventDelta = (
+      serialRefs.length > 0 ? Math.sign(delta) * QUANTITY_SCALE : delta
+    ) as SignedQuantity;
     // The override reason rides the reference doc verbatim — the
     // hash-chained ledger is the audit log (CHECKPOINT 1 resolution).
     const referenceDoc = {
@@ -495,14 +512,16 @@ export class StockAdjustmentCommand {
         type: 'stock.adjusted',
         skuId: command.skuId,
         binId: command.binId,
-        quantityDelta: command.quantityDelta,
+        // The snapshot IS the HTTP response body (and the idempotent replay's
+        // stored copy) — base units at the edge, milli-units below it.
+        quantityDelta: fromMilli(command.quantityDelta),
         occurredAt: appended.occurredAt,
         recordedAt: appended.recordedAt,
       },
       onHand: {
         skuId: command.skuId,
         binId: touched.binId,
-        quantity: touched.quantity,
+        quantity: fromMilli(touched.quantity),
       },
     };
   }

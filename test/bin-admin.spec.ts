@@ -2,6 +2,7 @@ import type { INestApplication } from '@nestjs/common';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { fromMilli, toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
@@ -357,7 +358,12 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
         from ledger_events
         where tenant_id = ${tenantId} and type = 'bin.merged'
         order by seq`;
-      return rows as unknown as MergeLedgerRow[];
+      // `quantity_delta` is milli-units (story 10.1); this helper is the
+      // suite's edge, so the arm assertions keep reading in base units.
+      return (rows as unknown as MergeLedgerRow[]).map((row) => ({
+        ...row,
+        quantity_delta: fromMilli(Number(row.quantity_delta)),
+      }));
     } finally {
       await sql.end();
     }
@@ -377,9 +383,10 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       const rows = await sql`
-        select coalesce(sum(quantity), 0)::int as n from stock_on_hand
+        select coalesce(sum(quantity), 0)::bigint as n from stock_on_hand
         where tenant_id = ${tenantId} and bin_id = ${binId} and sku_id = ${skuId}`;
-      return Number((rows[0] as unknown as { n: number }).n);
+      // The column holds milli-units (story 10.1); the suite asserts base units.
+      return fromMilli(Number((rows[0] as unknown as { n: number }).n));
     } finally {
       await sql.end();
     }
@@ -389,9 +396,10 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       const rows = await sql`
-        select coalesce(sum(quantity), 0)::int as n from batch_on_hand
+        select coalesce(sum(quantity), 0)::bigint as n from batch_on_hand
         where tenant_id = ${tenantId} and bin_id = ${binId} and sku_id = ${skuId} and batch_id = ${batchId}`;
-      return Number((rows[0] as unknown as { n: number }).n);
+      // The column holds milli-units (story 10.1); the suite asserts base units.
+      return fromMilli(Number((rows[0] as unknown as { n: number }).n));
     } finally {
       await sql.end();
     }
@@ -447,7 +455,9 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
   it('block toggle: 200 with the flag + audit row; replay re-serves; reuse 422; unknown bin 404; system bin 400 validation-failed', async () => {
     const key = ulid();
     const blocked = await blockBin(binA04, true, ownerToken, key).expect(200);
-    expect(blocked.body).toMatchObject({ id: binA04, blocked: true });
+    // `capacity` rides the block response: story 10.1 converts it out of
+    // milli-units here too, and nothing else in this suite observes it.
+    expect(blocked.body).toMatchObject({ id: binA04, capacity: 100, blocked: true });
 
     const replay = await blockBin(binA04, true, ownerToken, key).expect(200);
     expect(replay.body).toEqual(blocked.body);
@@ -806,7 +816,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     const bump = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await bump`
-        update stock_on_hand set quantity = quantity + 1
+        update stock_on_hand set quantity = quantity + ${toMilli(1)}
         where tenant_id = ${tenantId} and warehouse_id = ${warehouseId}
         and bin_id = ${binA09} and sku_id = ${serialSkuId}`;
     } finally {
@@ -914,7 +924,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       // The pairing CHECK: a retired_at without retired_by violates.
       const violation = admin`
         insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type, retired_at)
-        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${zoneId}, ${`CHK-${ulid().slice(0, 6)}`}, 10, 'shelf', now())`;
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${zoneId}, ${`CHK-${ulid().slice(0, 6)}`}, ${toMilli(10)}, 'shelf', now())`;
       await expect(violation).rejects.toThrow(/bins_retired_pairing/i);
     } finally {
       await admin.end();

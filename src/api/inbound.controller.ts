@@ -1,4 +1,5 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { toMilli } from '../shared/primitives/quantity';
 import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
@@ -150,7 +151,8 @@ export class InboundController {
         code: dto.code,
         lines: dto.lines.map((line) => ({
           skuId: line.skuId,
-          orderedQty: line.orderedQty,
+          // Story 10.1: the API edge scales into milli-units.
+          orderedQty: toMilli(line.orderedQty),
           unitCostPaise: line.unitCostPaise,
           expectedDate: line.expectedDate,
         })),
@@ -269,7 +271,8 @@ export class InboundController {
         lines: dto.lines.map((line) => ({
           ...(line.id === undefined ? {} : { id: line.id }),
           skuId: line.skuId,
-          orderedQty: line.orderedQty,
+          // Story 10.1: the API edge scales into milli-units.
+          orderedQty: toMilli(line.orderedQty),
           unitCostPaise: line.unitCostPaise,
           ...(line.expectedDate === undefined ? {} : { expectedDate: line.expectedDate }),
         })),

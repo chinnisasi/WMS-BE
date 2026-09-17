@@ -4,6 +4,7 @@ import { sql as drizzleSql } from 'drizzle-orm';
 import postgres from 'postgres';
 import request from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { fromMilli, toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import type { Database } from '../src/shared/db/db';
@@ -266,7 +267,40 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
       select quantity from stock_on_hand
       where tenant_id = ${tenantId} and warehouse_id = ${warehouse} and bin_id = ${binId}
     `;
-    return rows.length === 0 ? null : Number(rows[0]!.quantity);
+    // Story 10.1: the column holds milli-units (`bigint`, so postgres.js
+    // hands it back as a string); this suite reads and asserts base units.
+    return rows.length === 0 ? null : fromMilli(Number(rows[0]!.quantity));
+  }
+
+  /**
+   * A detection/rebuild report's divergences in BASE units — this suite's own
+   * `fromMilli` edge (story 10.1). `replayInTx` / `reconcileScanInTx` are
+   * inside the domain, so `projectedQuantity` / `replayedQuantity` are
+   * milli-units. The `reconciliation.divergence` OUTBOX payload is the
+   * opposite case: it LEAVES the domain, so `projected` / `replayed` there
+   * are already base units and are asserted raw below.
+   */
+  function divergenceUnits<T extends { projectedQuantity: number | null; replayedQuantity: number }>(
+    divergences: readonly T[],
+  ): T[] {
+    return divergences.map((divergence) => ({
+      ...divergence,
+      projectedQuantity:
+        divergence.projectedQuantity === null ? null : fromMilli(divergence.projectedQuantity),
+      replayedQuantity: fromMilli(divergence.replayedQuantity),
+    }));
+  }
+
+  /** The same edge for a report's repaired scopes (`RebuiltScope`). */
+  function repairedUnits<T extends { projectedQuantity: number | null; quantity: number }>(
+    repaired: readonly T[],
+  ): T[] {
+    return repaired.map((scope) => ({
+      ...scope,
+      projectedQuantity:
+        scope.projectedQuantity === null ? null : fromMilli(scope.projectedQuantity),
+      quantity: fromMilli(scope.quantity),
+    }));
   }
 
   /** One bin's opaque state epoch (story 4.3b) — null when never touched. */
@@ -278,22 +312,28 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     return rows.length === 0 ? null : Number(rows[0]!.epoch);
   }
 
-  /** The deliberate projection tamper (no trigger guards stock_on_hand). */
+  /**
+   * The deliberate projection tamper (no trigger guards stock_on_hand). The
+   * tamper is written in base units like every other number in this suite;
+   * the column is milli-units (story 10.1).
+   */
   async function tamperProjection(binId: string, delta: number, warehouse = warehouseId): Promise<void> {
     await sql`
-      update stock_on_hand set quantity = quantity + ${delta}
+      update stock_on_hand set quantity = quantity + ${toMilli(delta)}
       where tenant_id = ${tenantId} and warehouse_id = ${warehouse} and bin_id = ${binId}
     `;
   }
 
   async function projectionRows(warehouse = warehouseId): Promise<
-    { bin_id: string; quantity: number; updated_at: Date }[]
+    { bin_id: string; quantity: string; updated_at: Date }[]
   > {
+    // `quantity` is compared only for byte-identity (zero projection writes),
+    // so it stays exactly as postgres.js hands a `bigint` back: a string.
     return (await sql`
       select bin_id, quantity, updated_at from stock_on_hand
       where tenant_id = ${tenantId} and warehouse_id = ${warehouse}
       order by bin_id
-    `) as unknown as { bin_id: string; quantity: number; updated_at: Date }[];
+    `) as unknown as { bin_id: string; quantity: string; updated_at: Date }[];
   }
 
   async function checkpointRow(targetWarehouseId: string): Promise<
@@ -435,7 +475,7 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     const report = await facade.reconcile(tenantId, warehouseId);
     expect(report.advanced).toBe(false);
     expect(report.divergences).toHaveLength(1);
-    expect(report.divergences[0]).toEqual({
+    expect(divergenceUnits(report.divergences)[0]).toEqual({
       skuId,
       binId: binA,
       projectedQuantity: 16,
@@ -445,7 +485,7 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
       repeat: false,
     });
     // The rebuild: the projection carries the REPLAYED quantity now.
-    expect(report.repaired).toEqual([
+    expect(repairedUnits(report.repaired)).toEqual([
       { skuId, binId: binA, projectedQuantity: 16, quantity: 9, deleted: false },
     ]);
     expect(await onHandFor(binA)).toBe(9);
@@ -512,7 +552,7 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     expect(report.quarantined).toEqual(
       preQuarantines.length === 0 ? [{ skuId, binId: binA }] : [],
     );
-    expect(report.repaired).toEqual([
+    expect(repairedUnits(report.repaired)).toEqual([
       { skuId, binId: binA, projectedQuantity: 12, quantity: 9, deleted: false },
     ]);
     // (The earlier alert rows were drained and acked by the bus-observation
@@ -635,10 +675,10 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     // tamper is detected, rebuilt, and alerted — the next cycle's problem,
     // reconciled.
     const report = await facade.reconcile(tenantId, warehouseId);
-    expect(report.divergences).toEqual([
+    expect(divergenceUnits(report.divergences)).toEqual([
       { skuId, binId: binB, projectedQuantity: 11, replayedQuantity: 5, fromSeq: 5, toSeq: 5, repeat: false },
     ]);
-    expect(report.repaired).toEqual([
+    expect(repairedUnits(report.repaired)).toEqual([
       { skuId, binId: binB, projectedQuantity: 11, quantity: 5, deleted: false },
     ]);
     expect(await onHandFor(binB)).toBe(5);
@@ -662,10 +702,10 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     const seq6 = await adjust(binA, 1); // binA replay: 10
     expect(seq6).toBe(6);
     const caught = await facade.reconcile(tenantId, warehouseId);
-    expect(caught.divergences).toEqual([
+    expect(divergenceUnits(caught.divergences)).toEqual([
       { skuId, binId: binA, projectedQuantity: 14, replayedQuantity: 10, fromSeq: 6, toSeq: 6, repeat: false },
     ]);
-    expect(caught.repaired).toEqual([
+    expect(repairedUnits(caught.repaired)).toEqual([
       { skuId, binId: binA, projectedQuantity: 14, quantity: 10, deleted: false },
     ]);
     expect(await onHandFor(binA)).toBe(10);
@@ -685,19 +725,19 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     // ledger events at all (plain SQL — stock_on_hand has no trigger).
     await sql`
       insert into stock_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, quantity)
-      values (gen_random_uuid(), ${tenantId}, ${warehouseId}, ${fabricatedSkuId}, ${fabricatedBinId}, 5)
+      values (gen_random_uuid(), ${tenantId}, ${warehouseId}, ${fabricatedSkuId}, ${fabricatedBinId}, ${toMilli(5)})
     `;
     expect(await onHandFor(fabricatedBinId)).toBe(5);
 
     const before = (await outboxRows(RECONCILIATION_DIVERGENCE_EVENT)).length;
     const report = await facade.reconcile(tenantId, warehouseId);
     expect(report.advanced).toBe(false);
-    expect(report.divergences).toEqual([
+    expect(divergenceUnits(report.divergences)).toEqual([
       { skuId: fabricatedSkuId, binId: fabricatedBinId, projectedQuantity: 5, replayedQuantity: 0, repeat: false },
     ]);
     // The repair DELETES the fabricated row (the ledger is the only stock
     // truth — an event-less scope has nothing to rebuild toward).
-    expect(report.repaired).toEqual([
+    expect(repairedUnits(report.repaired)).toEqual([
       { skuId: fabricatedSkuId, binId: fabricatedBinId, projectedQuantity: 5, quantity: 0, deleted: true },
     ]);
     expect(await onHandFor(fabricatedBinId)).toBe(null);
@@ -745,10 +785,10 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     expect(epochBBefore).not.toBeNull();
     const beforeScoped = (await outboxRows(RECONCILIATION_DIVERGENCE_EVENT)).length;
     const scoped = await facade.rebuildProjections(tenantId, warehouseId, { skuId, binId: binB });
-    expect(scoped.divergences).toEqual([
+    expect(divergenceUnits(scoped.divergences)).toEqual([
       { skuId, binId: binB, projectedQuantity: 8, replayedQuantity: 6 },
     ]);
-    expect(scoped.repaired).toEqual([
+    expect(repairedUnits(scoped.repaired)).toEqual([
       { skuId, binId: binB, projectedQuantity: 8, quantity: 6, deleted: false },
     ]);
     expect(await onHandFor(binB)).toBe(6);
@@ -768,8 +808,10 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     // The FULL repair: every still-divergent scope of the warehouse.
     const beforeFull = (await outboxRows(RECONCILIATION_DIVERGENCE_EVENT)).length;
     const full = await facade.rebuildProjections(tenantId, warehouseId);
-    expect(full.divergences).toEqual([{ skuId, binId: binA, projectedQuantity: 16, replayedQuantity: 11 }]);
-    expect(full.repaired).toEqual([
+    expect(divergenceUnits(full.divergences)).toEqual([
+      { skuId, binId: binA, projectedQuantity: 16, replayedQuantity: 11 },
+    ]);
+    expect(repairedUnits(full.repaired)).toEqual([
       { skuId, binId: binA, projectedQuantity: 16, quantity: 11, deleted: false },
     ]);
     expect(await onHandFor(binA)).toBe(11);

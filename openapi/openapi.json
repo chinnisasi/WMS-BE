@@ -8141,8 +8141,9 @@
           "capacity": {
             "type": "number",
             "example": 120,
-            "minimum": 1,
-            "description": "Positive integer, base-UoM units"
+            "minimum": 0.001,
+            "maximum": 9007199254740,
+            "description": "Bin capacity. A quantity in the SKU's base UoM, to at most 3 decimal places. A value with more precision than that is rounded to 3 decimal places."
           },
           "type": {
             "type": "string",
@@ -8268,8 +8269,9 @@
           "capacity": {
             "type": "number",
             "example": 120,
-            "minimum": 1,
-            "description": "Capacity per bin, base-UoM units"
+            "minimum": 0.001,
+            "maximum": 9007199254740,
+            "description": "Capacity per bin. A quantity in the SKU's base UoM, to at most 3 decimal places. A value with more precision than that is rounded to 3 decimal places."
           },
           "type": {
             "type": "string",
@@ -8829,15 +8831,15 @@
             "type": "number",
             "example": 50,
             "minimum": 0,
-            "maximum": 2147483647,
-            "description": "Base-UoM units"
+            "maximum": 9007199254740,
+            "description": "A quantity in the SKU's base UoM, to at most 3 decimal places. A value with more precision than that is rounded to 3 decimal places."
           },
           "reorderQty": {
             "type": "number",
             "example": 100,
             "minimum": 0,
-            "maximum": 2147483647,
-            "description": "Base-UoM units"
+            "maximum": 9007199254740,
+            "description": "A quantity in the SKU's base UoM, to at most 3 decimal places. A value with more precision than that is rounded to 3 decimal places."
           },
           "barcode": {
             "type": "string",
@@ -9237,7 +9239,9 @@
           },
           "quantityDelta": {
             "type": "number",
-            "description": "Signed base-UoM integer; positive into the bin, negative out"
+            "description": "Signed quantity; positive into the bin, negative out. A quantity in the SKU's base UoM, to at most 3 decimal places. A value with more precision than that is rounded to 3 decimal places. A non-zero magnitude below 0.001 is refused rather than rounded to zero.",
+            "minimum": -9007199254740,
+            "maximum": 9007199254740
           },
           "reasonCode": {
             "type": "string",
@@ -9995,8 +9999,9 @@
           },
           "orderedQty": {
             "type": "number",
-            "description": "Ordered quantity in base UoM (positive integer)",
-            "minimum": 1
+            "description": "Ordered quantity. A quantity in the SKU's base UoM, to at most 3 decimal places. A value with more precision than that is rounded to 3 decimal places.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
           },
           "unitCostPaise": {
             "type": "number",
@@ -10292,9 +10297,9 @@
           },
           "quantity": {
             "type": "number",
-            "description": "Ordered quantity in base UoM — a positive integer",
-            "minimum": 1,
-            "maximum": 2147483647,
+            "description": "Ordered quantity. A quantity in the SKU's base UoM, to at most 3 decimal places. A value with more precision than that is rounded to 3 decimal places.",
+            "minimum": 0.001,
+            "maximum": 9007199254740,
             "example": 10
           }
         },
@@ -10504,8 +10509,8 @@
           "qty": {
             "type": "number",
             "description": "Units of this SKU counted into the parcel, in base UoM. Two lines naming the same SKU sum — the bench scans items, not lines.",
-            "minimum": 1,
-            "maximum": 2147483647
+            "minimum": 0.001,
+            "maximum": 9007199254740
           }
         },
         "required": [
@@ -11413,9 +11418,9 @@
           },
           "qty": {
             "type": "number",
-            "description": "Units actually drawn in base UoM. Equal to the line’s planned quantity for an ordinary pick; BELOW it (down to 0, an empty bin) for a short pick, which must carry a reasonCode. Above the plan is always a 400.",
+            "description": "Units actually drawn in base UoM. Equal to the line’s planned quantity for an ordinary pick; BELOW it (down to 0, an empty bin) for a short pick, which must carry a reasonCode. Above the plan is always a 400. A non-zero value below 0.001 is refused rather than rounded to zero — zero means an empty bin, which is a different report.",
             "minimum": 0,
-            "maximum": 2147483647
+            "maximum": 9007199254740
           },
           "occurredAt": {
             "type": "string",
@@ -11823,9 +11828,9 @@
           },
           "qty": {
             "type": "number",
-            "description": "Physically received quantity in base UoM (positive integer, at most 2147483647 — the int4 bound of the line table)",
-            "minimum": 1,
-            "maximum": 2147483647
+            "description": "Physically received quantity. A quantity in the SKU's base UoM, to at most 3 decimal places. A value with more precision than that is rounded to 3 decimal places.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
           }
         },
         "required": [
@@ -12792,9 +12797,9 @@
           },
           "qty": {
             "type": "number",
-            "description": "Placed quantity in base UoM (positive integer — partial placements allowed)",
-            "minimum": 1,
-            "maximum": 2147483647
+            "description": "Placed quantity — partial placements allowed. A quantity in the SKU's base UoM, to at most 3 decimal places. A value with more precision than that is rounded to 3 decimal places.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
           },
           "toBinId": {
             "type": "string",

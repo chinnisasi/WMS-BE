@@ -13,7 +13,7 @@ import {
   zones,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { signedQuantity } from '../../shared/primitives/quantity';
+import { QUANTITY_SCALE, assertExactQuantity, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from './idempotency-guard';
@@ -571,9 +571,11 @@ export class BinCommand {
             // over a disagreeing source).
             const serialEntries: readonly SerialLocationEntry[] = await this.inventory
               .serialsLocatedInBinInTx(tx, command.tenantId, row.skuId, source.id);
-            if (serialEntries.length !== row.quantity) {
+            // Story 10.1: an array length is a UNIT count — `row.quantity` is
+            // in milli-units, so the comparison is made in units.
+            if (serialEntries.length !== fromMilli(row.quantity)) {
               throw mergeValidation(
-                `Bin "${source.code}" serial state disagrees with its on-hand projection for SKU "${row.skuCode}" (${serialEntries.length} serials vs ${row.quantity} units) — resolve before merging.`,
+                `Bin "${source.code}" serial state disagrees with its on-hand projection for SKU "${row.skuCode}" (${serialEntries.length} serials vs ${fromMilli(row.quantity)} units) — resolve before merging.`,
               );
             }
             for (const entry of serialEntries) {
@@ -581,7 +583,8 @@ export class BinCommand {
                 skuId: row.skuId,
                 batchRef: entry.batchRef,
                 serialRef: entry.serialRef,
-                qty: 1,
+                // One serial is one whole unit — `QUANTITY_SCALE` milli-units.
+                qty: QUANTITY_SCALE,
               });
             }
           } else if (row.batchTracked) {
@@ -618,7 +621,10 @@ export class BinCommand {
 
         // The all-or-nothing capacity gate BEFORE any append: the whole merge
         // must fit, or nothing moves.
-        const movedUnits = arms.reduce((sum, arm) => sum + arm.qty, 0);
+        const movedUnits = arms.reduce(
+          (sum, arm) => assertExactQuantity(sum + arm.qty, 'bin merge moved units'),
+          0,
+        );
         const targetOccupancy = await binOccupancyInTx(
           tx,
           command.tenantId,
@@ -674,7 +680,8 @@ export class BinCommand {
           target: targetBin,
           moved: {
             skus: new Set(arms.map((arm) => arm.skuId)).size,
-            units: movedUnits,
+            // Story 10.1: base units at the response/outbox edge.
+            units: fromMilli(movedUnits),
           },
         };
 
@@ -841,8 +848,8 @@ export class BinCommand {
           .orderBy(asc(skus.code), asc(batches.code));
         if (plainRows.length > 0 || batchRows.length > 0) {
           const parts = [
-            ...plainRows.map((r) => `${r.skuCode} ×${r.quantity}`),
-            ...batchRows.map((r) => `${r.skuCode} (batch ${r.batchCode}) ×${r.quantity}`),
+            ...plainRows.map((r) => `${r.skuCode} ×${fromMilli(r.quantity)}`),
+            ...batchRows.map((r) => `${r.skuCode} (batch ${r.batchCode}) ×${fromMilli(r.quantity)}`),
           ];
           throw new ProblemException(
             'bin-not-empty',
@@ -969,7 +976,9 @@ function binFromRow(row: typeof bins.$inferSelect): BinSnapshot['bin'] {
     warehouseId: row.warehouseId,
     zoneId: row.zoneId,
     code: row.code,
-    capacity: row.capacity,
+    // Story 10.1: `binFromRow` is the module's only bin read shape — base
+    // units leave here, milli-units stay below.
+    capacity: fromMilli(row.capacity),
     type: row.type,
     blocked: row.blocked,
     systemOwned: row.systemOwned,

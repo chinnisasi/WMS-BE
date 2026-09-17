@@ -35,6 +35,7 @@ import { SkuCommand } from './sku.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ImportCatalogDto } from './catalog.dto';
 import { CatalogImportResponse, PatchSkuDto, SkuListResponse, SkuResponse } from './catalog.dto';
+import { toMilli } from '../../shared/primitives/quantity';
 
 export class SkuListQuery {
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
@@ -217,8 +218,10 @@ export class CatalogController {
         hsn: dto.hsn === undefined ? undefined : dto.hsn === '' ? null : dto.hsn,
         batchTracked: dto.batchTracked,
         serialTracked: dto.serialTracked,
-        reorderPoint: dto.reorderPoint,
-        reorderQty: dto.reorderQty,
+        // Story 10.1: both are UoM-denominated and compared against
+        // quantities, so they scale with them.
+        reorderPoint: dto.reorderPoint === undefined ? undefined : toMilli(dto.reorderPoint),
+        reorderQty: dto.reorderQty === undefined ? undefined : toMilli(dto.reorderQty),
         barcode: dto.barcode,
       },
       key,

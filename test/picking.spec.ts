@@ -3,6 +3,7 @@ import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import Redis from 'ioredis';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { fromMilli, toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
@@ -561,7 +562,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
   async function ledgerFor(picklistLineId: string): Promise<
     { type: string; quantity_delta: number; from_bin_id: string | null; to_bin_id: string | null; batch_ref: string | null; serial_ref: string | null; reference_doc: Record<string, unknown> }[]
   > {
-    return (await sql`
+    const rows = (await sql`
       select type, quantity_delta, from_bin_id, to_bin_id, batch_ref, serial_ref, reference_doc
       from ledger_events
       where tenant_id = ${tenantId}
@@ -576,6 +577,9 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       serial_ref: string | null;
       reference_doc: Record<string, unknown>;
     }[];
+    // Story 10.1: `quantity_delta` is milli-units. `reference_doc` is NOT —
+    // it leaves the domain verbatim, so its `shortfallQty` stays base units.
+    return rows.map((row) => ({ ...row, quantity_delta: fromMilli(Number(row.quantity_delta)) }));
   }
 
   async function reservationState(reservationId: string): Promise<string | null> {
@@ -593,7 +597,10 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       select quantity from stock_on_hand
       where tenant_id = ${tenantId} and sku_id = ${skuId} and bin_id = ${binId}
     `;
-    return (rows[0] as unknown as { quantity: number } | undefined)?.quantity ?? 0;
+    // Story 10.1: the column holds milli-units; this suite reads base units,
+    // so the helper is the edge (the API controllers are, in production).
+    const row = rows[0] as unknown as { quantity: number } | undefined;
+    return row === undefined ? 0 : fromMilli(Number(row.quantity));
   }
 
   /** The line as the DATABASE holds it — the short-pick record, not a view. */
@@ -613,7 +620,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     `;
     const row = rows[0];
     if (row === undefined) throw new Error(`no picklist line ${lineId}`);
-    return row as unknown as {
+    const line = row as unknown as {
       status: string;
       qty: number;
       shortfall_qty: number;
@@ -623,13 +630,15 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       slice_seq: number;
       walk_seq: number;
     };
+    // Story 10.1: `qty` / `shortfall_qty` are milli-units on the row.
+    return { ...line, qty: fromMilli(Number(line.qty)), shortfall_qty: fromMilli(Number(line.shortfall_qty)) };
   }
 
   /** Every slice of one order line, in creation order (re-plans land last). */
   async function slicesOf(orderLineId: string): Promise<
     { id: string; status: string; qty: number; shortfall_qty: number; slice_seq: number; walk_seq: number; bin_id: string | null; reservation_id: string | null }[]
   > {
-    return (await sql`
+    const rows = (await sql`
       select id, status, qty, shortfall_qty, slice_seq, walk_seq, bin_id, reservation_id
       from picklist_lines
       where tenant_id = ${tenantId} and order_line_id = ${orderLineId}
@@ -644,6 +653,12 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       bin_id: string | null;
       reservation_id: string | null;
     }[];
+    // Story 10.1: the stored quantities are milli-units; the suite reads base.
+    return rows.map((row) => ({
+      ...row,
+      qty: fromMilli(Number(row.qty)),
+      shortfall_qty: fromMilli(Number(row.shortfall_qty)),
+    }));
   }
 
   /**
@@ -663,15 +678,17 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     const snapshot = await app.get(InventoryFacade).atp(tenantId, warehouseId, skuId);
     const counterRaw = await valkey.get(`wms:{${tenantId}}:wh:${warehouseId}:res:${skuId}`);
     const journalRows = await sql`
-      select coalesce(sum(quantity), 0)::int as reserved from reservations
+      select coalesce(sum(quantity), 0)::bigint as reserved from reservations
       where tenant_id = ${tenantId} and warehouse_id = ${warehouseId} and sku_id = ${skuId}
         and state in ('held', 'committed')
     `;
+    // Story 10.1: all three places speak milli-units — the facade snapshot,
+    // the Valkey counter and the journal column. The suite speaks base units.
     return {
-      onHand: snapshot.onHand,
-      counter: counterRaw === null ? Number.NaN : Number(counterRaw),
-      journal: Number((journalRows[0] as unknown as { reserved: number }).reserved),
-      atp: snapshot.atp,
+      onHand: fromMilli(snapshot.onHand),
+      counter: counterRaw === null ? Number.NaN : fromMilli(Number(counterRaw)),
+      journal: fromMilli(Number((journalRows[0] as unknown as { reserved: number }).reserved)),
+      atp: fromMilli(snapshot.atp),
     };
   }
 
@@ -1268,7 +1285,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     const systemBinId = uuidv7();
     await sql`
       insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type, system_owned)
-      values (${systemBinId}, ${tenantId}, ${warehouseId}, ${zoneId}, ${`SYS-${ulid().slice(10, 16)}`}, 1000, 'shelf', true)
+      values (${systemBinId}, ${tenantId}, ${warehouseId}, ${zoneId}, ${`SYS-${ulid().slice(10, 16)}`}, ${toMilli(1000)}, 'shelf', true)
     `;
     const system = await pick(bodyFor(line, { binId: systemBinId })).expect(400);
     expect(system.body.code).toBe('validation-failed');
@@ -1383,7 +1400,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(replanHold).not.toBe(originalHold);
     expect(await reservationState(replanHold)).toBe('held');
     const holdRows = await sql`select quantity, owner_type, owner_id from reservations where id = ${replanHold}`;
-    expect(Number((holdRows[0] as unknown as { quantity: number }).quantity)).toBe(2);
+    expect(fromMilli(Number((holdRows[0] as unknown as { quantity: number }).quantity))).toBe(2);
     expect((holdRows[0] as unknown as { owner_id: string }).owner_id).toBe(line.orderLineId);
 
     // The re-plan: a NEW slice on the SAME picklist, at the alternate bin,
@@ -1610,7 +1627,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     // The whole hold (8) released; the remainder (8 − 1 drawn) re-granted.
     expect(await reservationState(originalHold)).toBe('released');
     const holdRows = await sql`select quantity from reservations where id = ${replanHold}`;
-    expect(Number((holdRows[0] as unknown as { quantity: number }).quantity)).toBe(7);
+    expect(fromMilli(Number((holdRows[0] as unknown as { quantity: number }).quantity))).toBe(7);
 
     // The untouched sibling must not be left pointing at a released hold —
     // it would replay into `pick-unresolvable` for a stop that is perfectly
@@ -1668,7 +1685,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     const replanHold = res.body.pick.replanReservationId as string;
     expect(replanHold).not.toBeNull();
     const holdRows = await sql`select quantity from reservations where id = ${replanHold}`;
-    expect(Number((holdRows[0] as unknown as { quantity: number }).quantity)).toBe(3);
+    expect(fromMilli(Number((holdRows[0] as unknown as { quantity: number }).quantity))).toBe(3);
 
     // Re-granting 7 would hold four phantom units against ATP forever; the
     // mirror is derived from the same figure, so counter and journal would
@@ -1866,7 +1883,9 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
           picklistLineId: body.picklistLineId,
           skuId: body.skuId,
           binId: body.binId,
-          qty: body.qty,
+          // Story 10.1: the COMMAND hashes milli-units (the controller scales
+          // at the edge), so the stored key's fingerprint must too.
+          qty: toMilli(body.qty),
           occurredAt: body.occurredAt,
         }),
         'utf8',
@@ -2041,7 +2060,8 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       select quantity from batch_on_hand
       where tenant_id = ${tenantId} and bin_id = ${binE} and batch_id = ${drawnBatch}
     `;
-    expect((batchOnHand[0] as unknown as { quantity: number }).quantity).toBe(2);
+    // Story 10.1: the projection column is milli-units.
+    expect(fromMilli(Number((batchOnHand[0] as unknown as { quantity: number }).quantity))).toBe(2);
   });
 
   it('a draw larger than the earliest batch spans TWO arms — one event each, FEFO order, and the pick row names no single batch', async () => {
@@ -2091,7 +2111,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect((remaining[0] as unknown as { batch_id: string; quantity: number }).batch_id).toBe(
       byCode.get(laterCode),
     );
-    expect((remaining[0] as unknown as { quantity: number }).quantity).toBe(4);
+    expect(fromMilli(Number((remaining[0] as unknown as { quantity: number }).quantity))).toBe(4);
   });
 
   it('a serial-tracked pick writes one ledger event per serial unit; a wrong count, a duplicate or a serial living elsewhere is refused', async () => {

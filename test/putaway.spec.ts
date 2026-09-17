@@ -4,6 +4,7 @@ import type { INestApplication } from '@nestjs/common';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { fromMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -349,11 +350,16 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
   > {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
-      return await sql`
+      const rows = await sql`
         select type, quantity_delta, from_bin_id, to_bin_id, serial_ref, reference_doc
         from ledger_events
         where tenant_id = ${tenantId} and reference_doc->>'grnId' = ${grnId}
         order by seq`;
+      // Story 10.1: the column holds milli-units; this suite reads base units.
+      return rows.map((row) => ({
+        ...(row as unknown as { quantity_delta: number }),
+        quantity_delta: fromMilli(Number((row as unknown as { quantity_delta: number }).quantity_delta)),
+      })) as unknown as Awaited<ReturnType<typeof ledgerRows>>;
     } finally {
       await sql.end();
     }
@@ -363,9 +369,10 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       const rows = await sql`
-        select coalesce(sum(quantity), 0)::int as n from stock_on_hand
+        select coalesce(sum(quantity), 0)::bigint as n from stock_on_hand
         where tenant_id = ${tenantId} and bin_id = ${binId} and sku_id = ${skuId}`;
-      return Number((rows[0] as unknown as { n: number }).n);
+      // Milli-units in the column (story 10.1) — base units out of the helper.
+      return fromMilli(Number((rows[0] as unknown as { n: number }).n));
     } finally {
       await sql.end();
     }
@@ -375,9 +382,10 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       const rows = await sql`
-        select coalesce(sum(quantity), 0)::int as n from batch_on_hand
+        select coalesce(sum(quantity), 0)::bigint as n from batch_on_hand
         where tenant_id = ${tenantId} and bin_id = ${binId} and sku_id = ${skuId} and batch_id = ${batchId}`;
-      return Number((rows[0] as unknown as { n: number }).n);
+      // Milli-units in the column (story 10.1) — base units out of the helper.
+      return fromMilli(Number((rows[0] as unknown as { n: number }).n));
     } finally {
       await sql.end();
     }
@@ -457,9 +465,24 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       .get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`)
       .set('Authorization', `Bearer ${operatorToken}`)
       .expect(200);
-    const bins = snapshot.body.bins as { id: string; code: string; blocked: boolean; systemOwned: boolean }[];
+    const bins = snapshot.body.bins as {
+      id: string;
+      code: string;
+      capacity: number;
+      blocked: boolean;
+      systemOwned: boolean;
+    }[];
     const putawayTasks = snapshot.body.putawayTasks as typeof tasks;
-    expect(bins.find((bin) => bin.id === binA01)).toMatchObject({ code: 'A-01', blocked: false, systemOwned: false });
+    // `capacity` is asserted because the device uses it for the pre-queue bin
+    // check while offline: story 10.1 converts it out of milli-units on this
+    // read, and a dropped conversion would tell every scanner the bin holds a
+    // thousand times what it does.
+    expect(bins.find((bin) => bin.id === binA01)).toMatchObject({
+      code: 'A-01',
+      capacity: 100,
+      blocked: false,
+      systemOwned: false,
+    });
     expect(bins.find((bin) => bin.code === 'RECEIVING')).toMatchObject({ systemOwned: true, blocked: false });
     expect(putawayTasks.find((task) => task.grnLineId === line.id)).toMatchObject({
       qty: 40,
@@ -608,12 +631,15 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       .get(`${API}/${tenantId}/putaway/placements?warehouseId=${warehouseId}`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .expect(200);
-    const entry = (list.body.items as { id: string; grnCode: string; skuCode: string; toBinCode: string; suggestedBinCode: string | null; reasonCode: string | null; deviceId: string }[]).find(
+    const entry = (list.body.items as { id: string; grnCode: string; qty: number; skuCode: string; toBinCode: string; suggestedBinCode: string | null; reasonCode: string | null; deviceId: string }[]).find(
       (item) => item.id === placement.id,
     )!;
     expect(entry).toBeTruthy();
     expect(entry).toMatchObject({
       grnCode: placement.grnCode,
+      // The list read converts out of milli-units (story 10.1) — asserted
+      // here, or the conversion is unobserved.
+      qty: placement.qty,
       skuCode: 'PUT-A',
       toBinCode: 'A-01',
       suggestedBinCode: 'A-01',

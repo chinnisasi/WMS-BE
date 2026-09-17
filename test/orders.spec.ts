@@ -3,6 +3,7 @@ import postgres from 'postgres';
 import request from 'supertest';
 import Redis from 'ioredis';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { fromMilli, toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { ValkeyClient } from '../src/shared/valkey/valkey.client';
@@ -275,9 +276,18 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       .send(body);
   }
 
-  /** The real-time ATP read (facade — story 2.5 has no ATP HTTP route). */
+  /**
+   * The real-time ATP read (facade — story 2.5 has no ATP HTTP route).
+   * Story 10.1: the facade speaks milli-units, so this helper is the suite's
+   * own `fromMilli` edge and every assertion below stays in base units.
+   */
   async function atp(skuId: string): Promise<{ onHand: number; reserved: number; atp: number }> {
-    return app.get(InventoryFacade).atp(tenantId, warehouseId, skuId);
+    const snapshot = await app.get(InventoryFacade).atp(tenantId, warehouseId, skuId);
+    return {
+      onHand: fromMilli(snapshot.onHand),
+      reserved: fromMilli(snapshot.reserved),
+      atp: fromMilli(snapshot.atp),
+    };
   }
 
   /** The live journal rows of one SKU's order holds (this suite's own truth read). */
@@ -287,7 +297,11 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       where tenant_id = ${tenantId} and sku_id = ${skuId} and owner_type = 'order'
       order by id
     `;
-    return rows as unknown as { id: string; state: string; quantity: number }[];
+    // The column holds milli-units (story 10.1); the suite asserts base units.
+    return (rows as unknown as { id: string; state: string; quantity: number }[]).map((row) => ({
+      ...row,
+      quantity: fromMilli(Number(row.quantity)),
+    }));
   }
 
   async function orderRow(orderId: string): Promise<Record<string, unknown> | undefined> {
@@ -393,7 +407,9 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       createBody([{ skuId, quantity: 1 }], { externalEventId: 'evt-1' }),
     ).expect(400);
     // The review-patch arms: a non-uuid integrationId and a quantity above
-    // the int4 column bound are rejected at the boundary (never a driver 500).
+    // the quantity ceiling are rejected at the boundary (never a driver 500).
+    // Story 10.1 moved that ceiling off int4 and onto MAX_QUANTITY_BASE
+    // (9007199254740 base units — the exact-integer bound of milli-units).
     await postOrder(
       opsToken,
       createBody([{ skuId, quantity: 1 }], {
@@ -402,7 +418,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
         externalEventId: 'evt-1',
       }),
     ).expect(400);
-    await postOrder(opsToken, createBody([{ skuId, quantity: 2_147_483_648 }])).expect(400);
+    await postOrder(opsToken, createBody([{ skuId, quantity: 9_007_199_254_741 }])).expect(400);
     // Nothing reached the journal for the probe SKUs beyond the fixtures.
     expect((await orderHolds(skuId)).length).toBeLessThanOrEqual(2); // the earlier tests' holds
   });
@@ -565,7 +581,10 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       select reserved_qty, reservation_id from order_lines
       where tenant_id = ${tenantId} and order_id = ${orderId}
     `;
-    expect(Number((cancelledLines[0] as unknown as { reserved_qty: number }).reserved_qty)).toBe(0);
+    // `reserved_qty` is milli-units (story 10.1) — unscaled to base here.
+    expect(
+      fromMilli(Number((cancelledLines[0] as unknown as { reserved_qty: number }).reserved_qty)),
+    ).toBe(0);
     expect((cancelledLines[0] as unknown as { reservation_id: string | null }).reservation_id).toBeNull();
     // ATP restored; the journal row is terminal-released, never deleted.
     expect(await atp(skuId)).toMatchObject({ onHand: 3, reserved: 0, atp: 3 });
@@ -885,13 +904,13 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     await expect(
       sql`
         insert into order_lines (id, tenant_id, order_id, sku_id, qty, status)
-        values (${uuidv7()}, ${tenantId}, ${orderId}, ${skuId}, 0, 'open')
+        values (${uuidv7()}, ${tenantId}, ${orderId}, ${skuId}, ${toMilli(0)}, 'open')
       `,
     ).rejects.toMatchObject({ code: '23514' });
     await expect(
       sql`
         insert into order_lines (id, tenant_id, order_id, sku_id, qty, reserved_qty, status)
-        values (${uuidv7()}, ${tenantId}, ${orderId}, ${skuId}, 1, 2, 'open')
+        values (${uuidv7()}, ${tenantId}, ${orderId}, ${skuId}, ${toMilli(1)}, ${toMilli(2)}, 'open')
       `,
     ).rejects.toMatchObject({ code: '23514' });
   });
@@ -968,7 +987,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     `;
     await sql`
       insert into order_lines (id, tenant_id, order_id, sku_id, qty, reserved_qty, status)
-      values (${uuidv7()}, ${foreignTenantId}, ${foreignOrderId}, ${uuidv7()}, 2, 0, 'open')
+      values (${uuidv7()}, ${foreignTenantId}, ${foreignOrderId}, ${uuidv7()}, ${toMilli(2)}, ${toMilli(0)}, 'open')
     `;
     // The probe below is only meaningful because both foreign rows exist.
     const foreignSeeded = await sql`

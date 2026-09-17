@@ -7,6 +7,7 @@ import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
+import { fromMilli } from '../../shared/primitives/quantity';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import {
@@ -341,6 +342,13 @@ export class InventoryFacade {
         // jsonb selects as `unknown` — the timeline's typed passthrough (the
         // verifier's own cast pattern, ledger.service).
         referenceDoc: row.referenceDoc as LedgerReferenceDoc,
+        // Story 10.1: this is a READ MODEL — a quantity crossing it is on its
+        // way to an HTTP body, so it converts from the domain's milli-units
+        // back to the operator-facing base UoM here. The in-transaction
+        // helpers further down this file (`stockByBinsInTx`,
+        // `batchOnHandForBinInTx`, `atp`, `qcHeldArmsInTx`) feed COMMANDS,
+        // not responses, and deliberately stay in milli-units.
+        quantityDelta: fromMilli(row.quantityDelta),
         occurredAt: canonicalInstant(row.occurredAt),
         recordedAt: canonicalInstant(row.recordedAt),
         createdAt: canonicalInstant(row.createdAt),
@@ -395,6 +403,8 @@ export class InventoryFacade {
         .limit(pageSize + 1);
       const items = rows.map((row) => ({
         ...row,
+        // Read model — base units at the edge (see `listEvents`).
+        quantity: fromMilli(row.quantity),
         createdAt: canonicalInstant(row.createdAt),
       }));
       return buildPage(items, pageSize);
@@ -879,7 +889,8 @@ export class InventoryFacade {
   ): Promise<BatchOnHandEntry[]> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
-      return tx
+      // Read model — the rows are mapped to base units below (story 10.1).
+      const rows = await tx
         .select({
           warehouseId: batchOnHand.warehouseId,
           skuId: batchOnHand.skuId,
@@ -897,6 +908,7 @@ export class InventoryFacade {
           ),
         )
         .orderBy(asc(batchOnHand.batchId));
+      return rows.map((row) => ({ ...row, quantity: fromMilli(row.quantity) }));
     });
   }
 
@@ -909,8 +921,8 @@ export class InventoryFacade {
    * warehouse).
    */
   async batchBinsOnHand(tenantId: string, batchId: string): Promise<BatchBinOnHandEntry[]> {
-    return withTenantTransaction(this.db, tenantId, async (tx) =>
-      tx
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
         .select({
           warehouseId: batchOnHand.warehouseId,
           skuId: batchOnHand.skuId,
@@ -919,8 +931,10 @@ export class InventoryFacade {
         })
         .from(batchOnHand)
         .where(and(eq(batchOnHand.tenantId, tenantId), eq(batchOnHand.batchId, batchId)))
-        .orderBy(asc(batchOnHand.warehouseId), asc(batchOnHand.binId)),
-    );
+        .orderBy(asc(batchOnHand.warehouseId), asc(batchOnHand.binId));
+      // Read model — base units at the edge (story 10.1).
+      return rows.map((row) => ({ ...row, quantity: fromMilli(row.quantity) }));
+    });
   }
 
   /**
@@ -949,6 +963,8 @@ export class InventoryFacade {
         .orderBy(asc(ledgerEvents.seq));
       return rows.map((row) => ({
         ...row,
+        // Read model — base units at the edge (story 10.1).
+        quantityDelta: fromMilli(row.quantityDelta),
         occurredAt: canonicalInstant(row.occurredAt),
         recordedAt: canonicalInstant(row.recordedAt),
       }));
@@ -1009,6 +1025,8 @@ export class InventoryFacade {
         .orderBy(asc(ledgerEvents.seq));
       return rows.map((row) => ({
         ...row,
+        // Read model — base units at the edge (story 10.1).
+        quantityDelta: fromMilli(row.quantityDelta),
         occurredAt: canonicalInstant(row.occurredAt),
         recordedAt: canonicalInstant(row.recordedAt),
       }));

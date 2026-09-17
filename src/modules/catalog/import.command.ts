@@ -25,6 +25,8 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
+import { MAX_QUANTITY_BASE, toMilli } from '../../shared/primitives/quantity';
+import { isFractionalUom, serialTrackedFractionalUomDetail } from './uom-precision';
 
 export const IMPORT_MODES = ['initial', 'fix'] as const;
 export type ImportMode = (typeof IMPORT_MODES)[number];
@@ -649,23 +651,41 @@ function parseTracked(raw: string, column: string, rowNumber: number): FieldResu
   };
 }
 
-function parseInt0(raw: string, column: string, rowNumber: number): FieldResult<number> {
+/**
+ * A non-negative quantity column (`reorder_point`, `reorder_qty`), parsed from
+ * the file's BASE units into the domain's MILLI-units — the importer is an API
+ * edge like any other (story 10.1). Named for what it now does: it no longer
+ * parses an integer, and what it returns is not the number in the cell.
+ *
+ * An empty cell still means zero. A value finer than the scale is rounded here
+ * rather than refused (the per-UoM precision refusal is story 10.2's), and the
+ * ceiling is the exact-integer range rather than int4.
+ *
+ * **A sub-milli value rounds to zero, and zero means "no reorder point" —
+ * not "a very small one".** A reorder point of `0.0004` kg becomes 0, and a
+ * zero reorder point is how the catalog says a SKU has none at all. That is a
+ * meaning change, not a rounding, but it is the honest one here: the column
+ * cannot hold a value finer than a milli-unit, and inventing a floor of one
+ * milli-unit would claim a precision the SKU's UoM has not declared. Story
+ * 10.2's precision rules are what turn this into a refusal.
+ */
+function parseQuantityMilli(raw: string, column: string, rowNumber: number): FieldResult<number> {
   const value = raw.trim();
   if (value === '') return { ok: true, value: 0 };
-  if (!/^\d+$/.test(value)) {
+  if (!/^\d+(\.\d+)?$/.test(value)) {
     return {
       ok: false,
-      error: rowError(rowNumber, null, 'validation-failed', `${column} must be a non-negative integer (got "${value}").`),
+      error: rowError(rowNumber, null, 'validation-failed', `${column} must be a non-negative quantity (got "${value}").`),
     };
   }
   const n = Number(value);
-  if (!Number.isSafeInteger(n) || n > INT_MAX) {
+  if (!Number.isFinite(n) || n > MAX_QUANTITY_BASE) {
     return {
       ok: false,
-      error: rowError(rowNumber, null, 'validation-failed', `${column} exceeds the integer ceiling of ${INT_MAX}.`),
+      error: rowError(rowNumber, null, 'validation-failed', `${column} exceeds the quantity ceiling of ${MAX_QUANTITY_BASE}.`),
     };
   }
-  return { ok: true, value: n };
+  return { ok: true, value: toMilli(n) };
 }
 
 /**
@@ -716,9 +736,20 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
   if (!batchResult.ok) return { ok: false, error: { ...batchResult.error, skuCode: code } };
   const serialResult = parseTracked(v['serial_tracked'] ?? '', 'serial_tracked', row.rowNumber);
   if (!serialResult.ok) return { ok: false, error: { ...serialResult.error, skuCode: code } };
-  const pointResult = parseInt0(v['reorder_point'] ?? '', 'reorder_point', row.rowNumber);
+  // Story 10.1: a serialized unit is discrete by definition — one ledger event
+  // per serial, and four call sites compare a unit count against
+  // `serials.length`. A SKU that is BOTH serial-tracked and measured to three
+  // decimals is a contradiction, refused once here rather than converted four
+  // times downstream.
+  if (serialResult.value && isFractionalUom(uom)) {
+    return {
+      ok: false,
+      error: rowError(row.rowNumber, code, 'validation-failed', serialTrackedFractionalUomDetail(uom)),
+    };
+  }
+  const pointResult = parseQuantityMilli(v['reorder_point'] ?? '', 'reorder_point', row.rowNumber);
   if (!pointResult.ok) return { ok: false, error: { ...pointResult.error, skuCode: code } };
-  const qtyResult = parseInt0(v['reorder_qty'] ?? '', 'reorder_qty', row.rowNumber);
+  const qtyResult = parseQuantityMilli(v['reorder_qty'] ?? '', 'reorder_qty', row.rowNumber);
   if (!qtyResult.ok) return { ok: false, error: { ...qtyResult.error, skuCode: code } };
   const batchTracked = batchResult.value;
   const serialTracked = serialResult.value;

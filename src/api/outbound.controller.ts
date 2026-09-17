@@ -1,4 +1,5 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { MIN_QUANTITY_BASE, scalesToZero, toMilli } from '../shared/primitives/quantity';
 import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
@@ -96,7 +97,8 @@ export class OutboundController {
         actorUserId: session.userId,
         warehouseId: dto.warehouseId,
         source: dto.source ?? 'manual',
-        lines: dto.lines.map((line) => ({ skuId: line.skuId, quantity: line.quantity })),
+        // Story 10.1: the API edge scales into milli-units.
+        lines: dto.lines.map((line) => ({ skuId: line.skuId, quantity: toMilli(line.quantity) })),
         // The channel arms are forwarded VERBATIM (present or not): the
         // command owns the required-together rule and 400s a manual order
         // that carries them — stripping them here would silently accept it.
@@ -188,7 +190,8 @@ export class OutboundController {
         tenantId,
         actorUserId: session.userId,
         orderId,
-        scanned: dto.scanned.map((line) => ({ skuId: line.skuId, qty: line.qty })),
+        // Story 10.1: the API edge scales into milli-units.
+        scanned: dto.scanned.map((line) => ({ skuId: line.skuId, qty: toMilli(line.qty) })),
         // `@IsOptional()` lets an explicit `null` through — normalized to
         // absent so an unmeasured parcel hashes identically either way.
         weightGrams: dto.weightGrams ?? undefined,
@@ -549,7 +552,8 @@ export class OutboundController {
         picklistLineId: dto.picklistLineId,
         skuId: dto.skuId,
         binId: dto.binId,
-        qty: dto.qty,
+        // Story 10.1: the API edge scales into milli-units.
+        qty: assertRecordable(dto.qty, 'qty'),
         occurredAt: dto.occurredAt,
         // `@IsOptional()` lets an explicit `"serials": null` through (the
         // mobile op payload always carries it) — normalize to absent so the
@@ -684,4 +688,24 @@ function assertOwnTenant(session: TenantSession, tenantId: string): void {
       'The session token tenant does not own this path.',
     );
   }
+}
+
+/**
+ * Story 10.1: a positive quantity finer than half a milli-unit would scale to
+ * zero and be recorded as "nothing happened" — a real pick filed as an
+ * empty-bin short pick, a real adjustment written as a zero-delta event. The
+ * story rounds a value that is merely too precise; it refuses one that would
+ * disappear.
+ */
+function assertRecordable(value: number, field: string): number {
+  if (scalesToZero(value)) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      `${field} is finer than the smallest recordable quantity`,
+      `${field} must be at least ${MIN_QUANTITY_BASE} in the SKU's base UoM (got ${value}) — ` +
+        'a smaller value would be recorded as zero, which means something else entirely.',
+    );
+  }
+  return toMilli(value);
 }

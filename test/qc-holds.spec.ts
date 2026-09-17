@@ -3,6 +3,7 @@ import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import Redis from 'ioredis';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { fromMilli, toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
@@ -294,17 +295,34 @@ describe('QC hold and release (e2e, story 3.4)', () => {
   async function holdLedgerRows(holdId: string): Promise<
     { type: string; quantity_delta: number; from_bin_id: string | null; to_bin_id: string | null; batch_ref: string | null; reference_doc: Record<string, unknown> }[]
   > {
-    return (await sql`
+    const rows = (await sql`
       select type, quantity_delta, from_bin_id, to_bin_id, batch_ref, reference_doc from ledger_events
       where tenant_id = ${tenantId} and reference_doc->>'holdId' = ${holdId}
       order by seq`) as unknown as Awaited<ReturnType<typeof holdLedgerRows>>;
+    // `quantity_delta` is milli-units (story 10.1); this helper is the suite's
+    // edge, so every assertion below it keeps reading in base units. The
+    // `reference_doc` payload already leaves the domain in base units.
+    return rows.map((row) => ({ ...row, quantity_delta: fromMilli(Number(row.quantity_delta)) }));
   }
 
   async function onHandAtBin(binId: string, skuId: string): Promise<number> {
     const rows = await sql`
-      select coalesce(sum(quantity), 0)::int as n from stock_on_hand
+      select coalesce(sum(quantity), 0)::bigint as n from stock_on_hand
       where tenant_id = ${tenantId} and bin_id = ${binId} and sku_id = ${skuId}`;
-    return Number((rows[0] as unknown as { n: number }).n);
+    // The column holds milli-units (story 10.1); the suite asserts base units.
+    return fromMilli(Number((rows[0] as unknown as { n: number }).n));
+  }
+
+  /** ATP in BASE units — the suite's own `fromMilli` edge (story 10.1). */
+  async function atpUnits(skuId: string, inWarehouseId: string = warehouseId) {
+    const snapshot = await facade.atp(tenantId, inWarehouseId, skuId);
+    return {
+      onHand: fromMilli(snapshot.onHand),
+      reserved: fromMilli(snapshot.reserved),
+      qcHeld: fromMilli(snapshot.qcHeld),
+      buffer: fromMilli(snapshot.buffer),
+      atp: fromMilli(snapshot.atp),
+    };
   }
 
   async function outboxRows(type: string): Promise<Record<string, unknown>[]> {
@@ -318,7 +336,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
   it('hold happy path: 201, qc.held movements into the system QC-hold bin, open row, outbox + audit, ATP snapshot pins qcHeld', async () => {
     const skuId = skuIds.get('QC-PLAIN')!;
     await seedStock(skuId, binA, 5);
-    expect(await facade.atp(tenantId, warehouseId, skuId)).toMatchObject({ qcHeld: 0, atp: 5 });
+    expect(await atpUnits(skuId)).toMatchObject({ qcHeld: 0, atp: 5 });
 
     const res = await placeHold({
       warehouseId,
@@ -374,7 +392,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
 
     // ATP snapshot: the held units drop out in BOTH terms — qcHeld is the
     // QC bin's on-hand and atp = committedOnHand − reserved − qcHeld.
-    expect(await facade.atp(tenantId, warehouseId, skuId)).toMatchObject({
+    expect(await atpUnits(skuId)).toMatchObject({
       onHand: 5,
       reserved: 0,
       qcHeld: 5,
@@ -552,7 +570,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
       where tenant_id = ${tenantId} and action = 'qc_hold.released' and target_id = ${holdId}`;
     expect(Number((audits[0] as unknown as { n: number }).n)).toBe(1);
 
-    expect(await facade.atp(tenantId, warehouseId, skuId)).toMatchObject({ qcHeld: 0, atp: 4 });
+    expect(await atpUnits(skuId)).toMatchObject({ qcHeld: 0, atp: 4 });
 
     const second = await releaseHold(holdId).expect(409);
     expect(second.body.code).toBe('qc-hold-released');
@@ -564,7 +582,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
     const holdId = (await placeHold(
       { warehouseId, skuId, binId: binA, reason: 'Held for the grant-refusal arm' },
     ).expect(201)).body.qcHold.id as string;
-    const atp = await facade.atp(tenantId, warehouseId, skuId);
+    const atp = await atpUnits(skuId);
     // onHand counts the whole warehouse SKU (the release arm restored the
     // other batch scope's 4 units to binB); the grant ceiling subtracts the
     // 3 QC-held units from it.
@@ -580,7 +598,8 @@ describe('QC hold and release (e2e, story 3.4)', () => {
         skuId,
         ownerType: 'order-line',
         ownerId: `qc-refusal-${ulid().toLowerCase()}`,
-        quantity: 5,
+        // The facade speaks milli-units (story 10.1); 5 base units of ask.
+        quantity: toMilli(5),
       });
       throw new Error('the grant must refuse');
     } catch (error) {
@@ -592,7 +611,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
 
     // Release restores the whole warehouse SKU's ATP (the 3 units return).
     await releaseHold(holdId).expect(200);
-    expect(await facade.atp(tenantId, warehouseId, skuId)).toMatchObject({ qcHeld: 0, atp: 7 });
+    expect(await atpUnits(skuId)).toMatchObject({ qcHeld: 0, atp: 7 });
   });
 
   it('origin bin missing mid-hold: 409, no movement, hold stays open', async () => {
@@ -666,11 +685,14 @@ describe('QC hold and release (e2e, story 3.4)', () => {
     // hold moves every on-hand batch row of the scope, one arm each.
     await seedStock(skuId, binA, 2, 'LOT-M1');
     await seedStock(skuId, binA, 3, 'LOT-M2');
-    const scopeBatches = (await sql`
+    const scopeBatches = ((await sql`
       select batch_id, quantity from batch_on_hand
       where tenant_id = ${tenantId} and warehouse_id = ${warehouseId}
       and sku_id = ${skuId} and bin_id = ${binA} and quantity > 0
-      order by batch_id`) as unknown as { batch_id: string; quantity: number }[];
+      order by batch_id`) as unknown as { batch_id: string; quantity: number }[])
+      // The column holds milli-units (story 10.1) — read it in base units so
+      // it compares against the (also unscaled) movement magnitudes below.
+      .map((b) => ({ ...b, quantity: fromMilli(Number(b.quantity)) }));
     expect(scopeBatches.length).toBeGreaterThanOrEqual(2);
 
     const holdId = (await placeHold(

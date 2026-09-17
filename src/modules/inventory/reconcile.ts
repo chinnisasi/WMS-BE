@@ -6,6 +6,7 @@ import { inventoryQuarantines, ledgerEvents, reconciliationCheckpoints } from '.
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { nowIso } from '../../shared/primitives/time';
 import { uuidv7 } from '../../shared/primitives/ids';
+import { fromMilli } from '../../shared/primitives/quantity';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { replayInTx, reconcileScanInTx, rebuildProjectionsInTx, warehouseAdvisoryLock } from './ledger.service';
@@ -247,8 +248,10 @@ export class ReconciliationService {
           divergences: flagged.map((divergence) => ({
             skuId: divergence.skuId,
             binId: divergence.binId,
-            projected: divergence.projectedQuantity,
-            replayed: divergence.replayedQuantity,
+            // Story 10.1: base units on the way out (the outbox contract).
+            projected:
+              divergence.projectedQuantity === null ? null : fromMilli(divergence.projectedQuantity),
+            replayed: fromMilli(divergence.replayedQuantity),
             fromSeq: divergence.fromSeq ?? 1,
             toSeq: divergence.toSeq ?? detection.watermark,
             repeat: divergence.repeat,

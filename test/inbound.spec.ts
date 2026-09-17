@@ -2,6 +2,7 @@ import type { INestApplication } from '@nestjs/common';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -651,7 +652,7 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
     const seedSql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await seedSql`
-        update purchase_order_lines set received_qty = ${receivedLine.orderedQty}
+        update purchase_order_lines set received_qty = ${toMilli(receivedLine.orderedQty)}
         where id = ${receivedLine.id} and tenant_id = ${tenantId}`;
     } finally {
       await seedSql.end();

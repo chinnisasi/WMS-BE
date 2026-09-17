@@ -11,6 +11,18 @@
  * it back (the pool grows — the spec's "increment"). ATP is then always
  * `committed on-hand − reserved − QC-held − buffer`, never derived from a
  * second mirror that could disagree.
+ *
+ * **Units (story 10.1).** The counter holds MILLI-units — the same scaled
+ * integers the Postgres columns hold — and nothing about these scripts
+ * changes: `INCRBY` and `SET` still take a plain decimal integer string,
+ * there is no `INCRBYFLOAT` anywhere, and no value is ever written in
+ * exponential notation. What DOES change is the headroom. Lua 5.1 numbers are
+ * IEEE doubles, so `tonumber(...)` is exact only to 2⁵³, and milli-units sit a
+ * thousand times closer to that ceiling than base units did. The callers
+ * assert every value they hand these scripts against `Number.isSafeInteger`
+ * before it arrives (see `ValkeyClient.setCounter`), which also keeps every
+ * value far below the `%.17g` formatting threshold Lua would use to render a
+ * number back into the string `SET` stores.
  */
 
 /**

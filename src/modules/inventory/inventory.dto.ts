@@ -1,8 +1,14 @@
 import { Transform, Type } from 'class-transformer';
 import {
+  MAX_QUANTITY_BASE,
+  MIN_QUANTITY_BASE,
+  QUANTITY_FIELD_DESCRIPTION,
+} from '../../shared/primitives/quantity';
+import {
   ArrayMaxSize,
   IsArray,
   IsInt,
+  IsNumber,
   IsOptional,
   IsString,
   IsUUID,
@@ -108,11 +114,22 @@ export class StockAdjustmentDto {
   @IsUUID()
   binId!: string;
 
-  @ApiProperty({ description: 'Signed base-UoM integer; positive into the bin, negative out' })
+  @ApiProperty({
+    description:
+      `Signed quantity; positive into the bin, negative out. ${QUANTITY_FIELD_DESCRIPTION} ` +
+      `A non-zero magnitude below ${MIN_QUANTITY_BASE} is refused rather than rounded to zero.`,
+    minimum: -MAX_QUANTITY_BASE,
+    maximum: MAX_QUANTITY_BASE,
+  })
+  // The magnitude floor is enforced at the controller, not here: this field is
+  // SIGNED, so `@Min(0.001)` — the granularity bound its unsigned siblings
+  // (`OrderLineInputDto.quantity`, `PackScanLineDto.qty`) carry — would also
+  // forbid every draw. The controller refuses a non-zero value that would
+  // scale to zero, which is the same rule stated where it can be stated.
   @Type(() => Number)
-  @IsInt()
-  @Min(-2147483648)
-  @Max(2147483647)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(-MAX_QUANTITY_BASE)
+  @Max(MAX_QUANTITY_BASE)
   quantityDelta!: number;
 
   @ApiProperty({ description: 'Machine reason for the correction (e.g. stock-count)' })

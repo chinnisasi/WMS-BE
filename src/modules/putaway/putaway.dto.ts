@@ -1,5 +1,6 @@
 import { Type } from 'class-transformer';
-import { ArrayMaxSize, IsArray, IsIn, IsInt, IsOptional, IsString, IsUUID, Length, Max, Min } from 'class-validator';
+import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
+import { ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, IsUUID, Length, Max, Min } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 /** The fixed mismatch-reason enum (the I/O matrix — 400 outside it). */
@@ -43,14 +44,14 @@ export class PlacePutawayDto {
   batchId?: string | null;
 
   @ApiProperty({
-    description: 'Placed quantity in base UoM (positive integer — partial placements allowed)',
-    minimum: 1,
-    maximum: 2147483647,
+    description: `Placed quantity — partial placements allowed. ${QUANTITY_FIELD_DESCRIPTION}`,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
   })
   @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(2_147_483_647)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
   qty!: number;
 
   @ApiProperty({ format: 'uuid', description: 'The target bin the operator scanned/entered' })

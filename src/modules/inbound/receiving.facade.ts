@@ -28,6 +28,7 @@ import type { PurchaseOrderLineSnapshot } from './po.command';
 import { lineSnapshot } from './po.command';
 import type { OverReceiptEntry } from './receiving.command';
 import { canonicalInstant } from '../../shared/primitives/time';
+import { fromMilli } from '../../shared/primitives/quantity';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
 export interface GoodsReceiptEntry {
@@ -247,8 +248,10 @@ export class ReceivingFacade {
         ...row,
         lineCount: aggregates.get(row.id)?.lineCount ?? 0,
         // int8 arrives as text through postgres.js; the contract is a number.
-        totalUnits: Number(aggregates.get(row.id)?.totalUnits ?? 0),
-        appliedUnits: Number(aggregates.get(row.id)?.appliedUnits ?? 0),
+        // Story 10.1: and a read-model number is in BASE units, not the
+        // domain's milli-units.
+        totalUnits: fromMilli(Number(aggregates.get(row.id)?.totalUnits ?? 0)),
+        appliedUnits: fromMilli(Number(aggregates.get(row.id)?.appliedUnits ?? 0)),
         occurredAt: canonicalInstant(row.occurredAt),
         recordedAt: canonicalInstant(row.recordedAt),
         createdAt: canonicalInstant(row.createdAt),
@@ -298,7 +301,8 @@ export class ReceivingFacade {
         poId: row.poId,
         poLineId: row.poLineId,
         skuId: row.skuId,
-        excessQty: row.excessQty,
+        // Read model — base units at the edge (story 10.1).
+        excessQty: fromMilli(row.excessQty),
         status: row.status as OverReceiptEntry['status'],
         requestedBy: row.requestedBy,
         requestedAt: canonicalInstant(row.requestedAt),

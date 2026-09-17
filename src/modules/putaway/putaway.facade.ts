@@ -31,6 +31,7 @@ import type {
   PlacePutawayCommand,
 } from './putaway.command';
 import { binCandidatesInTx } from './putaway.command';
+import { fromMilli } from '../../shared/primitives/quantity';
 
 export const DEFAULT_PUTAWAY_PAGE_SIZE = 50;
 
@@ -175,6 +176,9 @@ export class PutawayFacade {
         .limit(pageSize + 1);
       const items = rows.map((row) => ({
         ...row,
+        // Story 10.1: a read model hands out BASE units; the domain below
+        // keeps milli-units.
+        qty: fromMilli(row.qty),
         batchCode: row.batchCode ?? null,
         suggestedBinCode: row.suggestedBinCode ?? null,
         reasonCode: row.reasonCode ?? null,
@@ -332,12 +336,13 @@ export class PutawayFacade {
         skuCode: sku.code,
         batchId: row.batchId,
         batchCode: row.batchId === null ? null : (batchCodeById.get(row.batchId) ?? null),
-        qty: remaining,
+        // Read model + operator-facing text — base units (story 10.1).
+        qty: fromMilli(remaining),
         suggestedBin: fit === undefined ? null : { binId: fit.binId, binCode: fit.binCode },
         rationale:
           fit === undefined
             ? 'No storage bin has room for these units'
-            : `Lowest occupancy (${fit.occupancy}/${fit.capacity}) — room for ${fit.capacity - fit.occupancy}`,
+            : `Lowest occupancy (${fromMilli(fit.occupancy)}/${fromMilli(fit.capacity)}) — room for ${fromMilli(fit.capacity - fit.occupancy)}`,
       });
     }
     return tasks;
@@ -383,6 +388,7 @@ export class PutawayFacade {
         ),
       )
       .orderBy(asc(bins.code));
-    return rows;
+    // Read model — capacity leaves in base units (story 10.1).
+    return rows.map((row) => ({ ...row, capacity: fromMilli(row.capacity) }));
   }
 }

@@ -2,6 +2,7 @@ import { and, eq } from 'drizzle-orm';
 import { bins, zones } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import type { TenantTx } from '../../shared/db/tenant-scope';
+import { QUANTITY_SCALE } from '../../shared/primitives/quantity';
 
 /**
  * The system Receiving bin (Story 3.3): every warehouse owns exactly one,
@@ -20,8 +21,12 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 export const RECEIVING_ZONE_CODE = 'RECEIVING';
 export const RECEIVING_BIN_CODE = 'RECEIVING';
 export const RECEIVING_BIN_TYPE = 'staging';
-/** Effectively unbounded: receiving intake is never capacity-gated. */
-export const RECEIVING_BIN_CAPACITY = 1_000_000;
+/**
+ * Effectively unbounded: receiving intake is never capacity-gated. In
+ * milli-units (story 10.1) — 1,000,000 base units of sentinel headroom, the
+ * same figure it has always been, expressed in the units the column now holds.
+ */
+export const RECEIVING_BIN_CAPACITY = 1_000_000 * QUANTITY_SCALE;
 
 export interface ReceivingBinRef {
   readonly zoneId: string;
@@ -40,8 +45,8 @@ export interface ReceivingBinRef {
 export const QC_HOLD_ZONE_CODE = 'QC-HOLD';
 export const QC_HOLD_BIN_CODE = 'QC-HOLD';
 export const QC_HOLD_BIN_TYPE = 'staging';
-/** Effectively unbounded: quarantining stock is never capacity-gated. */
-export const QC_HOLD_BIN_CAPACITY = 1_000_000;
+/** Effectively unbounded: quarantining stock is never capacity-gated (milli-units). */
+export const QC_HOLD_BIN_CAPACITY = 1_000_000 * QUANTITY_SCALE;
 
 export async function ensureReceivingBinInTx(
   tx: TenantTx,

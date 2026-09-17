@@ -1,7 +1,8 @@
 import { ApiProperty } from '@nestjs/swagger';
+import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsIn, IsInt, IsOptional, IsString, Length, Max, Min } from 'class-validator';
-import { IMPORT_MODES, GST_RATE_BPS_MAX, INT_MAX } from './import.command';
+import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Length, Max, Min } from 'class-validator';
+import { IMPORT_MODES, GST_RATE_BPS_MAX } from './import.command';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -146,18 +147,30 @@ export class PatchSkuDto {
   @IsBoolean()
   serialTracked?: boolean;
 
-  @ApiProperty({ required: false, example: 50, minimum: 0, maximum: INT_MAX, description: 'Base-UoM units' })
+  @ApiProperty({
+    required: false,
+    example: 50,
+    minimum: 0,
+    maximum: MAX_QUANTITY_BASE,
+    description: QUANTITY_FIELD_DESCRIPTION,
+  })
   @IsOptional()
-  @IsInt()
+  @IsNumber({ allowNaN: false, allowInfinity: false })
   @Min(0)
-  @Max(INT_MAX)
+  @Max(MAX_QUANTITY_BASE)
   reorderPoint?: number;
 
-  @ApiProperty({ required: false, example: 100, minimum: 0, maximum: INT_MAX, description: 'Base-UoM units' })
+  @ApiProperty({
+    required: false,
+    example: 100,
+    minimum: 0,
+    maximum: MAX_QUANTITY_BASE,
+    description: QUANTITY_FIELD_DESCRIPTION,
+  })
   @IsOptional()
-  @IsInt()
+  @IsNumber({ allowNaN: false, allowInfinity: false })
   @Min(0)
-  @Max(INT_MAX)
+  @Max(MAX_QUANTITY_BASE)
   reorderQty?: number;
 
   @ApiProperty({ required: false, minLength: 1, maxLength: 64 })

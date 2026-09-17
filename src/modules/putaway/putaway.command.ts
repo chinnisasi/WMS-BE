@@ -17,7 +17,7 @@ import {
   stockOnHand,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { signedQuantity } from '../../shared/primitives/quantity';
+import { MAX_QUANTITY_MILLI, QUANTITY_SCALE, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -139,10 +139,13 @@ export interface ListPlacementsQuery {
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 /**
- * The line-quantity ceiling: `putaway_placements.qty` is int4, so a larger
- * (but typable) quantity must be a 400, never an insert-time 500.
+ * The line-quantity ceiling, in milli-units (story 10.1): the column is
+ * `bigint`, but the binding limit is the 2⁵³ exact-integer ceiling every
+ * quantity crosses in JavaScript and in the Valkey script's Lua. A larger
+ * (but typable) quantity must be a 400, never an insert-time 500 — or worse,
+ * a silent rounding.
  */
-export const MAX_PLACEMENT_QTY = 2_147_483_647;
+export const MAX_PLACEMENT_QTY = MAX_QUANTITY_MILLI;
 
 /**
  * The directed-putaway command (Story 3.5): `putaway.place`, a
@@ -244,11 +247,16 @@ export class PutawayCommand {
 
       // ── input validation (400 before any write) ────────────────────────
       const occurredAt = assertUtc(command.occurredAt, 'occurredAt');
+      // `command.qty` is in milli-units — the API edge scaled it.
       if (!Number.isInteger(command.qty) || command.qty < 1) {
-        throw putawayValidation(`Placement quantity must be a positive integer (got ${command.qty}).`);
+        throw putawayValidation(
+          `Placement quantity must be a positive quantity (got ${fromMilli(command.qty)}).`,
+        );
       }
       if (command.qty > MAX_PLACEMENT_QTY) {
-        throw putawayValidation(`Placement quantity must be at most ${MAX_PLACEMENT_QTY} (got ${command.qty}).`);
+        throw putawayValidation(
+          `Placement quantity must be at most ${fromMilli(MAX_PLACEMENT_QTY)} (got ${fromMilli(command.qty)}).`,
+        );
       }
       if (command.reasonCode !== null && !isMismatchReason(command.reasonCode)) {
         throw putawayValidation(
@@ -372,7 +380,7 @@ export class PutawayCommand {
       if (sku.serialTracked) {
         if (command.serials === undefined || command.serials.length === 0) {
           throw putawayValidation(
-            `SKU "${sku.code}" is serial-tracked — its placement needs one serial per unit (${command.qty}).`,
+            `SKU "${sku.code}" is serial-tracked — its placement needs one serial per unit (${fromMilli(command.qty)}).`,
           );
         }
         if (new Set(command.serials).size !== command.serials.length) {
@@ -380,9 +388,12 @@ export class PutawayCommand {
             'serials contains duplicates — a serial-tracked placement writes one ledger event per serial unit; the same serial cannot appear twice.',
           );
         }
-        if (command.serials.length !== command.qty) {
+        // Story 10.1: an array length is a UNIT count, so the comparison is
+        // made in units, never in milli-units. A serial-tracked SKU is pinned
+        // to a 0-dp UoM at catalog entry, so this is always whole.
+        if (command.serials.length !== fromMilli(command.qty)) {
           throw putawayValidation(
-            `A serial-tracked placement writes one ledger event per serial unit — ${command.serials.length} serials cannot place ${command.qty} units.`,
+            `A serial-tracked placement writes one ledger event per serial unit — ${command.serials.length} serials cannot place ${fromMilli(command.qty)} units.`,
           );
         }
         serials = command.serials;
@@ -407,7 +418,7 @@ export class PutawayCommand {
       const remaining = Math.min(line.appliedQty, remainingOnHand);
       if (command.qty > remaining) {
         throw putawayValidation(
-          `Only ${remaining} of this (sku, batch) remain in the Receiving bin for GRN line "${command.grnLineId}" — ${command.qty} cannot be placed.`,
+          `Only ${fromMilli(remaining)} of this (sku, batch) remain in the Receiving bin for GRN line "${command.grnLineId}" — ${fromMilli(command.qty)} cannot be placed.`,
         );
       }
 
@@ -510,7 +521,8 @@ export class PutawayCommand {
             warehouseId: command.warehouseId,
             type: 'putaway.placed',
             skuId: command.skuId,
-            quantityDelta: signedQuantity(1),
+            // One serial is one whole unit — `QUANTITY_SCALE` milli-units.
+            quantityDelta: signedQuantity(QUANTITY_SCALE),
             fromBinId: receivingBin.binId,
             toBinId: targetBin.id,
             // The batch arm rides the per-serial events too (the receiving
@@ -579,7 +591,9 @@ export class PutawayCommand {
           skuCode: sku.code,
           batchId,
           batchCode,
-          qty: command.qty,
+          // Story 10.1: the snapshot IS the HTTP body (and the idempotent
+          // replay's stored copy) — base units on the way out.
+          qty: fromMilli(command.qty),
           fromBinId: receivingBin.binId,
           toBinId: targetBin.id,
           toBinCode: targetBin.code,
@@ -608,7 +622,8 @@ export class PutawayCommand {
           grnLineId: command.grnLineId,
           skuId: command.skuId,
           batchId,
-          qty: command.qty,
+          // The outbox contract is base units too (story 10.1).
+          qty: fromMilli(command.qty),
           fromBinId: receivingBin.binId,
           toBinId: targetBin.id,
           suggestedBinId,
@@ -700,7 +715,8 @@ export async function suggestBinInTx(
       return {
         binId: candidate.binId,
         binCode: candidate.binCode,
-        rationale: `Lowest occupancy (${candidate.occupancy}/${candidate.capacity}) — room for ${room}`,
+        // The rationale is operator-facing text: it speaks base units.
+        rationale: `Lowest occupancy (${fromMilli(candidate.occupancy)}/${fromMilli(candidate.capacity)}) — room for ${fromMilli(room)}`,
       };
     }
   }
@@ -873,7 +889,7 @@ export function binFull(binCode: string, capacity: number, occupancy: number): P
     'bin-full',
     400,
     'Target bin is full',
-    `Bin "${binCode}" holds ${occupancy} of ${capacity} — placing would exceed its capacity.`,
+    `Bin "${binCode}" holds ${fromMilli(occupancy)} of ${fromMilli(capacity)} — placing would exceed its capacity.`,
   );
 }
 

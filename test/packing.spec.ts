@@ -3,6 +3,7 @@ import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import Redis from 'ioredis';
 import { ulid } from '../src/shared/primitives/ids';
+import { fromMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
@@ -430,15 +431,24 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
       .send({});
   }
 
+  /**
+   * Story 10.1: the facade speaks milli-units, so this helper is the suite's
+   * own `fromMilli` edge and every assertion below stays in base units.
+   */
   async function atp(skuId: string): Promise<{ onHand: number; reserved: number; atp: number }> {
-    return app.get(InventoryFacade).atp(tenantId, warehouseId, skuId);
+    const snapshot = await app.get(InventoryFacade).atp(tenantId, warehouseId, skuId);
+    return {
+      onHand: fromMilli(snapshot.onHand),
+      reserved: fromMilli(snapshot.reserved),
+      atp: fromMilli(snapshot.atp),
+    };
   }
 
   /** Every journal hold owned by one order's LINES — id-free, like the command's read. */
   async function holdsOfOrder(
     orderId: string,
   ): Promise<{ id: string; state: string; quantity: number }[]> {
-    return (await sql`
+    const rows = (await sql`
       select r.id, r.state, r.quantity from reservations r
       where r.tenant_id = ${tenantId}
         and r.owner_type = 'order'
@@ -448,6 +458,8 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
         )
       order by r.id
     `) as unknown as { id: string; state: string; quantity: number }[];
+    // The column holds milli-units (story 10.1); the suite asserts base units.
+    return rows.map((row) => ({ ...row, quantity: fromMilli(Number(row.quantity)) }));
   }
 
   async function orderStatus(orderId: string): Promise<string> {
@@ -466,7 +478,7 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
       reference_doc: Record<string, unknown>;
     }[]
   > {
-    return (await sql`
+    const rows = (await sql`
       select sku_id, quantity_delta, from_bin_id, to_bin_id, batch_ref, serial_ref, reference_doc
       from ledger_events
       where tenant_id = ${tenantId} and type = 'pack.packed'
@@ -481,6 +493,9 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
       serial_ref: string | null;
       reference_doc: Record<string, unknown>;
     }[];
+    // `quantity_delta` is a milli-unit bigint (story 10.1) — the driver hands
+    // it back as a string, and the suite asserts base units.
+    return rows.map((row) => ({ ...row, quantity_delta: fromMilli(Number(row.quantity_delta)) }));
   }
 
   async function onHand(skuId: string, binId: string): Promise<number> {
@@ -488,7 +503,9 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
       select quantity from stock_on_hand
       where tenant_id = ${tenantId} and sku_id = ${skuId} and bin_id = ${binId}
     `;
-    return (rows[0] as unknown as { quantity: number } | undefined)?.quantity ?? 0;
+    // `stock_on_hand.quantity` is milli-units (story 10.1) — read as base.
+    const row = rows[0] as unknown as { quantity: number } | undefined;
+    return row === undefined ? 0 : fromMilli(Number(row.quantity));
   }
 
   // ── the grammar, the constants and the capability ─────────────────────────
@@ -652,12 +669,15 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
       expect(res.body.code).toBe('validation-failed');
     }
     // The per-LINE cap is not the whole bound: duplicate lines AGGREGATE, and
-    // 500 of them naming one SKU would sail past int4 and die as a raw 22003
-    // at the comparison against `picks`. The aggregate carries the same cap.
+    // enough of them naming one SKU would sail past the quantity ceiling and
+    // die as a raw overflow at the comparison against `picks`. The aggregate
+    // carries the same cap. Story 10.1 moved that ceiling off int4 and onto
+    // MAX_QUANTITY_BASE (9007199254740 base units), so each line here is
+    // legal on its own and only their SUM crosses it.
     const overflow = await packOrder(orderId, {
       scanned: [
-        { skuId, qty: 2_000_000_000 },
-        { skuId, qty: 2_000_000_000 },
+        { skuId, qty: 5_000_000_000_000 },
+        { skuId, qty: 5_000_000_000_000 },
       ],
     }).expect(400);
     expect(overflow.body.code).toBe('validation-failed');

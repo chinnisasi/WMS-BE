@@ -28,6 +28,7 @@ import { CatalogFacade } from '../catalog/catalog.facade';
 import { buildStockPool, pickableBinsInTx } from './replan';
 import { WAVE_CLOCK } from './wave.clock';
 import type { WaveClock } from './wave.clock';
+import { fromMilli } from '../../shared/primitives/quantity';
 
 // ── state machines + policy constants (the outbound module exclusively owns
 // the wave/picklist state machines, AD-6 — the additive arms below are the
@@ -1413,8 +1414,10 @@ export function lineSnapshot(row: PicklistLine): PicklistLineSnapshot {
     binCode: row.binCode,
     batchId: row.batchId,
     reservationId: row.reservationId,
-    qty: row.qty,
-    shortfallQty: row.shortfallQty,
+    // Story 10.1: `lineSnapshot` is the module's only picklist-line read
+    // shape — base units leave here, milli-units stay in the columns.
+    qty: fromMilli(row.qty),
+    shortfallQty: fromMilli(row.shortfallQty),
     reasonCode: row.reasonCode,
     sliceSeq: row.sliceSeq,
     walkSeq: row.walkSeq,

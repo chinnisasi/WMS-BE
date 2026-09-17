@@ -4,7 +4,7 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, bins, idempotencyKeys, qcHolds, skus } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { signedQuantity } from '../../shared/primitives/quantity';
+import { fromMilli, signedQuantity } from '../../shared/primitives/quantity';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -260,7 +260,7 @@ export class QcCommand {
       );
       if (scope.quantity <= 0) {
         throw qcValidation(
-          `The (sku, bin) scope (${command.skuId} at ${command.binId}) has ${scope.quantity} on-hand units — a hold quarantines stock that exists.`,
+          `The (sku, bin) scope (${command.skuId} at ${command.binId}) has ${fromMilli(scope.quantity)} on-hand units — a hold quarantines stock that exists.`,
         );
       }
       // The batch rows sum to the plain quantity on a batch-tracked SKU; an

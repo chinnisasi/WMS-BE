@@ -291,7 +291,8 @@ async function openClaimsInTx(
   const rows = await tx
     .select({
       binId: picklistLines.binId,
-      claimed: sql<number>`coalesce(sum(${picklistLines.qty}), 0)::int`,
+      // Story 10.1: `::bigint` (milli-units overflow int4 at ~2.1M base units).
+      claimed: sql<string>`coalesce(sum(${picklistLines.qty}), 0)::bigint`,
     })
     .from(picklistLines)
     .where(
@@ -304,6 +305,6 @@ async function openClaimsInTx(
     )
     .groupBy(picklistLines.binId);
   return new Map(
-    rows.flatMap((row) => (row.binId === null ? [] : [[row.binId, row.claimed] as const])),
+    rows.flatMap((row) => (row.binId === null ? [] : [[row.binId, Number(row.claimed)] as const])),
   );
 }
