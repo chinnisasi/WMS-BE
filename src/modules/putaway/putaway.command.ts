@@ -17,7 +17,14 @@ import {
   stockOnHand,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { MAX_QUANTITY_MILLI, QUANTITY_SCALE, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
+import {
+  MAX_QUANTITY_MILLI,
+  QUANTITY_SCALE,
+  assertRecordableQuantity,
+  fromMilli,
+  signedQuantity,
+} from '../../shared/primitives/quantity';
+import { uomPrecision } from '../catalog/uom';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -193,6 +200,16 @@ export class PutawayCommand {
     command: PlacePutawayCommand,
     idempotencyKey: string,
   ): Promise<PutawayPlacementSnapshot> {
+    // ── story 10.2: this fingerprint is over BASE units ────────────────────
+    // Conversion moved out of the controller and into the command, behind the
+    // replay lookup, so the hashed value changed with it: a key written by a
+    // pre-10.2 build hashed MILLI-units and now answers 422
+    // `idempotency-key-reuse` rather than replaying. Accepted deliberately
+    // under the pre-launch premise — the same call story 10.1 made about the
+    // ledger hash chain — and pinned as EXPECTED by the cross-version replay
+    // guard in `test/picking.spec.ts`, so it is a recorded break and not a
+    // surprise. No compatibility branch exists; there is nothing to be
+    // compatible with.
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       deviceId: command.deviceId,
@@ -247,15 +264,17 @@ export class PutawayCommand {
 
       // ── input validation (400 before any write) ────────────────────────
       const occurredAt = assertUtc(command.occurredAt, 'occurredAt');
-      // `command.qty` is in milli-units — the API edge scaled it.
-      if (!Number.isInteger(command.qty) || command.qty < 1) {
+      // Story 10.2: `command.qty` is in BASE units here — shape and range
+      // only. The unit's own precision is asked below, once the SKU row is
+      // read, which keeps that refusal behind the replay lookup above.
+      if (!(command.qty > 0)) {
         throw putawayValidation(
-          `Placement quantity must be a positive quantity (got ${fromMilli(command.qty)}).`,
+          `Placement quantity must be a positive quantity (got ${String(command.qty)}).`,
         );
       }
-      if (command.qty > MAX_PLACEMENT_QTY) {
+      if (command.qty > fromMilli(MAX_PLACEMENT_QTY)) {
         throw putawayValidation(
-          `Placement quantity must be at most ${fromMilli(MAX_PLACEMENT_QTY)} (got ${fromMilli(command.qty)}).`,
+          `Placement quantity must be at most ${fromMilli(MAX_PLACEMENT_QTY)} (got ${String(command.qty)}).`,
         );
       }
       if (command.reasonCode !== null && !isMismatchReason(command.reasonCode)) {
@@ -313,7 +332,7 @@ export class PutawayCommand {
         );
       }
       const skuRows = await tx
-        .select({ id: skus.id, code: skus.code, batchTracked: skus.batchTracked, serialTracked: skus.serialTracked })
+        .select({ id: skus.id, code: skus.code, uom: skus.uom, batchTracked: skus.batchTracked, serialTracked: skus.serialTracked })
         .from(skus)
         .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
         .limit(1);
@@ -329,6 +348,16 @@ export class PutawayCommand {
       if (sku.id !== line.skuId) {
         throw putawayValidation(`SKU "${command.skuId}" does not match the GRN line's SKU "${line.skuId}".`);
       }
+
+      // ── story 10.2: conversion and the precision refusal, HERE ──────────
+      // Behind the replay lookup and behind the SKU read, because the unit is
+      // what says how precise this placement may be. `scaled` is the only
+      // quantity anything below reads; `command.qty` is base units and is not
+      // touched again.
+      const scaled: PlacePutawayCommand = {
+        ...command,
+        qty: assertRecordableQuantity(command.qty, 'qty', sku.uom, uomPrecision(sku.uom)),
+      };
 
       // ── the batch arm (batch-tracked SKUs) ──────────────────────────────
       let batchId: string | null = null;
@@ -380,7 +409,7 @@ export class PutawayCommand {
       if (sku.serialTracked) {
         if (command.serials === undefined || command.serials.length === 0) {
           throw putawayValidation(
-            `SKU "${sku.code}" is serial-tracked — its placement needs one serial per unit (${fromMilli(command.qty)}).`,
+            `SKU "${sku.code}" is serial-tracked — its placement needs one serial per unit (${fromMilli(scaled.qty)}).`,
           );
         }
         if (new Set(command.serials).size !== command.serials.length) {
@@ -391,9 +420,9 @@ export class PutawayCommand {
         // Story 10.1: an array length is a UNIT count, so the comparison is
         // made in units, never in milli-units. A serial-tracked SKU is pinned
         // to a 0-dp UoM at catalog entry, so this is always whole.
-        if (command.serials.length !== fromMilli(command.qty)) {
+        if (command.serials.length !== fromMilli(scaled.qty)) {
           throw putawayValidation(
-            `A serial-tracked placement writes one ledger event per serial unit — ${command.serials.length} serials cannot place ${fromMilli(command.qty)} units.`,
+            `A serial-tracked placement writes one ledger event per serial unit — ${command.serials.length} serials cannot place ${fromMilli(scaled.qty)} units.`,
           );
         }
         serials = command.serials;
@@ -416,9 +445,9 @@ export class PutawayCommand {
         batchId,
       );
       const remaining = Math.min(line.appliedQty, remainingOnHand);
-      if (command.qty > remaining) {
+      if (scaled.qty > remaining) {
         throw putawayValidation(
-          `Only ${fromMilli(remaining)} of this (sku, batch) remain in the Receiving bin for GRN line "${command.grnLineId}" — ${fromMilli(command.qty)} cannot be placed.`,
+          `Only ${fromMilli(remaining)} of this (sku, batch) remain in the Receiving bin for GRN line "${command.grnLineId}" — ${fromMilli(scaled.qty)} cannot be placed.`,
         );
       }
 
@@ -470,7 +499,7 @@ export class PutawayCommand {
         command.warehouseId,
         targetBin.id,
       );
-      if (occupancy + command.qty > targetBin.capacity) {
+      if (occupancy + scaled.qty > targetBin.capacity) {
         // FR-10: the rejection names the capacity and the occupancy.
         throw binFull(targetBin.code, targetBin.capacity, occupancy);
       }
@@ -481,7 +510,7 @@ export class PutawayCommand {
         command.tenantId,
         command.warehouseId,
         command.skuId,
-        command.qty,
+        scaled.qty,
       );
       const suggestedBinId = suggestion?.binId ?? null;
       if (suggestedBinId !== command.toBinId && command.reasonCode === null) {
@@ -547,7 +576,7 @@ export class PutawayCommand {
           warehouseId: command.warehouseId,
           type: 'putaway.placed',
           skuId: command.skuId,
-          quantityDelta: signedQuantity(command.qty),
+          quantityDelta: signedQuantity(scaled.qty),
           fromBinId: receivingBin.binId,
           toBinId: targetBin.id,
           batchRef: batchId,
@@ -569,7 +598,7 @@ export class PutawayCommand {
         grnLineId: command.grnLineId,
         skuId: command.skuId,
         batchId,
-        qty: command.qty,
+        qty: scaled.qty,
         fromBinId: receivingBin.binId,
         toBinId: targetBin.id,
         suggestedBinId,
@@ -593,7 +622,7 @@ export class PutawayCommand {
           batchCode,
           // Story 10.1: the snapshot IS the HTTP body (and the idempotent
           // replay's stored copy) — base units on the way out.
-          qty: fromMilli(command.qty),
+          qty: fromMilli(scaled.qty),
           fromBinId: receivingBin.binId,
           toBinId: targetBin.id,
           toBinCode: targetBin.code,
@@ -623,7 +652,7 @@ export class PutawayCommand {
           skuId: command.skuId,
           batchId,
           // The outbox contract is base units too (story 10.1).
-          qty: fromMilli(command.qty),
+          qty: fromMilli(scaled.qty),
           fromBinId: receivingBin.binId,
           toBinId: targetBin.id,
           suggestedBinId,

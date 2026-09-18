@@ -3,7 +3,12 @@ import { and, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { bins, idempotencyKeys, skus } from '../../shared/db/schema';
-import { QUANTITY_SCALE, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
+import {
+  QUANTITY_SCALE,
+  assertRecordableQuantity,
+  fromMilli,
+  signedQuantity,
+} from '../../shared/primitives/quantity';
 import type { SignedQuantity } from '../../shared/primitives/quantity';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
@@ -16,6 +21,7 @@ import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
+import { uomPrecision } from '../catalog/uom';
 import { LedgerService } from './ledger.service';
 
 /**
@@ -53,7 +59,14 @@ export interface AdjustStockCommand {
   readonly warehouseId: string;
   readonly skuId: string;
   readonly binId: string;
-  /** Signed base-UoM delta; zero is rejected (a nothing movement). */
+  /**
+   * Signed delta in the SKU's BASE UoM; zero is rejected (a nothing movement).
+   *
+   * Story 10.2: base units, not milli-units. The controller used to scale it
+   * while building this argument — which would have put the precision refusal
+   * in front of the replay lookup below. It is converted inside `adjust`,
+   * after the SKU's row (and therefore its declared precision) is read.
+   */
   readonly quantityDelta: number;
   readonly reasonCode: string;
   readonly note: string;
@@ -127,6 +140,16 @@ export class StockAdjustmentCommand {
    * adjustment hashes byte-identically to its pre-2.4 shape.
    */
   fingerprint(command: AdjustStockCommand): string {
+    // ── story 10.2: this fingerprint is over BASE units ────────────────────
+    // Conversion moved out of the controller and into the command, behind the
+    // replay lookup, so the hashed value changed with it: a key written by a
+    // pre-10.2 build hashed MILLI-units and now answers 422
+    // `idempotency-key-reuse` rather than replaying. Accepted deliberately
+    // under the pre-launch premise — the same call story 10.1 made about the
+    // ledger hash chain — and pinned as EXPECTED by the cross-version replay
+    // guard in `test/picking.spec.ts`, so it is a recorded break and not a
+    // surprise. No compatibility branch exists; there is nothing to be
+    // compatible with.
     return hashCommandPayload({
       tenantId: command.tenantId,
       warehouseId: command.warehouseId,
@@ -208,24 +231,22 @@ export class StockAdjustmentCommand {
         );
       }
     }
-    const delta = this.assertNonZeroDelta(command.quantityDelta);
+    this.assertNonZeroDelta(command.quantityDelta);
 
     // Serial-tracked movements move exactly one unit per event: the serial
     // count must equal the movement's magnitude (400 otherwise — the api
     // layer's DTO validation composes, this is the command's own backstop).
-    // Story 10.1: `delta` is in milli-units; `serialRefs.length` is an array
-    // length, which is a UNIT count and can never be anything else. The
-    // comparison is made in units, not milli-units — a serialized unit is
-    // discrete by definition (catalog entry refuses a serial-tracked SKU on a
-    // fractional UoM), so `fromMilli` here is always a whole number.
+    // `serialRefs.length` is an array length, which is a UNIT count and can
+    // never be anything else, so story 10.2 makes the comparison where the
+    // delta is ALSO in units: base UoM, before the transaction. It is a shape
+    // check on the request, needs no SKU row, and stays exactly where it was.
     const serialRefs = command.serialRefs ?? [];
-    const deltaUnits = fromMilli(Math.abs(delta));
-    if (serialRefs.length > 0 && serialRefs.length !== deltaUnits) {
+    if (serialRefs.length > 0 && serialRefs.length !== Math.abs(command.quantityDelta)) {
       throw new ProblemException(
         'validation-failed',
         400,
         'quantityDelta must match the serial count',
-        `A serial-tracked movement writes one ledger event per serial unit — ${serialRefs.length} serials cannot move ${fromMilli(delta)} units.`,
+        `A serial-tracked movement writes one ledger event per serial unit — ${serialRefs.length} serials cannot move ${command.quantityDelta} units.`,
       );
     }
 
@@ -273,9 +294,28 @@ export class StockAdjustmentCommand {
         // tenant — a foreign or nonexistent scope is 404 before any write.
         await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
         // Integrity-only reads: a missing scope is 404 before any write
-        // (the rows themselves are not used beyond existence).
+        // (the bin row is not used beyond existence; the SKU row carries the
+        // unit the delta is measured in).
         await this.assertBinInWarehouse(tx, command);
-        await this.assertSkuInTenant(tx, command);
+        const sku = await this.assertSkuInTenant(tx, command);
+
+        // ── story 10.2: conversion and the precision refusal, HERE ─────────
+        // ONLY the precision rule moved behind the replay lookup, because only
+        // it can tighten: the shape checks above the transaction are the same
+        // checks, in the same order, that they were before this story — a
+        // malformed request still answers 400 rather than 404, and a used key
+        // still answers 400 rather than replaying.
+        //
+        // Everything above this line is in the SKU's base UoM; everything
+        // below it is in milli-units.
+        const delta = signedQuantity(
+          assertRecordableQuantity(
+            command.quantityDelta,
+            'quantityDelta',
+            sku.uom,
+            uomPrecision(sku.uom),
+          ),
+        );
 
         const snapshot = await this.adjustToSnapshot(tx, command, delta, occurredAt);
 
@@ -298,8 +338,8 @@ export class StockAdjustmentCommand {
             // Story 10.1: a quantity leaves the domain in BASE units. The
             // outbox contract is unchanged by the representation migration —
             // an each-counted subscriber sees the identical number it always
-            // saw.
-            quantityDelta: fromMilli(command.quantityDelta),
+            // saw. (Story 10.2: the command field is already base units.)
+            quantityDelta: command.quantityDelta,
             seq: snapshot.event.seq,
             eventId: snapshot.event.id,
           },
@@ -332,10 +372,12 @@ export class StockAdjustmentCommand {
   }
 
   /**
-   * Signed, non-zero delta in milli-units (a zero-delta event is pure noise).
-   * `raw` has already been scaled at the API edge.
+   * Signed, non-zero delta (a zero-delta event is pure noise). Story 10.2:
+   * this runs BEFORE the transaction on the base-UoM value — "is this a
+   * movement at all" is a question about the request, not about the SKU's
+   * unit, and it answered 400 before this story too.
    */
-  private assertNonZeroDelta(raw: number): SignedQuantity {
+  private assertNonZeroDelta(raw: number): void {
     if (raw === 0) {
       throw new ProblemException(
         'validation-failed',
@@ -344,7 +386,6 @@ export class StockAdjustmentCommand {
         'A stock adjustment moves a non-zero quantity — zero deltas write no ledger event.',
       );
     }
-    return signedQuantity(raw);
   }
 
   /**
@@ -403,12 +444,17 @@ export class StockAdjustmentCommand {
     return bin;
   }
 
+  /**
+   * The SKU must exist in this tenant (404 otherwise). Story 10.2: the read
+   * also carries `uom` back, because the unit is what says how precise this
+   * movement's quantity is allowed to be.
+   */
   private async assertSkuInTenant(
     tx: TenantTx,
     command: AdjustStockCommand,
-  ): Promise<{ id: string }> {
+  ): Promise<{ id: string; uom: string }> {
     const rows = await tx
-      .select({ id: skus.id })
+      .select({ id: skus.id, uom: skus.uom })
       .from(skus)
       .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
       .limit(1);
@@ -514,7 +560,7 @@ export class StockAdjustmentCommand {
         binId: command.binId,
         // The snapshot IS the HTTP response body (and the idempotent replay's
         // stored copy) — base units at the edge, milli-units below it.
-        quantityDelta: fromMilli(command.quantityDelta),
+        quantityDelta: command.quantityDelta,
         occurredAt: appended.occurredAt,
         recordedAt: appended.recordedAt,
       },

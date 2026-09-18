@@ -1,5 +1,4 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
-import { toMilli } from '../../shared/primitives/quantity';
 import { Type } from 'class-transformer';
 import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 import {
@@ -280,9 +279,11 @@ export class TenancyController {
         warehouseId,
         zoneId,
         code: dto.code,
-        // Story 10.1: capacity is UoM-denominated and compared against
-        // quantities, so it scales with them.
-        capacity: toMilli(dto.capacity),
+        // Story 10.2: capacity crosses this edge in WHOLE units. The bin
+        // command scales it behind its replay lookup and refuses a fractional
+        // value there — a bin's capacity is space shared by SKUs with no
+        // single unit between them, so 2.5 of it means nothing.
+        capacity: dto.capacity,
         type: dto.type,
       },
       key,
@@ -329,8 +330,8 @@ export class TenancyController {
         aisleTo: dto.aisleTo,
         baysPerAisle: dto.baysPerAisle,
         levelsPerBay: dto.levelsPerBay,
-        // Story 10.1: capacity scales with the quantities it gates.
-        capacity: toMilli(dto.capacity),
+        // Story 10.2: whole units across this edge (see `createBin`).
+        capacity: dto.capacity,
         type: dto.type,
       },
       key,

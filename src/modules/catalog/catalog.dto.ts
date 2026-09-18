@@ -3,6 +3,7 @@ import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/prim
 import { Transform } from 'class-transformer';
 import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Length, Max, Min } from 'class-validator';
 import { IMPORT_MODES, GST_RATE_BPS_MAX } from './import.command';
+import { UOMS } from './uom';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -55,7 +56,10 @@ export class CatalogImportResponse {
 }
 
 export class SkuUomConversionResponse {
-  @ApiProperty({ example: 'box' })
+  // Story 10.2: the conversion target comes from the same closed vocabulary
+  // the base unit does — one tuple, published as the OpenAPI enum and backed
+  // by `uom_conversions_uom_check` in the database.
+  @ApiProperty({ example: 'box', enum: [...UOMS] })
   uom!: string;
 
   @ApiProperty({ example: 12, description: 'Positive integer, relative to the SKU\'s base UoM' })
@@ -75,7 +79,12 @@ export class SkuResponse {
   @ApiProperty({ example: 'Chili powder 100g' })
   name!: string;
 
-  @ApiProperty({ example: 'pcs' })
+  // Story 10.2: `uom` is a CLOSED vocabulary, published as the OpenAPI enum
+  // over the same tuple the DB CHECK is written from, so a generated client
+  // gets a closed type rather than `string`. An import file may still SPELL a
+  // unit generously (`pcs`, `Kg.`, `kilogram`); what comes back is always the
+  // canonical unit it resolved to.
+  @ApiProperty({ example: 'each', enum: [...UOMS] })
   uom!: string;
 
   @ApiProperty({ example: 1800, description: 'GST in basis points (1800 = 18%)' })

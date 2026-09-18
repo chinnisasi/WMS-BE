@@ -1,5 +1,4 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
-import { toMilli } from '../shared/primitives/quantity';
 import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
@@ -113,8 +112,10 @@ export class ReceivingController {
           skuId: line.skuId,
           batchCode: line.batchCode ?? null,
           mfgDate: line.mfgDate ?? null,
-          // Story 10.1: the API edge scales into milli-units.
-          qty: toMilli(line.qty),
+          // Story 10.2: BASE units cross this edge. The receiving command
+          // scales each line behind its replay lookup, once it has read the
+          // line's SKU and therefore the unit's declared precision.
+          qty: line.qty,
         })),
       },
       key,

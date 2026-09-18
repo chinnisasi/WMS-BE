@@ -15,7 +15,14 @@ import {
   users,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { MAX_QUANTITY_MILLI, assertExactQuantity, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
+import {
+  MAX_QUANTITY_MILLI,
+  assertExactQuantity,
+  assertRecordableQuantity,
+  fromMilli,
+  signedQuantity,
+} from '../../shared/primitives/quantity';
+import { uomPrecision } from '../catalog/uom';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -47,7 +54,11 @@ export interface GrnLineInput {
   readonly batchCode: string | null;
   /** Optional batch mfg date (ISO-8601 UTC). */
   readonly mfgDate: string | null;
-  /** Physically received quantity in base UoM — a positive integer. */
+  /**
+   * Physically received quantity. In the SKU's BASE UoM on the way in (story
+   * 10.2 — the controller no longer scales) and in milli-units once
+   * `submitGoodsReceipt` has converted it, behind its replay lookup.
+   */
   readonly qty: number;
 }
 
@@ -217,6 +228,16 @@ export class ReceivingCommand {
     command: SubmitGoodsReceiptCommand,
     idempotencyKey: string,
   ): Promise<GoodsReceiptSnapshot> {
+    // ── story 10.2: this fingerprint is over BASE units ────────────────────
+    // Conversion moved out of the controller and into the command, behind the
+    // replay lookup, so the hashed value changed with it: a key written by a
+    // pre-10.2 build hashed MILLI-units and now answers 422
+    // `idempotency-key-reuse` rather than replaying. Accepted deliberately
+    // under the pre-launch premise — the same call story 10.1 made about the
+    // ledger hash chain — and pinned as EXPECTED by the cross-version replay
+    // guard in `test/picking.spec.ts`, so it is a recorded break and not a
+    // surprise. No compatibility branch exists; there is nothing to be
+    // compatible with.
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       deviceId: command.deviceId,
@@ -289,14 +310,16 @@ export class ReceivingCommand {
       const occurredAt = assertUtc(command.occurredAt, 'occurredAt');
       const blindReasonCode = this.validateBlindPairing(command.poId, command.blindReasonCode);
       for (const line of command.lines) {
-        // `line.qty` is in milli-units — the API edge scaled it; the
-        // operator-facing text speaks base units.
-        if (!Number.isInteger(line.qty) || line.qty < 1) {
-          throw grnValidation(`Line quantity must be a positive quantity (got ${fromMilli(line.qty)}).`);
+        // Story 10.2: `line.qty` is in BASE units here — shape and range only.
+        // Whether the SKU's own unit may express this many decimals is asked
+        // below, once `loadSkus` has read the units, and therefore behind the
+        // replay lookup above.
+        if (!(line.qty > 0)) {
+          throw grnValidation(`Line quantity must be a positive quantity (got ${String(line.qty)}).`);
         }
-        if (line.qty > MAX_GRN_LINE_QTY) {
+        if (line.qty > fromMilli(MAX_GRN_LINE_QTY)) {
           throw grnValidation(
-            `Line quantity must be at most ${fromMilli(MAX_GRN_LINE_QTY)} (got ${fromMilli(line.qty)}).`,
+            `Line quantity must be at most ${fromMilli(MAX_GRN_LINE_QTY)} (got ${String(line.qty)}).`,
           );
         }
         if (line.mfgDate !== null) {
@@ -315,6 +338,18 @@ export class ReceivingCommand {
         command.tenantId,
         command.lines.map((line) => line.skuId),
       );
+
+      // ── story 10.2: conversion and the precision refusal, HERE ──────────
+      // Behind the replay lookup and with each line's unit in hand. Below
+      // this point every quantity is milli-units; `command.lines` is not read
+      // for a quantity again.
+      const lines: readonly GrnLineInput[] = command.lines.map((line) => {
+        const uom = skuById.get(line.skuId)!.uom;
+        return {
+          ...line,
+          qty: assertRecordableQuantity(line.qty, 'qty', uom, uomPrecision(uom)),
+        };
+      });
 
       // ── the receiving bin (tenancy-owned master data) ───────────────────
       const receivingBin = await ensureReceivingBinInTx(tx, command.tenantId, command.warehouseId);
@@ -397,7 +432,7 @@ export class ReceivingCommand {
       const rejected: RejectedGrnLine[] = [];
       const overReceiptRequests: OverReceiptRequest[] = [];
 
-      for (const input of command.lines) {
+      for (const input of lines) {
         const identity = batchIdentity.get(`${input.skuId}:${input.batchCode}`) ?? null;
         if (command.poId === null || input.poLineId === null) {
           // Blind arm: the physical quantity applies in full (no PO to gate it).

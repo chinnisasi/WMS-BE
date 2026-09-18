@@ -2,8 +2,18 @@
  * Quantity primitive (AD-9, amended by story 10.1): every quantity in the
  * domain is a **scaled integer in milli-units** — the SKU's base unit of
  * measure × 10³. Nothing decimal exists inside the domain: conversion to and
- * from the operator-facing decimal happens ONLY at the API edge, through
+ * from the operator-facing decimal happens at exactly two places, through
  * `toMilli`/`fromMilli` in this file.
+ *
+ * **Where the inbound conversion lives, and why it moved** (story 10.2). It
+ * used to run in the controllers, while the facade argument was being built.
+ * Once a too-fine value became a REFUSAL rather than a rounding, that position
+ * put the refusal in front of the idempotency replay lookup — so a device op
+ * that had already committed under looser rules would answer `400` on replay
+ * instead of re-serving its original `201`. Conversion therefore happens
+ * inside each command, behind its replay lookup and after it has read the
+ * SKU's unit, through `assertRecordableQuantity` below. Outbound conversion
+ * (`fromMilli`) is unchanged and still happens wherever a read model is built.
  *
  * This file is the chokepoint. Scaling is enforced here and in the database
  * column types (`bigint`), not across the call sites — a call site that hands
@@ -20,6 +30,8 @@
  * scale `Number.isSafeInteger` covers the whole usable range, so the branded
  * guards keep working exactly as before.
  */
+
+import { ProblemException } from '../problem-details/problem.exception';
 
 /**
  * Decimal places the representation can express — the cap on any declared
@@ -52,13 +64,15 @@ export const MAX_QUANTITY_MILLI = MAX_QUANTITY_BASE * QUANTITY_SCALE;
  * the OpenAPI document (and the generated clients) describe the contract the
  * same way everywhere.
  */
-// The per-UoM precision refusal (a value finer than the unit's own declared
-// precision is rejected rather than rounded) arrives with story 10.2. That
-// identifier stays in this comment: the description below is published in the
-// OpenAPI document and read by external consumers, who cannot resolve it.
+// Story 10.2 changed what this sentence says, and it had to: the old wording
+// ("is rounded to 3 decimal places") described the stopgap, and once the unit
+// declares its own precision that sentence is a lie published to every
+// external consumer. The description is prose, not an identifier — story
+// numbers stay out of it, because the people who read it cannot resolve them.
 export const QUANTITY_FIELD_DESCRIPTION =
-  'A quantity in the SKU\'s base UoM, to at most 3 decimal places. A value ' +
-  'with more precision than that is rounded to 3 decimal places.';
+  'A quantity in the SKU\'s base UoM, at the decimal precision that unit ' +
+  'declares (each = 0 places, kg = 3). A value finer than its unit allows is ' +
+  'refused, naming the unit and its precision — never silently rounded.';
 
 /**
  * A non-negative level (on-hand, reserved, capacity), in milli-units.
@@ -103,9 +117,10 @@ export function signedQuantity(value: number): SignedQuantity {
 
 /**
  * Edge converter, inbound: an operator-facing decimal in the base UoM becomes
- * the domain's milli-unit integer. Rounds to the nearest milli-unit — story
- * 10.2 is what teaches the system to REFUSE a value finer than its UoM's
- * declared precision; until then the edge rounds rather than refusing.
+ * the domain's milli-unit integer. This is ARITHMETIC only — the rule about
+ * what a unit is allowed to express lives in `assertRecordableQuantity`, which
+ * refuses a too-fine value rather than letting this function round it away
+ * (story 10.2). Call it, not this, at a write edge.
  *
  * Throws on a non-finite input or one beyond the exact range, so an overflow
  * is a typed refusal at the boundary and never a silent wrap downstream.
@@ -149,14 +164,15 @@ export function fromMilli(milli: number): number {
  * True when a non-zero input would VANISH at the edge: finer than half a
  * milli-unit, so `toMilli` rounds it to nothing.
  *
- * Rounding a value that is merely too precise is the declared behaviour of
- * this story (18.4567 → 18.457). Rounding one away entirely is not the same
- * thing: a pick of 0.0004 recorded as 0 is not a rounded pick, it is an
- * empty-bin short pick the operator never reported, and a stock adjustment of
- * 0.0004 becomes a zero-delta ledger event. Both are silent losses, so the
- * edge refuses them by name instead.
+ * Story 10.1 rounded a value that was merely too precise and refused only one
+ * that would vanish; story 10.2 refuses both, so this predicate is now a
+ * backstop inside `assertRecordableQuantity` rather than a gate of its own. It
+ * is kept, and kept named, because the loss it describes is specific: a pick
+ * of 0.0004 recorded as 0 is not a rounded pick, it is an empty-bin short pick
+ * the operator never reported, and a stock adjustment of 0.0004 becomes a
+ * zero-delta ledger event.
  */
-export function scalesToZero(value: number): boolean {
+function scalesToZero(value: number): boolean {
   return Number.isFinite(value) && value !== 0 && toMilli(value) === 0;
 }
 
@@ -182,4 +198,130 @@ export function assertExactQuantity(value: number, context: string): number {
     );
   }
   return value;
+}
+
+/**
+ * How many decimal places a number actually carries, read from its canonical
+ * decimal string rather than from arithmetic.
+ *
+ * **Why the string and not `value * 10 ** precision % 1`.** That product is
+ * not exact, and the error falls on the honest side: `1.005 * 1000` is
+ * `1004.9999999999999`, so a weight a scale prints every day would be refused
+ * as "finer than kilograms allow" — and it is not a rare corner, it is
+ * thousands of the values in any three-decimal range. A tolerance does not
+ * rescue it either, because the absolute error scales with the magnitude: the
+ * epsilon that forgives 1.005 is the wrong epsilon at 9 × 10¹¹.
+ *
+ * `String(n)` gives the SHORTEST decimal that round-trips to the same double —
+ * which, for a value that arrived as JSON, is the literal the client wrote.
+ * That is exactly the question being asked: how many decimal places did the
+ * operator type?
+ */
+export function decimalPlaces(value: number): number {
+  if (!Number.isFinite(value)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const text = String(Math.abs(value));
+  const exponentAt = text.indexOf('e');
+  if (exponentAt === -1) {
+    const dot = text.indexOf('.');
+    return dot === -1 ? 0 : text.length - dot - 1;
+  }
+  // Exponential form (`1e-7`, `1.5e-7`): the mantissa's own places, shifted.
+  const mantissa = text.slice(0, exponentAt);
+  const exponent = Number(text.slice(exponentAt + 1));
+  const dot = mantissa.indexOf('.');
+  const mantissaPlaces = dot === -1 ? 0 : mantissa.length - dot - 1;
+  return Math.max(0, mantissaPlaces - exponent);
+}
+
+/** True when `value` fits within a unit declaring `precision` decimal places. */
+export function isAtPrecision(value: number, precision: number): boolean {
+  return decimalPlaces(value) <= precision;
+}
+
+/**
+ * **The one write-edge gate for a quantity** (story 10.2), and the reason the
+ * two hand-copied `assertRecordable` helpers in `inventory.controller.ts` and
+ * `outbound.controller.ts` no longer exist: a rule stated twice is a rule that
+ * drifts, and this one now has nine call sites rather than two.
+ *
+ * It refuses, in this order, and returns the milli-unit integer otherwise:
+ *
+ *  1. a value beyond the exact-integer range (an overflow is a refusal at the
+ *     boundary, never a silent wrap downstream);
+ *  2. a value FINER than its unit declares — the story's rule. It names the
+ *     field, the unit, the declared precision and the offending value, the
+ *     house shape `serialTrackedFractionalUomDetail` established;
+ *  3. a non-zero value that would scale to nothing. Story 10.1's refusal,
+ *     kept as a backstop and now structurally unreachable: the finest unit in
+ *     the vocabulary declares `QUANTITY_DECIMALS` places, and a value at that
+ *     precision is at least one milli-unit. It stays because "unreachable"
+ *     is a property of today's vocabulary, not of this function.
+ *
+ * **Where it must be called from.** Behind the command's idempotency replay
+ * lookup, never at the controller edge. An op that committed once replays its
+ * stored snapshot forever, whatever the rules say now — a device that queued a
+ * scan under looser rules and replays it after they tighten must get its
+ * original `201`, not a `400`. Converting at the edge (where `toMilli` used to
+ * run) would have put this refusal in front of the replay.
+ */
+export function assertRecordableQuantity(
+  value: number,
+  field: string,
+  uom: string,
+  precision: number,
+): number {
+  if (!Number.isFinite(value) || Math.abs(value) > MAX_QUANTITY_BASE) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      `${field} is outside the exact quantity range`,
+      `${field} must be a finite quantity of at most ${MAX_QUANTITY_BASE} in the SKU's base UoM (got ${String(value)}).`,
+    );
+  }
+  if (!isAtPrecision(value, precision)) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      `${field} is finer than its unit allows`,
+      precisionRefusalDetail(field, value, uom, precision),
+    );
+  }
+  if (scalesToZero(value)) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      `${field} is finer than the smallest recordable quantity`,
+      `${field} must be at least ${MIN_QUANTITY_BASE} in the SKU's base UoM (got ${value}) — ` +
+        'a smaller value would be recorded as zero, which means something else entirely.',
+    );
+  }
+  return toMilli(value);
+}
+
+/**
+ * The precision refusal's text. Two sentences, because the two cases are
+ * genuinely different problems: a 0-dp unit cannot hold a fraction AT ALL
+ * (2.5 `each` is not a rounding question, it is a category error), while a
+ * 3-dp unit can hold fractions but not this one.
+ */
+export function precisionRefusalDetail(
+  field: string,
+  value: number,
+  uom: string,
+  precision: number,
+): string {
+  if (precision === 0) {
+    return (
+      `${field} must be a whole number: base UoM "${uom}" declares 0 decimal places, ` +
+      `so ${value} is not a quantity it can express. Record whole units, or measure ` +
+      'this SKU in a unit that allows fractions.'
+    );
+  }
+  return (
+    `${field} must have at most ${precision} decimal place(s): base UoM "${uom}" declares ` +
+    `${precision}, and ${value} carries ${decimalPlaces(value)}. It is refused rather than ` +
+    'rounded — a quantity the operator did not enter is a quantity nobody agreed to.'
+  );
 }

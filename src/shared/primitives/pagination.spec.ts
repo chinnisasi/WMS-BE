@@ -1,8 +1,10 @@
 import {
   MAX_QUANTITY_BASE,
   assertExactQuantity,
+  decimalPlaces,
   fromMilli,
   gstBps,
+  isAtPrecision,
   milliQuantity,
   signedQuantity,
   toMilli,
@@ -62,6 +64,47 @@ describe('deterministic primitives (AD-9)', () => {
     // The range refusal is typed, never a silent wrap.
     expect(() => toMilli(MAX_QUANTITY_BASE * 2)).toThrow();
     expect(() => toMilli(Number.NaN)).toThrow();
+  });
+
+  test('decimal places are read from the value, not computed from it (story 10.2)', () => {
+    // THE reason this is a string read rather than arithmetic. `v * 1000 % 1`
+    // condemns thousands of perfectly honest three-decimal values, because the
+    // product is not exact: 1.005 kg — a weight a scale prints every day —
+    // multiplies to 1004.9999999999999 and would be refused as "too fine".
+    expect(1.005 * 1000).not.toBe(1005);
+    expect((1.005 * 1000) % 1).not.toBe(0);
+    expect(decimalPlaces(1.005)).toBe(3);
+    expect(isAtPrecision(1.005, 3)).toBe(true);
+    // And a tolerance is not the fix: the absolute error scales with the
+    // value, so the epsilon that forgives 1.005 is the wrong epsilon at 900
+    // million. Reading the shortest round-tripping decimal — which, for a
+    // value that arrived as JSON, IS the literal the client wrote — has no
+    // magnitude dependence at all.
+    expect(decimalPlaces(0.1)).toBe(1);
+    expect(decimalPlaces(18.4567)).toBe(4);
+
+    expect(decimalPlaces(500)).toBe(0);
+    expect(decimalPlaces(-2.5)).toBe(1);
+    expect(decimalPlaces(18.4)).toBe(1);
+    expect(decimalPlaces(0.001)).toBe(3);
+    // Exponential notation is what `String()` gives back below 1e-6, and a
+    // naive indexOf('.') would call `1e-7` a whole number.
+    expect(String(1e-7)).toBe('1e-7');
+    expect(decimalPlaces(1e-7)).toBe(7);
+    expect(decimalPlaces(1.5e-7)).toBe(8);
+    // …and above the exponent, where the shortest round-trip has no point.
+    expect(decimalPlaces(1.5e3)).toBe(0);
+    expect(decimalPlaces(0)).toBe(0);
+    // A non-finite value can satisfy no precision at all.
+    expect(decimalPlaces(Number.NaN)).toBe(Number.POSITIVE_INFINITY);
+    expect(isAtPrecision(Number.NaN, 3)).toBe(false);
+
+    // The two declared precisions in the vocabulary, as a unit sees them.
+    expect(isAtPrecision(2, 0)).toBe(true);
+    expect(isAtPrecision(2.5, 0)).toBe(false);
+    expect(isAtPrecision(18.4, 3)).toBe(true);
+    expect(isAtPrecision(18.457, 3)).toBe(true);
+    expect(isAtPrecision(18.4567, 3)).toBe(false);
   });
 
   test('the fold accumulator guard fails loudly rather than rounding (story 10.1)', () => {

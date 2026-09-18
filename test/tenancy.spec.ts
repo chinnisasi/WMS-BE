@@ -5,7 +5,7 @@ import { HttpException } from '@nestjs/common';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
-import { MAX_QUANTITY_BASE } from '../src/shared/primitives/quantity';
+import { MAX_QUANTITY_BASE, toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { signTenantSession } from '../src/modules/tenancy/jwt-session';
@@ -1174,8 +1174,12 @@ describe('tenancy (e2e)', () => {
 
       const foreignBinInsert = scoped.begin(async (tx) => {
         await tx`select set_config('app.tenant_id', ${tenantA}, true)`;
+        // `toMilli(1)`, not a bare 1 (the `bin-admin.spec.ts` convention).
+        // Story 10.2 gave `bins.capacity` a whole-unit CHECK, so a raw 1
+        // milli-unit would give this insert a SECOND reason to fail and the
+        // assertion below would silently start proving the wrong thing.
         await tx`insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type)
-          values (${uuidv7()}, ${tenantB}, ${warehouseId}, ${zoneA.body.id}, ${`RLS-${ulid().slice(0, 4)}`}, 1, 'shelf')`;
+          values (${uuidv7()}, ${tenantB}, ${warehouseId}, ${zoneA.body.id}, ${`RLS-${ulid().slice(0, 4)}`}, ${toMilli(1)}, 'shelf')`;
       });
       await expect(foreignBinInsert).rejects.toThrow(/row-level security/i);
     } finally {

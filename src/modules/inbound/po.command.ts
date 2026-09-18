@@ -20,7 +20,8 @@ import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.ser
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { fromMilli } from '../../shared/primitives/quantity';
+import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
+import { uomPrecision } from '../catalog/uom';
 
 export interface PoLineInput {
   readonly skuId: string;
@@ -167,6 +168,15 @@ export class PurchaseOrderCommand {
   ) {}
 
   async create(command: CreatePoCommand, idempotencyKey: string): Promise<PurchaseOrderSnapshot> {
+    // ── story 10.2: this fingerprint is over BASE units ────────────────────
+    // Conversion moved out of the controller and into the command, behind the
+    // replay lookup, so the hashed value changed with it: a key written by a
+    // pre-10.2 build hashed MILLI-units and now answers 422
+    // `idempotency-key-reuse` rather than replaying. Accepted deliberately
+    // under the pre-launch premise — the same call story 10.1 made about the
+    // ledger hash chain — and pinned as EXPECTED by the cross-version replay
+    // guard in `test/picking.spec.ts`. No compatibility branch exists; there
+    // is nothing to be compatible with.
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       warehouseId: command.warehouseId,
@@ -193,12 +203,15 @@ export class PurchaseOrderCommand {
       // in tenant — a foreign or nonexistent scope is 404 before any write.
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
       await this.assertVendorInTenant(tx, command.tenantId, command.vendorId);
-      await this.assertSkuIdsInTenant(
+      const uomBySku = await this.assertSkuIdsInTenant(
         tx,
         command.tenantId,
         command.lines.map((line) => line.skuId),
       );
-      const lineRows = command.lines.map((line) => this.lineInsert(command.tenantId, null, line));
+      // Story 10.2: conversion and the precision refusal, behind the replay
+      // lookup above and with each line's unit in hand.
+      const lines = this.scaleLines(command.lines, uomBySku);
+      const lineRows = lines.map((line) => this.lineInsert(command.tenantId, null, line));
 
       let po: { id: string };
       try {
@@ -246,6 +259,7 @@ export class PurchaseOrderCommand {
   }
 
   async amend(command: AmendPoCommand, idempotencyKey: string): Promise<PurchaseOrderSnapshot> {
+    // Story 10.2: BASE units (see the note on `create`'s payload hash).
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       poId: command.poId,
@@ -296,16 +310,18 @@ export class PurchaseOrderCommand {
           );
         }
       }
-      await this.assertSkuIdsInTenant(
+      const uomBySku = await this.assertSkuIdsInTenant(
         tx,
         command.tenantId,
         command.lines.map((line) => line.skuId),
       );
+      // Story 10.2: same position, same reason — behind the replay lookup.
+      const lines = this.scaleLines(command.lines, uomBySku);
 
       // Removals first (lines absent from the request are removed), then
       // updates in place — `received_qty` is never touched by an amend.
       const requestedIds = new Set(
-        command.lines.filter((line) => line.id !== undefined).map((line) => line.id!),
+        lines.filter((line) => line.id !== undefined).map((line) => line.id!),
       );
       const removedIds = existingLines
         .map((line) => line.id)
@@ -313,7 +329,7 @@ export class PurchaseOrderCommand {
       if (removedIds.length > 0) {
         await tx.delete(purchaseOrderLines).where(inArray(purchaseOrderLines.id, removedIds));
       }
-      for (const line of command.lines) {
+      for (const line of lines) {
         if (line.id === undefined) {
           continue;
         }
@@ -328,7 +344,7 @@ export class PurchaseOrderCommand {
           })
           .where(eq(purchaseOrderLines.id, line.id));
       }
-      const added = command.lines
+      const added = lines
         .filter((line) => line.id === undefined)
         .map((line) => this.lineInsert(command.tenantId, po.id, line));
       if (added.length > 0) {
@@ -604,18 +620,24 @@ export class PurchaseOrderCommand {
     tx: TenantTx,
     tenantId: string,
     skuIds: readonly string[],
-  ): Promise<void> {
+  ): Promise<Map<string, string>> {
     const distinct = [...new Set(skuIds)];
+    const byId = new Map<string, string>();
     if (distinct.length === 0) {
-      return;
+      return byId;
     }
     const rows = await tx
-      .select({ id: skus.id })
+      // Story 10.2: the existence check also carries each SKU's base UoM
+      // back — the unit is what says how precise an ordered quantity may be,
+      // and one query answers both questions.
+      .select({ id: skus.id, uom: skus.uom })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)));
-    const found = new Set(rows.map((row) => row.id));
+    for (const row of rows) {
+      byId.set(row.id, row.uom);
+    }
     for (const skuId of distinct) {
-      if (!found.has(skuId)) {
+      if (!byId.has(skuId)) {
         throw new ProblemException(
           'not-found',
           404,
@@ -624,6 +646,31 @@ export class PurchaseOrderCommand {
         );
       }
     }
+    return byId;
+  }
+
+  /**
+   * Story 10.2: the PO lines' quantities, converted from the operator-facing
+   * base UoM into milli-units and refused when finer than the SKU's unit
+   * declares. Called inside the command transaction, behind the replay lookup
+   * — never at the controller edge, where a refusal would sit in front of it.
+   */
+  private scaleLines<T extends { readonly skuId: string; readonly orderedQty: number }>(
+    lines: readonly T[],
+    uomBySku: ReadonlyMap<string, string>,
+  ): T[] {
+    return lines.map((line) => {
+      const uom = uomBySku.get(line.skuId)!;
+      return {
+        ...line,
+        orderedQty: assertRecordableQuantity(
+          line.orderedQty,
+          'orderedQty',
+          uom,
+          uomPrecision(uom),
+        ),
+      };
+    });
   }
 
   /**

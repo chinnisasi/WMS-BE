@@ -1,5 +1,4 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
-import { toMilli } from '../shared/primitives/quantity';
 import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
@@ -92,8 +91,11 @@ export class PutawayController {
         grnLineId: dto.grnLineId,
         skuId: dto.skuId,
         batchId: dto.batchId ?? null,
-        // Story 10.1: the API edge scales into milli-units.
-        qty: toMilli(dto.qty),
+        // Story 10.2: BASE units cross this edge. The putaway command
+        // scales it behind its replay lookup and behind the SKU read — a
+        // queued placement that already committed replays to its original
+        // 201, whatever the vocabulary says now.
+        qty: dto.qty,
         toBinId: dto.toBinId,
         reasonCode: dto.reasonCode ?? null,
         occurredAt: dto.occurredAt,

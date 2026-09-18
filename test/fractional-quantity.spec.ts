@@ -747,12 +747,19 @@ describe('story 10.1: fractional quantities are scaled integers in milli-units',
       expect(await storedMilli(skuId)).toBe(18_400);
     });
 
-    it('a sub-milli value is rounded AT THE EDGE — 18.4567 kg stores 18457 (the refusal arrives with story 10.2)', async () => {
+    it('a value finer than its unit is REFUSED, not rounded — 18.4567 on a 3-dp kg (story 10.2)', async () => {
       const skuId = skuIds.get(KG_SKU)!;
-      const created = await adjust(skuId, 18.4567).expect(201);
-      expect(created.body.event.quantityDelta).toBe(18.457);
-      expect(await storedMilli(skuId)).toBe(18_400 + 18_457);
-      expect(created.body.onHand.quantity).toBe(fromMilli(18_400 + 18_457));
+      // This is the matrix row that changed meaning. Story 10.1 stored 18457
+      // here and said so; the unit now declares its own precision, so the
+      // same request is a typed refusal naming the unit, the precision and
+      // the value — and nothing is written.
+      const before = await storedMilli(skuId);
+      const refused = await adjust(skuId, 18.4567).expect(400);
+      expect(refused.body.code).toBe('validation-failed');
+      expect(refused.body.detail).toContain('"kg"');
+      expect(refused.body.detail).toContain('3');
+      expect(refused.body.detail).toContain('18.4567');
+      expect(await storedMilli(skuId)).toBe(before);
     });
 
     it('a fractional draw nets exactly — no float dust across a sequence of decimals', async () => {

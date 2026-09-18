@@ -24,7 +24,12 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { picklistLineDrewUnits } from './wave.command';
 import type { ReservationSnapshot } from '../inventory/inventory.facade';
-import { MAX_QUANTITY_MILLI, fromMilli } from '../../shared/primitives/quantity';
+import {
+  MAX_QUANTITY_MILLI,
+  assertRecordableQuantity,
+  fromMilli,
+} from '../../shared/primitives/quantity';
+import { uomPrecision } from '../catalog/uom';
 
 // ── state machine + policy constants (the outbound module exclusively owns
 // the order state machine, AD-6 — no other module may add or transition
@@ -100,7 +105,13 @@ const MAX_LINE_QUANTITY = MAX_QUANTITY_MILLI;
 /** One line as the client supplies it (manual entry and ingestion alike). */
 export interface OrderLineInput {
   readonly skuId: string;
-  /** Ordered quantity in base UoM — a positive integer. */
+  /**
+   * Ordered quantity. **In the SKU's BASE UoM on the way in** (story 10.2 —
+   * the controller no longer scales), and in milli-units once
+   * `assertRecordableQuantity` has converted it inside the create preflight.
+   * The same shape carries both because the conversion is a step in one
+   * command, not a crossing between two layers.
+   */
   readonly quantity: number;
 }
 
@@ -221,6 +232,17 @@ export class OrderCommandService {
     // For an ingested order this is also the dedup fingerprint: the same
     // channel payload redelivered under a new idempotency key resolves to
     // the same order; a divergent payload on the same ref is a 422.
+    // ── story 10.2: BOTH hashes below are over BASE units ─────────────────
+    // Conversion moved out of the controller and into the create preflight,
+    // behind the replay lookup, so the hashed line quantities changed with it.
+    // Two consequences, both accepted deliberately under the pre-launch
+    // premise (the same call story 10.1 made about the ledger hash chain):
+    // an idempotency key written by a pre-10.2 build answers 422
+    // `idempotency-key-reuse` rather than replaying, and a channel payload
+    // delivered by one answers `order-source-conflict` rather than resolving
+    // to its original order. `test/picking.spec.ts` pins the break as
+    // EXPECTED. No compatibility branch exists; there is nothing to be
+    // compatible with.
     const sourcePayloadHash =
       command.source === 'ingested'
         ? hashCommandPayload({
@@ -248,7 +270,7 @@ export class OrderCommandService {
 
       const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replay !== null) {
-        return { replayed: replay as OrderSnapshot };
+        return { replayed: replay as OrderSnapshot, lines: [] as OrderLineInput[] };
       }
 
       // ── input validation (400 before any write) ─────────────────────────
@@ -274,11 +296,22 @@ export class OrderCommandService {
 
       // ── master-data integrity in a write transaction (404 before writes) ─
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
-      await this.assertSkuIdsInTenant(
+      const uomBySku = await this.assertSkuIdsInTenant(
         tx,
         command.tenantId,
         command.lines.map((line) => line.skuId),
       );
+
+      // ── story 10.2: conversion and the precision refusal, HERE ───────────
+      // Behind the replay lookup above and with each line's unit in hand.
+      // Below this point every quantity is milli-units; above it, base units.
+      const lines: OrderLineInput[] = command.lines.map((line) => {
+        const uom = uomBySku.get(line.skuId)!;
+        return {
+          skuId: line.skuId,
+          quantity: assertRecordableQuantity(line.quantity, 'quantity', uom, uomPrecision(uom)),
+        };
+      });
 
       // ── channel dedup pre-check: the same payload twice → the same order ─
       // (the partial unique index is the concurrent-delivery backstop; this
@@ -311,24 +344,27 @@ export class OrderCommandService {
             payloadHash,
             snapshot,
           );
-          return { replayed: snapshot };
+          return { replayed: snapshot, lines };
         }
       }
-      return { replayed: null };
+      return { replayed: null, lines };
     });
     if (preflight.replayed !== null) {
       return preflight.replayed;
     }
+    // The milli-unit lines the preflight converted — the ONLY quantities the
+    // grant and write phases below ever see.
+    const lines = preflight.lines;
 
     // ── phase 2: the per-line ATP split + grants (each its own atomic unit).
     // Every grant lands before the order-create tx opens; any failure here
     // writes nothing (the 503 propagates; a deterministic loss under the
     // backorder policy marks the line backordered instead).
-    const lineIds = command.lines.map(() => uuidv7());
+    const lineIds = lines.map(() => uuidv7());
     const granted: { lineIndex: number; reservation: ReservationSnapshot }[] = [];
     try {
-      for (let index = 0; index < command.lines.length; index += 1) {
-        const line = command.lines[index]!;
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index]!;
         const reservation = await this.reserveLine(command, line, lineIds[index]!);
         if (reservation !== null) {
           granted.push({ lineIndex: index, reservation });
@@ -372,7 +408,7 @@ export class OrderCommandService {
           throw err;
         }
         await tx.insert(orderLines).values(
-          command.lines.map((line, index) => {
+          lines.map((line, index) => {
             const hold = granted.find((entry) => entry.lineIndex === index);
             const reservedQty = hold?.reservation.quantity ?? 0;
             return {
@@ -912,20 +948,25 @@ export class OrderCommandService {
     };
   }
 
-  /** Every line's SKU must exist in the tenant (404 naming the unknown id). */
+  /**
+   * Every line's SKU must exist in the tenant (404 naming the unknown id),
+   * and the read hands back each one's base UoM — story 10.2 converts the
+   * line quantities against the unit, so the existence check and the unit
+   * lookup are one query rather than two.
+   */
   private async assertSkuIdsInTenant(
     tx: TenantTx,
     tenantId: string,
     skuIds: readonly string[],
-  ): Promise<void> {
+  ): Promise<Map<string, string>> {
     const distinct = [...new Set(skuIds)];
     const rows = await tx
-      .select({ id: skus.id })
+      .select({ id: skus.id, uom: skus.uom })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)));
-    const found = new Set(rows.map((row) => row.id));
+    const byId = new Map(rows.map((row) => [row.id, row.uom]));
     for (const skuId of distinct) {
-      if (!found.has(skuId)) {
+      if (!byId.has(skuId)) {
         throw new ProblemException(
           'not-found',
           404,
@@ -934,6 +975,7 @@ export class OrderCommandService {
         );
       }
     }
+    return byId;
   }
 
   /** Line-shape validation (400 before any write). */
@@ -945,11 +987,14 @@ export class OrderCommandService {
       if (!UUID_RE.test(line.skuId)) {
         throw validationFailed('Every line names a well-formed skuId.');
       }
-      // `line.quantity` is in milli-units — the API edge scaled it; the
-      // operator-facing text speaks base units.
-      if (!Number.isInteger(line.quantity) || line.quantity <= 0 || line.quantity > MAX_LINE_QUANTITY) {
+      // Story 10.2: `line.quantity` is in BASE units here — the conversion
+      // (and the per-unit precision refusal) happens further down, behind the
+      // replay lookup. This is the shape check only: positive and inside the
+      // exact range. The unit's own precision is not this function's business,
+      // because it does not know which SKU each line names yet.
+      if (!(line.quantity > 0) || line.quantity > fromMilli(MAX_LINE_QUANTITY)) {
         throw validationFailed(
-          `Line quantity must be a positive quantity in base UoM, at most ${fromMilli(MAX_LINE_QUANTITY)} (got ${String(fromMilli(line.quantity))}).`,
+          `Line quantity must be a positive quantity in base UoM, at most ${fromMilli(MAX_LINE_QUANTITY)} (got ${String(line.quantity)}).`,
         );
       }
     }
