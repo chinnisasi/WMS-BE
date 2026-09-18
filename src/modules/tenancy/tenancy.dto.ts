@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
+import { MAX_QUANTITY_BASE } from '../../shared/primitives/quantity';
 import { Transform } from 'class-transformer';
 import { IsBoolean, IsEmail, IsIn, IsInt, IsNumber, IsString, IsUUID, Length, Matches, Max, Min } from 'class-validator';
 
@@ -231,14 +231,18 @@ export class CreateBinDto {
 
   @ApiProperty({
     example: 120,
-    minimum: 0.001,
+    minimum: 1,
     maximum: MAX_QUANTITY_BASE,
-    description: `Bin capacity. ${QUANTITY_FIELD_DESCRIPTION}`,
+    description: `Bin capacity. A bin's shared space across every SKU it holds — the one quantity with no unit of its own, so it counts WHOLE units, at least one. A fractional or zero capacity is refused.`,
   })
+  // Story 10.2: the whole-unit rule is DOCUMENTED here and ENFORCED in the
+  // command (`assertWholeUnitCapacity`), behind the idempotency replay lookup
+  // — the same position every other quantity edge in this story took. A
+  // `@IsInt()` here would refuse a fractional value in the ValidationPipe, in
+  // FRONT of that lookup, which is exactly what would answer 400 to a queued
+  // op that already committed. Only the upper bound stays, because a value
+  // past the exact-integer ceiling (story 10.1) cannot be converted at all.
   @IsNumber({ allowNaN: false, allowInfinity: false })
-  @Min(0.001)
-  // The exact-integer ceiling (story 10.1) — a bigger number would round
-  // silently rather than 400.
   @Max(MAX_QUANTITY_BASE)
   capacity!: number;
 
@@ -276,12 +280,13 @@ export class GenerateBinsDto {
 
   @ApiProperty({
     example: 120,
-    minimum: 0.001,
+    minimum: 1,
     maximum: MAX_QUANTITY_BASE,
-    description: `Capacity per bin. ${QUANTITY_FIELD_DESCRIPTION}`,
+    description: `Capacity per bin. A bin's shared space across every SKU it holds — the one quantity with no unit of its own, so it counts WHOLE units, at least one. A fractional or zero capacity is refused.`,
   })
+  // Story 10.2: documented here, enforced in the command (see
+  // `CreateBinDto.capacity` for why the validator does not own this rule).
   @IsNumber({ allowNaN: false, allowInfinity: false })
-  @Min(0.001)
   @Max(MAX_QUANTITY_BASE)
   capacity!: number;
 

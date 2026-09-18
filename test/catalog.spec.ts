@@ -208,7 +208,10 @@ describe('catalog (e2e)', () => {
     expect(codes).toContain('NEW-OK-1');
     expect(codes).not.toContain('NEW-BAD-GST');
     const created = list.body.items.find((s: { code: string }) => s.code === 'NEW-OK-1');
-    expect(created).toMatchObject({ barcode: 'BC-NEW-OK-1', gstRateBps: 1800, uom: 'pcs' });
+    // Story 10.2: the file says `pcs` and the catalog stores `each` — the
+    // alias map resolves the spelling to the one canonical unit, which is how
+    // `pcs`, `PCS` and `pieces` stop being three different units.
+    expect(created).toMatchObject({ barcode: 'BC-NEW-OK-1', gstRateBps: 1800, uom: 'each' });
     expect(created.uomConversions).toEqual(
       expect.arrayContaining([
         { uom: 'box', factor: 12 },
@@ -756,7 +759,7 @@ describe('catalog (e2e)', () => {
       const foreignSkuInsert = scoped.begin(async (tx) => {
         await tx`select set_config('app.tenant_id', ${tenantA}, true)`;
         await tx`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode)
-          values (${uuidv7()}, ${tenantB}, ${`RLS-${ulid().slice(0, 6)}`}, 'rls probe', 'pcs', 500, ${uuidv7()})`;
+          values (${uuidv7()}, ${tenantB}, ${`RLS-${ulid().slice(0, 6)}`}, 'rls probe', 'each', 500, ${uuidv7()})`;
       });
       await expect(foreignSkuInsert).rejects.toThrow(/row-level security/i);
 

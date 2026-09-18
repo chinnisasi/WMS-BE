@@ -25,8 +25,14 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { MAX_QUANTITY_BASE, toMilli } from '../../shared/primitives/quantity';
-import { isFractionalUom, serialTrackedFractionalUomDetail } from './uom-precision';
+import { MAX_QUANTITY_BASE, isAtPrecision, precisionRefusalDetail, toMilli } from '../../shared/primitives/quantity';
+import {
+  isFractionalUom,
+  resolveUom,
+  serialTrackedFractionalUomDetail,
+  unknownUomDetail,
+  uomPrecision,
+} from './uom';
 
 export const IMPORT_MODES = ['initial', 'fix'] as const;
 export type ImportMode = (typeof IMPORT_MODES)[number];
@@ -657,19 +663,24 @@ function parseTracked(raw: string, column: string, rowNumber: number): FieldResu
  * edge like any other (story 10.1). Named for what it now does: it no longer
  * parses an integer, and what it returns is not the number in the cell.
  *
- * An empty cell still means zero. A value finer than the scale is rounded here
- * rather than refused (the per-UoM precision refusal is story 10.2's), and the
- * ceiling is the exact-integer range rather than int4.
+ * An empty cell still means zero.
  *
- * **A sub-milli value rounds to zero, and zero means "no reorder point" —
- * not "a very small one".** A reorder point of `0.0004` kg becomes 0, and a
- * zero reorder point is how the catalog says a SKU has none at all. That is a
- * meaning change, not a rounding, but it is the honest one here: the column
- * cannot hold a value finer than a milli-unit, and inventing a floor of one
- * milli-unit would claim a precision the SKU's UoM has not declared. Story
- * 10.2's precision rules are what turn this into a refusal.
+ * **Story 10.2: a value finer than the row's own unit is a ROW ERROR, not a
+ * rounding.** 10.1 rounded here and said so, because nothing in the system
+ * could yet ask how precise a kilogram is; the sub-milli case was the worst of
+ * it — a reorder point of `0.0004` kg silently became 0, and a zero reorder
+ * point is how the catalog says a SKU has none AT ALL. That is a meaning
+ * change wearing a rounding's clothes. The unit now declares its precision, so
+ * the row is refused naming the unit, the precision and the value, and `fix`
+ * mode can re-submit it with a number the unit can actually hold.
  */
-function parseQuantityMilli(raw: string, column: string, rowNumber: number): FieldResult<number> {
+function parseQuantityMilli(
+  raw: string,
+  column: string,
+  rowNumber: number,
+  uom: string,
+  precision: number,
+): FieldResult<number> {
   const value = raw.trim();
   if (value === '') return { ok: true, value: 0 };
   if (!/^\d+(\.\d+)?$/.test(value)) {
@@ -683,6 +694,12 @@ function parseQuantityMilli(raw: string, column: string, rowNumber: number): Fie
     return {
       ok: false,
       error: rowError(rowNumber, null, 'validation-failed', `${column} exceeds the quantity ceiling of ${MAX_QUANTITY_BASE}.`),
+    };
+  }
+  if (!isAtPrecision(n, precision)) {
+    return {
+      ok: false,
+      error: rowError(rowNumber, null, 'validation-failed', precisionRefusalDetail(column, n, uom, precision)),
     };
   }
   return { ok: true, value: toMilli(n) };
@@ -711,13 +728,23 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
   if (name.length > NAME_MAX) {
     return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', `name must be at most ${NAME_MAX} characters.`) };
   }
-  const uom = get('uom');
-  if (uom === '') {
+  const uomRaw = get('uom');
+  if (uomRaw === '') {
     return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', 'uom is required.') };
   }
-  if (uom.length > UOM_MAX) {
+  if (uomRaw.length > UOM_MAX) {
     return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', `uom must be at most ${UOM_MAX} characters.`) };
   }
+  // Story 10.2: `uom` is a CLOSED vocabulary. The file may spell a unit
+  // generously — `pcs`, `Kg.`, `kilogram`, ` KG ` — and the alias map resolves
+  // every one of them to the single canonical unit the column stores. A
+  // spelling the vocabulary does not know is a ROW-level refusal naming it, so
+  // the rest of the file still commits and `fix` mode can re-submit this row.
+  const uom = resolveUom(uomRaw);
+  if (uom === null) {
+    return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', unknownUomDetail('uom', uomRaw)) };
+  }
+  const uomPrecisionPlaces = uomPrecision(uom);
   const gstRaw = get('gst_rate');
   if (gstRaw === '') {
     return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', 'gst_rate is required (basis points, 18% = 1800).') };
@@ -747,9 +774,9 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       error: rowError(row.rowNumber, code, 'validation-failed', serialTrackedFractionalUomDetail(uom)),
     };
   }
-  const pointResult = parseQuantityMilli(v['reorder_point'] ?? '', 'reorder_point', row.rowNumber);
+  const pointResult = parseQuantityMilli(v['reorder_point'] ?? '', 'reorder_point', row.rowNumber, uom, uomPrecisionPlaces);
   if (!pointResult.ok) return { ok: false, error: { ...pointResult.error, skuCode: code } };
-  const qtyResult = parseQuantityMilli(v['reorder_qty'] ?? '', 'reorder_qty', row.rowNumber);
+  const qtyResult = parseQuantityMilli(v['reorder_qty'] ?? '', 'reorder_qty', row.rowNumber, uom, uomPrecisionPlaces);
   if (!qtyResult.ok) return { ok: false, error: { ...qtyResult.error, skuCode: code } };
   const batchTracked = batchResult.value;
   const serialTracked = serialResult.value;
@@ -772,7 +799,7 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
           error: rowError(row.rowNumber, code, 'validation-failed', `uom_conversions entries must look like box:12 (positive integer factor) — got "${entry.trim()}".`),
         };
       }
-      const target = match[1].trim();
+      const targetRaw = match[1].trim();
       const factor = Number(match[2]);
       if (!Number.isSafeInteger(factor) || factor < 1 || factor > INT_MAX) {
         return {
@@ -780,8 +807,19 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
           error: rowError(row.rowNumber, code, 'validation-failed', `uom_conversions factor must be a positive integer of at most ${INT_MAX} (got "${match[2]}").`),
         };
       }
-      if (target === '') {
+      if (targetRaw === '') {
         return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', 'uom_conversions target UoM must not be empty.') };
+      }
+      // Story 10.2: the conversion target is the same closed vocabulary the
+      // base unit comes from — `uom_conversions_uom_check` is the DB backstop,
+      // and resolving here is what makes `box:12` and `boxes:12` one row
+      // rather than two.
+      const target = resolveUom(targetRaw);
+      if (target === null) {
+        return {
+          ok: false,
+          error: rowError(row.rowNumber, code, 'validation-failed', unknownUomDetail('uom_conversions target', targetRaw)),
+        };
       }
       if (target === uom) {
         return {

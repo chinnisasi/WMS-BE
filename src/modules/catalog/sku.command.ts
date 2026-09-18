@@ -17,8 +17,8 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { fromMilli } from '../../shared/primitives/quantity';
-import { isFractionalUom, serialTrackedFractionalUomDetail } from './uom-precision';
+import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
+import { isFractionalUom, serialTrackedFractionalUomDetail, uomPrecision } from './uom';
 
 export const DEFAULT_SKU_PAGE_SIZE = 50;
 export const MAX_SKU_PAGE_SIZE = 200;
@@ -53,6 +53,12 @@ export interface EditSkuCommand {
   readonly hsn?: string | null | undefined;
   readonly batchTracked?: boolean | undefined;
   readonly serialTracked?: boolean | undefined;
+  /**
+   * Story 10.2: both are in the operator-facing BASE UoM, not milli-units.
+   * The controller used to scale them, which put the precision refusal in
+   * front of the replay lookup; the conversion now happens inside `edit`,
+   * after the SKU row (and therefore its unit) has been read.
+   */
   readonly reorderPoint?: number | undefined;
   readonly reorderQty?: number | undefined;
   readonly barcode?: string | undefined;
@@ -151,6 +157,16 @@ export class SkuCommand {
         'At least one of name, gstRate, hsn, batchTracked, serialTracked, reorderPoint, reorderQty, barcode is required.',
       );
     }
+    // ── story 10.2: this fingerprint is over BASE units ────────────────────
+    // Conversion moved out of the controller and into the command, behind the
+    // replay lookup, so the hashed value changed with it: a key written by a
+    // pre-10.2 build hashed MILLI-units and now answers 422
+    // `idempotency-key-reuse` rather than replaying. Accepted deliberately
+    // under the pre-launch premise — the same call story 10.1 made about the
+    // ledger hash chain — and pinned as EXPECTED by the cross-version replay
+    // guard in `test/picking.spec.ts`, so it is a recorded break and not a
+    // surprise. No compatibility branch exists; there is nothing to be
+    // compatible with.
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       skuId: command.skuId,
@@ -203,6 +219,11 @@ export class SkuCommand {
         // SKU measured to three decimals can never carry serials. Refused
         // here, naming the UoM and the rule, rather than converted at the four
         // sites that compare a unit count to `serials.length`.
+        //
+        // Story 10.2: the rule is now a LOOKUP against the vocabulary's
+        // declared precision rather than a hand-maintained list of discrete
+        // spellings — same refusal, same text, no false refusal for a
+        // legitimate whole-unit unit nobody remembered to enumerate.
         if (fields.serialTracked === true && isFractionalUom(current.uom)) {
           throw new ProblemException(
             'validation-failed',
@@ -211,6 +232,21 @@ export class SkuCommand {
             serialTrackedFractionalUomDetail(current.uom),
           );
         }
+
+        // Story 10.2: the reorder thresholds are UoM-denominated, so they are
+        // converted HERE — behind the replay lookup, with the SKU's unit in
+        // hand — and a value finer than that unit declares is refused rather
+        // than rounded. A reorder point of 2.5 on an each-counted SKU is not a
+        // rounding question.
+        const precision = uomPrecision(current.uom);
+        const reorderPointMilli =
+          fields.reorderPoint === undefined
+            ? undefined
+            : assertRecordableQuantity(fields.reorderPoint, 'reorderPoint', current.uom, precision);
+        const reorderQtyMilli =
+          fields.reorderQty === undefined
+            ? undefined
+            : assertRecordableQuantity(fields.reorderQty, 'reorderQty', current.uom, precision);
 
         // Barcode uniqueness per tenant: another SKU already holding the new
         // barcode is a 409 naming it (the same conflict code the import
@@ -232,8 +268,8 @@ export class SkuCommand {
         if (fields.hsn !== undefined) updates.hsn = fields.hsn;
         if (fields.batchTracked !== undefined) updates.batchTracked = fields.batchTracked;
         if (fields.serialTracked !== undefined) updates.serialTracked = fields.serialTracked;
-        if (fields.reorderPoint !== undefined) updates.reorderPoint = fields.reorderPoint;
-        if (fields.reorderQty !== undefined) updates.reorderQty = fields.reorderQty;
+        if (reorderPointMilli !== undefined) updates.reorderPoint = reorderPointMilli;
+        if (reorderQtyMilli !== undefined) updates.reorderQty = reorderQtyMilli;
         if (fields.barcode !== undefined) updates.barcode = fields.barcode;
         try {
           const updatedRows = await tx

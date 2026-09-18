@@ -8,6 +8,7 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { uuidv7 } from '../../shared/primitives/ids';
 import type { ImportMode } from './import.command';
+import { uomPrecision } from './uom';
 
 /** What other modules get from the catalog module (module boundary — AD-6). */
 export interface CatalogImportSummary {
@@ -77,6 +78,18 @@ export interface SkuSummary {
   readonly name: string;
   readonly barcode: string;
   readonly uom: string;
+  /**
+   * Story 10.2: the decimal places `uom` declares. It rides the snapshot so
+   * the DEVICE can refuse a too-precise entry inside its own Rejected banner,
+   * offline, before the scan is ever queued — a refusal that only the server
+   * knew about would queue in a dead zone and come back hours later as a
+   * rejection the operator can no longer act on.
+   *
+   * Derived in process from the vocabulary, never read from a table: there is
+   * no per-SKU precision, and a nested pool-opening read here is the exact
+   * shape that deadlocked this endpoint once already.
+   */
+  readonly uomPrecision: number;
   readonly batchTracked: boolean;
   readonly serialTracked: boolean;
 }
@@ -162,7 +175,7 @@ export class CatalogFacade {
    * onto the caller's transaction already; this was the last one left.
    */
   async getSkuSummariesInTx(tx: TenantTx, tenantId: string): Promise<SkuSummary[]> {
-    return tx
+    const rows = await tx
       .select({
         id: skus.id,
         code: skus.code,
@@ -175,6 +188,10 @@ export class CatalogFacade {
       .from(skus)
       .where(eq(skus.tenantId, tenantId))
       .orderBy(skus.code);
+    // Story 10.2: the unit's declared precision joins the scan identity. It is
+    // a property of the UNIT, so it is looked up here rather than selected —
+    // still on the caller's transaction, still one query.
+    return rows.map((row) => ({ ...row, uomPrecision: uomPrecision(row.uom) }));
   }
 
   /** Batch identities of one SKU — the expiry half of the api layer's FEFO join. */

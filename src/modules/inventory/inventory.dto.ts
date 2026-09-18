@@ -1,7 +1,6 @@
 import { Transform, Type } from 'class-transformer';
 import {
   MAX_QUANTITY_BASE,
-  MIN_QUANTITY_BASE,
   QUANTITY_FIELD_DESCRIPTION,
 } from '../../shared/primitives/quantity';
 import {
@@ -115,9 +114,12 @@ export class StockAdjustmentDto {
   binId!: string;
 
   @ApiProperty({
-    description:
-      `Signed quantity; positive into the bin, negative out. ${QUANTITY_FIELD_DESCRIPTION} ` +
-      `A non-zero magnitude below ${MIN_QUANTITY_BASE} is refused rather than rounded to zero.`,
+    // Story 10.2 dropped 10.1's trailing "below 0.001 is refused rather than
+    // rounded to zero": the unit now declares its own precision, so for an
+    // each-counted SKU everything below 1 is refused and the old sentence read
+    // as nonsense beside the new one. `quantity.ts` documents that branch as
+    // structurally unreachable under the current vocabulary.
+    description: `Signed quantity; positive into the bin, negative out. ${QUANTITY_FIELD_DESCRIPTION}`,
     minimum: -MAX_QUANTITY_BASE,
     maximum: MAX_QUANTITY_BASE,
   })

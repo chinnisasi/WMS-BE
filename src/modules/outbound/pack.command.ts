@@ -12,7 +12,15 @@ import {
   skus,
 } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
-import { MAX_QUANTITY_MILLI, assertExactQuantity, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
+import {
+  MAX_QUANTITY_MILLI,
+  assertExactQuantity,
+  assertRecordableQuantity,
+  fromMilli,
+  signedQuantity,
+  toMilli,
+} from '../../shared/primitives/quantity';
+import { uomPrecision } from '../catalog/uom';
 import { canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -69,6 +77,12 @@ export interface PackDimensionsInput {
 /** One scanned line at the bench: a SKU and the units counted into the parcel. */
 export interface PackScanLineInput {
   readonly skuId: string;
+  /**
+   * Scanned quantity in the SKU's BASE UoM (story 10.2 — the controller no
+   * longer scales). `aggregateScan` converts it; the per-unit precision
+   * refusal runs later, behind the replay lookup, where the scanned SKUs'
+   * units are known.
+   */
   readonly qty: number;
 }
 
@@ -358,7 +372,7 @@ export class PackCommandService {
         skuIds.length === 0
           ? []
           : await tx
-              .select({ id: skus.id, code: skus.code, name: skus.name })
+              .select({ id: skus.id, code: skus.code, name: skus.name, uom: skus.uom })
               .from(skus)
               .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.id, skuIds)));
       const skuById = new Map(skuRows.map((row) => [row.id, row]));
@@ -372,6 +386,12 @@ export class PackCommandService {
           );
         }
       }
+      // ── story 10.2: the per-unit precision refusal, behind the replay ───
+      // The scan is verified against what was picked only after every scanned
+      // quantity is one the SKU's unit can actually express — 2.5 on an
+      // each-counted SKU is not a discrepancy to reconcile, it is a value the
+      // unit cannot hold.
+      assertScanPrecision(command.scanned, skuById);
       this.assertScanMatchesPicked(order.id, pickedBySku, scannedBySku, skuById);
 
       // ── the flip (conditional — the exactly-once backstop) ──────────────
@@ -725,13 +745,17 @@ function aggregateScan(scanned: readonly PackScanLineInput[]): Map<string, numbe
     if (!UUID_RE.test(line.skuId)) {
       throw packValidation('Every scanned line names a well-formed skuId.');
     }
-    // `line.qty` is in milli-units — the API edge scaled it.
-    if (!Number.isInteger(line.qty) || line.qty <= 0 || line.qty > MAX_SCAN_QUANTITY) {
+    // Story 10.2: `line.qty` arrives in BASE units and is scaled HERE, inside
+    // the command. This is arithmetic and a range check only — whether the
+    // SKU's own unit may express this many decimals is asked after the replay
+    // lookup, in `assertScanPrecision`, because a refusal in front of the
+    // replay would answer 400 to an op that already committed.
+    if (!(line.qty > 0) || line.qty > fromMilli(MAX_SCAN_QUANTITY)) {
       throw packValidation(
-        `Scanned quantity must be a positive quantity in base UoM, at most ${fromMilli(MAX_SCAN_QUANTITY)} (got ${String(fromMilli(line.qty))}).`,
+        `Scanned quantity must be a positive quantity in base UoM, at most ${fromMilli(MAX_SCAN_QUANTITY)} (got ${String(line.qty)}).`,
       );
     }
-    const running = (totals.get(line.skuId) ?? 0) + line.qty;
+    const running = (totals.get(line.skuId) ?? 0) + toMilli(line.qty);
     // The per-LINE cap above is not the whole bound: 500 lines naming one
     // SKU aggregate past the int4 ceiling and would die as a raw 22003 at
     // the comparison against `picks`, which is exactly what the constant
@@ -744,6 +768,28 @@ function aggregateScan(scanned: readonly PackScanLineInput[]): Map<string, numbe
     totals.set(line.skuId, running);
   }
   return totals;
+}
+
+/**
+ * Story 10.2: every scanned line must be a quantity its SKU's base UoM can
+ * express. Called with the RAW base-unit lines (not the aggregate): the
+ * operator typed or scanned each one, and each one is what the refusal has to
+ * name. `assertRecordableQuantity`'s return is discarded — `aggregateScan`
+ * already holds the converted totals; what is wanted here is the refusal.
+ */
+function assertScanPrecision(
+  scanned: readonly PackScanLineInput[],
+  skuById: ReadonlyMap<string, { uom: string }>,
+): void {
+  for (const line of scanned) {
+    const uom = skuById.get(line.skuId)?.uom;
+    if (uom === undefined) {
+      // Unreachable: an unknown scanned SKU is a 404 above. Skipping is the
+      // fail-safe direction — the 404 is the answer, not a second refusal.
+      continue;
+    }
+    void assertRecordableQuantity(line.qty, 'qty', uom, uomPrecision(uom));
+  }
 }
 
 /**

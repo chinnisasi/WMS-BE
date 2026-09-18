@@ -1,5 +1,10 @@
 import { Type } from 'class-transformer';
-import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
+import {
+  MAX_QUANTITY_BASE,
+  QUANTITY_DECIMALS,
+  QUANTITY_FIELD_DESCRIPTION,
+} from '../../shared/primitives/quantity';
+import { UOMS } from '../catalog/uom';
 import {
   ArrayMaxSize,
   ArrayMinSize,
@@ -418,8 +423,17 @@ export class CatalogSnapshotSkuDto {
   @ApiProperty()
   barcode!: string;
 
-  @ApiProperty()
+  @ApiProperty({ example: 'each', enum: [...UOMS] })
   uom!: string;
+
+  @ApiProperty({
+    example: 0,
+    minimum: 0,
+    maximum: QUANTITY_DECIMALS,
+    description:
+      'Decimal places this SKU\'s base UoM may express (each = 0, kg = 3). The device validates entry against it OFFLINE, inside the Rejected banner, so a too-precise scan is refused before it is ever queued.',
+  })
+  uomPrecision!: number;
 
   @ApiProperty()
   batchTracked!: boolean;

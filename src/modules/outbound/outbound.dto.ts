@@ -1,7 +1,6 @@
 import { Transform, Type } from 'class-transformer';
 import {
   MAX_QUANTITY_BASE,
-  MIN_QUANTITY_BASE,
   QUANTITY_FIELD_DESCRIPTION,
 } from '../../shared/primitives/quantity';
 import {
@@ -605,9 +604,10 @@ export class RecordPickDto {
   binId!: string;
 
   @ApiProperty({
+    // The trailing "below 0.001 is refused" sentence came off in story 10.2 —
+    // see `StockAdjustmentDto.quantityDelta` for why.
     description:
-      'Units actually drawn in base UoM. Equal to the line’s planned quantity for an ordinary pick; BELOW it (down to 0, an empty bin) for a short pick, which must carry a reasonCode. Above the plan is always a 400. ' +
-      `A non-zero value below ${MIN_QUANTITY_BASE} is refused rather than rounded to zero — zero means an empty bin, which is a different report.`,
+      `Units actually drawn in base UoM. Equal to the line’s planned quantity for an ordinary pick; BELOW it (down to 0, an empty bin) for a short pick, which must carry a reasonCode. Above the plan is always a 400. ${QUANTITY_FIELD_DESCRIPTION}`,
     minimum: 0,
     maximum: MAX_QUANTITY_BASE,
   })

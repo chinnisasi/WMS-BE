@@ -13,7 +13,14 @@ import {
   zones,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { QUANTITY_SCALE, assertExactQuantity, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
+import {
+  MAX_QUANTITY_BASE,
+  QUANTITY_SCALE,
+  assertExactQuantity,
+  fromMilli,
+  signedQuantity,
+  toMilli,
+} from '../../shared/primitives/quantity';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from './idempotency-guard';
@@ -42,6 +49,11 @@ export interface CreateBinCommand {
   readonly warehouseId: string;
   readonly zoneId: string;
   readonly code: string;
+  /**
+   * Story 10.2: WHOLE units on the way in (the controller no longer scales).
+   * `assertWholeUnitCapacity` converts it inside the command, behind the
+   * replay lookup — see that function for why capacity has no unit of its own.
+   */
   readonly capacity: number;
   readonly type: string;
 }
@@ -56,6 +68,7 @@ export interface GenerateBinsCommand {
   readonly aisleTo: string;
   readonly baysPerAisle: number;
   readonly levelsPerBay: number;
+  /** Whole units, per bin (story 10.2 — see `CreateBinCommand.capacity`). */
   readonly capacity: number;
   readonly type: string;
 }
@@ -186,6 +199,13 @@ export class BinCommand {
   ) {}
 
   async createBin(command: CreateBinCommand, idempotencyKey: string): Promise<BinSnapshot> {
+    // ── story 10.2: this fingerprint is over BASE units ────────────────────
+    // `capacity` is scaled inside the command now (behind the replay lookup),
+    // so the hashed value changed: a key written by a pre-10.2 build hashed
+    // MILLI-units and now answers 422 `idempotency-key-reuse` rather than
+    // replaying. Accepted deliberately under the pre-launch premise — the same
+    // call story 10.1 made about the ledger hash chain — and pinned as
+    // EXPECTED by the cross-version replay guard in `test/picking.spec.ts`.
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       warehouseId: command.warehouseId,
@@ -232,7 +252,14 @@ export class BinCommand {
         // write (same gate as generateGrid / setBlocked).
         await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
 
-        const bin = await insertBin(tx, command);
+        // Story 10.2: capacity is scaled HERE, behind the replay lookup, for
+        // the same reason every other quantity is (`assertWholeUnitCapacity`
+        // refuses a fractional one, and a refusal in front of the replay
+        // would answer 400 to an op that already committed).
+        const bin = await insertBin(tx, {
+          ...command,
+          capacity: assertWholeUnitCapacity(command.capacity),
+        });
 
         try {
           await tx.insert(idempotencyKeys).values({
@@ -289,6 +316,7 @@ export class BinCommand {
       capacity: command.capacity,
       type: command.type,
     });
+    // Story 10.2: BASE units (see the note on `createBin`'s payload hash).
 
     const { snapshot } = await withTenantTransaction(
       this.db,
@@ -342,7 +370,8 @@ export class BinCommand {
           warehouseId: command.warehouseId,
           zoneId: command.zoneId,
           code,
-          capacity: command.capacity,
+          // Story 10.2: whole units only, converted behind the replay lookup.
+          capacity: assertWholeUnitCapacity(command.capacity),
           type: command.type,
         }));
         try {
@@ -930,6 +959,36 @@ async function assertZoneInWarehouse(
 }
 
 /** Shared insert path for manually-created bins (same duplicate mapping). */
+/**
+ * Bin capacity, from the operator-facing number into milli-units — **whole
+ * units only** (story 10.2).
+ *
+ * It is the one quantity in the system with no unit at all: a bin holds many
+ * SKUs measured many different ways, and `suggestBin` calls its capacity
+ * "shared base-UoM space". A capacity of 2.5 therefore means nothing an
+ * operator can act on — 2.5 of WHAT? — so the fractional case is refused
+ * rather than given a unit it does not have. Comparing a whole-unit capacity
+ * against a fractional on-hand still works exactly as before: both are
+ * milli-units, and the comparison never needed them to share a precision.
+ */
+function assertWholeUnitCapacity(capacity: number): number {
+  // ONE rule, at all three gates: the DTO documents `minimum: 1`, this refuses
+  // anything else, and `bins_capacity_whole_units` backstops it in the
+  // database. Zero is refused here too — a bin with no capacity accepts no
+  // putaway, ever, and the API contract has never advertised one; accepting it
+  // from a non-HTTP caller would create a bin the contract says cannot exist.
+  if (!Number.isInteger(capacity) || capacity < 1 || capacity > MAX_QUANTITY_BASE) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      'capacity must be a whole number of units',
+      `capacity is the bin's shared space across every SKU it holds, which have no single unit between them — ` +
+        `so it counts WHOLE units (got ${String(capacity)}). Give it a whole number between 1 and ${MAX_QUANTITY_BASE}.`,
+    );
+  }
+  return toMilli(capacity);
+}
+
 async function insertBin(
   tx: TenantTx,
   command: CreateBinCommand,

@@ -139,6 +139,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     'PCK-SHORT-WCXL0', // 4.4: …and against a ZERO-unit report (its own SKU:
     //                         a leftover pool would re-plan the next scenario)
     'PCK-SHORT-LEGACY', // 4.4: a pre-4.4 stored snapshot replays with the defaults
+    'PCK-MILLI-KEY', // 10.2: a pre-10.2 MILLI fingerprint no longer replays (the accepted break)
   ] as const;
   const BATCH_SKU_CODE = 'PCK-FEFO';
   /** 4.3b: the batch-arm shortfall, routed by the epoch to 409 or 422. */
@@ -1883,9 +1884,11 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
           picklistLineId: body.picklistLineId,
           skuId: body.skuId,
           binId: body.binId,
-          // Story 10.1: the COMMAND hashes milli-units (the controller scales
-          // at the edge), so the stored key's fingerprint must too.
-          qty: toMilli(body.qty),
+          // Story 10.2: the COMMAND hashes BASE units. Conversion moved off
+          // the controller edge and into the command, behind this very replay
+          // lookup — so the stored key's fingerprint is over what the client
+          // sent, not over what the domain stores.
+          qty: body.qty,
           occurredAt: body.occurredAt,
         }),
         'utf8',
@@ -1907,6 +1910,60 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(served.replanReservationId).toBeNull();
     expect(served.replanned).toEqual([]);
     // …and the replay drew nothing: the line is untouched.
+    expect(await lineStatus(line.id)).toBe('planned');
+    expect(await ledgerFor(line.id)).toHaveLength(0);
+  });
+
+  it('a key written under story 10.1\'s MILLI fingerprint no longer replays — the ACCEPTED 10.2 break, pinned', async () => {
+    // The sibling of the test above, and the only cross-VERSION replay guard
+    // in the repo. Story 10.2 moved conversion out of the controller and into
+    // the command (behind the replay lookup, which is the whole point), so the
+    // fingerprint is now over BASE units where it used to be over milli-units.
+    // A key written by the deployed build therefore answers 422 rather than
+    // replaying.
+    //
+    // That break is ACCEPTED under the pre-launch premise — the same call
+    // story 10.1 made about rewriting `quantity_delta` under a hash chain it
+    // could not re-derive. What must not happen is for it to be accepted
+    // SILENTLY: this test asserts the 422 so the convention change is recorded
+    // evidence, and so a future change to the fingerprint has to argue with a
+    // test rather than slip through a green suite.
+    const skuId = sku('PCK-MILLI-KEY');
+    await seedStock(skuId, binA, 3);
+    const { picklist } = await releasedWave([{ skuId, quantity: 3 }], 'milli-key');
+    const line = picklist.lines[0]!;
+    const key = ulid();
+    const body = bodyFor(line);
+    const { createHash } = await import('node:crypto');
+    const legacyMilliHash = createHash('sha256')
+      .update(
+        JSON.stringify({
+          tenantId,
+          deviceId,
+          operatorUserId,
+          warehouseId,
+          picklistId: body.picklistId,
+          picklistLineId: body.picklistLineId,
+          skuId: body.skuId,
+          binId: body.binId,
+          // The story-10.1 convention: the controller scaled at the edge, so
+          // the command fingerprinted MILLI-units.
+          qty: toMilli(body.qty),
+          occurredAt: body.occurredAt,
+        }),
+        'utf8',
+      )
+      .digest('hex');
+    await sql`
+      insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+      values (${uuidv7()}, ${tenantId}, ${key}, ${legacyMilliHash}, ${sql.json({ pick: { id: uuidv7() } })})
+    `;
+
+    const refused = await pick(body, operatorToken, key).expect(422);
+    expect(refused.body.code).toBe('idempotency-key-reuse');
+    // The refusal is deterministic and writes nothing — the pre-10.2 op that
+    // owns this key keeps its stored snapshot; it simply cannot be reached
+    // through a 10.2 request body.
     expect(await lineStatus(line.id)).toBe('planned');
     expect(await ledgerFor(line.id)).toHaveLength(0);
   });

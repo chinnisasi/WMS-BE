@@ -70,6 +70,8 @@ export interface CatalogSnapshot {
     readonly name: string;
     readonly barcode: string;
     readonly uom: string;
+    /** Story 10.2: the decimal places `uom` declares — the device's offline precision gate. */
+    readonly uomPrecision: number;
     readonly batchTracked: boolean;
     readonly serialTracked: boolean;
   }[];

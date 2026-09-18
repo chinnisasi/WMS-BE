@@ -18,7 +18,13 @@ import {
   waves,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { QUANTITY_SCALE, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
+import {
+  QUANTITY_SCALE,
+  assertRecordableQuantity,
+  fromMilli,
+  signedQuantity,
+} from '../../shared/primitives/quantity';
+import { uomPrecision } from '../catalog/uom';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -82,6 +88,9 @@ export interface RecordPickCommand {
    * The units actually drawn. Equal to the line's planned quantity for an
    * ordinary pick; BELOW it (down to zero) for a short pick, which must
    * carry a `reasonCode`. Above it is always a 400.
+   *
+   * Story 10.2: in the SKU's BASE UoM on the way in; converted to milli-units
+   * inside `recordPick`, behind the replay lookup and the SKU read.
    */
   readonly qty: number;
   /** Device time (AD-1) — the ledger event's and the pick row's business time. */
@@ -327,6 +336,16 @@ export class PickCommandService {
    * key + different payload is the deterministic 422.
    */
   async recordPick(command: RecordPickCommand, idempotencyKey: string): Promise<PickSnapshot> {
+    // ── story 10.2: this fingerprint is over BASE units ────────────────────
+    // Conversion moved out of the controller and into the command, behind the
+    // replay lookup, so the hashed value changed with it: a key written by a
+    // pre-10.2 build hashed MILLI-units and now answers 422
+    // `idempotency-key-reuse` rather than replaying. Accepted deliberately
+    // under the pre-launch premise — the same call story 10.1 made about the
+    // ledger hash chain — and pinned as EXPECTED by the cross-version replay
+    // guard in `test/picking.spec.ts`, so it is a recorded break and not a
+    // surprise. No compatibility branch exists; there is nothing to be
+    // compatible with.
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       deviceId: command.deviceId,
@@ -427,11 +446,12 @@ export class PickCommandService {
       // Story 4.4 widens the floor from 1 to 0: a zero-unit short pick is how
       // an operator reports an EMPTY bin, and it is the one pick that draws
       // nothing at all. It still needs a reason, like every other short pick.
-      // `command.qty` is in milli-units — the API edge scaled it; the operator
-      // -facing text speaks base units.
-      if (!Number.isInteger(command.qty) || command.qty < 0) {
+      // Story 10.2: `command.qty` is in BASE units here — the conversion, and
+      // the refusal of a value finer than the SKU's unit allows, happen after
+      // the SKU row is read below. This is the sign check only.
+      if (!(command.qty >= 0)) {
         throw pickValidation(
-          `Pick quantity must be a non-negative quantity (got ${fromMilli(command.qty)}).`,
+          `Pick quantity must be a non-negative quantity (got ${String(command.qty)}).`,
         );
       }
       const reasonCode = command.reasonCode ?? null;
@@ -623,7 +643,7 @@ export class PickCommandService {
         throw wrongItem(line.skuId, command.skuId);
       }
       const skuRows = await tx
-        .select({ id: skus.id, code: skus.code, batchTracked: skus.batchTracked, serialTracked: skus.serialTracked })
+        .select({ id: skus.id, code: skus.code, uom: skus.uom, batchTracked: skus.batchTracked, serialTracked: skus.serialTracked })
         .from(skus)
         .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
         .limit(1);
@@ -637,24 +657,40 @@ export class PickCommandService {
         );
       }
 
+      // ── story 10.2: conversion and the precision refusal, HERE ──────────
+      // Behind the replay lookup (a queued scan that already committed under
+      // looser rules re-serves its snapshot above and never reaches this) and
+      // behind the SKU read, because the unit is what says how precise this
+      // draw may be. `scaled` carries milli-units; NOTHING below reads
+      // `command.qty` again, and nothing above it saw a milli-unit.
+      //
+      // The device refuses a too-precise scan on its own, offline, from the
+      // unit's precision in the cached catalog snapshot — so this is the
+      // backstop for a client that did not, never the operator's first
+      // feedback.
+      const scaled: RecordPickCommand = {
+        ...command,
+        qty: assertRecordableQuantity(command.qty, 'qty', sku.uom, uomPrecision(sku.uom)),
+      };
+
       // ── whole pick or short pick (story 4.4) ───────────────────────────
       // Above the plan is still a hard 400: a stop draws what it planned or
       // less, and units nobody reserved are not this line's to take. EQUAL to
       // the plan is an ordinary full pick even when a reason rides along —
       // the operator reported the whole quantity, so nothing came up short.
-      if (command.qty > line.qty) {
+      if (scaled.qty > line.qty) {
         throw pickValidation(
-          `Pick line "${command.picklistLineId}" plans ${fromMilli(line.qty)} unit(s) — a pick of ${fromMilli(command.qty)} draws more than the stop holds for this order.`,
+          `Pick line "${command.picklistLineId}" plans ${fromMilli(line.qty)} unit(s) — a pick of ${fromMilli(scaled.qty)} draws more than the stop holds for this order.`,
         );
       }
-      const shortPick = command.qty < line.qty;
+      const shortPick = scaled.qty < line.qty;
       if (shortPick && reasonCode === null) {
         throw pickValidation(
-          `Pick line "${command.picklistLineId}" plans ${fromMilli(line.qty)} unit(s) and this pick draws ${fromMilli(command.qty)} — ` +
+          `Pick line "${command.picklistLineId}" plans ${fromMilli(line.qty)} unit(s) and this pick draws ${fromMilli(scaled.qty)} — ` +
             `a short pick needs a reasonCode from ${JSON.stringify(SHORT_PICK_REASON_CODES)}.`,
         );
       }
-      const shortfallQty = shortPick ? line.qty - command.qty : 0;
+      const shortfallQty = shortPick ? line.qty - scaled.qty : 0;
 
       // ── the scanned bin (server-side truth, mirrored on-device) ─────────
       // `for('update')` mutexes the bin's draw against a concurrent pick of
@@ -723,9 +759,9 @@ export class PickCommandService {
         // demanding "one serial per unit" for zero units would make an empty
         // bin unreportable on precisely the SKUs whose units are tracked
         // individually.
-        if (command.qty > 0 && (command.serials === undefined || command.serials.length === 0)) {
+        if (scaled.qty > 0 && (command.serials === undefined || command.serials.length === 0)) {
           throw pickValidation(
-            `SKU "${sku.code}" is serial-tracked — its pick needs one serial per unit (${fromMilli(command.qty)}).`,
+            `SKU "${sku.code}" is serial-tracked — its pick needs one serial per unit (${fromMilli(scaled.qty)}).`,
           );
         }
         if (command.serials !== undefined) {
@@ -736,9 +772,9 @@ export class PickCommandService {
           }
           // Story 10.1: an array length is a UNIT count — the comparison is
           // made in units, never in milli-units.
-          if (command.serials.length !== fromMilli(command.qty)) {
+          if (command.serials.length !== fromMilli(scaled.qty)) {
             throw pickValidation(
-              `A serial-tracked pick draws one ledger event per serial unit — ${command.serials.length} serials cannot draw ${fromMilli(command.qty)} units.`,
+              `A serial-tracked pick draws one ledger event per serial unit — ${command.serials.length} serials cannot draw ${fromMilli(scaled.qty)} units.`,
             );
           }
           serialNumbers = command.serials;
@@ -849,18 +885,18 @@ export class PickCommandService {
       // bin would refuse the one report the operator is standing there to
       // make ("this shelf has nothing on it").
       const batchDraw =
-        command.qty === 0
+        scaled.qty === 0
           ? { arms: [] as { batchId: string | null; qty: number }[] }
           : sku.batchTracked
-            ? await this.deriveBatchArms(tx, command, occurredAt)
-            : { arms: [{ batchId: null, qty: command.qty }] };
+            ? await this.deriveBatchArms(tx, scaled, occurredAt)
+            : { arms: [{ batchId: null, qty: scaled.qty }] };
       if ('drawable' in batchDraw) {
         // Cases 3 vs today: a bin that cannot cover the draw is `409
         // pick-bin-short` when the epoch proves it MOVED (re-plannable — 4.4
         // turns it into an alternate bin or a partial order, and the client
         // keeps the op), and the unchanged `422 insufficient-on-hand` when it
         // did not (which is also every pre-upgrade device's behaviour).
-        throw binCannotCover(epochMoved, drawBin.code, batchDraw.drawable, command.qty);
+        throw binCannotCover(epochMoved, drawBin.code, batchDraw.drawable, scaled.qty);
       }
       const allocation = batchDraw.arms;
 
@@ -869,10 +905,10 @@ export class PickCommandService {
       // outcome names the bin CODE and what it actually holds rather than a
       // raw id.
       // Skipped at zero: nothing can fail to cover a draw of nothing.
-      if (command.qty > 0) {
+      if (scaled.qty > 0) {
         const onHand = await this.binOnHandInTx(tx, command, drawBin.id);
-        if (onHand < command.qty) {
-          throw binCannotCover(epochMoved, drawBin.code, onHand, command.qty);
+        if (onHand < scaled.qty) {
+          throw binCannotCover(epochMoved, drawBin.code, onHand, scaled.qty);
         }
       }
 
@@ -1046,7 +1082,7 @@ export class PickCommandService {
             line.reservationId,
           );
           reservationReleased = true;
-          // What the order line still OWES — NOT `quantity - command.qty`.
+          // What the order line still OWES — NOT `quantity - scaled.qty`.
           // Nothing ever shrinks `reservations.quantity` as slices are drawn:
           // a hold is a whole-quantity row whose only mutation is `state`, so
           // on a multi-slice order line `released.quantity` is still the WHOLE
@@ -1060,7 +1096,7 @@ export class PickCommandService {
           // `picked` slice drew its whole `qty`, a `short` one drew
           // `qty - shortfall_qty` (zero on the report of an empty bin). This
           // line itself is excluded — it was flipped to `short` just above and
-          // its own draw is `command.qty`.
+          // its own draw is `scaled.qty`.
           const drawnBySiblings = siblings
             .filter((sibling) => sibling.id !== line.id)
             .reduce((sum, sibling) => {
@@ -1068,7 +1104,7 @@ export class PickCommandService {
               if (sibling.status === 'short') return sum + (sibling.qty - sibling.shortfallQty);
               return sum;
             }, 0);
-          const remainder = released.quantity - drawnBySiblings - command.qty;
+          const remainder = released.quantity - drawnBySiblings - scaled.qty;
           counterRestoreUnits = released.quantity;
           if (remainder > 0) {
             const regranted = await this.inventory.grantReservationInTx(tx, {
@@ -1196,7 +1232,7 @@ export class PickCommandService {
       // — and `picks_qty_positive` says as much at the database. `picks`
       // keeps meaning "units that actually moved"; the report of an empty bin
       // lives on the LINE, which is what SM-3 needs anyway.
-      const pickId = command.qty === 0 ? null : uuidv7();
+      const pickId = scaled.qty === 0 ? null : uuidv7();
       const batchId = allocation.length === 1 ? allocation[0]!.batchId : null;
       if (pickId !== null) {
       try {
@@ -1217,7 +1253,7 @@ export class PickCommandService {
           reservationId: line.reservationId,
           reservationCommitted,
           conflictClass,
-          qty: command.qty,
+          qty: scaled.qty,
           pickedBy: command.operatorUserId,
           pickedAt,
           deviceId: command.deviceId,
@@ -1262,7 +1298,7 @@ export class PickCommandService {
           suggestedBatchCode,
           // Story 10.1: the snapshot IS the HTTP body, the stored idempotent
           // replay and the outbox payload — base units on the way out.
-          qty: fromMilli(command.qty),
+          qty: fromMilli(scaled.qty),
           reservationId: line.reservationId,
           reservationCommitted,
           lineStatus: shortPick ? 'short' : 'picked',
