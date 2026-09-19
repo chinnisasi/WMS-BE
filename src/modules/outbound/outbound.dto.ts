@@ -19,7 +19,7 @@ import {
   IsNumber,
   ValidateNested,
 } from 'class-validator';
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, OmitType } from '@nestjs/swagger';
 import { ORDER_SOURCES, ORDER_STATUSES } from './order.command';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
 // The pack bounds are the COMMAND's constants, imported rather than copied:
@@ -1083,12 +1083,12 @@ export class PackResponse {
  * (story 10.7). The same scan shape the tenant pack route verifies
  * (`PackOrderDto`, inherited validators and all), with the order id moved
  * into the BODY because a device route names no path order id. The device
- * client never captures parcel dimensions (`dimensionsMm` stays the web
- * surface's arm and its field stays absent in the device payload); the
- * inherited field remains so the two routes' bodies are one shape and the
- * command's hash contract does not fork.
+ * client never captures parcel dimensions, so `dimensionsMm` is OMITTED —
+ * the OpenAPI stops advertising it and (with the whitelist validation pipe)
+ * a device body that sends it is stripped rather than silently accepted;
+ * the web surface keeps the arm (review W6, story 10.7).
  */
-export class DevicePackDto extends PackOrderDto {
+export class DevicePackDto extends OmitType(PackOrderDto, ['dimensionsMm'] as const) {
   @ApiProperty({ format: 'uuid', description: 'The fully-picked order being packed' })
   @IsUUID()
   orderId!: string;

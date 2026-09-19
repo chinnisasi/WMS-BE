@@ -642,7 +642,7 @@ export class OutboundController {
           skuId: line.skuId,
           qty: line.qty,
           handlingUnitIds:
-            line.handlingUnitIds !== undefined && line.handlingUnitIds.length > 0
+            line.handlingUnitIds != null && line.handlingUnitIds.length > 0
               ? line.handlingUnitIds
               : undefined,
         })),

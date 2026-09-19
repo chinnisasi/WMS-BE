@@ -125,6 +125,46 @@ export const DEFAULT_OUTBOUND_PAGE_SIZE = 50;
 export const MAX_SNAPSHOT_PACK_TASKS = 500;
 
 /**
+ * Caps an over-read at `max`, cutting only on GROUP boundaries (the rows
+ * arrive ordered by group; `keyOf` names the group a row belongs to). A
+ * half-delivered group is exactly what the cap must never emit — the pack
+ * bench's exact-match gate needs EVERY SKU of an order, so the order
+ * straddling the ceiling is dropped whole (the `truncateToWholePicklists`
+ * shape, extracted parameterized by the group key so the boundary is
+ * unit-testable without seeding five hundred pack lines — review W8/W9,
+ * story 10.7).
+ *
+ * The one exception, and the reason this is a named function: when a SINGLE
+ * group occupies the entire ceiling on its own, dropping it whole would hand
+ * the devices an empty snapshot while packable work exists. There, a
+ * truncated group beats no group — the group is kept at the ceiling,
+ * TRUNCATED (never "returned as it is": the rows past the ceiling are cut,
+ * and the device's exact-match gate simply never sees a count it cannot
+ * reconcile against a snapshot that omits them). Pure.
+ */
+export function truncateToWholeGroups<T>(
+  overRead: readonly T[],
+  max: number,
+  keyOf: (row: T) => string,
+): T[] {
+  if (overRead.length <= max) {
+    return [...overRead];
+  }
+  const kept = overRead.slice(0, max);
+  const straddling = keyOf(kept[kept.length - 1]!);
+  // The cut fell inside `straddling` only if that group also has a row
+  // beyond the ceiling (the pick precedent's `overRead[max]` check — NOT the
+  // over-read's last row: a straddling order followed by other orders still
+  // straddles).
+  if (keyOf(overRead[max]!) !== straddling) {
+    return kept;
+  }
+  const whole = kept.filter((row) => keyOf(row) !== straddling);
+  // Never hand back nothing while packable work exists.
+  return whole.length === 0 ? kept : whole;
+}
+
+/**
  * The cursor is opaque to clients but crafted input is still possible — a
  * base64-valid payload with a non-uuid `id` would otherwise reach the
  * `::uuid` cast in SQL and surface as a 500 instead of a 400 (the
@@ -544,18 +584,10 @@ export class OutboundFacade {
       .orderBy(asc(orders.createdAt), asc(orders.id), asc(skus.code), asc(picks.skuId))
       .limit(MAX_SNAPSHOT_PACK_TASKS + 1);
 
-    // Whole-order truncation (the `truncateToWholePicklists` shape, keyed by
-    // order): the rows arrive ordered per order, so the straddling order is
-    // the one whose rows appear on both sides of the ceiling. Never hand back
-    // nothing while packable work exists — a single giant order is returned
-    // as it is, the same exception the pick tasks' truncation makes.
-    let rows = overRead;
-    if (rows.length > MAX_SNAPSHOT_PACK_TASKS) {
-      const kept = rows.slice(0, MAX_SNAPSHOT_PACK_TASKS);
-      const straddling = kept[kept.length - 1]!.orderId;
-      const whole = rows[rows.length - 1]!.orderId === straddling ? kept.filter((row) => row.orderId !== straddling) : kept;
-      rows = whole.length === 0 ? kept : whole;
-    }
+    // Whole-order truncation — `truncateToWholeGroups`, keyed by order. The
+    // over-read is `MAX_SNAPSHOT_PACK_TASKS + 1` so the function can see
+    // whether the ceiling fell inside an order.
+    const rows = truncateToWholeGroups(overRead, MAX_SNAPSHOT_PACK_TASKS, (row) => row.orderId);
 
     const packTasks: PackTask[] = rows.map((row) => ({
       orderId: row.orderId,

@@ -11967,16 +11967,6 @@
             "maximum": 1000000,
             "description": "Optional parcel weight in grams. Absence is never an error; a non-positive value is a 400."
           },
-          "dimensionsMm": {
-            "nullable": true,
-            "description": "Optional parcel dimensions in millimetres — all three sides together, or the object omitted.",
-            "type": "object",
-            "allOf": [
-              {
-                "$ref": "#/components/schemas/PackDimensionsDto"
-              }
-            ]
-          },
           "orderId": {
             "type": "string",
             "format": "uuid",

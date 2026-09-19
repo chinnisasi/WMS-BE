@@ -361,6 +361,8 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
     orderId: string;
     scanned: { skuId: string; qty: number; handlingUnitIds?: string[] }[];
     weightGrams?: number | null;
+    /** Only sent by the review-W6 refusal test — the device payload has no dimensions arm. */
+    dimensionsMm?: { lengthMm: number; widthMm: number; heightMm: number };
   }
 
   /** The story-10.7 device pack route, under the badge-in session. */
@@ -575,8 +577,106 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
       .expect(401);
     expect(bare.body.code).toBe('unauthenticated');
 
-    // And the order is still bench work — nothing was consumed by the refusals.
+    // Nothing was consumed by the refusals — and the order was never bench
+    // work in the first place: its pick line is still planned, so the
+    // packable predicate does not list it (review W14 — the old comment
+    // contradicted the assertion under it).
     const tasks = (await snapshot()).packTasks.filter((task) => task.orderId === orderId);
-    expect(tasks).toHaveLength(0); // still planned → not yet packable
+    expect(tasks).toHaveLength(0);
+  });
+
+  // ── the route's authority arms (review W11) ────────────────────────────────
+
+  /** A second tenant's badge-in operator — the foreign-tenant arm's token. */
+  async function secondTenantOperator(): Promise<string> {
+    const email = `other-${ulid().toLowerCase()}@example.com`;
+    const registered = await request(app.getHttpServer())
+      .post(API)
+      .set(KEY_HEADER, ulid())
+      .send({ name: `Other Co ${ulid()}`, ownerEmail: email, password: 'correct-horse-battery' })
+      .expect(201);
+    createdTenantIds.push(registered.body.tenant.id as string);
+    const otherTenantId = registered.body.tenant.id as string;
+    const otherToken = await request(app.getHttpServer())
+      .post(`${API}/sign-in`)
+      .send({ email, password: 'correct-horse-battery' })
+      .expect(200)
+      .then((res) => res.body.accessToken as string);
+    const minted = await request(app.getHttpServer())
+      .post(`${API}/${otherTenantId}/devices/enrollment-codes`)
+      .set('Authorization', `Bearer ${otherToken}`)
+      .set(KEY_HEADER, ulid())
+      .expect(201);
+    const enrolled = await request(app.getHttpServer())
+      .post(`${API}/${otherTenantId}/devices/enroll`)
+      .set(KEY_HEADER, ulid())
+      .send({ code: minted.body.code, label: 'Other tenant device', pin: '1357' })
+      .expect(201);
+    const operatorEmail = `other-op-${ulid().toLowerCase()}@example.com`;
+    const invited = await request(app.getHttpServer())
+      .post(`${API}/${otherTenantId}/users`)
+      .set('Authorization', `Bearer ${otherToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ email: operatorEmail, role: 'operator' })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`${API}/${otherTenantId}/accept-invite`)
+      .set(KEY_HEADER, ulid())
+      .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
+      .expect(200);
+    const badged = await request(app.getHttpServer())
+      .post(`${API}/${otherTenantId}/devices/badge-in`)
+      .set('Authorization', `Bearer ${enrolled.body.deviceToken as string}`)
+      .send({ operatorEmail, pin: '1357' })
+      .expect(200);
+    return badged.body.accessToken as string;
+  }
+
+  it('the device route is authority-gated: the key is required and must parse, a foreign tenant is 403', async () => {
+    const { orderId, line } = await pickedOrder('BENCH-BRAVO', 2, 'bench-authority');
+    const body: DevicePackBody = { orderId, scanned: [{ skuId: line.skuId, qty: 2 }] };
+
+    // No Idempotency-Key at all → 400, before any command logic runs.
+    const missing = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/packs`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .send(body)
+      .expect(400);
+    expect(missing.body.code).toBe('idempotency-key-required');
+
+    // A value that is not a ULID → 400, same gate.
+    const malformed = await devicePack(body, operatorToken, 'not-a-ulid').expect(400);
+    expect(malformed.body.code).toBe('idempotency-key-invalid');
+
+    // A valid badge-in session of ANOTHER tenant → 403 permission-denied,
+    // and nothing is written (the order is still packable work afterwards).
+    const foreignToken = await secondTenantOperator();
+    const denied = await devicePack(body, foreignToken).expect(403);
+    expect(denied.body.code).toBe('permission-denied');
+    expect((await snapshot()).packTasks.some((task) => task.orderId === orderId)).toBe(true);
+
+    // The order packs fine under its own tenant — the refusals never touched it.
+    await devicePack(body).expect(201);
+  });
+
+  it('the device route normalizes an explicit weightGrams null to the unmeasured parcel, and no longer accepts dimensionsMm', async () => {
+    const { orderId, line } = await pickedOrder('BENCH-CHARLIE', 2, 'bench-normalize');
+    const packed = await devicePack({
+      orderId,
+      scanned: [{ skuId: line.skuId, qty: 2 }],
+      // An explicit null is the same UNMEASURED parcel as an absent field —
+      // the controller normalizes it away so both spellings hash identically.
+      weightGrams: null,
+    }).expect(201);
+    expect(packed.body.pack.weightGrams).toBeNull();
+    expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
+
+    // The device payload has NO dimensions arm (review W6): the DTO omits it,
+    // so with the whitelist pipe a body that sends it is refused outright.
+    await devicePack({
+      orderId: uuidv7(),
+      scanned: [{ skuId: line.skuId, qty: 2 }],
+      dimensionsMm: { lengthMm: 100, widthMm: 100, heightMm: 100 },
+    }).expect(400);
   });
 });
