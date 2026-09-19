@@ -17,6 +17,7 @@ import {
   localTimeOfDay,
 } from '../src/modules/outbound/wave.command';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -163,7 +164,7 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
       .post(`${API}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `WAV-${ulid().slice(10, 16).toUpperCase()}`, name: `Wave WH ${ulid()}` })
+      .send({ origin: testAddress(), code: `WAV-${ulid().slice(10, 16).toUpperCase()}`, name: `Wave WH ${ulid()}` })
       .expect(201);
     warehouseId = warehouse.body.id as string;
     const zone = (
@@ -311,7 +312,7 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
       .post(`${API}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `${tag}-${ulid().slice(10, 16).toUpperCase()}`, name: `${tag} WH ${ulid()}` })
+      .send({ origin: testAddress(), code: `${tag}-${ulid().slice(10, 16).toUpperCase()}`, name: `${tag} WH ${ulid()}` })
       .expect(201);
     const id = warehouse.body.id as string;
     const zone = (
@@ -392,7 +393,7 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
       .post(`${API}/${tenantId}/outbound/orders`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId: inWarehouse, lines })
+      .send({ warehouseId: inWarehouse, lines, destination: testAddress() })
       .expect(201);
     return res.body.order.id as string;
   }

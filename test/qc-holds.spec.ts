@@ -9,6 +9,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import type { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -87,7 +88,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `QCH-${ulid().slice(10, 16).toUpperCase()}`, name: `QC WH ${ulid()}` })
+        .send({ origin: testAddress(), code: `QCH-${ulid().slice(10, 16).toUpperCase()}`, name: `QC WH ${ulid()}` })
         .expect(201)
     ).body.id as string;
     const zone = await request(app.getHttpServer())
@@ -751,7 +752,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `QCH2-${ulid().slice(10, 16).toUpperCase()}`, name: `QC WH2 ${ulid()}` })
+        .send({ origin: testAddress(), code: `QCH2-${ulid().slice(10, 16).toUpperCase()}`, name: `QC WH2 ${ulid()}` })
         .expect(201)
     ).body.id as string;
     const zone2 = (

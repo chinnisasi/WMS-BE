@@ -9,6 +9,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -214,7 +215,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       .post(`${API}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `BLR-${ulid().slice(10, 16).toUpperCase()}`, name: `Whitefield ${ulid()}` })
+      .send({ origin: testAddress(), code: `BLR-${ulid().slice(10, 16).toUpperCase()}`, name: `Whitefield ${ulid()}` })
       .expect(201);
     warehouseId = warehouse.body.id as string;
     const zone = await request(app.getHttpServer())

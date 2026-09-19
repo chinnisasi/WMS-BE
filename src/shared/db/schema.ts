@@ -126,6 +126,13 @@ export type AuditEvent = typeof auditEvents.$inferSelect;
 /**
  * Stocking sites. Warehouse codes are unique per tenant — duplicate rejection
  * names the conflicting code (409 `duplicate-warehouse-code`).
+ *
+ * Origin address (story 11-1): seven flat, nullable text columns — the point
+ * the warehouse ships FROM, rated and labelled from (story 4-6d). Set at
+ * create only; the update path is 4-6d's to add. Pre-11.1 rows read back
+ * null and are simply unrated. No FKs (repo convention). Column shape is the
+ * shared address field set (`src/shared/primitives/address.ts`); pincode is
+ * TEXT, never an integer — leading zeros are significant.
  */
 export const warehouses = pgTable(
   'warehouses',
@@ -136,6 +143,14 @@ export const warehouses = pgTable(
     tenantId: uuid('tenant_id').notNull(),
     code: text('code').notNull(),
     name: text('name').notNull(),
+    /** Origin address (story 11-1) — required at create, null on pre-11.1 rows. */
+    originContactName: text('origin_contact_name'),
+    originPhone: text('origin_phone'),
+    originLine1: text('origin_line1'),
+    originLine2: text('origin_line2'),
+    originCity: text('origin_city'),
+    originState: text('origin_state'),
+    originPincode: text('origin_pincode'),
     ...tenantTimestamps,
   },
   (table) => [uniqueIndex('warehouses_tenant_id_code_unique').on(table.tenantId, table.code)],
@@ -1530,6 +1545,14 @@ export const orders = pgTable(
     externalEventId: text('external_event_id'),
     /** The ingested payload's fingerprint; null on a manual order. */
     sourcePayloadHash: text('source_payload_hash'),
+    /** Destination address (story 11-1) — required at create, null on pre-11.1 rows. */
+    destinationContactName: text('destination_contact_name'),
+    destinationPhone: text('destination_phone'),
+    destinationLine1: text('destination_line1'),
+    destinationLine2: text('destination_line2'),
+    destinationCity: text('destination_city'),
+    destinationState: text('destination_state'),
+    destinationPincode: text('destination_pincode'),
     ...tenantTimestamps,
   },
   (table) => [

@@ -11,6 +11,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { signTenantSession } from '../src/modules/tenancy/jwt-session';
 import { TenancyService } from '../src/modules/tenancy/tenancy.service';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -29,7 +30,7 @@ function registrationBody(email: string): Record<string, unknown> {
 }
 
 function warehouseBody(code: string): Record<string, unknown> {
-  return { code, name: `Whitefield ${ulid()}` };
+  return { code, name: `Whitefield ${ulid()}`, origin: testAddress() };
 }
 
 describe('tenancy (e2e)', () => {
@@ -564,7 +565,7 @@ describe('tenancy (e2e)', () => {
       .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${token}`)
       .set('Idempotency-Key', ulid())
-      .send({ code: `  ${code}  `, name: '  Whitefield  ' })
+      .send({ code: `  ${code}  `, name: '  Whitefield  ', origin: testAddress() })
       .expect(201);
 
     // The trimmed code is the stored one: the unpadded duplicate conflicts.
@@ -572,7 +573,7 @@ describe('tenancy (e2e)', () => {
       .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${token}`)
       .set('Idempotency-Key', ulid())
-      .send({ code, name: 'Whitefield again' })
+      .send({ code, name: 'Whitefield again', origin: testAddress() })
       .expect(409);
     expect(dup.body).toMatchObject({ code: 'duplicate-warehouse-code' });
 
@@ -581,7 +582,7 @@ describe('tenancy (e2e)', () => {
       .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${token}`)
       .set('Idempotency-Key', ulid())
-      .send({ code: `BLR-${ulid().slice(10, 16).toUpperCase()}`, name: '   ' })
+      .send({ code: `BLR-${ulid().slice(10, 16).toUpperCase()}`, name: '   ', origin: testAddress() })
       .expect(400);
   });
 

@@ -29,6 +29,13 @@ import {
   assertRecordableQuantity,
   fromMilli,
 } from '../../shared/primitives/quantity';
+import {
+  addressFingerprint,
+  assertAddress,
+  addressFromColumns,
+  normalizeAddressInput,
+} from '../../shared/primitives/address';
+import type { AddressInput, AddressSnapshot } from '../../shared/primitives/address';
 import { uomPrecision } from '../catalog/uom';
 
 // ── state machine + policy constants (the outbound module exclusively owns
@@ -123,6 +130,15 @@ export interface CreateOrderCommand {
   /** `manual` (default) or `ingested` (the adapter-ready ingestion surface). */
   readonly source: OrderSource;
   readonly lines: readonly OrderLineInput[];
+  /**
+   * Where the shipment goes (story 11-1). REQUIRED at create (the human
+   * decision 2026-09-19) on manual and ingested orders alike — carriers rate,
+   * label and manifest from it. Validated command-side (`assertAddress`):
+   * atomic, never partial; the pincode is text. Absent on no caller today;
+   * the optionality here is the adapter path's, and the preflight refuses an
+   * absent address before any write.
+   */
+  readonly destination?: AddressInput | undefined;
   /** Channel arms — required together when `source: 'ingested'`, else absent. */
   readonly integrationId?: string | undefined;
   readonly externalEventId?: string | undefined;
@@ -164,6 +180,8 @@ export interface OrderSnapshot {
     readonly source: OrderSource;
     readonly integrationId: string | null;
     readonly externalEventId: string | null;
+    /** Where the shipment goes (story 11-1); null on a pre-11.1 order row. */
+    readonly destination: AddressSnapshot | null;
     readonly createdAt: string;
     readonly updatedAt: string;
     readonly lines: readonly OrderLineSnapshot[];
@@ -232,6 +250,17 @@ export class OrderCommandService {
     // For an ingested order this is also the dedup fingerprint: the same
     // channel payload redelivered under a new idempotency key resolves to
     // the same order; a divergent payload on the same ref is a 422.
+    // ── story 11-1: the destination address joins BOTH hashes ──────────────
+    // Normalized (trimmed, blank line2 dropped) BEFORE hashing — deterministic
+    // and DB-independent, so equivalent inputs hash identically. The key is
+    // always present (`?? null`): a body without an address hashes DIFFERENTLY
+    // from a pre-11.1 payload (whose hash lacked the key entirely), which is
+    // the accepted replay break — an in-flight pre-11.1 key answers 422
+    // `idempotency-key-reuse` / `order-source-conflict` instead of replaying.
+    // Pre-launch, nothing to be compatible with; pinned EXPECTED in
+    // `test/shipment-addresses.spec.ts`.
+    const normalizedDestination = normalizeAddressInput(command.destination);
+
     // ── story 10.2: BOTH hashes below are over BASE units ─────────────────
     // Conversion moved out of the controller and into the create preflight,
     // behind the replay lookup, so the hashed line quantities changed with it.
@@ -242,11 +271,13 @@ export class OrderCommandService {
     // delivered by one answers `order-source-conflict` rather than resolving
     // to its original order. `test/picking.spec.ts` pins the break as
     // EXPECTED. No compatibility branch exists; there is nothing to be
-    // compatible with.
+    // compatible with. (Story 11-1 grew the destination into both hashes —
+    // the same break again, pinned the same way.)
     const sourcePayloadHash =
       command.source === 'ingested'
         ? hashCommandPayload({
             warehouseId: command.warehouseId,
+            destination: addressFingerprint(normalizedDestination) ?? null,
             lines: command.lines.map(lineFingerprint),
           })
         : null;
@@ -256,6 +287,7 @@ export class OrderCommandService {
       source: command.source,
       integrationId,
       externalEventId,
+      destination: addressFingerprint(normalizedDestination) ?? null,
       lines: command.lines.map(lineFingerprint),
     });
 
@@ -270,11 +302,17 @@ export class OrderCommandService {
 
       const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replay !== null) {
-        return { replayed: replay as OrderSnapshot, lines: [] as OrderLineInput[] };
+        return { replayed: replay as OrderSnapshot, destination: undefined, lines: [] as OrderLineInput[] };
       }
 
       // ── input validation (400 before any write) ─────────────────────────
       this.assertLines(command.lines);
+      // Story 11-1: the destination is validated HERE, behind the replay
+      // lookup — the command is the boundary (the Epic 7 adapter path bypasses
+      // the DTO's @ValidateNested), and a refusal must never answer 400 to an
+      // op that already committed. Required at create (the human decision
+      // 2026-09-19), atomic (never partial), pincode six digits as text.
+      const destination = assertAddress(command.destination, 'destination');
       if (command.source === 'ingested') {
         if (integrationId === null || externalEventId === null || externalEventId === '') {
           throw validationFailed(
@@ -344,17 +382,20 @@ export class OrderCommandService {
             payloadHash,
             snapshot,
           );
-          return { replayed: snapshot, lines };
+          return { replayed: snapshot, destination: undefined, lines };
         }
       }
-      return { replayed: null, lines };
+      return { replayed: null, destination, lines };
     });
     if (preflight.replayed !== null) {
       return preflight.replayed;
     }
     // The milli-unit lines the preflight converted — the ONLY quantities the
-    // grant and write phases below ever see.
+    // grant and write phases below ever see. The destination is the
+    // preflight's validated, normalized address (story 11-1) — defined
+    // whenever the replay did not hit, because the validation above ran.
     const lines = preflight.lines;
+    const destination = preflight.destination!;
 
     // ── phase 2: the per-line ATP split + grants (each its own atomic unit).
     // Every grant lands before the order-create tx opens; any failure here
@@ -392,6 +433,16 @@ export class OrderCommandService {
             integrationId,
             externalEventId,
             sourcePayloadHash,
+            // Story 11-1: the validated, normalized destination — flat
+            // columns, copied at create (point-in-time), line2 null when
+            // absent. Pincode stays text.
+            destinationContactName: destination.contactName,
+            destinationPhone: destination.phone,
+            destinationLine1: destination.line1,
+            destinationLine2: destination.line2 ?? null,
+            destinationCity: destination.city,
+            destinationState: destination.state,
+            destinationPincode: destination.pincode,
           });
         } catch (err) {
           if (isUniqueViolationOn(err, ORDERS_SOURCE_EVENT_UNIQUE)) {
@@ -941,6 +992,17 @@ export class OrderCommandService {
         source: order.source as OrderSource,
         integrationId: order.integrationId,
         externalEventId: order.externalEventId,
+        // Story 11-1: the destination echoes from the flat columns; a
+        // pre-11.1 row (all null) reads back `destination: null`.
+        destination: addressFromColumns({
+          contactName: order.destinationContactName,
+          phone: order.destinationPhone,
+          line1: order.destinationLine1,
+          line2: order.destinationLine2,
+          city: order.destinationCity,
+          state: order.destinationState,
+          pincode: order.destinationPincode,
+        }),
         createdAt: canonicalInstant(order.createdAt),
         updatedAt: canonicalInstant(order.updatedAt),
         lines: lines.map((line) => lineSnapshot(line, reservations)),

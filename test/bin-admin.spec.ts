@@ -7,6 +7,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -81,7 +82,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `BA-${ulid().slice(10, 16).toUpperCase()}`, name: `Bin Admin Depot ${ulid()}` })
+        .send({ origin: testAddress(), code: `BA-${ulid().slice(10, 16).toUpperCase()}`, name: `Bin Admin Depot ${ulid()}` })
         .expect(201)
     ).body.id as string;
     zoneId = (
@@ -712,7 +713,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `BA2-${ulid().slice(10, 16).toUpperCase()}`, name: `Second Depot ${ulid()}` })
+        .send({ origin: testAddress(), code: `BA2-${ulid().slice(10, 16).toUpperCase()}`, name: `Second Depot ${ulid()}` })
         .expect(201)
     ).body.id as string;
     const otherZoneId = (

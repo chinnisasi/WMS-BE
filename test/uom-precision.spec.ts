@@ -23,6 +23,7 @@ import {
 } from '../src/modules/catalog/uom';
 import { QUANTITY_DECIMALS } from '../src/shared/primitives/quantity';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -379,7 +380,7 @@ describe('story 10.2: UoM is a closed vocabulary with a declared precision (e2e)
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `UOM-${ulid().slice(10, 16).toUpperCase()}`, name: 'Vocabulary WH' })
+        .send({ origin: testAddress(), code: `UOM-${ulid().slice(10, 16).toUpperCase()}`, name: 'Vocabulary WH' })
         .expect(201)
     ).body.id as string;
     zoneId = (
@@ -701,7 +702,7 @@ describe('story 10.2: UoM is a closed vocabulary with a declared precision (e2e)
           .post(`${API}/${tenantId}/outbound/orders`)
           .set('Authorization', `Bearer ${opsToken}`)
           .set(KEY_HEADER, ulid())
-          .send({ warehouseId, lines: [{ skuId, quantity: 4 }] })
+          .send({ warehouseId, lines: [{ skuId, quantity: 4 }], destination: testAddress() })
           .expect(201)
       ).body.order.id as string;
       const policyId = (

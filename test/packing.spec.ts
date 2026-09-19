@@ -11,6 +11,7 @@ import { ORDER_STATUSES } from '../src/modules/outbound/order.command';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { getLedgerEventType } from '../src/modules/inventory/ledger-registry';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -139,7 +140,7 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `PAK-${ulid().slice(10, 16).toUpperCase()}`, name: `Pack WH ${ulid()}` })
+        .send({ origin: testAddress(), code: `PAK-${ulid().slice(10, 16).toUpperCase()}`, name: `Pack WH ${ulid()}` })
         .expect(201)
     ).body.id as string;
     zoneId = (
@@ -329,7 +330,7 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
       .post(`${API}/${tenantId}/outbound/orders`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId, lines })
+      .send({ warehouseId, lines, destination: testAddress() })
       .expect(201);
     return res.body.order.id as string;
   }

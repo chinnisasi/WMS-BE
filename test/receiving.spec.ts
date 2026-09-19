@@ -6,6 +6,7 @@ import { MAX_QUANTITY_BASE, MAX_QUANTITY_MILLI, fromMilli } from '../src/shared/
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -71,7 +72,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `RCV-${ulid().slice(10, 16).toUpperCase()}`, name: `Receiving Depot ${ulid()}` })
+        .send({ origin: testAddress(), code: `RCV-${ulid().slice(10, 16).toUpperCase()}`, name: `Receiving Depot ${ulid()}` })
         .expect(201)
     ).body.id as string;
     vendorId = (

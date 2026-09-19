@@ -1,7 +1,23 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { MAX_QUANTITY_BASE } from '../../shared/primitives/quantity';
-import { Transform } from 'class-transformer';
-import { IsBoolean, IsEmail, IsIn, IsInt, IsNumber, IsString, IsUUID, Length, Matches, Max, Min } from 'class-validator';
+import { ADDRESS_FIELD_LENGTHS, PINCODE_RE } from '../../shared/primitives/address';
+import type { AddressSnapshot } from '../../shared/primitives/address';
+import { Transform, Type } from 'class-transformer';
+import {
+  IsBoolean,
+  IsEmail,
+  IsIn,
+  IsInt,
+  IsNumber,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Length,
+  Matches,
+  Max,
+  Min,
+  ValidateNested,
+} from 'class-validator';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -43,6 +59,93 @@ export class SignInDto {
   password!: string;
 }
 
+/**
+ * The shipment address, on the wire (story 11-1). One field set serves both
+ * the order destination (outbound) and the warehouse origin — the class is
+ * shared rather than copied so the two contracts cannot drift. The shapes
+ * mirror `src/shared/primitives/address.ts` (the same constants, the same
+ * pincode regex); the COMMAND re-validates everything behind its replay
+ * lookup, because the Epic 7 adapter path bypasses this DTO.
+ *
+ * No country field — India-only by design.
+ */
+export class AddressDto {
+  @ApiProperty({ example: 'Priya Spices Pvt Ltd', maxLength: ADDRESS_FIELD_LENGTHS.contactName })
+  @Trimmed()
+  @IsString()
+  @Length(1, ADDRESS_FIELD_LENGTHS.contactName)
+  contactName!: string;
+
+  @ApiProperty({ example: '+91 98450 12345', maxLength: ADDRESS_FIELD_LENGTHS.phone })
+  @Trimmed()
+  @IsString()
+  @Length(1, ADDRESS_FIELD_LENGTHS.phone)
+  phone!: string;
+
+  @ApiProperty({ example: '12, Peenya Industrial Area', maxLength: ADDRESS_FIELD_LENGTHS.line1 })
+  @Trimmed()
+  @IsString()
+  @Length(1, ADDRESS_FIELD_LENGTHS.line1)
+  line1!: string;
+
+  @ApiProperty({
+    required: false,
+    example: 'Gate 3',
+    maxLength: ADDRESS_FIELD_LENGTHS.line2,
+    description: 'Second address line — omit when there is none',
+  })
+  @Trimmed()
+  @IsOptional()
+  @IsString()
+  // Optional: absent skips validation; an explicit '' is allowed at the wire
+  // and normalized to "absent" by the command (the two hash identically).
+  @Length(0, ADDRESS_FIELD_LENGTHS.line2)
+  line2?: string;
+
+  @ApiProperty({ example: 'Bengaluru', maxLength: ADDRESS_FIELD_LENGTHS.city })
+  @Trimmed()
+  @IsString()
+  @Length(1, ADDRESS_FIELD_LENGTHS.city)
+  city!: string;
+
+  @ApiProperty({ example: 'Karnataka', maxLength: ADDRESS_FIELD_LENGTHS.state })
+  @Trimmed()
+  @IsString()
+  @Length(1, ADDRESS_FIELD_LENGTHS.state)
+  state!: string;
+
+  @ApiProperty({
+    example: '560066',
+    description: 'Six-digit Indian pincode, as TEXT — leading zeros are significant, never an integer',
+  })
+  @Trimmed()
+  @IsString()
+  @Matches(PINCODE_RE, { message: 'pincode must be a 6-digit Indian pincode' })
+  pincode!: string;
+}
+
+/**
+ * Snapshot → wire (story 11-1): the stored `line2` null (absent at create)
+ * serializes as an ABSENT optional field, not `null` — the same input that
+ * omitted line2 reads back omitting it. Everything else passes verbatim.
+ * Used at the response edges for both the order destination and the
+ * warehouse origin.
+ */
+export function toAddressDto(address: AddressSnapshot | null): AddressDto | null {
+  if (address === null) {
+    return null;
+  }
+  return {
+    contactName: address.contactName,
+    phone: address.phone,
+    line1: address.line1,
+    ...(address.line2 === null ? {} : { line2: address.line2 }),
+    city: address.city,
+    state: address.state,
+    pincode: address.pincode,
+  };
+}
+
 export class CreateWarehouseDto {
   @ApiProperty({ example: 'BLR-01', minLength: 1, maxLength: 32 })
   @Trimmed()
@@ -55,6 +158,15 @@ export class CreateWarehouseDto {
   @IsString()
   @Length(1, 120)
   name!: string;
+
+  @ApiProperty({
+    type: AddressDto,
+    description:
+      'The origin address — where shipments leave from (story 11-1). Required at create; carriers rate and label from it. There is no update endpoint (story 4-6d owns that decision).',
+  })
+  @ValidateNested()
+  @Type(() => AddressDto)
+  origin!: AddressDto;
 }
 
 export class TenantResponse {
@@ -191,6 +303,13 @@ export class WarehouseResponse {
 
   @ApiProperty({ example: 'Whitefield' })
   name!: string;
+
+  @ApiProperty({
+    type: AddressDto,
+    nullable: true,
+    description: 'The origin address (story 11-1); null on a pre-11.1 warehouse row',
+  })
+  origin!: AddressDto | null;
 
   @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
   createdAt!: string;

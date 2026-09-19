@@ -13,6 +13,8 @@ import { getMemberRoleIn } from './tenancy.service';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
+import { addressFingerprint, assertAddress, addressFromColumns, normalizeAddressInput } from '../../shared/primitives/address';
+import type { AddressInput, AddressSnapshot } from '../../shared/primitives/address';
 
 export interface CreateWarehouseCommand {
   readonly tenantId: string;
@@ -20,6 +22,14 @@ export interface CreateWarehouseCommand {
   readonly actorUserId: string;
   readonly code: string;
   readonly name: string;
+  /**
+   * The origin address (story 11-1) — where shipments leave from. REQUIRED
+   * at create (the human decision 2026-09-19); validated command-side
+   * (`assertAddress`, behind the replay lookup) because the shape rules must
+   * hold for any non-HTTP caller too, not only the DTO path. Set at create
+   * only — no update endpoint exists (story 4-6d owns that decision).
+   */
+  readonly origin?: AddressInput | undefined;
 }
 
 /** The API response body for a warehouse (the idempotency snapshot). */
@@ -29,6 +39,8 @@ export interface WarehouseSnapshot {
     readonly tenantId: string;
     readonly code: string;
     readonly name: string;
+    /** The origin address (story 11-1); null on a pre-11.1 warehouse row. */
+    readonly origin: AddressSnapshot | null;
     readonly createdAt: string;
   };
 }
@@ -37,10 +49,13 @@ const WAREHOUSES_TENANT_CODE = 'warehouses_tenant_id_code_unique';
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 /**
- * Warehouse creation (AD-10): validates nothing itself (DTO layer does),
- * writes the warehouse with `tenant_id` stamped, and de-dupes on
- * `(tenant_id, key)` in the same transaction (AD-5). Codes are unique per
- * tenant — the duplicate rejection names the conflicting code.
+ * Warehouse creation (AD-10): writes the warehouse with `tenant_id` stamped,
+ * and de-dupes on `(tenant_id, key)` in the same transaction (AD-5). Codes
+ * are unique per tenant — the duplicate rejection names the conflicting code.
+ * The origin address (story 11-1) is validated HERE, behind the replay
+ * lookup (`assertAddress`) — the DTO mirrors the shapes for HTTP callers,
+ * but the command is the boundary that keeps a bad address out of the
+ * columns (the adapter-path rule).
  */
 @Injectable()
 export class WarehouseCommand {
@@ -53,10 +68,18 @@ export class WarehouseCommand {
     command: CreateWarehouseCommand,
     idempotencyKey: string,
   ): Promise<WarehouseSnapshot> {
+    // Story 11-1: the origin joins the payload hash with the key always
+    // present (`?? null`) — a pre-11.1 body (no origin) hashes differently
+    // from any 11.1 body, so an in-flight pre-11.1 key answers 422 rather
+    // than replaying (the accepted hash-break precedent, pinned for orders
+    // in test/shipment-addresses.spec.ts). Normalized before hashing —
+    // deterministic, DB-independent.
+    const normalizedOrigin = addressFingerprint(normalizeAddressInput(command.origin));
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       code: command.code,
       name: command.name,
+      origin: normalizedOrigin ?? null,
     });
 
     const { snapshot } = await withTenantTransaction(
@@ -91,6 +114,9 @@ export class WarehouseCommand {
         }
 
         let warehouse: WarehouseSnapshot['warehouse'];
+        // Story 11-1: the origin's shape rules run HERE, behind the replay
+        // lookup — required at create, atomic, pincode six digits as text.
+        const origin = assertAddress(command.origin, 'origin');
         try {
           const rows = await tx
             .insert(warehouses)
@@ -99,6 +125,13 @@ export class WarehouseCommand {
               tenantId: command.tenantId,
               code: command.code,
               name: command.name,
+              originContactName: origin.contactName,
+              originPhone: origin.phone,
+              originLine1: origin.line1,
+              originLine2: origin.line2 ?? null,
+              originCity: origin.city,
+              originState: origin.state,
+              originPincode: origin.pincode,
             })
             .returning();
           const row = rows[0]!;
@@ -107,6 +140,15 @@ export class WarehouseCommand {
             tenantId: row.tenantId,
             code: row.code,
             name: row.name,
+            origin: addressFromColumns({
+              contactName: row.originContactName,
+              phone: row.originPhone,
+              line1: row.originLine1,
+              line2: row.originLine2,
+              city: row.originCity,
+              state: row.originState,
+              pincode: row.originPincode,
+            }),
             createdAt: row.createdAt,
           };
         } catch (err) {
