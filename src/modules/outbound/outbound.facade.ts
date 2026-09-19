@@ -1,13 +1,14 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { orders, wavePolicies, waves } from '../../shared/db/schema';
+import { handlingUnits, orders, picks, skus, wavePolicies, waves } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
+import { fromMilli } from '../../shared/primitives/quantity';
 import { canonicalInstant } from '../../shared/primitives/time';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
@@ -70,7 +71,58 @@ export interface WaveEntry {
   readonly updatedAt: string;
 }
 
+/**
+ * The device's pack bench unit of work (story 10.7, additive): ONE
+ * fully-picked order's per-SKU picked totals — the dataset the bench
+ * pre-verifies its scan against, offline. A pack task exists per (order,
+ * SKU) that actually moved units; the shape mirrors what
+ * `PackCommandService.assertScanMatchesPicked` compares (`picks` grouped by
+ * (order, sku), base units at the edge), so the device's exact-match gate
+ * verifies against the same numbers the server will.
+ */
+export interface PackTask {
+  readonly orderId: string;
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly skuName: string;
+  /** What the order actually had PICKED, in base units (a whole count at the bench). */
+  readonly pickedQty: number;
+  /**
+   * Story 10.3: the SKU is handled by unit — the bench must scan each
+   * case's label and the count must equal `pickedQty`, never a typed quantity.
+   */
+  readonly catchWeightTracked: boolean;
+}
+
+/**
+ * One `active` handling unit of the warehouse (story 10.7, additive): the
+ * id + skuId pair the bench resolves a catch-weight case label against,
+ * offline. Active-only self-prunes — a unit flips to `packed` at pack —
+ * so the array is bounded by received-not-yet-packed stock. DELIBERATELY
+ * uncapped: a unit the snapshot omits is a real case the bench would refuse
+ * to scan (its unknown-id gate), so an artificial ceiling here would
+ * queue-and-die a legitimate scan — the exact hole this array exists to close.
+ */
+export interface CatalogHandlingUnit {
+  readonly id: string;
+  readonly skuId: string;
+}
+
+/** The snapshot's pack arm, read in ONE transaction (one consistent read). */
+export interface PackWorkRead {
+  readonly packTasks: readonly PackTask[];
+  readonly handlingUnits: readonly CatalogHandlingUnit[];
+}
+
 export const DEFAULT_OUTBOUND_PAGE_SIZE = 50;
+
+/**
+ * The cap on the snapshot's pack tasks (the `MAX_SNAPSHOT_PICK_TASKS`
+ * precedent), truncated on ORDER boundaries so no order is ever
+ * half-delivered — a bench that saw one SKU of a two-SKU order could never
+ * reach the exact match its commit gate requires.
+ */
+export const MAX_SNAPSHOT_PACK_TASKS = 500;
 
 /**
  * The cursor is opaque to clients but crafted input is still possible — a
@@ -417,6 +469,134 @@ export class OutboundFacade {
   async getPickTasks(tenantId: string, warehouseId: string): Promise<PickTask[]> {
     return withTenantTransaction(this.db, tenantId, (tx) =>
       this.getPickTasksInTx(tx, tenantId, warehouseId),
+    );
+  }
+
+  /**
+   * The device's pack bench work (story 10.7, AD-4): the packable orders'
+   * per-SKU picked totals plus every active handling unit of the warehouse —
+   * composed into the sealed device catalog snapshot additively (the
+   * `pickTasks` precedent).
+   *
+   * The PACKABLE predicate mirrors `packOrder`'s own guards, read-only: an
+   * `accepted` order in the warehouse whose pick plan has at least one
+   * `picklist_lines` row, none still `planned`, and not every one
+   * `cancelled` (the command's whole-withdrawn FLOOR clause — a wave-cancelled
+   * order was never picked and stays re-wavable), and which actually moved
+   * units (`sum(picks.qty) > 0` — `picks` rows are strictly positive, so the
+   * grouped rows below imply it). The completeness is deliberately
+   * LINE-STATUS based, never `picks`-based: a zero-unit short pick writes no
+   * picks row (the command's own header documents why). Per-SKU `pickedQty`
+   * comes from the SAME grouped-`picks` read the command verifies against —
+   * one roll-up, so the snapshot cannot tell the bench a different number
+   * than the server will verify against.
+   *
+   * A READ of the catalog-owned `handling_units` table from this module:
+   * reads are precedented (`pick.command.ts` joins `skus` directly) — the
+   * architecture test's exclusive-writer rule binds WRITES only, and this
+   * module writes none (the `active → packed` flip stays in
+   * `handling-unit.store.ts` through the catalog facade).
+   *
+   * In-tx ONLY, deliberately (the `getPickTasksInTx` reason verbatim): the
+   * snapshot composes its parts in ONE tenant transaction — a pool-opening
+   * sibling would reserve a second connection while the outer one is held,
+   * and postgres.js queues connection requests with no timeout.
+   */
+  async getPackTasksInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<PackWorkRead> {
+    // The packable predicate: `picks` joined to its order (which carries the
+    // warehouse scope and the accepted status), with the line-status arms as
+    // correlated EXISTS fragments — the same shape the wave-list read's
+    // `picklistCount` subquery uses. `picks_tenant_order_idx` serves the
+    // grouped read; the subqueries ride `picklist_lines_tenant_order_idx`.
+    const overRead = await tx
+      .select({
+        orderId: picks.orderId,
+        orderCreatedAt: orders.createdAt,
+        skuId: picks.skuId,
+        skuCode: skus.code,
+        skuName: skus.name,
+        catchWeightTracked: skus.catchWeightTracked,
+        // Story 10.1: `::bigint` — an int4 sum overflows at ~2.1M base units;
+        // int8 comes back as a string and `Number(...)` is the boundary
+        // coercion, exactly as the pack command's own verification query does.
+        pickedQty: sql<string>`sum(${picks.qty})::bigint`,
+      })
+      .from(picks)
+      .innerJoin(orders, and(eq(orders.id, picks.orderId), eq(orders.tenantId, picks.tenantId)))
+      .innerJoin(skus, eq(skus.id, picks.skuId))
+      .where(
+        and(
+          eq(picks.tenantId, tenantId),
+          eq(orders.warehouseId, warehouseId),
+          eq(orders.status, 'accepted'),
+          sql`exists (select 1 from picklist_lines pl where pl.tenant_id = ${picks.tenantId} and pl.order_id = ${picks.orderId})`,
+          sql`not exists (select 1 from picklist_lines pl where pl.tenant_id = ${picks.tenantId} and pl.order_id = ${picks.orderId} and pl.status = 'planned')`,
+          sql`exists (select 1 from picklist_lines pl where pl.tenant_id = ${picks.tenantId} and pl.order_id = ${picks.orderId} and pl.status <> 'cancelled')`,
+        ),
+      )
+      // Primary key columns ride the group by so Postgres's functional
+      // dependency admits the other selected columns without listing them.
+      .groupBy(picks.orderId, orders.id, picks.skuId, skus.id)
+      .orderBy(asc(orders.createdAt), asc(orders.id), asc(skus.code), asc(picks.skuId))
+      .limit(MAX_SNAPSHOT_PACK_TASKS + 1);
+
+    // Whole-order truncation (the `truncateToWholePicklists` shape, keyed by
+    // order): the rows arrive ordered per order, so the straddling order is
+    // the one whose rows appear on both sides of the ceiling. Never hand back
+    // nothing while packable work exists — a single giant order is returned
+    // as it is, the same exception the pick tasks' truncation makes.
+    let rows = overRead;
+    if (rows.length > MAX_SNAPSHOT_PACK_TASKS) {
+      const kept = rows.slice(0, MAX_SNAPSHOT_PACK_TASKS);
+      const straddling = kept[kept.length - 1]!.orderId;
+      const whole = rows[rows.length - 1]!.orderId === straddling ? kept.filter((row) => row.orderId !== straddling) : kept;
+      rows = whole.length === 0 ? kept : whole;
+    }
+
+    const packTasks: PackTask[] = rows.map((row) => ({
+      orderId: row.orderId,
+      skuId: row.skuId,
+      skuCode: row.skuCode,
+      skuName: row.skuName,
+      // Base units at the response edge (story 10.1) — the count the bench's
+      // exact-match gate compares against.
+      pickedQty: fromMilli(Number(row.pickedQty)),
+      catchWeightTracked: row.catchWeightTracked,
+    }));
+
+    // Active units, id + skuId only (the bench resolves labels, nothing more).
+    // Uncapped — see `CatalogHandlingUnit` for why a cap would queue-and-die
+    // legitimate scans. Ordered by id so a re-serialized cache cannot change
+    // the list the device reasons over.
+    const units = await tx
+      .select({ id: handlingUnits.id, skuId: handlingUnits.skuId })
+      .from(handlingUnits)
+      .where(
+        and(
+          eq(handlingUnits.tenantId, tenantId),
+          eq(handlingUnits.warehouseId, warehouseId),
+          eq(handlingUnits.status, 'active'),
+        ),
+      )
+      .orderBy(asc(handlingUnits.id));
+
+    return { packTasks, handlingUnits: units };
+  }
+
+  /**
+   * The same read in its OWN tenant transaction — what the api shell calls
+   * when it joins this arm onto the device catalog snapshot. One transaction,
+   * one pooled connection, taken AFTER the snapshot's own has been released:
+   * the shell composes the facades sequentially rather than nesting, so
+   * neither read can queue behind the other.
+   */
+  async getPackTasks(tenantId: string, warehouseId: string): Promise<PackWorkRead> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.getPackTasksInTx(tx, tenantId, warehouseId),
     );
   }
 

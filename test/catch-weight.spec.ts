@@ -172,6 +172,7 @@ describe('catch weight and handling units (e2e, story 10.3)', () => {
     'CW-ADJUP,Beef case adjusted upward,case,,1800,,false,false,true,,,',
     'CW-QC,Beef case quarantined,case,,1800,,false,false,true,,,',
     'CW-PACK,Beef case packed,case,,1800,,false,false,true,,,',
+    'CW-DEVICE,Beef case device-packed,case,,1800,,false,false,true,,,',
     'CW-SPLIT,Beef case two order lines,case,,1800,,false,false,true,,,',
     'CW-FAILOPEN,Beef case written off then packed,case,,1800,,false,false,true,,,',
     'CW-REPLAY,Beef case replayed receipt,case,,1800,,false,false,true,,,',
@@ -1376,6 +1377,83 @@ describe('catch weight and handling units (e2e, story 10.3)', () => {
     expect(events).toHaveLength(1);
     expect(Number(events[0]!.quantity_delta)).toBe(0);
     expect(events[0]!.reference_doc.handlingUnitIds).toEqual([...unitIds].sort());
+  });
+
+  it('the DEVICE pack route (story 10.7) packs a catch-weight order with its unit ids, and the snapshot\'s pack arm agrees', async () => {
+    const { unitIds } = await seedPickableUnits('CW-DEVICE', [19_500, 19_600, 19_700]);
+    const orderId = await pickedOrder([{ skuId: sku('CW-DEVICE'), quantity: 3 }], 'cw-device');
+
+    // The snapshot is what the bench pre-verifies offline: the picked total
+    // (base units) from the same roll-up the command verifies against, plus
+    // every active unit label of the SKU.
+    const snapshot = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+    const packTasks = snapshot.body.packTasks as {
+      orderId: string;
+      skuId: string;
+      pickedQty: number;
+      catchWeightTracked: boolean;
+    }[];
+    const task = packTasks.find((candidate) => candidate.orderId === orderId);
+    expect(task).toEqual(
+      expect.objectContaining({
+        orderId,
+        skuId: sku('CW-DEVICE'),
+        pickedQty: 3,
+        catchWeightTracked: true,
+      }),
+    );
+    const handlingUnits = snapshot.body.handlingUnits as { id: string; skuId: string }[];
+    for (const id of unitIds) {
+      expect(handlingUnits.some((unit) => unit.id === id && unit.skuId === sku('CW-DEVICE'))).toBe(true);
+    }
+
+    // The device route: same command, device guard, order id in the BODY.
+    const key = ulid();
+    const body = {
+      orderId,
+      scanned: [{ skuId: sku('CW-DEVICE'), qty: 3, handlingUnitIds: unitIds }],
+    };
+    const packed = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/packs`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .set(KEY_HEADER, key)
+      .send(body)
+      .expect(201);
+    expect(packed.body.pack.orderStatus).toBe('ready_to_dispatch');
+    expect(packed.body.pack.lines[0].packedQty).toBe(3);
+
+    // A replay under the same key re-serves the stored slip — nothing re-packs.
+    const replayed = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/packs`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .set(KEY_HEADER, key)
+      .send(body)
+      .expect(201);
+    expect(replayed.body.pack).toEqual(packed.body.pack);
+
+    // A second pack under a NEW key is a 409.
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/packs`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .set(KEY_HEADER, ulid())
+      .send(body)
+      .expect(409);
+
+    // The units are packed: they drop out of the snapshot's active list, and
+    // the order out of the pack tasks — active-only self-prunes.
+    const after = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .expect(200);
+    const remainingUnits = after.body.handlingUnits as { id: string }[];
+    for (const id of unitIds) {
+      expect(remainingUnits.some((unit) => unit.id === id)).toBe(false);
+    }
+    const remainingTasks = after.body.packTasks as { orderId: string }[];
+    expect(remainingTasks.some((candidate) => candidate.orderId === orderId)).toBe(false);
   });
 
   it('a case written off as damaged is REFUSED at the bench — the fail-open the review found', async () => {

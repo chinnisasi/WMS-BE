@@ -1078,6 +1078,22 @@ export class PackResponse {
   pack!: PackDto;
 }
 
+/**
+ * POST /tenants/{tenantId}/outbound/packs body — the DEVICE pack route
+ * (story 10.7). The same scan shape the tenant pack route verifies
+ * (`PackOrderDto`, inherited validators and all), with the order id moved
+ * into the BODY because a device route names no path order id. The device
+ * client never captures parcel dimensions (`dimensionsMm` stays the web
+ * surface's arm and its field stays absent in the device payload); the
+ * inherited field remains so the two routes' bodies are one shape and the
+ * command's hash contract does not fork.
+ */
+export class DevicePackDto extends PackOrderDto {
+  @ApiProperty({ format: 'uuid', description: 'The fully-picked order being packed' })
+  @IsUUID()
+  orderId!: string;
+}
+
 // ── Dispatch (Story 4.6) ────────────────────────────────────────────────────
 
 /**
