@@ -8794,6 +8794,11 @@
               "sqft"
             ]
           },
+          "uomPrecision": {
+            "type": "number",
+            "example": 3,
+            "description": "The decimal places this SKU's base UoM declares (each = 0 places, kg = 3). Derived from the unit — never an input."
+          },
           "gstRateBps": {
             "type": "number",
             "example": 1800,
@@ -8847,6 +8852,7 @@
           "code",
           "name",
           "uom",
+          "uomPrecision",
           "gstRateBps",
           "hsn",
           "batchTracked",

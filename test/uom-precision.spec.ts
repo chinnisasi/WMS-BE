@@ -973,6 +973,60 @@ describe('story 10.2: UoM is a closed vocabulary with a declared precision (e2e)
     });
   });
 
+  // ── the web's precision source (story 10.5) ───────────────────────────────
+
+  describe('the SKU read shape', () => {
+    it('the LIST payload carries each SKU\'s declared precision, not just the device snapshot', async () => {
+      const catalog = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/catalog/skus?limit=200`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      const items = catalog.body.items as { code: string; uom: string; uomPrecision: number }[];
+      // Other blocks in this suite import further SKUs into the same tenant —
+      // the fixtures are found, not counted.
+      const each = items.find((item) => item.code === EACH_SKU)!;
+      const kg = items.find((item) => item.code === KG_SKU)!;
+      expect(each).toMatchObject({ uom: 'each', uomPrecision: 0 });
+      expect(kg).toMatchObject({ uom: 'kg', uomPrecision: 3 });
+      // Every item, not just the two fixtures: the field is DERIVED from the
+      // vocabulary, so any payload drifting from it is a defect by definition.
+      for (const item of items) {
+        expect(item.uomPrecision).toBe(UOM_PRECISION[item.uom as keyof typeof UOM_PRECISION]);
+      }
+    });
+
+    it('the PATCH payload carries it too — and a replay of the same key re-serves it', async () => {
+      const skuId = skuIds.get(KG_SKU)!;
+      const key = ulid();
+      const patched = await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, key)
+        .send({ reorderPoint: 1.25 })
+        .expect(200);
+      expect(patched.body).toMatchObject({ uom: 'kg', uomPrecision: 3, reorderPoint: 1.25 });
+
+      // The idempotency snapshot is the payload the web's `get` reads on a
+      // replay — it routes through the same read shape, so the field rides it.
+      const replayed = await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, key)
+        .send({ reorderPoint: 1.25 })
+        .expect(200);
+      expect(replayed.body.uomPrecision).toBe(3);
+    });
+
+    it('the published contract declares the field on SkuResponse', () => {
+      const document = JSON.parse(readFileSync(resolve(process.cwd(), 'openapi/openapi.json'), 'utf8')) as {
+        components: { schemas: Record<string, { properties: Record<string, unknown>; required?: string[] }> };
+      };
+      const dto = document.components.schemas['SkuResponse']!;
+      expect(dto.properties['uomPrecision']).toBeDefined();
+      expect(dto.required).toContain('uomPrecision');
+    });
+  });
+
   // ── the device's offline gate ─────────────────────────────────────────────
 
   describe('the catalog snapshot', () => {

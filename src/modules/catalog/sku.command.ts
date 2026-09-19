@@ -33,6 +33,18 @@ export interface SkuSnapshot {
   readonly code: string;
   readonly name: string;
   readonly uom: string;
+  /**
+   * Story 10.5: the decimal places `uom` declares, on the web-facing read
+   * shape too (the device snapshot has carried it since 10.2). The web
+   * renders quantities at declared precision and sizes decimal inputs from
+   * it — the same reason the device has it: the server's precision refusal
+   * is the authority, but a client that cannot read the precision cannot
+   * even render at it.
+   *
+   * Derived in process from the vocabulary, never an input, never a column:
+   * there is no per-SKU precision.
+   */
+  readonly uomPrecision: number;
   readonly gstRateBps: number;
   readonly hsn: string | null;
   readonly batchTracked: boolean;
@@ -391,6 +403,7 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     code: row.code,
     name: row.name,
     uom: row.uom,
+    uomPrecision: uomPrecision(row.uom),
     gstRateBps: row.gstRateBps,
     hsn: row.hsn,
     batchTracked: row.batchTracked,
