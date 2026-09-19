@@ -24,6 +24,14 @@ export const RECONCILIATION_CHECKPOINT_INVALID_EVENT = 'reconciliation.checkpoin
 export const CHECKPOINT_INVALID_LIMIT = 2;
 
 /**
+ * The full-pass cadence's ceiling (story 10.4): the counter is stored in an
+ * INTEGER column, and `incremental_count` climbs to the knob before a full
+ * pass resets it — so the knob is the column's stored maximum, and a value
+ * past `2147483647` would overflow it at the first upsert.
+ */
+export const MAX_RECONCILE_FULL_PASS_EVERY = 2147483647;
+
+/**
  * The default full-pass cadence (story 10.4): after this many BOUNDED passes
  * a partition runs one FULL pass (`replayInTx`), closing the bounded scan's
  * blind spot (a divergence on a scope untouched since the checkpoint). The
@@ -36,8 +44,10 @@ export const DEFAULT_RECONCILE_FULL_PASS_EVERY = 20;
  * The full-pass knob, `RECONCILE_FULL_PASS_EVERY` — parsed like the poll
  * intervals beside it (`parseReconcilePollMs`), except that UNSET means the
  * default cadence, not OFF: the scheduled full pass is part of the engine's
- * guarantee, so it is on unless a deployment tunes it. A non-positive value
- * or anything that is not an integer fails the boot loudly.
+ * guarantee, so it is on unless a deployment tunes it. A non-positive value,
+ * anything that is not an integer, or a value above
+ * `MAX_RECONCILE_FULL_PASS_EVERY` (the counter column is an integer, and the
+ * knob is its stored maximum) fails the boot loudly.
  *
  * **Why this helper lives here and not beside `parseReconcilePollMs` in
  * `src/jobs/jobs.module.ts`.** That file imports `InventoryModule`, which
@@ -53,9 +63,11 @@ export function parseReconcileFullPassEvery(raw: string | undefined): number {
     return DEFAULT_RECONCILE_FULL_PASS_EVERY;
   }
   const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < 1) {
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_RECONCILE_FULL_PASS_EVERY) {
     throw new Error(
-      `RECONCILE_FULL_PASS_EVERY must be a positive integer — bounded passes per full pass (got "${raw}")`,
+      `RECONCILE_FULL_PASS_EVERY must be a positive integer of at most ` +
+        `${MAX_RECONCILE_FULL_PASS_EVERY} — bounded passes per full pass, and the ` +
+        `counter column is an integer (got "${raw}")`,
     );
   }
   return parsed;
@@ -414,9 +426,13 @@ export class ReconciliationService {
       // stamps `updated_at`, converting the partition into an ordinary queue
       // member (oldest-`updated_at` first). `last_seq: 0` is detect's "no
       // checkpoint" state exactly (`lastSeq === 0 → full replay`), so the
-      // row changes no cycle semantics; the stamp still touches only
-      // `updated_at` — `last_seq`, `invalid_attempts` and `last_divergences`
-      // remain cycle-written state, written only by a cycle.
+      // row changes no cycle semantics; the stamp then touches only
+      // `updated_at`. An EXISTING checkpoint's cycle state (`last_seq`,
+      // `invalid_attempts`, `last_divergences`, `incremental_count`) is
+      // never overwritten by the failure path — the DO NOTHING leaves it
+      // alone. The fresh-row INSERT is the deliberate exception: it writes
+      // exactly those columns, to their no-checkpoint defaults, because a
+      // missing row is precisely what wedged the partition.
       //
       // For failure classes that kill the tenant-scoped seam itself (RLS
       // role, connection loss) this insert and stamp fail too — logged and
@@ -468,6 +484,13 @@ export class ReconciliationService {
    * partition starves. A checkpoint whose `last_seq` is BEYOND the ledger head
    * is equally pending — it has pending validation work (the ×2 discard path
    * is reachable via `reconcileNext`, not only via a direct `reconcile`).
+   * Story 10.4's third arm: a partition CAUGHT UP but owed a full pass
+   * (`incremental_count` at the knob's cadence) is picked too — the
+   * scheduled full pass is the bounded scan's blind-spot escape, and a quiet
+   * partition is exactly where that blind spot stays open. The full pass
+   * resets the counter, so the arm stops matching after one pass. The arm
+   * cannot spin: an owed partition sorts by `updated_at` like everyone else,
+   * and every cycle (clean, divergent or failed) stamps `updated_at`.
    * One partition per tick.
    */
   private async pickPartition(): Promise<{ tenantId: string; warehouseId: string } | null> {
@@ -483,6 +506,7 @@ export class ReconciliationService {
         on c.tenant_id = h.tenant_id and c.warehouse_id = h.warehouse_id
       where h.head_seq > coalesce(c.last_seq, 0)
          or c.last_seq > h.head_seq
+         or coalesce(c.incremental_count, 0) >= ${this.fullPassEvery}
       order by c.updated_at asc nulls first, h.tenant_id, h.warehouse_id
       limit 1
     `)) as unknown as { tenantId: string; warehouseId: string }[];

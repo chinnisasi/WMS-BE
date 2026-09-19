@@ -913,7 +913,9 @@ export const reconciliationCheckpoints = pgTable(
      * escape; the counter, not a wall clock, schedules it — deterministic,
      * per-partition by construction, and testable without a fake clock. A
      * bounded pass (clean or divergent) increments; a full pass resets to 0.
-     * Cycle-written state like `last_seq` — never touched by the failure path.
+     * An EXISTING checkpoint's cycle state (this column included) is never
+     * overwritten by the reconcile failure path; its fresh-row INSERT is the
+     * deliberate exception, writing the no-checkpoint default 0.
      */
     incrementalCount: integer('incremental_count').notNull().default(0),
     ...tenantTimestamps,

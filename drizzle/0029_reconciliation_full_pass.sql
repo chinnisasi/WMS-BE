@@ -8,10 +8,14 @@
 -- `RECONCILE_FULL_PASS_EVERY` (default 20 — N bounded passes between full passes),
 -- the next cycle runs the full compare and the counter resets. It is cycle-written
 -- state like `last_seq`: incremented by a bounded pass (clean or divergent),
--- reset by a full pass, never touched by the failure path.
+-- reset by a full pass; an EXISTING checkpoint's cycle state is never
+-- overwritten by the reconcile failure path (whose fresh-row INSERT writes
+-- this column's default 0 — the deliberate exception).
 --
 -- No RLS policy change — the column rides the table's existing 0008 tenant
--- isolation. Existing rows take the DEFAULT 0, so every pre-upgrade partition's
--- next pass is a full pass once (then bounded again) — the honest first pass over
--- the column's meaning.
+-- isolation. Existing rows take the DEFAULT 0, which is BELOW the knob's
+-- cadence: a pre-upgrade partition (`last_seq > 0`, count 0 < N) runs its
+-- next pass BOUNDED, and its first scheduled full pass arrives after N
+-- bounded passes have accumulated — the same cadence every new partition
+-- follows.
 ALTER TABLE "reconciliation_checkpoints" ADD COLUMN "incremental_count" integer DEFAULT 0 NOT NULL;

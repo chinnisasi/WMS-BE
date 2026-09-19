@@ -16,6 +16,7 @@ import type { DomainEvent, EventBus } from '../src/shared/events/event-bus.seam'
 import {
   RECONCILIATION_CHECKPOINT_INVALID_EVENT,
   RECONCILIATION_DIVERGENCE_EVENT,
+  ReconciliationService,
 } from '../src/modules/inventory/reconcile';
 import {
   DEFAULT_RECONCILE_FULL_PASS_EVERY,
@@ -1080,9 +1081,12 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     const memBinId = (await binIds(memWarehouseId))[0] as string;
     await adjust(memBinId, 1, memWarehouseId); // seq 1
 
-    // A hand-written memory mixing garbage with the one well-formed entry,
-    // which names the very scope about to diverge: a null, a bare string, a
-    // bare number, an object missing its binId — and one good entry.
+    // A hand-written memory mixing garbage with ONE entry naming the scope
+    // about to diverge: a null, a bare string, a bare number, an object
+    // missing its binId — and a well-shaped object whose `batchRef` is NOT a
+    // string. That last one is TYPED garbage: the `typeof batchRef ===
+    // 'string'` guard drops the KEY, never the entry, so the entry still
+    // names its (sku, bin) and still classifies through it.
     await sql`
       insert into reconciliation_checkpoints (id, tenant_id, warehouse_id, last_seq, invalid_attempts, last_divergences)
       values (gen_random_uuid(), ${tenantId}, ${memWarehouseId}, 0, 0, ${sql.json([
@@ -1090,18 +1094,27 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
         'garbage',
         5,
         { skuId },
-        { skuId, binId: memBinId },
+        { skuId, binId: memBinId, batchRef: 7 },
       ])})
     `;
     await tamperProjection(memBinId, 2, memWarehouseId); // stored: 3, replay: 1
 
     // The corruption probe's goal is a crash or a lost repeat classification;
-    // neither happens — the malformed entries are dropped with a warning and
-    // the good entry classifies the divergence a REPEAT.
+    // neither happens — the malformed entries are dropped with a warning, and
+    // the typed-garbage entry classifies the divergence a REPEAT. It is the
+    // ONLY entry naming the scope, so `repeat: true` is itself the proof it
+    // was kept — and the warning's dropped count (4, not 5) pins that a
+    // well-shaped entry with a non-string `batchRef` is kept, its key
+    // discarded.
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const report = await facade.reconcile(tenantId, memWarehouseId);
     expect(report.advanced).toBe(false);
     expect(report.divergences).toHaveLength(1);
     expect(report.divergences[0]!.repeat).toBe(true);
+    expect(warnSpy.mock.calls.map((call) => String(call[0])).join('\n')).toContain(
+      'last_divergences had 4 malformed entr',
+    );
+    warnSpy.mockRestore();
     // The repair rewrote the memory in its own well-formed shape — the
     // garbage does not survive a cycle.
     expect(await checkpointRow(memWarehouseId)).toMatchObject({
@@ -1244,7 +1257,36 @@ describe('reconciliation worker plumbing (unit, story 2.2)', () => {
       expect(() => parseReconcileFullPassEvery('1.5')).toThrow(/RECONCILE_FULL_PASS_EVERY/);
       expect(() => parseReconcileFullPassEvery('0')).toThrow(/RECONCILE_FULL_PASS_EVERY/);
       expect(() => parseReconcileFullPassEvery('-3')).toThrow(/RECONCILE_FULL_PASS_EVERY/);
+      // The counter column is an integer, and the knob is its stored maximum:
+      // a knob past the column's max would overflow `incremental_count`.
+      expect(() => parseReconcileFullPassEvery('2147483648')).toThrow(/2147483647/);
+      expect(parseReconcileFullPassEvery('2147483647')).toBe(2147483647);
     });
+  });
+
+  describe('ReconciliationService (the knob at the boot)', () => {
+    it('an invalid RECONCILE_FULL_PASS_EVERY fails the constructor (loud boot, not a silent worker)', () => {
+      for (const bad of ['soon', '1.5', '0', '-5', '2147483648']) {
+        process.env.RECONCILE_FULL_PASS_EVERY = bad;
+        try {
+          expect(
+            () =>
+              new ReconciliationService(
+                stubConstructorDb() as never,
+                stubConstructorDb() as never,
+                stubConstructorDb() as never,
+              ),
+          ).toThrow(/RECONCILE_FULL_PASS_EVERY/);
+        } finally {
+          delete process.env.RECONCILE_FULL_PASS_EVERY;
+        }
+      }
+    });
+
+    /** The constructor's deps are never called before the env parse throws. */
+    function stubConstructorDb(): object {
+      return {};
+    }
   });
 
   describe('ReconciliationWorker', () => {

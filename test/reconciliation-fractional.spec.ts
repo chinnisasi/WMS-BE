@@ -139,6 +139,10 @@ describe('reconciliation over fractional stock (e2e, story 10.4)', () => {
   }, 60_000);
 
   afterAll(async () => {
+    // The knob is set at module scope for THIS suite's cadence; jest runs
+    // `maxWorkers: 1`, so leaving it set would leak cadence 2 into every
+    // suite that runs after this one.
+    delete process.env.RECONCILE_FULL_PASS_EVERY;
     await cleanupRows();
     const rawDb = app.get<unknown>(DATABASE) as { $client?: { end(): Promise<void> } };
     await rawDb.$client?.end();
@@ -746,5 +750,68 @@ describe('reconciliation over fractional stock (e2e, story 10.4)', () => {
     expect(rows).toHaveLength(1);
     return (rows[0] as unknown as { id: string }).id;
   }
+
+  it('a QUIET partition owed a full pass is picked even when caught up — the scheduled full pass fires, catches the blind-spot tamper, and resets the counter', async () => {
+    const wh = await createWarehouse('QUIET', ['A-01-01']);
+    const bin = wh.binIds[0] as string;
+    // Drive the counter to the suite's cadence (2) with events flowing:
+    // cycle 1 full (0), cycle 2 bounded (1), cycle 3 bounded (2).
+    for (let seq = 1; seq <= 3; seq += 1) {
+      await adjust(wh.warehouseId, eachSkuId, bin, 1);
+      expect(await facade.reconcile(tenantId, wh.warehouseId)).toMatchObject({
+        advanced: true,
+        previousSeq: seq - 1 === 0 ? null : seq - 1,
+        watermark: seq,
+      });
+    }
+    expect(await checkpointRow(wh.warehouseId)).toMatchObject({
+      last_seq: 3,
+      incremental_count: 2,
+    });
+
+    // The partition goes quiet: no new events. Tamper a scope untouched
+    // since the checkpoint — invisible to any bounded scan, whose window is
+    // empty, and invisible to both pending arms of the pick (the partition
+    // is caught up). ONLY the counter arm can reach it.
+    await tamperStockMilli(eachSkuId, bin, wh.warehouseId, 7); // stored: 3007, replay: 3000
+
+    // Make this the oldest partition the counter arm can match (the other
+    // count-2 partitions of earlier tests are freshened), so one call proves
+    // the arm: a caught-up partition is picked, and the full replay runs.
+    await sql`
+      update reconciliation_checkpoints set updated_at = now() - interval '1 hour'
+      where tenant_id = ${tenantId} and warehouse_id = ${wh.warehouseId}
+    `;
+    await sql`
+      update reconciliation_checkpoints set updated_at = now()
+      where tenant_id = ${tenantId} and warehouse_id <> ${wh.warehouseId}
+    `;
+    const picked = await facade.reconcileNext();
+    expect(picked).not.toBeNull();
+    expect(picked!.warehouseId).toBe(wh.warehouseId);
+    expect(picked!.advanced).toBe(false);
+    expect(picked!.divergences).toHaveLength(1);
+    expect(picked!.divergences[0]).toMatchObject({
+      skuId: eachSkuId,
+      binId: bin,
+      projectedQuantity: 3007,
+      replayedQuantity: 3000,
+    });
+    // The full pass reset the counter on the divergent arm — the partition
+    // is no longer owed.
+    expect(await checkpointRow(wh.warehouseId)).toMatchObject({
+      last_seq: 3,
+      incremental_count: 0,
+      last_divergences: [{ skuId: eachSkuId, binId: bin }],
+    });
+
+    // With the counter reset and no pending work anywhere, the worker goes
+    // idle — the arm stopped matching.
+    let idle = false;
+    for (let tick = 0; tick < 20 && !idle; tick += 1) {
+      idle = (await facade.reconcileNext()) === null;
+    }
+    expect(idle).toBe(true);
+  });
 
 });

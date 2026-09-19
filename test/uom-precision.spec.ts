@@ -919,16 +919,34 @@ describe('story 10.2: UoM is a closed vocabulary with a declared precision (e2e)
         [
           'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
           'UOM-ONCE,Counted item,each,,1800,,false,false,2.5,10,',
+          // `parseQuantityMilli`'s second consumer, in its own row: one row
+          // surfaces only its FIRST invalid cell (reorder_point is checked
+          // before reorder_qty), so the qty leg needs its own SKU.
+          'UOM-ONCE-QTY,Counted item too,each,,1800,,false,false,10,2.5,',
         ].join('\n'),
       ).expect(201);
       expect(run.body.committedRows).toBe(0);
-      const imported = run.body.errors[0].detail as string;
+      const rowErrors = run.body.errors as { skuCode: string; detail: string }[];
+      expect(rowErrors).toHaveLength(2);
+      const imported = rowErrors.find((error) => error.skuCode === 'UOM-ONCE')!.detail;
+      const importedQty = rowErrors.find((error) => error.skuCode === 'UOM-ONCE-QTY')!.detail;
+      const patchedQty = await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuIds.get(EACH_SKU)!}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ reorderQty: 2.5 })
+        .expect(400);
 
       // Byte-identity modulo the label (pinned through normalization so a
-      // future label rename cannot silently loosen the comparison).
+      // future label rename cannot silently loosen the comparison). Both
+      // quantity cells are pinned: `reorder_point` AND `reorder_qty` are the
+      // two consumers of the shared core on the import edge.
       const normalizedPatch = (patched.body.detail as string).replace(/reorderPoint/g, 'F');
       const normalizedImport = imported.replace(/reorder_point/g, 'F');
       expect(normalizedPatch).toBe(normalizedImport);
+      const normalizedPatchQty = (patchedQty.body.detail as string).replace(/reorderQty/g, 'F');
+      const normalizedImportQty = importedQty.replace(/reorder_qty/g, 'F');
+      expect(normalizedPatchQty).toBe(normalizedImportQty);
 
       // …and pinned literally against the shared core's own text, so neither
       // edge can soften or reword the sentence alone.
@@ -939,6 +957,16 @@ describe('story 10.2: UoM is a closed vocabulary with a declared precision (e2e)
       );
       expect(imported).toBe(
         'reorder_point must be a whole number: base UoM "each" declares 0 decimal places, ' +
+          'so 2.5 is not a quantity it can express. Record whole units, or measure this ' +
+          'SKU in a unit that allows fractions.',
+      );
+      expect(patchedQty.body.detail).toBe(
+        'reorderQty must be a whole number: base UoM "each" declares 0 decimal places, ' +
+          'so 2.5 is not a quantity it can express. Record whole units, or measure this ' +
+          'SKU in a unit that allows fractions.',
+      );
+      expect(importedQty).toBe(
+        'reorder_qty must be a whole number: base UoM "each" declares 0 decimal places, ' +
           'so 2.5 is not a quantity it can express. Record whole units, or measure this ' +
           'SKU in a unit that allows fractions.',
       );
