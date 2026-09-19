@@ -1084,8 +1084,8 @@ export class PackResponse {
  * (`PackOrderDto`, inherited validators and all), with the order id moved
  * into the BODY because a device route names no path order id. The device
  * client never captures parcel dimensions, so `dimensionsMm` is OMITTED —
- * the OpenAPI stops advertising it and (with the whitelist validation pipe)
- * a device body that sends it is stripped rather than silently accepted;
+ * the OpenAPI stops advertising it and (the whitelist pipe runs
+ * `forbidNonWhitelisted`) a device body that sends it is REFUSED with a 400;
  * the web surface keeps the arm (review W6, story 10.7).
  */
 export class DevicePackDto extends OmitType(PackOrderDto, ['dimensionsMm'] as const) {

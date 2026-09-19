@@ -630,6 +630,10 @@ export class OutboundController {
       {
         tenantId,
         actorUserId: session.userId,
+        // The badge-in session's device: the command re-authorizes the device
+        // row in-tx (the pick command's mirror), so a device revoked after
+        // its token was minted is refused here, per call.
+        deviceId: session.deviceId,
         orderId: dto.orderId,
         // Deliberately parallel to the tenant pack route's normalization
         // (which this story leaves untouched, its route being frozen scope):

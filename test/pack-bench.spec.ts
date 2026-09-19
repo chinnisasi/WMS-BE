@@ -267,10 +267,8 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
   }
 
   /**
-   * Story 10.7's operator lacks `pack.execute` by design? No — an operator
-   * carries it (the tenant route's own fixtures pack as `ops_manager`; the
-   * DEVICE route's badge-in operator is the one the spec names the bench for).
-   * This helper exists so the authority arm can demote explicitly.
+   * A manual accepted order through the tenant route (reserved at accept) —
+   * the fixtures' one entry point into outbound work.
    */
   async function createOrder(lines: { skuId: string; quantity: number }[]): Promise<string> {
     const res = await request(app.getHttpServer())
@@ -678,5 +676,124 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
       scanned: [{ skuId: line.skuId, qty: 2 }],
       dimensionsMm: { lengthMm: 100, widthMm: 100, heightMm: 100 },
     }).expect(400);
+  });
+
+  /** A fresh device + a badge-in session for a user of the given role. */
+  async function badgedSessionForRole(role: string, pin: string, tag: string): Promise<{ token: string; deviceId: string }> {
+    const operatorEmail = `${tag}-${role}-${ulid().toLowerCase()}@example.com`;
+    const invited = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/users`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ email: operatorEmail, role })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/accept-invite`)
+      .set(KEY_HEADER, ulid())
+      .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
+      .expect(200);
+    const minted = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/devices/enrollment-codes`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .expect(201);
+    const enrolled = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/devices/enroll`)
+      .set(KEY_HEADER, ulid())
+      .send({ code: minted.body.code, label: `${tag} ${role}`, pin })
+      .expect(201);
+    const badged = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/devices/badge-in`)
+      .set('Authorization', `Bearer ${enrolled.body.deviceToken as string}`)
+      .send({ operatorEmail, pin })
+      .expect(200);
+    return { token: badged.body.accessToken as string, deviceId: enrolled.body.device.id as string };
+  }
+
+  it('the device route pins its remaining authority arms: unknown order 404, role-denied 403, revoked device 403, non-positive weight 400, ids on a non-CW SKU refused', async () => {
+    const { orderId, line } = await pickedOrder('BENCH-ALPHA', 2, 'bench-arms');
+    const body: DevicePackBody = { orderId, scanned: [{ skuId: line.skuId, qty: 2 }] };
+
+    // An order id that does not exist in this tenant → 404 not-found.
+    const unknown = await devicePack({ orderId: uuidv7(), scanned: [{ skuId: line.skuId, qty: 2 }] }).expect(404);
+    expect(unknown.body.code).toBe('not-found');
+
+    // An accountant's badge-in session has no pack.execute → 403 role-denied,
+    // decided at the COMMAND entry (the role is re-read there, not from JWT).
+    const accountant = await badgedSessionForRole('accountant', '3456', 'bench-arms');
+    const roleDenied = await devicePack(body, accountant.token).expect(403);
+    expect(roleDenied.body.code).toBe('role-denied');
+    expect(roleDenied.body.detail).toContain('pack.execute');
+
+    // A revoked device's credential → 403 device-revoked at the session guard.
+    const disposable = await badgedSessionForRole('operator', '4567', 'bench-arms');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/devices/${disposable.deviceId}/revoke`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .expect(200);
+    const revoked = await devicePack(body, disposable.token).expect(403);
+    expect(revoked.body.code).toBe('device-revoked');
+
+    // A non-positive weight is the DTO's Min(1) gate → 400 validation-failed.
+    const zeroWeight = await devicePack({ ...body, weightGrams: 0 }).expect(400);
+    expect(zeroWeight.body.code).toBe('validation-failed');
+
+    // Handling-unit ids on a NON-catch-weight SKU are refused, never ignored —
+    // the command's packValidation arm (validation-failed; nothing written).
+    const idsOnPlain = await devicePack({
+      ...body,
+      scanned: [{ skuId: line.skuId, qty: 2, handlingUnitIds: [uuidv7()] }],
+    }).expect(400);
+    expect(idsOnPlain.body.code).toBe('validation-failed');
+    expect(idsOnPlain.body.detail).toContain('is not catch-weight tracked');
+
+    // Nothing above wrote — the order packs under its own operator.
+    await devicePack(body).expect(201);
+  });
+
+  it('the snapshot rolls a SKU split across TWO order lines into ONE packTasks row, and the device route packs the roll-up', async () => {
+    // The groupBy must key (order, sku) — NOT (orderLine, sku): an order line
+    // split (2 + 3 of one SKU) must read as one bench line of 5, exactly what
+    // `packOrder`'s own verification query compares against.
+    const skuAlpha = sku('BENCH-ALPHA');
+    await seedStock(skuAlpha, binA, 12);
+    const orderId = await createOrder([
+      { skuId: skuAlpha, quantity: 2 },
+      { skuId: skuAlpha, quantity: 3 },
+    ]);
+    const policy = await policyId(`bench-split-${ulid().slice(10, 18)}`);
+    const generated = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/waves`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ warehouseId, policyId: policy, orderIds: [orderId] })
+      .expect(201);
+    const waveId = generated.body.wave.id as string;
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/waves/${waveId}/release`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+    const wave = (
+      await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/outbound/waves/${waveId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200)
+    ).body.wave as { picklists: { lines: PickLine[] }[] };
+    const lines = wave.picklists[0]!.lines;
+    expect(lines).toHaveLength(2);
+    for (const line of lines) {
+      if (line.binId !== null) await pick(line);
+    }
+
+    const tasks = (await snapshot()).packTasks.filter((task) => task.orderId === orderId);
+    expect(tasks).toEqual([expect.objectContaining({ orderId, skuId: skuAlpha, pickedQty: 5, skuCode: 'BENCH-ALPHA' })]);
+
+    // And the roll-up is what the device route packs: one scan line, qty 5.
+    await devicePack({ orderId, scanned: [{ skuId: skuAlpha, qty: 5 }] }).expect(201);
+    expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
+    expect((await snapshot()).packTasks.some((task) => task.orderId === orderId)).toBe(false);
   });
 });
