@@ -18,6 +18,7 @@ import {
   CancelOrderDto,
   CreateOrderDto,
   CreateWavePolicyDto,
+  DevicePackDto,
   DispatchOrderDto,
   DispatchResponse,
   GenerateWaveDto,
@@ -588,6 +589,80 @@ export class OutboundController {
       key,
     );
     return { pick: { ...snapshot.pick } };
+  }
+
+  @Post(':tenantId/outbound/packs')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(DeviceSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'pack.execute — the DEVICE bench route (badge-in session required): the same packOrder command the tenant route delegates to, with the order id in the body. The scan is compared against what the order actually had PICKED; a discrepancy is refused (422 pack-mismatch) naming the SKU and both quantities before anything is written. On a match, the accepted → ready_to_dispatch flip, the zero-quantity pack.packed events, the outbox, the audit and the idempotency key commit in ONE transaction and the packing slip is returned. Parcel weight is optional; dimensions are NOT part of the device payload (the web surface keeps that arm)',
+  })
+  @ApiBody({ type: DevicePackDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: PackResponse,
+    description:
+      'Packed: the packing slip (the idempotency snapshot — a replay under the same key re-serves it, nothing re-packs)',
+  })
+  // The handling-unit-id-on-non-CW refusal rides the 400 arm, not the 422:
+  // packValidation throws 400 validation-failed for it (pack.command.ts) —
+  // the doc follows the command's actual status (review round 2 follow-up).
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed orderId, a malformed scan line, a non-positive weight, or a handling-unit id for a non-catch-weight SKU (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), unknown or revoked device (device-revoked), or the operator lacks pack.execute (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Order, or a scanned SKU, does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is already packed, is cancelled, was never waved, had its whole plan withdrawn by a wave cancel (re-wave it), still has a planned pick line, or a scanned handling unit is no longer active (conflict); or a concurrent idempotent request (conflict). Nothing is written') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('The scanned contents differ from what was picked — a wrong quantity, a missing or extra SKU (pack-mismatch, naming every divergent SKU with both quantities), or a catch-weight count that does not equal the picked units; nothing written. Also: idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
+  async packOrderFromDevice(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentDeviceSession() session: DeviceSession,
+    @Body() dto: DevicePackDto,
+  ): Promise<PackResponse> {
+    assertOwnDeviceTenant(session.tenantId, tenantId);
+    if (session.userId === null) {
+      // A bare enrollment credential has no operator — badge-in first.
+      throw badgeInRequired();
+    }
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.packOrder(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        // The badge-in session's device: the command re-authorizes the device
+        // row in-tx (the pick command's mirror), so a device revoked after
+        // its token was minted is refused here, per call.
+        deviceId: session.deviceId,
+        orderId: dto.orderId,
+        // Deliberately parallel to the tenant pack route's normalization
+        // (which this story leaves untouched, its route being frozen scope):
+        // the empty handlingUnitIds → absent spelling is what keeps a
+        // non-catch-weight pack's hash byte-identical to its pre-10.3 shape.
+        // A drift between the two spellings would surface as
+        // idempotency-key-reuse mysteries, not as a wrong pack — keep the two
+        // copies identical.
+        scanned: dto.scanned.map((line) => ({
+          skuId: line.skuId,
+          qty: line.qty,
+          handlingUnitIds:
+            line.handlingUnitIds != null && line.handlingUnitIds.length > 0
+              ? line.handlingUnitIds
+              : undefined,
+        })),
+        // `@IsOptional()` lets an explicit `null` through — normalized to
+        // absent so an unmeasured parcel hashes identically either way.
+        weightGrams: dto.weightGrams ?? undefined,
+        // dimensionsMm deliberately ABSENT: the device never captures parcel
+        // dimensions (the web surface keeps the arm), and an unmeasured
+        // parcel hashes identically to its absence.
+      },
+      key,
+    );
+    return { pack: { ...snapshot.pack, lines: snapshot.pack.lines.map((line) => ({ ...line })) } };
   }
 
   @Get(':tenantId/outbound/waves/:waveId')

@@ -4,6 +4,7 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
   auditEvents,
+  devices,
   idempotencyKeys,
   orderLines,
   orders,
@@ -26,6 +27,7 @@ import { canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
+import { deviceRevoked } from '../tenancy/enrollment.command';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -111,6 +113,15 @@ export interface PackOrderCommand {
   readonly tenantId: string;
   /** The session user — authority is re-read from the DB at command entry. */
   readonly actorUserId: string;
+  /**
+   * The badge-in session's device (the DEVICE route's call — review round 2,
+   * story 10.7). Present, the command re-authorizes the device row in-tx,
+   * exactly as the pick command does: the JWT is transport, never authority
+   * (AD-10), so a device revoked after its token was minted is refused
+   * (`device-revoked`) on its next pack. The tenant route omits it — its
+   * authority is the session's own role.
+   */
+  readonly deviceId?: string | undefined;
   readonly orderId: string;
   /** What the operator scanned into the parcel (aggregated per SKU here). */
   readonly scanned: readonly PackScanLineInput[];
@@ -253,6 +264,21 @@ export class PackCommandService {
         await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
         'pack.execute',
       );
+      // ── device re-authorization (fail-closed, the pick command's mirror) ─
+      // The DEVICE route carries its badge-in session's device; a device
+      // revoked after the token was minted is refused here, per call.
+      if (command.deviceId !== undefined) {
+        const deviceRows = await tx
+          .select()
+          .from(devices)
+          .where(and(eq(devices.id, command.deviceId), eq(devices.tenantId, command.tenantId)))
+          .for('update')
+          .limit(1);
+        const device = deviceRows[0];
+        if (!device || device.status !== 'active' || device.pinHash === null) {
+          throw deviceRevoked();
+        }
+      }
 
       // ── idempotency replay (before any read of state, before any write) ─
       const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);

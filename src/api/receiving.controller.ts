@@ -174,7 +174,16 @@ export class ReceivingController {
     // entire outbound graph into inbound's initialization for one array.
     const snapshot = await this.receiving.getCatalogSnapshot(tenantId, query.warehouseId);
     const pickTasks = await this.outbound.getPickTasks(tenantId, query.warehouseId);
-    return { ...snapshot, pickTasks: pickTasks.map((task) => ({ ...task })) };
+    // Story 10.7: the pack arm — packable orders' per-SKU picked totals plus
+    // the warehouse's active handling units. Same sequential composition: the
+    // shell never nests one facade's transaction inside another's.
+    const packWork = await this.outbound.getPackTasks(tenantId, query.warehouseId);
+    return {
+      ...snapshot,
+      pickTasks: pickTasks.map((task) => ({ ...task })),
+      packTasks: packWork.packTasks.map((task) => ({ ...task })),
+      handlingUnits: packWork.handlingUnits.map((unit) => ({ ...unit })),
+    };
   }
 
   @Get(':tenantId/receiving/goods-receipts')

@@ -19,7 +19,7 @@ import {
   IsNumber,
   ValidateNested,
 } from 'class-validator';
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, OmitType } from '@nestjs/swagger';
 import { ORDER_SOURCES, ORDER_STATUSES } from './order.command';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
 // The pack bounds are the COMMAND's constants, imported rather than copied:
@@ -1076,6 +1076,22 @@ export class PackDto {
 export class PackResponse {
   @ApiProperty({ type: PackDto })
   pack!: PackDto;
+}
+
+/**
+ * POST /tenants/{tenantId}/outbound/packs body — the DEVICE pack route
+ * (story 10.7). The same scan shape the tenant pack route verifies
+ * (`PackOrderDto`, inherited validators and all), with the order id moved
+ * into the BODY because a device route names no path order id. The device
+ * client never captures parcel dimensions, so `dimensionsMm` is OMITTED —
+ * the OpenAPI stops advertising it and (the whitelist pipe runs
+ * `forbidNonWhitelisted`) a device body that sends it is REFUSED with a 400;
+ * the web surface keeps the arm (review W6, story 10.7).
+ */
+export class DevicePackDto extends OmitType(PackOrderDto, ['dimensionsMm'] as const) {
+  @ApiProperty({ format: 'uuid', description: 'The fully-picked order being packed' })
+  @IsUUID()
+  orderId!: string;
 }
 
 // ── Dispatch (Story 4.6) ────────────────────────────────────────────────────

@@ -502,6 +502,42 @@ export class CatalogSnapshotPoDto {
   lines!: readonly PurchaseOrderLineDto[];
 }
 
+/** One pack task of the device snapshot (story 10.7, additive) — the bench's unit of work. */
+export class CatalogPackTaskDto {
+  @ApiProperty({ format: 'uuid', description: 'The fully-picked, still-accepted order' })
+  orderId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({
+    description:
+      'What the order actually had PICKED of this SKU, in base units — from the same grouped-picks read the pack command verifies against. The bench scans to EXACTLY this; a whole count at the bench.',
+  })
+  pickedQty!: number;
+
+  @ApiProperty({
+    description:
+      'Story 10.3: the SKU is handled by unit — the bench must scan each case\'s handling-unit label (count == pickedQty), never a typed quantity.',
+  })
+  catchWeightTracked!: boolean;
+}
+
+/** One active handling unit of the device snapshot (story 10.7, additive). */
+export class CatalogHandlingUnitDto {
+  @ApiProperty({ format: 'uuid', description: 'The unit label the bench scans' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The SKU the unit belongs to' })
+  skuId!: string;
+}
+
 export class CatalogSnapshotResponse {
   @ApiProperty({ description: 'ISO-8601 UTC capture time' })
   generatedAt!: string;
@@ -523,4 +559,10 @@ export class CatalogSnapshotResponse {
 
   @ApiProperty({ type: [PickTaskDto], description: 'Story 4.3 (additive): the pick tasks of every ready picklist on a released wave, in walk order (the bin/batch each names is advisory — the server re-derives both at pick time)' })
   pickTasks!: readonly PickTaskDto[];
+
+  @ApiProperty({ type: [CatalogPackTaskDto], description: 'Story 10.7 (additive): the packable orders\' per-SKU picked totals — the dataset the bench pre-verifies its scan against, offline. Mirrors the pack command\'s own verification query (picks grouped by (order, sku)) and its completeness guards (accepted, ≥1 pick line, none planned, not all cancelled)' })
+  packTasks!: readonly CatalogPackTaskDto[];
+
+  @ApiProperty({ type: [CatalogHandlingUnitDto], description: 'Story 10.7 (additive): every ACTIVE handling unit of the warehouse (id + skuId) — the labels a catch-weight bench scan resolves against, offline. Active-only self-prunes (units flip to packed at pack)' })
+  handlingUnits!: readonly CatalogHandlingUnitDto[];
 }
