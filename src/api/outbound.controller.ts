@@ -607,12 +607,15 @@ export class OutboundController {
     description:
       'Packed: the packing slip (the idempotency snapshot — a replay under the same key re-serves it, nothing re-packs)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed orderId, a malformed scan line, or a non-positive weight (validation-failed)') })
+  // The handling-unit-id-on-non-CW refusal rides the 400 arm, not the 422:
+  // packValidation throws 400 validation-failed for it (pack.command.ts) —
+  // the doc follows the command's actual status (review round 2 follow-up).
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed orderId, a malformed scan line, a non-positive weight, or a handling-unit id for a non-catch-weight SKU (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), unknown or revoked device (device-revoked), or the operator lacks pack.execute (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Order, or a scanned SKU, does not exist in this tenant (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('The order is already packed, is cancelled, was never waved, had its whole plan withdrawn by a wave cancel (re-wave it), still has a planned pick line, or a scanned handling unit is no longer active (conflict); or a concurrent idempotent request (conflict). Nothing is written') })
-  @ApiResponse({ status: 422, ...problemJsonResponse('The scanned contents differ from what was picked — a wrong quantity, a missing or extra SKU (pack-mismatch, naming every divergent SKU with both quantities), a catch-weight count that does not equal the picked units, or a handling-unit id for a non-catch-weight SKU (validation-failed); nothing written. Also: idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('The scanned contents differ from what was picked — a wrong quantity, a missing or extra SKU (pack-mismatch, naming every divergent SKU with both quantities), or a catch-weight count that does not equal the picked units; nothing written. Also: idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
   async packOrderFromDevice(
     @Param('tenantId') tenantId: string,

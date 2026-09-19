@@ -5740,7 +5740,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, a malformed orderId, a malformed scan line, or a non-positive weight (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, a malformed orderId, a malformed scan line, a non-positive weight, or a handling-unit id for a non-catch-weight SKU (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5790,7 +5790,7 @@
             }
           },
           "422": {
-            "description": "The scanned contents differ from what was picked — a wrong quantity, a missing or extra SKU (pack-mismatch, naming every divergent SKU with both quantities), a catch-weight count that does not equal the picked units, or a handling-unit id for a non-catch-weight SKU (validation-failed); nothing written. Also: idempotency key reused with a different payload (idempotency-key-reuse)",
+            "description": "The scanned contents differ from what was picked — a wrong quantity, a missing or extra SKU (pack-mismatch, naming every divergent SKU with both quantities), or a catch-weight count that does not equal the picked units; nothing written. Also: idempotency key reused with a different payload (idempotency-key-reuse)",
             "content": {
               "application/problem+json": {
                 "schema": {
