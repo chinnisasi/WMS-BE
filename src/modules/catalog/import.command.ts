@@ -33,6 +33,7 @@ import {
   unknownUomDetail,
   uomPrecision,
 } from './uom';
+import { assertSkuAttributes, type SkuAttributeFields } from './sku-attributes';
 
 export const IMPORT_MODES = ['initial', 'fix'] as const;
 export type ImportMode = (typeof IMPORT_MODES)[number];
@@ -90,6 +91,11 @@ const OPTIONAL_COLUMNS = [
   'batch_tracked',
   'serial_tracked',
   'catch_weight_tracked',
+  'weight_grams',
+  'length_mm',
+  'width_mm',
+  'height_mm',
+  'country_of_origin',
   'reorder_point',
   'reorder_qty',
   'barcode',
@@ -115,6 +121,12 @@ interface ValidRow {
   readonly batchTracked: boolean;
   readonly serialTracked: boolean;
   readonly catchWeightTracked: boolean;
+  /** Story 11.2 — the static physical attributes; a blank cell → null. */
+  readonly weightGrams: number | null;
+  readonly lengthMm: number | null;
+  readonly widthMm: number | null;
+  readonly heightMm: number | null;
+  readonly countryOfOrigin: string | null;
   readonly reorderPoint: number;
   readonly reorderQty: number;
   /** Null → generated server-side (uuidv7) at insert. */
@@ -281,6 +293,11 @@ export class ImportCommand {
             batchTracked: row.batchTracked,
             serialTracked: row.serialTracked,
             catchWeightTracked: row.catchWeightTracked,
+            weightGrams: row.weightGrams,
+            lengthMm: row.lengthMm,
+            widthMm: row.widthMm,
+            heightMm: row.heightMm,
+            countryOfOrigin: row.countryOfOrigin,
             reorderPoint: row.reorderPoint,
             reorderQty: row.reorderQty,
             // Generated server-side at entry (uuidv7) unless the file carries one.
@@ -826,6 +843,41 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
     return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', `barcode must be at most ${BARCODE_MAX} characters.`) };
   }
 
+  // Story 11.2 — the physical attributes. Cells parse to WYSIWYG grams /
+  // millimetres (the `handling_units.weightGrams` precedent, extended to mm):
+  // a blank cell → null (unset, the same shape an edit's `null` reads back),
+  // and the ONE shared validator (`assertSkuAttributes`) rules on every
+  // present value — a zero, negative-shaped, fractional or over-cap number,
+  // or a non-alpha-2 origin, is a per-row error naming the field, so the rest
+  // of the file still commits and `fix` mode can re-submit this row.
+  const countryRaw = get('country_of_origin');
+  const weightResult = parseAttributeNumber(v['weight_grams'], 'weight_grams', row.rowNumber);
+  if (!weightResult.ok) return { ok: false, error: { ...weightResult.error, skuCode: code } };
+  const lengthResult = parseAttributeNumber(v['length_mm'], 'length_mm', row.rowNumber);
+  if (!lengthResult.ok) return { ok: false, error: { ...lengthResult.error, skuCode: code } };
+  const widthResult = parseAttributeNumber(v['width_mm'], 'width_mm', row.rowNumber);
+  if (!widthResult.ok) return { ok: false, error: { ...widthResult.error, skuCode: code } };
+  const heightResult = parseAttributeNumber(v['height_mm'], 'height_mm', row.rowNumber);
+  if (!heightResult.ok) return { ok: false, error: { ...heightResult.error, skuCode: code } };
+  const attributes: SkuAttributeFields = {
+    weightGrams: weightResult.value,
+    lengthMm: lengthResult.value,
+    widthMm: widthResult.value,
+    heightMm: heightResult.value,
+    countryOfOrigin: countryRaw === '' ? null : countryRaw,
+  };
+  try {
+    assertSkuAttributes(attributes);
+  } catch (err) {
+    // The validator's detail names the field, the unit and the value it
+    // refused — rendered verbatim into the row error.
+    const response = (err as ProblemException).getResponse() as { detail?: string };
+    return {
+      ok: false,
+      error: rowError(row.rowNumber, code, 'validation-failed', response.detail ?? 'Invalid physical attribute value.'),
+    };
+  }
+
   const conversions: { uom: string; factor: number }[] = [];
   const conversionsRaw = v['uom_conversions']?.trim() ?? '';
   if (conversionsRaw !== '') {
@@ -889,10 +941,36 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       batchTracked,
       serialTracked,
       catchWeightTracked,
+      weightGrams: attributes.weightGrams ?? null,
+      lengthMm: attributes.lengthMm ?? null,
+      widthMm: attributes.widthMm ?? null,
+      heightMm: attributes.heightMm ?? null,
+      countryOfOrigin: attributes.countryOfOrigin ?? null,
       reorderPoint,
       reorderQty,
       barcode: barcode === '' ? null : barcode,
       conversions,
     },
   };
+}
+
+/**
+ * One physical-attribute cell (`weight_grams`, `length_mm`, `width_mm`,
+ * `height_mm`): a blank cell is `null` (unset); anything present must be a
+ * positive decimal-literal shape — the same grammar `parseQuantityMilli`
+ * admits — and the value/range rules are the shared validator's, downstream.
+ * A minus sign or a non-numeric spelling is refused here naming the CSV
+ * column; a fraction or an over-cap value reaches `assertSkuAttributes` and
+ * is refused there naming the API field.
+ */
+function parseAttributeNumber(raw: string | undefined, column: string, rowNumber: number): FieldResult<number | null> {
+  const value = (raw ?? '').trim();
+  if (value === '') return { ok: true, value: null };
+  if (!/^\d+(\.\d+)?$/.test(value)) {
+    return {
+      ok: false,
+      error: rowError(rowNumber, null, 'validation-failed', `${column} must be a positive whole number (got "${value}").`),
+    };
+  }
+  return { ok: true, value: Number(value) };
 }

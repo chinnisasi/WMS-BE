@@ -20,6 +20,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
 import { isFractionalUom, serialTrackedFractionalUomDetail, uomPrecision } from './uom';
 import { countLiveHandlingUnitsInTx } from './handling-unit.store';
+import { assertSkuAttributes } from './sku-attributes';
 
 export const DEFAULT_SKU_PAGE_SIZE = 50;
 export const MAX_SKU_PAGE_SIZE = 200;
@@ -51,6 +52,16 @@ export interface SkuSnapshot {
   readonly serialTracked: boolean;
   /** Story 10.3 — handled by unit, priced by weight (`handling_units`). */
   readonly catchWeightTracked: boolean;
+  /**
+   * Story 11.2 — the static physical attributes (FR-36), WYSIWYG in grams
+   * and millimetres (`sku-attributes.ts`). Absent attributes read `null`;
+   * the static catalog weight is NOT Epic 10's per-unit catch weight.
+   */
+  readonly weightGrams: number | null;
+  readonly lengthMm: number | null;
+  readonly widthMm: number | null;
+  readonly heightMm: number | null;
+  readonly countryOfOrigin: string | null;
   readonly reorderPoint: number;
   readonly reorderQty: number;
   readonly barcode: string;
@@ -70,6 +81,18 @@ export interface EditSkuCommand {
   readonly serialTracked?: boolean | undefined;
   /** Story 10.3 — catch weight. Mutually exclusive with `serialTracked`. */
   readonly catchWeightTracked?: boolean | undefined;
+  /**
+   * Story 11.2 — the static physical attributes, WYSIWYG grams/millimetres.
+   * PATCH semantics follow the `hsn` precedent: absent = unchanged, `null` =
+   * cleared. Bounds live in `assertSkuAttributes` (`sku-attributes.ts`),
+   * enforced HERE behind the replay lookup — not at the DTO, which only
+   * mirrors them.
+   */
+  readonly weightGrams?: number | null | undefined;
+  readonly lengthMm?: number | null | undefined;
+  readonly widthMm?: number | null | undefined;
+  readonly heightMm?: number | null | undefined;
+  readonly countryOfOrigin?: string | null | undefined;
   /**
    * Story 10.2: both are in the operator-facing BASE UoM, not milli-units.
    * The controller used to scale them, which put the precision refusal in
@@ -163,6 +186,13 @@ export class SkuCommand {
       batchTracked: command.batchTracked,
       serialTracked: command.serialTracked,
       catchWeightTracked: command.catchWeightTracked,
+      // Story 11.2 — the physical attributes count as fields for the
+      // empty-patch refusal, exactly as every other PATCH field does.
+      weightGrams: command.weightGrams,
+      lengthMm: command.lengthMm,
+      widthMm: command.widthMm,
+      heightMm: command.heightMm,
+      countryOfOrigin: command.countryOfOrigin,
       reorderPoint: command.reorderPoint,
       reorderQty: command.reorderQty,
       barcode: command.barcode,
@@ -172,9 +202,17 @@ export class SkuCommand {
         'validation-failed',
         400,
         'Empty SKU edit',
-        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, reorderPoint, reorderQty, barcode is required.',
+        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode is required.',
       );
     }
+    // ── story 11.2: this hash did NOT break ──────────────────────────────────
+    // Every attribute field is optional, so a pre-11.2 body leaves them
+    // `undefined`, and `JSON.stringify` drops `undefined` keys — old hashes
+    // are reproduced exactly and in-flight keys replay 200. Contrast 10.2,
+    // where the hashed *representation* changed (milli→base) and the break was
+    // accepted and pinned. Nothing is converted here, so there is nothing to
+    // break. Pinned by the no-break replay test in `test/sku-attributes.spec.ts`.
+    //
     // ── story 10.2: this fingerprint is over BASE units ────────────────────
     // Conversion moved out of the controller and into the command, behind the
     // replay lookup, so the hashed value changed with it: a key written by a
@@ -231,6 +269,20 @@ export class SkuCommand {
         if (!current) {
           throw skuNotFound();
         }
+
+        // Story 11.2: the physical attributes are validated HERE — behind the
+        // replay lookup (the 10.2 rule: a rule that can tighten must not
+        // answer 400 to an op that already committed), with the SKU's
+        // existence already settled so an unknown SKU answers 404, not 400.
+        // The same validator the import row parser calls; the DTO mirrors the
+        // bounds but is not the boundary.
+        assertSkuAttributes({
+          weightGrams: fields.weightGrams,
+          lengthMm: fields.lengthMm,
+          widthMm: fields.widthMm,
+          heightMm: fields.heightMm,
+          countryOfOrigin: fields.countryOfOrigin,
+        });
 
         // Story 10.1: turning serial tracking ON is catalog entry for the
         // rule's purposes — a serialized unit is discrete by definition, so a
@@ -335,6 +387,13 @@ export class SkuCommand {
         if (fields.serialTracked !== undefined) updates.serialTracked = fields.serialTracked;
         if (fields.catchWeightTracked !== undefined)
           updates.catchWeightTracked = fields.catchWeightTracked;
+        // Story 11.2 — absent = unchanged, null = cleared (the `hsn`
+        // precedent); a cleared attribute reads back `null`.
+        if (fields.weightGrams !== undefined) updates.weightGrams = fields.weightGrams;
+        if (fields.lengthMm !== undefined) updates.lengthMm = fields.lengthMm;
+        if (fields.widthMm !== undefined) updates.widthMm = fields.widthMm;
+        if (fields.heightMm !== undefined) updates.heightMm = fields.heightMm;
+        if (fields.countryOfOrigin !== undefined) updates.countryOfOrigin = fields.countryOfOrigin;
         if (reorderPointMilli !== undefined) updates.reorderPoint = reorderPointMilli;
         if (reorderQtyMilli !== undefined) updates.reorderQty = reorderQtyMilli;
         if (fields.barcode !== undefined) updates.barcode = fields.barcode;
@@ -409,6 +468,13 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     batchTracked: row.batchTracked,
     serialTracked: row.serialTracked,
     catchWeightTracked: row.catchWeightTracked,
+    // Story 11.2 — absent attributes read `null` (no backfill; a pre-11.2 row
+    // and an import that left the columns blank both read the same).
+    weightGrams: row.weightGrams,
+    lengthMm: row.lengthMm,
+    widthMm: row.widthMm,
+    heightMm: row.heightMm,
+    countryOfOrigin: row.countryOfOrigin,
     // Story 10.1: `toSnapshot` is the module's only SKU read shape — base
     // units leave here, milli-units stay in the column.
     reorderPoint: fromMilli(row.reorderPoint),

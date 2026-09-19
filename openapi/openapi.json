@@ -2208,7 +2208,7 @@
             "bearer": []
           }
         ],
-        "summary": "Edits a SKU (name, GST, HSN, flags, reorder defaults, barcode — the SKU code is immutable)",
+        "summary": "Edits a SKU (name, GST, HSN, flags, physical attributes, reorder defaults, barcode — the SKU code is immutable)",
         "tags": [
           "catalog"
         ]
@@ -9011,6 +9011,36 @@
             "example": false,
             "description": "Story 10.3: handled by unit, priced by weight — each physical unit received carries its own captured weight on a handling_units row. Mutually exclusive with serialTracked."
           },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "example": 500,
+            "description": "Static catalog weight in grams — what carriers rate from. Positive whole number ≤ 1,000,000 (1 tonne), or null when unset. NOT the per-handling-unit catch weight (that lives on handling_units)."
+          },
+          "lengthMm": {
+            "type": "number",
+            "nullable": true,
+            "example": 200,
+            "description": "Length in millimetres. Positive whole number ≤ 10,000, or null when unset."
+          },
+          "widthMm": {
+            "type": "number",
+            "nullable": true,
+            "example": 150,
+            "description": "Width in millimetres. Positive whole number ≤ 10,000, or null when unset."
+          },
+          "heightMm": {
+            "type": "number",
+            "nullable": true,
+            "example": 100,
+            "description": "Height in millimetres. Positive whole number ≤ 10,000, or null when unset."
+          },
+          "countryOfOrigin": {
+            "type": "string",
+            "nullable": true,
+            "example": "IN",
+            "description": "Country of origin, ISO 3166-1 alpha-2 uppercase (e.g. IN, CN), or null when unset."
+          },
           "reorderPoint": {
             "type": "number",
             "example": 50
@@ -9047,6 +9077,11 @@
           "batchTracked",
           "serialTracked",
           "catchWeightTracked",
+          "weightGrams",
+          "lengthMm",
+          "widthMm",
+          "heightMm",
+          "countryOfOrigin",
           "reorderPoint",
           "reorderQty",
           "barcode",
@@ -9106,6 +9141,44 @@
             "type": "boolean",
             "example": false,
             "description": "Story 10.3: handled by unit, priced by weight. Turning it on for a serial-tracked SKU (or the reverse) is a 400 — two per-unit identity systems over one unit is unsupported."
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "example": 500,
+            "minimum": 1,
+            "maximum": 1000000,
+            "description": "Static catalog weight in grams (positive whole number, ≤ 1,000,000). Omit to leave unchanged; null to clear."
+          },
+          "lengthMm": {
+            "type": "number",
+            "nullable": true,
+            "example": 200,
+            "minimum": 1,
+            "maximum": 10000,
+            "description": "Length in millimetres (positive whole number, ≤ 10,000). Omit to leave unchanged; null to clear."
+          },
+          "widthMm": {
+            "type": "number",
+            "nullable": true,
+            "example": 150,
+            "minimum": 1,
+            "maximum": 10000,
+            "description": "Width in millimetres (positive whole number, ≤ 10,000). Omit to leave unchanged; null to clear."
+          },
+          "heightMm": {
+            "type": "number",
+            "nullable": true,
+            "example": 100,
+            "minimum": 1,
+            "maximum": 10000,
+            "description": "Height in millimetres (positive whole number, ≤ 10,000). Omit to leave unchanged; null to clear."
+          },
+          "countryOfOrigin": {
+            "type": "string",
+            "nullable": true,
+            "example": "IN",
+            "description": "Country of origin, ISO 3166-1 alpha-2 uppercase (e.g. IN, CN). Omit to leave unchanged; null or \"\" to clear."
           },
           "reorderPoint": {
             "type": "number",

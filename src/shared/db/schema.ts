@@ -311,6 +311,34 @@ export const skus = pgTable(
      * physical unit is its own change.
      */
     catchWeightTracked: boolean('catch_weight_tracked').notNull().default(false),
+    /**
+     * Story 11.2 — the SKU's STATIC physical attributes (FR-36): the catalog
+     * weight and dimensions carriers rate and print labels from, and the
+     * second hard input behind 4-6d and 11-5's capacity checks. Integer
+     * storage, WYSIWYG everywhere — grams and millimetres, the
+     * `handling_units.weight_grams` precedent (integer + named cap), no
+     * decimals and no conversion layer anywhere; carrier adapters convert at
+     * their own edge. All five are nullable and never required at create
+     * (creation is import-only with a live corpus of files): a SKU without
+     * them is simply unrateable — 4-6d refuses rating for it and names the
+     * gap, 11-5 skips its capacity check. No backfill.
+     *
+     * NOT catch weight (AD-22): `weightGrams` is the static catalog weight for
+     * rating; Epic 10's per-handling-unit actual weight stays separate.
+     *
+     * Bounds are CHECKs declared in `drizzle/0031_sku_physical_attributes.sql`
+     * (the 0028 pattern — CHECKs live only in migration SQL) and mirrored in
+     * `assertSkuAttributes` (`src/modules/catalog/sku-attributes.ts`), the one
+     * validator both the edit command and the import row parser call.
+     */
+    /** Positive whole grams, ≤ 1,000,000 (1 tonne). */
+    weightGrams: integer('weight_grams'),
+    /** Positive whole millimetres, ≤ 10,000 — each axis independent. */
+    lengthMm: integer('length_mm'),
+    widthMm: integer('width_mm'),
+    heightMm: integer('height_mm'),
+    /** ISO 3166-1 alpha-2, uppercase (`IN`, `CN`). India-only system ≠ India-only origin. */
+    countryOfOrigin: text('country_of_origin'),
     /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
     reorderPoint: bigint('reorder_point', { mode: 'number' }).notNull().default(0),
     reorderQty: bigint('reorder_qty', { mode: 'number' }).notNull().default(0),
