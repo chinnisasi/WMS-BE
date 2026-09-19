@@ -184,7 +184,9 @@ export class GrnLineDto {
   @ApiProperty({ type: String, nullable: true })
   batchCode!: string | null;
 
-  @ApiProperty({ description: 'Physical truth: everything that arrived', minimum: 1 })
+  // The schema floor matches the receipt validator (@Min(0.001)): physical
+  // truth is fractional since story 10-1, so a sub-1 line quantity is real.
+  @ApiProperty({ description: 'Physical truth: everything that arrived', minimum: 0.001 })
   qty!: number;
 
   @ApiProperty({ description: 'The within-open portion applied immediately', minimum: 0 })
@@ -377,7 +379,9 @@ export class OverReceiptDto {
   @ApiProperty({ format: 'uuid' })
   skuId!: string;
 
-  @ApiProperty({ description: `The excess held for approval. ${QUANTITY_FIELD_DESCRIPTION}`, minimum: 1 })
+  // The schema floor follows the GRN line it derives from (@Min(0.001)): a
+  // sub-1 fractional excess is a real queue item, not a schema violation.
+  @ApiProperty({ description: `The excess held for approval. ${QUANTITY_FIELD_DESCRIPTION}`, minimum: 0.001 })
   excessQty!: number;
 
   @ApiProperty({ enum: ['pending', 'approved', 'rejected'] })
