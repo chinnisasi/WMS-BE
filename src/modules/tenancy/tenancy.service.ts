@@ -13,6 +13,8 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
+import { addressFromColumns } from '../../shared/primitives/address';
+import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
 
 /** What other modules get from the tenancy spine (module boundary — AD-6). */
@@ -202,7 +204,15 @@ export class TenancyService {
     cursor?: string,
     limit: number = DEFAULT_WAREHOUSE_PAGE_SIZE,
   ): Promise<
-    Page<{ id: string; tenantId: string; code: string; name: string; createdAt: string }>
+    Page<{
+      id: string;
+      tenantId: string;
+      code: string;
+      name: string;
+      /** The origin address (story 11-1); null on a pre-11.1 warehouse row. */
+      origin: AddressSnapshot | null;
+      createdAt: string;
+    }>
   > {
     const pageSize = Math.min(Math.max(Math.trunc(limit) || DEFAULT_WAREHOUSE_PAGE_SIZE, 1), MAX_WAREHOUSE_PAGE_SIZE);
     const before = cursor === undefined ? undefined : decodeCursorSafe(cursor);
@@ -214,6 +224,13 @@ export class TenancyService {
           tenantId: warehouses.tenantId,
           code: warehouses.code,
           name: warehouses.name,
+          originContactName: warehouses.originContactName,
+          originPhone: warehouses.originPhone,
+          originLine1: warehouses.originLine1,
+          originLine2: warehouses.originLine2,
+          originCity: warehouses.originCity,
+          originState: warehouses.originState,
+          originPincode: warehouses.originPincode,
           createdAt: warehouses.createdAt,
         })
         .from(warehouses)
@@ -230,7 +247,25 @@ export class TenancyService {
       return query;
     });
     const page = buildPage(rows, pageSize);
-    return { items: page.items, nextCursor: page.nextCursor };
+    return {
+      items: page.items.map((row) => ({
+        id: row.id,
+        tenantId: row.tenantId,
+        code: row.code,
+        name: row.name,
+        origin: addressFromColumns({
+          contactName: row.originContactName,
+          phone: row.originPhone,
+          line1: row.originLine1,
+          line2: row.originLine2,
+          city: row.originCity,
+          state: row.originState,
+          pincode: row.originPincode,
+        }),
+        createdAt: row.createdAt,
+      })),
+      nextCursor: page.nextCursor,
+    };
   }
 
   /**

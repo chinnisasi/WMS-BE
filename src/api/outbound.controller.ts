@@ -11,6 +11,7 @@ import { UUID_RE } from '../shared/primitives/ids';
 import { OutboundFacade } from '../modules/outbound/outbound.facade';
 import type { ListOrdersQuery } from '../modules/outbound/outbound.facade';
 import type { OrderLineDto } from '../modules/outbound/outbound.dto';
+import { toAddressDto } from '../modules/tenancy/tenancy.dto';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -102,6 +103,11 @@ export class OutboundController {
         // declared precision) is already read — a precision refusal in front
         // of that lookup would answer 400 to an op that already committed.
         lines: dto.lines.map((line) => ({ skuId: line.skuId, quantity: line.quantity })),
+        // Story 11-1: the destination is forwarded VERBATIM — the command
+        // owns the atomic required-together rule and the pincode shape behind
+        // its replay lookup (the adapter path bypasses this DTO), so
+        // stripping or normalizing here would silently diverge from it.
+        destination: dto.destination,
         // The channel arms are forwarded VERBATIM (present or not): the
         // command owns the required-together rule and 400s a manual order
         // that carries them — stripping them here would silently accept it.
@@ -111,7 +117,7 @@ export class OutboundController {
       },
       key,
     );
-    return { order: { ...snapshot.order, lines: snapshot.order.lines.map(toLineDto) } };
+    return { order: { ...snapshot.order, destination: toAddressDto(snapshot.order.destination), lines: snapshot.order.lines.map(toLineDto) } };
   }
 
   @Post(':tenantId/outbound/orders/:orderId/cancel')
@@ -151,7 +157,7 @@ export class OutboundController {
       { tenantId, actorUserId: session.userId, orderId },
       key,
     );
-    return { order: { ...snapshot.order, lines: snapshot.order.lines.map(toLineDto) } };
+    return { order: { ...snapshot.order, destination: toAddressDto(snapshot.order.destination), lines: snapshot.order.lines.map(toLineDto) } };
   }
 
   @Post(':tenantId/outbound/orders/:orderId/pack')
@@ -301,7 +307,7 @@ export class OutboundController {
     if (order === null) {
       throw orderNotFound(orderId);
     }
-    return { order: { ...order, lines: order.lines.map(toLineDto) } };
+    return { order: { ...order, destination: toAddressDto(order.destination), lines: order.lines.map(toLineDto) } };
   }
 
   @Get(':tenantId/warehouses/:warehouseId/outbound/orders')
@@ -333,7 +339,7 @@ export class OutboundController {
       limit: query.limit,
     };
     const page = await this.outbound.listOrders(tenantId, warehouseId, listQuery);
-    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
+    return { items: page.items.map((item) => ({ ...item, destination: toAddressDto(item.destination) })), nextCursor: page.nextCursor };
   }
 
   // ── waves and picklists (Story 4.2) ───────────────────────────────────────

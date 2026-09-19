@@ -21,6 +21,7 @@ import {
 } from 'class-validator';
 import { ApiProperty, OmitType } from '@nestjs/swagger';
 import { ORDER_SOURCES, ORDER_STATUSES } from './order.command';
+import { AddressDto } from '../tenancy/tenancy.dto';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
 // The pack bounds are the COMMAND's constants, imported rather than copied:
 // a literal here and a constant there drift silently, and the DTO is the
@@ -108,6 +109,15 @@ export class CreateOrderDto {
   @ValidateNested({ each: true })
   @Type(() => OrderLineInputDto)
   lines!: OrderLineInputDto[];
+
+  @ApiProperty({
+    type: AddressDto,
+    description:
+      'Where the shipment goes (story 11-1). REQUIRED at create — manual and ingested alike; carriers rate, label and manifest from it. Atomic: every field is required except line2. The command re-validates everything behind its replay lookup (the adapter path bypasses this DTO).',
+  })
+  @ValidateNested()
+  @Type(() => AddressDto)
+  destination!: AddressDto;
 }
 
 /** POST /tenants/{tenantId}/outbound/orders/{orderId}/cancel body — none. */
@@ -175,6 +185,13 @@ export class OrderDto {
   @ApiProperty({ type: String, nullable: true, description: 'Channel external event id (null on a manual order)' })
   externalEventId!: string | null;
 
+  @ApiProperty({
+    type: AddressDto,
+    nullable: true,
+    description: 'Where the shipment goes (story 11-1); null on a pre-11.1 order row',
+  })
+  destination!: AddressDto | null;
+
   @ApiProperty({ description: 'ISO-8601 UTC creation time' })
   createdAt!: string;
 
@@ -235,6 +252,13 @@ export class OrderEntryDto {
 
   @ApiProperty({ type: String, nullable: true })
   externalEventId!: string | null;
+
+  @ApiProperty({
+    type: AddressDto,
+    nullable: true,
+    description: 'Where the shipment goes (story 11-1); null on a pre-11.1 order row',
+  })
+  destination!: AddressDto | null;
 
   @ApiProperty({ description: 'ISO-8601 UTC creation time' })
   createdAt!: string;

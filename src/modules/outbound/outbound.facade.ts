@@ -8,6 +8,8 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
+import { addressFromColumns } from '../../shared/primitives/address';
+import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { canonicalInstant } from '../../shared/primitives/time';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
@@ -47,6 +49,8 @@ export interface OrderEntry {
   readonly source: OrderSource;
   readonly integrationId: string | null;
   readonly externalEventId: string | null;
+  /** Where the shipment goes (story 11-1); null on a pre-11.1 order row. */
+  readonly destination: AddressSnapshot | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -270,6 +274,15 @@ export class OutboundFacade {
           source: orders.source,
           integrationId: orders.integrationId,
           externalEventId: orders.externalEventId,
+          // Story 11-1: the list row carries the destination (city + pincode
+          // are what the dispatch surface shows first); pre-11.1 rows null.
+          destinationContactName: orders.destinationContactName,
+          destinationPhone: orders.destinationPhone,
+          destinationLine1: orders.destinationLine1,
+          destinationLine2: orders.destinationLine2,
+          destinationCity: orders.destinationCity,
+          destinationState: orders.destinationState,
+          destinationPincode: orders.destinationPincode,
           createdAt: orders.createdAt,
           updatedAt: orders.updatedAt,
         })
@@ -286,9 +299,22 @@ export class OutboundFacade {
         .orderBy(desc(orders.createdAt), desc(orders.id))
         .limit(pageSize + 1);
       const items = rows.map((row) => ({
-        ...row,
+        id: row.id,
+        tenantId: row.tenantId,
+        warehouseId: row.warehouseId,
         status: row.status as OrderStatus,
         source: row.source as OrderSource,
+        integrationId: row.integrationId,
+        externalEventId: row.externalEventId,
+        destination: addressFromColumns({
+          contactName: row.destinationContactName,
+          phone: row.destinationPhone,
+          line1: row.destinationLine1,
+          line2: row.destinationLine2,
+          city: row.destinationCity,
+          state: row.destinationState,
+          pincode: row.destinationPincode,
+        }),
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       }));

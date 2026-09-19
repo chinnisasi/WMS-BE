@@ -57,6 +57,7 @@ import {
   SetupChecklistResponse,
   ZoneListResponse,
   ZoneResponse,
+  toAddressDto,
 } from './tenancy.dto';
 
 export class WarehouseListQuery {
@@ -157,10 +158,11 @@ export class TenancyController {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const snapshot = await this.warehouseCommand.create(
-      { tenantId, actorUserId: session.userId, code: dto.code, name: dto.name },
+      { tenantId, actorUserId: session.userId, code: dto.code, name: dto.name, origin: dto.origin },
       key,
     );
-    return snapshot.warehouse;
+    // Story 11-1: the origin crosses the snapshot→wire edge (line2 null → absent).
+    return { ...snapshot.warehouse, origin: toAddressDto(snapshot.warehouse.origin) };
   }
 
   @Get(':tenantId/warehouses')
@@ -183,7 +185,10 @@ export class TenancyController {
       query.cursor,
       query.limit === undefined ? undefined : query.limit,
     );
-    return { items: [...page.items], nextCursor: page.nextCursor };
+    return {
+      items: page.items.map((warehouse) => ({ ...warehouse, origin: toAddressDto(warehouse.origin) })),
+      nextCursor: page.nextCursor,
+    };
   }
 
   @Post(':tenantId/warehouses/:warehouseId/zones')

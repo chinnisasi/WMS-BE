@@ -8096,6 +8096,55 @@
           "user"
         ]
       },
+      "AddressDto": {
+        "type": "object",
+        "properties": {
+          "contactName": {
+            "type": "string",
+            "example": "Priya Spices Pvt Ltd",
+            "maxLength": 120
+          },
+          "phone": {
+            "type": "string",
+            "example": "+91 98450 12345",
+            "maxLength": 20
+          },
+          "line1": {
+            "type": "string",
+            "example": "12, Peenya Industrial Area",
+            "maxLength": 200
+          },
+          "line2": {
+            "type": "string",
+            "example": "Gate 3",
+            "maxLength": 200,
+            "description": "Second address line — omit when there is none"
+          },
+          "city": {
+            "type": "string",
+            "example": "Bengaluru",
+            "maxLength": 100
+          },
+          "state": {
+            "type": "string",
+            "example": "Karnataka",
+            "maxLength": 100
+          },
+          "pincode": {
+            "type": "string",
+            "example": "560066",
+            "description": "Six-digit Indian pincode, as TEXT — leading zeros are significant, never an integer"
+          }
+        },
+        "required": [
+          "contactName",
+          "phone",
+          "line1",
+          "city",
+          "state",
+          "pincode"
+        ]
+      },
       "CreateWarehouseDto": {
         "type": "object",
         "properties": {
@@ -8110,11 +8159,20 @@
             "example": "Whitefield",
             "minLength": 1,
             "maxLength": 120
+          },
+          "origin": {
+            "description": "The origin address — where shipments leave from (story 11-1). Required at create; carriers rate and label from it. There is no update endpoint (story 4-6d owns that decision).",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AddressDto"
+              }
+            ]
           }
         },
         "required": [
           "code",
-          "name"
+          "name",
+          "origin"
         ]
       },
       "WarehouseResponse": {
@@ -8138,6 +8196,16 @@
             "type": "string",
             "example": "Whitefield"
           },
+          "origin": {
+            "nullable": true,
+            "description": "The origin address (story 11-1); null on a pre-11.1 warehouse row",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AddressDto"
+              }
+            ]
+          },
           "createdAt": {
             "type": "string",
             "example": "2026-09-08T00:00:00.000Z"
@@ -8148,6 +8216,7 @@
           "tenantId",
           "code",
           "name",
+          "origin",
           "createdAt"
         ]
       },
@@ -10562,11 +10631,20 @@
             "items": {
               "$ref": "#/components/schemas/OrderLineInputDto"
             }
+          },
+          "destination": {
+            "description": "Where the shipment goes (story 11-1). REQUIRED at create — manual and ingested alike; carriers rate, label and manifest from it. Atomic: every field is required except line2. The command re-validates everything behind its replay lookup (the adapter path bypasses this DTO).",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AddressDto"
+              }
+            ]
           }
         },
         "required": [
           "warehouseId",
-          "lines"
+          "lines",
+          "destination"
         ]
       },
       "OrderLineDto": {
@@ -10675,6 +10753,16 @@
             "nullable": true,
             "description": "Channel external event id (null on a manual order)"
           },
+          "destination": {
+            "nullable": true,
+            "description": "Where the shipment goes (story 11-1); null on a pre-11.1 order row",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AddressDto"
+              }
+            ]
+          },
           "createdAt": {
             "type": "string",
             "description": "ISO-8601 UTC creation time"
@@ -10698,6 +10786,7 @@
           "source",
           "integrationId",
           "externalEventId",
+          "destination",
           "createdAt",
           "updatedAt",
           "lines"
@@ -11164,6 +11253,16 @@
             "type": "string",
             "nullable": true
           },
+          "destination": {
+            "nullable": true,
+            "description": "Where the shipment goes (story 11-1); null on a pre-11.1 order row",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AddressDto"
+              }
+            ]
+          },
           "createdAt": {
             "type": "string",
             "description": "ISO-8601 UTC creation time"
@@ -11181,6 +11280,7 @@
           "source",
           "integrationId",
           "externalEventId",
+          "destination",
           "createdAt",
           "updatedAt"
         ]
