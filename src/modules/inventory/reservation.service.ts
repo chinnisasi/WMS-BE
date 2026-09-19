@@ -97,7 +97,7 @@ export interface GrantReservationCommand {
   /** Who holds the units (free-form — Epic 4's order lines are the first writers). */
   readonly ownerType: string;
   readonly ownerId: string;
-  /** Base-UoM units to hold; a positive integer. */
+  /** Base-UoM units to hold, at the unit's declared precision. */
   readonly quantity: number;
   /** Hold TTL in seconds; defaults to `DEFAULT_RESERVATION_TTL_SECONDS`. */
   readonly ttlSeconds?: number;

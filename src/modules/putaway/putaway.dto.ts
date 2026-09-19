@@ -122,7 +122,7 @@ export class PutawayPlacementDto {
   @ApiProperty({ type: String, nullable: true, description: 'The catalog batch code; null on non-batch-tracked SKUs' })
   batchCode!: string | null;
 
-  @ApiProperty({ description: 'The placed quantity (positive integer)', minimum: 1 })
+  @ApiProperty({ description: `The placed quantity. ${QUANTITY_FIELD_DESCRIPTION}`, minimum: 1 })
   qty!: number;
 
   @ApiProperty({ format: 'uuid', description: 'The system Receiving bin the units left' })

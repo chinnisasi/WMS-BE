@@ -12729,7 +12729,7 @@
           },
           "excessQty": {
             "type": "number",
-            "description": "The excess held for approval (positive integer)",
+            "description": "The excess held for approval. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
             "minimum": 1
           },
           "status": {
@@ -13066,7 +13066,7 @@
           },
           "qty": {
             "type": "number",
-            "description": "The placed quantity (positive integer)",
+            "description": "The placed quantity. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
             "minimum": 1
           },
           "fromBinId": {

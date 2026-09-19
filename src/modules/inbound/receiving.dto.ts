@@ -377,7 +377,7 @@ export class OverReceiptDto {
   @ApiProperty({ format: 'uuid' })
   skuId!: string;
 
-  @ApiProperty({ description: 'The excess held for approval (positive integer)', minimum: 1 })
+  @ApiProperty({ description: `The excess held for approval. ${QUANTITY_FIELD_DESCRIPTION}`, minimum: 1 })
   excessQty!: number;
 
   @ApiProperty({ enum: ['pending', 'approved', 'rejected'] })

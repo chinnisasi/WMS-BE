@@ -67,7 +67,7 @@ export interface PlacePutawayCommand {
   readonly skuId: string;
   /** The catalog batch identity — null on non-batch-tracked SKUs. */
   readonly batchId: string | null;
-  /** The placed quantity in base UoM — a positive integer (partial placements allowed). */
+  /** The placed quantity in base UoM, at the unit's declared precision (partial placements allowed). */
   readonly qty: number;
   /** The target bin the operator scanned/entered. */
   readonly toBinId: string;

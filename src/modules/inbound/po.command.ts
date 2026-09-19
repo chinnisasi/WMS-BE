@@ -25,7 +25,7 @@ import { uomPrecision } from '../catalog/uom';
 
 export interface PoLineInput {
   readonly skuId: string;
-  /** Ordered quantity in base UoM — a positive integer. */
+  /** Ordered quantity in base UoM, at the unit's declared precision. */
   readonly orderedQty: number;
   /** Unit cost as integer paise (AD-9) — never a float. */
   readonly unitCostPaise: number;
@@ -438,7 +438,7 @@ export class PurchaseOrderCommand {
 
       // Carried lines move their open quantity (ordered − received) to the
       // successor; a carried line with nothing left to carry is a client
-      // error — cancel it instead (ordered_qty must stay a positive integer).
+      // error — cancel it instead (ordered_qty must stay positive).
       const carried = existingLines.filter(
         (line) => dispositionByLineId.get(line.id)!.disposition === 'carried',
       );
