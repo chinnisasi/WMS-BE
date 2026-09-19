@@ -10,6 +10,7 @@ import { ValkeyClient } from '../src/shared/valkey/valkey.client';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { ORDER_LINE_STATUSES, ORDER_SOURCES, ORDER_STATUSES } from '../src/modules/outbound/order.command';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -115,7 +116,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       .post(`${API}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `ORD-${ulid().slice(10, 16).toUpperCase()}`, name: `Order WH ${ulid()}` })
+      .send({ origin: testAddress(), code: `ORD-${ulid().slice(10, 16).toUpperCase()}`, name: `Order WH ${ulid()}` })
       .expect(201);
     warehouseId = warehouse.body.id as string;
     const zone = (
@@ -261,7 +262,9 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     lines: { skuId: string; quantity: number }[],
     extra: Record<string, unknown> = {},
   ): Record<string, unknown> {
-    return { warehouseId, lines, ...extra };
+    // Story 11-1: destination REQUIRED at create — `extra` may override it
+    // (the divergent-payload arms do) or drop it with `{ destination: undefined }`.
+    return { warehouseId, lines, destination: testAddress(), ...extra };
   }
 
   function postOrder(
@@ -428,6 +431,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     await postOrder(opsToken, {
       warehouseId: uuidv7(),
       lines: [{ skuId, quantity: 1 }],
+      destination: testAddress(),
     }).expect(404);
     const res = await postOrder(opsToken, createBody([{ skuId: uuidv7(), quantity: 1 }])).expect(
       404,
@@ -502,6 +506,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       integrationId,
       externalEventId,
       lines: [{ skuId, quantity: 2 }],
+      destination: testAddress(),
     };
     const first = await postOrder(opsToken, payload).expect(201);
     expect((first.body.order as { source: string }).source).toBe('ingested');
@@ -527,6 +532,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       integrationId,
       externalEventId: `evt-${ulid().toLowerCase()}`,
       lines: [{ skuId, quantity: 3 }],
+      destination: testAddress(),
     };
     // Two different keys, same payload, fired concurrently: the dedup index
     // is the race backstop — the loser releases its own grants and resolves
@@ -965,7 +971,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       .post(`${API}/${foreignTenantId}/warehouses`)
       .set('Authorization', `Bearer ${foreignToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `FOR-${ulid().slice(10, 16).toUpperCase()}`, name: `Foreign WH ${ulid()}` })
+      .send({ origin: testAddress(), code: `FOR-${ulid().slice(10, 16).toUpperCase()}`, name: `Foreign WH ${ulid()}` })
       .expect(201);
     await request(app.getHttpServer())
       .post(`${API}/${foreignTenantId}/outbound/orders`)
@@ -974,6 +980,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       .send({
         warehouseId: foreignWh.body.id as string,
         lines: [{ skuId: uuidv7(), quantity: 1 }],
+        destination: testAddress(),
       })
       .expect(404); // the foreign tenant has no such SKU — nothing written
 

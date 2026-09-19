@@ -15,6 +15,7 @@ import {
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { getLedgerEventType } from '../src/modules/inventory/ledger-registry';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -158,7 +159,7 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `DSP-${ulid().slice(10, 16).toUpperCase()}`, name: `Dispatch WH ${ulid()}` })
+        .send({ origin: testAddress(), code: `DSP-${ulid().slice(10, 16).toUpperCase()}`, name: `Dispatch WH ${ulid()}` })
         .expect(201)
     ).body.id as string;
     zoneId = (
@@ -348,7 +349,7 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
       .post(`${API}/${tenantId}/outbound/orders`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId, lines })
+      .send({ warehouseId, lines, destination: testAddress() })
       .expect(201);
     return res.body.order.id as string;
   }

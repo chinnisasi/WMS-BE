@@ -6,6 +6,7 @@ import { toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -179,7 +180,7 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
       .post(`${API}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `INB-${ulid().slice(10, 16).toUpperCase()}`, name: `Inboundpoint ${ulid()}` })
+      .send({ origin: testAddress(), code: `INB-${ulid().slice(10, 16).toUpperCase()}`, name: `Inboundpoint ${ulid()}` })
       .expect(201);
     warehouseId = warehouse.body.id as string;
 

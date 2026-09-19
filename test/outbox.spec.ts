@@ -13,6 +13,7 @@ import {
 } from '../src/shared/events/outbox';
 import type { DomainEvent, EventBus } from '../src/shared/events/event-bus.seam';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -432,7 +433,7 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
       .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
       .set(scheme, token)
       .set(KEY_HEADER, ulid())
-      .send({ code: 'WH-9', name: 'Nine Warehouse' })
+      .send({ origin: testAddress(), code: 'WH-9', name: 'Nine Warehouse' })
       .expect(201);
     const warehouseId = warehouse.body.id as string;
     expect(warehouse.body.code).toBe('WH-9');

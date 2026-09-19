@@ -7,6 +7,7 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -29,7 +30,7 @@ function registrationBody(email: string): Record<string, unknown> {
 }
 
 function warehouseBody(code: string): Record<string, unknown> {
-  return { code, name: `Whitefield ${ulid()}` };
+  return { code, name: `Whitefield ${ulid()}`, origin: testAddress() };
 }
 
 function csvFile(rows: Record<string, string>[]): Buffer {

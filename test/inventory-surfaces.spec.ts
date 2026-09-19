@@ -5,6 +5,7 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -148,7 +149,7 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
       .post(`${API}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `SRF-${ulid().slice(10, 16).toUpperCase()}`, name: `Surfacepoint ${ulid()}` })
+      .send({ origin: testAddress(), code: `SRF-${ulid().slice(10, 16).toUpperCase()}`, name: `Surfacepoint ${ulid()}` })
       .expect(201);
     warehouseId = warehouse.body.id as string;
     const zone = await request(app.getHttpServer())
@@ -378,7 +379,7 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
       .post(`${API}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `SRF2-${ulid().slice(10, 16).toUpperCase()}`, name: `Surfacepoint Two ${ulid()}` })
+      .send({ origin: testAddress(), code: `SRF2-${ulid().slice(10, 16).toUpperCase()}`, name: `Surfacepoint Two ${ulid()}` })
       .expect(201);
     const w2Id = w2.body.id as string;
     const w2zone = await request(app.getHttpServer())

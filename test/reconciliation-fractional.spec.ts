@@ -12,6 +12,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { RECONCILIATION_DIVERGENCE_EVENT } from '../src/modules/inventory/reconcile';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -240,7 +241,7 @@ describe('reconciliation over fractional stock (e2e, story 10.4)', () => {
       .post(`${API}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `${code}-${ulid().slice(10, 16).toUpperCase()}`, name: `ReconFrac ${code}` })
+      .send({ origin: testAddress(), code: `${code}-${ulid().slice(10, 16).toUpperCase()}`, name: `ReconFrac ${code}` })
       .expect(201);
     const warehouseId = warehouse.body.id as string;
     const zone = await request(app.getHttpServer())

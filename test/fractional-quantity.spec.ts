@@ -25,6 +25,7 @@ import type {
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { QUANTITY_SCALE, fromMilli, toMilli } from '../src/shared/primitives/quantity';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -612,7 +613,7 @@ describe('story 10.1: fractional quantities are scaled integers in milli-units',
           .post(`${API}/${tenantId}/warehouses`)
           .set('Authorization', `Bearer ${ownerToken}`)
           .set(KEY_HEADER, ulid())
-          .send({ code: `FRQ-${ulid().slice(10, 16).toUpperCase()}`, name: 'Fractional WH' })
+          .send({ origin: testAddress(), code: `FRQ-${ulid().slice(10, 16).toUpperCase()}`, name: 'Fractional WH' })
           .expect(201)
       ).body.id as string;
       zoneId = (

@@ -8,6 +8,7 @@ import { fromMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -79,7 +80,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `PUT-${ulid().slice(10, 16).toUpperCase()}`, name: `Putaway Depot ${ulid()}` })
+        .send({ origin: testAddress(), code: `PUT-${ulid().slice(10, 16).toUpperCase()}`, name: `Putaway Depot ${ulid()}` })
         .expect(201)
     ).body.id as string;
 

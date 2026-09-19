@@ -8,6 +8,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { RECONCILIATION_DIVERGENCE_EVENT } from '../src/modules/inventory/reconcile';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -162,7 +163,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       .post(`${API}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `TRC-${ulid().slice(10, 16).toUpperCase()}`, name: `Tracepoint ${ulid()}` })
+      .send({ origin: testAddress(), code: `TRC-${ulid().slice(10, 16).toUpperCase()}`, name: `Tracepoint ${ulid()}` })
       .expect(201);
     warehouseId = warehouse.body.id as string;
     const zone = await request(app.getHttpServer())

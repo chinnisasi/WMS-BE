@@ -12,6 +12,7 @@ import { SHORT_PICK_REASON_CODES } from '../src/modules/outbound/pick.command';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { getLedgerEventType } from '../src/modules/inventory/ledger-registry';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -185,7 +186,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `PCK-${ulid().slice(10, 16).toUpperCase()}`, name: `Pick WH ${ulid()}` })
+        .send({ origin: testAddress(), code: `PCK-${ulid().slice(10, 16).toUpperCase()}`, name: `Pick WH ${ulid()}` })
         .expect(201)
     ).body.id as string;
     zoneId = (
@@ -416,7 +417,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       .post(`${API}/${tenantId}/outbound/orders`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId, lines })
+      .send({ warehouseId, lines, destination: testAddress() })
       .expect(201);
     return res.body.order.id as string;
   }

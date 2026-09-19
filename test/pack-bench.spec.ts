@@ -7,6 +7,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -100,7 +101,7 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
         .post(`${API}/${tenantId}/warehouses`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ code: `BEN-${ulid().slice(10, 16).toUpperCase()}`, name: `Bench WH ${ulid()}` })
+        .send({ origin: testAddress(), code: `BEN-${ulid().slice(10, 16).toUpperCase()}`, name: `Bench WH ${ulid()}` })
         .expect(201)
     ).body.id as string;
     zoneId = (
@@ -275,7 +276,7 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
       .post(`${API}/${tenantId}/outbound/orders`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId, lines })
+      .send({ warehouseId, lines, destination: testAddress() })
       .expect(201);
     return res.body.order.id as string;
   }

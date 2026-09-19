@@ -17,6 +17,7 @@ import { ReservationService } from '../src/modules/inventory/reservation.service
 import type { ReservationSnapshot } from '../src/modules/inventory/reservation.service';
 import { ReservationReaper, parseReservationReaperPollMs } from '../src/jobs/jobs.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -259,7 +260,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
       .post(`${API}/${tenantId}/warehouses`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ code: `RSV-${ulid().slice(10, 16).toUpperCase()}`, name: `Reserve WH ${ulid()}` })
+      .send({ origin: testAddress(), code: `RSV-${ulid().slice(10, 16).toUpperCase()}`, name: `Reserve WH ${ulid()}` })
       .expect(201);
     warehouseId = warehouse.body.id as string;
     const zone = await request(app.getHttpServer())
