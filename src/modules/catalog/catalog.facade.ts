@@ -19,6 +19,8 @@ import {
   markHandlingUnitsPackedInTx,
   settleHandlingUnitIntakeInTx,
 } from './handling-unit.store';
+import { getKitCompositionInTx, getKitSkuIdsInTx } from './kit.store';
+import type { KitCompositionLine } from './kit.store';
 import type {
   CreateHandlingUnitInput,
   HandlingUnitIdentity,
@@ -69,6 +71,9 @@ export interface SerialIdentity {
   readonly serialNumber: string;
   readonly status: string;
 }
+
+/** One composition row as the explosion consumes it (Story 11.4) — milli-units in. */
+export type { KitCompositionLine } from './kit.store';
 
 /** One batch intake input to `ensureBatches` (dates are UTC-validated instants). */
 export interface EnsureBatchInput {
@@ -435,6 +440,35 @@ export class CatalogFacade {
               );
       return serialNumbers.map((serialNumber) => rows.find((row) => row.serialNumber === serialNumber)!);
     });
+  }
+
+  // ── kits (Story 11.4 — the composition seam) ──────────────────────────────
+  //
+  // `kit_compositions` is catalog-owned (a kit IS a SKU: kit-ness is the
+  // PRESENCE of composition rows, never a flag — AD-19). Outbound needs the
+  // BOM to explode a kit line at acceptance; inbound and inventory need the
+  // one-bit "is this SKU a kit" answer to refuse +stock onto it. The
+  // implementation lives in `kit.store.ts` (a file-level in-tx seam) because
+  // the inventory module cannot import `CatalogModule` — these methods are the
+  // facade face of the same functions, for the siblings that already hold this
+  // module (inbound, outbound). One implementation.
+
+  /** See `getKitCompositionInTx` — the explosion's flat-BOM read. */
+  async getKitCompositionInTx(
+    tx: TenantTx,
+    tenantId: string,
+    kitSkuId: string,
+  ): Promise<KitCompositionLine[]> {
+    return getKitCompositionInTx(tx, tenantId, kitSkuId);
+  }
+
+  /** See `getKitSkuIdsInTx` — the batch "is a kit" answer the +stock guards take. */
+  async getKitSkuIdsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuIds: readonly string[],
+  ): Promise<string[]> {
+    return getKitSkuIdsInTx(tx, tenantId, skuIds);
   }
 
   // ── handling units (Story 10.3 — the catch-weight write seam) ─────────────

@@ -445,6 +445,51 @@ export const uomConversions = pgTable(
 export type UomConversion = typeof uomConversions.$inferSelect;
 
 /**
+ * Kit compositions (Story 11.4 — FR-38, AD-19): one row per component of one
+ * kit SKU. **A kit is a SKU** — the kit-ness of a SKU is the PRESENCE of its
+ * composition rows, never a flag (the 11.3 relational-identity precedent); a
+ * SKU with rows is a kit, a SKU without them is an ordinary stock SKU. The
+ * kit itself never holds, receives or adjusts stock (FR-38: stock is held on
+ * the components; `kit-cannot-hold-stock` refuses both +stock writers).
+ *
+ * `kit_sku_id` / `component_sku_id` are bare uuids with no FK (the repo
+ * convention), validated in the command transaction. `qty` is the component
+ * quantity **per ONE kit**, in the component SKU's base UoM milli-units (the
+ * milli-unit rule; the kit's own `uom_conversions` play no part in the
+ * explosion — 1 kit = 1 base-UoM unit of the kit SKU). Flat one level: a
+ * component SKU cannot itself be a kit (409 `kit-component-is-kit`, both SKU
+ * rows locked `.for('update')` in id order — the concurrent mutual-composition
+ * cycle is closed by serialization, not by detection).
+ *
+ * RLS policy + CHECKs live **only in the migration SQL** (0033).
+ */
+export const kitCompositions = pgTable(
+  'kit_compositions',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    kitSkuId: uuid('kit_sku_id').notNull(),
+    componentSkuId: uuid('component_sku_id').notNull(),
+    /** Milli-units — the component's base UoM × 10³ (AD-9 as amended by 10.1). */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('kit_compositions_kit_component_unique').on(
+      table.tenantId,
+      table.kitSkuId,
+      table.componentSkuId,
+    ),
+    index('kit_compositions_kit_sku_id_idx').on(table.kitSkuId),
+    index('kit_compositions_tenant_id_idx').on(table.tenantId),
+  ],
+);
+
+export type KitComposition = typeof kitCompositions.$inferSelect;
+
+/**
  * Batch identity (Story 2.4 — catalog-owned, beside `skus`): one row per
  * (tenant, sku, code) batch of a batch-tracked SKU, carrying the intake
  * master data — `mfg_date` / `expiry_date` (nullable; expiry is optional at
@@ -1694,6 +1739,14 @@ export const orderLines = pgTable(
     reservedQty: bigint('reserved_qty', { mode: 'number' }).notNull().default(0),
     /** The line's reservation hold (null when nothing could be reserved). */
     reservationId: uuid('reservation_id'),
+    /**
+     * Story 11.4: the kit line this component line exploded from (null on an
+     * ordinary line and on the kit parent itself). Bare uuid, no FK — repo
+     * convention; the parent is the kit SKU's order line created in the same
+     * transaction. Explosion is point-in-time: a later composition edit never
+     * re-explodes an accepted order.
+     */
+    parentLineId: uuid('parent_line_id'),
     status: text('status').notNull().default('open'),
     ...tenantTimestamps,
   },
@@ -1701,6 +1754,8 @@ export const orderLines = pgTable(
     // The detail read's per-line ordering and any per-order roll-up.
     index('order_lines_order_id_idx').on(table.orderId, table.createdAt, table.id),
     index('order_lines_tenant_id_idx').on(table.tenantId),
+    // Story 11.4: a kit line's component children (the parent's roll-up read).
+    index('order_lines_parent_line_idx').on(table.parentLineId),
   ],
 );
 

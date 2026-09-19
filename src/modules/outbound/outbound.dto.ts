@@ -154,6 +154,14 @@ export class OrderLineDto {
   @ApiProperty({ type: String, nullable: true, description: 'The hold’s live journal state (held / released / committed / expired)' })
   reservationState!: string | null;
 
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description:
+      'Story 11.4 — the kit line this component line exploded from at acceptance (null on ordinary lines and kit parents; a parent is any line another line names here)',
+  })
+  parentLineId!: string | null;
+
   @ApiProperty({ description: 'ISO-8601 UTC creation time' })
   createdAt!: string;
 }

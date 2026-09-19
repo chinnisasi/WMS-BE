@@ -22,10 +22,13 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
+import { CatalogFacade } from '../catalog/catalog.facade';
+import type { KitCompositionLine } from '../catalog/catalog.facade';
 import { picklistLineDrewUnits } from './wave.command';
 import type { ReservationSnapshot } from '../inventory/inventory.facade';
 import {
   MAX_QUANTITY_MILLI,
+  QUANTITY_SCALE,
   assertRecordableQuantity,
   fromMilli,
 } from '../../shared/primitives/quantity';
@@ -167,6 +170,12 @@ export interface OrderLineSnapshot {
   readonly reservationId: string | null;
   /** The hold's live journal state (`held` at accept; read through the facade). */
   readonly reservationState: string | null;
+  /**
+   * Story 11.4 — the kit line this component line exploded from at
+   * acceptance; null on every ordinary line and on kit parent lines. The
+   * PARENT is found by inversion (any line whose id another line names).
+   */
+  readonly parentLineId: string | null;
   readonly createdAt: string;
 }
 
@@ -223,6 +232,9 @@ export class OrderCommandService {
     // (AD-6): the per-line grants, the ATP reads, and the reservation-state
     // read ride the inventory facade's seam.
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+    // Story 11.4 — the kit explosion reads the flat BOM through the catalog
+    // facade (`getKitCompositionInTx`), in the same tx that accepts the order.
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
   ) {}
 
   /**
@@ -302,7 +314,12 @@ export class OrderCommandService {
 
       const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replay !== null) {
-        return { replayed: replay as OrderSnapshot, destination: undefined, lines: [] as OrderLineInput[] };
+        return {
+          replayed: replay as OrderSnapshot,
+          destination: undefined,
+          lines: [] as OrderLineInput[],
+          explosions: new Map(),
+        };
       }
 
       // ── input validation (400 before any write) ─────────────────────────
@@ -351,6 +368,32 @@ export class OrderCommandService {
         };
       });
 
+      // ── story 11.4: the kit explosion plan ───────────────────────────────
+      // Which input lines are kits, and their flat BOMs — read in THIS
+      // transaction (the acceptance explosion is point-in-time: the child
+      // lines copied below are what the order keeps, immune to later
+      // composition edits). Kit-ness is one facade lookup (composition-row
+      // presence); the BOM itself is one more. The child quantities are
+      // validated HERE, before any grant moves: an explosion that would
+      // overflow the quantity ceiling or fall below the component's milli
+      // resolution is a 400, never a half-granted surprise.
+      const kitSkuIds = await this.catalog.getKitSkuIdsInTx(
+        tx,
+        command.tenantId,
+        lines.map((line) => line.skuId),
+      );
+      const bomBySku = new Map<string, readonly KitCompositionLine[]>();
+      for (const skuId of kitSkuIds) {
+        bomBySku.set(skuId, await this.catalog.getKitCompositionInTx(tx, command.tenantId, skuId));
+      }
+      const explosions = new Map<number, readonly KitCompositionLine[]>();
+      for (let index = 0; index < lines.length; index += 1) {
+        const bom = bomBySku.get(lines[index]!.skuId);
+        if (bom !== undefined) {
+          explosions.set(index, explodeKitLine(lines[index]!, index, bom));
+        }
+      }
+
       // ── channel dedup pre-check: the same payload twice → the same order ─
       // (the partial unique index is the concurrent-delivery backstop; this
       // read settles the sequential redelivery before any reservation moves).
@@ -382,10 +425,10 @@ export class OrderCommandService {
             payloadHash,
             snapshot,
           );
-          return { replayed: snapshot, destination: undefined, lines };
+          return { replayed: snapshot, destination: undefined, lines, explosions: new Map() };
         }
       }
-      return { replayed: null, destination, lines };
+      return { replayed: null, destination, lines, explosions };
     });
     if (preflight.replayed !== null) {
       return preflight.replayed;
@@ -396,20 +439,75 @@ export class OrderCommandService {
     // whenever the replay did not hit, because the validation above ran.
     const lines = preflight.lines;
     const destination = preflight.destination!;
+    // The kit explosion plan the preflight validated (empty on a replay or a
+    // dedup hit — those never reach the grant phase).
+    const explosions = preflight.explosions;
 
     // ── phase 2: the per-line ATP split + grants (each its own atomic unit).
     // Every grant lands before the order-create tx opens; any failure here
     // writes nothing (the 503 propagates; a deterministic loss under the
     // backorder policy marks the line backordered instead).
+    //
+    // Story 11.4: a kit line reserves through its CHILD lines — each
+    // component grants against its own child line id (ownerType 'order',
+    // ownerId = the child line's id), so waves/picklists/dispatch see
+    // ordinary holds. All-or-nothing per kit (the human decision): if any
+    // component cannot fully reserve, the siblings this attempt granted are
+    // released and the whole kit line backorders — a kit never ships half
+    // its contents, and it never half-holds.
     const lineIds = lines.map(() => uuidv7());
-    const granted: { lineIndex: number; reservation: ReservationSnapshot }[] = [];
+    const childIds = new Map<number, string[]>();
+    for (const [index, bom] of explosions) {
+      childIds.set(index, bom.map(() => uuidv7()));
+    }
+    const plainHolds = new Map<number, ReservationSnapshot>();
+    const childHolds = new Map<string, ReservationSnapshot>();
+    const granted: ReservationSnapshot[] = [];
     try {
       for (let index = 0; index < lines.length; index += 1) {
-        const line = lines[index]!;
-        const reservation = await this.reserveLine(command, line, lineIds[index]!);
-        if (reservation !== null) {
-          granted.push({ lineIndex: index, reservation });
+        const bom = explosions.get(index);
+        if (bom === undefined) {
+          const reservation = await this.reserveLine(command, lines[index]!, lineIds[index]!);
+          if (reservation !== null) {
+            plainHolds.set(index, reservation);
+            granted.push(reservation);
+          }
+          continue;
         }
+        // The kit's components, in composition order. All-or-nothing per kit
+        // (the human decision): `reserveLine` grants min(qty, ATP) — the
+        // plain line's partial grant — but a kit may not hold PART of a
+        // component's requirement, so a hold below the component's full
+        // exploded quantity is a shortfall too: the granted siblings release
+        // and the whole kit backorders. A kit never ships half its contents
+        // and never half-holds.
+        const holds: ReservationSnapshot[] = [];
+        let fullyGranted = true;
+        for (let childIndex = 0; childIndex < bom.length; childIndex += 1) {
+          const component = bom[childIndex]!;
+          const reservation = await this.reserveLine(
+            command,
+            { skuId: component.componentSkuId, quantity: component.qty },
+            childIds.get(index)![childIndex]!,
+          );
+          if (reservation === null) {
+            fullyGranted = false;
+            break;
+          }
+          // Push BEFORE the shortfall check: the partial hold is a real
+          // journal row — it must release with its siblings, never orphan.
+          holds.push(reservation);
+          if (reservation.quantity < component.qty) {
+            fullyGranted = false;
+            break;
+          }
+        }
+        if (!fullyGranted) {
+          await this.releaseAll(command.tenantId, holds, 'kit-backorder');
+          continue;
+        }
+        holds.forEach((hold, childIndex) => childHolds.set(`${index}:${childIndex}`, hold));
+        granted.push(...holds);
       }
     } catch (err) {
       // Fail closed (the I/O matrix): a reservation-store failure (503) or
@@ -458,20 +556,58 @@ export class OrderCommandService {
           }
           throw err;
         }
+        // Story 11.4: one insert for parents, plain lines and children alike
+        // — a child is an ordinary line whose `parentLineId` names the kit
+        // line it exploded from (point-in-time, copied at acceptance). The
+        // parent itself carries no hold — the components carry the stock —
+        // and its status mirrors the kit's all-or-nothing outcome.
         await tx.insert(orderLines).values(
-          lines.map((line, index) => {
-            const hold = granted.find((entry) => entry.lineIndex === index);
-            const reservedQty = hold?.reservation.quantity ?? 0;
-            return {
+          lines.flatMap((line, index): (typeof orderLines.$inferInsert)[] => {
+            const bom = explosions.get(index);
+            if (bom === undefined) {
+              const hold = plainHolds.get(index);
+              const reservedQty = hold?.quantity ?? 0;
+              return [
+                {
+                  id: lineIds[index]!,
+                  tenantId: command.tenantId,
+                  orderId,
+                  skuId: line.skuId,
+                  qty: line.quantity,
+                  reservedQty,
+                  reservationId: hold?.id ?? null,
+                  status: reservedQty < line.quantity ? 'backordered' : 'open',
+                  parentLineId: null,
+                },
+              ];
+            }
+            const parentRow = {
               id: lineIds[index]!,
               tenantId: command.tenantId,
               orderId,
               skuId: line.skuId,
               qty: line.quantity,
-              reservedQty,
-              reservationId: hold?.reservation.id ?? null,
-              status: reservedQty < line.quantity ? 'backordered' : 'open',
+              reservedQty: 0,
+              reservationId: null,
+              status: childHolds.has(`${index}:0`) ? 'open' : 'backordered',
+              parentLineId: null,
             };
+            const childRows = bom.map((component, childIndex) => {
+              const hold = childHolds.get(`${index}:${childIndex}`);
+              const reservedQty = hold?.quantity ?? 0;
+              return {
+                id: childIds.get(index)![childIndex]!,
+                tenantId: command.tenantId,
+                orderId,
+                skuId: component.componentSkuId,
+                qty: component.qty,
+                reservedQty,
+                reservationId: hold?.id ?? null,
+                status: reservedQty < component.qty ? 'backordered' : 'open',
+                parentLineId: lineIds[index]!,
+              };
+            });
+            return [parentRow, ...childRows];
           }),
         );
 
@@ -844,10 +980,10 @@ export class OrderCommandService {
   /** Releases every reservation this command granted (the nothing-written invariant). */
   private async releaseAll(
     tenantId: string,
-    granted: readonly { lineIndex: number; reservation: ReservationSnapshot }[],
+    granted: readonly ReservationSnapshot[],
     cause: string,
   ): Promise<void> {
-    for (const { reservation } of granted) {
+    for (const reservation of granted) {
       try {
         await this.inventory.releaseReservation(tenantId, reservation.id);
       } catch (err) {
@@ -970,6 +1106,11 @@ export class OrderCommandService {
       .from(orderLines)
       .where(eq(orderLines.orderId, order.id))
       .orderBy(orderLines.createdAt, orderLines.id);
+    // Story 11.4: the kit parents are the ids the children name — inversion,
+    // no flag, the same relational identity as kit-ness itself.
+    const kitParentIds = new Set(
+      lines.map((line) => line.parentLineId).filter((id): id is string => id !== null),
+    );
     const reservationIds = lines
       .map((line) => line.reservationId)
       .filter((id): id is string => id !== null);
@@ -1005,7 +1146,7 @@ export class OrderCommandService {
         }),
         createdAt: canonicalInstant(order.createdAt),
         updatedAt: canonicalInstant(order.updatedAt),
-        lines: lines.map((line) => lineSnapshot(line, reservations)),
+        lines: lines.map((line) => lineSnapshot(line, reservations, kitParentIds)),
       },
     };
   }
@@ -1067,8 +1208,18 @@ export class OrderCommandService {
 export function lineSnapshot(
   row: OrderLine,
   reservations: ReadonlyMap<string, ReservationSnapshot>,
+  kitParentIds: ReadonlySet<string> = new Set(),
 ): OrderLineSnapshot {
   const reservation = row.reservationId === null ? undefined : reservations.get(row.reservationId);
+  // A kit parent line holds nothing itself — its children hold the stock —
+  // so its shortfall is the all-or-nothing outcome (0 when the kit's
+  // components reserved, the whole qty when the kit backordered), never the
+  // meaningless qty − 0.
+  const shortfallMilli = kitParentIds.has(row.id)
+    ? row.status === 'backordered'
+      ? row.qty
+      : 0
+    : row.qty - row.reservedQty;
   return {
     id: row.id,
     orderId: row.orderId,
@@ -1078,15 +1229,50 @@ export function lineSnapshot(
     // leave and milli-units stay below.
     qty: fromMilli(row.qty),
     reservedQty: fromMilli(row.reservedQty),
-    shortfallQty: fromMilli(row.qty - row.reservedQty),
+    shortfallQty: fromMilli(shortfallMilli),
     status: row.status,
     reservationId: row.reservationId,
     reservationState: reservation?.state ?? null,
+    parentLineId: row.parentLineId,
     createdAt: canonicalInstant(row.createdAt),
   };
 }
 
 // ── outcomes ─────────────────────────────────────────────────────────────────
+
+/**
+ * Story 11.4 — one kit line's explosion into its component child lines, with
+ * the quantity math validated HERE (phase 1, before any grant moves).
+ *
+ * 1 kit = 1 base-UoM unit of the kit SKU (the kit's own `uom_conversions`
+ * play no part). Component qty is per ONE kit, in the component's base-UoM
+ * milli-units; a kit line of Q (kit-milli) therefore needs Q × per-kit-milli
+ * ÷ 1000 milli of the component. Two refusals fall out of that arithmetic:
+ * a product not divisible by the milli scale (a sub-milli child quantity the
+ * component's own units could never express) and a product or quotient above
+ * the exact-integer / quantity ceilings — both 400s, never silent rounding
+ * after grants were made (the `MAX_LINE_QUANTITY` rationale).
+ */
+function explodeKitLine(
+  line: OrderLineInput,
+  lineIndex: number,
+  bom: readonly KitCompositionLine[],
+): KitCompositionLine[] {
+  return bom.map((component) => {
+    const product = line.quantity * component.qty;
+    if (!Number.isSafeInteger(product) || product / QUANTITY_SCALE > MAX_LINE_QUANTITY) {
+      throw validationFailed(
+        `Line ${lineIndex} (kit ${line.skuId}) explodes past the quantity ceiling: ${String(line.quantity)} × ${String(component.qty)} milli is more than any line can carry. Split the order line.`,
+      );
+    }
+    if (product % QUANTITY_SCALE !== 0) {
+      throw validationFailed(
+        `Line ${lineIndex} (kit ${line.skuId}) explodes to a sub-milli component quantity (${String(product)} milli-product) — the component's UoM cannot express it. Adjust the kit line quantity or the composition.`,
+      );
+    }
+    return { componentSkuId: component.componentSkuId, qty: product / QUANTITY_SCALE };
+  });
+}
 
 function validationFailed(detail: string): ProblemException {
   return new ProblemException('validation-failed', 400, 'Order validation failed', detail);

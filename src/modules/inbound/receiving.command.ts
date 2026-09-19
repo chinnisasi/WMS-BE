@@ -41,6 +41,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { CatalogFacade } from '../catalog/catalog.facade';
+import { kitCannotHoldStock } from '../catalog/kit.store';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerMovement } from '../inventory/inventory.facade';
 import { canonicalInstant } from '../../shared/primitives/time';
@@ -388,6 +389,23 @@ export class ReceivingCommand {
         command.tenantId,
         command.lines.map((line) => line.skuId),
       );
+
+      // ── story 11.4: a kit SKU never receives stock (FR-38) ──────────────
+      // A kit's stock IS its components' — a GRN line against a kit SKU
+      // would invent independent stock the explosion never sees. The
+      // kit-ness answer is one facade lookup (catalog owns
+      // `kit_compositions`); the 409 names the offending SKUs.
+      const kitSkuIds = await this.catalog.getKitSkuIdsInTx(
+        tx,
+        command.tenantId,
+        command.lines.map((line) => line.skuId),
+      );
+      if (kitSkuIds.length > 0) {
+        throw kitCannotHoldStock(
+          'GRN line',
+          kitSkuIds.map((skuId) => skuById.get(skuId)!.code),
+        );
+      }
 
       // ── story 10.3: the catch-weight FLAG rules, behind the replay ──────
       // These need the SKU row, so they sit here rather than in the shape
