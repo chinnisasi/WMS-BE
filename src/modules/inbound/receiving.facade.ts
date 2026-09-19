@@ -74,6 +74,8 @@ export interface CatalogSnapshot {
     readonly uomPrecision: number;
     readonly batchTracked: boolean;
     readonly serialTracked: boolean;
+    /** Story 10.3: handled by unit, priced by weight — the device's offline catch-weight prompt. */
+    readonly catchWeightTracked: boolean;
   }[];
   readonly openPurchaseOrders: readonly {
     readonly id: string;

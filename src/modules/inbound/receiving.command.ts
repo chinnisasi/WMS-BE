@@ -17,12 +17,18 @@ import {
 import { uuidv7 } from '../../shared/primitives/ids';
 import {
   MAX_QUANTITY_MILLI,
+  QUANTITY_SCALE,
   assertExactQuantity,
   assertRecordableQuantity,
   fromMilli,
   signedQuantity,
 } from '../../shared/primitives/quantity';
 import { uomPrecision } from '../catalog/uom';
+import {
+  MAX_HANDLING_UNITS_PER_REQUEST,
+  assertCatchWeightGrams,
+} from '../catalog/handling-unit';
+import type { CreateHandlingUnitInput } from '../catalog/catalog.facade';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -60,6 +66,17 @@ export interface GrnLineInput {
    * `submitGoodsReceipt` has converted it, behind its replay lookup.
    */
   readonly qty: number;
+  /**
+   * Story 10.3 — catch weight: ONE captured weight, in integer GRAMS, per
+   * physical unit on this line. Required for a `catch_weight_tracked` SKU,
+   * forbidden for every other SKU, and `weightsGrams.length` must equal `qty`
+   * — one weight per unit is the whole contract.
+   *
+   * It is **never a quantity**: it is not scaled, not compared against
+   * `quantity_delta`, and never reaches the ATP path. Six cases of beef are
+   * quantity `6` and six weights of ~18,400 g each.
+   */
+  readonly weightsGrams: readonly number[] | null;
 }
 
 export interface SubmitGoodsReceiptCommand {
@@ -102,6 +119,13 @@ export interface GoodsReceiptLineSnapshot {
   readonly appliedQty: number;
   /** The excess pended for approval (0 unless over-received). */
   readonly excessQty: number;
+  /**
+   * Story 10.3: the handling units this line produced, in creation order —
+   * present only on a catch-weight line. These ids are what a unit label is
+   * printed with and what the pack bench scans back, so the receipt response
+   * is where they have to surface.
+   */
+  readonly handlingUnitIds?: readonly string[];
 }
 
 /** One line the server refused to settle (naming the reason — the other lines settle). */
@@ -169,6 +193,15 @@ const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
  * rounding.
  */
 export const MAX_GRN_LINE_QTY = MAX_QUANTITY_MILLI;
+
+/**
+ * Story 10.3 — the ceiling on handling units one GRN line may declare. One
+ * weight per unit means the array length IS the unit count, so an unbounded
+ * array is an unbounded request body on a device endpoint; 500 cases on one
+ * line is already a full pallet several times over. A typed 400 is the
+ * boundary, the `MAX_SCAN_LINES` precedent.
+ */
+export const MAX_HANDLING_UNITS_PER_GRN_LINE = 500;
 
 /** GRN codes are `GRN-<n>`, zero-padded to 4 digits, unique per tenant. */
 function grnCode(n: number): string {
@@ -252,8 +285,25 @@ export class ReceivingCommand {
         batchCode: line.batchCode,
         mfgDate: line.mfgDate,
         qty: line.qty,
+        // Story 10.3 — ADDITIVE and in the operator's own order. `null`
+        // normalizes to `undefined`, which `JSON.stringify` drops, so a
+        // non-catch-weight receipt hashes byte-identically to its pre-10.3
+        // shape and keys already in flight still replay. The weights are NOT
+        // sorted: unlike pack's scan (where A,B,C and C,B,A are the same
+        // physical act), the order here is the order the operator weighed the
+        // cases in, and unit i of the line IS weight i.
+        weightsGrams: line.weightsGrams ?? undefined,
       })),
     });
+
+    // ── story 10.3: the catch-weight SHAPE check, ABOVE the transaction ────
+    // It needs no database row — an array length against a declared unit
+    // count, and each element's own bounds — so it belongs in the top tier
+    // (`IMPLEMENTATION-GUIDE.md` §1): a malformed request must answer 400
+    // whether or not its key was used before. The FLAG-dependent half (this
+    // SKU requires weights / must not carry them) needs the SKU row and
+    // therefore runs behind the replay lookup, below.
+    assertWeightShape(command.lines);
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── device re-authorization (fail-closed, the selfTestEcho mirror) ──
@@ -338,6 +388,36 @@ export class ReceivingCommand {
         command.tenantId,
         command.lines.map((line) => line.skuId),
       );
+
+      // ── story 10.3: the catch-weight FLAG rules, behind the replay ──────
+      // These need the SKU row, so they sit here rather than in the shape
+      // tier above: a catch-weight SKU must carry one weight per unit, and
+      // every other SKU must carry none. Both directions fail CLOSED — a
+      // weight list silently ignored on a non-catch-weight SKU would be a
+      // weight the operator recorded and the system threw away.
+      for (const line of command.lines) {
+        const sku = skuById.get(line.skuId)!;
+        if (sku.catchWeightTracked) {
+          if (sku.serialTracked) {
+            // Refused at catalog entry (`sku.command.ts` / `import.command.ts`);
+            // this is the backstop for a row that predates the rule or was
+            // written by some other path. Two per-unit identity systems over
+            // one physical unit is its own change.
+            throw grnValidation(
+              `SKU "${sku.code}" is both catch-weight tracked and serial-tracked — two per-unit identity systems over one unit are not supported. Clear one of the two flags.`,
+            );
+          }
+          if (line.weightsGrams === null || line.weightsGrams.length === 0) {
+            throw grnValidation(
+              `SKU "${sku.code}" is catch-weight tracked — every unit received needs its own captured weight, so the line must carry ${String(line.qty)} weight(s) in weightsGrams (got none).`,
+            );
+          }
+        } else if (line.weightsGrams !== null) {
+          throw grnValidation(
+            `SKU "${sku.code}" is not catch-weight tracked — weightsGrams is meaningless for it and is refused rather than ignored.`,
+          );
+        }
+      }
 
       // ── story 10.2: conversion and the precision refusal, HERE ──────────
       // Behind the replay lookup and with each line's unit in hand. Below
@@ -508,6 +588,68 @@ export class ReceivingCommand {
         );
       }
 
+      // ── story 10.3: one handling unit per physical unit received ───────
+      // Written ALONGSIDE the ledger append, never as part of it: the ledger
+      // records one aggregate `grn.received` per line exactly as before, and
+      // these rows are the relational satellite that answers what that event
+      // cannot — what each individual case weighs.
+      //
+      // The over-receipt split is applied here rather than deferred. ALL the
+      // rows are created, because all the cases physically arrived; the slice
+      // the PO's open quantity covers is `active` and the excess is
+      // `pending_approval`, which `decideOverReceipt` later flips to `active`
+      // or `rejected`. Neither decision ever creates or destroys a row — a
+      // receipt that pretended the excess cases were not on the dock would
+      // leave the warehouse holding stock nothing in the system can name.
+      //
+      // A unit counts as applied only when the applied slice covers it WHOLE
+      // (`floor`): a fractional remainder cannot make two-thirds of a case
+      // live stock, so the part-covered case pends with the rest.
+      const handlingUnitInputs: CreateHandlingUnitInput[] = [];
+      for (const entry of settled) {
+        const weights = entry.input.weightsGrams;
+        if (weights === null) {
+          continue;
+        }
+        // The applied slice has to land on a WHOLE number of cases. A PO
+        // remainder that covers two-thirds of a case would otherwise leave
+        // live on-hand backed by no `active` unit — stock pack could never
+        // account for, with no path back. Refused rather than floored.
+        if (entry.applied % QUANTITY_SCALE !== 0) {
+          throw grnValidation(
+            `SKU "${skuById.get(entry.input.skuId)!.code}" is catch-weight tracked, so the portion a purchase order can absorb must be a whole number of cases — ${fromMilli(entry.applied)} is not. Amend the purchase order line, or receive this delivery blind.`,
+          );
+        }
+        const appliedUnits = Math.max(
+          0,
+          Math.min(weights.length, entry.applied / QUANTITY_SCALE),
+        );
+        weights.forEach((weightGrams, index) => {
+          handlingUnitInputs.push({
+            warehouseId: command.warehouseId,
+            skuId: entry.input.skuId,
+            batchId: entry.batchId,
+            grnLineId: entry.lineId,
+            weightGrams,
+            status: index < appliedUnits ? 'active' : 'pending_approval',
+          });
+        });
+      }
+      // Through the catalog facade (AD-6) — `handling_units` has exactly one
+      // writer, the way `serials` does, and `test/architecture.spec.ts` fails
+      // the build for any direct write from this module.
+      const createdUnits = await this.catalog.createHandlingUnits(
+        tx,
+        command.tenantId,
+        handlingUnitInputs,
+      );
+      const handlingUnitIdsByLine = new Map<string, string[]>();
+      for (const unit of createdUnits) {
+        const list = handlingUnitIdsByLine.get(unit.grnLineId) ?? [];
+        list.push(unit.id);
+        handlingUnitIdsByLine.set(unit.grnLineId, list);
+      }
+
       // Ledger events: one per applied line — the batch arm rides on
       // batch-tracked receipts; the serial arm stays closed (no serial intake).
       for (const entry of settled) {
@@ -624,6 +766,12 @@ export class ReceivingCommand {
             qty: fromMilli(entry.input.qty),
             appliedQty: fromMilli(entry.applied),
             excessQty: fromMilli(entry.input.qty - entry.applied),
+            // Story 10.3: present only on a catch-weight line, so a
+            // non-catch-weight GRN's snapshot is byte-identical to its
+            // pre-10.3 shape (`JSON.stringify` drops absent keys).
+            ...(handlingUnitIdsByLine.has(entry.lineId)
+              ? { handlingUnitIds: handlingUnitIdsByLine.get(entry.lineId)! }
+              : {}),
           })),
           ...(rejected.length === 0 ? {} : { rejectedLines: rejected }),
         },
@@ -801,6 +949,24 @@ export class ReceivingCommand {
             .where(eq(purchaseOrderLines.id, row.poLineId));
         }
       }
+
+      // ── story 10.3: the handling units that pended WITH this excess ─────
+      // The path the spec's first draft missed entirely. Approval flips them
+      // `pending_approval → active`; rejection flips them `→ rejected`.
+      // Neither arm creates or destroys a row — the physical case arrived
+      // either way — and a unit left `pending_approval` forever would be a
+      // case pack can never admit and nothing can ever write off.
+      //
+      // It rides the SAME transaction as the decision, the ledger append and
+      // the `received_qty` bump: a decision that half-landed would leave
+      // quantity and units disagreeing with no path back. Non-catch-weight
+      // lines simply match no rows, so this is a no-op for them.
+      await this.catalog.settleHandlingUnitIntake(
+        tx,
+        command.tenantId,
+        row.grnLineId,
+        command.decision,
+      );
 
       await tx
         .update(overReceipts)
@@ -1002,6 +1168,51 @@ export class ReceivingCommand {
 
 function grnValidation(detail: string): ProblemException {
   return new ProblemException('validation-failed', 400, 'Invalid goods receipt', detail);
+}
+
+/**
+ * Story 10.3 — the catch-weight SHAPE checks, answerable without a database
+ * row and therefore run ABOVE the transaction (`IMPLEMENTATION-GUIDE.md` §1,
+ * tier 1): each declared weight's own bounds, and the one-weight-per-unit
+ * contract between the array's length and the line's declared quantity.
+ *
+ * Whether THIS SKU may (or must) carry weights at all is a different
+ * question — it needs the SKU row, and so it is asked inside the transaction,
+ * behind the replay lookup, where a rule that tightened since the op was
+ * queued cannot refuse an op that already committed.
+ */
+function assertWeightShape(lines: readonly GrnLineInput[]): void {
+  // Request-WIDE first: a per-line cap alone is defeated by 200 lines naming
+  // 500 units each, and every unit costs an insert tuple and a row.
+  const declared = lines.reduce((total, line) => total + (line.weightsGrams?.length ?? 0), 0);
+  if (declared > MAX_HANDLING_UNITS_PER_REQUEST) {
+    throw grnValidation(
+      `A goods receipt declares at most ${MAX_HANDLING_UNITS_PER_REQUEST} handling units across all of its lines (got ${declared}).`,
+    );
+  }
+  for (const line of lines) {
+    const weights = line.weightsGrams;
+    if (weights === null) {
+      continue;
+    }
+    if (weights.length > MAX_HANDLING_UNITS_PER_GRN_LINE) {
+      throw grnValidation(
+        `A goods-receipt line declares at most ${MAX_HANDLING_UNITS_PER_GRN_LINE} handling units (got ${weights.length}).`,
+      );
+    }
+    for (const weight of weights) {
+      assertCatchWeightGrams(weight, 'weightsGrams');
+    }
+    // One weight per unit, so the array length IS the unit count — and a
+    // fractional quantity cannot be a count of physical cases. Both counts
+    // are named: an operator who weighed five cases and typed six needs to
+    // know which of the two numbers to correct.
+    if (!Number.isInteger(line.qty) || weights.length !== line.qty) {
+      throw grnValidation(
+        `A catch-weight line carries exactly one weight per unit received: qty is ${String(line.qty)} but weightsGrams has ${weights.length} entry(ies). A catch-weight receipt counts whole units.`,
+      );
+    }
+  }
 }
 
 function assertUtc(value: string, field: string): string {

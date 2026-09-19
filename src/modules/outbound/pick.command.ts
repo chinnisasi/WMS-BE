@@ -643,7 +643,14 @@ export class PickCommandService {
         throw wrongItem(line.skuId, command.skuId);
       }
       const skuRows = await tx
-        .select({ id: skus.id, code: skus.code, uom: skus.uom, batchTracked: skus.batchTracked, serialTracked: skus.serialTracked })
+        .select({
+          id: skus.id,
+          code: skus.code,
+          uom: skus.uom,
+          batchTracked: skus.batchTracked,
+          serialTracked: skus.serialTracked,
+          catchWeightTracked: skus.catchWeightTracked,
+        })
         .from(skus)
         .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
         .limit(1);
@@ -749,6 +756,19 @@ export class PickCommandService {
         throw pickValidation(
           `SKU "${sku.code}" is both batch- and serial-tracked — picking it is not in this release: ` +
             'the scan carries no batch per serial, so the batch arm cannot be derived without guessing.',
+        );
+      }
+
+      // Story 10.3: a catch-weight SKU is handled BY UNIT — one
+      // `handling_units` row per physical case — so a draw of 1.5 cases is a
+      // quantity no set of cases can account for. Refused HERE, where the
+      // operator can still act on it, rather than at the bench: by then the
+      // units have left the bin and the hold is committed, and pack's own
+      // whole-unit refusal would strand the order with no way back.
+      if (sku.catchWeightTracked && scaled.qty % QUANTITY_SCALE !== 0) {
+        throw pickValidation(
+          `SKU "${sku.code}" is catch-weight tracked — every quantity is a count of physical cases, ` +
+            `and ${fromMilli(scaled.qty)} is not a whole number of them.`,
         );
       }
 

@@ -217,6 +217,7 @@ export class CatalogController {
         hsn: dto.hsn === undefined ? undefined : dto.hsn === '' ? null : dto.hsn,
         batchTracked: dto.batchTracked,
         serialTracked: dto.serialTracked,
+        catchWeightTracked: dto.catchWeightTracked,
         // Story 10.2: both stay in BASE units here. The command converts them
         // behind its replay lookup, where the SKU's row — and therefore its
         // declared precision — is already in hand; converting at this edge

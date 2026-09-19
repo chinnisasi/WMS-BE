@@ -89,6 +89,7 @@ const OPTIONAL_COLUMNS = [
   'hsn',
   'batch_tracked',
   'serial_tracked',
+  'catch_weight_tracked',
   'reorder_point',
   'reorder_qty',
   'barcode',
@@ -113,6 +114,7 @@ interface ValidRow {
   readonly hsn: string | null;
   readonly batchTracked: boolean;
   readonly serialTracked: boolean;
+  readonly catchWeightTracked: boolean;
   readonly reorderPoint: number;
   readonly reorderQty: number;
   /** Null → generated server-side (uuidv7) at insert. */
@@ -278,6 +280,7 @@ export class ImportCommand {
             hsn: row.hsn,
             batchTracked: row.batchTracked,
             serialTracked: row.serialTracked,
+            catchWeightTracked: row.catchWeightTracked,
             reorderPoint: row.reorderPoint,
             reorderQty: row.reorderQty,
             // Generated server-side at entry (uuidv7) unless the file carries one.
@@ -774,12 +777,36 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       error: rowError(row.rowNumber, code, 'validation-failed', serialTrackedFractionalUomDetail(uom)),
     };
   }
+  const catchWeightResult = parseTracked(
+    v['catch_weight_tracked'] ?? '',
+    'catch_weight_tracked',
+    row.rowNumber,
+  );
+  if (!catchWeightResult.ok) return { ok: false, error: { ...catchWeightResult.error, skuCode: code } };
+  // Story 10.3: catch weight and serial tracking are two per-unit identity
+  // systems over ONE physical unit — a serial identified from the ledger, a
+  // handling unit identified from its own row — and nothing decides which one
+  // a scan at pack is naming. Refused ONCE here at catalog entry, as a ROW
+  // error so the rest of the file still commits and `fix` mode can re-submit
+  // this row.
+  if (catchWeightResult.value && serialResult.value) {
+    return {
+      ok: false,
+      error: rowError(
+        row.rowNumber,
+        code,
+        'validation-failed',
+        'catch_weight_tracked and serial_tracked cannot both be true: both claim to identify the same physical unit — a serial from the ledger, a handling unit from its own row — and nothing decides which one a scan names. Pick one.',
+      ),
+    };
+  }
   const pointResult = parseQuantityMilli(v['reorder_point'] ?? '', 'reorder_point', row.rowNumber, uom, uomPrecisionPlaces);
   if (!pointResult.ok) return { ok: false, error: { ...pointResult.error, skuCode: code } };
   const qtyResult = parseQuantityMilli(v['reorder_qty'] ?? '', 'reorder_qty', row.rowNumber, uom, uomPrecisionPlaces);
   if (!qtyResult.ok) return { ok: false, error: { ...qtyResult.error, skuCode: code } };
   const batchTracked = batchResult.value;
   const serialTracked = serialResult.value;
+  const catchWeightTracked = catchWeightResult.value;
   const reorderPoint = pointResult.value;
   const reorderQty = qtyResult.value;
   const barcode = get('barcode');
@@ -849,6 +876,7 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       hsn: hsn === '' ? null : hsn,
       batchTracked,
       serialTracked,
+      catchWeightTracked,
       reorderPoint,
       reorderQty,
       barcode: barcode === '' ? null : barcode,

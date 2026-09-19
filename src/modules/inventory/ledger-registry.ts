@@ -29,6 +29,21 @@ export type LedgerReferenceDoc =
        * unchanged (the key serializes only when present).
        */
       readonly overrideReason?: string;
+      /**
+       * Story 10.3 — the handling units this adjustment consumed, sorted.
+       *
+       * A catch-weight write-off must NAME the cases it scraps (a handling
+       * unit has no location, so an aggregate delta cannot say which case was
+       * damaged), and those names belong inside the tamper-evident chain for
+       * the same reason pack's do: a case that never shipped is a case whose
+       * disposal has to be provable. `referenceDoc` is already hashed, so the
+       * ids ride it rather than a new `ledger_events` column — hashing a new
+       * column would change every pre-existing event's canonical bytes.
+       *
+       * Optional and additive: absent on every non-catch-weight adjustment,
+       * whose canonical bytes are therefore unchanged.
+       */
+      readonly handlingUnitIds?: readonly string[];
     }
   // Story 3.3 — the receipt arm: every `grn.received` movement names the GRN
   // it landed under, and (when received against a purchase order) the PO and
@@ -132,6 +147,26 @@ export type LedgerReferenceDoc =
       readonly lengthMm?: number;
       readonly widthMm?: number;
       readonly heightMm?: number;
+      /**
+       * Story 10.3 — the handling units consumed into THIS order line, sorted.
+       *
+       * This is the whole tamper-evidence story for catch weight, and it is
+       * why `ledger_events` gains no column: `referenceDoc` is ALREADY inside
+       * `canonicalEventBytes`, so the ids are hash-chained like everything
+       * else — while a historical event, whose stored jsonb simply lacks the
+       * key, hashes to exactly the bytes it always did (`JSON.stringify`
+       * drops absent keys). A new hashed COLUMN would instead have changed
+       * every pre-existing event's canonical form and reported severity-1
+       * across the whole chain, on top of the break 0026 already took.
+       *
+       * Sorted before hashing, matching the sibling `scanned` list in the
+       * same command: scanning cases A,B,C into a parcel is the same physical
+       * act as C,B,A, and two orderings must not create two packs.
+       *
+       * Present only on a catch-weight line — an ADDITIVE optional key, the
+       * way `weightGrams` is; the arm is never reshaped.
+       */
+      readonly handlingUnitIds?: readonly string[];
     }
   // Story 4.6 — the dispatch arm: the SHIPMENT record, and the terminal
   // event of an order's life. Like `pack`, it moves nothing (`pick.picked`

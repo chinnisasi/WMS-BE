@@ -283,6 +283,19 @@ export const skus = pgTable(
     hsn: text('hsn'),
     batchTracked: boolean('batch_tracked').notNull().default(false),
     serialTracked: boolean('serial_tracked').notNull().default(false),
+    /**
+     * Story 10.3 — catch weight: the SKU is handled BY UNIT and priced BY
+     * WEIGHT (meat, fish, cheese, produce). A case of beef is quantity `1`
+     * weighing 18,400 g; the weight lives on `handling_units`, one row per
+     * physical unit, and is NEVER a quantity. The flag gates the receipt
+     * prompt, the pack scan and the adjustment refusals, and it rides the
+     * device catalog snapshot so a handheld can prompt for weight offline.
+     *
+     * `catch_weight_tracked` and `serial_tracked` are mutually exclusive
+     * (refused at catalog entry): two per-unit identity systems over one
+     * physical unit is its own change.
+     */
+    catchWeightTracked: boolean('catch_weight_tracked').notNull().default(false),
     /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
     reorderPoint: bigint('reorder_point', { mode: 'number' }).notNull().default(0),
     reorderQty: bigint('reorder_qty', { mode: 'number' }).notNull().default(0),
@@ -398,6 +411,80 @@ export const serials = pgTable(
 );
 
 export type Serial = typeof serials.$inferSelect;
+
+/**
+ * Handling units (Story 10.3 — catch weight): ONE row per physical unit of a
+ * `catch_weight_tracked` SKU, carrying the weight captured when that unit was
+ * received. Catalog-owned like `batches` and `serials`, and created only
+ * through `CatalogFacade` (AD-6).
+ *
+ * **It is a relational satellite record, deliberately NOT a ledger-tracked
+ * entity.** `ledger_events` gains no column and no event type for it: hashing
+ * a new column would change the canonical bytes of every pre-existing event
+ * and break `verifyChain` a second time on top of 0026, and NOT hashing it
+ * would leave the field that decides what a customer is invoiced outside the
+ * tamper-evident chain. Association rides the `handlingUnitIds` key of the
+ * already-hashed `reference_doc` of the existing per-line `pack.packed` event
+ * instead, which changes no historical event's bytes.
+ *
+ * **Why this diverges from `serials`.** A serial earns its location from the
+ * ledger because putaway and pick fan OUT one event per serial. Nothing here
+ * does, so this row must answer from its own columns what a serial answers
+ * from the ledger: `warehouse_id` (pack's cross-warehouse guard), `batch_id`
+ * (what makes `catch_weight × batch` genuinely usable rather than nominally
+ * allowed) and `status` (the lifecycle that keeps pack from failing open on a
+ * written-off case). The accepted, documented cost: **a handling unit has no
+ * queryable location between receipt and pack.** Mid-life traceability and
+ * move-as-unit are epic 15's problem.
+ *
+ * `weight_grams` is INTEGER GRAMS — never a milli-unit quantity, never scaled,
+ * never near the Valkey ATP path. Weight has no reservation, so the 2⁵³
+ * Lua/JS ceiling that forced quantity to milli-units does not bind it.
+ *
+ * It is **captured once, at receipt, and no code path updates it** — which is
+ * a property of the code, pinned by a source scan in
+ * `test/architecture.spec.ts`, and NOT a database guarantee: there is no
+ * trigger, and the ledger does not cover it either (`grn.received` is an
+ * aggregate event carrying neither the ids nor the grams, so an out-of-band
+ * UPDATE would leave `verifyChain` green). Say "no writer changes it", not
+ * "it cannot change".
+ *
+ * `status` ∈ `active | pending_approval | rejected | packed` and
+ * `weight_grams > 0 AND <= MAX_HANDLING_UNIT_WEIGHT_GRAMS` are CHECKs in the
+ * migration DDL (repo convention — never in this file), as is the RLS policy,
+ * which is single-dimension on `tenant_id` alone like every other one.
+ * `packed_order_line_id` is set ONCE, at pack, by a conditional write on
+ * `status = 'active'`.
+ */
+export const handlingUnits = pgTable(
+  'handling_units',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    /** Pack's cross-warehouse 404 guard — deliberately NOT part of the RLS predicate. */
+    warehouseId: uuid('warehouse_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** Set when the SKU is batch-tracked — a unit's batch, recoverable from its own row. */
+    batchId: uuid('batch_id'),
+    /** Provenance: the receipt line that produced this unit. */
+    grnLineId: uuid('grn_line_id').notNull(),
+    /** Integer GRAMS, captured once at receipt. Immutable. Never a quantity. */
+    weightGrams: integer('weight_grams').notNull(),
+    status: text('status').notNull().default('active'),
+    /** Written once, at pack, by the conditional `status = 'active'` write. */
+    packedOrderLineId: uuid('packed_order_line_id'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    index('handling_units_tenant_sku_status_idx').on(table.tenantId, table.skuId, table.status),
+    index('handling_units_tenant_grn_line_idx').on(table.tenantId, table.grnLineId),
+    index('handling_units_tenant_id_idx').on(table.tenantId),
+  ],
+);
+
+export type HandlingUnit = typeof handlingUnits.$inferSelect;
 
 /**
  * One row per import run (Story 1.4): `mode` is `initial` or `fix`, the

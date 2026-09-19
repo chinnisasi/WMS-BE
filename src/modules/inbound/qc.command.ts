@@ -178,7 +178,11 @@ export class QcCommand {
       // warehouse in tenant, SKU in tenant, bin in the tenant's warehouse.
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
       const skuRows = await tx
-        .select({ id: skus.id, serialTracked: skus.serialTracked })
+        .select({
+          id: skus.id,
+          serialTracked: skus.serialTracked,
+          catchWeightTracked: skus.catchWeightTracked,
+        })
         .from(skus)
         .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
         .limit(1);
@@ -192,6 +196,21 @@ export class QcCommand {
       if (skuRows[0].serialTracked) {
         throw qcValidation(
           `SKU ${command.skuId} is serial-tracked — a bulk (sku, bin) QC hold would strand its serial location records at the origin bin, so it cannot be quarantined as a whole scope.`,
+        );
+      }
+      // Story 10.3: the same reasoning, transferred verbatim to catch weight.
+      // `placeHold` moves a whole `(sku, bin)` scope and carries NO per-unit
+      // identifiers, and a handling unit has no location between receipt and
+      // pack — so nothing here could say WHICH cases were quarantined. The
+      // rule the story turns on is that every path which can consume a unit
+      // either names units explicitly or is refused: adjustment names them,
+      // and this one is refused. Accepting it silently would leave the held
+      // units `active` and packable, which is the fail-open this whole
+      // status column exists to prevent. Refused and deferred beats quietly
+      // wrong; per-unit quarantine is epic 15's, alongside move-as-unit.
+      if (skuRows[0].catchWeightTracked) {
+        throw qcValidation(
+          `SKU ${command.skuId} is catch-weight tracked — a bulk (sku, bin) QC hold names no handling units, so its cases would stay packable while their stock sat in the QC bin. Quarantining catch-weight stock is not supported; write the affected cases off by naming them on a stock adjustment instead.`,
         );
       }
       const binRows = await tx

@@ -23,6 +23,24 @@ import { QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { uomPrecision } from '../catalog/uom';
 import { LedgerService } from './ledger.service';
+// Story 10.3 — the catch-weight write seam. `handling_units` is CATALOG-owned
+// and has exactly one writer (AD-6); this module never touches the table.
+//
+// It is imported as file-level in-tx functions rather than through
+// `CatalogFacade`, because the status flip must commit in the SAME transaction
+// as the ledger event — a flip that half-landed would either ship a written-off
+// case or strand a live one — and this module cannot take a DI edge on
+// `CatalogModule`: catalog reaches tenancy, tenancy reaches putaway, putaway
+// reaches back here, so the edge is a module-EVALUATION cycle no `forwardRef`
+// can unwind. The repo's established escape for exactly this is the file-level
+// in-tx helper (`ensureReceivingBinInTx`, `openQcHoldsForBinsInTx`), and
+// `CatalogFacade` exposes the very same functions to the siblings that can
+// hold it.
+import {
+  lockHandlingUnitsInTx,
+  markHandlingUnitsAdjustedInTx,
+} from '../catalog/handling-unit.store';
+import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 
 /**
  * `stock.adjustment` (Story 2.1): the first movement producer, exercisable
@@ -97,6 +115,19 @@ export interface AdjustStockCommand {
    * exactly one ledger event per serial unit (qty ±1, one transaction).
    */
   readonly serialRefs?: readonly string[] | undefined;
+  /**
+   * Story 10.3 — the per-unit channel for a catch-weight SKU, mirroring
+   * `serialRefs`. It is REQUIRED on a catch-weight adjustment and its length
+   * must equal `|quantityDelta|`.
+   *
+   * Without a way to NAME the units, this write-off would be untargetable: a
+   * handling unit has no location, so an aggregate `quantityDelta` alone
+   * cannot say WHICH of N cases was damaged — and every named unit that is
+   * not moved out of `active` stays packable, which means a case written off
+   * as damaged still ships. That is the fail-open the review found; this
+   * field is its fix.
+   */
+  readonly handlingUnitIds?: readonly string[] | undefined;
 }
 
 /** The API response body (the idempotency snapshot). */
@@ -170,6 +201,18 @@ export class StockAdjustmentCommand {
             },
       // Null behaves as absent (normalized upstream too — never a 500 here).
       serials: command.serials == null ? undefined : [...command.serials],
+      // Story 10.3 — ADDITIVE, and in the operator's own order like
+      // `serials`: it is an identity list the client chose, not a set the
+      // command normalizes. Absent normalizes to `undefined`, which
+      // `JSON.stringify` drops, so a non-catch-weight adjustment hashes
+      // byte-identically to its pre-10.3 shape.
+      // SORTED, matching the sibling list in `pack.command.ts`: scanning
+      // cases A,B,C off a damaged pallet is the same physical act as C,B,A,
+      // so the two orderings must replay rather than answer 422. (`serials`
+      // above is deliberately left unsorted — its order is the order the
+      // ledger writes one event per serial in, which is intent, not a set.)
+      handlingUnitIds:
+        command.handlingUnitIds == null ? undefined : [...command.handlingUnitIds].sort(),
     });
   }
 
@@ -250,6 +293,41 @@ export class StockAdjustmentCommand {
       );
     }
 
+    // Story 10.3: the same shape check for the catch-weight channel, in the
+    // same tier and for the same reason — an array length is a UNIT count,
+    // comparable against a base-UoM delta with no SKU row in hand. Whether
+    // THIS SKU requires the channel at all needs the row, so it is asked
+    // behind the replay lookup below.
+    const handlingUnitIds = command.handlingUnitIds ?? [];
+    if (handlingUnitIds.length > 0) {
+      // The command tier's own bound — the DTO publishes the same number, so
+      // the two gates cannot disagree and a non-HTTP caller meets the rule.
+      if (handlingUnitIds.length > MAX_HANDLING_UNITS_PER_REQUEST) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'Too many handling units in one adjustment',
+          `An adjustment names at most ${MAX_HANDLING_UNITS_PER_REQUEST} handling units (got ${handlingUnitIds.length}).`,
+        );
+      }
+      if (new Set(handlingUnitIds).size !== handlingUnitIds.length) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'handlingUnitIds repeats a unit',
+          'A handling unit is one physical case — naming it twice in one adjustment would write it off twice.',
+        );
+      }
+      if (handlingUnitIds.length !== Math.abs(command.quantityDelta)) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'quantityDelta must match the handling-unit count',
+          `A catch-weight movement moves one handling unit per unit of quantity — ${handlingUnitIds.length} handling unit(s) cannot move ${command.quantityDelta} units.`,
+        );
+      }
+    }
+
     // Stable fingerprint over the command's business fields (fixed key
     // order — see hashCommandPayload). An omitted occurredAt is absent
     // from both attempts, so the fingerprint is stable across retries.
@@ -316,6 +394,48 @@ export class StockAdjustmentCommand {
             uomPrecision(sku.uom),
           ),
         );
+
+        // ── story 10.3: the catch-weight arm, behind the replay lookup ────
+        // Both directions fail CLOSED. A catch-weight SKU with no named units
+        // is refused, because an untargeted write-off leaves every case
+        // `active` and therefore packable — goods shipped that inventory says
+        // do not exist. A non-catch-weight SKU carrying the field is refused
+        // too, rather than having it quietly ignored.
+        // A POSITIVE catch-weight adjustment has no coherent meaning here.
+        // The only path that CREATES handling units is receipt, because a unit
+        // cannot exist without a captured weight and there is nowhere on this
+        // command to supply one. Left unrefused, the guard below would demand
+        // ids for an intake and `moveHandlingUnitsOutOfActive` would then
+        // write off live cases to "add" stock — the exact inverse of intent.
+        // Refused by name, the same way a catch-weight QC hold is: intake
+        // outside receipt is deferred, not silently wrong.
+        if (sku.catchWeightTracked && command.quantityDelta > 0) {
+          throw new ProblemException(
+            'validation-failed',
+            400,
+            'A catch-weight SKU cannot be adjusted upward',
+            `SKU "${command.skuId}" is catch-weight tracked: every unit carries a captured weight, and receipt is the only path that can capture one. Receive the stock instead of adjusting it in.`,
+          );
+        }
+        if (sku.catchWeightTracked && handlingUnitIds.length === 0) {
+          throw new ProblemException(
+            'validation-failed',
+            400,
+            'A catch-weight adjustment must name its handling units',
+            `SKU "${command.skuId}" is catch-weight tracked: a handling unit has no location, so nothing but handlingUnitIds can say WHICH case this adjustment moves. Name ${Math.abs(command.quantityDelta)} handling unit(s).`,
+          );
+        }
+        if (!sku.catchWeightTracked && handlingUnitIds.length > 0) {
+          throw new ProblemException(
+            'validation-failed',
+            400,
+            'SKU is not catch-weight tracked',
+            `SKU "${command.skuId}" is not catch-weight tracked — it has no handling units, so handlingUnitIds is refused rather than ignored.`,
+          );
+        }
+        if (handlingUnitIds.length > 0) {
+          await this.moveHandlingUnitsOutOfActive(tx, command, handlingUnitIds);
+        }
 
         const snapshot = await this.adjustToSnapshot(tx, command, delta, occurredAt);
 
@@ -452,9 +572,9 @@ export class StockAdjustmentCommand {
   private async assertSkuInTenant(
     tx: TenantTx,
     command: AdjustStockCommand,
-  ): Promise<{ id: string; uom: string }> {
+  ): Promise<{ id: string; uom: string; catchWeightTracked: boolean }> {
     const rows = await tx
-      .select({ id: skus.id, uom: skus.uom })
+      .select({ id: skus.id, uom: skus.uom, catchWeightTracked: skus.catchWeightTracked })
       .from(skus)
       .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
       .limit(1);
@@ -467,6 +587,79 @@ export class StockAdjustmentCommand {
       );
     }
     return rows[0];
+  }
+
+  /**
+   * Story 10.3 — the named handling units leave `active`.
+   *
+   * The rows are LOCKED first, so the guards below decide against state that
+   * cannot move under them, and the facade's write is then conditional on
+   * `active` as the backstop rather than as the gate. Refusal order mirrors
+   * pack's, because they are the same questions about the same rows: a unit
+   * that is unknown, another tenant's or another warehouse's is a 404 (an id
+   * that does not resolve here must never reveal that it resolves elsewhere);
+   * one belonging to a different SKU is a 422 naming both; one that is no
+   * longer `active` is a 409 naming the status it actually holds.
+   */
+  private async moveHandlingUnitsOutOfActive(
+    tx: TenantTx,
+    command: AdjustStockCommand,
+    handlingUnitIds: readonly string[],
+  ): Promise<void> {
+    const units = await lockHandlingUnitsInTx(tx, command.tenantId, handlingUnitIds);
+    const byId = new Map(units.map((unit) => [unit.id, unit]));
+    for (const id of handlingUnitIds) {
+      const unit = byId.get(id);
+      if (unit === undefined || unit.warehouseId !== command.warehouseId) {
+        throw new ProblemException(
+          'not-found',
+          404,
+          'Handling unit not found',
+          `No handling unit with id "${id}" exists in this warehouse.`,
+        );
+      }
+      if (unit.skuId !== command.skuId) {
+        throw new ProblemException(
+          'validation-failed',
+          422,
+          'Handling unit belongs to another SKU',
+          `Handling unit "${id}" belongs to SKU "${unit.skuId}", but this adjustment moves SKU "${command.skuId}".`,
+        );
+      }
+      // Story 10.3: the case must belong to the LOT this movement debits.
+      // `batchRef` is what `batch_on_hand` folds against, so writing off a
+      // LOT-B case while debiting LOT-A would leave both lots wrong and the
+      // recall trace pointing at the wrong one.
+      if ((unit.batchId ?? null) !== (command.batchRef ?? null)) {
+        throw new ProblemException(
+          'validation-failed',
+          422,
+          'Handling unit belongs to another batch',
+          `Handling unit "${id}" carries batch "${unit.batchId ?? 'none'}", but this adjustment moves batch "${command.batchRef ?? 'none'}". A catch-weight case is written off against the lot it was received into.`,
+        );
+      }
+      // NOTE what is deliberately NOT checked here: the unit's STATUS. A
+      // status read and a separate status write are two chances to disagree,
+      // and a guard duplicating the write's own predicate makes the write
+      // untestable — remove the predicate and nothing fails. The single
+      // authority is the conditional `.where(status = 'active')` write below;
+      // the 409 names each offending unit's real status by re-reading the
+      // rows this transaction still holds locked.
+    }
+    const moved = await markHandlingUnitsAdjustedInTx(tx, command.tenantId, handlingUnitIds);
+    if (moved.length !== handlingUnitIds.length) {
+      const writtenOffIds = new Set(moved.map((unit) => unit.id));
+      const refused = handlingUnitIds.filter((id) => !writtenOffIds.has(id));
+      const rows = await lockHandlingUnitsInTx(tx, command.tenantId, refused);
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Handling unit is not active',
+        `${refused.length} handling unit(s) are not active and cannot be adjusted away: ` +
+          `${rows.map((row) => `${row.id} (${row.status})`).join(', ')}. ` +
+          'Only an active unit can be written off — one already packed or already written off is refused. Nothing was written.',
+      );
+    }
   }
 
   /**
@@ -505,6 +698,17 @@ export class StockAdjustmentCommand {
     ) as SignedQuantity;
     // The override reason rides the reference doc verbatim — the
     // hash-chained ledger is the audit log (CHECKPOINT 1 resolution).
+    // Story 10.3: the handling units this adjustment consumed ride the
+    // already-hashed reference doc, SORTED — exactly as pack's do. Without
+    // them the bench's consumption of a case is tamper-evident and the
+    // write-off of one is not, which is the half of the story that decides
+    // whether a case that never shipped can be proven to have been scrapped.
+    // An optional key: a non-catch-weight adjustment's canonical bytes are
+    // unchanged, because `JSON.stringify` drops the absent key.
+    const adjustedHandlingUnitIds =
+      command.handlingUnitIds === undefined || command.handlingUnitIds.length === 0
+        ? undefined
+        : [...command.handlingUnitIds].sort();
     const referenceDoc = {
       kind: 'manual-adjustment' as const,
       reasonCode: command.reasonCode,
@@ -512,6 +716,9 @@ export class StockAdjustmentCommand {
       ...(command.batch?.overrideReason !== undefined
         ? { overrideReason: command.batch.overrideReason }
         : {}),
+      ...(adjustedHandlingUnitIds === undefined
+        ? {}
+        : { handlingUnitIds: adjustedHandlingUnitIds }),
     };
 
     // Zero deltas are rejected upstream (`assertNonZeroDelta`), so `< 0` /

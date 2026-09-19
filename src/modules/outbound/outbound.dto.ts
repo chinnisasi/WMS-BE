@@ -27,6 +27,7 @@ import { SHORT_PICK_REASON_CODES } from './pick.command';
 // gate every HTTP caller actually hits. (`order.command` / `pick.command`
 // set the precedent above; `pack.command` imports no DTO, so no cycle.)
 import { MAX_DIMENSION_MM, MAX_SCAN_LINES, MAX_WEIGHT_GRAMS } from './pack.command';
+import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 import { MAX_CARRIER_NAME_LENGTH, MAX_TRACKING_NUMBER_LENGTH } from './dispatch.command';
 import {
   PICKLIST_LINE_STATUSES,
@@ -936,6 +937,21 @@ export class PackScanLineDto {
   @Min(0.001)
   @Max(MAX_QUANTITY_BASE)
   qty!: number;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    format: 'uuid',
+    maxItems: MAX_HANDLING_UNITS_PER_REQUEST,
+    description:
+      'Catch weight (story 10.3): the handling units of this SKU counted into the parcel — supplied PER SKU, never per order line, because the bench cannot tell which line of a two-line order a case belongs to. The server derives that split from the picks. Required for a catch-weight-tracked SKU (one id per picked unit), refused for every other SKU.',
+  })
+  @IsOptional()
+  @IsArray()
+  // The SAME named constant the command tier enforces request-wide.
+  @ArrayMaxSize(MAX_HANDLING_UNITS_PER_REQUEST)
+  @IsUUID('all', { each: true })
+  handlingUnitIds?: string[];
 }
 
 /**

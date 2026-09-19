@@ -9,6 +9,27 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
 import { uuidv7 } from '../../shared/primitives/ids';
 import type { ImportMode } from './import.command';
 import { uomPrecision } from './uom';
+// The handling-unit seam lives in its own file (see the block inside the
+// class): these are re-exported so a consumer that already holds the facade
+// imports one module, not two.
+import {
+  createHandlingUnitsInTx,
+  lockHandlingUnitsInTx,
+  markHandlingUnitsAdjustedInTx,
+  markHandlingUnitsPackedInTx,
+  settleHandlingUnitIntakeInTx,
+} from './handling-unit.store';
+import type {
+  CreateHandlingUnitInput,
+  HandlingUnitIdentity,
+  HandlingUnitPackAssignment,
+} from './handling-unit.store';
+
+export type {
+  CreateHandlingUnitInput,
+  HandlingUnitIdentity,
+  HandlingUnitPackAssignment,
+} from './handling-unit.store';
 
 /** What other modules get from the catalog module (module boundary — AD-6). */
 export interface CatalogImportSummary {
@@ -29,6 +50,8 @@ export interface CatalogSkuIdentity {
   readonly code: string;
   readonly batchTracked: boolean;
   readonly serialTracked: boolean;
+  /** Story 10.3 — handled by unit, priced by weight (`handling_units`). */
+  readonly catchWeightTracked: boolean;
 }
 
 /** Batch identity (catalog-owned) — location/quantity live in inventory (AD-6). */
@@ -92,6 +115,13 @@ export interface SkuSummary {
   readonly uomPrecision: number;
   readonly batchTracked: boolean;
   readonly serialTracked: boolean;
+  /**
+   * Story 10.3: the SKU is handled by unit and priced by weight. It rides the
+   * snapshot for the same reason `uomPrecision` does — the device has to
+   * PROMPT for a per-unit weight at receipt while offline, and a prompt that
+   * only the server knows about never happens on the floor.
+   */
+  readonly catchWeightTracked: boolean;
 }
 
 @Injectable()
@@ -143,6 +173,7 @@ export class CatalogFacade {
           code: skus.code,
           batchTracked: skus.batchTracked,
           serialTracked: skus.serialTracked,
+          catchWeightTracked: skus.catchWeightTracked,
         })
         .from(skus)
         .where(and(eq(skus.tenantId, tenantId), eq(skus.id, skuId)))
@@ -184,6 +215,7 @@ export class CatalogFacade {
         uom: skus.uom,
         batchTracked: skus.batchTracked,
         serialTracked: skus.serialTracked,
+        catchWeightTracked: skus.catchWeightTracked,
       })
       .from(skus)
       .where(eq(skus.tenantId, tenantId))
@@ -403,6 +435,67 @@ export class CatalogFacade {
               );
       return serialNumbers.map((serialNumber) => rows.find((row) => row.serialNumber === serialNumber)!);
     });
+  }
+
+  // ── handling units (Story 10.3 — the catch-weight write seam) ─────────────
+  //
+  // `handling_units` has exactly ONE writer, the way `serials` does. The
+  // implementation lives in `handling-unit.store.ts` (a file-level in-tx seam,
+  // the `ensureReceivingBinInTx` / `openQcHoldsForBinsInTx` pattern) because
+  // the inventory module cannot import `CatalogModule` — catalog reaches
+  // tenancy, tenancy reaches putaway, putaway reaches inventory, and that is a
+  // module-EVALUATION cycle no `forwardRef` can unwind. These methods are the
+  // facade face of the same functions, for the siblings that already hold this
+  // module (inbound, outbound) and for the api shell. One implementation.
+  //
+  // Every one of them runs on the CALLER's transaction: a unit row commits with
+  // the GRN that produced it and flips with the pack or adjustment that
+  // consumed it.
+
+  /** See `createHandlingUnitsInTx` — the only moment a weight is captured. */
+  async createHandlingUnits(
+    tx: TenantTx,
+    tenantId: string,
+    inputs: readonly CreateHandlingUnitInput[],
+  ): Promise<HandlingUnitIdentity[]> {
+    return createHandlingUnitsInTx(tx, tenantId, inputs);
+  }
+
+  /** See `settleHandlingUnitIntakeInTx` — `pending_approval → active | rejected`. */
+  async settleHandlingUnitIntake(
+    tx: TenantTx,
+    tenantId: string,
+    grnLineId: string,
+    decision: 'approve' | 'reject',
+  ): Promise<HandlingUnitIdentity[]> {
+    return settleHandlingUnitIntakeInTx(tx, tenantId, grnLineId, decision);
+  }
+
+  /** See `markHandlingUnitsAdjustedInTx` — the write-off's `active → rejected`. */
+  async markHandlingUnitsAdjusted(
+    tx: TenantTx,
+    tenantId: string,
+    ids: readonly string[],
+  ): Promise<HandlingUnitIdentity[]> {
+    return markHandlingUnitsAdjustedInTx(tx, tenantId, ids);
+  }
+
+  /** See `markHandlingUnitsPackedInTx` — the set-once `active → packed`. */
+  async markHandlingUnitsPacked(
+    tx: TenantTx,
+    tenantId: string,
+    assignments: readonly HandlingUnitPackAssignment[],
+  ): Promise<HandlingUnitIdentity[]> {
+    return markHandlingUnitsPackedInTx(tx, tenantId, assignments);
+  }
+
+  /** See `lockHandlingUnitsInTx` — the guarded read every consuming path takes. */
+  async lockHandlingUnits(
+    tx: TenantTx,
+    tenantId: string,
+    ids: readonly string[],
+  ): Promise<HandlingUnitIdentity[]> {
+    return lockHandlingUnitsInTx(tx, tenantId, ids);
   }
 
   /** Fail-closed tracked-flag check inside the ensure transaction. */
