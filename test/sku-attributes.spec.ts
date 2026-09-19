@@ -294,7 +294,17 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
     const { id } = skuByCode('ATTR-OK');
     const res = await patchSku(id, {}).expect(400);
     expect(res.body.code).toBe('validation-failed');
-    for (const field of ['weightGrams', 'lengthMm', 'widthMm', 'heightMm', 'countryOfOrigin']) {
+    // 11-3 added productId and variantValues to the optional fields the
+    // detail enumerates — an empty body still lists them alongside 11-2's.
+    for (const field of [
+      'weightGrams',
+      'lengthMm',
+      'widthMm',
+      'heightMm',
+      'countryOfOrigin',
+      'productId',
+      'variantValues',
+    ]) {
       expect(String(res.body.detail)).toContain(field);
     }
   });

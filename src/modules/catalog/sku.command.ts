@@ -360,11 +360,15 @@ export class SkuCommand {
             setProductId = null;
             setVariantValues = null;
           } else {
+            // `for('update')`: every product-row writer serializes here —
+            // a concurrent ProductCommand.edit cannot slip an axes change in
+            // between this read and the SKU UPDATE below.
             const productRows = await tx
               .select()
               .from(products)
               .where(and(eq(products.id, fields.productId), eq(products.tenantId, command.tenantId)))
-              .limit(1);
+              .limit(1)
+              .for('update');
             const product = productRows[0];
             if (!product) {
               throw productNotFound(fields.productId);
@@ -420,11 +424,15 @@ export class SkuCommand {
               'variantValues cannot be set without the SKU belonging to a product — attach it with productId first.',
             );
           }
+          // Same lock as the attach arm — the re-value guards against the
+          // product's CURRENT axes, so a concurrent axes edit must not land
+          // between this read and the SKU UPDATE.
           const productRows = await tx
             .select()
             .from(products)
             .where(and(eq(products.id, current.productId), eq(products.tenantId, command.tenantId)))
-            .limit(1);
+            .limit(1)
+            .for('update');
           const product = productRows[0];
           if (!product) {
             throw productNotFound(current.productId);

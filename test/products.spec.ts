@@ -380,6 +380,48 @@ describe('product variants (e2e, story 11-3)', () => {
     expect(products.find((p) => p.id === tee)!.skuCount).toBe(3);
   });
 
+  test('a SKU re-claiming its OWN current values answers 200 — the duplicate check excludes itself', async () => {
+    const tee = productIds.get('Oversized Tee')!;
+    const { id: skuA } = skuByCode('VAR-A'); // holds size=M, colour=Red
+
+    // The attach branch (productId + variantValues present): the identical
+    // re-attach is not a duplicate — `ne(skus.id, command.skuId)` excludes
+    // the SKU's own row.
+    const reAttached = await patchSku(skuA, {
+      productId: tee,
+      variantValues: { size: 'M', colour: 'Red' },
+    }).expect(200);
+    expect(reAttached.body.productId).toBe(tee);
+    expect(reAttached.body.variantValues).toEqual({ size: 'M', colour: 'Red' });
+
+    // The values-only branch: re-submitting the current values against the
+    // same attachment takes the same self-exclusion.
+    const reValued = await patchSku(skuA, {
+      variantValues: { colour: 'Red', size: 'M' },
+    }).expect(200);
+    expect(reValued.body.variantValues).toEqual({ size: 'M', colour: 'Red' });
+  });
+
+  test('the SKU list filters by productId; an unknown product id is an empty page', async () => {
+    const tee = productIds.get('Oversized Tee')!;
+    const filtered = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .query({ productId: tee })
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const items = filtered.body.items as { code: string; productId: string }[];
+    expect(items.map((item) => item.code).sort()).toEqual(['VAR-A', 'VAR-B', 'VAR-C']);
+    expect(items.every((item) => item.productId === tee)).toBe(true);
+
+    const empty = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .query({ productId: uuidv7() })
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    expect(empty.body.items).toEqual([]);
+    expect(empty.body.nextCursor).toBeNull();
+  });
+
   test('detaches: variantValues are cleared with it, and the SKU can re-attach with new values', async () => {
     const tee = productIds.get('Oversized Tee')!;
     const { id: skuC } = skuByCode('VAR-C');
@@ -539,6 +581,35 @@ describe('product variants (e2e, story 11-3)', () => {
     const tenantDupError = (tenantDup.body.errors as { code: string; detail: string }[])[0]!;
     expect(tenantDupError.code).toBe('duplicate-variant-values');
     expect(tenantDupError.detail).toContain('IMP-VAR-1');
+  });
+
+  test('the product list keyset walks past page 1 to exhaustion (limit=2)', async () => {
+    const all = (await listProducts().expect(200)).body.items as { id: string }[];
+    expect(all.length).toBeGreaterThanOrEqual(5);
+
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    let next: string | null = null;
+    let pages = 0;
+    for (;;) {
+      const page = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/catalog/products`)
+        .query(cursor ? { limit: 2, cursor } : { limit: 2 })
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      const items = page.body.items as { id: string }[];
+      expect(items.length).toBeLessThanOrEqual(2);
+      seen.push(...items.map((item) => item.id));
+      next = page.body.nextCursor as string | null;
+      if (next === null) break;
+      cursor = next;
+      pages += 1;
+      expect(pages).toBeLessThan(10); // runaway guard
+    }
+    expect(pages).toBeGreaterThanOrEqual(2);
+    expect(next).toBeNull(); // the final page ends the walk
+    expect(new Set(seen).size).toBe(seen.length); // pages are disjoint
+    expect(seen).toEqual(all.map((item) => item.id)); // the un-paged order
   });
 
   test('keeps the closed-header contract: an unknown column is still 400 file-unreadable', async () => {

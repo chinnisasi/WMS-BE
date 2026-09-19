@@ -2133,7 +2133,7 @@
           }
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "The created product (a matching Idempotency-Key replays it)",
             "content": {
               "application/json": {
@@ -2144,7 +2144,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or an invalid name/axes (validation-failed / empty-product-edit)",
+            "description": "Missing or malformed Idempotency-Key, or an invalid name/axes (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {

@@ -186,6 +186,13 @@ export class ProductCommand {
   }
 
   async edit(command: EditProductCommand, idempotencyKey: string): Promise<ProductSnapshot> {
+    // Shape check above the transaction: a malformed (non-uuid) path param
+    // must answer the 404 before Postgres answers a raw 22P02 — the exact
+    // guard the SKU attach path carries for its productId field.
+    if (!UUID_RE.test(command.productId)) {
+      throw productNotFound(command.productId);
+    }
+
     // The `hsn` template: absent = unchanged. An empty PATCH is its own error
     // code — `empty-product-edit` (the DTO admits optional-only bodies).
     const fields = {
@@ -276,11 +283,22 @@ export class ProductCommand {
         const updates: Partial<typeof products.$inferInsert> = { updatedAt: nowIso() };
         if (fields.name !== undefined) updates.name = fields.name;
         if (fields.axes !== undefined) updates.axes = [...fields.axes];
-        const updatedRows = await tx
-          .update(products)
-          .set(updates)
-          .where(eq(products.id, command.productId))
-          .returning();
+        let updatedRows;
+        try {
+          updatedRows = await tx
+            .update(products)
+            .set(updates)
+            .where(eq(products.id, command.productId))
+            .returning();
+        } catch (err) {
+          // A concurrent rename won the name race between the pre-check and
+          // this update — create's backstop, edit's twin (a raw 23505 is
+          // never an answer).
+          if (isUniqueViolationOn(err, PRODUCTS_TENANT_NAME)) {
+            throw duplicateProductName(fields.name ?? current.name);
+          }
+          throw err;
+        }
         const row = updatedRows[0]!;
         const skuCount = await countAttachedSkus(tx, command.tenantId, row.id);
         const snapshot: ProductSnapshot = {
@@ -372,10 +390,13 @@ export class ProductCommand {
                 ),
               )
               .groupBy(skus.productId);
-      return { pageRows, counts };
+      // The FULL limit+1 batch goes to buildPage — it is the +1 that decides
+      // whether a next cursor exists (the sku.list shape; slicing here first
+      // would collapse every page to the last one).
+      return { productRows, counts };
     });
     const page = buildPage(
-      rows.pageRows.map((row) => ({
+      rows.productRows.map((row) => ({
         id: row.id,
         tenantId: row.tenantId,
         name: row.name,

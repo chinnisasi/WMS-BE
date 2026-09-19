@@ -282,10 +282,14 @@ export class ImportCommand {
         ];
         const productByName = new Map<string, { id: string; name: string; axes: readonly string[] }>();
         if (productNames.length > 0) {
+          // `for('update')`: the same serialization the SKU edit command takes
+          // — a concurrent ProductCommand.edit must not change a referenced
+          // product's axes between this read and the rows' INSERT.
           const referenced = await tx
             .select({ id: products.id, name: products.name, axes: products.axes })
             .from(products)
-            .where(and(eq(products.tenantId, command.tenantId), inArray(products.name, productNames)));
+            .where(and(eq(products.tenantId, command.tenantId), inArray(products.name, productNames)))
+            .for('update');
           for (const row of referenced) productByName.set(row.name, row);
         }
         const referencedIds = [...new Set([...productByName.values()].map((product) => product.id))];
@@ -1055,7 +1059,8 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
   // side effect of the first CSV row); the tenant read that resolves it runs
   // later, alongside the duplicate checks. A values cell without a product
   // is refused HERE (values ride the product); a product cell without values
-  // fails the coverage check in that later pass, naming the missing axis.
+  // fails the shared validator in that later pass — `variantValues must be
+  // an object keyed by the product's axes` (it names no axis).
   const productNameRaw = get('product');
   if (productNameRaw.length > PRODUCT_NAME_MAX) {
     return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', `product must be at most ${PRODUCT_NAME_MAX} characters.`) };

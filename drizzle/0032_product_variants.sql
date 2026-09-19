@@ -26,8 +26,10 @@
 -- ADDITIVE ONLY: one CREATE TABLE, two ADD COLUMNs, indexes. No data
 -- statement, nothing to back-fill — every pre-11.3 SKU reads
 -- `product_id = NULL`, `variant_values = NULL`, and every pre-11.3 code path
--- behaves exactly as it did. Which is also why this needs no fail-fast re-run
--- guard: CREATE TABLE and ADD COLUMN cannot be applied twice.
+-- behaves exactly as it did. The appended CONSTRAINT/POLICY are NOT hand
+-- re-runnable, and none of this needs to be: the drizzle journal is the
+-- re-run guard — each statement is applied exactly once (the 0028/0031
+-- pattern).
 
 CREATE TABLE "products" (
 	"id" uuid PRIMARY KEY NOT NULL,
