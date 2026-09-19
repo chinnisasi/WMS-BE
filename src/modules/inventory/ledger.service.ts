@@ -834,6 +834,10 @@ export class LedgerService {
           divergences: report.divergences.map((divergence) => ({
             skuId: divergence.skuId,
             binId: divergence.binId,
+            // Story 10.4: a batch-arm divergence names its batch — the same
+            // optional key the cycle alert carries, so a manual rebuild's
+            // alert is no less nameable than the cycle's.
+            ...(divergence.batchRef !== undefined ? { batchRef: divergence.batchRef } : {}),
             // Story 10.1: the alert leaves the domain, so it speaks base
             // units like every other outbound quantity.
             projected:

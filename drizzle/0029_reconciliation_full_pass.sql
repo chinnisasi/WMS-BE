@@ -1,0 +1,17 @@
+-- Story 10.4 — the bounded scan schedules a FULL pass; the failure path un-wedged.
+--
+-- `reconciliation_checkpoints` gains `incremental_count`: the number of bounded
+-- passes accumulated on this partition since its last FULL replay (`replayInTx`).
+-- The bounded scan (`reconcileScanInTx`) compares only the scopes its window
+-- touched, so a divergence on a scope untouched since the checkpoint is a blind
+-- spot reachable only manually today. When the counter reaches
+-- `RECONCILE_FULL_PASS_EVERY` (default 20 — N bounded passes between full passes),
+-- the next cycle runs the full compare and the counter resets. It is cycle-written
+-- state like `last_seq`: incremented by a bounded pass (clean or divergent),
+-- reset by a full pass, never touched by the failure path.
+--
+-- No RLS policy change — the column rides the table's existing 0008 tenant
+-- isolation. Existing rows take the DEFAULT 0, so every pre-upgrade partition's
+-- next pass is a full pass once (then bounded again) — the honest first pass over
+-- the column's meaning.
+ALTER TABLE "reconciliation_checkpoints" ADD COLUMN "incremental_count" integer DEFAULT 0 NOT NULL;

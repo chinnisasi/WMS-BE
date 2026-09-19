@@ -25,7 +25,7 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { MAX_QUANTITY_BASE, isAtPrecision, precisionRefusalDetail, toMilli } from '../../shared/primitives/quantity';
+import { MAX_QUANTITY_BASE, validateRecordableQuantity } from '../../shared/primitives/quantity';
 import {
   isFractionalUom,
   resolveUom,
@@ -676,6 +676,17 @@ function parseTracked(raw: string, column: string, rowNumber: number): FieldResu
  * change wearing a rounding's clothes. The unit now declares its precision, so
  * the row is refused naming the unit, the precision and the value, and `fix`
  * mode can re-submit it with a number the unit can actually hold.
+ *
+ * **Story 10.4: the RULE itself is no longer stated here.** This function used
+ * to hand-roll ceiling → precision → convert, a second statement of the
+ * write-edge rule `assertRecordableQuantity` already owned. It now delegates
+ * to the one core (`validateRecordableQuantity`) — the precision arm's refusal
+ * text is byte-identical to the HTTP path's because it is THE SAME TEXT —
+ * while the two call shapes keep their differences deliberately: the malformed
+ * and over-ceiling arms keep their import-specific sentences, and the SIGN
+ * rule is one parameter of the core (import cells are levels and may not be
+ * negative; command deltas are signed — though this path's regex rejects a
+ * minus sign first, so the core's sign arm is defense in depth here).
  */
 function parseQuantityMilli(
   raw: string,
@@ -692,20 +703,21 @@ function parseQuantityMilli(
       error: rowError(rowNumber, null, 'validation-failed', `${column} must be a non-negative quantity (got "${value}").`),
     };
   }
-  const n = Number(value);
-  if (!Number.isFinite(n) || n > MAX_QUANTITY_BASE) {
+  const result = validateRecordableQuantity(Number(value), column, uom, precision, 'non-negative');
+  if (result.ok) {
+    return { ok: true, value: result.milli };
+  }
+  // Over-ceiling keeps its import-specific sentence (the row-error context
+  // differs from the command path's ProblemException); the precision and
+  // vanish arms speak the shared core's text — byte-identical to the HTTP
+  // path's precision arm. The sign arm is unreachable behind the regex.
+  if (result.arm === 'ceiling') {
     return {
       ok: false,
       error: rowError(rowNumber, null, 'validation-failed', `${column} exceeds the quantity ceiling of ${MAX_QUANTITY_BASE}.`),
     };
   }
-  if (!isAtPrecision(n, precision)) {
-    return {
-      ok: false,
-      error: rowError(rowNumber, null, 'validation-failed', precisionRefusalDetail(column, n, uom, precision)),
-    };
-  }
-  return { ok: true, value: toMilli(n) };
+  return { ok: false, error: rowError(rowNumber, null, 'validation-failed', result.detail) };
 }
 
 /**

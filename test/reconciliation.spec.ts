@@ -17,7 +17,12 @@ import {
   RECONCILIATION_CHECKPOINT_INVALID_EVENT,
   RECONCILIATION_DIVERGENCE_EVENT,
 } from '../src/modules/inventory/reconcile';
-import { ReconciliationWorker, parseReconcilePollMs } from '../src/jobs/jobs.module';
+import {
+  DEFAULT_RECONCILE_FULL_PASS_EVERY,
+  ReconciliationWorker,
+  parseReconcileFullPassEvery,
+  parseReconcilePollMs,
+} from '../src/jobs/jobs.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
@@ -29,6 +34,10 @@ process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
 // (the same convention as the outbox suite's relay).
 delete process.env.OUTBOX_RELAY_POLL_MS;
 delete process.env.OUTBOX_RECONCILE_POLL_MS;
+// Story 10.4: this suite pins the DEFAULT full-pass cadence — every bounded
+// pass count it walks through stays under the knob, so no scheduled full pass
+// perturbs the cycle-by-cycle assertions.
+delete process.env.RECONCILE_FULL_PASS_EVERY;
 
 const API = '/api/v1/tenants';
 const KEY_HEADER = 'Idempotency-Key';
@@ -61,6 +70,7 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
   // Seeded aggregate roots (one tenant; three warehouses — the main matrix
   // warehouse, the checkpoint-validation warehouse, and the anchor warehouse).
   let tenantId: string;
+  let ownerToken: string;
   let opsToken: string;
   let warehouseId: string;
   let binA: string;
@@ -92,7 +102,7 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
       .expect(201);
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
-    const ownerToken = (
+    ownerToken = (
       await request(app.getHttpServer())
         .post(`${API}/sign-in`)
         .send({ email, password: 'correct-horse-battery' })
@@ -340,16 +350,25 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     | {
         last_seq: number;
         invalid_attempts: number;
+        incremental_count: number;
+        updated_at: Date;
         last_divergences: { skuId: string; binId: string }[] | null;
       }
     | undefined
   > {
     const rows = await sql`
-      select last_seq, invalid_attempts, last_divergences from reconciliation_checkpoints
+      select last_seq, invalid_attempts, incremental_count, updated_at, last_divergences
+      from reconciliation_checkpoints
       where tenant_id = ${tenantId} and warehouse_id = ${targetWarehouseId} limit 1
     `;
     return rows[0] as
-      | { last_seq: number; invalid_attempts: number; last_divergences: { skuId: string; binId: string }[] | null }
+      | {
+          last_seq: number;
+          invalid_attempts: number;
+          incremental_count: number;
+          updated_at: Date;
+          last_divergences: { skuId: string; binId: string }[] | null;
+        }
       | undefined;
   }
 
@@ -924,6 +943,174 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     expect(picked).toBe(warehouseId);
   });
 
+  // ── Story 10.4: the failure path and the full-pass cadence ───────────────
+  //
+  // The deterministic failure lever for the next two tests: a ledger event's
+  // `quantity_delta` poisoned beyond the exact-integer range (2⁵³) via the
+  // replication-role bypass — the fold's `assertExactQuantity` throws, the
+  // WHOLE cycle throws, and the failure path exercises. (The verify-before-
+  // anchor test tampered a delta the same way; here the tamper never needs to
+  // restore, because the poisoned partition is deliberately left failing.)
+
+  it('a persistently failing never-checkpointed partition does not wedge the worker — the failure path inserts an EMPTY checkpoint and the next tick serves another partition', async () => {
+    const failWarehouseId = await createWarehouse(ownerToken, 'FAIL', ['F-01-01']);
+    const failBinId = (await binIds(failWarehouseId))[0] as string;
+    const seq1 = await adjust(failBinId, 1, failWarehouseId);
+    expect(seq1).toBe(1);
+
+    // Poison the movement: the fold throws, deterministically, every cycle.
+    await sql.unsafe('set session_replication_role = replica');
+    await sql.unsafe(
+      'update ledger_events set quantity_delta = 9007199254740992 where tenant_id = $1 and warehouse_id = $2 and seq = 1',
+      [tenantId, failWarehouseId],
+    );
+    await sql.unsafe('set session_replication_role = DEFAULT');
+
+    // Pending work on another partition, so the next tick has somewhere to go.
+    await adjust(binA, 1);
+
+    // The failing partition's checkpoint appears after its first failed
+    // cycle. Concurrent jest workers share the database, so `reconcileNext`
+    // may pick a foreign suite's partition on some ticks — the loop stops at
+    // the first failure of THIS partition (observable only through the row
+    // the failure path must insert: that insert is the wedge fix).
+    let requeued = false;
+    for (let tick = 0; tick < 60 && !requeued; tick += 1) {
+      try {
+        await facade.reconcileNext();
+      } catch {
+        requeued = (await checkpointRow(failWarehouseId)) !== undefined;
+      }
+    }
+    expect(requeued).toBe(true);
+
+    // An EMPTY checkpoint: an ordinary queue member now — `last_seq 0` is
+    // detect's "no checkpoint" state exactly, and nothing else was written.
+    expect(await checkpointRow(failWarehouseId)).toMatchObject({
+      last_seq: 0,
+      invalid_attempts: 0,
+      incremental_count: 0,
+      last_divergences: null,
+    });
+
+    // The wedge is broken: a later tick serves a DIFFERENT partition (the
+    // failure stamp made this one the freshest, so it sorts last).
+    const seen: string[] = [];
+    for (let tick = 0; tick < 60 && seen.length === 0; tick += 1) {
+      const report = await facade.reconcileNext().catch(() => null);
+      if (
+        report !== null &&
+        report.tenantId === tenantId &&
+        report.warehouseId !== failWarehouseId
+      ) {
+        seen.push(report.warehouseId);
+      }
+    }
+    expect(seen.length).toBeGreaterThan(0);
+  });
+
+  it('a failing cycle on an EXISTING checkpoint wipes nothing — the insert is DO NOTHING, then only the stamp lands', async () => {
+    const survWarehouseId = await createWarehouse(ownerToken, 'SURV', ['S-01-01']);
+    const survBinId = (await binIds(survWarehouseId))[0] as string;
+    await adjust(survBinId, 2, survWarehouseId); // seq 1
+    await tamperProjection(survBinId, 3, survWarehouseId); // stored: 5, replay: 2
+
+    const first = await facade.reconcile(tenantId, survWarehouseId);
+    expect(first.divergences).toHaveLength(1);
+    const before = await checkpointRow(survWarehouseId);
+    expect(before).toMatchObject({
+      last_seq: 0,
+      invalid_attempts: 0,
+      incremental_count: 0,
+      last_divergences: [{ skuId, binId: survBinId }],
+    });
+
+    // A movement makes the partition pending again — then its event is
+    // poisoned, so the next cycle fails inside the fold.
+    await adjust(survBinId, 1, survWarehouseId); // seq 2
+    await sql.unsafe('set session_replication_role = replica');
+    await sql.unsafe(
+      'update ledger_events set quantity_delta = 9007199254740992 where tenant_id = $1 and warehouse_id = $2 and seq = 2',
+      [tenantId, survWarehouseId],
+    );
+    await sql.unsafe('set session_replication_role = DEFAULT');
+
+    // Make THIS partition the one a tick must pick (the stamp is only
+    // observable on the partition that failed): backdate it, freshen every
+    // other checkpoint of the tenant — including the poisoned FAIL partition's.
+    const stampMarker = new Date(Date.now() - 60_000);
+    await sql`
+      update reconciliation_checkpoints set updated_at = now() - interval '1 hour'
+      where tenant_id = ${tenantId} and warehouse_id = ${survWarehouseId}
+    `;
+    await sql`
+      update reconciliation_checkpoints set updated_at = now()
+      where tenant_id = ${tenantId} and warehouse_id <> ${survWarehouseId}
+    `;
+
+    let stamped = false;
+    for (let tick = 0; tick < 60 && !stamped; tick += 1) {
+      try {
+        await facade.reconcileNext();
+      } catch {
+        const row = await checkpointRow(survWarehouseId);
+        stamped = row !== undefined && row.updated_at.getTime() > stampMarker.getTime();
+      }
+    }
+    expect(stamped).toBe(true);
+
+    // The DO NOTHING: the pre-failure cycle state survives byte-for-byte —
+    // an upsert here would have wiped the repeat memory (`last_seq`,
+    // `last_divergences`) and silently cured a corrupt checkpoint, bypassing
+    // the ×2 discard and its alert.
+    const after = await checkpointRow(survWarehouseId);
+    expect(after).toMatchObject({
+      last_seq: before!.last_seq,
+      invalid_attempts: before!.invalid_attempts,
+      incremental_count: before!.incremental_count,
+      last_divergences: before!.last_divergences,
+    });
+    // …while the stamp still landed: the partition is an ordinary queue
+    // member (oldest-`updated_at` first), not a re-picked head.
+    expect(after!.updated_at.getTime()).toBeGreaterThan(before!.updated_at.getTime());
+  });
+
+  it('a malformed last_divergences entry is skipped typed — the well-formed entries still classify repeats', async () => {
+    const memWarehouseId = await createWarehouse(ownerToken, 'MEM', ['M-01-01']);
+    const memBinId = (await binIds(memWarehouseId))[0] as string;
+    await adjust(memBinId, 1, memWarehouseId); // seq 1
+
+    // A hand-written memory mixing garbage with the one well-formed entry,
+    // which names the very scope about to diverge: a null, a bare string, a
+    // bare number, an object missing its binId — and one good entry.
+    await sql`
+      insert into reconciliation_checkpoints (id, tenant_id, warehouse_id, last_seq, invalid_attempts, last_divergences)
+      values (gen_random_uuid(), ${tenantId}, ${memWarehouseId}, 0, 0, ${sql.json([
+        null,
+        'garbage',
+        5,
+        { skuId },
+        { skuId, binId: memBinId },
+      ])})
+    `;
+    await tamperProjection(memBinId, 2, memWarehouseId); // stored: 3, replay: 1
+
+    // The corruption probe's goal is a crash or a lost repeat classification;
+    // neither happens — the malformed entries are dropped with a warning and
+    // the good entry classifies the divergence a REPEAT.
+    const report = await facade.reconcile(tenantId, memWarehouseId);
+    expect(report.advanced).toBe(false);
+    expect(report.divergences).toHaveLength(1);
+    expect(report.divergences[0]!.repeat).toBe(true);
+    // The repair rewrote the memory in its own well-formed shape — the
+    // garbage does not survive a cycle.
+    expect(await checkpointRow(memWarehouseId)).toMatchObject({
+      last_seq: 0,
+      last_divergences: [{ skuId, binId: memBinId }],
+    });
+    expect(await quarantineRows(memWarehouseId)).toHaveLength(1);
+  });
+
   it('detection transactions pin repeatable read isolation (the consistent-snapshot read)', async () => {
     const level = await withTenantTransaction(
       db,
@@ -1033,6 +1220,30 @@ describe('reconciliation worker plumbing (unit, story 2.2)', () => {
       expect(() => parseReconcilePollMs('soon')).toThrow(/OUTBOX_RECONCILE_POLL_MS/);
       expect(() => parseReconcilePollMs('1.5')).toThrow(/OUTBOX_RECONCILE_POLL_MS/);
       expect(() => parseReconcilePollMs('-5')).toThrow(/OUTBOX_RECONCILE_POLL_MS/);
+    });
+  });
+
+  describe('parseReconcileFullPassEvery (story 10.4)', () => {
+    // Unlike the poll intervals, the full-pass cadence is ON when unset — the
+    // scheduled full pass is part of the engine's guarantee, so UNSET means
+    // the default cadence, not OFF.
+    it('unset and empty fall back to the default cadence', () => {
+      expect(DEFAULT_RECONCILE_FULL_PASS_EVERY).toBe(20);
+      expect(parseReconcileFullPassEvery(undefined)).toBe(20);
+      expect(parseReconcileFullPassEvery('')).toBe(20);
+    });
+
+    it('a positive integer passes through (1 alternates bounded and full passes)', () => {
+      expect(parseReconcileFullPassEvery('1')).toBe(1);
+      expect(parseReconcileFullPassEvery('20')).toBe(20);
+      expect(parseReconcileFullPassEvery('200')).toBe(200);
+    });
+
+    it('anything not a positive integer fails the boot loudly', () => {
+      expect(() => parseReconcileFullPassEvery('soon')).toThrow(/RECONCILE_FULL_PASS_EVERY/);
+      expect(() => parseReconcileFullPassEvery('1.5')).toThrow(/RECONCILE_FULL_PASS_EVERY/);
+      expect(() => parseReconcileFullPassEvery('0')).toThrow(/RECONCILE_FULL_PASS_EVERY/);
+      expect(() => parseReconcileFullPassEvery('-3')).toThrow(/RECONCILE_FULL_PASS_EVERY/);
     });
   });
 

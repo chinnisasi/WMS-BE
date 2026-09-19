@@ -23,6 +23,44 @@ export const RECONCILIATION_CHECKPOINT_INVALID_EVENT = 'reconciliation.checkpoin
 /** Consecutive checkpoint-validation failures before the checkpoint is discarded. */
 export const CHECKPOINT_INVALID_LIMIT = 2;
 
+/**
+ * The default full-pass cadence (story 10.4): after this many BOUNDED passes
+ * a partition runs one FULL pass (`replayInTx`), closing the bounded scan's
+ * blind spot (a divergence on a scope untouched since the checkpoint). The
+ * semantics are "N bounded passes between full passes", so 1 alternates — a
+ * bounded pass increments the counter, a full pass resets it.
+ */
+export const DEFAULT_RECONCILE_FULL_PASS_EVERY = 20;
+
+/**
+ * The full-pass knob, `RECONCILE_FULL_PASS_EVERY` — parsed like the poll
+ * intervals beside it (`parseReconcilePollMs`), except that UNSET means the
+ * default cadence, not OFF: the scheduled full pass is part of the engine's
+ * guarantee, so it is on unless a deployment tunes it. A non-positive value
+ * or anything that is not an integer fails the boot loudly.
+ *
+ * **Why this helper lives here and not beside `parseReconcilePollMs` in
+ * `src/jobs/jobs.module.ts`.** That file imports `InventoryModule`, which
+ * imports this one — a back-import of the jobs shell from here is a module
+ * cycle, and under this repo's CJS output it breaks the NestJS boot outright
+ * (`Cannot access 'InvModule' before initialization`, verified). The knob is
+ * still re-exported FROM the jobs shell beside `parseReconcilePollMs`, so the
+ * worker's env-parse surface stays in one place; the service reads it in its
+ * constructor — never module scope, so e2e suites can set the env per suite.
+ */
+export function parseReconcileFullPassEvery(raw: string | undefined): number {
+  if (raw === undefined || raw === '') {
+    return DEFAULT_RECONCILE_FULL_PASS_EVERY;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(
+      `RECONCILE_FULL_PASS_EVERY must be a positive integer — bounded passes per full pass (got "${raw}")`,
+    );
+  }
+  return parsed;
+}
+
 /** A divergent scope flagged by the cycle, with its repeat classification. */
 export interface FlaggedDivergence extends ReplayDivergence {
   readonly repeat: boolean;
@@ -58,22 +96,36 @@ interface CycleDetection {
   readonly previousSeq: number | null;
   /** The window's lower bound this cycle compares across (0 = full pass). */
   readonly lastSeq: number;
-  readonly lastDivergences: readonly { skuId: string; binId: string }[];
+  /** Story 10.4: the pass kind this cycle ran — the counter's write arm. */
+  readonly fullPass: boolean;
+  /** Story 10.4: the counter as the cycle STARTED with (bounded passes so far). */
+  readonly incrementalCount: number;
+  /** Story 10.4: the memory's entries may carry the batch arm's identity. */
+  readonly lastDivergences: readonly { skuId: string; binId: string; batchRef?: string }[];
   readonly skipped: boolean;
   readonly checkpointDiscarded: boolean;
   readonly clean: boolean;
   readonly divergences: readonly ReplayDivergence[];
 }
 
+/**
+ * The repeat-classification key (story 10.4, unchanged): `skuId:binId` ONLY.
+ * `batchRef` never joins the key — a batch-arm divergence and a plain one on
+ * the same (sku, bin) are the same scope's repeat, the (sku, bin) quarantine
+ * fires exactly as it did before the batch identity was carried, and
+ * pre-upgrade memory rows (no `batchRef`) classify exactly as they did.
+ */
 function divergenceScopeKey(divergence: { skuId: string; binId: string }): string {
   return `${divergence.skuId}:${divergence.binId}`;
 }
 
-function parseLastDivergences(raw: Record<string, unknown>[] | null): { skuId: string; binId: string }[] {
+function parseLastDivergences(
+  raw: Record<string, unknown>[] | null,
+): { skuId: string; binId: string; batchRef?: string }[] {
   if (!Array.isArray(raw)) {
     return [];
   }
-  const entries: { skuId: string; binId: string }[] = [];
+  const entries: { skuId: string; binId: string; batchRef?: string }[] = [];
   let dropped = 0;
   for (const entry of raw) {
     // The column is corruption-prone by definition (the checkpoint row is
@@ -91,7 +143,12 @@ function parseLastDivergences(raw: Record<string, unknown>[] | null): { skuId: s
       dropped += 1;
       continue;
     }
-    entries.push({ skuId, binId });
+    // Story 10.4: the batch arm's identity rides the memory as an OPTIONAL
+    // key — pre-upgrade rows have none, and absence must classify (and
+    // re-emit) exactly as it did before. (`exactOptionalPropertyTypes`: a
+    // present `batchRef` is spread in, an absent one stays absent.)
+    const batchRef = typeof record['batchRef'] === 'string' ? record['batchRef'] : undefined;
+    entries.push(batchRef === undefined ? { skuId, binId } : { skuId, binId, batchRef });
   }
   if (dropped > 0) {
     new Logger('ReconciliationService').warn(
@@ -126,6 +183,13 @@ function parseLastDivergences(raw: Record<string, unknown>[] | null): { skuId: s
 export class ReconciliationService {
   private readonly logger = new Logger('ReconciliationService');
 
+  /**
+   * The full-pass cadence (bounded passes per full pass), read in the
+   * constructor — never module scope, so a suite (or a deployment) can set
+   * `RECONCILE_FULL_PASS_EVERY` per process.
+   */
+  private readonly fullPassEvery: number;
+
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     // The one cross-tenant read (partition discovery) runs on the BYPASSRLS
@@ -133,7 +197,9 @@ export class ReconciliationService {
     // outbox relay's tenant discovery.
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
     @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
-  ) {}
+  ) {
+    this.fullPassEvery = parseReconcileFullPassEvery(process.env.RECONCILE_FULL_PASS_EVERY);
+  }
 
   /**
    * One reconciliation cycle for one (tenant, warehouse) partition.
@@ -237,6 +303,13 @@ export class ReconciliationService {
 
       // ONE alert per cycle, naming the warehouse, every divergent scope
       // (projected vs replayed), its event range, and whether it is a repeat.
+      // Story 10.4: a batch-arm divergence names its batch — optional key
+      // (additive on the 10.1 payload contract; no consumer branches on
+      // absence), so a (sku, bin, batch) imbalance is nameable without a
+      // jsonb scan. The quarantine below stays (sku, bin)-keyed on purpose:
+      // ATP fail-closure lives at the granularity ATP is granted, and
+      // over-restricting a batch imbalance to the whole bin never
+      // under-protects.
       await this.outbox.append(tx, {
         messageId: uuidv7(),
         tenantId,
@@ -248,6 +321,7 @@ export class ReconciliationService {
           divergences: flagged.map((divergence) => ({
             skuId: divergence.skuId,
             binId: divergence.binId,
+            ...(divergence.batchRef !== undefined ? { batchRef: divergence.batchRef } : {}),
             // Story 10.1: base units on the way out (the outbox contract).
             projected:
               divergence.projectedQuantity === null ? null : fromMilli(divergence.projectedQuantity),
@@ -264,10 +338,17 @@ export class ReconciliationService {
       // still-divergent scope as a repeat. On conflict, only the divergence
       // memory (and the validation-failure streak, broken by this cycle's
       // VALID checkpoint validation) is written — never last_seq.
+      //
+      // Story 10.4: the memory may carry the batch arm's identity, and the
+      // `incremental_count` follows the PASS KIND, regardless of which arm of
+      // this upsert the write lands in — the same bounded/full rule the clean
+      // advance applies (a bounded pass increments, a full pass resets).
       const lastDivergences = flagged.map((divergence) => ({
         skuId: divergence.skuId,
         binId: divergence.binId,
+        ...(divergence.batchRef !== undefined ? { batchRef: divergence.batchRef } : {}),
       }));
+      const incrementalCount = detection.fullPass ? 0 : detection.incrementalCount + 1;
       await tx
         .insert(reconciliationCheckpoints)
         .values({
@@ -279,11 +360,12 @@ export class ReconciliationService {
           // pre-cycle last_seq, unchanged.
           lastSeq: detection.lastSeq,
           invalidAttempts: 0,
+          incrementalCount,
           lastDivergences,
         })
         .onConflictDoUpdate({
           target: [reconciliationCheckpoints.tenantId, reconciliationCheckpoints.warehouseId],
-          set: { lastDivergences, invalidAttempts: 0, updatedAt: nowIso() },
+          set: { lastDivergences, invalidAttempts: 0, incrementalCount, updatedAt: nowIso() },
         });
 
       return { quarantined, repaired };
@@ -316,15 +398,49 @@ export class ReconciliationService {
     try {
       return await this.reconcile(partition.tenantId, partition.warehouseId);
     } catch (error) {
-      // A persistently failing cycle must not wedge its partition at the
-      // head of the queue forever: best-effort, stamp ONLY the checkpoint's
-      // `updated_at` so the partition re-queues behind the others (never
-      // last_seq / invalid_attempts / last_divergences — cycle state is
-      // written only by a cycle; a partition without a checkpoint row has
-      // nothing to stamp and re-queues as the nulls-first bucket anyway).
+      // A persistently failing cycle must not wedge its partition at the head
+      // of the queue forever. Before story 10.4 the comment here treated "no
+      // checkpoint row → nulls-first re-pick" as fairness — it is the
+      // opposite: with ONE partition picked per tick, a persistently failing
+      // never-checkpointed partition is picked EVERY tick, its failure stamp
+      // (an UPDATE) matches no row, and the worker serves nothing else — the
+      // bounded-scan escape hatch was unreachable behind it. So the failure
+      // path first INSERTS an empty checkpoint row (`last_seq 0`,
+      // `invalid_attempts 0`, `last_divergences null`) with ON CONFLICT DO
+      // NOTHING — never an upsert: an upsert would wipe an EXISTING
+      // checkpoint's `last_seq`/`last_divergences` (destroying the repeat
+      // memory and silently curing a corrupt checkpoint, bypassing the ×2
+      // discard and its `reconciliation.checkpoint_invalid` alert) — and then
+      // stamps `updated_at`, converting the partition into an ordinary queue
+      // member (oldest-`updated_at` first). `last_seq: 0` is detect's "no
+      // checkpoint" state exactly (`lastSeq === 0 → full replay`), so the
+      // row changes no cycle semantics; the stamp still touches only
+      // `updated_at` — `last_seq`, `invalid_attempts` and `last_divergences`
+      // remain cycle-written state, written only by a cycle.
+      //
+      // For failure classes that kill the tenant-scoped seam itself (RLS
+      // role, connection loss) this insert and stamp fail too — logged and
+      // retried next rotation; the wedge is then bounded by the same outage.
       try {
-        await withTenantTransaction(this.db, partition.tenantId, (tx) =>
-          tx
+        await withTenantTransaction(this.db, partition.tenantId, async (tx) => {
+          await tx
+            .insert(reconciliationCheckpoints)
+            .values({
+              id: uuidv7(),
+              tenantId: partition.tenantId,
+              warehouseId: partition.warehouseId,
+              lastSeq: 0,
+              invalidAttempts: 0,
+              incrementalCount: 0,
+              lastDivergences: null,
+            })
+            .onConflictDoNothing({
+              target: [
+                reconciliationCheckpoints.tenantId,
+                reconciliationCheckpoints.warehouseId,
+              ],
+            });
+          await tx
             .update(reconciliationCheckpoints)
             .set({ updatedAt: nowIso() })
             .where(
@@ -332,8 +448,8 @@ export class ReconciliationService {
                 eq(reconciliationCheckpoints.tenantId, partition.tenantId),
                 eq(reconciliationCheckpoints.warehouseId, partition.warehouseId),
               ),
-            ),
-        );
+            );
+        });
       } catch (stampError) {
         this.logger.warn(
           `Reconciliation failure-requeue stamp failed: tenant=${partition.tenantId} ` +
@@ -411,6 +527,16 @@ export class ReconciliationService {
         const base = {
           watermark,
           previousSeq: checkpoint?.lastSeq ?? null,
+          // The counter as this cycle STARTED with (0: no checkpoint row).
+          incrementalCount: checkpoint?.incrementalCount ?? 0,
+          // Story 10.4: the pass kind. `lastSeq === 0` is a full pass exactly
+          // as before (no checkpoint, or a discarded one — an uncheckpointed
+          // window); the scheduled full pass adds the SECOND trigger: a
+          // partition whose bounded passes have accumulated past the knob's
+          // cadence. The counter rule is per PASS KIND, regardless of which
+          // upsert arm the cycle's write lands in: a bounded pass increments,
+          // a full pass resets to 0.
+          fullPass: (checkpoint?.lastSeq ?? 0) === 0 || (checkpoint?.incrementalCount ?? 0) >= this.fullPassEvery,
         };
 
         // Checkpoint validation (IN-08): the stored watermark must agree with
@@ -448,9 +574,14 @@ export class ReconciliationService {
             const report = await replayInTx(tx, tenantId, warehouseId);
             if (report.matches) {
               // The discarding cycle's full replay verified the projections —
-              // the checkpoint is re-earned to the watermark HERE (same
+              // the checkpoint is re-earned to the watermark HERE (the same
               // upsert as the normal clean advance), so `advanced: true` is
-              // truthful and the next cycle is bounded again.
+              // truthful and the next cycle is bounded again. Story 10.4: the
+              // re-earned checkpoint starts BOUNDED — this was a full pass,
+              // so the counter is reset in both arms (a freshly re-earned
+              // checkpoint must not inherit the corrupt row's count — and the
+              // row was deleted, so the insert arm is the one that normally
+              // lands; the conflict set covers a concurrent re-creation).
               await tx
                 .insert(reconciliationCheckpoints)
                 .values({
@@ -459,6 +590,7 @@ export class ReconciliationService {
                   warehouseId,
                   lastSeq: watermark,
                   invalidAttempts: 0,
+                  incrementalCount: 0,
                   lastDivergences: null,
                 })
                 .onConflictDoUpdate({
@@ -466,6 +598,7 @@ export class ReconciliationService {
                   set: {
                     lastSeq: watermark,
                     invalidAttempts: 0,
+                    incrementalCount: 0,
                     lastDivergences: null,
                     updatedAt: nowIso(),
                   },
@@ -475,6 +608,10 @@ export class ReconciliationService {
               ...base,
               previousSeq: checkpoint.lastSeq,
               lastSeq: 0,
+              // The discard path's pass is full BY CONSTRUCTION — the corrupt
+              // base's counter/kind are meaningless here.
+              fullPass: true,
+              incrementalCount: 0,
               lastDivergences: [],
               skipped: false,
               checkpointDiscarded: true,
@@ -484,7 +621,7 @@ export class ReconciliationService {
           }
           // First consecutive invalid checkpoint: record the failure and skip
           // the pass — the next cycle re-validates and discards on a second
-          // consecutive failure.
+          // consecutive failure. (No pass ran, so the counter is untouched.)
           await tx
             .update(reconciliationCheckpoints)
             .set({ invalidAttempts: attempts, updatedAt: nowIso() })
@@ -508,15 +645,22 @@ export class ReconciliationService {
         const lastSeq = checkpoint?.lastSeq ?? 0;
         // No checkpoint (first cycle, or discarded) = a FULL pass: the whole
         // ledger compared exactly (every scope with events and every stored
-        // projection row). Otherwise the bounded compare window.
-        const report =
-          lastSeq === 0
-            ? await replayInTx(tx, tenantId, warehouseId)
-            : await reconcileScanInTx(tx, tenantId, warehouseId, lastSeq, watermark);
+        // projection row). Story 10.4 adds the second trigger: a partition
+        // whose bounded passes have accumulated to the knob's cadence. The
+        // cost of the full pass is small next to the bounded scan (the fold
+        // is whole either way — only the compare is windowed), so the full
+        // pass reuses `replayInTx` as-is; a second fold implementation would
+        // be a new correctness surface in the one component whose
+        // correctness is the point.
+        const report = base.fullPass
+          ? await replayInTx(tx, tenantId, warehouseId)
+          : await reconcileScanInTx(tx, tenantId, warehouseId, lastSeq, watermark);
 
         if (report.matches) {
           // Clean pass: advance the checkpoint to the window head in the
-          // same snapshot that verified it.
+          // same snapshot that verified it. Story 10.4: the counter follows
+          // the pass kind — a bounded pass increments, a full pass resets.
+          const incrementalCount = base.fullPass ? 0 : base.incrementalCount + 1;
           await tx
             .insert(reconciliationCheckpoints)
             .values({
@@ -525,6 +669,7 @@ export class ReconciliationService {
               warehouseId,
               lastSeq: watermark,
               invalidAttempts: 0,
+              incrementalCount,
               lastDivergences: null,
             })
             .onConflictDoUpdate({
@@ -532,6 +677,7 @@ export class ReconciliationService {
               set: {
                 lastSeq: watermark,
                 invalidAttempts: 0,
+                incrementalCount,
                 lastDivergences: null,
                 updatedAt: nowIso(),
               },
@@ -539,6 +685,7 @@ export class ReconciliationService {
           return {
             ...base,
             lastSeq,
+            incrementalCount,
             lastDivergences: [],
             skipped: false,
             checkpointDiscarded: false,

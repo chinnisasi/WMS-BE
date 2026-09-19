@@ -67,6 +67,18 @@ export function parseReservationReaperPollMs(raw: string | undefined): number {
   return parsed;
 }
 
+// Story 10.4: the full-pass knob's parse helper is defined in
+// `modules/inventory/reconcile.ts` and re-exported here beside
+// `parseReconcilePollMs` so this worker shell's env-parse surface stays in
+// one place. The DEFINITION cannot live here: the inventory module would
+// have to import this file back to consume it, and that cycle breaks the
+// NestJS boot under CJS (`Cannot access 'InvModule' before initialization`,
+// verified — inventory.module loads before jobs.module in app.module.ts).
+export {
+  DEFAULT_RECONCILE_FULL_PASS_EVERY,
+  parseReconcileFullPassEvery,
+} from '../modules/inventory/reconcile';
+
 /**
  * The outbox relay worker (story outbox-relay): an interval poll loop over
  * `OutboxRelay.drain()`. Sheddable twice over (AD-17): a cycle still in

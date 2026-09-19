@@ -901,6 +901,48 @@ describe('story 10.2: UoM is a closed vocabulary with a declared precision (e2e)
         .expect(200);
       expect(accepted.body.reorderPoint).toBe(2.125);
     });
+
+    it('the precision refusal is stated ONCE — the HTTP PATCH and CSV import answers are byte-identical (story 10.4)', async () => {
+      // The two call shapes (the command write-edge gate and the CSV import's
+      // `parseQuantityMilli`) now delegate to ONE core
+      // (`validateRecordableQuantity`), so the same too-fine value must draw
+      // the same sentence from both — differing only in the field's LABEL,
+      // which is each edge's own vocabulary (`reorderPoint` on the HTTP
+      // contract, `reorder_point` in the CSV header).
+      const patched = await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuIds.get(EACH_SKU)!}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ reorderPoint: 2.5 })
+        .expect(400);
+      const run = await importCsv(
+        [
+          'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+          'UOM-ONCE,Counted item,each,,1800,,false,false,2.5,10,',
+        ].join('\n'),
+      ).expect(201);
+      expect(run.body.committedRows).toBe(0);
+      const imported = run.body.errors[0].detail as string;
+
+      // Byte-identity modulo the label (pinned through normalization so a
+      // future label rename cannot silently loosen the comparison).
+      const normalizedPatch = (patched.body.detail as string).replace(/reorderPoint/g, 'F');
+      const normalizedImport = imported.replace(/reorder_point/g, 'F');
+      expect(normalizedPatch).toBe(normalizedImport);
+
+      // …and pinned literally against the shared core's own text, so neither
+      // edge can soften or reword the sentence alone.
+      expect(patched.body.detail).toBe(
+        'reorderPoint must be a whole number: base UoM "each" declares 0 decimal places, ' +
+          'so 2.5 is not a quantity it can express. Record whole units, or measure this ' +
+          'SKU in a unit that allows fractions.',
+      );
+      expect(imported).toBe(
+        'reorder_point must be a whole number: base UoM "each" declares 0 decimal places, ' +
+          'so 2.5 is not a quantity it can express. Record whole units, or measure this ' +
+          'SKU in a unit that allows fractions.',
+      );
+    });
   });
 
   // ── the device's offline gate ─────────────────────────────────────────────
