@@ -99,6 +99,13 @@ export class SkuResponse {
   @ApiProperty({ example: false })
   serialTracked!: boolean;
 
+  @ApiProperty({
+    example: false,
+    description:
+      'Story 10.3: handled by unit, priced by weight — each physical unit received carries its own captured weight on a handling_units row. Mutually exclusive with serialTracked.',
+  })
+  catchWeightTracked!: boolean;
+
   @ApiProperty({ example: 50 })
   reorderPoint!: number;
 
@@ -155,6 +162,16 @@ export class PatchSkuDto {
   @IsOptional()
   @IsBoolean()
   serialTracked?: boolean;
+
+  @ApiProperty({
+    required: false,
+    example: false,
+    description:
+      'Story 10.3: handled by unit, priced by weight. Turning it on for a serial-tracked SKU (or the reverse) is a 400 — two per-unit identity systems over one unit is unsupported.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  catchWeightTracked?: boolean;
 
   @ApiProperty({
     required: false,

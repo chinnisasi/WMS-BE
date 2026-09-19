@@ -19,6 +19,7 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
 import { isFractionalUom, serialTrackedFractionalUomDetail, uomPrecision } from './uom';
+import { countLiveHandlingUnitsInTx } from './handling-unit.store';
 
 export const DEFAULT_SKU_PAGE_SIZE = 50;
 export const MAX_SKU_PAGE_SIZE = 200;
@@ -36,6 +37,8 @@ export interface SkuSnapshot {
   readonly hsn: string | null;
   readonly batchTracked: boolean;
   readonly serialTracked: boolean;
+  /** Story 10.3 — handled by unit, priced by weight (`handling_units`). */
+  readonly catchWeightTracked: boolean;
   readonly reorderPoint: number;
   readonly reorderQty: number;
   readonly barcode: string;
@@ -53,6 +56,8 @@ export interface EditSkuCommand {
   readonly hsn?: string | null | undefined;
   readonly batchTracked?: boolean | undefined;
   readonly serialTracked?: boolean | undefined;
+  /** Story 10.3 — catch weight. Mutually exclusive with `serialTracked`. */
+  readonly catchWeightTracked?: boolean | undefined;
   /**
    * Story 10.2: both are in the operator-facing BASE UoM, not milli-units.
    * The controller used to scale them, which put the precision refusal in
@@ -145,6 +150,7 @@ export class SkuCommand {
       hsn: command.hsn,
       batchTracked: command.batchTracked,
       serialTracked: command.serialTracked,
+      catchWeightTracked: command.catchWeightTracked,
       reorderPoint: command.reorderPoint,
       reorderQty: command.reorderQty,
       barcode: command.barcode,
@@ -154,7 +160,7 @@ export class SkuCommand {
         'validation-failed',
         400,
         'Empty SKU edit',
-        'At least one of name, gstRate, hsn, batchTracked, serialTracked, reorderPoint, reorderQty, barcode is required.',
+        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, reorderPoint, reorderQty, barcode is required.',
       );
     }
     // ── story 10.2: this fingerprint is over BASE units ────────────────────
@@ -233,6 +239,53 @@ export class SkuCommand {
           );
         }
 
+        // Story 10.3: catch weight and serial tracking are two per-unit
+        // identity systems over ONE physical unit, and the combination is
+        // unsolved — a serial identifies the unit from the ledger, a handling
+        // unit identifies it from its own row, and nothing decides which one a
+        // scan at pack is naming. Refused ONCE, here at catalog entry, rather
+        // than at the four downstream sites that would each have to guess.
+        //
+        // The check is over the RESULTING state, not the patch: turning either
+        // flag on against a SKU that already carries the other is the same
+        // contradiction as setting both in one request, and a patch-only check
+        // would wave the first case straight through.
+        const resultingSerialTracked = fields.serialTracked ?? current.serialTracked;
+        const resultingCatchWeightTracked =
+          fields.catchWeightTracked ?? current.catchWeightTracked;
+        if (resultingSerialTracked && resultingCatchWeightTracked) {
+          throw new ProblemException(
+            'validation-failed',
+            400,
+            'A SKU cannot be both catch-weight and serial tracked',
+            `SKU "${current.code}" would be both serial-tracked and catch-weight tracked. Both systems claim to identify the same physical unit — a serial from the ledger, a handling unit from its own row — and nothing decides which one a scan names. Pick one.`,
+          );
+        }
+
+        // Story 10.3: the flag may not move while the SKU still has LIVE
+        // handling units (`active` or `pending_approval`). Turning it OFF
+        // strands them — their stock stays on hand and ships accounted for by
+        // no case at all; turning it ON leaves existing on-hand backed by no
+        // unit, so pack can never satisfy its one-id-per-picked-unit rule and
+        // the SKU is wedged forever. Neither direction has a repair path, so
+        // the flip is refused rather than cascaded.
+        if (
+          fields.catchWeightTracked !== undefined &&
+          fields.catchWeightTracked !== current.catchWeightTracked
+        ) {
+          const live = await countLiveHandlingUnitsInTx(tx, command.tenantId, command.skuId);
+          if (live > 0) {
+            throw new ProblemException(
+              'conflict',
+              409,
+              'Catch-weight tracking cannot change while units are live',
+              `SKU "${current.code}" has ${live} live handling unit(s). Turning catch-weight tracking ` +
+                `${fields.catchWeightTracked ? 'on' : 'off'} would leave its stock and its cases disagreeing with no way back — ` +
+                'pack, write off or reject every live unit first.',
+            );
+          }
+        }
+
         // Story 10.2: the reorder thresholds are UoM-denominated, so they are
         // converted HERE — behind the replay lookup, with the SKU's unit in
         // hand — and a value finer than that unit declares is refused rather
@@ -268,6 +321,8 @@ export class SkuCommand {
         if (fields.hsn !== undefined) updates.hsn = fields.hsn;
         if (fields.batchTracked !== undefined) updates.batchTracked = fields.batchTracked;
         if (fields.serialTracked !== undefined) updates.serialTracked = fields.serialTracked;
+        if (fields.catchWeightTracked !== undefined)
+          updates.catchWeightTracked = fields.catchWeightTracked;
         if (reorderPointMilli !== undefined) updates.reorderPoint = reorderPointMilli;
         if (reorderQtyMilli !== undefined) updates.reorderQty = reorderQtyMilli;
         if (fields.barcode !== undefined) updates.barcode = fields.barcode;
@@ -340,6 +395,7 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     hsn: row.hsn,
     batchTracked: row.batchTracked,
     serialTracked: row.serialTracked,
+    catchWeightTracked: row.catchWeightTracked,
     // Story 10.1: `toSnapshot` is the module's only SKU read shape — base
     // units leave here, milli-units stay in the column.
     reorderPoint: fromMilli(row.reorderPoint),

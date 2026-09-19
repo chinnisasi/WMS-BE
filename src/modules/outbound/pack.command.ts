@@ -14,6 +14,7 @@ import {
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import {
   MAX_QUANTITY_MILLI,
+  QUANTITY_SCALE,
   assertExactQuantity,
   assertRecordableQuantity,
   fromMilli,
@@ -32,6 +33,11 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerReferenceDoc } from '../inventory/inventory.facade';
+// Cross-module composition through the facade only (AD-6): `handling_units`
+// is catalog-owned and has exactly ONE writer. This module never touches it.
+import { CatalogFacade } from '../catalog/catalog.facade';
+import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
+import type { HandlingUnitPackAssignment } from '../catalog/catalog.facade';
 import { ORDER_OWNER_TYPE } from './order.command';
 import type { OrderSource, OrderStatus } from './order.command';
 
@@ -84,6 +90,21 @@ export interface PackScanLineInput {
    * units are known.
    */
   readonly qty: number;
+  /**
+   * Story 10.3 — the handling units of a catch-weight SKU counted into this
+   * parcel, supplied PER SKU beside the quantity, never per order line.
+   *
+   * Per SKU because that is what the bench can actually know: this command's
+   * own comment below records that the bench counts SKUs and *cannot* tell
+   * which line of a two-line order a unit belongs to. The assignment to lines
+   * is derived server-side from the same `picks.orderLineId` split that
+   * already produces per-line `packedQty`, consuming sorted ids in order — so
+   * it is deterministic and a replay reproduces it exactly.
+   *
+   * Two scan lines naming the same SKU concatenate, exactly as their
+   * quantities sum.
+   */
+  readonly handlingUnitIds?: readonly string[] | undefined;
 }
 
 export interface PackOrderCommand {
@@ -181,6 +202,11 @@ export class PackCommandService {
     // `pack.packed` events ride `appendLedgerEventInTx` inside THIS
     // command's transaction — the outbound module writes no ledger table.
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+    // Story 10.3: the `active → packed` flip has to commit in the SAME
+    // transaction as the order flip and the `pack.packed` events — a flip
+    // that half-landed would either ship a case the system still calls live
+    // or consume one the order never shipped.
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
   ) {}
 
   /**
@@ -196,13 +222,22 @@ export class PackCommandService {
     // same physical parcel carry the same intent and must replay rather than
     // collide on `idempotency-key-reuse`. The measurements ARE intent (a
     // re-weigh is a different claim about the parcel) and hash as given.
-    const scannedBySku = aggregateScan(command.scanned);
+    const { totals: scannedBySku, handlingUnitIdsBySku } = aggregateScan(command.scanned);
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       orderId: command.orderId,
       scanned: [...scannedBySku.entries()]
         .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-        .map(([skuId, qty]) => ({ skuId, qty })),
+        // Story 10.3: the handling-unit ids ride the SKU's own entry and are
+        // SORTED, for the same reason the SKU list above is — scanning cases
+        // A,B,C into a parcel is the same physical act as C,B,A, and two
+        // orderings must not create two packs. (`pick.command.ts` deliberately
+        // does NOT sort its `serials`; the conflict is only apparent — its
+        // stated reason is that a retry of the same body must replay, which
+        // sorting preserves, since sorting is deterministic.) Absent
+        // normalizes to `undefined`, which `JSON.stringify` drops, so a
+        // non-catch-weight pack hashes byte-identically to its pre-10.3 shape.
+        .map(([skuId, qty]) => ({ skuId, qty, handlingUnitIds: handlingUnitIdsBySku.get(skuId) })),
       weightGrams: command.weightGrams ?? undefined,
       dimensionsMm: command.dimensionsMm ?? undefined,
     });
@@ -346,15 +381,26 @@ export class PackCommandService {
           // ~2.1M base units. `int8` comes back as a string; `Number(...)`
           // below is the boundary coercion.
           qty: sql<string>`sum(${picks.qty})::bigint`,
+          // Story 10.3: the batch the draw actually RESOLVED (`picks.batch_id`
+          // is server-re-derived FEFO, not the plan's suggestion). A
+          // catch-weight case scanned at the bench must belong to the lot the
+          // pick drew, or a recall traces the shipment to the wrong lot.
+          // Grouping by it splits a multi-batch line into several rows; both
+          // roll-ups below accumulate, so their sums are unchanged.
+          batchId: picks.batchId,
         })
         .from(picks)
         .where(and(eq(picks.tenantId, command.tenantId), eq(picks.orderId, order.id)))
-        .groupBy(picks.orderLineId, picks.skuId);
+        .groupBy(picks.orderLineId, picks.skuId, picks.batchId);
       const pickedByLine = new Map<string, number>();
       const pickedBySku = new Map<string, number>();
+      const batchesByLine = new Map<string, Set<string | null>>();
       for (const row of pickRows) {
         pickedByLine.set(row.orderLineId, (pickedByLine.get(row.orderLineId) ?? 0) + Number(row.qty));
         pickedBySku.set(row.skuId, (pickedBySku.get(row.skuId) ?? 0) + Number(row.qty));
+        const drawn = batchesByLine.get(row.orderLineId) ?? new Set<string | null>();
+        drawn.add(row.batchId);
+        batchesByLine.set(row.orderLineId, drawn);
       }
 
       // ── the order's lines (one `pack.packed` event each) ────────────────
@@ -372,7 +418,13 @@ export class PackCommandService {
         skuIds.length === 0
           ? []
           : await tx
-              .select({ id: skus.id, code: skus.code, name: skus.name, uom: skus.uom })
+              .select({
+                id: skus.id,
+                code: skus.code,
+                name: skus.name,
+                uom: skus.uom,
+                catchWeightTracked: skus.catchWeightTracked,
+              })
               .from(skus)
               .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.id, skuIds)));
       const skuById = new Map(skuRows.map((row) => [row.id, row]));
@@ -393,6 +445,24 @@ export class PackCommandService {
       // unit cannot hold.
       assertScanPrecision(command.scanned, skuById);
       this.assertScanMatchesPicked(order.id, pickedBySku, scannedBySku, skuById);
+
+      // ── story 10.3: the catch-weight units, resolved BEFORE any write ────
+      // Every refusal below is a refusal of the whole pack: a parcel that
+      // cannot account for each of its cases is not a parcel this command
+      // will journal. The rows are locked here so the guards decide against
+      // state that cannot move under them, and the facade's conditional
+      // `status = 'active'` write is then the backstop rather than the gate.
+      const handlingUnitsByOrderLine = await this.resolveHandlingUnits(
+        tx,
+        command.tenantId,
+        order.warehouseId,
+        lines,
+        pickedByLine,
+        pickedBySku,
+        batchesByLine,
+        handlingUnitIdsBySku,
+        skuById,
+      );
 
       // ── the flip (conditional — the exactly-once backstop) ──────────────
       const packedAt = nowIso();
@@ -448,6 +518,12 @@ export class PackCommandService {
                 widthMm: dimensionsMm.widthMm,
                 heightMm: dimensionsMm.heightMm,
               }),
+          // Story 10.3: the units this line consumed, already sorted (a slice
+          // of the sorted per-SKU list). Absent on every non-catch-weight
+          // line, so its canonical bytes are unchanged.
+          ...(handlingUnitsByOrderLine.has(line.id)
+            ? { handlingUnitIds: handlingUnitsByOrderLine.get(line.id)! }
+            : {}),
         };
         const appended = await this.inventory.appendLedgerEventInTx(tx, {
           tenantId: command.tenantId,
@@ -482,6 +558,34 @@ export class PackCommandService {
           ledgerEventId: appended.eventId,
         });
         totalUnits = assertExactQuantity(totalUnits + packedQty, 'pack total units');
+      }
+
+      // ── story 10.3: the units become `packed`, set-once ─────────────────
+      // Conditional on `active` inside the facade, so a case written off by
+      // an adjustment (which moves it to `rejected`) can never be packed —
+      // the fail-open this status column exists to close. The rows are held
+      // under this transaction's locks, so a short return means a genuine
+      // concurrent move and rolls the whole pack back.
+      const packAssignments: HandlingUnitPackAssignment[] = [];
+      for (const [orderLineId, ids] of handlingUnitsByOrderLine) {
+        for (const id of ids) {
+          packAssignments.push({ id, orderLineId });
+        }
+      }
+      if (packAssignments.length > 0) {
+        const packedUnits = await this.catalog.markHandlingUnitsPacked(
+          tx,
+          command.tenantId,
+          packAssignments,
+        );
+        if (packedUnits.length !== packAssignments.length) {
+          throw await this.handlingUnitNotActive(
+            tx,
+            command.tenantId,
+            packAssignments.map((assignment) => assignment.id),
+            new Set(packedUnits.map((unit) => unit.id)),
+          );
+        }
       }
 
       // ── the dead holds this pack is the last chance to release ──────────
@@ -640,6 +744,193 @@ export class PackCommandService {
     );
   }
 
+  /**
+   * Story 10.3 — resolve the scanned handling units, refuse everything that
+   * does not add up, and derive each unit's ORDER LINE server-side.
+   *
+   * The assignment is the part worth reading twice. The bench supplies ids
+   * per SKU because it cannot tell which line of a two-line order a case
+   * belongs to (`order_lines` has no unique on `(order_id, sku_id)`, and the
+   * scan model was deliberately built not to ask). So the split comes from
+   * the same source per-line `packedQty` already comes from — the
+   * `picks.orderLineId` roll-up — and the SORTED ids are consumed in order
+   * across the order's lines in their own deterministic order. Same request,
+   * same assignment, every replay.
+   *
+   * Refusals, in order: an id for a SKU that is not catch-weight tracked
+   * (400, fail closed — never silently ignored); a count that does not equal
+   * the SKU's packed units (422 naming both, because a catch-weight SKU must
+   * account for every unit); an unknown, foreign-tenant or foreign-warehouse
+   * id (404 — resolved inside the tenant transaction, so existence never
+   * leaks); a unit whose SKU is not this line's (422 naming both); a unit
+   * that is no longer `active` (409 naming the status it actually holds — a
+   * case written off as damaged, or already packed into another parcel).
+   */
+  private async resolveHandlingUnits(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    lines: readonly { readonly id: string; readonly skuId: string }[],
+    pickedByLine: ReadonlyMap<string, number>,
+    pickedBySku: ReadonlyMap<string, number>,
+    batchesByLine: ReadonlyMap<string, ReadonlySet<string | null>>,
+    handlingUnitIdsBySku: ReadonlyMap<string, readonly string[]>,
+    skuById: ReadonlyMap<string, { code: string; catchWeightTracked: boolean }>,
+  ): Promise<Map<string, string[]>> {
+    // Every catch-weight SKU that actually moved units must be accounted for,
+    // and every SKU the scan named ids for must actually be catch-weight.
+    const skuIds = new Set<string>([...handlingUnitIdsBySku.keys()]);
+    for (const [skuId, picked] of pickedBySku) {
+      if (picked > 0 && skuById.get(skuId)?.catchWeightTracked === true) {
+        skuIds.add(skuId);
+      }
+    }
+    const assignments = new Map<string, string[]>();
+    const allIds: string[] = [];
+    for (const skuId of [...skuIds].sort()) {
+      const sku = skuById.get(skuId);
+      const ids = handlingUnitIdsBySku.get(skuId) ?? [];
+      if (sku === undefined) {
+        // UNREACHABLE today — every scanned SKU is 404'd above and every
+        // picked SKU is in `skuById` by construction — and deliberately a
+        // THROW rather than a skipped iteration anyway. An optional chain
+        // here would quietly drop this SKU's catch-weight accounting and ship
+        // its cases still `active`, which is the fail-open the status column
+        // exists to close; no test can reach it, so the shape has to be safe
+        // on its own terms.
+        throw new ProblemException(
+          'not-found',
+          404,
+          'SKU not found',
+          `No SKU with id "${skuId}" exists in this tenant.`,
+        );
+      }
+      if (!sku.catchWeightTracked) {
+        throw packValidation(
+          `SKU ${sku.code} (${skuId}) is not catch-weight tracked — it has no handling units, so handlingUnitIds is refused rather than ignored.`,
+        );
+      }
+      const packedUnits = packedUnitCount(pickedBySku.get(skuId) ?? 0, sku.code, skuId);
+      if (ids.length !== packedUnits) {
+        throw new ProblemException(
+          'pack-mismatch',
+          422,
+          'Scanned handling units do not match what was picked',
+          `SKU ${sku.code} (${skuId}) is catch-weight tracked and must account for every unit: ${packedUnits} unit(s) were picked, ${ids.length} handling unit id(s) were scanned. Nothing was written.`,
+        );
+      }
+      // The per-line split, from the `picks` roll-up the slip already uses.
+      let cursor = 0;
+      for (const line of lines) {
+        if (line.skuId !== skuId) {
+          continue;
+        }
+        // `packedUnitCount` refuses a quantity that is not a whole number of
+        // cases, so `slice` can never silently truncate a fractional count —
+        // a 1.5/1.5 split is a 422 here, not one case on one line and two on
+        // the other. (`pick.command.ts` refuses the fractional draw earlier
+        // still, where the operator can act on it; this is the backstop that
+        // makes the arithmetic below safe on its own terms.)
+        const lineUnits = packedUnitCount(pickedByLine.get(line.id) ?? 0, sku.code, skuId);
+        if (lineUnits === 0) {
+          continue;
+        }
+        assignments.set(line.id, ids.slice(cursor, cursor + lineUnits));
+        cursor += lineUnits;
+      }
+      if (cursor !== ids.length) {
+        // Unreachable while the per-line roll-up sums to the per-SKU one;
+        // kept because an id assigned to no line would be a case the parcel
+        // consumed and no ledger event names.
+        throw new ProblemException(
+          'pack-mismatch',
+          422,
+          'Scanned handling units do not match what was picked',
+          `SKU ${sku.code} (${skuId}): ${ids.length} handling unit id(s) scanned but only ${cursor} could be assigned to an order line. Nothing was written.`,
+        );
+      }
+      allIds.push(...ids);
+    }
+    if (allIds.length === 0) {
+      return assignments;
+    }
+
+    const units = await this.catalog.lockHandlingUnits(tx, tenantId, allIds);
+    const byId = new Map(units.map((unit) => [unit.id, unit]));
+    for (const [orderLineId, ids] of assignments) {
+      const line = lines.find((candidate) => candidate.id === orderLineId)!;
+      for (const id of ids) {
+        const unit = byId.get(id);
+        if (unit === undefined || unit.warehouseId !== warehouseId) {
+          throw new ProblemException(
+            'not-found',
+            404,
+            'Handling unit not found',
+            `No handling unit with id "${id}" exists in this warehouse.`,
+          );
+        }
+        if (unit.skuId !== line.skuId) {
+          throw new ProblemException(
+            'validation-failed',
+            422,
+            'Handling unit belongs to another SKU',
+            `Handling unit "${id}" belongs to SKU "${unit.skuId}", but the order line it was counted into is SKU "${line.skuId}".`,
+          );
+        }
+        // Story 10.3: the case must belong to the LOT the pick actually drew.
+        // The draw re-derives its batch FEFO at pick time, so a bench that
+        // scanned a LOT-B case against a LOT-A draw would ship goods whose
+        // recall trace points at the wrong lot — and `batch_on_hand` would
+        // have debited the other one. Named both ways so the operator knows
+        // which case to swap.
+        const drawn = batchesByLine.get(orderLineId) ?? new Set<string | null>([null]);
+        if (!drawn.has(unit.batchId)) {
+          throw new ProblemException(
+            'validation-failed',
+            422,
+            'Handling unit belongs to another batch',
+            `Handling unit "${id}" carries batch "${unit.batchId ?? 'none'}", but this order line drew ` +
+              `${[...drawn].map((batch) => `"${batch ?? 'none'}"`).join(', ')}. A catch-weight case ships from the lot it was picked from.`,
+          );
+        }
+        // NOTE what is deliberately NOT checked here: the unit's STATUS.
+        // A status read and a separate status write are two chances to
+        // disagree, and a guard that duplicates the write's own predicate
+        // makes the write untestable — remove the predicate and nothing
+        // fails, which is precisely the "a guard no test exercises" defect
+        // class. The single authority is the conditional
+        // `.where(status = 'active')` write, and the 409 below names each
+        // offending unit's real status by re-reading the rows THIS
+        // transaction still holds locked.
+      }
+    }
+    return assignments;
+  }
+
+  /**
+   * The 409 a short conditional write earns, naming each unit's actual status.
+   *
+   * The rows are still locked by this transaction, so the re-read is exact —
+   * it reports the status that refused the write, not a status that has since
+   * moved on.
+   */
+  private async handlingUnitNotActive(
+    tx: TenantTx,
+    tenantId: string,
+    attempted: readonly string[],
+    packedIds: ReadonlySet<string>,
+  ): Promise<ProblemException> {
+    const refused = attempted.filter((id) => !packedIds.has(id));
+    const rows = await this.catalog.lockHandlingUnits(tx, tenantId, refused);
+    const named = rows.map((row) => `${row.id} (${row.status})`);
+    return packConflict(
+      'Handling unit is not active',
+      `${refused.length} scanned handling unit(s) are not active and cannot be packed: ${namedSample(
+        named,
+      )}. Only an active unit ships — a case written off as damaged, or already packed into another parcel, is refused. Nothing was written.`,
+    );
+  }
+
   // ── input validation (400 before any write) ───────────────────────────────
 
   private assertWeight(value: number | null | undefined): number | null {
@@ -734,16 +1025,47 @@ export class PackCommandService {
  * colliding. Shape validation rides here so a malformed line is a 400 before
  * the command opens its transaction.
  */
-function aggregateScan(scanned: readonly PackScanLineInput[]): Map<string, number> {
+function aggregateScan(scanned: readonly PackScanLineInput[]): {
+  readonly totals: Map<string, number>;
+  readonly handlingUnitIdsBySku: Map<string, readonly string[]>;
+} {
   if (scanned.length > MAX_SCAN_LINES) {
     throw packValidation(
       `A pack carries at most ${MAX_SCAN_LINES} scan line(s) (got ${scanned.length}).`,
     );
   }
   const totals = new Map<string, number>();
+  // Story 10.3: the handling-unit ids aggregate the same way the quantities
+  // do — two lines naming one SKU concatenate. Duplicate detection is
+  // REQUEST-WIDE, not per line: one physical case scanned twice is a case
+  // counted twice, however the client split its lines.
+  const unitsBySku = new Map<string, string[]>();
+  const seenUnits = new Set<string>();
   for (const line of scanned) {
     if (!UUID_RE.test(line.skuId)) {
       throw packValidation('Every scanned line names a well-formed skuId.');
+    }
+    for (const unitId of line.handlingUnitIds ?? []) {
+      if (!UUID_RE.test(unitId)) {
+        throw packValidation('Every scanned handling unit names a well-formed id.');
+      }
+      if (seenUnits.size >= MAX_HANDLING_UNITS_PER_REQUEST) {
+        // Request-WIDE, in the command tier: each id costs a locked row, a
+        // conditional write and a place in a hashed reference doc, and the
+        // per-line `@ArrayMaxSize` alone admits 500 lines × 500 ids.
+        throw packValidation(
+          `A pack scans at most ${MAX_HANDLING_UNITS_PER_REQUEST} handling units across all of its lines.`,
+        );
+      }
+      if (seenUnits.has(unitId)) {
+        throw packValidation(
+          `Handling unit "${unitId}" was scanned twice into this parcel — a case ships exactly once.`,
+        );
+      }
+      seenUnits.add(unitId);
+      const list = unitsBySku.get(line.skuId) ?? [];
+      list.push(unitId);
+      unitsBySku.set(line.skuId, list);
     }
     // Story 10.2: `line.qty` arrives in BASE units and is scaled HERE, inside
     // the command. This is arithmetic and a range check only — whether the
@@ -767,7 +1089,35 @@ function aggregateScan(scanned: readonly PackScanLineInput[]): Map<string, numbe
     }
     totals.set(line.skuId, running);
   }
-  return totals;
+  // Sorted once, here, so every consumer — the payload hash, the per-line
+  // assignment and the reference doc — sees the same order.
+  const handlingUnitIdsBySku = new Map<string, readonly string[]>();
+  for (const [skuId, ids] of unitsBySku) {
+    handlingUnitIdsBySku.set(skuId, [...ids].sort());
+  }
+  return { totals, handlingUnitIdsBySku };
+}
+
+/**
+ * Story 10.3 — a packed quantity expressed as a count of PHYSICAL UNITS.
+ *
+ * A handling unit is one whole case, so a catch-weight SKU's packed quantity
+ * has to divide evenly into units; a fractional remainder is a quantity no
+ * set of cases can account for, and it is refused rather than floored. This
+ * is the one place catch weight and the milli-unit quantity representation
+ * meet, and the direction is strictly quantity → unit COUNT — no weight is
+ * ever scaled, compared against a quantity, or converted into one.
+ */
+function packedUnitCount(milli: number, skuCode: string, skuId: string): number {
+  if (milli % QUANTITY_SCALE !== 0) {
+    throw new ProblemException(
+      'pack-mismatch',
+      422,
+      'A catch-weight quantity must be a whole number of units',
+      `SKU ${skuCode} (${skuId}) is catch-weight tracked, so every packed quantity is a count of physical cases — ${fromMilli(milli)} is not. Nothing was written.`,
+    );
+  }
+  return milli / QUANTITY_SCALE;
 }
 
 /**

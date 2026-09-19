@@ -122,6 +122,11 @@ export class InventoryController {
       occurredAt: dto.occurredAt,
       batch: arms.batch,
       serials: arms.serials,
+      // Story 10.3: the catch-weight per-unit channel crosses the edge
+      // untouched — ids, not quantities. Whether this SKU requires it (and
+      // whether the named units are live) is asked inside the command,
+      // behind its replay lookup, where the SKU row is in hand.
+      handlingUnitIds: arms.handlingUnitIds,
     };
     // The SKU's tracking flags decide whether this request touches the 2.4
     // surface at all (a FEFO default draw carries NO fields, yet is armed).
@@ -129,7 +134,8 @@ export class InventoryController {
     const touchesArms =
       arms.batch !== undefined ||
       arms.serials !== undefined ||
-      (sku !== null && (sku.batchTracked || sku.serialTracked));
+      arms.handlingUnitIds !== undefined ||
+      (sku !== null && (sku.batchTracked || sku.serialTracked || sku.catchWeightTracked));
     if (touchesArms) {
       // Permission before EVERYTHING on the 2.4 surface (review loop 1): the
       // capability assert precedes any validation 400, any identity creation,
@@ -676,6 +682,7 @@ function assertOwnTenant(session: TenantSession, tenantId: string): void {
 function normalizeArms(dto: StockAdjustmentDto): {
   batch: AdjustStockBatch | undefined;
   serials: string[] | undefined;
+  handlingUnitIds: string[] | undefined;
 } {
   const rawBatch = dto.batch ?? undefined;
   const batch =
@@ -688,7 +695,15 @@ function normalizeArms(dto: StockAdjustmentDto): {
           overrideReason: rawBatch.overrideReason,
         };
   const trimmed = (dto.serials ?? []).map((serial) => serial.trim());
-  return { batch, serials: trimmed.length > 0 ? trimmed : undefined };
+  // Story 10.3: an empty array is absent, exactly as `serials` is — the two
+  // spellings of "no handling units" must fingerprint identically, or a
+  // client that sends `[]` on a retry would answer 422 instead of replaying.
+  const handlingUnitIds = dto.handlingUnitIds ?? [];
+  return {
+    batch,
+    serials: trimmed.length > 0 ? trimmed : undefined,
+    handlingUnitIds: handlingUnitIds.length > 0 ? [...handlingUnitIds] : undefined,
+  };
 }
 
 /** A batch/serial arm on a SKU that does not track it — 400 (the I/O matrix). */

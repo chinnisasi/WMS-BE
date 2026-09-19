@@ -193,7 +193,17 @@ export class OutboundController {
         actorUserId: session.userId,
         orderId,
         // Story 10.2: BASE units cross this edge (see `createOrder` above).
-        scanned: dto.scanned.map((line) => ({ skuId: line.skuId, qty: line.qty })),
+        scanned: dto.scanned.map((line) => ({
+          skuId: line.skuId,
+          qty: line.qty,
+          // Story 10.3: handling-unit ids cross the edge untouched — they are
+          // identities, not quantities. An empty array normalizes to absent
+          // so the two spellings of "no units" hash identically.
+          handlingUnitIds:
+            line.handlingUnitIds !== undefined && line.handlingUnitIds.length > 0
+              ? line.handlingUnitIds
+              : undefined,
+        })),
         // `@IsOptional()` lets an explicit `null` through — normalized to
         // absent so an unmeasured parcel hashes identically either way.
         weightGrams: dto.weightGrams ?? undefined,

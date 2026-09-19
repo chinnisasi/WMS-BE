@@ -17,6 +17,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
+import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 
 /** Trim at the validation boundary (the tenancy DTO pattern). */
 function Trim() {
@@ -183,6 +184,22 @@ export class StockAdjustmentDto {
   @IsString({ each: true })
   @Length(1, 64, { each: true })
   serials?: string[];
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    format: 'uuid',
+    maxItems: MAX_HANDLING_UNITS_PER_REQUEST,
+    description:
+      'Catch-weight arm (story 10.3, catch-weight-tracked SKUs only): the handling units this adjustment moves — one id per unit of quantity, so the count must equal |quantityDelta|. It is REQUIRED for a catch-weight SKU: a handling unit has no location, so nothing else can say which case was damaged, and a unit left active after a write-off still ships at pack.',
+  })
+  @IsOptional()
+  @IsArray()
+  // The SAME named constant the command tier enforces — a literal here and a
+  // constant there is exactly how two gates drift apart.
+  @ArrayMaxSize(MAX_HANDLING_UNITS_PER_REQUEST)
+  @IsUUID('all', { each: true })
+  handlingUnitIds?: string[];
 }
 
 /** Query for the event-timeline read (keyset cursor pagination). */

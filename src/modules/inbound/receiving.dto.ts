@@ -23,6 +23,11 @@ import {
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { PurchaseOrderLineDto } from './inbound.dto';
+import {
+  MAX_HANDLING_UNIT_WEIGHT_GRAMS,
+  MAX_HANDLING_UNITS_PER_REQUEST,
+} from '../catalog/handling-unit';
+import { MAX_HANDLING_UNITS_PER_GRN_LINE } from './receiving.command';
 // Story 3.5 (additive): the snapshot's putaway decision fields reuse the
 // putaway module's DTOs (one shape on every surface).
 import { PutawayBinDto, PutawayTaskDto } from '../putaway/putaway.dto';
@@ -87,6 +92,25 @@ export class GrnLineInputDto {
   @Min(0.001)
   @Max(MAX_QUANTITY_BASE)
   qty!: number;
+
+  @ApiProperty({
+    required: false,
+    type: [Number],
+    nullable: true,
+    maxItems: MAX_HANDLING_UNITS_PER_GRN_LINE,
+    // (the command additionally caps the REQUEST at
+    // MAX_HANDLING_UNITS_PER_REQUEST across every line)
+    description:
+      'Catch weight (story 10.3): one captured weight in whole GRAMS per physical unit on this line — required for a catch-weight-tracked SKU, refused for every other SKU, and exactly qty entries long. It is a per-unit actual weight, never a quantity and never the parcel weight pack records.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(Math.min(MAX_HANDLING_UNITS_PER_GRN_LINE, MAX_HANDLING_UNITS_PER_REQUEST))
+  @Type(() => Number)
+  @IsInt({ each: true })
+  @Min(1, { each: true })
+  @Max(MAX_HANDLING_UNIT_WEIGHT_GRAMS, { each: true })
+  weightsGrams?: number[] | null;
 }
 
 /** POST /tenants/{tenantId}/receiving/goods-receipts body (device session). */
@@ -168,6 +192,14 @@ export class GrnLineDto {
 
   @ApiProperty({ description: 'The excess pended for approval', minimum: 0 })
   excessQty!: number;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    description:
+      'Catch weight (story 10.3): the handling units this line produced, in the order their weights were supplied — present only on a catch-weight line. These ids are what a unit label carries and what the pack bench scans back.',
+  })
+  handlingUnitIds?: readonly string[];
 }
 
 /** One line the server refused to settle (naming the reason — the others settle). */
@@ -440,6 +472,12 @@ export class CatalogSnapshotSkuDto {
 
   @ApiProperty()
   serialTracked!: boolean;
+
+  @ApiProperty({
+    description:
+      'Story 10.3: the SKU is handled by unit and priced by weight. It rides the snapshot so the device can PROMPT for a per-unit weight at receipt while offline — a prompt only the server knows about never happens on the floor.',
+  })
+  catchWeightTracked!: boolean;
 }
 
 /** One open PO of the device snapshot (header + line quantities). */

@@ -116,6 +116,22 @@ export class ReceivingController {
           // scales each line behind its replay lookup, once it has read the
           // line's SKU and therefore the unit's declared precision.
           qty: line.qty,
+          // Story 10.3: GRAMS cross this edge unchanged and stay grams all
+          // the way to the column — a catch weight is never scaled, because
+          // it is never a quantity. `@IsOptional()` lets an explicit `null`
+          // through; it normalizes to absent so the two spellings of "no
+          // weights" hash identically.
+          // An empty array normalizes to ABSENT, the way the sibling
+          // controllers normalize their optional arms: otherwise `[]` on a
+          // non-catch-weight line answers the one-weight-per-unit count
+          // message instead of "is not catch-weight tracked", and the two
+          // spellings of "no weights" would fingerprint differently.
+          weightsGrams:
+            line.weightsGrams !== undefined &&
+            line.weightsGrams !== null &&
+            line.weightsGrams.length > 0
+              ? line.weightsGrams
+              : null,
         })),
       },
       key,

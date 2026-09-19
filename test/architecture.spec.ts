@@ -355,6 +355,190 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
   });
 });
 
+describe('architecture: catalog identity is catalog-module-owned (story 10.3)', () => {
+  /**
+   * Catalog has owned `skus`, `batches` and `serials` exclusively since 1.4 /
+   * 2.4, and `../SYSTEM-DESIGN.md` records that the ownership was never
+   * ENFORCED: this file covered the stock/ledger, order/wave/pick and carrier
+   * table sets, and `catalog` (with `tenancy`, `inbound` and `putaway`) had no
+   * block at all. Story 10.3 adds `handling_units` — a fourth catalog-owned
+   * identity table with FOUR write paths spread across three sibling modules —
+   * so the guard is written now, while the table is new and it is free, and it
+   * closes the standing gap on the three older tables at the same time.
+   *
+   * The rule it enforces is the one `ensureSerials` established: catalog
+   * identity has exactly ONE writer, `catalog.facade.ts`, and inbound,
+   * outbound and inventory reach it through facade methods that run on their
+   * own transaction. A direct write from a sibling is how 10.3's first
+   * revision was drafted, and nothing in the repo would have caught it.
+   *
+   * Note what is deliberately NOT guarded here: catalog's file-level
+   * *imports*. `uom.ts` is imported directly by inbound, outbound, inventory
+   * and the api shell by design (the vocabulary is a shared primitive, not a
+   * seam), so an inventory-style past-the-facade import guard would be a lie
+   * about this module. Table WRITES are the invariant that actually matters.
+   */
+  const CATALOG_TABLES = [
+    'skus',
+    'batches',
+    'serials',
+    'handlingUnits',
+    // `uom_conversions` was in the raw-SQL list but missing from the Drizzle
+    // one, so a `.insert(uomConversions)` outside catalog walked straight
+    // through a guard whose name says it cannot.
+    'uomConversions',
+  ] as const;
+  const RAW_CATALOG_TABLES = 'skus|batches|serials|handling_units|uom_conversions';
+  const catalogRoot = join(SRC_ROOT, 'modules', 'catalog');
+
+  it('no catalog-identity write happens outside the catalog module', () => {
+    const outside = files.filter((file) => !file.path.startsWith(catalogRoot));
+    const offenders: string[] = [];
+    for (const file of outside) {
+      for (const pattern of [
+        ...CATALOG_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_CATALOG_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) {
+          offenders.push(`${file.path}: /${pattern.source}/`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the catalog module itself writes them (the test is meaningful)', () => {
+    // A guard whose subject stopped being written would pass vacuously
+    // forever. Each table is pinned to the file that owns its writes.
+    const facade = readFileSync(join(catalogRoot, 'catalog.facade.ts'), 'utf8');
+    expect(drizzleWriteOn('batches').test(facade)).toBe(true);
+    expect(drizzleWriteOn('serials').test(facade)).toBe(true);
+    const store = readFileSync(join(catalogRoot, 'handling-unit.store.ts'), 'utf8');
+    expect(drizzleWriteOn('handlingUnits').test(store)).toBe(true);
+    const importCommand = readFileSync(join(catalogRoot, 'import.command.ts'), 'utf8');
+    expect(drizzleWriteOn('skus').test(importCommand)).toBe(true);
+  });
+
+  it('handling units have exactly ONE writer, and every transition goes through it (story 10.3)', () => {
+    // The `ensureSerials` seam, made mechanical. FOUR transitions — create at
+    // receipt, settle an over-receipt intake, pack, adjust away — reached from
+    // THREE different sibling modules; every one of them must land in this one
+    // file, or a status flip and the movement it belongs with can drift into
+    // two transactions.
+    const HANDLING_UNIT_OWNER = join(catalogRoot, 'handling-unit.store.ts');
+    const offenders: string[] = [];
+    for (const file of files) {
+      if (file.path === HANDLING_UNIT_OWNER) continue;
+      if (drizzleWriteOn('handlingUnits').test(file.source)) {
+        offenders.push(`${file.path}: writes handlingUnits`);
+      }
+      if (/\b(insert into|update|delete from)\s+handling_units\b/i.test(file.source)) {
+        offenders.push(`${file.path}: raw-SQL write of handling_units`);
+      }
+    }
+    expect(offenders).toEqual([]);
+
+    // The seam covers every transition the table has. A missing function here
+    // is a transition some command is about to implement inline.
+    const store = readFileSync(HANDLING_UNIT_OWNER, 'utf8');
+    const facade = readFileSync(join(catalogRoot, 'catalog.facade.ts'), 'utf8');
+    for (const fn of [
+      'createHandlingUnitsInTx',
+      'settleHandlingUnitIntakeInTx',
+      'markHandlingUnitsPackedInTx',
+      'markHandlingUnitsAdjustedInTx',
+      'lockHandlingUnitsInTx',
+      // The read `SkuCommand.edit` guards the flag flip with — catalog-internal,
+      // so it is exported by the seam but has no facade face. A facade method
+      // with no sibling caller is an unpinned surface, which is why the
+      // by-GRN-line read that had none was deleted rather than kept.
+      'countLiveHandlingUnitsInTx',
+    ]) {
+      expect(store).toContain(`export async function ${fn}(`);
+    }
+    // The four transitions plus the guarded read DO have facade faces, for
+    // the siblings that hold this module (inbound, outbound).
+    for (const fn of [
+      'createHandlingUnitsInTx',
+      'settleHandlingUnitIntakeInTx',
+      'markHandlingUnitsPackedInTx',
+      'markHandlingUnitsAdjustedInTx',
+      'lockHandlingUnitsInTx',
+    ]) {
+      expect(facade).toContain(fn);
+    }
+    // Each consuming module actually reaches the seam (the assertions above
+    // are vacuous if nobody calls it).
+    const receiving = readFileSync(
+      join(SRC_ROOT, 'modules', 'inbound', 'receiving.command.ts'),
+      'utf8',
+    );
+    expect(receiving).toContain('this.catalog.createHandlingUnits');
+    expect(receiving).toContain('this.catalog.settleHandlingUnitIntake');
+    expect(readFileSync(join(SRC_ROOT, 'modules', 'outbound', 'pack.command.ts'), 'utf8')).toContain(
+      'this.catalog.markHandlingUnitsPacked',
+    );
+    expect(
+      readFileSync(join(SRC_ROOT, 'modules', 'inventory', 'inventory.command.ts'), 'utf8'),
+    ).toContain('markHandlingUnitsAdjustedInTx(');
+    expect(readFileSync(join(catalogRoot, 'sku.command.ts'), 'utf8')).toContain(
+      'countLiveHandlingUnitsInTx(',
+    );
+  });
+
+  it('nothing under src/ ever updates a captured weight (story 10.3)', () => {
+    // `weight_grams` is captured once at receipt and carried to invoice, and
+    // the ledger does NOT cover it: `grn.received` is an aggregate event
+    // carrying neither the unit ids nor their grams, so an UPDATE of the
+    // column would leave `verifyChain` perfectly green. "Immutable" is
+    // therefore a property of the CODE — which means it needs a code-side
+    // guard, or it is a comment that goes stale the first time someone adds a
+    // re-weigh endpoint without reading this file.
+    const offenders: string[] = [];
+    for (const file of files) {
+      // A Drizzle `.set({...weightGrams...})` on any update, and the raw-SQL
+      // spelling. The column NAME alone is not banned — the migration and the
+      // doc comments must be free to say it.
+      if (/\.set\(\s*\{[^}]*\bweightGrams\b/s.test(file.source)) {
+        offenders.push(`${file.path}: updates weightGrams`);
+      }
+      if (/\bset\s+weight_grams\s*=/i.test(file.source)) {
+        offenders.push(`${file.path}: raw-SQL update of weight_grams`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningfulness: both shapes it bans are shapes it would actually catch,
+    // and the INSERT that legitimately writes the column is not one of them.
+    expect(/\.set\(\s*\{[^}]*\bweightGrams\b/s.test('.set({ weightGrams: 1 })')).toBe(true);
+    expect(/\bset\s+weight_grams\s*=/i.test('update handling_units set weight_grams = 1')).toBe(
+      true,
+    );
+    expect(/\.set\(\s*\{[^}]*\bweightGrams\b/s.test('.values({ weightGrams: 1 })')).toBe(false);
+  });
+
+  it('a catch weight never enters the quantity path (story 10.3)', () => {
+    // The story's single loudest boundary: a catch weight is integer GRAMS
+    // and is never a quantity. If `handling-unit.ts` ever reaches for the
+    // milli-unit primitives, the weight has started travelling the path that
+    // scales, reserves and folds — and 10.1's completed migration re-opens.
+    const handlingUnit =
+      readFileSync(join(catalogRoot, 'handling-unit.ts'), 'utf8') +
+      readFileSync(join(catalogRoot, 'handling-unit.store.ts'), 'utf8');
+    // The IMPORT and the CALL, never the name in prose — a guard that banned
+    // the string would only teach people to stop naming it in comments (the
+    // `CARRIER_ENCRYPTION_KEY` precedent above).
+    expect(/primitives\/quantity['"]/.test(handlingUnit)).toBe(false);
+    expect(/\b(toMilli|fromMilli|assertRecordableQuantity|milliQuantity)\s*\(/.test(handlingUnit)).toBe(
+      false,
+    );
+    // Meaningfulness: the shapes it bans are shapes it would actually catch.
+    expect(/primitives\/quantity['"]/.test("from '../../shared/primitives/quantity';")).toBe(true);
+    expect(/\b(toMilli|fromMilli|assertRecordableQuantity|milliQuantity)\s*\(/.test('toMilli(x)')).toBe(
+      true,
+    );
+  });
+});
+
 describe('architecture: carrier credentials are carriers-module-owned (story 4.6b)', () => {
   /**
    * Story 4.6b stands up the carrier substrate: the adapter registry and the
