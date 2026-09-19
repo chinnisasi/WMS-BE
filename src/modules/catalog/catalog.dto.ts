@@ -87,6 +87,17 @@ export class SkuResponse {
   @ApiProperty({ example: 'each', enum: [...UOMS] })
   uom!: string;
 
+  // Story 10.5: the decimal places `uom` declares, derived in process from
+  // the vocabulary — mirroring the device snapshot's field (10.2), so the web
+  // can render at declared precision and size decimal inputs without
+  // mirroring the precision table client-side. Never an input.
+  @ApiProperty({
+    example: 3,
+    description:
+      'The decimal places this SKU\'s base UoM declares (each = 0 places, kg = 3). Derived from the unit — never an input.',
+  })
+  uomPrecision!: number;
+
   @ApiProperty({ example: 1800, description: 'GST in basis points (1800 = 18%)' })
   gstRateBps!: number;
 

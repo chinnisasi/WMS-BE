@@ -122,7 +122,9 @@ export class PutawayPlacementDto {
   @ApiProperty({ type: String, nullable: true, description: 'The catalog batch code; null on non-batch-tracked SKUs' })
   batchCode!: string | null;
 
-  @ApiProperty({ description: 'The placed quantity (positive integer)', minimum: 1 })
+  // The schema floor matches the placement validator (@Min(0.001)) — the
+  // response DTO's `minimum` documents the fractional truth, it does not gate.
+  @ApiProperty({ description: `The placed quantity. ${QUANTITY_FIELD_DESCRIPTION}`, minimum: 0.001 })
   qty!: number;
 
   @ApiProperty({ format: 'uuid', description: 'The system Receiving bin the units left' })
