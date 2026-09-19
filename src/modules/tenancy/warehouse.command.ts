@@ -13,7 +13,7 @@ import { getMemberRoleIn } from './tenancy.service';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { addressFingerprint, assertAddress, addressFromColumns } from '../../shared/primitives/address';
+import { addressFingerprint, assertAddress, addressFromColumns, normalizeAddressInput } from '../../shared/primitives/address';
 import type { AddressInput, AddressSnapshot } from '../../shared/primitives/address';
 
 export interface CreateWarehouseCommand {
@@ -74,7 +74,7 @@ export class WarehouseCommand {
     // than replaying (the accepted hash-break precedent, pinned for orders
     // in test/shipment-addresses.spec.ts). Normalized before hashing —
     // deterministic, DB-independent.
-    const normalizedOrigin = addressFingerprint(command.origin);
+    const normalizedOrigin = addressFingerprint(normalizeAddressInput(command.origin));
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       code: command.code,

@@ -8,8 +8,9 @@
  * Validation lives HERE, at the command layer (`assertAddress`), not only in
  * the DTOs — the Epic 7 adapter path and every other non-HTTP caller bypass
  * the ValidationPipe, and the command is the boundary that keeps a bad
- * address out of the columns. The DTOs mirror the same constants and the
- * same regex; an HTTP caller is refused by both, in the same words.
+ * address out of the columns. The DTOs import the same constants and the
+ * same regex (their message wording is class-validator's own; the command's
+ * wording here is the canonical one).
  *
  * No country field — India-only by design (GST, paise, Indian carriers).
  * Extensibility is noted, not built.
@@ -66,6 +67,9 @@ const REQUIRED_ADDRESS_FIELDS = [
 
 type RequiredAddressField = (typeof REQUIRED_ADDRESS_FIELDS)[number];
 
+/** Every field of the address, `line2` included (typed, then shaped). */
+const ADDRESS_FIELDS = [...REQUIRED_ADDRESS_FIELDS, 'line2'] as const;
+
 /**
  * Trims every field and treats a whitespace-only `line2` as absent — the
  * command-layer twin of the DTO's `@Trim`. Pure and deterministic, so the
@@ -75,9 +79,9 @@ type RequiredAddressField = (typeof REQUIRED_ADDRESS_FIELDS)[number];
  * "no address" from "an address to validate".
  */
 export function normalizeAddressInput(
-  input: AddressInput | undefined,
+  input: AddressInput | null | undefined,
 ): AddressInput | undefined {
-  if (input === undefined) return undefined;
+  if (input === undefined || input === null) return undefined;
   const trim = (value: unknown): string | undefined =>
     typeof value === 'string' ? value.trim() : undefined;
   const line2 = trim(input.line2);
@@ -98,10 +102,10 @@ export function normalizeAddressInput(
  * `undefined` — `JSON.stringify` drops it, so a body without line2 and one
  * with `line2: ''` hash identically.
  */
-export function addressFingerprint(address: AddressInput | undefined):
-  | Record<string, unknown>
-  | undefined {
-  if (address === undefined) return undefined;
+export function addressFingerprint(
+  address: AddressInput | null | undefined,
+): Record<string, unknown> | undefined {
+  if (address === undefined || address === null) return undefined;
   return {
     contactName: address.contactName,
     phone: address.phone,
@@ -130,17 +134,28 @@ export function addressFingerprint(address: AddressInput | undefined):
  * returns, never the raw input.
  */
 export function assertAddress(
-  input: AddressInput | undefined,
+  input: AddressInput | null | undefined,
   label: string,
 ): AddressInput {
+  // Typed before shaped: a non-string field (JSON numbers, booleans, nulls)
+  // is refused by name — never coerced into a missing field or a silent
+  // drop. A null/absent address falls through to the required refusal below.
+  const raw = input as Record<string, unknown> | null | undefined;
+  for (const field of ADDRESS_FIELDS) {
+    const value = raw?.[field];
+    if (value !== undefined && typeof value !== 'string') {
+      throw addressValidationFailed(`${label}.${field} must be text.`);
+    }
+  }
   const address = normalizeAddressInput(input);
   if (address === undefined) {
     throw addressValidationFailed(
       `${label} is required — an order (or warehouse) carries a full address: contactName, phone, line1, city, state and pincode.`,
     );
   }
+  // After normalization every required field is a string; only '' is missing.
   const missing: RequiredAddressField[] = REQUIRED_ADDRESS_FIELDS.filter(
-    (field) => (address[field] as string | undefined) === undefined || address[field] === '',
+    (field) => address[field] === '',
   );
   // An address is atomic: a caller who supplied some fields but left a
   // required one out (or supplied an empty object) is refused by name, never
@@ -160,6 +175,11 @@ export function assertAddress(
         `${label}.${field} is at most ${ceiling} characters (got ${value.length}).`,
       );
     }
+  }
+  if (address.line2 !== undefined && address.line2.length > ADDRESS_FIELD_LENGTHS.line2) {
+    throw addressValidationFailed(
+      `${label}.line2 is at most ${ADDRESS_FIELD_LENGTHS.line2} characters (got ${address.line2.length}).`,
+    );
   }
   if (!PINCODE_RE.test(address.pincode)) {
     throw addressValidationFailed(

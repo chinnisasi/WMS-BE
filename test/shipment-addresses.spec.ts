@@ -251,6 +251,18 @@ describe('shipment addresses (e2e, story 11-1): destination + origin I/O, the re
       .set('Authorization', `Bearer ${token}`);
   }
 
+  function postWarehouse(
+    token: string,
+    body: Record<string, unknown>,
+    key: string = ulid(),
+  ): request.Test {
+    return request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses`)
+      .set('Authorization', `Bearer ${token}`)
+      .set(KEY_HEADER, key)
+      .send(body);
+  }
+
   async function orderCount(): Promise<number> {
     const rows = await sql`
       select count(*)::int as n from orders where tenant_id = ${tenantId}
@@ -426,6 +438,24 @@ describe('shipment addresses (e2e, story 11-1): destination + origin I/O, the re
     expect(String(pinRes.body.detail)).toContain('pincode');
   });
 
+  it('an origin field over its ceiling is 400: contactName past 120, line2 past 200', async () => {
+    const contactRes = await postWarehouse(ownerToken, {
+      code: `SHA6-${ulid().slice(10, 16).toUpperCase()}`,
+      name: 'Long Contact WH',
+      origin: testAddress({ contactName: 'x'.repeat(121) }),
+    }).expect(400);
+    expect(contactRes.body).toMatchObject({ code: 'validation-failed' });
+    expect(String(contactRes.body.detail)).toContain('contactName');
+
+    const line2Res = await postWarehouse(ownerToken, {
+      code: `SHA7-${ulid().slice(10, 16).toUpperCase()}`,
+      name: 'Long Line2 WH',
+      origin: testAddress({ line2: 'y'.repeat(201) }),
+    }).expect(400);
+    expect(line2Res.body).toMatchObject({ code: 'validation-failed' });
+    expect(String(line2Res.body.detail)).toContain('line2');
+  });
+
   it('the origin echoes on the warehouse list read', async () => {
     const origin = testAddress({ contactName: 'List Echo Owner' });
     await request(app.getHttpServer())
@@ -489,6 +519,30 @@ describe('shipment addresses (e2e, story 11-1): destination + origin I/O, the re
     expect(divergent.body).toMatchObject({ code: 'order-source-conflict' });
   });
 
+  // ── the origin joins the idempotency hash ────────────────────────────────
+
+  it('the origin joins the idempotency hash: the same key with a divergent origin is 422', async () => {
+    // Mirrors the destination pin above for the warehouse create: the origin
+    // participates in the payload hash (normalized first, so a blank line2
+    // and an absent one hash the same), so the same key with a different
+    // origin cannot silently replay.
+    const key = ulid();
+    const body = {
+      code: `SHA8-${ulid().slice(10, 16).toUpperCase()}`,
+      name: 'Origin Hash WH',
+      origin: testAddress(),
+    };
+    await postWarehouse(ownerToken, body, key).expect(201);
+    const divergent = await postWarehouse(
+      ownerToken,
+      { ...body, origin: testAddress({ contactName: 'Someone Else' }) },
+      key,
+    ).expect(422);
+    expect(divergent.body).toMatchObject({ code: 'idempotency-key-reuse' });
+    // ...and a same-key replay of the IDENTICAL body still replays.
+    await postWarehouse(ownerToken, body, key).expect(201);
+  });
+
   // ── the accepted replay break, pinned ────────────────────────────────────
 
   it('a key written under the pre-11.1 fingerprint no longer replays — the ACCEPTED 11.1 break, pinned', async () => {
@@ -520,6 +574,28 @@ describe('shipment addresses (e2e, story 11-1): destination + origin I/O, the re
       })})
     `;
     const res = await postOrder(opsToken, createBody(lines), key).expect(422);
+    expect(res.body).toMatchObject({ code: 'idempotency-key-reuse' });
+  });
+
+  it('a warehouse key written under the pre-11.1 fingerprint (no origin) no longer replays — the same break on the warehouse arm, pinned', async () => {
+    // Story 11-1 added `origin: fingerprint ?? null` to the warehouse hash.
+    // A key written by a pre-11.1 build hashed over exactly
+    // {tenantId, code, name} — NO origin key — so an 11.1 recomputation can
+    // never match it; the replay must answer 422, never silently create.
+    const code = `SHA9-${ulid().slice(10, 16).toUpperCase()}`;
+    const legacyPayloadHash = hashCommandPayload({ tenantId, code, name: 'Legacy Origin WH' });
+    const key = ulid();
+    await sql`
+      insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+      values (${uuidv7()}, ${tenantId}, ${key}, ${legacyPayloadHash}, ${sql.json({
+        warehouse: { id: uuidv7() },
+      })})
+    `;
+    const res = await postWarehouse(
+      ownerToken,
+      { code, name: 'Legacy Origin WH', origin: testAddress() },
+      key,
+    ).expect(422);
     expect(res.body).toMatchObject({ code: 'idempotency-key-reuse' });
   });
 
