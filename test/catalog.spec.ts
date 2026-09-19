@@ -212,6 +212,10 @@ describe('catalog (e2e)', () => {
     // alias map resolves the spelling to the one canonical unit, which is how
     // `pcs`, `PCS` and `pieces` stop being three different units.
     expect(created).toMatchObject({ barcode: 'BC-NEW-OK-1', gstRateBps: 1800, uom: 'each' });
+    // Story 11.3: a SKU imported without the product columns reads unattached
+    // — productId and variantValues both null (the pre-11.3 shape every
+    // legacy row carries).
+    expect(created).toMatchObject({ productId: null, variantValues: null });
     expect(created.uomConversions).toEqual(
       expect.arrayContaining([
         { uom: 'box', factor: 12 },

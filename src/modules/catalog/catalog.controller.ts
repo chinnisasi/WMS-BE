@@ -4,7 +4,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 // Pulls in @types/multer's `Express.Multer.File` namespace augmentation.
 import type {} from 'multer';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsInt, IsOptional, IsString, IsUUID, Max, Min } from 'class-validator';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -33,10 +33,43 @@ import { ImportCommand, MAX_IMPORT_BYTES } from './import.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { SkuCommand } from './sku.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { ProductCommand } from './product.command';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ImportCatalogDto } from './catalog.dto';
-import { CatalogImportResponse, PatchSkuDto, SkuListResponse, SkuResponse } from './catalog.dto';
+import {
+  CatalogImportResponse,
+  CreateProductDto,
+  PatchProductDto,
+  PatchSkuDto,
+  ProductListResponse,
+  ProductResponse,
+  SkuListResponse,
+  SkuResponse,
+} from './catalog.dto';
 
 export class SkuListQuery {
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+
+  // Story 11.3 — the optional product filter: the variants of ONE product
+  // (the 11-6 matrix's data source), same keyset sort.
+  @ApiProperty({ required: false, format: 'uuid', description: 'List only the SKUs attached to this product' })
+  @IsOptional()
+  @IsUUID()
+  productId?: string;
+}
+
+export class ProductListQuery {
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()
@@ -96,6 +129,7 @@ export class CatalogController {
   constructor(
     private readonly importCommand: ImportCommand,
     private readonly skuCommand: SkuCommand,
+    private readonly productCommand: ProductCommand,
   ) {}
 
   @Post(':tenantId/catalog/imports')
@@ -175,6 +209,7 @@ export class CatalogController {
       tenantId,
       query.cursor,
       query.limit === undefined ? undefined : query.limit,
+      query.productId,
     );
     return {
       items: page.items.map((item) => ({ ...item, uomConversions: item.uomConversions.map((c) => ({ ...c })) })),
@@ -182,19 +217,117 @@ export class CatalogController {
     };
   }
 
+  @Post(':tenantId/catalog/products')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Creates a product — identity only (name + declared axes); SKUs attach to it through the SKU edit PATCH' })
+  @ApiBody({ type: CreateProductDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: ProductResponse, description: 'The created product (a matching Idempotency-Key replays it)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid name/axes (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Product name already exists in this tenant (duplicate-product-name)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async createProduct(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: CreateProductDto,
+  ): Promise<ProductResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const product = await this.productCommand.create(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        name: dto.name,
+        axes: dto.axes,
+      },
+      key,
+    );
+    return { ...product, axes: [...product.axes] };
+  }
+
+  @Get(':tenantId/catalog/products')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Lists products (keyset cursor pagination) — items carry the derived skuCount' })
+  @ApiOkResponse({ type: ProductListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor (invalid-cursor) or out-of-range limit (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async listProducts(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: ProductListQuery,
+  ): Promise<ProductListResponse> {
+    assertOwnTenant(session, tenantId);
+    const page = await this.productCommand.list(
+      tenantId,
+      query.cursor,
+      query.limit === undefined ? undefined : query.limit,
+    );
+    return {
+      items: page.items.map((item) => ({ ...item, axes: [...item.axes] })),
+      nextCursor: page.nextCursor,
+    };
+  }
+
+  @Patch(':tenantId/catalog/products/:productId')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Edits a product (name always; axes only while no SKU is attached)' })
+  @ApiBody({ type: PatchProductDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ProductResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an empty body (empty-product-edit)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Product does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Axes change with variants attached (product-has-variants), or the new name is taken (duplicate-product-name)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'productId', format: 'uuid' })
+  async editProduct(
+    @Param('tenantId') tenantId: string,
+    @Param('productId') productId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: PatchProductDto,
+  ): Promise<ProductResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const product = await this.productCommand.edit(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        productId,
+        name: dto.name,
+        axes: dto.axes,
+      },
+      key,
+    );
+    return { ...product, axes: [...product.axes] };
+  }
+
   @Patch(':tenantId/catalog/skus/:skuId')
   @HttpCode(HttpStatus.OK)
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Edits a SKU (name, GST, HSN, flags, physical attributes, reorder defaults, barcode — the SKU code is immutable)' })
+  @ApiOperation({ summary: 'Edits a SKU (name, GST, HSN, flags, physical attributes, reorder defaults, barcode, product attach/detach — the SKU code is immutable)' })
   @ApiBody({ type: PatchSkuDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: SkuResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid/empty body') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid/empty body, or variantValues not covering the product\'s axes (names the axis)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('SKU does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Barcode already belongs to another SKU (duplicate-barcode names it)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('SKU (or, on attach, the product) does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Barcode already belongs to another SKU (duplicate-barcode names it), or another SKU of this product already carries identical variantValues (duplicate-variant-values)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'skuId', format: 'uuid' })
@@ -234,6 +367,12 @@ export class CatalogController {
         reorderPoint: dto.reorderPoint,
         reorderQty: dto.reorderQty,
         barcode: dto.barcode,
+        // Story 11.3 — the variant fields pass through WYSIWYG: absent =
+        // unchanged, `productId: null` = detach (values clear with it). The
+        // command is the boundary (product existence, exact axis coverage,
+        // duplicate variants).
+        productId: dto.productId,
+        variantValues: dto.variantValues,
       },
       key,
     );

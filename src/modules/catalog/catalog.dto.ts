@@ -2,20 +2,28 @@ import { ApiProperty } from '@nestjs/swagger';
 import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
 import { Transform } from 'class-transformer';
 import {
+  ArrayMaxSize,
+  ArrayMinSize,
+  IsArray,
   IsBoolean,
   IsIn,
   IsInt,
   IsNumber,
+  IsObject,
   IsOptional,
   IsString,
+  IsUUID,
   Length,
   Matches,
   Max,
+  MaxLength,
   Min,
+  MinLength,
 } from 'class-validator';
 import { IMPORT_MODES, GST_RATE_BPS_MAX } from './import.command';
 import { UOMS } from './uom';
 import { MAX_SKU_DIMENSION_MM, MAX_SKU_WEIGHT_GRAMS } from './sku-attributes';
+import { AXIS_NAME_MAX, MAX_PRODUCT_AXES, PRODUCT_NAME_MAX } from './product.command';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -177,6 +185,25 @@ export class SkuResponse {
 
   @ApiProperty({ example: 100 })
   reorderQty!: number;
+
+  // Story 11.3 — the variant identity. Null on every unattached SKU (all
+  // pre-11.3 rows read this way); attach/detach happens through the PATCH
+  // below, never through a separate write path.
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    format: 'uuid',
+    description: 'The product this SKU is a variant of, or null when unattached.',
+  })
+  productId!: string | null;
+
+  @ApiProperty({
+    type: Object,
+    nullable: true,
+    example: { size: 'M', colour: 'Red' },
+    description: 'This SKU\'s values on the product\'s declared axes, present iff productId is set.',
+  })
+  variantValues!: Record<string, string> | null;
 
   @ApiProperty({ example: '0198f7a2-1b3c-7d4e-8f90-112233445588', description: 'Generated server-side (uuidv7) unless provided' })
   barcode!: string;
@@ -356,4 +383,115 @@ export class PatchSkuDto {
   @IsString()
   @Length(1, 64)
   barcode?: string;
+
+  // Story 11.3 — the variant attach/detach fields. The `hsn` template again:
+  // absent = unchanged, `null` (on productId) = detach and clear
+  // variantValues with it. The command re-checks everything behind its
+  // replay lookup (product existence → 404, the exact axis coverage → 400,
+  // a duplicate variant → 409); this DTO is the wire shape only.
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    format: 'uuid',
+    description:
+      'Attach the SKU to this product (variantValues is then required), or null to detach it — variantValues are cleared with the detach.',
+  })
+  @IsOptional()
+  @IsUUID()
+  productId?: string | null;
+
+  @ApiProperty({
+    required: false,
+    type: Object,
+    nullable: true,
+    example: { size: 'M', colour: 'Red' },
+    description:
+      'The SKU\'s values on the product\'s declared axes. Must cover EXACTLY the product\'s axes — a missing key, an unknown key or a blank value is a 400 naming the axis. Cannot ride a detach.',
+  })
+  @IsOptional()
+  @IsObject()
+  variantValues?: Record<string, string> | null;
+}
+
+// ── Story 11.3 — the product (AD-19): identity only, above `skus` ──────────
+
+export class CreateProductDto {
+  @ApiProperty({ minLength: 1, maxLength: PRODUCT_NAME_MAX, example: 'Oversized Tee' })
+  @Trimmed()
+  @IsString()
+  @Length(1, PRODUCT_NAME_MAX)
+  name!: string;
+
+  @ApiProperty({
+    type: [String],
+    minItems: 1,
+    maxItems: MAX_PRODUCT_AXES,
+    example: ['size', 'colour'],
+    description: `The declared variant axes, 1–${MAX_PRODUCT_AXES} short names. Immutable while variants are attached.`,
+  })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_PRODUCT_AXES)
+  @Transform(({ value }) => (Array.isArray(value) ? value.map((axis: unknown) => (typeof axis === 'string' ? axis.trim() : axis)) : value))
+  @IsString({ each: true })
+  @MinLength(1, { each: true })
+  @MaxLength(AXIS_NAME_MAX, { each: true })
+  axes!: string[];
+}
+
+/** PATCH fields on a product: name is always editable, axes only while empty. */
+export class PatchProductDto {
+  @ApiProperty({ required: false, minLength: 1, maxLength: PRODUCT_NAME_MAX })
+  @IsOptional()
+  @Trimmed()
+  @IsString()
+  @Length(1, PRODUCT_NAME_MAX)
+  name?: string;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    minItems: 1,
+    maxItems: MAX_PRODUCT_AXES,
+    description: 'The declared axes. Refused 409 `product-has-variants` while any SKU is attached.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_PRODUCT_AXES)
+  @IsString({ each: true })
+  @Transform(({ value }) => (Array.isArray(value) ? value.map((axis: unknown) => (typeof axis === 'string' ? axis.trim() : axis)) : value))
+  @IsString({ each: true })
+  @MinLength(1, { each: true })
+  @MaxLength(AXIS_NAME_MAX, { each: true })
+  axes?: string[];
+}
+
+export class ProductResponse {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ example: 'Oversized Tee' })
+  name!: string;
+
+  @ApiProperty({ type: [String], example: ['size', 'colour'] })
+  axes!: string[];
+
+  @ApiProperty({ example: 2, description: 'How many SKUs in this tenant are attached to this product (derived, never stored)' })
+  skuCount!: number;
+
+  @ApiProperty({ example: '2026-09-19T00:00:00.000Z' })
+  createdAt!: string;
+}
+
+export class ProductListResponse {
+  @ApiProperty({ type: [ProductResponse] })
+  items!: ProductResponse[];
+
+  @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
+  nextCursor!: string | null;
 }

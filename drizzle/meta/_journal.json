@@ -225,6 +225,13 @@
       "when": 1789819907250,
       "tag": "0031_sku_physical_attributes",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1789834606054,
+      "tag": "0032_product_variants",
+      "breakpoints": true
     }
   ]
 }
