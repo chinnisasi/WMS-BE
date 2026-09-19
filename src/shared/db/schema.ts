@@ -343,6 +343,25 @@ export const skus = pgTable(
     reorderPoint: bigint('reorder_point', { mode: 'number' }).notNull().default(0),
     reorderQty: bigint('reorder_qty', { mode: 'number' }).notNull().default(0),
     barcode: text('barcode').notNull(),
+    /**
+     * Story 11.3 — the product this SKU is a variant of (AD-19). Nullable: a
+     * pre-11.3 row and an import row without the `product` column read null.
+     * A bare uuid column with no FK (the repo convention), validated in the
+     * command transaction. Attach/detach rides the SKU edit PATCH — no
+     * second write path.
+     */
+    productId: uuid('product_id'),
+    /**
+     * Story 11.3 — this SKU's values on the product's declared axes, keyed by
+     * axis name (e.g. `{"size":"M","colour":"Red"}`). Present iff
+     * `product_id` is set — the pairing is a row-local CHECK declared ONLY in
+     * `drizzle/0032_product_variants.sql` (the 0031 pattern). The command
+     * layer requires the values to cover the product's axes EXACTLY (missing
+     * key, unknown key or blank value → 400 naming the axis), and refuses a
+     * second SKU in one product carrying identical values (409
+     * `duplicate-variant-values`).
+     */
+    variantValues: jsonb('variant_values').$type<Record<string, string>>(),
     ...tenantTimestamps,
   },
   (table) => [
@@ -350,10 +369,52 @@ export const skus = pgTable(
     uniqueIndex('skus_tenant_id_barcode_unique').on(table.tenantId, table.barcode),
     index('skus_created_at_id_idx').on(table.createdAt, table.id),
     index('skus_tenant_id_idx').on(table.tenantId),
+    // Story 11.3 — the product list's skuCount and the SKU list's productId
+    // filter both resolve through this column (uuid + index, no FK).
+    index('skus_product_id_idx').on(table.productId),
   ],
 );
 
 export type Sku = typeof skus.$inferSelect;
+
+/**
+ * Product identity (Story 11.3 — AD-19): the grouping layer ABOVE `skus`. A
+ * product carries name + declared axes only — no UoM, no tracking flags, no
+ * stock concept: the SKU remains every ledger event's unit, and no table
+ * below the catalog learns what a variant is. Axes are presentation (an
+ * 1–3-entry string array); the attached SKUs' axis values live on
+ * `skus.variant_values`, validated against these keys in the command
+ * transaction. `product_id` on `skus` is a bare uuid column with no FK (the
+ * repo convention), validated in the command transaction. Name is unique per
+ * tenant (the `skus.code` precedent). No delete command — append-only.
+ */
+export const products = pgTable(
+  'products',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    name: text('name').notNull(),
+    /**
+     * The declared variant axes (e.g. `["size","colour"]`), 1–3 short names.
+     * Immutable while the product has variants attached (409
+     * `product-has-variants`) — renaming an axis would silently orphan every
+     * attached SKU's values. jsonb + `$type<>` (the `responseSnapshot`
+     * precedent); axes are presentation, so a normalized axis table buys
+     * nothing no consumer needs.
+     */
+    axes: jsonb('axes').$type<string[]>().notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('products_tenant_id_name_unique').on(table.tenantId, table.name),
+    index('products_created_at_id_idx').on(table.createdAt, table.id),
+    index('products_tenant_id_idx').on(table.tenantId),
+  ],
+);
+
+export type Product = typeof products.$inferSelect;
 
 /**
  * UoM conversions relative to the SKU's base UoM (Story 1.4): `factor` is a

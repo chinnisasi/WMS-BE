@@ -9,6 +9,7 @@ import {
   catalogImportErrors,
   catalogImports,
   idempotencyKeys,
+  products,
   skus,
   uomConversions,
 } from '../../shared/db/schema';
@@ -34,6 +35,13 @@ import {
   uomPrecision,
 } from './uom';
 import { assertSkuAttributes, type SkuAttributeFields } from './sku-attributes';
+import {
+  AXIS_NAME_MAX,
+  PRODUCT_NAME_MAX,
+  VARIANT_VALUE_MAX,
+  assertVariantValues,
+  variantValuesFingerprint,
+} from './product.command';
 
 export const IMPORT_MODES = ['initial', 'fix'] as const;
 export type ImportMode = (typeof IMPORT_MODES)[number];
@@ -99,6 +107,18 @@ const OPTIONAL_COLUMNS = [
   'reorder_point',
   'reorder_qty',
   'barcode',
+  // Story 11.3 — the variant columns. The closed-header contract grows
+  // again: a CSV carrying these against a pre-11.3 binary would be rejected
+  // wholesale, so the header contract and the row parser grow together (the
+  // 11.2 precedent). `product` REFERENCES an existing product by NAME —
+  // import never creates products (auto-declared axes from the first row's
+  // keys would make the product's identity an implicit side effect); a
+  // missing name is a per-row error naming it, the uom-vocabulary refusal
+  // shape. `variant_values` is the ONE cell (no per-axis CSV columns — the
+  // closed-header contract would break): `size=M; colour=Red`, the
+  // `uom_conversions` box:12 cell-grammar precedent.
+  'product',
+  'variant_values',
 ] as const;
 const KNOWN_COLUMNS: ReadonlySet<string> = new Set([...REQUIRED_COLUMNS, ...OPTIONAL_COLUMNS]);
 
@@ -132,6 +152,10 @@ interface ValidRow {
   /** Null → generated server-side (uuidv7) at insert. */
   readonly barcode: string | null;
   readonly conversions: readonly { readonly uom: string; readonly factor: number }[];
+  /** Story 11.3 — the referenced product's NAME, or null (blank cell → no product). */
+  readonly productName: string | null;
+  /** Story 11.3 — the parsed `variant_values` cell, or null (blank cell → no values). */
+  readonly variantValues: Record<string, string> | null;
 }
 
 type FieldResult<T> = { ok: true; value: T } | { ok: false; error: CatalogImportErrorDto };
@@ -246,14 +270,87 @@ export class ImportCommand {
           else errors.push(result.error);
         }
 
+        // ── Story 11.3: resolve the referenced products and run the SAME
+        // command-side rules the SKU edit PATCH runs. Per-row errors keep the
+        // partial commit honest (the uom-vocabulary refusal shape: the rest
+        // of the file still commits and fix mode can re-submit this row).
+        // The duplicate-variant rule is enforced across the whole file and
+        // the tenant's existing attached SKUs — the same invariants the edit
+        // command guards, stated here as row errors.
+        const productNames = [
+          ...new Set(valid.filter((row) => row.productName !== null).map((row) => row.productName as string)),
+        ];
+        const productByName = new Map<string, { id: string; name: string; axes: readonly string[] }>();
+        if (productNames.length > 0) {
+          const referenced = await tx
+            .select({ id: products.id, name: products.name, axes: products.axes })
+            .from(products)
+            .where(and(eq(products.tenantId, command.tenantId), inArray(products.name, productNames)));
+          for (const row of referenced) productByName.set(row.name, row);
+        }
+        const referencedIds = [...new Set([...productByName.values()].map((product) => product.id))];
+        // Existing attached variants per referenced product, keyed by the
+        // stable fingerprint (key-order independent) — one query for the
+        // whole file.
+        const tenantVariants = new Map<string, string>();
+        if (referencedIds.length > 0) {
+          const attached = await tx
+            .select({ productId: skus.productId, variantValues: skus.variantValues, code: skus.code })
+            .from(skus)
+            .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.productId, referencedIds)));
+          for (const row of attached) {
+            if (row.productId !== null && row.variantValues !== null) {
+              tenantVariants.set(
+                `${row.productId}|${variantValuesFingerprint(row.variantValues)}`,
+                row.code,
+              );
+            }
+          }
+        }
+        const insertableRows: (ValidRow & { productId: string | null })[] = [];
+        for (const row of valid) {
+          if (row.productName === null) {
+            insertableRows.push({ ...row, productId: null });
+            continue;
+          }
+          const product = productByName.get(row.productName);
+          if (!product) {
+            errors.push(
+              rowError(
+                row.rowNumber,
+                row.code,
+                'validation-failed',
+                `product "${row.productName}" does not exist in this tenant — import references products, it never creates them. Create the product first.`,
+              ),
+            );
+            continue;
+          }
+          try {
+            // The ONE shared validator — a value missing an axis, naming an
+            // unknown axis or carrying a blank is refused THERE, naming the
+            // axis, exactly as the edit command refuses it.
+            assertVariantValues(product.axes, row.variantValues);
+          } catch (err) {
+            const response = (err as ProblemException).getResponse() as { detail?: string };
+            errors.push(rowError(row.rowNumber, row.code, 'validation-failed', response.detail ?? 'Invalid variant values.'));
+            continue;
+          }
+          insertableRows.push({
+            ...row,
+            productId: product.id,
+            variantValues: row.variantValues === null ? null : { ...row.variantValues },
+          });
+        }
+
         // Duplicate detection: file-internal first (order of appearance), then
         // the tenant's existing SKUs — one error per row, first failure wins.
         const seenCodes = new Map<string, number>();
         const seenBarcodes = new Map<string, string>();
         const conflicts = await findTenantConflicts(tx, command.tenantId, valid);
 
-        const insertable: ValidRow[] = [];
-        for (const row of valid) {
+        const insertable: (ValidRow & { productId: string | null })[] = [];
+        const seenVariants = new Map<string, number>();
+        for (const row of insertableRows) {
           if (seenCodes.has(row.code)) {
             errors.push(rowError(row.rowNumber, row.code, 'duplicate-sku-code', `SKU code "${row.code}" appears twice in this file — row ${seenCodes.get(row.code)} used it first.`));
             continue;
@@ -266,6 +363,24 @@ export class ImportCommand {
             const conflictingSku = seenBarcodes.get(row.barcode) ?? conflicts.barcodes.get(row.barcode)!;
             errors.push(rowError(row.rowNumber, row.code, 'duplicate-barcode', `Barcode "${row.barcode}" already belongs to SKU "${conflictingSku}".`));
             continue;
+          }
+          // Story 11.3 — duplicate variants are refused: a second SKU in one
+          // product carrying identical values, within this file (naming the
+          // earlier row) or already attached in the tenant (naming that
+          // SKU). Same rule the edit command guards with its 409.
+          if (row.productId !== null && row.variantValues !== null) {
+            const fingerprint = `${row.productId}|${variantValuesFingerprint(row.variantValues)}`;
+            const earlier = seenVariants.get(fingerprint);
+            if (earlier !== undefined) {
+              errors.push(rowError(row.rowNumber, row.code, 'duplicate-variant-values', `Row ${earlier} already claimed these values in product "${row.productName}" — two variants of one product cannot be identical.`));
+              continue;
+            }
+            const existingCode = tenantVariants.get(fingerprint);
+            if (existingCode !== undefined) {
+              errors.push(rowError(row.rowNumber, row.code, 'duplicate-variant-values', `Product "${row.productName}" already has SKU "${existingCode}" carrying the identical values — two variants of one product cannot be identical.`));
+              continue;
+            }
+            seenVariants.set(fingerprint, row.rowNumber);
           }
           seenCodes.set(row.code, row.rowNumber);
           if (row.barcode !== null) seenBarcodes.set(row.barcode, row.code);
@@ -302,6 +417,11 @@ export class ImportCommand {
             reorderQty: row.reorderQty,
             // Generated server-side at entry (uuidv7) unless the file carries one.
             barcode: row.barcode ?? uuidv7(),
+            // Story 11.3 — the variant attachment (null/unset when the row
+            // carries no product; the CHECK requires the pairing, which the
+            // resolution pass guarantees).
+            productId: row.productId,
+            variantValues: row.variantValues,
           }));
           try {
             for (const chunk of chunked(skuRows)) {
@@ -929,6 +1049,28 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
     }
   }
 
+  // Story 11.3 — the variant columns, shape-only. `product` is an existing
+  // product's NAME (import references, never creates — auto-declaring axes
+  // from the first row's keys would make the product's identity an implicit
+  // side effect of the first CSV row); the tenant read that resolves it runs
+  // later, alongside the duplicate checks. A values cell without a product
+  // is refused HERE (values ride the product); a product cell without values
+  // fails the coverage check in that later pass, naming the missing axis.
+  const productNameRaw = get('product');
+  if (productNameRaw.length > PRODUCT_NAME_MAX) {
+    return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', `product must be at most ${PRODUCT_NAME_MAX} characters.`) };
+  }
+  let parsedValues: Record<string, string> | null = null;
+  const valuesRaw = v['variant_values']?.trim() ?? '';
+  if (valuesRaw !== '') {
+    if (productNameRaw === '') {
+      return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', 'variant_values cannot be set without the product column — values ride the product.') };
+    }
+    const parsed = parseVariantValuesCell(valuesRaw, row.rowNumber);
+    if (!parsed.ok) return { ok: false, error: { ...parsed.error, skuCode: code } };
+    parsedValues = parsed.value;
+  }
+
   return {
     ok: true,
     row: {
@@ -950,8 +1092,57 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       reorderQty,
       barcode: barcode === '' ? null : barcode,
       conversions,
+      // Story 11.3 — the product reference and the parsed values cell. The
+      // coverage rules run later (they need the referenced product's axes,
+      // a tenant read); shape-only errors refuse here.
+      productName: productNameRaw === '' ? null : productNameRaw,
+      variantValues: parsedValues,
     },
   };
+}
+
+/**
+ * One `variant_values` cell, the `uom_conversions` cell-grammar precedent
+ * (`box:12` → `size=M; colour=Red`): split on `;`, each entry `axis=value`
+ * split on the FIRST `=`, both sides trimmed. Blank entries between `;`s are
+ * skipped (trailing separators), but an entry with no `=`, an empty axis or
+ * an empty value is a row error naming the cell. A value over
+ * `VARIANT_VALUE_MAX` is refused HERE naming the CSV column; the axis
+ * coverage against the referenced product's axes is the command-side rule
+ * (`assertVariantValues`), run once the product row is in hand.
+ */
+function parseVariantValuesCell(raw: string, rowNumber: number): FieldResult<Record<string, string>> {
+  const values: Record<string, string> = {};
+  for (const entry of raw.split(';')) {
+    const trimmed = entry.trim();
+    if (trimmed === '') continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) {
+      return {
+        ok: false,
+        error: rowError(rowNumber, null, 'validation-failed', `variant_values entries must look like size=M (axis=value) — got "${trimmed}".`),
+      };
+    }
+    const axis = trimmed.slice(0, eq).trim();
+    const value = trimmed.slice(eq + 1).trim();
+    if (axis === '') {
+      return { ok: false, error: rowError(rowNumber, null, 'validation-failed', `variant_values carries an entry with an empty axis — got "${trimmed}".`) };
+    }
+    if (axis.length > AXIS_NAME_MAX) {
+      return { ok: false, error: rowError(rowNumber, null, 'validation-failed', `variant_values axis "${axis}" exceeds the ${AXIS_NAME_MAX}-character axis-name cap.`) };
+    }
+    if (value === '') {
+      return { ok: false, error: rowError(rowNumber, null, 'validation-failed', `variant_values carries an empty value for axis "${axis}".`) };
+    }
+    if (value.length > VARIANT_VALUE_MAX) {
+      return { ok: false, error: rowError(rowNumber, null, 'validation-failed', `variant_values value for axis "${axis}" exceeds ${VARIANT_VALUE_MAX} characters.`) };
+    }
+    if (axis in values) {
+      return { ok: false, error: rowError(rowNumber, null, 'validation-failed', `variant_values repeats the axis "${axis}" within one cell.`) };
+    }
+    values[axis] = value;
+  }
+  return { ok: true, value: values };
 }
 
 /**

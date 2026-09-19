@@ -1,8 +1,8 @@
 import { forwardRef, Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { idempotencyKeys, skus, uomConversions } from '../../shared/db/schema';
+import { idempotencyKeys, products, skus, uomConversions } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
@@ -21,6 +21,11 @@ import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/qua
 import { isFractionalUom, serialTrackedFractionalUomDetail, uomPrecision } from './uom';
 import { countLiveHandlingUnitsInTx } from './handling-unit.store';
 import { assertSkuAttributes } from './sku-attributes';
+import {
+  assertVariantValues,
+  normalizeVariantValues,
+  productNotFound,
+} from './product.command';
 
 export const DEFAULT_SKU_PAGE_SIZE = 50;
 export const MAX_SKU_PAGE_SIZE = 200;
@@ -62,6 +67,14 @@ export interface SkuSnapshot {
   readonly widthMm: number | null;
   readonly heightMm: number | null;
   readonly countryOfOrigin: string | null;
+  /**
+   * Story 11.3 — the product this SKU is a variant of (AD-19), null on an
+   * unattached SKU. Read-only here: attach/detach happens through `edit`'s
+   * optional `productId` PATCH field — no second write path.
+   */
+  readonly productId: string | null;
+  /** This SKU's values on the product's axes; null when unattached. */
+  readonly variantValues: Record<string, string> | null;
   readonly reorderPoint: number;
   readonly reorderQty: number;
   readonly barcode: string;
@@ -102,6 +115,21 @@ export interface EditSkuCommand {
   readonly reorderPoint?: number | undefined;
   readonly reorderQty?: number | undefined;
   readonly barcode?: string | undefined;
+  /**
+   * Story 11.3 — attach to a product, or detach. The `hsn` template again:
+   * absent = unchanged, `null` = detach (variantValues cleared with it), a
+   * uuid = attach (and `variantValues` must then cover that product's axes
+   * EXACTLY). No second write path — the SKU edit PATCH is the only way a
+   * SKU becomes a variant.
+   */
+  readonly productId?: string | null | undefined;
+  /**
+   * Story 11.3 — the SKU's axis values, required (with the coverage rules of
+   * `assertVariantValues`) whenever a product is being attached or the
+   * attached product's values change. A bare `variantValues` with no
+   * attached product is a 400 — values ride the product.
+   */
+  readonly variantValues?: Record<string, unknown> | null | undefined;
 }
 
 /**
@@ -127,13 +155,20 @@ export class SkuCommand {
     tenantId: string,
     cursor?: string,
     limit: number = DEFAULT_SKU_PAGE_SIZE,
+    productId?: string,
   ): Promise<Page<SkuSnapshot>> {
     const pageSize = Math.min(Math.max(Math.trunc(limit) || DEFAULT_SKU_PAGE_SIZE, 1), MAX_SKU_PAGE_SIZE);
     const before = cursor === undefined ? undefined : decodeCursorSafe(cursor);
     // Page + conversions in one tenant-scoped transaction (RLS session state
     // set once; both queries app-filter on tenant_id as the authority).
     const { rows, conversions } = await withTenantTransaction(this.db, tenantId, async (tx) => {
-      const scope = eq(skus.tenantId, tenantId);
+      // Story 11.3: the optional product filter — the variants of ONE product
+      // (the 11-6 matrix's data source), still keyset-paginated on the same
+      // (created_at, id) sort.
+      const scope =
+        productId === undefined
+          ? eq(skus.tenantId, tenantId)
+          : and(eq(skus.tenantId, tenantId), eq(skus.productId, productId));
       const skuRows = await tx
         .select()
         .from(skus)
@@ -196,13 +231,20 @@ export class SkuCommand {
       reorderPoint: command.reorderPoint,
       reorderQty: command.reorderQty,
       barcode: command.barcode,
+      // Story 11.3 — the variant fields count as fields for the empty-patch
+      // refusal, exactly as every other PATCH field does. `productId: null`
+      // (detach) is a field; `undefined` drops out of the spread hash below,
+      // so a pre-11.3 body reproduces its old hash and in-flight keys still
+      // replay 200 (the 11.2 no-break reasoning, pinned by test).
+      productId: command.productId,
+      variantValues: command.variantValues,
     };
     if (Object.values(fields).every((value) => value === undefined)) {
       throw new ProblemException(
         'validation-failed',
         400,
         'Empty SKU edit',
-        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode is required.',
+        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues is required.',
       );
     }
     // ── story 11.2: this hash did NOT break ──────────────────────────────────
@@ -283,6 +325,129 @@ export class SkuCommand {
           heightMm: fields.heightMm,
           countryOfOrigin: fields.countryOfOrigin,
         });
+
+        // ── Story 11.3: attach / detach / re-value — behind the replay
+        // lookup, with the SKU's existence already settled. `setProductId` /
+        // `setVariantValues` stay `undefined` when the patch moves neither —
+        // an ordinary edit of an attached SKU re-validates nothing.
+        let setProductId: string | null | undefined;
+        let setVariantValues: Record<string, string> | null | undefined;
+        if (fields.productId !== undefined) {
+          // Non-HTTP callers (and a hand-built command) skip the DTO's
+          // @IsUUID — the command is the boundary that keeps a bad ref out
+          // of the uuid column (a raw 22P02 is never an answer).
+          if (fields.productId !== null && !UUID_RE.test(fields.productId)) {
+            throw new ProblemException(
+              'validation-failed',
+              400,
+              'Invalid product reference',
+              'productId must be a uuid or null (null detaches the SKU from its product).',
+            );
+          }
+          if (fields.productId === null) {
+            // Detach clears the values with it — the row-local CHECK requires
+            // the pairing, and a product-less value is an orphan by
+            // definition. A variantValues key alongside productId: null is a
+            // mistake, refused rather than silently dropped.
+            if (fields.variantValues !== undefined) {
+              throw new ProblemException(
+                'validation-failed',
+                400,
+                'Variant values need a product',
+                'variantValues cannot ride a detach — productId: null clears them with it.',
+              );
+            }
+            setProductId = null;
+            setVariantValues = null;
+          } else {
+            const productRows = await tx
+              .select()
+              .from(products)
+              .where(and(eq(products.id, fields.productId), eq(products.tenantId, command.tenantId)))
+              .limit(1);
+            const product = productRows[0];
+            if (!product) {
+              throw productNotFound(fields.productId);
+            }
+            if (fields.variantValues === undefined || fields.variantValues === null) {
+              throw new ProblemException(
+                'validation-failed',
+                400,
+                'Variant values do not match the product',
+                `variantValues is required when attaching product "${product.name}" — every declared axis ` +
+                  `(${product.axes.join(', ')}) must carry exactly one value.`,
+              );
+            }
+            // The ONE shared validator: every axis covered exactly, one
+            // non-empty ≤64-char value per axis — the missing key, unknown
+            // key or blank value refuses HERE, naming variantValues and the
+            // axis (the I/O matrix's `Variant values mismatch` arm).
+            assertVariantValues(product.axes, fields.variantValues);
+            const values = normalizeVariantValues(fields.variantValues as Record<string, string>);
+            // Duplicate variants are refused: two SKUs in one product
+            // carrying identical values is the 409 the I/O matrix names,
+            // checked in-transaction (the repo's no-FK convention — a
+            // partial unique index over a jsonb expression would work, but
+            // the product row is already resolved here, so the check costs
+            // one indexed query).
+            const duplicate = await tx
+              .select({ code: skus.code })
+              .from(skus)
+              .where(
+                and(
+                  eq(skus.tenantId, command.tenantId),
+                  eq(skus.productId, product.id),
+                  ne(skus.id, command.skuId),
+                  eq(skus.variantValues, values),
+                ),
+              )
+              .limit(1);
+            if (duplicate[0]) {
+              throw duplicateVariantValues(product.name, values, duplicate[0].code);
+            }
+            setProductId = product.id;
+            setVariantValues = values;
+          }
+        } else if (fields.variantValues !== undefined) {
+          // Values without a product move: re-value against the SKU's
+          // CURRENT attachment (an edit touching only the values). A SKU
+          // with no product has no axes to cover — refused.
+          if (current.productId === null || fields.variantValues === null) {
+            throw new ProblemException(
+              'validation-failed',
+              400,
+              'Variant values need a product',
+              'variantValues cannot be set without the SKU belonging to a product — attach it with productId first.',
+            );
+          }
+          const productRows = await tx
+            .select()
+            .from(products)
+            .where(and(eq(products.id, current.productId), eq(products.tenantId, command.tenantId)))
+            .limit(1);
+          const product = productRows[0];
+          if (!product) {
+            throw productNotFound(current.productId);
+          }
+          assertVariantValues(product.axes, fields.variantValues);
+          const values = normalizeVariantValues(fields.variantValues as Record<string, string>);
+          const duplicate = await tx
+            .select({ code: skus.code })
+            .from(skus)
+            .where(
+              and(
+                eq(skus.tenantId, command.tenantId),
+                eq(skus.productId, product.id),
+                ne(skus.id, command.skuId),
+                eq(skus.variantValues, values),
+              ),
+            )
+            .limit(1);
+          if (duplicate[0]) {
+            throw duplicateVariantValues(product.name, values, duplicate[0].code);
+          }
+          setVariantValues = values;
+        }
 
         // Story 10.1: turning serial tracking ON is catalog entry for the
         // rule's purposes — a serialized unit is discrete by definition, so a
@@ -397,6 +562,10 @@ export class SkuCommand {
         if (reorderPointMilli !== undefined) updates.reorderPoint = reorderPointMilli;
         if (reorderQtyMilli !== undefined) updates.reorderQty = reorderQtyMilli;
         if (fields.barcode !== undefined) updates.barcode = fields.barcode;
+        // Story 11.3 — the variant columns move only when the patch moved
+        // them (`undefined` = untouched; `null` = cleared with the detach).
+        if (setProductId !== undefined) updates.productId = setProductId;
+        if (setVariantValues !== undefined) updates.variantValues = setVariantValues;
         try {
           const updatedRows = await tx
             .update(skus)
@@ -475,6 +644,11 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     widthMm: row.widthMm,
     heightMm: row.heightMm,
     countryOfOrigin: row.countryOfOrigin,
+    // Story 11.3 — an unattached SKU (every pre-11.3 row, every import row
+    // without the `product` column) reads `productId: null`,
+    // `variantValues: null`, exactly like the 11.2 attributes.
+    productId: row.productId,
+    variantValues: row.variantValues ?? null,
     // Story 10.1: `toSnapshot` is the module's only SKU read shape — base
     // units leave here, milli-units stay in the column.
     reorderPoint: fromMilli(row.reorderPoint),
@@ -505,6 +679,20 @@ export function duplicateBarcode(barcode: string, conflictingCode: string): Prob
     conflictingCode === ''
       ? `Barcode "${barcode}" already belongs to another SKU in this tenant.`
       : `Barcode "${barcode}" already belongs to SKU "${conflictingCode}".`,
+  );
+}
+
+export function duplicateVariantValues(
+  productName: string,
+  values: Readonly<Record<string, string>>,
+  conflictingCode: string,
+): ProblemException {
+  return new ProblemException(
+    'duplicate-variant-values',
+    409,
+    'Variant values already used in this product',
+    `Product "${productName}" already has SKU "${conflictingCode}" carrying ${JSON.stringify(values)} — ` +
+      'two variants of one product cannot be identical.',
   );
 }
 

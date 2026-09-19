@@ -2030,6 +2030,16 @@
               "example": 50,
               "type": "number"
             }
+          },
+          {
+            "name": "productId",
+            "required": false,
+            "in": "query",
+            "description": "List only the SKUs attached to this product",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -2080,6 +2090,331 @@
           }
         ],
         "summary": "Lists SKUs (keyset cursor pagination)",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/catalog/products": {
+      "post": {
+        "operationId": "CatalogController_createProduct",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProductDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The created product (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid name/axes (validation-failed / empty-product-edit)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Product name already exists in this tenant (duplicate-product-name)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Creates a product — identity only (name + declared axes); SKUs attach to it through the SKU edit PATCH",
+        "tags": [
+          "catalog"
+        ]
+      },
+      "get": {
+        "operationId": "CatalogController_listProducts",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor (invalid-cursor) or out-of-range limit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists products (keyset cursor pagination) — items carry the derived skuCount",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/catalog/products/{productId}": {
+      "patch": {
+        "operationId": "CatalogController_editProduct",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "productId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchProductDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an empty body (empty-product-edit)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Product does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Axes change with variants attached (product-has-variants), or the new name is taken (duplicate-product-name)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Edits a product (name always; axes only while no SKU is attached)",
         "tags": [
           "catalog"
         ]
@@ -2143,7 +2478,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or invalid/empty body",
+            "description": "Missing or malformed Idempotency-Key, or invalid/empty body, or variantValues not covering the product's axes (names the axis)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2173,7 +2508,7 @@
             }
           },
           "404": {
-            "description": "SKU does not exist in this tenant (not-found)",
+            "description": "SKU (or, on attach, the product) does not exist in this tenant (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2183,7 +2518,7 @@
             }
           },
           "409": {
-            "description": "Barcode already belongs to another SKU (duplicate-barcode names it)",
+            "description": "Barcode already belongs to another SKU (duplicate-barcode names it), or another SKU of this product already carries identical variantValues (duplicate-variant-values)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2208,7 +2543,7 @@
             "bearer": []
           }
         ],
-        "summary": "Edits a SKU (name, GST, HSN, flags, physical attributes, reorder defaults, barcode — the SKU code is immutable)",
+        "summary": "Edits a SKU (name, GST, HSN, flags, physical attributes, reorder defaults, barcode, product attach/detach — the SKU code is immutable)",
         "tags": [
           "catalog"
         ]
@@ -9049,6 +9384,21 @@
             "type": "number",
             "example": 100
           },
+          "productId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The product this SKU is a variant of, or null when unattached."
+          },
+          "variantValues": {
+            "type": "object",
+            "nullable": true,
+            "example": {
+              "size": "M",
+              "colour": "Red"
+            },
+            "description": "This SKU's values on the product's declared axes, present iff productId is set."
+          },
           "barcode": {
             "type": "string",
             "example": "0198f7a2-1b3c-7d4e-8f90-112233445588",
@@ -9084,6 +9434,8 @@
           "countryOfOrigin",
           "reorderPoint",
           "reorderQty",
+          "productId",
+          "variantValues",
           "barcode",
           "uomConversions",
           "createdAt"
@@ -9108,6 +9460,117 @@
           "items",
           "nextCursor"
         ]
+      },
+      "CreateProductDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "example": "Oversized Tee"
+          },
+          "axes": {
+            "minItems": 1,
+            "maxItems": 3,
+            "example": [
+              "size",
+              "colour"
+            ],
+            "description": "The declared variant axes, 1–3 short names. Immutable while variants are attached.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "name",
+          "axes"
+        ]
+      },
+      "ProductResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string",
+            "example": "Oversized Tee"
+          },
+          "axes": {
+            "example": [
+              "size",
+              "colour"
+            ],
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "skuCount": {
+            "type": "number",
+            "example": 2,
+            "description": "How many SKUs in this tenant are attached to this product (derived, never stored)"
+          },
+          "createdAt": {
+            "type": "string",
+            "example": "2026-09-19T00:00:00.000Z"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "name",
+          "axes",
+          "skuCount",
+          "createdAt"
+        ]
+      },
+      "ProductListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProductResponse"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true,
+            "description": "Opaque keyset cursor"
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PatchProductDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "axes": {
+            "minItems": 1,
+            "maxItems": 3,
+            "description": "The declared axes. Refused 409 `product-has-variants` while any SKU is attached.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       },
       "PatchSkuDto": {
         "type": "object",
@@ -9198,6 +9661,21 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 64
+          },
+          "productId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "Attach the SKU to this product (variantValues is then required), or null to detach it — variantValues are cleared with the detach."
+          },
+          "variantValues": {
+            "type": "object",
+            "nullable": true,
+            "example": {
+              "size": "M",
+              "colour": "Red"
+            },
+            "description": "The SKU's values on the product's declared axes. Must cover EXACTLY the product's axes — a missing key, an unknown key or a blank value is a 400 naming the axis. Cannot ride a detach."
           }
         }
       },
