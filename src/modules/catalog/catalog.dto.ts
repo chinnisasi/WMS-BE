@@ -1,9 +1,21 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsIn, IsInt, IsNumber, IsOptional, IsString, Length, Max, Min } from 'class-validator';
+import {
+  IsBoolean,
+  IsIn,
+  IsInt,
+  IsNumber,
+  IsOptional,
+  IsString,
+  Length,
+  Matches,
+  Max,
+  Min,
+} from 'class-validator';
 import { IMPORT_MODES, GST_RATE_BPS_MAX } from './import.command';
 import { UOMS } from './uom';
+import { MAX_SKU_DIMENSION_MM, MAX_SKU_WEIGHT_GRAMS } from './sku-attributes';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -117,6 +129,49 @@ export class SkuResponse {
   })
   catchWeightTracked!: boolean;
 
+  // Story 11.2 — the static physical attributes, WYSIWYG grams/millimetres
+  // (`sku-attributes.ts`). Null when unset; a pre-11.2 row reads null too.
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    example: 500,
+    description:
+      'Static catalog weight in grams — what carriers rate from. Positive whole number ≤ 1,000,000 (1 tonne), or null when unset. NOT the per-handling-unit catch weight (that lives on handling_units).',
+  })
+  weightGrams!: number | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    example: 200,
+    description: 'Length in millimetres. Positive whole number ≤ 10,000, or null when unset.',
+  })
+  lengthMm!: number | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    example: 150,
+    description: 'Width in millimetres. Positive whole number ≤ 10,000, or null when unset.',
+  })
+  widthMm!: number | null;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    example: 100,
+    description: 'Height in millimetres. Positive whole number ≤ 10,000, or null when unset.',
+  })
+  heightMm!: number | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    example: 'IN',
+    description: 'Country of origin, ISO 3166-1 alpha-2 uppercase (e.g. IN, CN), or null when unset.',
+  })
+  countryOfOrigin!: string | null;
+
   @ApiProperty({ example: 50 })
   reorderPoint!: number;
 
@@ -183,6 +238,91 @@ export class PatchSkuDto {
   @IsOptional()
   @IsBoolean()
   catchWeightTracked?: boolean;
+
+  // Story 11.2 — the physical attributes, mirrored from `assertSkuAttributes`
+  // (`sku-attributes.ts`). PATCH semantics follow the `hsn` precedent: absent
+  // = unchanged, null = cleared (`@IsOptional` lets a null through
+  // unvalidated; the command clears on it).
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    example: 500,
+    minimum: 1,
+    maximum: MAX_SKU_WEIGHT_GRAMS,
+    description:
+      'Static catalog weight in grams (positive whole number, ≤ 1,000,000). Omit to leave unchanged; null to clear.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_SKU_WEIGHT_GRAMS)
+  weightGrams?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    example: 200,
+    minimum: 1,
+    maximum: MAX_SKU_DIMENSION_MM,
+    description: 'Length in millimetres (positive whole number, ≤ 10,000). Omit to leave unchanged; null to clear.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_SKU_DIMENSION_MM)
+  lengthMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    example: 150,
+    minimum: 1,
+    maximum: MAX_SKU_DIMENSION_MM,
+    description: 'Width in millimetres (positive whole number, ≤ 10,000). Omit to leave unchanged; null to clear.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_SKU_DIMENSION_MM)
+  widthMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    example: 100,
+    minimum: 1,
+    maximum: MAX_SKU_DIMENSION_MM,
+    description: 'Height in millimetres (positive whole number, ≤ 10,000). Omit to leave unchanged; null to clear.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_SKU_DIMENSION_MM)
+  heightMm?: number | null;
+
+  // The `hsn` template: '' clears (mapped to null by the controller), so the
+  // pattern admits the empty string; anything non-empty must be two uppercase
+  // ISO 3166-1 alpha-2 letters. The same regex is `ORIGIN_RE` in
+  // `sku-attributes.ts`, where the command re-checks it behind the replay.
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    example: 'IN',
+    description:
+      'Country of origin, ISO 3166-1 alpha-2 uppercase (e.g. IN, CN). Omit to leave unchanged; null or "" to clear.',
+  })
+  @IsOptional()
+  @Trimmed()
+  @IsString()
+  @Matches(/^$|^[A-Z]{2}$/, {
+    message: 'countryOfOrigin must be two uppercase ISO 3166-1 alpha-2 letters (e.g. IN, CN), empty to clear.',
+  })
+  countryOfOrigin?: string | null;
 
   @ApiProperty({
     required: false,

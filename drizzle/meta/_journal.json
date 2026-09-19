@@ -218,6 +218,13 @@
       "when": 1789807893345,
       "tag": "0030_shipment_addresses",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1789819907250,
+      "tag": "0031_sku_physical_attributes",
+      "breakpoints": true
     }
   ]
 }

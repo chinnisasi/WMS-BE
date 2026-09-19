@@ -186,7 +186,7 @@ export class CatalogController {
   @HttpCode(HttpStatus.OK)
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Edits a SKU (name, GST, HSN, flags, reorder defaults, barcode — the SKU code is immutable)' })
+  @ApiOperation({ summary: 'Edits a SKU (name, GST, HSN, flags, physical attributes, reorder defaults, barcode — the SKU code is immutable)' })
   @ApiBody({ type: PatchSkuDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: SkuResponse })
@@ -218,6 +218,14 @@ export class CatalogController {
         batchTracked: dto.batchTracked,
         serialTracked: dto.serialTracked,
         catchWeightTracked: dto.catchWeightTracked,
+        // Story 11.2 — the physical attributes pass through WYSIWYG (grams /
+        // millimetres); `countryOfOrigin` follows the `hsn` template, '' → null.
+        weightGrams: dto.weightGrams,
+        lengthMm: dto.lengthMm,
+        widthMm: dto.widthMm,
+        heightMm: dto.heightMm,
+        countryOfOrigin:
+          dto.countryOfOrigin === undefined ? undefined : dto.countryOfOrigin === '' ? null : dto.countryOfOrigin,
         // Story 10.2: both stay in BASE units here. The command converts them
         // behind its replay lookup, where the SKU's row — and therefore its
         // declared precision — is already in hand; converting at this edge
