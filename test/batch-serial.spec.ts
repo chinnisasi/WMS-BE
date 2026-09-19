@@ -7,6 +7,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { RECONCILIATION_DIVERGENCE_EVENT } from '../src/modules/inventory/reconcile';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -667,6 +668,22 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       const rebuilt = await facade.rebuildProjections(tenantId, warehouseId, { skuId: sku, binId: binA });
       const batchRepair = rebuilt.repaired.find((r) => r.batchRef === batchId);
       expect(batchRepair).toMatchObject({ quantity: toMilli(7), deleted: false });
+
+      // The appended alert names the batch too (story 10.4): the manual
+      // rebuild's divergence entry is no less nameable than the cycle's —
+      // the same optional `batchRef` key rides both alerts.
+      const alertRows = (await sql`
+        select payload from outbox_messages
+        where tenant_id = ${tenantId} and type = ${RECONCILIATION_DIVERGENCE_EVENT}
+          and payload->>'warehouseId' = ${warehouseId}
+        order by created_at desc limit 1
+      `) as unknown as { payload: { divergences: { skuId: string; binId: string; batchRef?: string }[] } }[];
+      expect(alertRows).toHaveLength(1);
+      const alertEntry = alertRows[0]!.payload.divergences.find(
+        (d) => d.skuId === sku && d.binId === binA,
+      );
+      expect(alertEntry).toBeDefined();
+      expect(alertEntry!.batchRef).toBe(batchId);
 
       const after = await facade.replay(tenantId, warehouseId);
       expect(after.matches).toBe(true);

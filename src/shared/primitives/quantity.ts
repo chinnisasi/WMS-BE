@@ -246,18 +246,13 @@ export function isAtPrecision(value: number, precision: number): boolean {
  * `outbound.controller.ts` no longer exist: a rule stated twice is a rule that
  * drifts, and this one now has nine call sites rather than two.
  *
- * It refuses, in this order, and returns the milli-unit integer otherwise:
- *
- *  1. a value beyond the exact-integer range (an overflow is a refusal at the
- *     boundary, never a silent wrap downstream);
- *  2. a value FINER than its unit declares — the story's rule. It names the
- *     field, the unit, the declared precision and the offending value, the
- *     house shape `serialTrackedFractionalUomDetail` established;
- *  3. a non-zero value that would scale to nothing. Story 10.1's refusal,
- *     kept as a backstop and now structurally unreachable: the finest unit in
- *     the vocabulary declares `QUANTITY_DECIMALS` places, and a value at that
- *     precision is at least one milli-unit. It stays because "unreachable"
- *     is a property of today's vocabulary, not of this function.
+ * Story 10.4 moved the RULE into `validateRecordableQuantity` below (the CSV
+ * import's `parseQuantityMilli` delegates to the same core), so this function
+ * is the gate's THROWING shape: it runs the rule with signed deltas allowed
+ * and maps the refusal arms into the ProblemException shape the nine command
+ * call sites answer with. The arms' texts are unchanged from 10.2 — the
+ * precision arm's detail in particular is byte-identical to the import
+ * path's, which is what makes the rule provably stated once.
  *
  * **Where it must be called from.** Behind the command's idempotency replay
  * lookup, never at the controller edge. An op that committed once replays its
@@ -272,32 +267,99 @@ export function assertRecordableQuantity(
   uom: string,
   precision: number,
 ): number {
+  const result = validateRecordableQuantity(value, field, uom, precision, 'signed');
+  if (result.ok) {
+    return result.milli;
+  }
+  throw new ProblemException(
+    'validation-failed',
+    400,
+    RECORDABLE_QUANTITY_ARM_TITLES[result.arm](field),
+    result.detail,
+  );
+}
+
+/**
+ * The one STATEMENT of the recordable-quantity rule (story 10.4): the pure
+ * validate + convert core both call shapes delegate to. `assertRecordableQuantity`
+ * (the HTTP command write-edge gate) and `catalog/import.command.ts`'s
+ * `parseQuantityMilli` (the CSV import edge) wrap it — the rule — ceiling →
+ * sign → precision → vanish → convert — is written here exactly once, and the
+ * two call shapes differ only in how they surface a refusal (a ProblemException
+ * versus a CSV row error) and in the SIGN parameter: a command's deltas are
+ * signed (`-3` draws), an import cell is a level and may not be negative.
+ *
+ * The arms, in order:
+ *
+ *  1. **ceiling** — a value beyond the exact-integer range (an overflow is a
+ *     refusal at the boundary, never a silent wrap downstream);
+ *  2. **sign** — a negative value on a call shape that takes levels. Never
+ *     fires for the command's signed deltas by construction;
+ *  3. **precision** — a value FINER than its unit declares. The refusal text
+ *     comes from `precisionRefusalDetail` and is byte-identical across both
+ *     call shapes (that is the point of the core: one rule, one sentence);
+ *  4. **vanish** — a non-zero value that would scale to nothing. Structurally
+ *     unreachable with today's vocabulary (the finest unit declares
+ *     `QUANTITY_DECIMALS` places), kept for the same reason as before:
+ *     "unreachable" is a property of today's vocabulary.
+ *
+ * A result object, not a throw: the import edge maps the arms into its own
+ * row-error shape, where a throw would abort the whole file instead of
+ * refusing one row. Call shapes that CAN throw wrap it (`assertRecordableQuantity`).
+ */
+export type RecordableQuantityCheck =
+  | { readonly ok: true; readonly milli: number }
+  | {
+      readonly ok: false;
+      readonly arm: 'ceiling' | 'sign' | 'precision' | 'vanish';
+      readonly detail: string;
+    };
+
+export type QuantitySign = 'signed' | 'non-negative';
+
+const RECORDABLE_QUANTITY_ARM_TITLES: Record<
+  'ceiling' | 'sign' | 'precision' | 'vanish',
+  (field: string) => string
+> = {
+  ceiling: (field) => `${field} is outside the exact quantity range`,
+  sign: (field) => `${field} must not be negative`,
+  precision: (field) => `${field} is finer than its unit allows`,
+  vanish: (field) => `${field} is finer than the smallest recordable quantity`,
+};
+
+export function validateRecordableQuantity(
+  value: number,
+  field: string,
+  uom: string,
+  precision: number,
+  sign: QuantitySign,
+): RecordableQuantityCheck {
   if (!Number.isFinite(value) || Math.abs(value) > MAX_QUANTITY_BASE) {
-    throw new ProblemException(
-      'validation-failed',
-      400,
-      `${field} is outside the exact quantity range`,
-      `${field} must be a finite quantity of at most ${MAX_QUANTITY_BASE} in the SKU's base UoM (got ${String(value)}).`,
-    );
+    return {
+      ok: false,
+      arm: 'ceiling',
+      detail: `${field} must be a finite quantity of at most ${MAX_QUANTITY_BASE} in the SKU's base UoM (got ${String(value)}).`,
+    };
+  }
+  if (sign === 'non-negative' && value < 0) {
+    return {
+      ok: false,
+      arm: 'sign',
+      detail: `${field} must be a non-negative quantity (got ${String(value)}).`,
+    };
   }
   if (!isAtPrecision(value, precision)) {
-    throw new ProblemException(
-      'validation-failed',
-      400,
-      `${field} is finer than its unit allows`,
-      precisionRefusalDetail(field, value, uom, precision),
-    );
+    return { ok: false, arm: 'precision', detail: precisionRefusalDetail(field, value, uom, precision) };
   }
   if (scalesToZero(value)) {
-    throw new ProblemException(
-      'validation-failed',
-      400,
-      `${field} is finer than the smallest recordable quantity`,
-      `${field} must be at least ${MIN_QUANTITY_BASE} in the SKU's base UoM (got ${value}) — ` +
+    return {
+      ok: false,
+      arm: 'vanish',
+      detail: `${field} must be at least ${MIN_QUANTITY_BASE} in the SKU's base UoM (got ${value}) — ` +
         'a smaller value would be recorded as zero, which means something else entirely.',
-    );
+    };
   }
-  return toMilli(value);
+  return { ok: true, milli: toMilli(value) };
 }
 
 /**

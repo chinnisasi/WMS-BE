@@ -907,6 +907,17 @@ export const reconciliationCheckpoints = pgTable(
     lastSeq: integer('last_seq').notNull().default(0),
     invalidAttempts: integer('invalid_attempts').notNull().default(0),
     lastDivergences: jsonb('last_divergences').$type<Record<string, unknown>[] | null>(),
+    /**
+     * Story 10.4: bounded passes accumulated since the last FULL pass on this
+     * partition. The full pass (`replayInTx`) is the bounded scan's blind-spot
+     * escape; the counter, not a wall clock, schedules it — deterministic,
+     * per-partition by construction, and testable without a fake clock. A
+     * bounded pass (clean or divergent) increments; a full pass resets to 0.
+     * An EXISTING checkpoint's cycle state (this column included) is never
+     * overwritten by the reconcile failure path; its fresh-row INSERT is the
+     * deliberate exception, writing the no-checkpoint default 0.
+     */
+    incrementalCount: integer('incremental_count').notNull().default(0),
     ...tenantTimestamps,
   },
   (table) => [
