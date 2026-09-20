@@ -58,8 +58,14 @@ const SKU_CODES = [
   'KIT-LISTA', 'KIT-LISTB', 'COMP-LIST',
   // the overflow refusal (a per-kit quantity that explodes past any line)
   'KIT-KO', 'COMP-O1',
+  // a SKU with on-hand / a live reservation cannot become a kit
+  'HOLD-C1', 'HOLD-R1',
+  // the precision refusal: a kit in kg whose component is a 0-decimal unit
+  'COMP-PE1',
+  // the over-receipt approval arm (a kit that arrives between GRN and decision)
+  'OVR-KIT',
 ] as const;
-const KG_CODES = ['KIT-KG', 'COMP-G'] as const; // the sub-milli refusal pair
+const KG_CODES = ['KIT-KG', 'COMP-G', 'KIT-KPREC'] as const; // the sub-milli/precision kit pairs
 
 interface KitComponent {
   skuId: string;
@@ -129,6 +135,8 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
   let operatorToken: string;
   let warehouseId: string;
   let binA: string;
+  /** The over-receipt test's PO needs a vendor (the receiving.spec fixture). */
+  let vendorId: string;
   // The KE1 create key — the replay and divergent-retry tests re-send it.
   let ke1CreateKey: string;
   const skuIds = new Map<string, string>();
@@ -202,6 +210,16 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
         .send({ capacity: 100000, type: 'shelf', code: 'A-01-01' })
         .expect(201)
     ).body.id as string;
+
+    // ── the over-receipt test's vendor ────────────────────────────────────
+    vendorId = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/vendors`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'KIT-VEND-1', name: 'Kit Vendor 1' })
+        .expect(201)
+    ).body.vendor.id as string;
 
     // ── all scenario SKUs via catalog import ───────────────────────────────
     const csvHeader =
@@ -297,6 +315,9 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
         'over_receipts',
         'goods_receipt_lines',
         'goods_receipt_notes',
+        'purchase_order_lines',
+        'purchase_orders',
+        'vendors',
         'order_lines',
         'orders',
       ]) {
@@ -665,11 +686,15 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
       expect(res.body).toMatchObject({ status: 409, code: 'kit-already-composed' });
     });
 
-    it('400 on an empty composition and 400 on a non-integer quantity for a whole-unit component', async () => {
-      // The edge validator (ArrayMinSize) refuses the empty array before the
-      // command sees it.
+    it('400 empty-kit-composition on an empty composition (the NAMED arm, create and PUT) and 400 on a non-integer quantity for a whole-unit component', async () => {
+      // No DTO edge validator eats the arm: an empty array reaches the
+      // command, whose guard answers the named 400 (the DTO carries no
+      // @ArrayMinSize for exactly this reason).
       const empty = await createKit(sku('KIT-KS1'), []).expect(400);
-      expect(empty.body).toMatchObject({ status: 400, code: 'validation-failed' });
+      expect(empty.body).toMatchObject({ status: 400, code: 'empty-kit-composition' });
+      // PUT: the shape check runs before the not-found door check.
+      const putEmpty = await putKit(sku('KIT-KPUT'), []).expect(400);
+      expect(putEmpty.body).toMatchObject({ status: 400, code: 'empty-kit-composition' });
       // `each` declares zero decimal places — 1.5 of a component is not a
       // quantity that unit can express.
       const fine = await createKit(sku('KIT-KS1'), [{ skuId: sku('COMP-S1'), quantity: 1.5 }]).expect(400);
@@ -850,6 +875,112 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
         select count(*)::int as n from stock_on_hand where tenant_id = ${tenantId} and sku_id = ${sku('KIT-KE1')}
       `) as unknown as { n: number }[];
       expect(Number(rows[0]!.n)).toBe(0);
+    });
+
+    it('409 kit-sku-holds-stock: a SKU with on-hand stock cannot become a kit', async () => {
+      // A kit never reserves, receives or adjusts stock, and no order line can
+      // ever reserve one — a kit created ON stock would strand it forever.
+      await seedStock(sku('HOLD-C1'), 5);
+      const res = await createKit(sku('HOLD-C1'), [{ skuId: sku('COMP-E1'), quantity: 1 }]).expect(409);
+      expect(res.body).toMatchObject({ status: 409, code: 'kit-sku-holds-stock' });
+      expect(res.body.detail as string).toContain('on hand');
+      const rows = (await sql`
+        select count(*)::int as n from kit_compositions where kit_sku_id = ${sku('HOLD-C1')}
+      `) as unknown as { n: number }[];
+      expect(Number(rows[0]!.n)).toBe(0);
+    });
+
+    it('409 kit-sku-holds-stock: a SKU with a live reservation cannot become a kit', async () => {
+      await seedStock(sku('HOLD-R1'), 10);
+      await postOrder([{ skuId: sku('HOLD-R1'), quantity: 5 }]).expect(201);
+      // Zero the on-hand first — the guard's stock arm would otherwise answer
+      // (the on-hand check precedes the reservation check by design).
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/inventory/adjustments`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId,
+          skuId: sku('HOLD-R1'),
+          binId: binA,
+          quantityDelta: -10,
+          reasonCode: 'cycle-count',
+          note: 'kits-suite: isolate the reservation arm',
+        })
+        .expect(201);
+      const res = await createKit(sku('HOLD-R1'), [{ skuId: sku('COMP-E1'), quantity: 1 }]).expect(409);
+      expect(res.body).toMatchObject({ status: 409, code: 'kit-sku-holds-stock' });
+      expect(res.body.detail as string).toContain('reservation');
+    });
+
+    it('over-receipt approval on a SKU that became a kit after the GRN: 409 kit-cannot-hold-stock, the excess stays unapplied', async () => {
+      // The GRN applies its within-open portion (10) and pends the excess
+      // (5) for approval — a decision that can land days later.
+      const po = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/inbound/purchase-orders`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({
+            warehouseId,
+            vendorId,
+            code: `PO-${ulid().slice(10, 18).toUpperCase()}`,
+            lines: [{ skuId: sku('OVR-KIT'), orderedQty: 10, unitCostPaise: 1250 }],
+          })
+          .expect(201)
+      ).body.purchaseOrder as { id: string; lines: { id: string }[] };
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/goods-receipts`)
+        .set('Authorization', `Bearer ${operatorToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId,
+          poId: po.id,
+          blindReasonCode: null,
+          occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+          lines: [{ poLineId: po.lines[0]!.id, skuId: sku('OVR-KIT'), batchCode: null, mfgDate: null, qty: 15 }],
+        })
+        .expect(201);
+      const pending = (await sql`
+        select id from over_receipts
+        where tenant_id = ${tenantId} and sku_id = ${sku('OVR-KIT')} and status = 'pending'
+      `) as unknown as { id: string }[];
+      expect(pending).toHaveLength(1);
+      const overReceiptId = pending[0]!.id;
+      // Move the applied stock away (to binA) and zero the SKU: the
+      // kit-create stock guard refuses a SKU still holding stock, so the
+      // reachable window for this refusal is an emptied SKU.
+      const recvBin = (await sql`
+        select bin_id from stock_on_hand
+        where tenant_id = ${tenantId} and sku_id = ${sku('OVR-KIT')} and quantity > 0 limit 1
+      `) as unknown as { bin_id: string }[];
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/inventory/adjustments`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId,
+          skuId: sku('OVR-KIT'),
+          binId: recvBin[0]!.bin_id,
+          quantityDelta: -10,
+          reasonCode: 'cycle-count',
+          note: 'kits-suite: empty the SKU',
+        })
+        .expect(201);
+      await createKit(sku('OVR-KIT'), [{ skuId: sku('COMP-E1'), quantity: 1 }]).expect(201);
+      // The approval is a +stock writer in its own right — it must refuse.
+      const res = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/over-receipts/${overReceiptId}/approve`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .expect(409);
+      expect(res.body).toMatchObject({ status: 409, code: 'kit-cannot-hold-stock' });
+      // Nothing applied: the decision is terminal-refused, the row stays
+      // pending for a human reject.
+      const after = (await sql`
+        select status from over_receipts where id = ${overReceiptId}
+      `) as unknown as { status: string }[];
+      expect(after[0]!.status).toBe('pending');
     });
 
     it('CHECKs on kit_compositions: a zero quantity and a self-row are DB-rejected', async () => {
@@ -1048,11 +1179,31 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
 
     it('a sub-milli explosion is a 400 — the component UoM cannot express it', async () => {
       // kg × kg: a per-kit quantity of 0.001 kg is 1 milli; a line of 0.5 kg
-      // is 500 milli — the product 500 is not divisible by the milli scale.
+      // is 500 milli — the child 0.5 milli is below the kg unit's own milli
+      // resolution.
       await createKit(sku('KIT-KG'), [{ skuId: sku('COMP-G'), quantity: 0.001 }]).expect(201);
       const res = await postOrder([{ skuId: sku('KIT-KG'), quantity: 0.5 }]).expect(400);
       expect(res.body).toMatchObject({ status: 400, code: 'validation-failed' });
-      expect(res.body.detail as string).toContain('sub-milli');
+      expect(res.body.detail as string).toContain('cannot express');
+    });
+
+    it('an explosion below the component unit\'s declared precision is a 400 — 0.5 of a 0-decimal component can never be picked', async () => {
+      // A kit in kg whose component is `each` (0 decimal places): 0.5 kg of
+      // the kit explodes to 0.5 each — milli-expressible, so the old
+      // sub-milli check passed it, but no pick could ever record it.
+      await createKit(sku('KIT-KPREC'), [{ skuId: sku('COMP-PE1'), quantity: 1 }]).expect(201);
+      const res = await postOrder([{ skuId: sku('KIT-KPREC'), quantity: 0.5 }]).expect(400);
+      expect(res.body).toMatchObject({ status: 400, code: 'validation-failed' });
+      expect(res.body.detail as string).toContain('cannot express');
+      const rows = (await sql`
+        select count(*)::int as n from order_lines ol
+        join skus s on s.id = ol.sku_id
+        where ol.tenant_id = ${tenantId} and s.code = 'KIT-KPREC'
+      `) as unknown as { n: number }[];
+      expect(Number(rows[0]!.n)).toBe(0);
+      // Whole kilograms explode fine: 2 kg → 2 each.
+      await seedStock(sku('COMP-PE1'), 10);
+      await postOrder([{ skuId: sku('KIT-KPREC'), quantity: 2 }]).expect(201);
     });
 
     it('cancel releases the CHILD holds and restores ATP', async () => {

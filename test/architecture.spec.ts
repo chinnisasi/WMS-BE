@@ -387,8 +387,11 @@ describe('architecture: catalog identity is catalog-module-owned (story 10.3)', 
     // one, so a `.insert(uomConversions)` outside catalog walked straight
     // through a guard whose name says it cannot.
     'uomConversions',
+    // Story 11.4: kit-ness is the presence of composition rows — a write
+    // outside catalog would forge kit-ness (KitCommand is the one writer).
+    'kitCompositions',
   ] as const;
-  const RAW_CATALOG_TABLES = 'skus|batches|serials|handling_units|uom_conversions';
+  const RAW_CATALOG_TABLES = 'skus|batches|serials|handling_units|uom_conversions|kit_compositions';
   const catalogRoot = join(SRC_ROOT, 'modules', 'catalog');
 
   it('no catalog-identity write happens outside the catalog module', () => {

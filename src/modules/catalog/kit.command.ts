@@ -1,8 +1,14 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { idempotencyKeys, kitCompositions, skus } from '../../shared/db/schema';
+import {
+  idempotencyKeys,
+  kitCompositions,
+  reservations,
+  skus,
+  stockOnHand,
+} from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import {
@@ -19,6 +25,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { DEFAULT_SKU_PAGE_SIZE, MAX_SKU_PAGE_SIZE } from './sku.command';
+import { getKitSkuIdsInTx } from './kit.store';
 import { uomPrecision } from './uom';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
@@ -146,6 +153,7 @@ export class KitCommand {
 
       // 2. The guards, against locked rows.
       await assertNotKitInTx(tx, command.tenantId, command.skuId);
+      await assertKitSkuHoldsNoStock(tx, command.tenantId, kit);
       assertSelfReference(command.skuId, componentIds);
       await assertComponentsAreNotKits(tx, command.tenantId, componentIds, componentById);
       const qtyBySku = await assertComponentQuantities(command.components, componentById);
@@ -478,28 +486,6 @@ function assertComponentQuantities(
 }
 
 /**
- * Kit-ness is relational: a SKU is a kit iff composition rows exist for it.
- * One indexed lookup — the definition the explosion, the +stock refusals and
- * the component-is-kit guard all share.
- */
-export async function kitSkuIdsInTx(
-  tx: TenantTx,
-  tenantId: string,
-  skuIds: readonly string[],
-): Promise<string[]> {
-  if (skuIds.length === 0) {
-    return [];
-  }
-  const rows = await tx
-    .selectDistinctOn([kitCompositions.kitSkuId], { kitSkuId: kitCompositions.kitSkuId })
-    .from(kitCompositions)
-    .where(
-      and(eq(kitCompositions.tenantId, tenantId), inArray(kitCompositions.kitSkuId, [...skuIds])),
-    );
-  return rows.map((row) => row.kitSkuId);
-}
-
-/**
  * Create's entry guard: the SKU the caller names must not already be a kit —
  * create is the only door into kit-ness, PUT replaces an existing kit's BOM.
  * Runs against the locked rows.
@@ -518,6 +504,57 @@ async function assertNotKitInTx(tx: TenantTx, tenantId: string, skuId: string): 
       `SKU "${skuId}" already carries a composition — create is the only door into kit-ness; PUT replaces an existing kit's BOM.`,
     );
   }
+}
+
+/**
+ * A SKU that already holds stock or a live reservation cannot become a kit.
+ * Every stock writer refuses a kit (the `kit-cannot-hold-stock` guards in
+ * receiving and stock adjustment) and no order line can ever reserve one —
+ * orders explode to components — so a kit created ON stock would strand that
+ * stock and its ATP forever, with no write-off path. Runs against the locked
+ * kit row, in the same transaction as the composition write, so a GRN that
+ * commits stock concurrently serializes on the same `.for('update')` sku row
+ * (the GRN's `loadSkus` locks it too) and is already visible here.
+ */
+async function assertKitSkuHoldsNoStock(
+  tx: TenantTx,
+  tenantId: string,
+  kit: typeof skus.$inferSelect,
+): Promise<void> {
+  const stockRows = await tx
+    .select({ quantity: stockOnHand.quantity })
+    .from(stockOnHand)
+    .where(
+      and(eq(stockOnHand.tenantId, kit.tenantId), eq(stockOnHand.skuId, kit.id), gt(stockOnHand.quantity, 0)),
+    )
+    .limit(1);
+  if (stockRows[0] !== undefined) {
+    throw kitSkuHoldsStock(kit, `${fromMilli(stockRows[0].quantity)} on hand`);
+  }
+  const holdRows = await tx
+    .select({ id: reservations.id })
+    .from(reservations)
+    .where(
+      and(
+        eq(reservations.tenantId, kit.tenantId),
+        eq(reservations.skuId, kit.id),
+        inArray(reservations.state, ['held', 'committed']),
+      ),
+    )
+    .limit(1);
+  if (holdRows[0] !== undefined) {
+    throw kitSkuHoldsStock(kit, 'a live reservation');
+  }
+}
+
+/** The create refusal for a SKU that already carries stock or a live hold. */
+function kitSkuHoldsStock(kit: typeof skus.$inferSelect, because: string): ProblemException {
+  return new ProblemException(
+    'kit-sku-holds-stock',
+    409,
+    'This SKU already holds stock',
+    `SKU "${kit.code}" already carries ${because} — making it a kit would strand that stock forever (a kit never reserves, receives or adjusts stock; orders explode to its components). Move or consume the stock first.`,
+  );
 }
 
 /** The row-local guard's command-side twin: a kit cannot compose itself. */
@@ -547,7 +584,7 @@ async function assertComponentsAreNotKits(
   componentIds: readonly string[],
   componentById: ReadonlyMap<string, typeof skus.$inferSelect>,
 ): Promise<void> {
-  const kitIds = await kitSkuIdsInTx(tx, tenantId, componentIds);
+  const kitIds = await getKitSkuIdsInTx(tx, tenantId, componentIds);
   if (kitIds.length > 0) {
     const named = kitIds
       .map((kitId) => componentById.get(kitId)?.code ?? kitId)

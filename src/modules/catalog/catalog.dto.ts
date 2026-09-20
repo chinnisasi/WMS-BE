@@ -529,8 +529,10 @@ export class PutKitDto {
     maxItems: MAX_KIT_COMPONENTS,
     description: `The flat BOM — at least one component, at most ${MAX_KIT_COMPONENTS}, no repeats, no kit-of-kit.`,
   })
+  // NO @ArrayMinSize: an empty array must reach the command, whose guard
+  // answers the NAMED 400 `empty-kit-composition` — a generic DTO
+  // validation-failed would bury the arm the contract pins.
   @IsArray()
-  @ArrayMinSize(1)
   @ArrayMaxSize(MAX_KIT_COMPONENTS)
   @ValidateNested({ each: true })
   @Type(() => KitComponentDto)

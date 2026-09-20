@@ -89,7 +89,7 @@ export class InventoryController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks stock.adjust (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, bin, or SKU does not exist in this tenant (not-found), or an explicit batch code does not exist for the SKU (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Concurrent request on the same Idempotency-Key (conflict); or a serial-tracked movement scans a serial that already lives in a bin (duplicate-serial, naming it) or draws a serial the ledger last saw in another bin (serial-elsewhere, naming the last-known bin)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Concurrent request on the same Idempotency-Key (conflict); a kit SKU can never hold stock (kit-cannot-hold-stock, naming it); or a serial-tracked movement scans a serial that already lives in a bin (duplicate-serial, naming it) or draws a serial the ledger last saw in another bin (serial-elsewhere, naming the last-known bin)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or the movement would drive on-hand, or the resolved/overridden batch\'s on-hand, below zero (insufficient-on-hand names the bin, and the batchRef on a batch-tracked draw)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async adjustStock(

@@ -28,6 +28,7 @@ import { picklistLineDrewUnits } from './wave.command';
 import type { ReservationSnapshot } from '../inventory/inventory.facade';
 import {
   MAX_QUANTITY_MILLI,
+  QUANTITY_DECIMALS,
   QUANTITY_SCALE,
   assertRecordableQuantity,
   fromMilli,
@@ -386,11 +387,30 @@ export class OrderCommandService {
       for (const skuId of kitSkuIds) {
         bomBySku.set(skuId, await this.catalog.getKitCompositionInTx(tx, command.tenantId, skuId));
       }
+      // The component SKUs' units: the child quantity must be expressible in
+      // the COMPONENT's declared precision, not merely in milli-units — a
+      // 0-decimal component (each) can never take a 0.5 child line, and a
+      // grant that moved anyway would strand an unpickable line.
+      const componentSkuIds = [...bomBySku.values()].flatMap((bom) =>
+        bom.map((line) => line.componentSkuId),
+      );
+      const componentUomBySku =
+        componentSkuIds.length === 0
+          ? new Map<string, string>()
+          : await this.assertSkuIdsInTenant(tx, command.tenantId, componentSkuIds);
       const explosions = new Map<number, readonly KitCompositionLine[]>();
       for (let index = 0; index < lines.length; index += 1) {
         const bom = bomBySku.get(lines[index]!.skuId);
         if (bom !== undefined) {
-          explosions.set(index, explodeKitLine(lines[index]!, index, bom));
+          explosions.set(
+            index,
+            explodeKitLine(
+              lines[index]!,
+              index,
+              bom,
+              componentUomBySku,
+            ),
+          );
         }
       }
 
@@ -1248,15 +1268,20 @@ export function lineSnapshot(
  * play no part). Component qty is per ONE kit, in the component's base-UoM
  * milli-units; a kit line of Q (kit-milli) therefore needs Q × per-kit-milli
  * ÷ 1000 milli of the component. Two refusals fall out of that arithmetic:
- * a product not divisible by the milli scale (a sub-milli child quantity the
- * component's own units could never express) and a product or quotient above
- * the exact-integer / quantity ceilings — both 400s, never silent rounding
- * after grants were made (the `MAX_LINE_QUANTITY` rationale).
+ * a product or quotient above the exact-integer / quantity ceilings, and a
+ * child quantity the COMPONENT's own unit cannot express — `child % 10^(3 −
+ * precision) ≠ 0` covers both a sub-milli remainder and (for a 0- or 1-
+ * decimal unit like `each`) a finer-than-declared fraction such as 0.5 each,
+ * which a pick could never record (`assertRecordableQuantity` refuses it) and
+ * which would strand the child line with its hold until TTL. Both are 400s —
+ * never silent rounding after grants were made (the `MAX_LINE_QUANTITY`
+ * rationale).
  */
 function explodeKitLine(
   line: OrderLineInput,
   lineIndex: number,
   bom: readonly KitCompositionLine[],
+  uomByComponentSku: ReadonlyMap<string, string>,
 ): KitCompositionLine[] {
   return bom.map((component) => {
     const product = line.quantity * component.qty;
@@ -1265,12 +1290,14 @@ function explodeKitLine(
         `Line ${lineIndex} (kit ${line.skuId}) explodes past the quantity ceiling: ${String(line.quantity)} × ${String(component.qty)} milli is more than any line can carry. Split the order line.`,
       );
     }
-    if (product % QUANTITY_SCALE !== 0) {
+    const child = product / QUANTITY_SCALE;
+    const precision = uomPrecision(uomByComponentSku.get(component.componentSkuId)!);
+    if (child % 10 ** (QUANTITY_DECIMALS - precision) !== 0) {
       throw validationFailed(
-        `Line ${lineIndex} (kit ${line.skuId}) explodes to a sub-milli component quantity (${String(product)} milli-product) — the component's UoM cannot express it. Adjust the kit line quantity or the composition.`,
+        `Line ${lineIndex} (kit ${line.skuId}) explodes to a component quantity the component's UoM cannot express (child ${String(child)} milli at ${String(precision)} decimal place(s)) — adjust the kit line quantity or the composition.`,
       );
     }
-    return { componentSkuId: component.componentSkuId, qty: product / QUANTITY_SCALE };
+    return { componentSkuId: component.componentSkuId, qty: child };
   });
 }
 

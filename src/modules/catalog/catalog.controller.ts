@@ -415,7 +415,7 @@ export class CatalogController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The kit SKU (or a component SKU) does not exist in this tenant (not-found / kit-component-not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The SKU is already a kit (kit-already-composed), a component appears twice (duplicate-kit-component), or a component is itself a kit (kit-component-is-kit — flat BOM)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The SKU is already a kit (kit-already-composed), a component appears twice (duplicate-kit-component), a component is itself a kit (kit-component-is-kit — flat BOM), or the SKU already holds stock or a live reservation — making it a kit would strand that stock (kit-sku-holds-stock)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'skuId', format: 'uuid', description: 'The SKU that becomes a kit' })

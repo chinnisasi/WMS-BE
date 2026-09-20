@@ -917,6 +917,21 @@ export class ReceivingCommand {
       const decisionEvent = `over_receipt.${status}`;
 
       if (command.decision === 'approve') {
+        // Story 11.4: the approval is a third +stock writer — the excess
+        // applies as a fresh `grn.received` delta at DECISION time, days after
+        // the GRN's own kit check ran. A SKU that became a kit in between must
+        // refuse here too, or the approval invents independent kit stock.
+        const overReceiptKitIds = await this.catalog.getKitSkuIdsInTx(tx, command.tenantId, [
+          row.skuId,
+        ]);
+        if (overReceiptKitIds.length > 0) {
+          const skuRows = await tx
+            .select({ code: skus.code })
+            .from(skus)
+            .where(eq(skus.id, row.skuId))
+            .limit(1);
+          throw kitCannotHoldStock('over-receipt approval', [skuRows[0]?.code ?? row.skuId]);
+        }
         // The excess applies as a normal ledger append (corrections are new
         // events) — the system Receiving bin (ensured, idempotent) is its
         // location, the GRN line's batch identity its batch arm.
@@ -1077,7 +1092,14 @@ export class ReceivingCommand {
     }
   }
 
-  /** Every line's SKU exists in the tenant (404 naming the unknown id); returns the loaded rows. */
+  /**
+   * Every line's SKU exists in the tenant (404 naming the unknown id); returns
+   * the loaded rows. The read takes `.for('update')` in id order — story 11.4:
+   * the row locks serialize a GRN against a concurrent kit-create on the same
+   * SKU (which locks the same rows), so the "GRN commits stock onto a SKU
+   * that just became a kit" race cannot interleave; the kit create's
+   * stock/reservation guard then decides against committed state.
+   */
   private async loadSkus(
     tx: TenantTx,
     tenantId: string,
@@ -1087,7 +1109,9 @@ export class ReceivingCommand {
     const rows = await tx
       .select()
       .from(skus)
-      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)));
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)))
+      .orderBy(skus.id)
+      .for('update');
     const byId = new Map(rows.map((row) => [row.id, row]));
     for (const skuId of distinct) {
       if (!byId.has(skuId)) {

@@ -2648,7 +2648,7 @@
             }
           },
           "409": {
-            "description": "The SKU is already a kit (kit-already-composed), a component appears twice (duplicate-kit-component), or a component is itself a kit (kit-component-is-kit — flat BOM)",
+            "description": "The SKU is already a kit (kit-already-composed), a component appears twice (duplicate-kit-component), a component is itself a kit (kit-component-is-kit — flat BOM), or the SKU already holds stock or a live reservation — making it a kit would strand that stock (kit-sku-holds-stock)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3629,7 +3629,7 @@
             }
           },
           "409": {
-            "description": "Concurrent request on the same Idempotency-Key (conflict); or a serial-tracked movement scans a serial that already lives in a bin (duplicate-serial, naming it) or draws a serial the ledger last saw in another bin (serial-elsewhere, naming the last-known bin)",
+            "description": "Concurrent request on the same Idempotency-Key (conflict); a kit SKU can never hold stock (kit-cannot-hold-stock, naming it); or a serial-tracked movement scans a serial that already lives in a bin (duplicate-serial, naming it) or draws a serial the ledger last saw in another bin (serial-elsewhere, naming the last-known bin)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6776,7 +6776,7 @@
             }
           },
           "409": {
-            "description": "The PO is not open (po-not-open, naming the status), or a concurrent idempotent request (conflict)",
+            "description": "The PO is not open (po-not-open, naming the status), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7190,7 +7190,7 @@
             }
           },
           "409": {
-            "description": "Already approved/rejected (over-receipt-decided), or a concurrent idempotent request (conflict)",
+            "description": "Already approved/rejected (over-receipt-decided), the SKU became a kit since the GRN — the excess can never apply to it (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
