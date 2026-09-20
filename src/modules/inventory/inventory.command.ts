@@ -41,6 +41,9 @@ import {
   markHandlingUnitsAdjustedInTx,
 } from '../catalog/handling-unit.store';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
+// Story 11.4 — the kit-ness reads, same escape: file-level in-tx helpers out
+// of catalog (the store above), never a DI edge on `CatalogModule`.
+import { getKitSkuIdsInTx, kitCannotHoldStock } from '../catalog/kit.store';
 
 /**
  * `stock.adjustment` (Story 2.1): the first movement producer, exercisable
@@ -377,6 +380,17 @@ export class StockAdjustmentCommand {
         await this.assertBinInWarehouse(tx, command);
         const sku = await this.assertSkuInTenant(tx, command);
 
+        // ── story 11.4: a kit SKU never adjusts stock (FR-38) ───────────────
+        // A kit's stock IS its components' — an adjustment against a kit SKU
+        // would invent independent stock the explosion never sees. The
+        // kit-ness answer is one file-level lookup (catalog owns
+        // `kit_compositions`; this module cannot take a DI edge on
+        // `CatalogModule`), read in this same transaction.
+        const kitSkuIds = await getKitSkuIdsInTx(tx, command.tenantId, [command.skuId]);
+        if (kitSkuIds.length > 0) {
+          throw kitCannotHoldStock('stock.adjustment', [sku.code]);
+        }
+
         // ── story 10.2: conversion and the precision refusal, HERE ─────────
         // ONLY the precision rule moved behind the replay lookup, because only
         // it can tighten: the shape checks above the transaction are the same
@@ -572,9 +586,9 @@ export class StockAdjustmentCommand {
   private async assertSkuInTenant(
     tx: TenantTx,
     command: AdjustStockCommand,
-  ): Promise<{ id: string; uom: string; catchWeightTracked: boolean }> {
+  ): Promise<{ id: string; code: string; uom: string; catchWeightTracked: boolean }> {
     const rows = await tx
-      .select({ id: skus.id, uom: skus.uom, catchWeightTracked: skus.catchWeightTracked })
+      .select({ id: skus.id, code: skus.code, uom: skus.uom, catchWeightTracked: skus.catchWeightTracked })
       .from(skus)
       .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
       .limit(1);

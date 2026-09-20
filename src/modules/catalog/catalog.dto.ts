@@ -1,6 +1,10 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
-import { Transform } from 'class-transformer';
+import {
+  MAX_QUANTITY_BASE,
+  MIN_QUANTITY_BASE,
+  QUANTITY_FIELD_DESCRIPTION,
+} from '../../shared/primitives/quantity';
+import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayMinSize,
@@ -19,11 +23,13 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateNested,
 } from 'class-validator';
 import { IMPORT_MODES, GST_RATE_BPS_MAX } from './import.command';
 import { UOMS } from './uom';
 import { MAX_SKU_DIMENSION_MM, MAX_SKU_WEIGHT_GRAMS } from './sku-attributes';
 import { AXIS_NAME_MAX, MAX_PRODUCT_AXES, PRODUCT_NAME_MAX } from './product.command';
+import { MAX_KIT_COMPONENTS } from './kit.command';
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -491,6 +497,82 @@ export class ProductResponse {
 export class ProductListResponse {
   @ApiProperty({ type: [ProductResponse] })
   items!: ProductResponse[];
+
+  @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
+  nextCursor!: string | null;
+}
+
+// ── Story 11.4 — kits and bundles (FR-38, AD-19): a kit IS a SKU ───────────
+
+export class KitComponentDto {
+  @ApiProperty({ format: 'uuid', description: 'The component SKU\'s id' })
+  @IsUUID()
+  skuId!: string;
+
+  @ApiProperty({
+    example: 2,
+    minimum: MIN_QUANTITY_BASE,
+    maximum: MAX_QUANTITY_BASE,
+    description: `Per ONE kit, in the component's own base UoM. ${QUANTITY_FIELD_DESCRIPTION}`,
+  })
+  @IsNumber()
+  @Min(MIN_QUANTITY_BASE)
+  @Max(MAX_QUANTITY_BASE)
+  quantity!: number;
+}
+
+/** PUT /kit — the full BOM replaces whatever composition the SKU carried. */
+export class PutKitDto {
+  @ApiProperty({
+    type: [KitComponentDto],
+    minItems: 1,
+    maxItems: MAX_KIT_COMPONENTS,
+    description: `The flat BOM — at least one component, at most ${MAX_KIT_COMPONENTS}, no repeats, no kit-of-kit.`,
+  })
+  // NO @ArrayMinSize: an empty array must reach the command, whose guard
+  // answers the NAMED 400 `empty-kit-composition` — a generic DTO
+  // validation-failed would bury the arm the contract pins.
+  @IsArray()
+  @ArrayMaxSize(MAX_KIT_COMPONENTS)
+  @ValidateNested({ each: true })
+  @Type(() => KitComponentDto)
+  components!: KitComponentDto[];
+}
+
+export class KitComponentResponse {
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ example: 'CHILI-100' })
+  code!: string;
+
+  @ApiProperty({ example: 2, description: 'Per ONE kit, in the component\'s base UoM' })
+  qty!: number;
+}
+
+export class KitResponse {
+  @ApiProperty({ format: 'uuid', description: 'The kit SKU\'s id — a kit IS a SKU' })
+  skuId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ example: 'FIRSTAID-KIT' })
+  code!: string;
+
+  @ApiProperty({ example: 'First-aid kit' })
+  name!: string;
+
+  @ApiProperty({ type: [KitComponentResponse] })
+  components!: KitComponentResponse[];
+
+  @ApiProperty({ example: '2026-09-20T00:00:00.000Z' })
+  createdAt!: string;
+}
+
+export class KitListResponse {
+  @ApiProperty({ type: [KitResponse] })
+  items!: KitResponse[];
 
   @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor' })
   nextCursor!: string | null;

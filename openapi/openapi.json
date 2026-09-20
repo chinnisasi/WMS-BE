@@ -2549,6 +2549,352 @@
         ]
       }
     },
+    "/tenants/{tenantId}/catalog/skus/{skuId}/kit": {
+      "post": {
+        "operationId": "CatalogController_createKit",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "skuId",
+            "required": true,
+            "in": "path",
+            "description": "The SKU that becomes a kit",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutKitDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The kit with its composition (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KitResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid/empty component array (empty-kit-composition, validation-failed), or the kit naming itself (kit-self-reference)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The kit SKU (or a component SKU) does not exist in this tenant (not-found / kit-component-not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The SKU is already a kit (kit-already-composed), a component appears twice (duplicate-kit-component), a component is itself a kit (kit-component-is-kit — flat BOM), or the SKU already holds stock or a live reservation — making it a kit would strand that stock (kit-sku-holds-stock)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Makes an existing SKU a kit — attaches its flat composition (the only door into kit-ness; PUT replaces an existing kit's BOM)",
+        "tags": [
+          "catalog"
+        ]
+      },
+      "put": {
+        "operationId": "CatalogController_replaceKit",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "skuId",
+            "required": true,
+            "in": "path",
+            "description": "The kit SKU whose composition is replaced",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutKitDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KitResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid/empty component array (empty-kit-composition, validation-failed), or the kit naming itself (kit-self-reference)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The SKU does not exist — or is not a kit (replace never creates kit-ness) — or a component SKU is unknown (not-found / kit-component-not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A component appears twice (duplicate-kit-component), or a component is itself a kit (kit-component-is-kit — flat BOM)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Replaces an existing kit's whole composition (PUT semantics — the BOM is a set, not a partial body)",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/catalog/kits": {
+      "get": {
+        "operationId": "CatalogController_listKits",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KitListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor (invalid-cursor) or out-of-range limit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists kits — SKUs carrying composition rows, with their flat BOMs (keyset cursor pagination)",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
     "/health": {
       "get": {
         "operationId": "HealthController_health",
@@ -3283,7 +3629,7 @@
             }
           },
           "409": {
-            "description": "Concurrent request on the same Idempotency-Key (conflict); or a serial-tracked movement scans a serial that already lives in a bin (duplicate-serial, naming it) or draws a serial the ledger last saw in another bin (serial-elsewhere, naming the last-known bin)",
+            "description": "Concurrent request on the same Idempotency-Key (conflict); a kit SKU can never hold stock (kit-cannot-hold-stock, naming it); or a serial-tracked movement scans a serial that already lives in a bin (duplicate-serial, naming it) or draws a serial the ledger last saw in another bin (serial-elsewhere, naming the last-known bin)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6430,7 +6776,7 @@
             }
           },
           "409": {
-            "description": "The PO is not open (po-not-open, naming the status), or a concurrent idempotent request (conflict)",
+            "description": "The PO is not open (po-not-open, naming the status), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6844,7 +7190,7 @@
             }
           },
           "409": {
-            "description": "Already approved/rejected (over-receipt-decided), or a concurrent idempotent request (conflict)",
+            "description": "Already approved/rejected (over-receipt-decided), the SKU became a kit since the GRN — the excess can never apply to it (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9679,6 +10025,127 @@
           }
         }
       },
+      "KitComponentDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The component SKU's id"
+          },
+          "quantity": {
+            "type": "number",
+            "example": 2,
+            "minimum": 0.001,
+            "maximum": 9007199254740,
+            "description": "Per ONE kit, in the component's own base UoM. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded."
+          }
+        },
+        "required": [
+          "skuId",
+          "quantity"
+        ]
+      },
+      "PutKitDto": {
+        "type": "object",
+        "properties": {
+          "components": {
+            "minItems": 1,
+            "maxItems": 50,
+            "description": "The flat BOM — at least one component, at most 50, no repeats, no kit-of-kit.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KitComponentDto"
+            }
+          }
+        },
+        "required": [
+          "components"
+        ]
+      },
+      "KitComponentResponse": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "CHILI-100"
+          },
+          "qty": {
+            "type": "number",
+            "example": 2,
+            "description": "Per ONE kit, in the component's base UoM"
+          }
+        },
+        "required": [
+          "skuId",
+          "code",
+          "qty"
+        ]
+      },
+      "KitResponse": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The kit SKU's id — a kit IS a SKU"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "FIRSTAID-KIT"
+          },
+          "name": {
+            "type": "string",
+            "example": "First-aid kit"
+          },
+          "components": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KitComponentResponse"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "example": "2026-09-20T00:00:00.000Z"
+          }
+        },
+        "required": [
+          "skuId",
+          "tenantId",
+          "code",
+          "name",
+          "components",
+          "createdAt"
+        ]
+      },
+      "KitListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/KitResponse"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true,
+            "description": "Opaque keyset cursor"
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
       "HealthResponse": {
         "type": "object",
         "properties": {
@@ -11243,6 +11710,11 @@
             "nullable": true,
             "description": "The hold’s live journal state (held / released / committed / expired)"
           },
+          "parentLineId": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 11.4 — the kit line this component line exploded from at acceptance (null on ordinary lines and kit parents; a parent is any line another line names here)"
+          },
           "createdAt": {
             "type": "string",
             "description": "ISO-8601 UTC creation time"
@@ -11258,6 +11730,7 @@
           "status",
           "reservationId",
           "reservationState",
+          "parentLineId",
           "createdAt"
         ]
       },

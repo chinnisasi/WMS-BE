@@ -1,4 +1,4 @@
-import { Body, Catch, Controller, Get, HttpCode, HttpStatus, Param, Patch, PayloadTooLargeException, Post, Query, UploadedFile, UseFilters, UseGuards, UseInterceptors } from '@nestjs/common';
+import { Body, Catch, Controller, Get, HttpCode, HttpStatus, Param, Patch, PayloadTooLargeException, Post, Put, Query, UploadedFile, UseFilters, UseGuards, UseInterceptors } from '@nestjs/common';
 import type { ExceptionFilter } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 // Pulls in @types/multer's `Express.Multer.File` namespace augmentation.
@@ -35,14 +35,19 @@ import { SkuCommand } from './sku.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ProductCommand } from './product.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { KitCommand } from './kit.command';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ImportCatalogDto } from './catalog.dto';
 import {
   CatalogImportResponse,
   CreateProductDto,
+  KitListResponse,
+  KitResponse,
   PatchProductDto,
   PatchSkuDto,
   ProductListResponse,
   ProductResponse,
+  PutKitDto,
   SkuListResponse,
   SkuResponse,
 } from './catalog.dto';
@@ -70,6 +75,22 @@ export class SkuListQuery {
 }
 
 export class ProductListQuery {
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
+// Story 11.4 — the kit list query (the sku/product list shape, no filters yet).
+export class KitListQuery {
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()
@@ -130,6 +151,7 @@ export class CatalogController {
     private readonly importCommand: ImportCommand,
     private readonly skuCommand: SkuCommand,
     private readonly productCommand: ProductCommand,
+    private readonly kitCommand: KitCommand,
   ) {}
 
   @Post(':tenantId/catalog/imports')
@@ -377,6 +399,98 @@ export class CatalogController {
       key,
     );
     return { ...sku, uomConversions: sku.uomConversions.map((c) => ({ ...c })) };
+  }
+
+  // ── Story 11.4 — kits and bundles (FR-38, AD-19): a kit IS a SKU ──────────
+
+  @Post(':tenantId/catalog/skus/:skuId/kit')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Makes an existing SKU a kit — attaches its flat composition (the only door into kit-ness; PUT replaces an existing kit\'s BOM)' })
+  @ApiBody({ type: PutKitDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: KitResponse, description: 'The kit with its composition (a matching Idempotency-Key replays it)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid/empty component array (empty-kit-composition, validation-failed), or the kit naming itself (kit-self-reference)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The kit SKU (or a component SKU) does not exist in this tenant (not-found / kit-component-not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The SKU is already a kit (kit-already-composed), a component appears twice (duplicate-kit-component), a component is itself a kit (kit-component-is-kit — flat BOM), or the SKU already holds stock or a live reservation — making it a kit would strand that stock (kit-sku-holds-stock)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'skuId', format: 'uuid', description: 'The SKU that becomes a kit' })
+  async createKit(
+    @Param('tenantId') tenantId: string,
+    @Param('skuId') skuId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: PutKitDto,
+  ): Promise<KitResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const kit = await this.kitCommand.create(
+      { tenantId, actorUserId: session.userId, skuId, components: dto.components },
+      key,
+    );
+    return { ...kit, components: kit.components.map((c) => ({ ...c })) };
+  }
+
+  @Put(':tenantId/catalog/skus/:skuId/kit')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Replaces an existing kit\'s whole composition (PUT semantics — the BOM is a set, not a partial body)' })
+  @ApiBody({ type: PutKitDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: KitResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid/empty component array (empty-kit-composition, validation-failed), or the kit naming itself (kit-self-reference)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The SKU does not exist — or is not a kit (replace never creates kit-ness) — or a component SKU is unknown (not-found / kit-component-not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A component appears twice (duplicate-kit-component), or a component is itself a kit (kit-component-is-kit — flat BOM)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'skuId', format: 'uuid', description: 'The kit SKU whose composition is replaced' })
+  async replaceKit(
+    @Param('tenantId') tenantId: string,
+    @Param('skuId') skuId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: PutKitDto,
+  ): Promise<KitResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const kit = await this.kitCommand.put(
+      { tenantId, actorUserId: session.userId, skuId, components: dto.components },
+      key,
+    );
+    return { ...kit, components: kit.components.map((c) => ({ ...c })) };
+  }
+
+  @Get(':tenantId/catalog/kits')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Lists kits — SKUs carrying composition rows, with their flat BOMs (keyset cursor pagination)' })
+  @ApiOkResponse({ type: KitListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor (invalid-cursor) or out-of-range limit (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async listKits(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: KitListQuery,
+  ): Promise<KitListResponse> {
+    assertOwnTenant(session, tenantId);
+    const page = await this.kitCommand.list(
+      tenantId,
+      query.cursor,
+      query.limit === undefined ? undefined : query.limit,
+    );
+    return {
+      items: page.items.map((item) => ({ ...item, components: item.components.map((c) => ({ ...c })) })),
+      nextCursor: page.nextCursor,
+    };
   }
 }
 

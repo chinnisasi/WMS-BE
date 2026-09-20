@@ -83,7 +83,7 @@ export class ReceivingController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or the operator was demoted to accountant (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, purchase order, or a line\'s SKU does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The PO is not open (po-not-open, naming the status), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The PO is not open (po-not-open, naming the status), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
   async submitGoodsReceipt(
@@ -257,7 +257,7 @@ export class ReceivingController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks review.decide (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No over-receipt with this id exists in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Already approved/rejected (over-receipt-decided), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Already approved/rejected (over-receipt-decided), the SKU became a kit since the GRN — the excess can never apply to it (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'overReceiptId', format: 'uuid' })
