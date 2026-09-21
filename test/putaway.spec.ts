@@ -1222,7 +1222,122 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       .then((res) => expect(res.body).toMatchObject({ code: 'not-found' }));
   });
 
-  // ── RLS + CHECK (deployment parity) ────────────────────────────────────────
+  // ── Story 11-5 — the dimensional-capacity gates (matrix rows 1–9) ──────────
+
+  it('dimensional capacity: the suggestion skips failing bins, the three new placement arms fire with the bin and both numbers, a SKU without attributes still places under the unit gate alone', async () => {
+    // A dimensioned SKU: PUT-D weighs 5 kg and measures 500×400×300 mm
+    // (60,000,000 mm³ per unit). Seeded through the real surfaces: import,
+    // then the SKU edit's attribute fields.
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'PUT-D,Putaway Item D,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const dimSkuId = (skus.body.items as { code: string; id: string }[]).find((item) => item.code === 'PUT-D')!.id;
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${dimSkuId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ weightGrams: 5000, lengthMm: 500, widthMm: 400, heightMm: 300 })
+      .expect(200);
+
+    // Four bins in their own zone, codes sorting before every `A-*` bin so
+    // the empty `0-*` group ranks first in the suggestion (all empty, then
+    // code order). Each carries exactly one limit:
+    // `0-D` fails the dim fit (length 400 < the SKU's 500), `0-V` fails the
+    // volume gate (1,000,000,000 mm³ vs 60,000,000 per unit), `0-W` fails the
+    // weight gate (5,000 g = exactly one unit), and `0-F` fits everything.
+    const zoneD = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'D', name: 'Dimensional zone' })
+        .expect(201)
+    ).body.id as string;
+    const createDimBin = async (code: string, attrs: Record<string, unknown>): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneD}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf', ...attrs })
+          .expect(201)
+      ).body.id as string;
+    const bin0DId = await createDimBin('0-D', { lengthMm: 400, widthMm: 1000, heightMm: 1000 });
+    const bin0V = await createDimBin('0-V', { lengthMm: 1000, widthMm: 1000, heightMm: 1000 });
+    const bin0W = await createDimBin('0-W', { maxWeightGrams: 5000 });
+    const bin0F = await createDimBin('0-F', {
+      lengthMm: 1000,
+      widthMm: 1000,
+      heightMm: 1000,
+      maxWeightGrams: 100000,
+    });
+
+    // The suggestion skips the failing candidates: among the empty bins the
+    // ranking is 0-D, 0-F, 0-V, 0-W — 0-D is skipped (oversize), 0-F fits, so
+    // the task must point at 0-F (never at 0-D/0-V/0-W).
+    const first = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 2 }]);
+    const tasks = await getTasks();
+    const task = tasks.find((entry) => entry.grnLineId === first.lines[0]!.id)!;
+    expect(task.suggestedBin).toEqual({ binId: bin0F, binCode: '0-F' });
+    expect(task.rationale).toBe('Lowest occupancy (0/100) — room for 100');
+
+    // The placement within every gate matches the suggestion — no reason code.
+    await placeForLine(first.lines[0]!, bin0F, { qty: 1 }).expect(201);
+
+    // Dim fit trips (400 bin-item-oversize, naming bin + dimension + both
+    // numbers): 0-D's length is 400 mm, the SKU's is 500 mm.
+    const oversize = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const oversizeRes = await placeForLine(oversize.lines[0]!, bin0DId).expect(400);
+    expect(oversizeRes.body).toMatchObject({ status: 400, code: 'bin-item-oversize' });
+    expect(oversizeRes.body.detail).toContain('0-D');
+    expect(oversizeRes.body.detail).toContain('length');
+    expect(oversizeRes.body.detail).toContain('400');
+    expect(oversizeRes.body.detail).toContain('500');
+    expect(await ledgerRows(oversize.grnId)).toHaveLength(1); // grn.received only
+    expect(await placementRowCount(oversize.grnId)).toBe(0);
+
+    // Weight gate: one 5 kg unit exactly fills 0-W's 5,000 g limit, the second
+    // overflows it — the load read is cumulative over the bin's stock.
+    const firstWeight = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    await placeForLine(firstWeight.lines[0]!, bin0W, { reasonCode: 'operator-preference' }).expect(201);
+    const secondWeight = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const weightRes = await placeForLine(secondWeight.lines[0]!, bin0W, {}).expect(400);
+    expect(weightRes.body).toMatchObject({ status: 400, code: 'bin-overweight' });
+    expect(weightRes.body.detail).toContain('0-W');
+    expect(weightRes.body.detail).toContain('10000');
+    expect(weightRes.body.detail).toContain('5000');
+    expect(await placementRowCount(secondWeight.grnId)).toBe(0);
+
+    // Volume gate: sixteen 60,000,000 mm³ units sit just under 0-V's
+    // 1,000,000,000 mm³ (via the adjustment surface — the load read over
+    // stock_on_hand), the seventeenth overflows it.
+    const volGrn = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 17 }]);
+    await adjust({ warehouseId, skuId: dimSkuId, binId: bin0V, quantityDelta: 16, reasonCode: 'cycle-count', note: 'prefill 0-V' }).expect(201);
+    const volumeRes = await placeForLine(volGrn.lines[0]!, bin0V, { qty: 1, reasonCode: 'operator-preference' }).expect(400);
+    expect(volumeRes.body).toMatchObject({ status: 400, code: 'bin-volume-exceeded' });
+    expect(volumeRes.body.detail).toContain('0-V');
+    expect(volumeRes.body.detail).toContain('1020000000');
+    expect(volumeRes.body.detail).toContain('1000000000');
+    expect(await ledgerRows(volGrn.grnId)).toHaveLength(1);
+    expect(await placementRowCount(volGrn.grnId)).toBe(0);
+
+    // Fail-open on missing attributes: PUT-B carries no attributes, so it
+    // places into the weight-limited 0-W under the unit gate alone.
+    const plainGrn = await blindGrn([{ poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 5 }]);
+    await placeForLine(plainGrn.lines[0]!, bin0W, { reasonCode: 'operator-preference' }).expect(201);
+  });
 
   it('RLS: a non-superuser session scoped to one tenant sees no putaway rows of another tenant and cannot write foreign rows', async () => {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
