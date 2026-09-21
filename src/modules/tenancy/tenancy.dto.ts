@@ -2,8 +2,9 @@ import { ApiProperty } from '@nestjs/swagger';
 import { MAX_QUANTITY_BASE } from '../../shared/primitives/quantity';
 // Story 11-5: the bin capacity caps (same import the SKU-attribute DTOs make
 // to `sku-attributes.ts` — the DTO mirrors the command's bounds, the command
-// enforces them). No cycle: `bin.command` never imports this module.
-import { MAX_BIN_DIMENSION_MM, MAX_BIN_WEIGHT_GRAMS } from './bin.command';
+// enforces them). A standalone file (the 11-5 review triage #10): importing
+// `bin.command` from a DTO would pull its whole module graph in at load time.
+import { MAX_BIN_DIMENSION_MM, MAX_BIN_WEIGHT_GRAMS } from './bin-capacity';
 import { ADDRESS_FIELD_LENGTHS, PINCODE_RE } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { Transform, Type } from 'class-transformer';

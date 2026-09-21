@@ -1015,7 +1015,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, invalid body, a system bin (validation-failed names the bin), or a body mixing blocked with capacity attributes",
+            "description": "Missing or malformed Idempotency-Key, invalid body, a system bin on the blocked arm (validation-failed names the bin — the capacity arm deliberately permits system bins), a body mixing blocked with capacity attributes, a body carrying neither (validation-failed), or a non-boolean blocked (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1154,7 +1154,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, a structural guard (validation-failed / bin-retired / bin-blocked — a blocked SOURCE is allowed, the only way to empty a blocked bin; only the target must be live), or a target overflow (bin-full names capacity and occupancy — nothing committed)",
+            "description": "Missing or malformed Idempotency-Key, a structural guard (validation-failed / bin-retired / bin-blocked — a blocked SOURCE is allowed, the only way to empty a blocked bin; only the target must be live), a target overflow (bin-full names capacity and occupancy), or the target over its physical limits (bin-overweight / bin-volume-exceeded / bin-item-oversize, story 11-5 — nothing committed in any arm)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7746,7 +7746,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, an invalid body, a system target bin (validation-failed naming the bin), a blocked bin (bin-blocked naming the bin), a full bin (bin-full naming the bin, its capacity and occupancy), an over-place (validation-failed naming the remaining quantity), a missing/malformed mismatch reason, or a serial-arm violation (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, an invalid body, a system target bin (validation-failed naming the bin), a blocked bin (bin-blocked naming the bin), a full bin (bin-full naming the bin, its capacity and occupancy), over its physical limits (bin-overweight / bin-volume-exceeded naming the bin, the limit and the load; bin-item-oversize naming the bin, the dimension and both sizes — story 11-5), an over-place (validation-failed naming the remaining quantity), a missing/malformed mismatch reason, or a serial-arm violation (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {

@@ -19,6 +19,7 @@ import {
 import { uuidv7 } from '../../shared/primitives/ids';
 import {
   MAX_QUANTITY_MILLI,
+  QUANTITY_DECIMALS,
   QUANTITY_SCALE,
   assertRecordableQuantity,
   fromMilli,
@@ -536,6 +537,13 @@ export class PutawayCommand {
       // weight → volume → dim fit. A bin without the matching limit skips the
       // gate (fail-open on missing attributes); a SKU without the attribute
       // contributes zero weight/volume.
+      //
+      // SYNC HAZARD: this arm list exists in THREE places that must never
+      // diverge — here, `candidateFitsSku` (the suggestion + the task
+      // derivation) and `mergeBin`'s target gates — because the suggestion
+      // must never point at a bin the gates refuse. A fourth arm (the
+      // spec's Epic 19/20 extension note predicts FR-71 ones) lands in all
+      // three, in the same order.
       if (targetBin.maxWeightGrams !== null) {
         const weightLimit = BigInt(targetBin.maxWeightGrams) * BigInt(QUANTITY_SCALE);
         const weightAfter = load.weightLoad + BigInt(scaled.qty) * BigInt(sku.weightGrams ?? 0);
@@ -1015,7 +1023,13 @@ export async function binOccupancyInTx(
       volumeLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * (coalesce(${skus.lengthMm}, 0) * coalesce(${skus.widthMm}, 0) * coalesce(${skus.heightMm}, 0))), 0)::numeric`,
     })
     .from(stockOnHand)
-    .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+    // LEFT join, deliberately: the units sum must stay join-independent (the
+    // pre-11.5 read summed stock_on_hand unconditionally), and this read must
+    // agree with `binCandidatesInTx`'s LEFT join — the repo has no FKs, so an
+    // inner join would silently drop a stock row from the UNITS gate too if
+    // its sku row were ever missing (11-5 review triage #5). The coalesced
+    // attributes make the load sums unaffected.
+    .leftJoin(skus, eq(skus.id, stockOnHand.skuId))
     .where(
       and(
         eq(stockOnHand.tenantId, tenantId),
@@ -1139,7 +1153,13 @@ function fromMilliText(milli: bigint): string {
   const negative = milli < 0n;
   const abs = negative ? -milli : milli;
   const whole = (abs / BigInt(QUANTITY_SCALE)).toString();
-  const frac = (abs % BigInt(QUANTITY_SCALE)).toString().padStart(3, '0').replace(/0+$/, '');
+  // The pad width is `QUANTITY_DECIMALS`, not a literal — the scale is
+  // defined by that one number, and a pad-3 copy beside it is exactly the
+  // drift the constant exists to prevent (11-5 review triage #9).
+  const frac = (abs % BigInt(QUANTITY_SCALE))
+    .toString()
+    .padStart(QUANTITY_DECIMALS, '0')
+    .replace(/0+$/, '');
   const text = frac.length === 0 ? whole : `${whole}.${frac}`;
   return negative ? `-${text}` : text;
 }

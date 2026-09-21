@@ -774,6 +774,9 @@ export class BinCommand {
         // conservative coexistence as the placement), ordered weight → volume
         // → dim fit. The load figures are milli-scaled: qty is milli-units ×
         // grams (or mm³) is a milli-load, compared against limit × 1000.
+        // SYNC HAZARD: the arm list must never diverge from the placement's
+        // gates and `candidateFitsSku` (see the placement copy's note) — a
+        // fourth arm lands in all three, in the same order.
         if (target.maxWeightGrams !== null) {
           const weightAfter = targetLoad.weightLoad + movedWeight;
           if (weightAfter > BigInt(target.maxWeightGrams) * BigInt(QUANTITY_SCALE)) {
@@ -1279,12 +1282,9 @@ function assertWholeUnitCapacity(capacity: number): number {
 }
 
 // ── story 11-5: the bin's capacity attributes (FR-39) ────────────────────────
-
-/** Bins are BIGGER than SKUs (a floor location is an area): 100 m axes. */
-export const MAX_BIN_DIMENSION_MM = 100_000;
-
-/** Bins are BIGGER than SKUs: 100 tonnes (vs the SKU side's 1 tonne cap). */
-export const MAX_BIN_WEIGHT_GRAMS = 100_000_000;
+// The caps live in `bin-capacity.ts` (the 11.2 `sku-attributes.ts` precedent —
+// the DTO mirror imports them without pulling this command's module graph).
+import { MAX_BIN_DIMENSION_MM, MAX_BIN_WEIGHT_GRAMS } from './bin-capacity';
 
 /**
  * The bin's optional capacity attribute fields a write edge may carry.

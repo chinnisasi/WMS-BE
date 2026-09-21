@@ -62,7 +62,7 @@ export class PutawayController {
     description:
       'Placement recorded: the placement snapshot with suggestion-vs-actual (the idempotency snapshot — a replay re-serves it, nothing re-moves)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, a system target bin (validation-failed naming the bin), a blocked bin (bin-blocked naming the bin), a full bin (bin-full naming the bin, its capacity and occupancy), an over-place (validation-failed naming the remaining quantity), a missing/malformed mismatch reason, or a serial-arm violation (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, a system target bin (validation-failed naming the bin), a blocked bin (bin-blocked naming the bin), a full bin (bin-full naming the bin, its capacity and occupancy), over its physical limits (bin-overweight / bin-volume-exceeded naming the bin, the limit and the load; bin-item-oversize naming the bin, the dimension and both sizes — story 11-5), an over-place (validation-failed naming the remaining quantity), a missing/malformed mismatch reason, or a serial-arm violation (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or the operator lacks putaway.execute (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, GRN line, SKU, batch, or bin does not exist in this tenant (not-found)') })

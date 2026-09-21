@@ -395,7 +395,7 @@ export class TenancyController {
   @ApiBody({ type: PatchBinDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: BinResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, a system bin (validation-failed names the bin), or a body mixing blocked with capacity attributes') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, a system bin on the blocked arm (validation-failed names the bin — the capacity arm deliberately permits system bins), a body mixing blocked with capacity attributes, a body carrying neither (validation-failed), or a non-boolean blocked (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied) or bin.create (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Bin does not exist in this warehouse (not-found)') })
@@ -419,6 +419,21 @@ export class TenancyController {
     // attributes; the re-homing precedent in reverse). The two arms never mix
     // in one request (one idempotency key per request); a pre-11.5 body was
     // always `{blocked}`-shaped, so the state arm's contract is unchanged.
+    // `blocked: null` must 400 here, NOT reach the state command: the DTO's
+    // `@IsOptional` skips validation for null as well as undefined, and
+    // `setBlocked` writing null into a NOT NULL column would answer 500 where
+    // pre-11.5 answered 400 (the 11-5 review's one high finding). The four
+    // capacity attributes keep their null-means-clear semantics — the
+    // asymmetry is deliberate: `blocked` is a state toggle, the attrs are
+    // limits.
+    if (dto.blocked !== undefined && typeof dto.blocked !== 'boolean') {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'blocked must be a boolean',
+        'The PATCH body carries `blocked: null` — send `true`/`false` to change the bin\'s operational state, or omit `blocked` entirely to change a capacity attribute.',
+      );
+    }
     const hasBlocked = dto.blocked !== undefined;
     const hasCapacity =
       dto.lengthMm !== undefined ||
@@ -478,7 +493,7 @@ export class TenancyController {
   @ApiBody({ type: MergeBinDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: BinMergeResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a structural guard (validation-failed / bin-retired / bin-blocked — a blocked SOURCE is allowed, the only way to empty a blocked bin; only the target must be live), or a target overflow (bin-full names capacity and occupancy — nothing committed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a structural guard (validation-failed / bin-retired / bin-blocked — a blocked SOURCE is allowed, the only way to empty a blocked bin; only the target must be live), a target overflow (bin-full names capacity and occupancy), or the target over its physical limits (bin-overweight / bin-volume-exceeded / bin-item-oversize, story 11-5 — nothing committed in any arm)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.retire (role-denied — Owner and Ops Manager only)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Source or target bin does not exist in this warehouse (not-found)') })

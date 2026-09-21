@@ -1308,6 +1308,32 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     expect(await ledgerRows(oversize.grnId)).toHaveLength(1); // grn.received only
     expect(await placementRowCount(oversize.grnId)).toBe(0);
 
+    // The other two dim-fit dimensions bind the same way (triage #11): the
+    // SKU's 400 mm width does not fit 0-WD's 300 mm width, its 300 mm height
+    // does not fit 0-HD's 200 mm — each arm names ITS dimension and both
+    // numbers.
+    const bin0WD = await createDimBin('0-WD', { lengthMm: 1000, widthMm: 300, heightMm: 1000 });
+    const widthGrn = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const widthRes = await placeForLine(widthGrn.lines[0]!, bin0WD).expect(400);
+    expect(widthRes.body).toMatchObject({ status: 400, code: 'bin-item-oversize' });
+    expect(widthRes.body.detail).toContain('0-WD');
+    expect(widthRes.body.detail).toContain('width');
+    expect(widthRes.body.detail).toContain('300');
+    expect(widthRes.body.detail).toContain('400');
+    expect(await ledgerRows(widthGrn.grnId)).toHaveLength(1);
+    expect(await placementRowCount(widthGrn.grnId)).toBe(0);
+
+    const bin0HD = await createDimBin('0-HD', { lengthMm: 1000, widthMm: 1000, heightMm: 200 });
+    const heightGrn = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const heightRes = await placeForLine(heightGrn.lines[0]!, bin0HD).expect(400);
+    expect(heightRes.body).toMatchObject({ status: 400, code: 'bin-item-oversize' });
+    expect(heightRes.body.detail).toContain('0-HD');
+    expect(heightRes.body.detail).toContain('height');
+    expect(heightRes.body.detail).toContain('200');
+    expect(heightRes.body.detail).toContain('300');
+    expect(await ledgerRows(heightGrn.grnId)).toHaveLength(1);
+    expect(await placementRowCount(heightGrn.grnId)).toBe(0);
+
     // Weight gate: one 5 kg unit exactly fills 0-W's 5,000 g limit, the second
     // overflows it — the load read is cumulative over the bin's stock.
     const firstWeight = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
@@ -1319,6 +1345,9 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     expect(weightRes.body.detail).toContain('10000');
     expect(weightRes.body.detail).toContain('5000');
     expect(await placementRowCount(secondWeight.grnId)).toBe(0);
+    // The refusal left the bin exactly as it found it (triage #12): 0-W still
+    // holds its single pre-attempt unit — no partial movement, no on-hand drift.
+    expect(await plainOnHand(bin0W, dimSkuId)).toBe(1);
 
     // Volume gate: sixteen 60,000,000 mm³ units sit just under 0-V's
     // 1,000,000,000 mm³ (via the adjustment surface — the load read over
@@ -1333,10 +1362,91 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     expect(await ledgerRows(volGrn.grnId)).toHaveLength(1);
     expect(await placementRowCount(volGrn.grnId)).toBe(0);
 
+    // Gate ORDER (triage #15): the unit gate fires FIRST. 0-U carries both a
+    // unit capacity the placement trips (1 + 1 > 1) and a weight limit the
+    // SAME placement would also overflow (5,000 + 5,000 g > 5,000 g) — the
+    // rejection is `bin-full` naming capacity and occupancy, never
+    // `bin-overweight`.
+    const bin0U = await createDimBin('0-U', { capacity: 1, maxWeightGrams: 5000, lengthMm: 500, widthMm: 500, heightMm: 500 });
+    await adjust({ warehouseId, skuId: dimSkuId, binId: bin0U, quantityDelta: 1, reasonCode: 'cycle-count', note: 'prefill 0-U' }).expect(201);
+    const orderGrn = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const orderRes = await placeForLine(orderGrn.lines[0]!, bin0U, { reasonCode: 'operator-preference' }).expect(400);
+    expect(orderRes.body).toMatchObject({ status: 400, code: 'bin-full' });
+    expect(orderRes.body.detail).toContain('0-U');
+    expect(orderRes.body.detail).toContain('holds 1 of 1');
+    expect(await ledgerRows(orderGrn.grnId)).toHaveLength(1);
+    expect(await placementRowCount(orderGrn.grnId)).toBe(0);
+
     // Fail-open on missing attributes: PUT-B carries no attributes, so it
     // places into the weight-limited 0-W under the unit gate alone.
     const plainGrn = await blindGrn([{ poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 5 }]);
     await placeForLine(plainGrn.lines[0]!, bin0W, { reasonCode: 'operator-preference' }).expect(201);
+  });
+
+  it('dimensional capacity: none fit through a NEW physical gate — suggestion null with the unchanged rationale (triage #12)', async () => {
+    // PUT-D, dimensioned by the 11-5 test above: 5 kg, 500×400×300 mm. The
+    // pre-11.5 "nothing fits" arm (the 120-unit line) tripped the UNIT gate
+    // only; here the candidate list is non-empty and every candidate fails a
+    // physical gate instead.
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const dimSkuId = (skus.body.items as { code: string; id: string }[]).find((item) => item.code === 'PUT-D')!.id;
+
+    // A second warehouse whose ONLY storage bin fails the weight gate
+    // (1,000 g < PUT-D's 5,000 g per unit): the unit gate passes (1 of 100),
+    // so a missing physical arm would point the task at this bin.
+    const warehouse2Id = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `PUT2-${ulid().slice(10, 16).toUpperCase()}`, name: `Second Putaway Depot ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zone2Id = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouse2Id}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A', name: 'Second Aisle A' })
+        .expect(201)
+    ).body.id as string;
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses/${warehouse2Id}/zones/${zone2Id}/bins`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ code: 'B-01', capacity: 100, type: 'shelf', maxWeightGrams: 1000 })
+      .expect(201);
+
+    // Receive one 5 kg unit into the second warehouse's Receiving bin (the
+    // suite helper is bound to the first warehouse's id — inline the call).
+    const grnRes = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/goods-receipts`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        warehouseId: warehouse2Id,
+        poId: null,
+        blindReasonCode: 'unannounced-delivery',
+        occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+        lines: [{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 1 }],
+      })
+      .expect(201);
+    const grn = grnRes.body.goodsReceipt as { id: string; lines: { id: string }[] };
+
+    // The task derivation gates every candidate through `candidateFitsSku` —
+    // the task carries NO suggestion and the UNCHANGED rationale wording.
+    const tasksRes = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/putaway/tasks?warehouseId=${warehouse2Id}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const task = (tasksRes.body.items as { grnLineId: string; suggestedBin: { binId: string } | null; rationale: string }[]).find(
+      (entry) => entry.grnLineId === grn.lines[0]!.id,
+    )!;
+    expect(task.suggestedBin).toBeNull();
+    expect(task.rationale).toBe('No storage bin has room for these units');
   });
 
   it('RLS: a non-superuser session scoped to one tenant sees no putaway rows of another tenant and cannot write foreign rows', async () => {
