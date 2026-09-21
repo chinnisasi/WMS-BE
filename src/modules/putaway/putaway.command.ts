@@ -332,7 +332,19 @@ export class PutawayCommand {
         );
       }
       const skuRows = await tx
-        .select({ id: skus.id, code: skus.code, uom: skus.uom, batchTracked: skus.batchTracked, serialTracked: skus.serialTracked })
+        .select({
+          id: skus.id,
+          code: skus.code,
+          uom: skus.uom,
+          batchTracked: skus.batchTracked,
+          serialTracked: skus.serialTracked,
+          // Story 11-5: the static attributes the weight/volume/dim-fit gates
+          // consume (null = contributes units only).
+          weightGrams: skus.weightGrams,
+          lengthMm: skus.lengthMm,
+          widthMm: skus.widthMm,
+          heightMm: skus.heightMm,
+        })
         .from(skus)
         .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
         .limit(1);
@@ -459,7 +471,19 @@ export class PutawayCommand {
       // ledger's insufficiency guard; no existing path locks bin rows, so
       // bins-row → serial-lock → warehouse-lock stays acyclic.)
       const binRows = await tx
-        .select({ id: bins.id, code: bins.code, capacity: bins.capacity, blocked: bins.blocked, systemOwned: bins.systemOwned, retiredAt: bins.retiredAt })
+        .select({
+          id: bins.id,
+          code: bins.code,
+          capacity: bins.capacity,
+          blocked: bins.blocked,
+          systemOwned: bins.systemOwned,
+          retiredAt: bins.retiredAt,
+          // Story 11-5: the bin's physical limits (null = unconstrained).
+          lengthMm: bins.lengthMm,
+          widthMm: bins.widthMm,
+          heightMm: bins.heightMm,
+          maxWeightGrams: bins.maxWeightGrams,
+        })
         .from(bins)
         .where(
           and(
@@ -493,15 +517,52 @@ export class PutawayCommand {
         // FR-10: the rejection names the reason and the bin.
         throw binBlocked(targetBin.code);
       }
-      const occupancy = await binOccupancyInTx(
+      // ── the load read (the gates' shared input — one query) ─────────────
+      // Story 11-5: `binOccupancyInTx` is now the load-read (units + weight +
+      // volume), still inside the `.for('update')` window the unit gate
+      // established. Every gate below fires on the SAME read.
+      const load = await binOccupancyInTx(
         tx,
         command.tenantId,
         command.warehouseId,
         targetBin.id,
       );
-      if (occupancy + scaled.qty > targetBin.capacity) {
+      if (load.units + scaled.qty > targetBin.capacity) {
         // FR-10: the rejection names the capacity and the occupancy.
-        throw binFull(targetBin.code, targetBin.capacity, occupancy);
+        throw binFull(targetBin.code, targetBin.capacity, load.units);
+      }
+      // ── story 11-5: the three new gates, AFTER the unit gate (the
+      // conservative coexistence — a dimmed SKU counts toward both), ordered
+      // weight → volume → dim fit. A bin without the matching limit skips the
+      // gate (fail-open on missing attributes); a SKU without the attribute
+      // contributes zero weight/volume.
+      if (targetBin.maxWeightGrams !== null) {
+        const weightLimit = BigInt(targetBin.maxWeightGrams) * BigInt(QUANTITY_SCALE);
+        const weightAfter = load.weightLoad + BigInt(scaled.qty) * BigInt(sku.weightGrams ?? 0);
+        if (weightAfter > weightLimit) {
+          throw binOverweight(targetBin.code, targetBin.maxWeightGrams, weightAfter);
+        }
+      }
+      if (targetBin.lengthMm !== null && targetBin.widthMm !== null && targetBin.heightMm !== null) {
+        const binVolume = BigInt(targetBin.lengthMm * targetBin.widthMm * targetBin.heightMm);
+        const perUnitVolume = (sku.lengthMm ?? 0) * (sku.widthMm ?? 0) * (sku.heightMm ?? 0);
+        const volumeAfter = load.volumeLoad + BigInt(scaled.qty) * BigInt(perUnitVolume);
+        if (volumeAfter > binVolume * BigInt(QUANTITY_SCALE)) {
+          throw binVolumeExceeded(
+            targetBin.code,
+            targetBin.lengthMm * targetBin.widthMm * targetBin.heightMm,
+            volumeAfter,
+          );
+        }
+      }
+      if (sku.lengthMm !== null && targetBin.lengthMm !== null && sku.lengthMm > targetBin.lengthMm) {
+        throw binItemOversize(targetBin.code, 'length', sku.lengthMm, targetBin.lengthMm, sku.code);
+      }
+      if (sku.widthMm !== null && targetBin.widthMm !== null && sku.widthMm > targetBin.widthMm) {
+        throw binItemOversize(targetBin.code, 'width', sku.widthMm, targetBin.widthMm, sku.code);
+      }
+      if (sku.heightMm !== null && targetBin.heightMm !== null && sku.heightMm > targetBin.heightMm) {
+        throw binItemOversize(targetBin.code, 'height', sku.heightMm, targetBin.heightMm, sku.code);
       }
 
       // ── the suggestion (capacity-only v1, RE-DERIVED at placement) ──────
@@ -511,6 +572,14 @@ export class PutawayCommand {
         command.warehouseId,
         command.skuId,
         scaled.qty,
+        // Story 11-5: the same SKU attributes gate the suggestion — the
+        // re-derivation never points at a bin the gates would refuse.
+        {
+          weightGrams: sku.weightGrams,
+          lengthMm: sku.lengthMm,
+          widthMm: sku.widthMm,
+          heightMm: sku.heightMm,
+        },
       );
       const suggestedBinId = suggestion?.binId ?? null;
       if (suggestedBinId !== command.toBinId && command.reasonCode === null) {
@@ -726,9 +795,10 @@ export function isMismatchReason(value: string): value is PutawayMismatchReasonC
 /**
  * The capacity-only v1 suggestion (the recorded FR-10 deviation): among the
  * warehouse's storage bins — not blocked, not system-owned — with room for
- * the line's quantity (current occupancy + qty ≤ capacity), the LOWEST
- * occupancy wins, then bin code order. No velocity class, no zone affinity,
- * no nightly job (those ship with the deferred report story).
+ * the line's quantity (story 11-5: which fit the unit, weight, volume and
+ * dim-fit gates together — `candidateFitsSku`), the LOWEST occupancy wins,
+ * then bin code order. No velocity class, no zone affinity, no nightly job
+ * (those ship with the deferred report story).
  */
 export async function suggestBinInTx(
   tx: TenantTx,
@@ -736,10 +806,11 @@ export async function suggestBinInTx(
   warehouseId: string,
   skuId: string,
   qty: number,
+  skuAttrs: SkuPhysicalAttributes,
 ): Promise<{ binId: string; binCode: string; rationale: string } | null> {
   const candidates = await binCandidatesInTx(tx, tenantId, warehouseId);
   for (const candidate of candidates) {
-    if (candidate.occupancy + qty <= candidate.capacity) {
+    if (candidateFitsSku(candidate, skuAttrs, qty)) {
       const room = candidate.capacity - candidate.occupancy;
       return {
         binId: candidate.binId,
@@ -757,13 +828,90 @@ export interface PutawayBinCandidate {
   readonly binCode: string;
   readonly capacity: number;
   readonly occupancy: number;
+  // ── story 11-5: the bin's physical limits + current weight/volume load ───
+  readonly lengthMm: number | null;
+  readonly widthMm: number | null;
+  readonly heightMm: number | null;
+  readonly maxWeightGrams: number | null;
+  readonly weightLoad: bigint;
+  readonly volumeLoad: bigint;
+}
+
+/**
+ * The SKU side of the fit predicate — the static physical attributes a
+ * placement or task-derivation read carries. Every field nullable: a SKU
+ * without attributes contributes only units (fail-open on missing attributes).
+ */
+export interface SkuPhysicalAttributes {
+  readonly weightGrams: number | null;
+  readonly lengthMm: number | null;
+  readonly widthMm: number | null;
+  readonly heightMm: number | null;
+}
+
+/**
+ * Story 11-5 — the ONE fit predicate all three suggestion consumers share
+ * (the suggestion, the placement's re-derivation, the task derivation): a bin
+ * fits a (SKU, qty) when every declared gate passes. Full when ANY declared
+ * gate trips:
+ *
+ * - unit gate — occupancy + qty ≤ capacity (unchanged, always declared);
+ * - weight gate — load + qty×weight ≤ maxWeightGrams × 1000 (milli-scaled:
+ *   qty is milli-units and weight is grams, so the load is milli-grams);
+ * - volume gate — load + qty×(l×w×h) ≤ (L×W×H) × 1000; binds only when the
+ *   bin declares all three dims (a half-dimensioned bin cannot bound volume);
+ * - dim fit — the SKU's dimension never exceeds the bin's same dimension,
+ *   checked per-dimension, both sides present (oversize binds only when both
+ *   sides are dimensioned).
+ *
+ * A SKU with no attributes contributes zero weight and zero volume, so the
+ * three new gates pass wherever the unit gate passes — byte-identical to
+ * pre-11.5 behavior. A dimmed SKU double-counts (units AND weight/volume) —
+ * the deliberate conservative coexistence (see the spec's Design Notes).
+ */
+export function candidateFitsSku(
+  candidate: PutawayBinCandidate,
+  sku: SkuPhysicalAttributes,
+  qtyMilli: number,
+): boolean {
+  if (candidate.occupancy + qtyMilli > candidate.capacity) {
+    return false;
+  }
+  if (candidate.maxWeightGrams !== null) {
+    const weightLimit = BigInt(candidate.maxWeightGrams) * BigInt(QUANTITY_SCALE);
+    const weightAfter = candidate.weightLoad + BigInt(qtyMilli) * BigInt(sku.weightGrams ?? 0);
+    if (weightAfter > weightLimit) {
+      return false;
+    }
+  }
+  if (candidate.lengthMm !== null && candidate.widthMm !== null && candidate.heightMm !== null) {
+    const binVolume = BigInt(
+      candidate.lengthMm * candidate.widthMm * candidate.heightMm,
+    );
+    const perUnitVolume = (sku.lengthMm ?? 0) * (sku.widthMm ?? 0) * (sku.heightMm ?? 0);
+    if (candidate.volumeLoad + BigInt(qtyMilli) * BigInt(perUnitVolume) > binVolume * BigInt(QUANTITY_SCALE)) {
+      return false;
+    }
+  }
+  if (sku.lengthMm !== null && candidate.lengthMm !== null && sku.lengthMm > candidate.lengthMm) {
+    return false;
+  }
+  if (sku.widthMm !== null && candidate.widthMm !== null && sku.widthMm > candidate.widthMm) {
+    return false;
+  }
+  if (sku.heightMm !== null && candidate.heightMm !== null && sku.heightMm > candidate.heightMm) {
+    return false;
+  }
+  return true;
 }
 
 /**
  * The warehouse's putaway-eligible bins (not blocked, not system-owned, not
  * retired — Story 3.6), ranked lowest occupancy then bin code — the
  * suggestion's input order. Occupancy is the bin's total on-hand across
- * every SKU (capacity is shared base-UoM space), folded in one grouped query.
+ * every SKU (capacity is shared base-UoM space), folded in one grouped query;
+ * story 11-5 adds the bins' physical limits and the same load-read's
+ * weight/volume sums, so the fit predicate can run per candidate.
  */
 export async function binCandidatesInTx(
   tx: TenantTx,
@@ -775,7 +923,13 @@ export async function binCandidatesInTx(
       binId: bins.id,
       binCode: bins.code,
       capacity: bins.capacity,
+      lengthMm: bins.lengthMm,
+      widthMm: bins.widthMm,
+      heightMm: bins.heightMm,
+      maxWeightGrams: bins.maxWeightGrams,
       occupancy: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint`,
+      weightLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * coalesce(${skus.weightGrams}, 0)), 0)::numeric`,
+      volumeLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * (coalesce(${skus.lengthMm}, 0) * coalesce(${skus.widthMm}, 0) * coalesce(${skus.heightMm}, 0))), 0)::numeric`,
     })
     .from(bins)
     .leftJoin(
@@ -786,6 +940,7 @@ export async function binCandidatesInTx(
         eq(stockOnHand.warehouseId, warehouseId),
       ),
     )
+    .leftJoin(skus, eq(skus.id, stockOnHand.skuId))
     .where(
       and(
         eq(bins.tenantId, tenantId),
@@ -796,26 +951,71 @@ export async function binCandidatesInTx(
         isNull(bins.retiredAt),
       ),
     )
-    .groupBy(bins.id, bins.code, bins.capacity)
+    .groupBy(
+      bins.id,
+      bins.code,
+      bins.capacity,
+      bins.lengthMm,
+      bins.widthMm,
+      bins.heightMm,
+      bins.maxWeightGrams,
+    )
     .orderBy(asc(sql`coalesce(sum(${stockOnHand.quantity}), 0)`), asc(bins.code));
   return rows.map((row) => ({
     binId: row.binId,
     binCode: row.binCode,
     capacity: row.capacity,
+    lengthMm: row.lengthMm,
+    widthMm: row.widthMm,
+    heightMm: row.heightMm,
+    maxWeightGrams: row.maxWeightGrams,
     occupancy: Number(row.occupancy),
+    weightLoad: BigInt(row.weightLoad ?? 0),
+    volumeLoad: BigInt(row.volumeLoad ?? 0),
   }));
 }
 
-/** One bin's total on-hand across every SKU (the capacity gate's input). */
+/**
+ * One bin's load (story 11-5): the capacity gates' shared input, read in ONE
+ * grouped query joined to `skus` — `stock_on_hand` is the authoritative bin
+ * quantity (the projections' plain fold; no batch arm — `batch_on_hand` is a
+ * per-batch breakdown folded beside it with the SAME magnitude, not a second
+ * pool).
+ *
+ * - `units` — the milli-unit occupancy the unit gate has always compared.
+ * - `weightLoad` — Σ(qty_milli × weight_grams), a MILLI-GRAM figure (a
+ *   fractional quantity contributes a fractional load); compared against
+ *   `max_weight_grams × QUANTITY_SCALE`.
+ * - `volumeLoad` — Σ(qty_milli × l×w×h), milli-mm³ (1 mm³ = 1 milli-ml);
+ *   compared against `(L×W×H) × QUANTITY_SCALE`.
+ *
+ * The weight/volume sums are `::numeric`, read as string, converted to
+ * BigInt at the boundary — NOT `::bigint`: a milli-quantity past 2^53 times a
+ * max-dimension SKU's per-unit volume (or a max-weight SKU) overflows an
+ * int8 sum, and adversarial (huge-qty × max-attr) products are exactly the
+ * rows a capacity gate exists to catch. A SKU with no attributes contributes
+ * nothing to either load (fail-open on missing attributes).
+ */
+export interface BinLoad {
+  readonly units: number;
+  readonly weightLoad: bigint;
+  readonly volumeLoad: bigint;
+}
+
 export async function binOccupancyInTx(
   tx: TenantTx,
   tenantId: string,
   warehouseId: string,
   binId: string,
-): Promise<number> {
+): Promise<BinLoad> {
   const rows = await tx
-    .select({ occupancy: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint` })
+    .select({
+      units: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint`,
+      weightLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * coalesce(${skus.weightGrams}, 0)), 0)::numeric`,
+      volumeLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * (coalesce(${skus.lengthMm}, 0) * coalesce(${skus.widthMm}, 0) * coalesce(${skus.heightMm}, 0))), 0)::numeric`,
+    })
     .from(stockOnHand)
+    .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
     .where(
       and(
         eq(stockOnHand.tenantId, tenantId),
@@ -823,7 +1023,11 @@ export async function binOccupancyInTx(
         eq(stockOnHand.binId, binId),
       ),
     );
-  return Number(rows[0]?.occupancy ?? 0);
+  return {
+    units: Number(rows[0]?.units ?? 0),
+    weightLoad: BigInt(rows[0]?.weightLoad ?? 0),
+    volumeLoad: BigInt(rows[0]?.volumeLoad ?? 0),
+  };
 }
 
 /**
@@ -919,6 +1123,76 @@ export function binFull(binCode: string, capacity: number, occupancy: number): P
     400,
     'Target bin is full',
     `Bin "${binCode}" holds ${fromMilli(occupancy)} of ${fromMilli(capacity)} — placing would exceed its capacity.`,
+  );
+}
+
+// ── story 11-5: the weight/volume/dim-fit rejections (binFull's siblings) ────
+// Same shape: 400, named problem code, a detail naming the bin and BOTH
+// numbers (the load and the limit).
+
+/**
+ * Milli-units to operator-facing text for loads that are BigInt: the plain
+ * `fromMilli` takes a number and throws past 2^53, and an adversarial load
+ * (huge-quantity × max-attribute) is exactly the figure these messages name.
+ */
+function fromMilliText(milli: bigint): string {
+  const negative = milli < 0n;
+  const abs = negative ? -milli : milli;
+  const whole = (abs / BigInt(QUANTITY_SCALE)).toString();
+  const frac = (abs % BigInt(QUANTITY_SCALE)).toString().padStart(3, '0').replace(/0+$/, '');
+  const text = frac.length === 0 ? whole : `${whole}.${frac}`;
+  return negative ? `-${text}` : text;
+}
+
+/** The over-weight rejection (FR-39): it names the bin, the limit, the load. */
+export function binOverweight(
+  binCode: string,
+  limitGrams: number,
+  loadMilli: bigint,
+): ProblemException {
+  return new ProblemException(
+    'bin-overweight',
+    400,
+    'Target bin would exceed its weight capacity',
+    `Bin "${binCode}" carries ${fromMilliText(loadMilli)} g of its ${limitGrams} g max weight — placing would exceed its weight capacity.`,
+  );
+}
+
+/**
+ * The over-volume rejection (FR-39): it names the bin, the limit, the load.
+ * Operator-facing load is milli-mm³ ÷ 1000 = Σ(qty_base × l×w×h) mm³.
+ */
+export function binVolumeExceeded(
+  binCode: string,
+  limitMm3: number,
+  loadMilli: bigint,
+): ProblemException {
+  return new ProblemException(
+    'bin-volume-exceeded',
+    400,
+    'Target bin would exceed its volumetric capacity',
+    `Bin "${binCode}" holds ${fromMilliText(loadMilli)} mm³ of its ${limitMm3} mm³ — placing would exceed its volumetric capacity.`,
+  );
+}
+
+/**
+ * The oversize-SKU rejection (FR-39): per-dimension — a SKU dimension is
+ * larger than the same bin dimension, both sides present. It names the bin,
+ * the dimension and both numbers, plus the offending SKU (a merge moves many
+ * SKUs; the message must say which one does not fit).
+ */
+export function binItemOversize(
+  binCode: string,
+  dimension: 'length' | 'width' | 'height',
+  skuMm: number,
+  binMm: number,
+  skuCode: string,
+): ProblemException {
+  return new ProblemException(
+    'bin-item-oversize',
+    400,
+    'SKU does not fit the bin',
+    `Bin "${binCode}" is too small for SKU "${skuCode}": the bin's ${dimension} is ${binMm} mm but the SKU's ${dimension} is ${skuMm} mm.`,
   );
 }
 

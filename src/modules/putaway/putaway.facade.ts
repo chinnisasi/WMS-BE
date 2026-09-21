@@ -30,7 +30,7 @@ import type {
   PutawayPlacementSnapshot,
   PlacePutawayCommand,
 } from './putaway.command';
-import { binCandidatesInTx } from './putaway.command';
+import { binCandidatesInTx, candidateFitsSku } from './putaway.command';
 import { fromMilli } from '../../shared/primitives/quantity';
 
 export const DEFAULT_PUTAWAY_PAGE_SIZE = 50;
@@ -269,7 +269,17 @@ export class PutawayFacade {
     // Identity codes (sku + batch) for the task cards.
     const skuIds = [...new Set(lineRows.map((row) => row.skuId))];
     const skuRows = await tx
-      .select({ id: skus.id, code: skus.code, batchTracked: skus.batchTracked })
+      .select({
+        id: skus.id,
+        code: skus.code,
+        batchTracked: skus.batchTracked,
+        // Story 11-5: the task-derivation fit consumes the same attributes —
+        // the suggestion never points at a bin the gates would refuse.
+        weightGrams: skus.weightGrams,
+        lengthMm: skus.lengthMm,
+        widthMm: skus.widthMm,
+        heightMm: skus.heightMm,
+      })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, skuIds)));
     const skuById = new Map(skuRows.map((row) => [row.id, row]));
@@ -327,7 +337,10 @@ export class PutawayFacade {
       if (remaining <= 0) {
         continue; // already placed (or the stock moved elsewhere) — no task
       }
-      const fit = candidates.find((candidate) => candidate.occupancy + remaining <= candidate.capacity);
+      // Story 11-5: the same fit predicate the suggestion and the placement
+      // re-derivation use — a SKU without attributes still fits wherever the
+      // unit gate passes (fail-open on missing attributes).
+      const fit = candidates.find((candidate) => candidateFitsSku(candidate, sku, remaining));
       tasks.push({
         grnId: row.grnId,
         grnCode: row.grnCode,

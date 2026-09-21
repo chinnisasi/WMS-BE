@@ -36,9 +36,12 @@ import { openQcHoldsForBinsInTx } from '../inbound/qc.command';
 import {
   binBlocked,
   binFull,
+  binItemOversize,
   binOccupancyInTx,
+  binOverweight,
   binRetiredAsSource,
   binRetiredAsTarget,
+  binVolumeExceeded,
 } from '../putaway/putaway.command';
 import { IDEMPOTENCY_TENANT_KEY, binHoldOpen, binNotFound, binRetired409 } from './bin.errors';
 
@@ -55,6 +58,14 @@ export interface CreateBinCommand {
    * replay lookup — see that function for why capacity has no unit of its own.
    */
   readonly capacity: number;
+  // ── story 11-5: the bin's optional physical capacity (FR-39) ─────────────
+  // Absent = unconstrained (pre-11.5 behavior); null = explicitly cleared
+  // (same verb semantics the SKU-attribute edit uses). `undefined` is spelled
+  // out because the repo compiles with `exactOptionalPropertyTypes`.
+  readonly lengthMm?: number | null | undefined;
+  readonly widthMm?: number | null | undefined;
+  readonly heightMm?: number | null | undefined;
+  readonly maxWeightGrams?: number | null | undefined;
   readonly type: string;
 }
 
@@ -70,6 +81,11 @@ export interface GenerateBinsCommand {
   readonly levelsPerBay: number;
   /** Whole units, per bin (story 10.2 — see `CreateBinCommand.capacity`). */
   readonly capacity: number;
+  /** Story 11-5: the optional physical capacity, per bin (see `CreateBinCommand`). */
+  readonly lengthMm?: number | null | undefined;
+  readonly widthMm?: number | null | undefined;
+  readonly heightMm?: number | null | undefined;
+  readonly maxWeightGrams?: number | null | undefined;
   readonly type: string;
 }
 
@@ -92,6 +108,26 @@ export interface RetireBinCommand {
   readonly binId: string;
 }
 
+/**
+ * Story 11-5 — the bin's capacity attributes (FR-39), the PATCH dispatch arm:
+ * tenancy owns bin STRUCTURE, so the attribute write is tenancy's command even
+ * though it rides the same PATCH route as putaway's `blocked` state command
+ * (the re-homing precedent in reverse). Absent = unchanged; null = cleared;
+ * a present value must be a positive whole integer within the caps
+ * (`assertBinCapacityAttributes`, behind the replay lookup — the 10.2 rule).
+ */
+export interface EditBinCapacityCommand {
+  readonly tenantId: string;
+  /** The session user — authority is re-read from the DB at command entry. */
+  readonly actorUserId: string;
+  readonly warehouseId: string;
+  readonly binId: string;
+  readonly lengthMm?: number | null | undefined;
+  readonly widthMm?: number | null | undefined;
+  readonly heightMm?: number | null | undefined;
+  readonly maxWeightGrams?: number | null | undefined;
+}
+
 /** The API response body for a bin (the idempotency snapshot). */
 export interface BinSnapshot {
   readonly bin: {
@@ -101,6 +137,11 @@ export interface BinSnapshot {
     readonly zoneId: string;
     readonly code: string;
     readonly capacity: number;
+    /** Story 11-5 — the optional physical capacity (null = unconstrained). */
+    readonly lengthMm: number | null;
+    readonly widthMm: number | null;
+    readonly heightMm: number | null;
+    readonly maxWeightGrams: number | null;
     readonly type: string;
     readonly blocked: boolean;
     /** The Receiving/QC-hold system bins (never blockable/mergeable/retirable). */
@@ -212,6 +253,14 @@ export class BinCommand {
       zoneId: command.zoneId,
       code: command.code,
       capacity: command.capacity,
+      // Story 11-5: the capacity attributes ride the hash with the 11-2
+      // spread precedent — `JSON.stringify` drops `undefined` keys, so an
+      // attrs-less request fingerprints byte-identically to a pre-11.5 one
+      // and existing replay keys keep replaying.
+      lengthMm: command.lengthMm,
+      widthMm: command.widthMm,
+      heightMm: command.heightMm,
+      maxWeightGrams: command.maxWeightGrams,
       type: command.type,
     });
 
@@ -255,7 +304,10 @@ export class BinCommand {
         // Story 10.2: capacity is scaled HERE, behind the replay lookup, for
         // the same reason every other quantity is (`assertWholeUnitCapacity`
         // refuses a fractional one, and a refusal in front of the replay
-        // would answer 400 to an op that already committed).
+        // would answer 400 to an op that already committed). Story 11-5: the
+        // capacity attributes take the same position — the one validator
+        // (`assertBinCapacityAttributes`) runs behind the replay lookup too.
+        assertBinCapacityAttributes(command);
         const bin = await insertBin(tx, {
           ...command,
           capacity: assertWholeUnitCapacity(command.capacity),
@@ -314,6 +366,11 @@ export class BinCommand {
       baysPerAisle: command.baysPerAisle,
       levelsPerBay: command.levelsPerBay,
       capacity: command.capacity,
+      // Story 11-5: the capacity attributes (the createBin hash note).
+      lengthMm: command.lengthMm,
+      widthMm: command.widthMm,
+      heightMm: command.heightMm,
+      maxWeightGrams: command.maxWeightGrams,
       type: command.type,
     });
     // Story 10.2: BASE units (see the note on `createBin`'s payload hash).
@@ -351,6 +408,10 @@ export class BinCommand {
         await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
         await assertZoneInWarehouse(tx, command.zoneId, command.warehouseId);
 
+        // Story 11-5: the capacity attributes validate behind the replay
+        // lookup (the createBin position — the 10.2 rule), once for the run.
+        assertBinCapacityAttributes(command);
+
         // Collision pre-check in the same transaction: any generated code that
         // already exists in this warehouse (any zone — codes are unique per
         // warehouse) fails the run naming the first conflicting code, with
@@ -372,6 +433,11 @@ export class BinCommand {
           code,
           // Story 10.2: whole units only, converted behind the replay lookup.
           capacity: assertWholeUnitCapacity(command.capacity),
+          // Story 11-5: the same attributes on every generated bin.
+          lengthMm: command.lengthMm ?? null,
+          widthMm: command.widthMm ?? null,
+          heightMm: command.heightMm ?? null,
+          maxWeightGrams: command.maxWeightGrams ?? null,
           type: command.type,
         }));
         try {
@@ -572,6 +638,12 @@ export class BinCommand {
             skuCode: skus.code,
             batchTracked: skus.batchTracked,
             serialTracked: skus.serialTracked,
+            // Story 11-5: the attributes the target's weight/volume gates and
+            // the per-SKU dim-fit check consume (null = units only).
+            weightGrams: skus.weightGrams,
+            lengthMm: skus.lengthMm,
+            widthMm: skus.widthMm,
+            heightMm: skus.heightMm,
           })
           .from(stockOnHand)
           .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
@@ -587,9 +659,16 @@ export class BinCommand {
 
         interface MergeArm {
           readonly skuId: string;
+          readonly skuCode: string;
           readonly batchRef: string | null;
           readonly serialRef: string | null;
           readonly qty: number;
+          // Story 11-5: the SKU's static attributes ride every arm — the
+          // moved-load sums and the per-SKU dim-fit check read them here.
+          readonly weightGrams: number | null;
+          readonly lengthMm: number | null;
+          readonly widthMm: number | null;
+          readonly heightMm: number | null;
         }
         const arms: MergeArm[] = [];
         for (const row of onHandRows) {
@@ -614,6 +693,11 @@ export class BinCommand {
                 serialRef: entry.serialRef,
                 // One serial is one whole unit — `QUANTITY_SCALE` milli-units.
                 qty: QUANTITY_SCALE,
+                skuCode: row.skuCode,
+                weightGrams: row.weightGrams,
+                lengthMm: row.lengthMm,
+                widthMm: row.widthMm,
+                heightMm: row.heightMm,
               });
             }
           } else if (row.batchTracked) {
@@ -636,6 +720,11 @@ export class BinCommand {
                 batchRef: batchRow.batchId,
                 serialRef: null,
                 qty: batchRow.quantity,
+                skuCode: row.skuCode,
+                weightGrams: row.weightGrams,
+                lengthMm: row.lengthMm,
+                widthMm: row.widthMm,
+                heightMm: row.heightMm,
               });
             }
           } else {
@@ -644,24 +733,78 @@ export class BinCommand {
               batchRef: null,
               serialRef: null,
               qty: row.quantity,
+              skuCode: row.skuCode,
+              weightGrams: row.weightGrams,
+              lengthMm: row.lengthMm,
+              widthMm: row.widthMm,
+              heightMm: row.heightMm,
             });
           }
         }
 
         // The all-or-nothing capacity gate BEFORE any append: the whole merge
-        // must fit, or nothing moves.
+        // must fit, or nothing moves. Story 11-5: the target's weight/volume
+        // loads ride the same read (`binOccupancyInTx` is now the load-read)
+        // and the moved loads are exact BigInt sums over the arms — a merge
+        // cannot overflow what a placement cannot.
         const movedUnits = arms.reduce(
           (sum, arm) => assertExactQuantity(sum + arm.qty, 'bin merge moved units'),
           0,
         );
-        const targetOccupancy = await binOccupancyInTx(
+        const movedWeight = arms.reduce(
+          (sum, arm) => sum + BigInt(arm.qty) * BigInt(arm.weightGrams ?? 0),
+          0n,
+        );
+        const movedVolume = arms.reduce(
+          (sum, arm) =>
+            sum +
+            BigInt(arm.qty) * BigInt((arm.lengthMm ?? 0) * (arm.widthMm ?? 0) * (arm.heightMm ?? 0)),
+          0n,
+        );
+        const targetLoad = await binOccupancyInTx(
           tx,
           command.tenantId,
           command.warehouseId,
           target.id,
         );
-        if (targetOccupancy + movedUnits > target.capacity) {
-          throw binFull(target.code, target.capacity, targetOccupancy);
+        if (targetLoad.units + movedUnits > target.capacity) {
+          throw binFull(target.code, target.capacity, targetLoad.units);
+        }
+        // ── story 11-5: the three new gates, AFTER the unit gate (the same
+        // conservative coexistence as the placement), ordered weight → volume
+        // → dim fit. The load figures are milli-scaled: qty is milli-units ×
+        // grams (or mm³) is a milli-load, compared against limit × 1000.
+        if (target.maxWeightGrams !== null) {
+          const weightAfter = targetLoad.weightLoad + movedWeight;
+          if (weightAfter > BigInt(target.maxWeightGrams) * BigInt(QUANTITY_SCALE)) {
+            throw binOverweight(target.code, target.maxWeightGrams, weightAfter);
+          }
+        }
+        if (target.lengthMm !== null && target.widthMm !== null && target.heightMm !== null) {
+          const binVolume = BigInt(target.lengthMm * target.widthMm * target.heightMm);
+          const volumeAfter = targetLoad.volumeLoad + movedVolume;
+          if (volumeAfter > binVolume * BigInt(QUANTITY_SCALE)) {
+            throw binVolumeExceeded(
+              target.code,
+              target.lengthMm * target.widthMm * target.heightMm,
+              volumeAfter,
+            );
+          }
+        }
+        // The dim-fit check is per moved SKU (each arm's SKU must physically
+        // fit the target's dimension, both sides present — the placement arm's
+        // semantics).
+        const movedSkus = new Map(arms.map((arm) => [arm.skuId, arm]));
+        for (const arm of movedSkus.values()) {
+          if (arm.lengthMm !== null && target.lengthMm !== null && arm.lengthMm > target.lengthMm) {
+            throw binItemOversize(target.code, 'length', arm.lengthMm, target.lengthMm, arm.skuCode);
+          }
+          if (arm.widthMm !== null && target.widthMm !== null && arm.widthMm > target.widthMm) {
+            throw binItemOversize(target.code, 'width', arm.widthMm, target.widthMm, arm.skuCode);
+          }
+          if (arm.heightMm !== null && target.heightMm !== null && arm.heightMm > target.heightMm) {
+            throw binItemOversize(target.code, 'height', arm.heightMm, target.heightMm, arm.skuCode);
+          }
         }
 
         // ── the movements (one `bin.merged` event per arm) ──────────────────
@@ -931,6 +1074,152 @@ export class BinCommand {
 
     return snapshot;
   }
+
+  /**
+   * Story 11-5 — edit a bin's capacity attributes (FR-39): tenancy owns bin
+   * STRUCTURE, so the attribute write is this module's command even though it
+   * rides the same PATCH route as putaway's `blocked` state command (the
+   * 3.6 re-homing precedent in reverse — one URL, per-body dispatch). Gated
+   * by `bin.create` (the bin master-data capability — no new capability).
+   *
+   * Semantics (the 11.2 SKU-attribute edit's): an absent field is UNCHANGED,
+   * a null field CLEARS the limit, a present value must pass
+   * `assertBinCapacityAttributes`. Dimensions survive a warehouse retrofit —
+   * a bin keeps its row, only the limits change. The system bins are
+   * editable (their limits are real); a retired bin is not (retirement is
+   * terminal — 409 `bin-retired`).
+   *
+   * Guards (the invariant order): capability `bin.create`, idempotency
+   * replay, warehouse assertion (404), the bin row locked `.for('update')`,
+   * the retired guard, the attribute validator (behind the replay), the
+   * write, the outbox append, the audit row, the idempotency key LAST.
+   */
+  async editBinCapacity(
+    command: EditBinCapacityCommand,
+    idempotencyKey: string,
+  ): Promise<BinSnapshot> {
+    const payloadHash = hashCommandPayload({
+      tenantId: command.tenantId,
+      warehouseId: command.warehouseId,
+      binId: command.binId,
+      // Absent attributes drop out of the JSON (`undefined` keys vanish), so
+      // the fingerprint carries exactly the fields the request names.
+      lengthMm: command.lengthMm,
+      widthMm: command.widthMm,
+      heightMm: command.heightMm,
+      maxWeightGrams: command.maxWeightGrams,
+    });
+
+    const { snapshot } = await withTenantTransaction(
+      this.db,
+      command.tenantId,
+      async (tx) => {
+        // Authority at command-service entry (Story 1.5) — DB read, same tx.
+        assertPermission(
+          await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+          'bin.create',
+        );
+
+        const existing = await tx
+          .select()
+          .from(idempotencyKeys)
+          .where(
+            and(
+              eq(idempotencyKeys.tenantId, command.tenantId),
+              eq(idempotencyKeys.key, idempotencyKey),
+            ),
+          )
+          .limit(1);
+        if (existing[0]) {
+          if (existing[0].payloadHash !== payloadHash) {
+            throw idempotencyKeyReuse();
+          }
+          return {
+            snapshot: existing[0].responseSnapshot as BinSnapshot,
+            replayed: true,
+          };
+        }
+
+        await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
+
+        const lockedRows = await tx
+          .select()
+          .from(bins)
+          .where(
+            and(
+              eq(bins.id, command.binId),
+              eq(bins.tenantId, command.tenantId),
+              eq(bins.warehouseId, command.warehouseId),
+            ),
+          )
+          .limit(1)
+          .for('update');
+        const row = lockedRows[0];
+        if (row === undefined) {
+          throw binNotFound();
+        }
+        // A retired bin is operationally gone — its structure is settled
+        // (the block command's rejection, sibling for the same URL's state
+        // arm). A SYSTEM bin stays editable: its limits are real.
+        if (row.retiredAt !== null) {
+          throw binRetired409(row.code);
+        }
+
+        // The one validator, behind the replay lookup (the 10.2 rule — see
+        // `assertBinCapacityAttributes`).
+        assertBinCapacityAttributes(command);
+
+        const updatedRows = await tx
+          .update(bins)
+          .set({
+            // Absent = leave the stored value; null = clear it.
+            lengthMm: command.lengthMm === undefined ? row.lengthMm : command.lengthMm,
+            widthMm: command.widthMm === undefined ? row.widthMm : command.widthMm,
+            heightMm: command.heightMm === undefined ? row.heightMm : command.heightMm,
+            maxWeightGrams:
+              command.maxWeightGrams === undefined ? row.maxWeightGrams : command.maxWeightGrams,
+            updatedAt: nowIso(),
+          })
+          .where(eq(bins.id, row.id))
+          .returning();
+        const bin = binFromRow(updatedRows[0]!);
+
+        // In-transaction outbox append (AD-7) — a replay appends nothing.
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: 'bin.capacity_changed',
+          occurredAt: nowIso(),
+          payload: {
+            binId: bin.id,
+            warehouseId: bin.warehouseId,
+            lengthMm: bin.lengthMm,
+            widthMm: bin.widthMm,
+            heightMm: bin.heightMm,
+            maxWeightGrams: bin.maxWeightGrams,
+          },
+        });
+
+        // The audit row — same transaction, after the outbox, before the
+        // idempotency key (the 3.4/3.5 invariant order).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'bin.capacity_changed',
+          targetType: 'bin',
+          targetId: bin.id,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+
+        await writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, { bin });
+        return { snapshot: { bin }, replayed: false };
+      },
+    );
+
+    return snapshot;
+  }
 }
 
 /**
@@ -989,6 +1278,72 @@ function assertWholeUnitCapacity(capacity: number): number {
   return toMilli(capacity);
 }
 
+// ── story 11-5: the bin's capacity attributes (FR-39) ────────────────────────
+
+/** Bins are BIGGER than SKUs (a floor location is an area): 100 m axes. */
+export const MAX_BIN_DIMENSION_MM = 100_000;
+
+/** Bins are BIGGER than SKUs: 100 tonnes (vs the SKU side's 1 tonne cap). */
+export const MAX_BIN_WEIGHT_GRAMS = 100_000_000;
+
+/**
+ * The bin's optional capacity attribute fields a write edge may carry.
+ * Absent (`undefined`) and cleared (`null`) are both legal and skip the value
+ * rules — the create/grid verbs treat both as "unconstrained" (nothing to
+ * leave unchanged on a fresh row), the PATCH verb reads absent as
+ * "leave unchanged" and null as "clear". `undefined` is spelled out because
+ * the repo compiles with `exactOptionalPropertyTypes`.
+ */
+export interface BinCapacityAttributeFields {
+  readonly lengthMm?: number | null | undefined;
+  readonly widthMm?: number | null | undefined;
+  readonly heightMm?: number | null | undefined;
+  readonly maxWeightGrams?: number | null | undefined;
+}
+
+/** One numeric attribute: its field name, its ceiling, the unit its messages name. */
+interface BinAttributeSpec {
+  readonly key: 'lengthMm' | 'widthMm' | 'heightMm' | 'maxWeightGrams';
+  readonly cap: number;
+  readonly unit: string;
+}
+
+const BIN_CAPACITY_ATTRIBUTES: readonly BinAttributeSpec[] = [
+  { key: 'lengthMm', cap: MAX_BIN_DIMENSION_MM, unit: 'millimetres' },
+  { key: 'widthMm', cap: MAX_BIN_DIMENSION_MM, unit: 'millimetres' },
+  { key: 'heightMm', cap: MAX_BIN_DIMENSION_MM, unit: 'millimetres' },
+  { key: 'maxWeightGrams', cap: MAX_BIN_WEIGHT_GRAMS, unit: 'grams' },
+];
+
+/**
+ * The one write-edge gate for the bin's capacity attributes —
+ * `assertWholeUnitCapacity`'s sibling and `assertSkuAttributes`' mirror
+ * (story 11.2's one-validator pattern). Every create/grid/PATCH write path
+ * calls it, behind the replay lookup (the 10.2 rule — a refusal in front of
+ * the replay would answer 400 to an op that already committed). Absent and
+ * null skip the check; anything present must be a positive WHOLE number
+ * within the cap (a fraction is refused, never rounded), and the DTO mirrors
+ * the same bounds — a mirror, not a boundary.
+ *
+ * Pure SHAPE check — it needs no database row. Where it RUNS is decided by
+ * the 10.2 rule, not by this function.
+ */
+export function assertBinCapacityAttributes(fields: BinCapacityAttributeFields): void {
+  for (const { key, cap, unit } of BIN_CAPACITY_ATTRIBUTES) {
+    const value = fields[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0 || value > cap) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        `${key} is not a recordable bin capacity`,
+        `${key} must be a positive whole number of ${unit}, at most ${cap} — got ${String(value)}. ` +
+          `A bin's physical capacity is whole ${unit}, never a fraction and never negative.`,
+      );
+    }
+  }
+}
+
 async function insertBin(
   tx: TenantTx,
   command: CreateBinCommand,
@@ -1005,6 +1360,12 @@ async function insertBin(
         zoneId: command.zoneId,
         code: command.code,
         capacity: command.capacity,
+        // Story 11-5: an absent attribute stores as null (unconstrained) —
+        // creation has no "leave unchanged" reading, so absent and null agree.
+        lengthMm: command.lengthMm ?? null,
+        widthMm: command.widthMm ?? null,
+        heightMm: command.heightMm ?? null,
+        maxWeightGrams: command.maxWeightGrams ?? null,
         type: command.type,
       })
       .returning();
@@ -1038,6 +1399,12 @@ function binFromRow(row: typeof bins.$inferSelect): BinSnapshot['bin'] {
     // Story 10.1: `binFromRow` is the module's only bin read shape — base
     // units leave here, milli-units stay below.
     capacity: fromMilli(row.capacity),
+    // Story 11-5: the physical capacity echoes as raw integers (the 11.2
+    // SKU-attribute precedent — attributes are facts, not quantities).
+    lengthMm: row.lengthMm,
+    widthMm: row.widthMm,
+    heightMm: row.heightMm,
+    maxWeightGrams: row.maxWeightGrams,
     type: row.type,
     blocked: row.blocked,
     systemOwned: row.systemOwned,
