@@ -1015,7 +1015,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, invalid body, or a system bin (validation-failed names the bin)",
+            "description": "Missing or malformed Idempotency-Key, invalid body, a system bin (validation-failed names the bin), or a body mixing blocked with capacity attributes",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1035,7 +1035,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied)",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied) or bin.create (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1080,7 +1080,7 @@
             "bearer": []
           }
         ],
-        "summary": "Blocks or unblocks a bin (Story 3.6: never a system or retired bin)",
+        "summary": "Blocks or unblocks a bin (Story 3.6: never a system or retired bin), or edits its capacity attributes (Story 11-5: dimensions and max weight — tenancy owns the structure)",
         "tags": [
           "tenancy"
         ]
@@ -9015,6 +9015,34 @@
             "maximum": 9007199254740,
             "description": "Bin capacity. A bin's shared space across every SKU it holds — the one quantity with no unit of its own, so it counts WHOLE units, at least one. A fractional or zero capacity is refused."
           },
+          "lengthMm": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Internal length in millimetres. Omit to leave the bin unconstrained; null to clear. At most 100000."
+          },
+          "widthMm": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Internal width in millimetres. Omit to leave the bin unconstrained; null to clear. At most 100000."
+          },
+          "heightMm": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Internal height in millimetres. Omit to leave the bin unconstrained; null to clear. At most 100000."
+          },
+          "maxWeightGrams": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000000,
+            "description": "Max weight in grams. Omit to leave the bin unconstrained; null to clear. At most 100000000."
+          },
           "type": {
             "type": "string",
             "enum": [
@@ -9060,6 +9088,26 @@
             "example": 120,
             "description": "Base-UoM units"
           },
+          "lengthMm": {
+            "type": "number",
+            "nullable": true,
+            "description": "Internal length in millimetres (null = unconstrained)"
+          },
+          "widthMm": {
+            "type": "number",
+            "nullable": true,
+            "description": "Internal width in millimetres (null = unconstrained)"
+          },
+          "heightMm": {
+            "type": "number",
+            "nullable": true,
+            "description": "Internal height in millimetres (null = unconstrained)"
+          },
+          "maxWeightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "Max weight in grams (null = unconstrained)"
+          },
           "type": {
             "type": "string",
             "enum": [
@@ -9103,6 +9151,10 @@
           "zoneId",
           "code",
           "capacity",
+          "lengthMm",
+          "widthMm",
+          "heightMm",
+          "maxWeightGrams",
           "type",
           "blocked",
           "retiredAt",
@@ -9142,6 +9194,34 @@
             "minimum": 1,
             "maximum": 9007199254740,
             "description": "Capacity per bin. A bin's shared space across every SKU it holds — the one quantity with no unit of its own, so it counts WHOLE units, at least one. A fractional or zero capacity is refused."
+          },
+          "lengthMm": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Internal length in millimetres, per bin. Omit for unconstrained bins. At most 100000."
+          },
+          "widthMm": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Internal width in millimetres, per bin. Omit for unconstrained bins. At most 100000."
+          },
+          "heightMm": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Internal height in millimetres, per bin. Omit for unconstrained bins. At most 100000."
+          },
+          "maxWeightGrams": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000000,
+            "description": "Max weight in grams, per bin. Omit for unconstrained bins. At most 100000000."
           },
           "type": {
             "type": "string",
@@ -9222,12 +9302,37 @@
           "blocked": {
             "type": "boolean",
             "example": false,
-            "description": "true blocks the bin (broken); false unblocks"
+            "description": "true blocks the bin (broken); false unblocks. Mutually exclusive with the capacity attributes."
+          },
+          "lengthMm": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Internal length in millimetres. Omit to leave unchanged; null to clear. Mutually exclusive with blocked."
+          },
+          "widthMm": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Internal width in millimetres. Omit to leave unchanged; null to clear. Mutually exclusive with blocked."
+          },
+          "heightMm": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000,
+            "description": "Internal height in millimetres. Omit to leave unchanged; null to clear. Mutually exclusive with blocked."
+          },
+          "maxWeightGrams": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100000000,
+            "description": "Max weight in grams. Omit to leave unchanged; null to clear. Mutually exclusive with blocked."
           }
-        },
-        "required": [
-          "blocked"
-        ]
+        }
       },
       "MergeBinDto": {
         "type": "object",
