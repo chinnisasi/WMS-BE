@@ -225,6 +225,30 @@ export const bins = pgTable(
     code: text('code').notNull(),
     /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
     capacity: bigint('capacity', { mode: 'number' }).notNull(),
+    /**
+     * Story 11-5 — the bin's OPTIONAL physical capacity (FR-39): internal
+     * dimensions and a max weight, the bin-side counterpart of 11.2's SKU
+     * attributes and the second side of the three new capacity gates
+     * (placement, merge, suggestion) that consume them beside the unit gate.
+     * Integer storage, WYSIWYG everywhere — millimetres and grams, the 11.2
+     * precedent, bins sized a magnitude above SKUs (a floor location is an
+     * area): dims ≤ 100,000 mm, weight ≤ 100,000,000 g. All four are
+     * nullable = unconstrained = pre-11.5 behavior; a bin without limits is
+     * gated by its unit count alone.
+     *
+     * Tenancy owns the writes (structure — create/grid/editBinCapacity);
+     * putaway only reads them in its gates. Bounds are CHECKs declared in
+     * `drizzle/0034_bin_dimensional_capacity.sql` (the 0031 pattern — CHECKs
+     * live only in migration SQL) and mirrored in `assertBinCapacityAttributes`
+     * (`src/modules/tenancy/bin.command.ts`), the one validator all three
+     * write paths call.
+     */
+    /** Positive whole millimetres, ≤ 100,000 — each axis independent. */
+    lengthMm: integer('length_mm'),
+    widthMm: integer('width_mm'),
+    heightMm: integer('height_mm'),
+    /** Positive whole grams, ≤ 100,000,000 (100 tonnes). */
+    maxWeightGrams: integer('max_weight_grams'),
     type: text('type').notNull(),
     blocked: boolean('blocked').notNull().default(false),
     systemOwned: boolean('system_owned').notNull().default(false),

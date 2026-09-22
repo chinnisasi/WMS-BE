@@ -134,6 +134,12 @@ export class BinStateCommand {
           code: updated.code,
           // Story 10.1: base units at the response edge.
           capacity: fromMilli(updated.capacity),
+          // Story 11-5: the physical capacity echoes as raw integers (read
+          // from the row the state command's `.returning()` handed back).
+          lengthMm: updated.lengthMm,
+          widthMm: updated.widthMm,
+          heightMm: updated.heightMm,
+          maxWeightGrams: updated.maxWeightGrams,
           type: updated.type,
           blocked: updated.blocked,
           systemOwned: updated.systemOwned,

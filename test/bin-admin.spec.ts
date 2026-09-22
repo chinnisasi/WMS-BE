@@ -6,6 +6,9 @@ import { fromMilli, toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
+import { MAX_BIN_DIMENSION_MM } from '../src/modules/tenancy/bin-capacity';
+import { BinCommand } from '../src/modules/tenancy/bin.command';
+import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 
@@ -907,7 +910,398 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       .expect(401);
   });
 
-  // ── the schema contract: RLS + the 0016 round-trip ──────────────────────────
+  // ── Story 11-5 — the bin's capacity attributes (FR-39) ──────────────────────
+
+  it('capacity attributes: create/grid accept the physical limits and echo them raw; fractional, zero, negative and over-cap values are 400 validation-failed', async () => {
+    const create = (body: Record<string, unknown>): SupertestTest =>
+      request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send(body);
+
+    // A bin with limits creates cleanly and echoes the raw integers (no
+    // fromMilli anywhere on attributes — the 11.2 SKU-attribute precedent).
+    const limited = await create({ code: 'A-30', capacity: 100, type: 'shelf', lengthMm: 1200, maxWeightGrams: 20000 }).expect(201);
+    expect(limited.body).toMatchObject({ code: 'A-30', capacity: 100, lengthMm: 1200, widthMm: null, heightMm: null, maxWeightGrams: 20000 });
+
+    // A grid run stamps the same attributes on every generated bin.
+    const grid = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins/grid`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ aisleFrom: 'C', aisleTo: 'C', baysPerAisle: 1, levelsPerBay: 2, capacity: 50, type: 'shelf', widthMm: 800, heightMm: 900 })
+      .expect(201);
+    expect(grid.body).toMatchObject({ generatedCount: 2, firstCode: 'C-01-01' });
+    const listed = await zoneBins(zoneId);
+    const generated = listed.find((bin) => bin.code === 'C-01-01')!;
+    expect(generated).toMatchObject({ widthMm: 800, heightMm: 900, lengthMm: null, maxWeightGrams: null });
+
+    // The value rules: fractional, zero, negative and over-cap — all 400
+    // `validation-failed` (the DTO mirror here, the command validator behind
+    // the replay for non-HTTP callers).
+    for (const bad of [
+      { lengthMm: 0.5 },
+      { lengthMm: 0 },
+      { lengthMm: -1 },
+      { lengthMm: 100001 },
+      { widthMm: 0.5 },
+      { heightMm: 0 },
+      { maxWeightGrams: 0.5 },
+      { maxWeightGrams: -100 },
+      { maxWeightGrams: 100000001 },
+    ]) {
+      const res = await create({ code: `BAD-${ulid().slice(0, 6)}`, capacity: 100, type: 'shelf', ...bad }).expect(400);
+      expect(res.body).toMatchObject({ status: 400, code: 'validation-failed' });
+    }
+    const badGrid = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins/grid`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ aisleFrom: 'C', aisleTo: 'C', baysPerAisle: 1, levelsPerBay: 1, capacity: 50, type: 'shelf', maxWeightGrams: 100000001 })
+      .expect(400);
+    expect(badGrid.body).toMatchObject({ code: 'validation-failed' });
+  });
+
+  it('PATCH capacity attributes: absent=unchanged, null=clears, replay re-serves, reuse 422, unknown 404, retired 409, accountant 403, system bin editable, mixing with blocked 400, empty body 400; outbox + audit per mutation', async () => {
+    const listed = await zoneBins(zoneId);
+    const binA30 = listed.find((bin) => bin.code === 'A-30')!.id;
+    const patch = (binId: string, body: Record<string, unknown>, token = ownerToken, key = ulid()): SupertestTest =>
+      request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .set(KEY_HEADER, key)
+        .send(body);
+
+    // Absent = unchanged, present = set (the 11.2 SKU-attribute semantics).
+    const edit = await patch(binA30, { widthMm: 800 }, ownerToken, ulid()).expect(200);
+    expect(edit.body).toMatchObject({ lengthMm: 1200, widthMm: 800, heightMm: null, maxWeightGrams: 20000 });
+
+    const replayKey = ulid();
+    const editHeight = await patch(binA30, { heightMm: 900 }, ownerToken, replayKey).expect(200);
+    const replay = await patch(binA30, { heightMm: 900 }, ownerToken, replayKey).expect(200);
+    expect(replay.body).toEqual(editHeight.body);
+    await patch(binA30, { heightMm: 950 }, ownerToken, replayKey).expect(422)
+      .then((res) => expect(res.body).toMatchObject({ code: 'idempotency-key-reuse' }));
+
+    // null clears the limit; the other attributes survive untouched.
+    await patch(binA30, { lengthMm: null }).expect(200)
+      .then((res) => expect(res.body).toMatchObject({ lengthMm: null, widthMm: 800, maxWeightGrams: 20000 }));
+
+    await patch(uuidv7(), { maxWeightGrams: 100 }).expect(404);
+
+    // A retired bin's structure is settled (binA01 retired earlier).
+    await patch(binA01, { maxWeightGrams: 100 }).expect(409)
+      .then((res) => expect(res.body).toMatchObject({ code: 'bin-retired' }));
+
+    // The accountant holds no capabilities — `bin.create` is the gate.
+    await patch(binA30, { maxWeightGrams: 100 }, accountantToken).expect(403)
+      .then((res) => expect(res.body).toMatchObject({ code: 'role-denied' }));
+
+    // The system bins are editable (their limits are real).
+    const receivingBin = await receivingBinId();
+    await patch(receivingBin, { maxWeightGrams: 1000 }).expect(200)
+      .then((res) => expect(res.body).toMatchObject({ maxWeightGrams: 1000, systemOwned: true }));
+
+    // One route, two arms: the state command's `blocked` and the attribute
+    // edit never mix in one request, and an empty body changes nothing.
+    await patch(binA30, { blocked: true, lengthMm: 100 }).expect(400)
+      .then((res) => expect(res.body).toMatchObject({ code: 'validation-failed' }));
+    await patch(binA30, {}).expect(400)
+      .then((res) => expect(res.body).toMatchObject({ code: 'validation-failed' }));
+
+    // `blocked: null` is 400 — the DTO's `@IsOptional` skips null, so without
+    // the controller's guard the state command would write null into a NOT
+    // NULL column and answer 500 (the 11-5 review's high finding). The bin's
+    // state is untouched by the refusal.
+    const blockedBefore = (await zoneBins(zoneId)).find((bin) => bin.id === binA30)!.blocked;
+    const nullBlocked = await patch(binA30, { blocked: null }).expect(400);
+    expect(nullBlocked.body).toMatchObject({ code: 'validation-failed' });
+    expect(String(nullBlocked.body.detail)).toContain('blocked');
+    expect((await zoneBins(zoneId)).find((bin) => bin.id === binA30)!.blocked).toBe(blockedBefore);
+
+    // The bad values the triage names — the DTO mirror (@IsInt @Min @Max)
+    // refuses each before the command. The command validator behind these
+    // same bounds is exercised DIRECTLY in the next test.
+    for (const bad of [
+      { lengthMm: 0.5 },
+      { lengthMm: 0 },
+      { lengthMm: -5 },
+      { lengthMm: 100001 },
+      { maxWeightGrams: 0 },
+    ]) {
+      await patch(binA30, bad).expect(400)
+        .then((res) => expect(res.body).toMatchObject({ code: 'validation-failed' }));
+    }
+
+    // One outbox event + one audit row per mutation (three above), none per replay.
+    const events = await outboxRows('bin.capacity_changed');
+    expect(events.filter((row) => row.payload.binId === binA30)).toHaveLength(3);
+    const audits = await auditRows('bin.capacity_changed');
+    expect(audits.filter((row) => row.target_id === binA30)).toHaveLength(3);
+  });
+
+  it('the command validator bites on its own: direct createBin / editBinCapacity calls refuse values the DTO mirror would hide', async () => {
+    // Triage #2: the HTTP arms above pass through the DTO mirror
+    // (`@IsInt @Min @Max`), so they would keep passing even with
+    // `assertBinCapacityAttributes` deleted — every non-HTTP write edge (the
+    // grid generator, any future caller) leans on the command validator
+    // ALONE. These direct service calls prove it is load-bearing: same bad
+    // values, the named 400 problem, nothing written.
+    type BinAttrKey = 'lengthMm' | 'widthMm' | 'heightMm' | 'maxWeightGrams';
+    const attrField = (key: BinAttrKey, value: number): Partial<Record<BinAttrKey, number>> =>
+      ({ [key]: value } as Partial<Record<BinAttrKey, number>>);
+    const badValues: { key: BinAttrKey; value: number }[] = [
+      { key: 'lengthMm', value: 0.5 },
+      { key: 'lengthMm', value: 0 },
+      { key: 'lengthMm', value: -5 },
+      { key: 'lengthMm', value: 100001 },
+      { key: 'widthMm', value: 0.5 },
+      { key: 'heightMm', value: 0 },
+      { key: 'maxWeightGrams', value: 0 },
+      { key: 'maxWeightGrams', value: 100000001 },
+    ];
+    const expectCapacityRefusal = (attempt: unknown, key: BinAttrKey, value: number): void => {
+      expect(attempt).toBeInstanceOf(ProblemException);
+      expect((attempt as ProblemException).getResponse()).toMatchObject({
+        status: 400,
+        code: 'validation-failed',
+        title: `${key} is not a recordable bin capacity`,
+      });
+      expect(((attempt as ProblemException).getResponse() as { detail: string }).detail).toContain(String(value));
+    };
+
+    const binCommands = app.get(BinCommand);
+    const owners = postgres(process.env.DATABASE_URL!, { max: 1 });
+    let ownerUserId: string;
+    try {
+      const rows = await owners`select id from users where tenant_id = ${tenantId} and role = 'owner' limit 1`;
+      ownerUserId = (rows[0] as unknown as { id: string }).id;
+    } finally {
+      await owners.end();
+    }
+
+    for (const { key, value } of badValues) {
+      const attempt = await binCommands
+        .createBin(
+          {
+            tenantId,
+            actorUserId: ownerUserId,
+            warehouseId,
+            zoneId,
+            code: `CMD-${ulid().slice(0, 6)}`,
+            capacity: 10,
+            type: 'shelf',
+            ...attrField(key, value),
+          },
+          ulid(),
+        )
+        .catch((err: unknown) => err);
+      expectCapacityRefusal(attempt, key, value);
+    }
+
+    // The same validator behind the PATCH arm — editBinCapacity.
+    const listed = await zoneBins(zoneId);
+    const binA30Id = listed.find((bin) => bin.code === 'A-30')!.id;
+    for (const { key, value } of [
+      { key: 'lengthMm', value: 0.5 } as { key: BinAttrKey; value: number },
+      { key: 'lengthMm', value: 100001 } as { key: BinAttrKey; value: number },
+      { key: 'maxWeightGrams', value: 0 } as { key: BinAttrKey; value: number },
+    ]) {
+      const attempt = await binCommands
+        .editBinCapacity({ tenantId, actorUserId: ownerUserId, warehouseId, binId: binA30Id, ...attrField(key, value) }, ulid())
+        .catch((err: unknown) => err);
+      expectCapacityRefusal(attempt, key, value);
+    }
+
+    // Every refusal rolled back: no CMD- bin exists and A-30's attributes
+    // are exactly what the PATCH test above left them.
+    const after = await zoneBins(zoneId);
+    expect(after.some((bin) => bin.code.startsWith('CMD-'))).toBe(false);
+    expect(after.find((bin) => bin.id === binA30Id)).toMatchObject({
+      lengthMm: null,
+      widthMm: 800,
+      heightMm: 900,
+      maxWeightGrams: 20000,
+    });
+  });
+
+  it('volume gate exactness is pinned: MAX_BIN_DIMENSION_MM**3 stays a safe double (triage #7)', () => {
+    // The gates compute a bin's L×W×H in JS doubles before BigInt takes over
+    // — exact only while the product stays under Number.MAX_SAFE_INTEGER.
+    // Widening the cap past ~208,000 mm would silently lose gate precision;
+    // a widening that forgets to move the product inside BigInt fails HERE.
+    expect(MAX_BIN_DIMENSION_MM ** 3).toBeLessThan(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('merge dimensional gates: bin-overweight / bin-volume-exceeded / bin-item-oversize name the target bin and both numbers and write NOTHING; a fitting merge with limits moves cleanly', async () => {
+    // A dimensioned SKU through the real surfaces: import, then the edit's
+    // attribute fields (5 kg, 500×400×300 mm).
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'BA-D,Bin Admin Item D,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const dimSkuId = (skus.body.items as { code: string; id: string }[]).find((item) => item.code === 'BA-D')!.id;
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${dimSkuId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ weightGrams: 5000, lengthMm: 500, widthMm: 400, heightMm: 300 })
+      .expect(200);
+
+    const createBin = async (code: string, attrs: Record<string, unknown>): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf', ...attrs })
+          .expect(201)
+      ).body.id as string;
+    // Targets pre-loaded to the exact limit (the load read is cumulative over
+    // the target's stock), one-unit sources:
+    const srcW = await createBin('A-20', {});
+    const tgtW = await createBin('A-21', { maxWeightGrams: 5000 }); // 1 unit = exactly 5,000 g
+    const srcV = await createBin('A-23', {});
+    const tgtV = await createBin('A-22', { lengthMm: 1000, widthMm: 1000, heightMm: 1000 }); // 16 units = 960M of 1,000M mm³
+    const srcD = await createBin('A-25', {});
+    const tgtD = await createBin('A-24', { lengthMm: 400, widthMm: 1000, heightMm: 1000 });
+    const tgtOK = await createBin('A-26', { maxWeightGrams: 100000, lengthMm: 2000, widthMm: 2000, heightMm: 2000 });
+    // The other two dim-fit dimensions (triage #11): a target too NARROW
+    // (width 300 < the SKU's 400) and one too SHALLOW (height 200 < 300) —
+    // each with a one-unit source.
+    const srcDW = await createBin('A-27', {});
+    const tgtDW = await createBin('A-28', { lengthMm: 1000, widthMm: 300, heightMm: 1000 });
+    const srcDH = await createBin('A-29', {});
+    const tgtDH = await createBin('A-31', { lengthMm: 1000, widthMm: 1000, heightMm: 200 });
+    await fill(tgtW, dimSkuId, 1);
+    await fill(tgtV, dimSkuId, 16);
+    await fill(srcW, dimSkuId, 1);
+    await fill(srcV, dimSkuId, 1);
+    await fill(srcD, dimSkuId, 1);
+    await fill(srcDW, dimSkuId, 1);
+    await fill(srcDH, dimSkuId, 1);
+
+    // Weight: 5,000 g in the target + 5,000 g moved > the 5,000 g limit.
+    const overweight = await merge(srcW, tgtW).expect(400);
+    expect(overweight.body).toMatchObject({ code: 'bin-overweight' });
+    expect(String(overweight.body.detail)).toContain('A-21');
+    expect(String(overweight.body.detail)).toContain('10000');
+    expect(String(overweight.body.detail)).toContain('5000');
+
+    // Volume: 960M mm³ in the target + 60M moved > 1,000M mm³.
+    const volumeExceeded = await merge(srcV, tgtV).expect(400);
+    expect(volumeExceeded.body).toMatchObject({ code: 'bin-volume-exceeded' });
+    expect(String(volumeExceeded.body.detail)).toContain('A-22');
+    expect(String(volumeExceeded.body.detail)).toContain('1020000000');
+    expect(String(volumeExceeded.body.detail)).toContain('1000000000');
+
+    // Dim fit: the moved SKU's 500 mm length does not fit the 400 mm target.
+    const oversize = await merge(srcD, tgtD).expect(400);
+    expect(oversize.body).toMatchObject({ code: 'bin-item-oversize' });
+    expect(String(oversize.body.detail)).toContain('A-24');
+    expect(String(oversize.body.detail)).toContain('length');
+    expect(String(oversize.body.detail)).toContain('400');
+    expect(String(oversize.body.detail)).toContain('500');
+
+    // Width and height bind the same way, each naming ITS dimension and both
+    // numbers (triage #11): 400 mm of width > the 300 mm target, 300 mm of
+    // height > the 200 mm target.
+    const oversizeWidth = await merge(srcDW, tgtDW).expect(400);
+    expect(oversizeWidth.body).toMatchObject({ code: 'bin-item-oversize' });
+    expect(String(oversizeWidth.body.detail)).toContain('A-28');
+    expect(String(oversizeWidth.body.detail)).toContain('width');
+    expect(String(oversizeWidth.body.detail)).toContain('300');
+    expect(String(oversizeWidth.body.detail)).toContain('400');
+
+    const oversizeHeight = await merge(srcDH, tgtDH).expect(400);
+    expect(oversizeHeight.body).toMatchObject({ code: 'bin-item-oversize' });
+    expect(String(oversizeHeight.body.detail)).toContain('A-31');
+    expect(String(oversizeHeight.body.detail)).toContain('height');
+    expect(String(oversizeHeight.body.detail)).toContain('200');
+    expect(String(oversizeHeight.body.detail)).toContain('300');
+
+    // All-or-nothing: not one bin.merged event moved an arm.
+    for (const sourceId of [srcW, srcV, srcD, srcDW, srcDH]) {
+      expect((await mergeLedgerRows()).filter((row) => row.from_bin_id === sourceId)).toHaveLength(0);
+    }
+    expect(await plainOnHand(srcW, dimSkuId)).toBe(1);
+    expect(await plainOnHand(tgtW, dimSkuId)).toBe(1);
+
+    // A fitting merge with limits set moves cleanly — the gates are inert
+    // until a limit trips (a merge cannot overflow what a placement cannot,
+    // and conversely a fit is a fit).
+    const fit = await merge(srcW, tgtOK).expect(200);
+    expect(fit.body.target).toMatchObject({ code: 'A-26', maxWeightGrams: 100000, lengthMm: 2000 });
+    expect(fit.body.source.retiredAt).not.toBeNull();
+  });
+
+  it('0034 round-trip: the four capacity columns exist on bins; the bounded CHECKs hold; RLS still gates the table', async () => {
+    const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const columns = await admin`
+        select column_name from information_schema.columns
+        where table_name = 'bins'
+        and column_name in ('length_mm', 'width_mm', 'height_mm', 'max_weight_grams')`;
+      expect(columns.map((row) => row.column_name as string).sort()).toEqual([
+        'height_mm',
+        'length_mm',
+        'max_weight_grams',
+        'width_mm',
+      ]);
+
+      const checks = await admin`
+        select conname from pg_constraint
+        where conrelid = 'bins'::regclass and contype = 'c'
+        and conname in ('bins_length_mm_bounded', 'bins_width_mm_bounded', 'bins_height_mm_bounded', 'bins_max_weight_grams_bounded')`;
+      expect(checks).toHaveLength(4);
+
+      // The bounds backstop: a zero dimension and an over-cap weight are
+      // DB-rejected by any path; null (unconstrained) stays storable.
+      const badDim = admin`
+        insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type, length_mm)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${zoneId}, ${`CHK-${ulid().slice(0, 6)}`}, ${toMilli(10)}, 'shelf', 0)`;
+      await expect(badDim).rejects.toThrow(/bins_length_mm_bounded/i);
+      const badWeight = admin`
+        insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type, max_weight_grams)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${zoneId}, ${`CHK-${ulid().slice(0, 6)}`}, ${toMilli(10)}, 'shelf', 100000001)`;
+      await expect(badWeight).rejects.toThrow(/bins_max_weight_grams_bounded/i);
+
+      // RLS still gates the table (the Story 1.3 probes, against the new
+      // columns): a probe role scoped to a foreign tenant reads nothing of
+      // ours, an unscoped read fails closed.
+      const foreignTenantId = uuidv7();
+      const probeUrl = new URL(process.env.DATABASE_URL!);
+      probeUrl.username = 'wms_rls_probe';
+      probeUrl.password = 'wms_rls_probe';
+      const scoped = postgres(probeUrl.toString(), { max: 1 });
+      try {
+        const foreignSelect = await scoped.begin(async (tx) => {
+          await tx`select set_config('app.tenant_id', ${foreignTenantId}, true)`;
+          return tx`select id, length_mm, max_weight_grams from bins where tenant_id = ${tenantId}`;
+        });
+        expect(foreignSelect).toHaveLength(0);
+
+        const unscoped = await scoped`select id from bins where tenant_id = ${tenantId}`;
+        expect(unscoped).toHaveLength(0);
+      } finally {
+        await scoped.end();
+      }
+    } finally {
+      await admin.end();
+    }
+  });
 
   it('0016 round-trip: retired_at/retired_by exist on bins; the pairing CHECK holds; RLS still gates the table', async () => {
     const admin = postgres(process.env.DATABASE_URL!, { max: 1 });

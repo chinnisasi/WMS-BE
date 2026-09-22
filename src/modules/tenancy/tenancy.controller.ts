@@ -289,6 +289,12 @@ export class TenancyController {
         // value there — a bin's capacity is space shared by SKUs with no
         // single unit between them, so 2.5 of it means nothing.
         capacity: dto.capacity,
+        // Story 11-5: the optional physical capacity (FR-39) — absent =
+        // unconstrained on a fresh bin.
+        lengthMm: dto.lengthMm,
+        widthMm: dto.widthMm,
+        heightMm: dto.heightMm,
+        maxWeightGrams: dto.maxWeightGrams,
         type: dto.type,
       },
       key,
@@ -337,6 +343,11 @@ export class TenancyController {
         levelsPerBay: dto.levelsPerBay,
         // Story 10.2: whole units across this edge (see `createBin`).
         capacity: dto.capacity,
+        // Story 11-5: the optional physical capacity, per generated bin.
+        lengthMm: dto.lengthMm,
+        widthMm: dto.widthMm,
+        heightMm: dto.heightMm,
+        maxWeightGrams: dto.maxWeightGrams,
         type: dto.type,
       },
       key,
@@ -378,14 +389,15 @@ export class TenancyController {
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
   @ApiOperation({
-    summary: 'Blocks or unblocks a bin (Story 3.6: never a system or retired bin)',
+    summary:
+      'Blocks or unblocks a bin (Story 3.6: never a system or retired bin), or edits its capacity attributes (Story 11-5: dimensions and max weight — tenancy owns the structure)',
   })
   @ApiBody({ type: PatchBinDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: BinResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, or a system bin (validation-failed names the bin)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, a system bin on the blocked arm (validation-failed names the bin — the capacity arm deliberately permits system bins), a body mixing blocked with capacity attributes, a body carrying neither (validation-failed), or a non-boolean blocked (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
-  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied) or bin.create (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Bin does not exist in this warehouse (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('The bin is retired (bin-retired — retirement is terminal)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
@@ -402,10 +414,69 @@ export class TenancyController {
   ): Promise<BinResponse> {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
+    // Story 11-5: per-body dispatch on ONE route — putaway owns bin
+    // OPERATIONAL state (`blocked`), tenancy owns bin STRUCTURE (the capacity
+    // attributes; the re-homing precedent in reverse). The two arms never mix
+    // in one request (one idempotency key per request); a pre-11.5 body was
+    // always `{blocked}`-shaped, so the state arm's contract is unchanged.
+    // `blocked: null` must 400 here, NOT reach the state command: the DTO's
+    // `@IsOptional` skips validation for null as well as undefined, and
+    // `setBlocked` writing null into a NOT NULL column would answer 500 where
+    // pre-11.5 answered 400 (the 11-5 review's one high finding). The four
+    // capacity attributes keep their null-means-clear semantics — the
+    // asymmetry is deliberate: `blocked` is a state toggle, the attrs are
+    // limits.
+    if (dto.blocked !== undefined && typeof dto.blocked !== 'boolean') {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'blocked must be a boolean',
+        'The PATCH body carries `blocked: null` — send `true`/`false` to change the bin\'s operational state, or omit `blocked` entirely to change a capacity attribute.',
+      );
+    }
+    const hasBlocked = dto.blocked !== undefined;
+    const hasCapacity =
+      dto.lengthMm !== undefined ||
+      dto.widthMm !== undefined ||
+      dto.heightMm !== undefined ||
+      dto.maxWeightGrams !== undefined;
+    if (hasBlocked && hasCapacity) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'blocked and capacity attributes cannot change together',
+        'A blocked change and a capacity-attribute change are two different operations on this bin — send them as separate PATCH requests (one idempotency key per request).',
+      );
+    }
+    if (hasCapacity) {
+      const snapshot = await this.binCommand.editBinCapacity(
+        {
+          tenantId,
+          actorUserId: session.userId,
+          warehouseId,
+          binId,
+          lengthMm: dto.lengthMm,
+          widthMm: dto.widthMm,
+          heightMm: dto.heightMm,
+          maxWeightGrams: dto.maxWeightGrams,
+        },
+        key,
+      );
+      return normalizeBin(snapshot.bin);
+    }
+    if (!hasBlocked) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Nothing to change',
+        'Send `blocked` (the bin\'s operational state) or a capacity attribute (lengthMm, widthMm, heightMm, maxWeightGrams) — the body carries neither.',
+      );
+    }
     // Story 3.6: delegated to the re-homed command — the putaway module owns
     // bin operational state; the URL and the response body are unchanged.
+    // (`blocked` is defined here — the other two arms returned above.)
     const snapshot = await this.binStateCommand.setBlocked(
-      { tenantId, actorUserId: session.userId, warehouseId, binId, blocked: dto.blocked },
+      { tenantId, actorUserId: session.userId, warehouseId, binId, blocked: dto.blocked! },
       key,
     );
     return normalizeBin(snapshot.bin);
@@ -422,7 +493,7 @@ export class TenancyController {
   @ApiBody({ type: MergeBinDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: BinMergeResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a structural guard (validation-failed / bin-retired / bin-blocked — a blocked SOURCE is allowed, the only way to empty a blocked bin; only the target must be live), or a target overflow (bin-full names capacity and occupancy — nothing committed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a structural guard (validation-failed / bin-retired / bin-blocked — a blocked SOURCE is allowed, the only way to empty a blocked bin; only the target must be live), a target overflow (bin-full names capacity and occupancy), or the target over its physical limits (bin-overweight / bin-volume-exceeded / bin-item-oversize, story 11-5 — nothing committed in any arm)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.retire (role-denied — Owner and Ops Manager only)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Source or target bin does not exist in this warehouse (not-found)') })
@@ -522,12 +593,23 @@ function normalizeBin(bin: {
   systemOwned?: boolean;
   retiredAt?: string | null;
   retiredBy?: string | null;
+  lengthMm?: number | null;
+  widthMm?: number | null;
+  heightMm?: number | null;
+  maxWeightGrams?: number | null;
 }): BinResponse {
   return {
     ...bin,
     systemOwned: bin.systemOwned ?? false,
     retiredAt: bin.retiredAt ?? null,
     retiredBy: bin.retiredBy ?? null,
+    // Story 11-5: stored pre-11.5 idempotency snapshots lack the four
+    // nullable capacity attributes — an absent field reads as null (the same
+    // additive-nullable contract as the retirement pair above).
+    lengthMm: bin.lengthMm ?? null,
+    widthMm: bin.widthMm ?? null,
+    heightMm: bin.heightMm ?? null,
+    maxWeightGrams: bin.maxWeightGrams ?? null,
   } as BinResponse;
 }
 

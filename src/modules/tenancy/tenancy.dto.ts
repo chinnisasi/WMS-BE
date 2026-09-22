@@ -1,5 +1,10 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { MAX_QUANTITY_BASE } from '../../shared/primitives/quantity';
+// Story 11-5: the bin capacity caps (same import the SKU-attribute DTOs make
+// to `sku-attributes.ts` — the DTO mirrors the command's bounds, the command
+// enforces them). A standalone file (the 11-5 review triage #10): importing
+// `bin.command` from a DTO would pull its whole module graph in at load time.
+import { MAX_BIN_DIMENSION_MM, MAX_BIN_WEIGHT_GRAMS } from './bin-capacity';
 import { ADDRESS_FIELD_LENGTHS, PINCODE_RE } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { Transform, Type } from 'class-transformer';
@@ -365,6 +370,67 @@ export class CreateBinDto {
   @Max(MAX_QUANTITY_BASE)
   capacity!: number;
 
+  // Story 11-5: the bin's OPTIONAL physical capacity (FR-39) — the 11.2
+  // SKU-attribute DTO mirror. Absent = unconstrained on a fresh bin; the
+  // value rules live in the command (`assertBinCapacityAttributes`, behind
+  // the replay lookup — the 10.2 rule); the caps here document what the
+  // command enforces.
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_DIMENSION_MM,
+    description: `Internal length in millimetres. Omit to leave the bin unconstrained; null to clear. At most ${MAX_BIN_DIMENSION_MM}.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_DIMENSION_MM)
+  lengthMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_DIMENSION_MM,
+    description: `Internal width in millimetres. Omit to leave the bin unconstrained; null to clear. At most ${MAX_BIN_DIMENSION_MM}.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_DIMENSION_MM)
+  widthMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_DIMENSION_MM,
+    description: `Internal height in millimetres. Omit to leave the bin unconstrained; null to clear. At most ${MAX_BIN_DIMENSION_MM}.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_DIMENSION_MM)
+  heightMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_WEIGHT_GRAMS,
+    description: `Max weight in grams. Omit to leave the bin unconstrained; null to clear. At most ${MAX_BIN_WEIGHT_GRAMS}.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_WEIGHT_GRAMS)
+  maxWeightGrams?: number | null;
+
   @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
   @IsIn(BIN_TYPES)
   type!: BinType;
@@ -409,15 +475,143 @@ export class GenerateBinsDto {
   @Max(MAX_QUANTITY_BASE)
   capacity!: number;
 
+  // Story 11-5: the bin's OPTIONAL physical capacity, per generated bin
+  // (the `CreateBinDto` mirror — see its field comments).
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_DIMENSION_MM,
+    description: `Internal length in millimetres, per bin. Omit for unconstrained bins. At most ${MAX_BIN_DIMENSION_MM}.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_DIMENSION_MM)
+  lengthMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_DIMENSION_MM,
+    description: `Internal width in millimetres, per bin. Omit for unconstrained bins. At most ${MAX_BIN_DIMENSION_MM}.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_DIMENSION_MM)
+  widthMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_DIMENSION_MM,
+    description: `Internal height in millimetres, per bin. Omit for unconstrained bins. At most ${MAX_BIN_DIMENSION_MM}.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_DIMENSION_MM)
+  heightMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_WEIGHT_GRAMS,
+    description: `Max weight in grams, per bin. Omit for unconstrained bins. At most ${MAX_BIN_WEIGHT_GRAMS}.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_WEIGHT_GRAMS)
+  maxWeightGrams?: number | null;
+
   @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
   @IsIn(BIN_TYPES)
   type!: BinType;
 }
 
 export class PatchBinDto {
-  @ApiProperty({ example: false, description: 'true blocks the bin (broken); false unblocks' })
+  // Story 11-5: the PATCH body now carries BOTH of the route's arms —
+  // putaway's `{blocked}` state command and tenancy's capacity-attribute
+  // edit. The two never mix in one request (a body with both is refused —
+  // one idempotency key per request); a body with neither is a 400.
+  // `blocked` went from required to optional, but a blocked-only body is the
+  // only body the route ever accepted pre-11.5, so no client broke.
+  @ApiProperty({
+    required: false,
+    example: false,
+    description: 'true blocks the bin (broken); false unblocks. Mutually exclusive with the capacity attributes.',
+  })
+  @IsOptional()
   @IsBoolean()
-  blocked!: boolean;
+  blocked?: boolean;
+
+  // Story 11-5: the capacity attributes (the `CreateBinDto` mirror) —
+  // absent = leave unchanged, null = clear. Dispatched to tenancy's
+  // `editBinCapacity` (structure is tenancy's; `blocked` is putaway's).
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_DIMENSION_MM,
+    description: `Internal length in millimetres. Omit to leave unchanged; null to clear. Mutually exclusive with blocked.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_DIMENSION_MM)
+  lengthMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_DIMENSION_MM,
+    description: `Internal width in millimetres. Omit to leave unchanged; null to clear. Mutually exclusive with blocked.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_DIMENSION_MM)
+  widthMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_DIMENSION_MM,
+    description: `Internal height in millimetres. Omit to leave unchanged; null to clear. Mutually exclusive with blocked.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_DIMENSION_MM)
+  heightMm?: number | null;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: MAX_BIN_WEIGHT_GRAMS,
+    description: `Max weight in grams. Omit to leave unchanged; null to clear. Mutually exclusive with blocked.`,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_BIN_WEIGHT_GRAMS)
+  maxWeightGrams?: number | null;
 }
 
 export class ZoneResponse {
@@ -466,6 +660,37 @@ export class BinResponse {
 
   @ApiProperty({ example: 120, description: 'Base-UoM units' })
   capacity!: number;
+
+  // Story 11-5: the optional physical capacity echoes as RAW integers (the
+  // 11.2 SKU-attribute precedent — attributes are facts, not quantities; no
+  // fromMilli anywhere on them).
+  @ApiProperty({
+    nullable: true,
+    type: Number,
+    description: 'Internal length in millimetres (null = unconstrained)',
+  })
+  lengthMm!: number | null;
+
+  @ApiProperty({
+    nullable: true,
+    type: Number,
+    description: 'Internal width in millimetres (null = unconstrained)',
+  })
+  widthMm!: number | null;
+
+  @ApiProperty({
+    nullable: true,
+    type: Number,
+    description: 'Internal height in millimetres (null = unconstrained)',
+  })
+  heightMm!: number | null;
+
+  @ApiProperty({
+    nullable: true,
+    type: Number,
+    description: 'Max weight in grams (null = unconstrained)',
+  })
+  maxWeightGrams!: number | null;
 
   // `string` here (not the BinType union): the response echoes DB rows whose
   // column is text; the enum is still pinned in the OpenAPI schema below.
