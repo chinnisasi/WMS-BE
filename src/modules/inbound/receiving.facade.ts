@@ -76,6 +76,14 @@ export interface CatalogSnapshot {
     readonly serialTracked: boolean;
     /** Story 10.3: handled by unit, priced by weight — the device's offline catch-weight prompt. */
     readonly catchWeightTracked: boolean;
+    /**
+     * Story 11.7: the SKU's values on its product's declared variant axes —
+     * null when the SKU is unattached. Third mirror of the `SkuSummary` arm
+     * (10.2/10.3 precedent): keep in lockstep or this mirror ships stale.
+     */
+    readonly variantValues: Record<string, string> | null;
+    /** Story 11.7: the attached product's declared axes, in declaration order. Null when unattached. */
+    readonly axes: string[] | null;
   }[];
   readonly openPurchaseOrders: readonly {
     readonly id: string;

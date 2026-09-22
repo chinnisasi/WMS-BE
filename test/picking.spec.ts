@@ -141,6 +141,9 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     //                         a leftover pool would re-plan the next scenario)
     'PCK-SHORT-LEGACY', // 4.4: a pre-4.4 stored snapshot replays with the defaults
     'PCK-MILLI-KEY', // 10.2: a pre-10.2 MILLI fingerprint no longer replays (the accepted break)
+    'PCK-KIT', // 11.7: the kit-context arm — the parent kit's SKU
+    'PCK-KIT-COMP', // 11.7: the kit's component — its task names the parent's SKU
+    'PCK-KIT-PLAIN', // 11.7: the ordinary line — its task's kit field is null
   ] as const;
   const BATCH_SKU_CODE = 'PCK-FEFO';
   /** 4.3b: the batch-arm shortfall, routed by the epoch to 409 or 422. */
@@ -313,6 +316,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',
+        'kit_compositions', // before skus — kit-ness is relational, the rows must go first
         'batches',
         'skus',
         'devices',
@@ -509,6 +513,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       qty: number;
       walkSeq: number;
       binStateEpoch: number | null;
+      kitParentSkuCode: string | null;
     }[]
   > {
     const res = await request(app.getHttpServer())
@@ -522,6 +527,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       qty: number;
       walkSeq: number;
       binStateEpoch: number | null;
+      kitParentSkuCode: string | null;
     }[];
   }
 
@@ -2443,10 +2449,55 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     const walkCodes = forThisWalk.map((task) => task.binCode);
     expect([...walkCodes]).toEqual([...walkCodes].sort());
     expect(forThisWalk[0]!.skuCode).toBe('PCK-SNAP');
+    // Story 11.7: an ordinary line's task carries no kit context — null, never
+    // an absent key (the server always sends the field).
+    expect(forThisWalk[0]!.kitParentSkuCode).toBeNull();
 
     const first = mine.find((line) => line.binId === binI)!;
     await pick(bodyFor(first)).expect(201);
     const after = await snapshotTasks();
     expect(after.some((task) => task.picklistLineId === first.id)).toBe(false);
+  });
+
+  it('the snapshot names a kit component’s parent kit SKU in its pickTasks — the ordinary line beside it stays null', async () => {
+    // Inline kit fixture: the kit composition is made HERE (the kit POST is
+    // the only door into kit-ness), the component stock is seeded, and one
+    // order carries the kit line (which explodes) beside an ordinary line.
+    const kitSkuId = sku('PCK-KIT');
+    const compSkuId = sku('PCK-KIT-COMP');
+    const plainSkuId = sku('PCK-KIT-PLAIN');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/skus/${kitSkuId}/kit`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ components: [{ skuId: compSkuId, quantity: 2 }] })
+      .expect(201);
+    await seedStock(compSkuId, binA, 4);
+    await seedStock(plainSkuId, binA, 4);
+    const { picklist } = await releasedWave(
+      [
+        { skuId: kitSkuId, quantity: 1 },
+        { skuId: plainSkuId, quantity: 3 },
+      ],
+      'kittask',
+    );
+
+    const tasks = await snapshotTasks();
+    const mine = picklist.lines.filter((line) => line.status === 'planned');
+    const componentTask = tasks.find(
+      (task) => mine.some((line) => line.id === task.picklistLineId) && task.skuCode === 'PCK-KIT-COMP',
+    );
+    expect(componentTask).toBeDefined();
+    expect(componentTask!.kitParentSkuCode).toBe('PCK-KIT');
+    const ordinaryTask = tasks.find(
+      (task) => mine.some((line) => line.id === task.picklistLineId) && task.skuCode === 'PCK-KIT-PLAIN',
+    );
+    expect(ordinaryTask).toBeDefined();
+    expect(ordinaryTask!.kitParentSkuCode).toBeNull();
+    // The kit parent itself never appears as a task: it holds no reservation,
+    // so wave planning plans only the exploded component lines.
+    expect(
+      tasks.some((task) => task.skuCode === 'PCK-KIT' && mine.some((line) => line.id === task.picklistLineId)),
+    ).toBe(false);
   });
 });

@@ -163,6 +163,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       await sql.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_imports WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM skus WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await sql.unsafe('DELETE FROM products WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM devices WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM bins WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM zones WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -913,7 +914,14 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     const snapshot = res.body as {
       generatedAt: string;
       warehouseId: string;
-      skus: { id: string; code: string; barcode: string; batchTracked: boolean }[];
+      skus: {
+        id: string;
+        code: string;
+        barcode: string;
+        batchTracked: boolean;
+        variantValues: Record<string, string> | null;
+        axes: string[] | null;
+      }[];
       openPurchaseOrders: { id: string; code: string; lines: { openQty: number }[] }[];
     };
     expect(snapshot.warehouseId).toBe(warehouseId);
@@ -922,6 +930,34 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     const batchSku = snapshot.skus.find((sku) => sku.id === batchSkuId)!;
     expect(batchSku.batchTracked).toBe(true);
     expect(typeof batchSku.barcode).toBe('string');
+
+    // Story 11.7: the variant fields ride the SKU arm — the attached product's
+    // axes in declaration order and the SKU's values on them, both null on an
+    // unattached SKU. Fixtures are built inline (test/support has no product
+    // helper; test/products.spec.ts is the pattern reference, not an import).
+    const variantProduct = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/products`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ name: `Receiving Variant ${ulid().slice(10, 16).toUpperCase()}`, axes: ['size', 'colour'] })
+      .expect(201);
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${plainSkuId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ productId: variantProduct.body.id, variantValues: { size: 'M', colour: 'Red' } })
+      .expect(200);
+    const refreshed = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`)
+      .set('Authorization', `Bearer ${badged.accessToken}`)
+      .expect(200);
+    const skusAfter = (refreshed.body as typeof snapshot).skus;
+    const variantSku = skusAfter.find((sku) => sku.id === plainSkuId)!;
+    expect(variantSku.variantValues).toEqual({ size: 'M', colour: 'Red' });
+    expect(variantSku.axes).toEqual(['size', 'colour']);
+    // The unattached arm: BOTH fields null — null, never an absent key.
+    expect(batchSku.variantValues).toBeNull();
+    expect(batchSku.axes).toBeNull();
 
     // The open PO list: a fresh open PO is present; a closed one is not.
     const fresh = await createOpenPo(9, plainSkuId);

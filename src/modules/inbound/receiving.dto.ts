@@ -482,6 +482,24 @@ export class CatalogSnapshotSkuDto {
       'Story 10.3: the SKU is handled by unit and priced by weight. It rides the snapshot so the device can PROMPT for a per-unit weight at receipt while offline — a prompt only the server knows about never happens on the floor.',
   })
   catchWeightTracked!: boolean;
+
+  @ApiProperty({
+    type: Object,
+    nullable: true,
+    example: { size: 'M', colour: 'Red' },
+    description:
+      'Story 11.7: this SKU\'s values on its product\'s declared variant axes, null when the SKU is unattached. Rides the snapshot so the device can SAY which variant a pick scan holds, offline (UX-DR28).',
+  })
+  variantValues!: Record<string, string> | null;
+
+  @ApiProperty({
+    type: [String],
+    nullable: true,
+    example: ['size', 'colour'],
+    description:
+      'Story 11.7: the attached product\'s declared variant axes, in declaration order — the order a variant label is read in. Null when the SKU is unattached.',
+  })
+  axes!: string[] | null;
 }
 
 /** One open PO of the device snapshot (header + line quantities). */
