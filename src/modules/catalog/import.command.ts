@@ -29,7 +29,7 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { MAX_QUANTITY_BASE, validateRecordableQuantity } from '../../shared/primitives/quantity';
+import { MAX_QUANTITY_BASE, fromMilli, validateRecordableQuantity } from '../../shared/primitives/quantity';
 import {
   isFractionalUom,
   resolveUom,
@@ -45,7 +45,7 @@ import {
   assertVariantValues,
   variantValuesFingerprint,
 } from './product.command';
-import { MAX_KIT_COMPONENTS } from './kit.command';
+import { MAX_KIT_COMPONENTS, kitEventPayload } from './kit.command';
 import { getKitSkuIdsInTx } from './kit.store';
 
 export const IMPORT_MODES = ['initial', 'fix'] as const;
@@ -199,7 +199,9 @@ type ExcelBuffer = Parameters<Workbook['xlsx']['load']>[0];
  * insert — a failing row is not committed) and the 11.6 kit pass (compositions
  * resolved by code AFTER the SKU insert — a component may be an earlier row of
  * the same file, so a refused kit cell leaves its SKU row committed and fails
- * as a row error; the PUT route and fix mode can retry the composition).
+ * as a row error; the SKU row and the failure overlap in the counts. Only the
+ * PUT route can retry the composition — fix mode cannot, because the
+ * committed SKU is refused `duplicate-sku-code` on resubmit).
  */
 @Injectable()
 export class ImportCommand {
@@ -484,9 +486,10 @@ export class ImportCommand {
           // kit store's guards, the SAME rules the kit create command runs
           // (flat BOM, one level; a kit never holds stock; quantities in the
           // component's base UoM against its declared precision). A refused
-          // cell leaves its SKU row committed and fails as a row error; the
-          // PUT route (or a fix-mode resubmit of just the composition) can
-          // retry the composition later.
+          // cell leaves its SKU row committed and fails as a row error; only
+          // the PUT route can retry the composition — a fix-mode resubmit of
+          // the row is refused `duplicate-sku-code`, the SKU already
+          // committing in the earlier run.
           const kitImports = insertable.filter((row) => row.kitComponents !== null);
           if (kitImports.length > 0) {
             // Same index alignment as the conversion rows: insertable's codes
@@ -543,6 +546,11 @@ export class ImportCommand {
             );
 
             const compositionRows: { id: string; tenantId: string; kitSkuId: string; componentSkuId: string; qty: number }[] = [];
+            // Event parity with KitCommand.create (story 11.4): every kit
+            // this pass creates appends `catalog.kit_created` in-transaction,
+            // so an outbox consumer sees import-created kits exactly as it
+            // sees command-created ones. Refused cells emit nothing.
+            const kitEvents: { skuId: string; code: string; components: { skuId: string; code: string; qty: number }[] }[] = [];
             for (const row of kitImports) {
               const kitSkuId = skuIdByCode.get(row.code)!;
               if (stockKits.has(kitSkuId)) {
@@ -606,10 +614,34 @@ export class ImportCommand {
                     qty: entry.qty,
                   });
                 }
+                kitEvents.push({
+                  skuId: kitSkuId,
+                  code: row.code,
+                  components: row.kitComponents!.map((component, i) => ({
+                    skuId: composition[i]!.componentSkuId,
+                    code: component.code,
+                    // The event carries base units, the command's convention —
+                    // the pass's composition holds milli.
+                    qty: fromMilli(composition[i]!.qty),
+                  })),
+                });
               }
             }
             for (const chunk of chunked(compositionRows)) {
               await tx.insert(kitCompositions).values(chunk);
+            }
+            for (const kit of kitEvents) {
+              await this.outbox.append(tx, {
+                messageId: uuidv7(),
+                tenantId: command.tenantId,
+                type: 'catalog.kit_created',
+                occurredAt: nowIso(),
+                payload: kitEventPayload({
+                  skuId: kit.skuId,
+                  code: kit.code,
+                  components: kit.components,
+                }),
+              });
             }
           }
         }
