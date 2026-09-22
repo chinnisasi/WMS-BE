@@ -921,16 +921,26 @@ export class ReceivingCommand {
         // applies as a fresh `grn.received` delta at DECISION time, days after
         // the GRN's own kit check ran. A SKU that became a kit in between must
         // refuse here too, or the approval invents independent kit stock.
+        //
+        // Fix A2 (epic-11 retro F2): lock the SKU row FIRST — the `loadSkus`
+        // shape, tenant-scoped, id-ordered, `.for('update')` — so a concurrent
+        // kit-create serializes on the same row the kit command locks in
+        // `lockSkus`, and the kit probe below decides against committed state
+        // instead of racing it. The refusal then reuses the locked row's code
+        // (no unlocked follow-up read). The reject arm takes NO lock: it
+        // writes nothing but status, and need not serialize against a kit
+        // create.
+        const lockedSkus = await tx
+          .select({ code: skus.code })
+          .from(skus)
+          .where(and(eq(skus.tenantId, command.tenantId), eq(skus.id, row.skuId)))
+          .orderBy(skus.id)
+          .for('update');
         const overReceiptKitIds = await this.catalog.getKitSkuIdsInTx(tx, command.tenantId, [
           row.skuId,
         ]);
         if (overReceiptKitIds.length > 0) {
-          const skuRows = await tx
-            .select({ code: skus.code })
-            .from(skus)
-            .where(eq(skus.id, row.skuId))
-            .limit(1);
-          throw kitCannotHoldStock('over-receipt approval', [skuRows[0]?.code ?? row.skuId]);
+          throw kitCannotHoldStock('over-receipt approval', [lockedSkus[0]?.code ?? row.skuId]);
         }
         // The excess applies as a normal ledger append (corrections are new
         // events) — the system Receiving bin (ensured, idempotent) is its

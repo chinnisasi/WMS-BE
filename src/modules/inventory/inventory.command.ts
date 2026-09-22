@@ -582,6 +582,15 @@ export class StockAdjustmentCommand {
    * The SKU must exist in this tenant (404 otherwise). Story 10.2: the read
    * also carries `uom` back, because the unit is what says how precise this
    * movement's quantity is allowed to be.
+   *
+   * Fix A2 (epic-11 retro F2): the read locks the SKU row `.for('update')` —
+   * the same read it already performed, now serializing this +stock writer
+   * against a concurrent kit-create on the same SKU (which locks the same row
+   * in `lockSkus` before its stock guard). Without the lock, the adjustment's
+   * kit probe could read not-a-kit while a kit create that saw stock = 0
+   * committed in parallel — a kit SKU stranded with on-hand stock no command
+   * can remove. The lock sits after the replay lookup, so a replayed
+   * adjustment returns before this read and takes no lock.
    */
   private async assertSkuInTenant(
     tx: TenantTx,
@@ -591,7 +600,8 @@ export class StockAdjustmentCommand {
       .select({ id: skus.id, code: skus.code, uom: skus.uom, catchWeightTracked: skus.catchWeightTracked })
       .from(skus)
       .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
-      .limit(1);
+      .limit(1)
+      .for('update');
     if (rows[0] === undefined) {
       throw new ProblemException(
         'not-found',
