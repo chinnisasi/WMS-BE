@@ -2,8 +2,10 @@
  * Kit composition store (Story 11.4 — the file-level in-tx seam, the
  * `handling-unit.store.ts` pattern).
  *
- * `kit_compositions` is CATALOG-owned and has exactly one writer (`KitCommand`,
- * AD-6): kit-ness is the PRESENCE of composition rows, never a flag. Every
+ * `kit_compositions` is CATALOG-owned: kit-ness is the PRESENCE of composition
+ * rows, never a flag. `KitCommand` is the primary writer (AD-6); the catalog
+ * import's `kit_components` resolution pass (Story 11.6) is the second
+ * catalog-internal one, writing through these same guards. Every
  * other module's read of kit-ness goes through these functions — the inventory
  * module cannot take a DI edge on `CatalogModule` (catalog reaches tenancy,
  * tenancy reaches putaway, putaway reaches back there — the module-EVALUATION
