@@ -1,5 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import type { PicklistLine } from '../../shared/db/schema';
@@ -9,6 +10,7 @@ import {
   bins,
   devices,
   idempotencyKeys,
+  orderLines,
   orders,
   picklistLines,
   picklists,
@@ -247,6 +249,15 @@ export interface PickTask {
    * row yet; the server treats that as a match.
    */
   readonly binStateEpoch: number | null;
+  /**
+   * Story 11.7: the parent kit SKU's code when this task's order line is a kit
+   * component (`order_lines.parent_line_id` → the parent's line → its SKU's
+   * code), null on an ordinary line and on a kit parent. DISPLAY-ONLY — the
+   * device shows "from kit {code}" in the task header; no pick logic reads
+   * kit-ness (the module doc's invariant amendment). The explosion is
+   * point-in-time, so the parent line the join resolves always exists.
+   */
+  readonly kitParentSkuCode: string | null;
 }
 
 /** The AD-14 taxonomy's two SUCCESS arms, plus "no conflict at all". */
@@ -1599,6 +1610,11 @@ export class PickCommandService {
    * snapshot, so it must not degrade with picking history.
    */
   async getPickTasksInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<PickTask[]> {
+    // Story 11.7: a kit component's task names its parent kit's SKU code, for
+    // the task header's "from kit" line. `order_lines` self-joins once — a
+    // component line's `parent_line_id` is another row of the same table.
+    const parentLines = alias(orderLines, 'parent_order_lines');
+    const parentSkus = alias(skus, 'parent_skus');
     const overRead = await tx
       .select({
         waveId: picklistLines.waveId,
@@ -1615,11 +1631,15 @@ export class PickCommandService {
         qty: picklistLines.qty,
         sliceSeq: picklistLines.sliceSeq,
         walkSeq: picklistLines.walkSeq,
+        kitParentSkuCode: parentSkus.code,
       })
       .from(picklistLines)
       .innerJoin(picklists, eq(picklists.id, picklistLines.picklistId))
       .innerJoin(waves, eq(waves.id, picklistLines.waveId))
       .innerJoin(skus, eq(skus.id, picklistLines.skuId))
+      .leftJoin(orderLines, eq(orderLines.id, picklistLines.orderLineId))
+      .leftJoin(parentLines, eq(parentLines.id, orderLines.parentLineId))
+      .leftJoin(parentSkus, eq(parentSkus.id, parentLines.skuId))
       .where(
         and(
           eq(picklistLines.tenantId, tenantId),
@@ -1689,6 +1709,7 @@ export class PickCommandService {
       walkSeq: row.walkSeq,
       stopCount: stops.get(row.picklistId)?.size ?? 0,
       binStateEpoch: binEpochs.get(row.binId!) ?? null,
+      kitParentSkuCode: row.kitParentSkuCode,
     }));
   }
 }

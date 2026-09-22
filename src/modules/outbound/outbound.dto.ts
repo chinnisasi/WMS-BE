@@ -919,6 +919,14 @@ export class PickTaskDto {
       'Story 4.3b (AD-14): the stop bin’s state_epoch at snapshot time — opaque, compared only for equality. The device carries it back on the queued pick so the server can classify a conflict instead of rejecting blindly. Null when the bin has no epoch row yet (no movement has ever touched it).',
   })
   binStateEpoch!: number | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description:
+      'Story 11.7: the parent kit SKU\'s code when this task\'s order line is a kit component (order_lines.parent_line_id), null on an ordinary line. Display-only — the device renders "from kit {code}" in the task header; no pick logic reads kit-ness.',
+  })
+  kitParentSkuCode!: string | null;
 }
 
 // ── Packing (Story 4.5) ─────────────────────────────────────────────────────

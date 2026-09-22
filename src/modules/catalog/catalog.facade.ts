@@ -1,7 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
-import { batches, catalogImports, serials, skus } from '../../shared/db/schema';
+import { batches, catalogImports, products, serials, skus } from '../../shared/db/schema';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -127,6 +127,20 @@ export interface SkuSummary {
    * only the server knows about never happens on the floor.
    */
   readonly catchWeightTracked: boolean;
+  /**
+   * Story 11.7: the SKU's values on its product's declared variant axes
+   * (`size: M, colour: Red`), null when the SKU is unattached. It rides the
+   * snapshot so the device can SAY which variant a scan holds at pick time,
+   * offline — picking the wrong size is the dominant apparel error (UX-DR28),
+   * and a label that only the server could compose never reaches the floor.
+   */
+  readonly variantValues: Record<string, string> | null;
+  /**
+   * Story 11.7: the attached product's declared axes, in DECLARATION order —
+   * the order a variant label is read in. Null when the SKU is unattached
+   * (left join on `products`).
+   */
+  readonly axes: string[] | null;
 }
 
 @Injectable()
@@ -221,8 +235,14 @@ export class CatalogFacade {
         batchTracked: skus.batchTracked,
         serialTracked: skus.serialTracked,
         catchWeightTracked: skus.catchWeightTracked,
+        // Story 11.7: the variant identity rides the scan surface. The values
+        // are already a `skus` column; the axes are the ATTACHED PRODUCT's, so
+        // a left join — an unattached SKU carries null on both.
+        variantValues: skus.variantValues,
+        axes: products.axes,
       })
       .from(skus)
+      .leftJoin(products, eq(products.id, skus.productId))
       .where(eq(skus.tenantId, tenantId))
       .orderBy(skus.code);
     // Story 10.2: the unit's declared precision joins the scan identity. It is
