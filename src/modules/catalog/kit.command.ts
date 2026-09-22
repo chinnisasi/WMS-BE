@@ -512,9 +512,19 @@ async function assertNotKitInTx(tx: TenantTx, tenantId: string, skuId: string): 
  * receiving and stock adjustment) and no order line can ever reserve one —
  * orders explode to components — so a kit created ON stock would strand that
  * stock and its ATP forever, with no write-off path. Runs against the locked
- * kit row, in the same transaction as the composition write, so a GRN that
- * commits stock concurrently serializes on the same `.for('update')` sku row
- * (the GRN's `loadSkus` locks it too) and is already visible here.
+ * kit row, in the same transaction as the composition write, so any concurrent
+ * +stock writer serializes on the same `.for('update')` sku row and is already
+ * visible here — all THREE of them lock the row before writing stock: the GRN
+ * (`receiving.loadSkus`), the stock adjustment (`assertSkuInTenant`), and the
+ * over-receipt approval (its decision-time SKU lock, fix A2).
+ *
+ * Serialization premise (fix A2): this holds under READ COMMITTED — the
+ * `withTenantTransaction` default (only reconcile opts into repeatable read).
+ * A kit create blocked on the SKU row re-reads committed state after the
+ * writer commits, so the loser answers against what the winner wrote; under
+ * REPEATABLE READ the blocked read would answer from its pre-block snapshot
+ * and the stranded-stock skew would reappear despite both sides holding the
+ * lock.
  */
 async function assertKitSkuHoldsNoStock(
   tx: TenantTx,
