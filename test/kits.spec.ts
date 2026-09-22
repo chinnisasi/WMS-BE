@@ -64,9 +64,10 @@ const SKU_CODES = [
   'COMP-PE1',
   // the over-receipt approval arm (a kit that arrives between GRN and decision)
   'OVR-KIT',
-  // fix A2 races: the adjustment-vs-kit-create pair, and the over-receipt
-  // recipe's own SKU (PO → GRN with excess → emptied → race)
-  'KIT-ADJR', 'COMP-ADJC', 'OVR-RACE',
+  // fix A2 races: the adjustment-vs-kit-create pair (one fresh kit SKU per
+  // interleaving), and the over-receipt recipe's own SKUs (PO → GRN with
+  // excess → emptied → race; one per interleaving)
+  'KIT-ADJR', 'KIT-ADJR2', 'KIT-ADJR3', 'COMP-ADJC', 'OVR-RACE', 'OVR-RACE2',
 ] as const;
 const KG_CODES = ['KIT-KG', 'COMP-G', 'KIT-KPREC'] as const; // the sub-milli/precision kit pairs
 
@@ -994,139 +995,163 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
     // stranding kit stock no command can remove.
 
     it('fix A2: a kit create racing a stock adjustment serializes — exactly one commits', async () => {
-      const settled = await Promise.allSettled([
-        createKit(sku('KIT-ADJR'), [{ skuId: sku('COMP-ADJC'), quantity: 1 }], ulid()),
-        request(app.getHttpServer())
+      // Three interleavings, one fresh kit SKU (and fresh idempotency keys)
+      // each — a single shot can dodge the race by scheduling luck, so the
+      // never-both invariant must hold every time.
+      for (const kitCode of ['KIT-ADJR', 'KIT-ADJR2', 'KIT-ADJR3']) {
+        const settled = await Promise.allSettled([
+          createKit(sku(kitCode), [{ skuId: sku('COMP-ADJC'), quantity: 1 }], ulid()),
+          request(app.getHttpServer())
+            .post(`${API}/${tenantId}/inventory/adjustments`)
+            .set('Authorization', `Bearer ${opsToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({
+              warehouseId,
+              skuId: sku(kitCode),
+              binId: binA,
+              quantityDelta: 5,
+              reasonCode: 'cycle-count',
+              note: 'kits-suite: adjustment-vs-kit-create race',
+            }),
+        ]);
+        const responses = settled.map((outcome) => {
+          if (outcome.status !== 'fulfilled') throw outcome.reason;
+          return outcome.value;
+        });
+        const statuses = responses.map((res) => res.status).sort((a, b) => a - b);
+        expect(statuses).toEqual([201, 409]);
+        // The safe outcomes only: the kit create committed and the adjustment
+        // answered kit-cannot-hold-stock, or the adjustment committed and the
+        // kit create answered kit-sku-holds-stock.
+        const loser = responses.find((res) => res.status === 409)!;
+        expect(['kit-cannot-hold-stock', 'kit-sku-holds-stock']).toContain(loser.body.code);
+        const kitWon = loser.body.code === 'kit-cannot-hold-stock';
+        const compRows = (await sql`
+          select count(*)::int as n from kit_compositions
+          where tenant_id = ${tenantId} and kit_sku_id = ${sku(kitCode)}
+        `) as unknown as { n: number }[];
+        const stockRows = (await sql`
+          select count(*)::int as n from stock_on_hand
+          where tenant_id = ${tenantId} and sku_id = ${sku(kitCode)} and quantity > 0
+        `) as unknown as { n: number }[];
+        if (kitWon) {
+          expect(Number(compRows[0]!.n)).toBe(1);
+          expect(Number(stockRows[0]!.n)).toBe(0);
+        } else {
+          expect(Number(compRows[0]!.n)).toBe(0);
+          expect(Number(stockRows[0]!.n)).toBeGreaterThan(0);
+        }
+      }
+    });
+
+    it('fix A2: a kit create racing an over-receipt approval serializes — exactly one commits', async () => {
+      // Two interleavings, one fresh OVR SKU each — a single shot can dodge
+      // the race by scheduling luck. The full over-receipt recipe per
+      // iteration: PO → GRN applying 10 and pending 5 → the applied stock
+      // emptied via adjustment (the kit-create stock guard refuses a SKU
+      // still holding stock) → then the race between the kit create and the
+      // approval, a +stock writer in its own right.
+      for (const ovrCode of ['OVR-RACE', 'OVR-RACE2']) {
+        const po = (
+          await request(app.getHttpServer())
+            .post(`${API}/${tenantId}/inbound/purchase-orders`)
+            .set('Authorization', `Bearer ${ownerToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({
+              warehouseId,
+              vendorId,
+              code: `PO-${ulid().slice(10, 18).toUpperCase()}`,
+              lines: [{ skuId: sku(ovrCode), orderedQty: 10, unitCostPaise: 1250 }],
+            })
+            .expect(201)
+        ).body.purchaseOrder as { id: string; lines: { id: string }[] };
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/receiving/goods-receipts`)
+          .set('Authorization', `Bearer ${operatorToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({
+            warehouseId,
+            poId: po.id,
+            blindReasonCode: null,
+            occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+            lines: [{ poLineId: po.lines[0]!.id, skuId: sku(ovrCode), batchCode: null, mfgDate: null, qty: 15 }],
+          })
+          .expect(201);
+        const pending = (await sql`
+          select id from over_receipts
+          where tenant_id = ${tenantId} and sku_id = ${sku(ovrCode)} and status = 'pending'
+        `) as unknown as { id: string }[];
+        expect(pending).toHaveLength(1);
+        const overReceiptId = pending[0]!.id;
+        const recvBin = (await sql`
+          select bin_id from stock_on_hand
+          where tenant_id = ${tenantId} and sku_id = ${sku(ovrCode)} and quantity > 0 limit 1
+        `) as unknown as { bin_id: string }[];
+        expect(recvBin).toHaveLength(1);
+        await request(app.getHttpServer())
           .post(`${API}/${tenantId}/inventory/adjustments`)
           .set('Authorization', `Bearer ${opsToken}`)
           .set(KEY_HEADER, ulid())
           .send({
             warehouseId,
-            skuId: sku('KIT-ADJR'),
-            binId: binA,
-            quantityDelta: 5,
+            skuId: sku(ovrCode),
+            binId: recvBin[0]!.bin_id,
+            quantityDelta: -10,
             reasonCode: 'cycle-count',
-            note: 'kits-suite: adjustment-vs-kit-create race',
-          }),
-      ]);
-      const responses = settled.map((outcome) => {
-        if (outcome.status !== 'fulfilled') throw outcome.reason;
-        return outcome.value;
-      });
-      const statuses = responses.map((res) => res.status).sort((a, b) => a - b);
-      expect(statuses).toEqual([201, 409]);
-      // The safe outcomes only: the kit create committed and the adjustment
-      // answered kit-cannot-hold-stock, or the adjustment committed and the
-      // kit create answered kit-sku-holds-stock.
-      const loser = responses.find((res) => res.status === 409)!;
-      expect(['kit-cannot-hold-stock', 'kit-sku-holds-stock']).toContain(loser.body.code);
-      const kitWon = loser.body.code === 'kit-cannot-hold-stock';
-      const compRows = (await sql`
-        select count(*)::int as n from kit_compositions
-        where tenant_id = ${tenantId} and kit_sku_id = ${sku('KIT-ADJR')}
-      `) as unknown as { n: number }[];
-      const stockRows = (await sql`
-        select count(*)::int as n from stock_on_hand
-        where tenant_id = ${tenantId} and sku_id = ${sku('KIT-ADJR')} and quantity > 0
-      `) as unknown as { n: number }[];
-      if (kitWon) {
-        expect(Number(compRows[0]!.n)).toBe(1);
-        expect(Number(stockRows[0]!.n)).toBe(0);
-      } else {
-        expect(Number(compRows[0]!.n)).toBe(0);
-        expect(Number(stockRows[0]!.n)).toBeGreaterThan(0);
-      }
-    });
-
-    it('fix A2: a kit create racing an over-receipt approval serializes — exactly one commits', async () => {
-      // The full over-receipt recipe: PO → GRN applying 10 and pending 5 →
-      // the applied stock emptied via adjustment (the kit-create stock guard
-      // refuses a SKU still holding stock) → then the race between the kit
-      // create and the approval, a +stock writer in its own right.
-      const po = (
-        await request(app.getHttpServer())
-          .post(`${API}/${tenantId}/inbound/purchase-orders`)
-          .set('Authorization', `Bearer ${ownerToken}`)
-          .set(KEY_HEADER, ulid())
-          .send({
-            warehouseId,
-            vendorId,
-            code: `PO-${ulid().slice(10, 18).toUpperCase()}`,
-            lines: [{ skuId: sku('OVR-RACE'), orderedQty: 10, unitCostPaise: 1250 }],
+            note: 'kits-suite: empty the SKU before the race',
           })
-          .expect(201)
-      ).body.purchaseOrder as { id: string; lines: { id: string }[] };
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/receiving/goods-receipts`)
-        .set('Authorization', `Bearer ${operatorToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({
-          warehouseId,
-          poId: po.id,
-          blindReasonCode: null,
-          occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
-          lines: [{ poLineId: po.lines[0]!.id, skuId: sku('OVR-RACE'), batchCode: null, mfgDate: null, qty: 15 }],
-        })
-        .expect(201);
-      const pending = (await sql`
-        select id from over_receipts
-        where tenant_id = ${tenantId} and sku_id = ${sku('OVR-RACE')} and status = 'pending'
-      `) as unknown as { id: string }[];
-      expect(pending).toHaveLength(1);
-      const overReceiptId = pending[0]!.id;
-      const recvBin = (await sql`
-        select bin_id from stock_on_hand
-        where tenant_id = ${tenantId} and sku_id = ${sku('OVR-RACE')} and quantity > 0 limit 1
-      `) as unknown as { bin_id: string }[];
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/inventory/adjustments`)
-        .set('Authorization', `Bearer ${opsToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({
-          warehouseId,
-          skuId: sku('OVR-RACE'),
-          binId: recvBin[0]!.bin_id,
-          quantityDelta: -10,
-          reasonCode: 'cycle-count',
-          note: 'kits-suite: empty the SKU before the race',
-        })
-        .expect(201);
-      const settled = await Promise.allSettled([
-        createKit(sku('OVR-RACE'), [{ skuId: sku('COMP-E1'), quantity: 1 }], ulid()),
-        request(app.getHttpServer())
-          .post(`${API}/${tenantId}/receiving/over-receipts/${overReceiptId}/approve`)
-          .set('Authorization', `Bearer ${opsToken}`)
-          .set(KEY_HEADER, ulid()),
-      ]);
-      const responses = settled.map((outcome) => {
-        if (outcome.status !== 'fulfilled') throw outcome.reason;
-        return outcome.value;
-      });
-      const statuses = responses.map((res) => res.status).sort((a, b) => a - b);
-      expect(statuses).toEqual([201, 409]);
-      const loser = responses.find((res) => res.status === 409)!;
-      expect(['kit-cannot-hold-stock', 'kit-sku-holds-stock']).toContain(loser.body.code);
-      const kitWon = loser.body.code === 'kit-cannot-hold-stock';
-      const compRows = (await sql`
-        select count(*)::int as n from kit_compositions
-        where tenant_id = ${tenantId} and kit_sku_id = ${sku('OVR-RACE')}
-      `) as unknown as { n: number }[];
-      const stockRows = (await sql`
-        select count(*)::int as n from stock_on_hand
-        where tenant_id = ${tenantId} and sku_id = ${sku('OVR-RACE')} and quantity > 0
-      `) as unknown as { n: number }[];
-      const decision = (await sql`
-        select status from over_receipts where id = ${overReceiptId}
-      `) as unknown as { status: string }[];
-      if (kitWon) {
-        expect(Number(compRows[0]!.n)).toBe(1);
-        expect(Number(stockRows[0]!.n)).toBe(0);
-        // The decision is terminal-refused; the row stays pending.
-        expect(decision[0]!.status).toBe('pending');
-      } else {
-        expect(Number(compRows[0]!.n)).toBe(0);
-        expect(Number(stockRows[0]!.n)).toBeGreaterThan(0);
-        expect(decision[0]!.status).toBe('approved');
+          .expect(201);
+        // The precondition the refusal arm depends on: the SKU really holds
+        // nothing, else the approval-won branch passes vacuously and the
+        // approval-refusal arm is never exercised.
+        const emptied = (await sql`
+          select count(*)::int as n from stock_on_hand
+          where tenant_id = ${tenantId} and sku_id = ${sku(ovrCode)} and quantity > 0
+        `) as unknown as { n: number }[];
+        expect(Number(emptied[0]!.n)).toBe(0);
+        const settled = await Promise.allSettled([
+          createKit(sku(ovrCode), [{ skuId: sku('COMP-E1'), quantity: 1 }], ulid()),
+          request(app.getHttpServer())
+            .post(`${API}/${tenantId}/receiving/over-receipts/${overReceiptId}/approve`)
+            .set('Authorization', `Bearer ${opsToken}`)
+            .set(KEY_HEADER, ulid()),
+        ]);
+        const responses = settled.map((outcome) => {
+          if (outcome.status !== 'fulfilled') throw outcome.reason;
+          return outcome.value;
+        });
+        const statuses = responses.map((res) => res.status).sort((a, b) => a - b);
+        // The approve endpoint answers 200 on success (@HttpCode(OK)) while
+        // the kit create answers 201 — which endpoint wins the race decides
+        // the winner's status, so only the loser is pinned: exactly one 409,
+        // the other a success.
+        expect(statuses).toHaveLength(2);
+        expect(statuses.filter((status) => status === 409)).toHaveLength(1);
+        expect([200, 201]).toContain(statuses.find((status) => status !== 409)!);
+        const loser = responses.find((res) => res.status === 409)!;
+        expect(['kit-cannot-hold-stock', 'kit-sku-holds-stock']).toContain(loser.body.code);
+        const kitWon = loser.body.code === 'kit-cannot-hold-stock';
+        const compRows = (await sql`
+          select count(*)::int as n from kit_compositions
+          where tenant_id = ${tenantId} and kit_sku_id = ${sku(ovrCode)}
+        `) as unknown as { n: number }[];
+        const stockRows = (await sql`
+          select count(*)::int as n from stock_on_hand
+          where tenant_id = ${tenantId} and sku_id = ${sku(ovrCode)} and quantity > 0
+        `) as unknown as { n: number }[];
+        const decision = (await sql`
+          select status from over_receipts where id = ${overReceiptId}
+        `) as unknown as { status: string }[];
+        if (kitWon) {
+          expect(Number(compRows[0]!.n)).toBe(1);
+          expect(Number(stockRows[0]!.n)).toBe(0);
+          // The decision is terminal-refused; the row stays pending.
+          expect(decision[0]!.status).toBe('pending');
+        } else {
+          expect(Number(compRows[0]!.n)).toBe(0);
+          expect(Number(stockRows[0]!.n)).toBeGreaterThan(0);
+          expect(decision[0]!.status).toBe('approved');
+        }
       }
     });
 
