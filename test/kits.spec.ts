@@ -1288,4 +1288,254 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
       expect(await orderStatus(orderId)).toBe('dispatched');
     });
   });
+
+  // ── Story 11.6: the kit_components import column ──────────────────────────
+
+  describe('kit_components import (story 11.6)', () => {
+    // The 13 codes that COMMIT as SKU rows — including the 7 whose kit cell
+    // is refused: the resolution pass runs after every SKU row has committed,
+    // so a refused cell leaves its SKU in place and fails as a row error
+    // (spec design note). Only the three shape-refused rows create nothing.
+    const IMPORT_CODES = [
+      'IMP-IA', 'IMP-IB', 'KIT-IMP-1', 'KIT-IMP-GHOST', 'KIT-IMP-SELF',
+      'KIT-IMP-KITCOMP', 'KIT-IMP-M1', 'KIT-IMP-M2', 'KIT-IMP-P', 'IMP-CE',
+      'KIT-IMP-PKG', 'IMP-CG', 'KIT-IMP-FINE',
+    ] as const;
+    const importSkuIds = new Map<string, string>();
+
+    function imp(code: string): string {
+      const id = importSkuIds.get(code);
+      if (id === undefined) throw new Error(`unknown import fixture SKU ${code}`);
+      return id;
+    }
+
+    beforeAll(async () => {
+      // A pre-existing kit for the `kit-component-is-kit` arm, composed
+      // through the command path BEFORE the fixture import — the describe is
+      // self-contained, not reaching into the 11.4 fixture's KIT-KE1.
+      const preCsv = [
+        'sku_code,name,uom,gst_rate',
+        'KIT-IMP-PRE,Import Pre Kit,pcs,1800',
+        'KIT-IMP-PREC,Import Pre Component,pcs,1800',
+      ].join('\n');
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/catalog/imports`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .field('mode', 'initial')
+        .attach('file', Buffer.from(preCsv, 'utf8'), { filename: 'kit-import-pre.csv', contentType: 'text/csv' })
+        .expect(201);
+      const preSkus = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/catalog/skus?limit=200`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      const preIds = new Map(
+        (preSkus.body.items as { code: string; id: string }[]).map((item) => [item.code, item.id] as const),
+      );
+      await createKit(preIds.get('KIT-IMP-PRE')!, [{ skuId: preIds.get('KIT-IMP-PREC')!, quantity: 1 }]).expect(201);
+
+      const csv = [
+        'sku_code,name,uom,gst_rate,kit_components',
+        // 1-2: plain SKUs the file's kits reference (file-internal resolution)
+        'IMP-IA,Import A,pcs,1800,',
+        'IMP-IB,Import B,pcs,1800,',
+        // 3: the happy path — components resolved from earlier rows of THIS file
+        'KIT-IMP-1,Import Kit 1,pcs,1800,IMP-IA:2;IMP-IB:1',
+        // 4: unknown component code (not in the tenant, not in the file)
+        'KIT-IMP-GHOST,Import Ghost,pcs,1800,NO-SUCH-CODE:1',
+        // 5: self-reference
+        'KIT-IMP-SELF,Import Self,pcs,1800,KIT-IMP-SELF:1',
+        // 6: component is a PRE-EXISTING kit (composed above, command path)
+        'KIT-IMP-KITCOMP,Import KitComp,pcs,1800,KIT-IMP-PRE:1',
+        // 7-8: in-file mutual composition — both directions refused (flat BOM)
+        'KIT-IMP-M1,Import Mutual A,pcs,1800,KIT-IMP-M2:1',
+        'KIT-IMP-M2,Import Mutual B,pcs,1800,KIT-IMP-M1:1',
+        // 9: quantity below the component's declared precision (each = 0 places)
+        'KIT-IMP-P,Import Precision,kg,1800,IMP-CE:1.5',
+        // 10: the 0-decimal component
+        'IMP-CE,Import Each,each,1800,',
+        // 11-12: the happy kg path — 1.5 kg against a 3-decimal unit
+        'KIT-IMP-PKG,Import Kg Kit,kg,1800,IMP-CG:1.5',
+        'IMP-CG,Import Kg,kg,1800,',
+        // 13: finer than the component unit's precision (kg = 3 places)
+        'KIT-IMP-FINE,Import Fine,kg,1800,IMP-CG:0.0005',
+        // 14-19: cell-shape refusals — the SKU row never commits
+        'KIT-IMP-BADCELL,Import Bad Cell,pcs,1800,IMP-IA',
+        'KIT-IMP-DUPCELL,Import Dup Cell,pcs,1800,IMP-IA:2;IMP-IA:1',
+        `KIT-IMP-MANY,Import Many,pcs,1800,${Array.from({ length: 51 }, (_, i) => `IMP-MANY-N${i}:1`).join(';')}`,
+        // separators only — no component at all (the empty-kit-composition arm)
+        'KIT-IMP-SEP,Import Sep,pcs,1800,;;;',
+        // an entry with no component code
+        'KIT-IMP-NOCODE,Import NoCode,pcs,1800,:2',
+        // a component code over the 64-character SKU-code cap
+        `KIT-IMP-LONGCODE,Import Long,pcs,1800,${'L'.repeat(65)}:1`,
+      ].join('\n');
+      const res = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/catalog/imports`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .field('mode', 'initial')
+        .attach('file', Buffer.from(csv, 'utf8'), { filename: 'kit-import.csv', contentType: 'text/csv' })
+        .expect(201);
+      const body = res.body as { committedRows: number; failedRows: number };
+      // 13 SKU rows commit; 13 rows fail — 7 at the kit pass, 6 at the shape.
+      expect(body.committedRows).toBe(13);
+      expect(body.failedRows).toBe(13);
+
+      const skus = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/catalog/skus?limit=200`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      for (const item of skus.body.items as { code: string; id: string }[]) {
+        if ((IMPORT_CODES as readonly string[]).includes(item.code)) importSkuIds.set(item.code, item.id);
+      }
+      expect(importSkuIds.size).toBe(IMPORT_CODES.length);
+    });
+
+    it('resolves file-internal references: the composition rows land in milli, the kit lists in base units', async () => {
+      const rows = (await sql`
+        select kit_sku_id, component_sku_id, qty from kit_compositions
+        where tenant_id = ${tenantId} and kit_sku_id in (${imp('KIT-IMP-1')}, ${imp('KIT-IMP-PKG')})
+        order by kit_sku_id, component_sku_id
+      `) as unknown as { kit_sku_id: string; component_sku_id: string; qty: string }[];
+      expect(rows).toHaveLength(3);
+      expect(rows.find((row) => row.kit_sku_id === imp('KIT-IMP-1') && row.component_sku_id === imp('IMP-IA'))!.qty).toBe('2000');
+      expect(rows.find((row) => row.kit_sku_id === imp('KIT-IMP-1') && row.component_sku_id === imp('IMP-IB'))!.qty).toBe('1000');
+      expect(rows.find((row) => row.kit_sku_id === imp('KIT-IMP-PKG'))!.qty).toBe('1500');
+
+      const kits = (await listKits().expect(200)).body.items as Kit[];
+      const kit1 = kits.find((kit) => kit.code === 'KIT-IMP-1')!;
+      expect(kit1.components).toEqual([
+        { skuId: imp('IMP-IA'), code: 'IMP-IA', qty: 2 },
+        { skuId: imp('IMP-IB'), code: 'IMP-IB', qty: 1 },
+      ]);
+      const kitKg = kits.find((kit) => kit.code === 'KIT-IMP-PKG')!;
+      expect(kitKg.components).toEqual([{ skuId: imp('IMP-CG'), code: 'IMP-CG', qty: 1.5 }]);
+      // A blank cell is no composition: the plain rows are not kits.
+      for (const plain of ['IMP-IA', 'IMP-IB', 'IMP-CE', 'IMP-CG']) {
+        expect(kits.find((kit) => kit.code === plain)).toBeUndefined();
+      }
+
+      // Event parity with the command path: each kit the pass creates appends
+      // `catalog.kit_created`, body built by the SAME `kitEventPayload` the
+      // kit command uses — a refused cell emits nothing.
+      const events1 = await kitEvents('catalog.kit_created', imp('KIT-IMP-1'));
+      expect(events1).toHaveLength(1);
+      expect(events1[0]).toEqual({
+        skuId: imp('KIT-IMP-1'),
+        code: 'KIT-IMP-1',
+        components: [
+          { skuId: imp('IMP-IA'), code: 'IMP-IA', qty: 2 },
+          { skuId: imp('IMP-IB'), code: 'IMP-IB', qty: 1 },
+        ],
+      });
+      const eventsKg = await kitEvents('catalog.kit_created', imp('KIT-IMP-PKG'));
+      expect(eventsKg).toEqual([
+        { skuId: imp('KIT-IMP-PKG'), code: 'KIT-IMP-PKG', components: [{ skuId: imp('IMP-CG'), code: 'IMP-CG', qty: 1.5 }] },
+      ]);
+      expect(await kitEvents('catalog.kit_created', imp('KIT-IMP-GHOST'))).toHaveLength(0);
+    });
+
+    it('the imported kit is a real kit: order acceptance explodes it', async () => {
+      await seedStock(imp('IMP-IA'), 100);
+      await seedStock(imp('IMP-IB'), 100);
+      const res = await postOrder([{ skuId: imp('KIT-IMP-1'), quantity: 5 }]).expect(201);
+      const order = res.body.order as { id: string; lines: OrderLine[] };
+      const parent = lineOf(order, imp('KIT-IMP-1'));
+      expect(parent).toMatchObject({ qty: 5, reservedQty: 0, shortfallQty: 0, parentLineId: null });
+      expect(lineOf(order, imp('IMP-IA'))).toMatchObject({ qty: 10, reservedQty: 10, parentLineId: parent.id });
+      expect(lineOf(order, imp('IMP-IB'))).toMatchObject({ qty: 5, reservedQty: 5, parentLineId: parent.id });
+      expect(await holdsOfOrder(order.id)).toHaveLength(2);
+      expect(await atp(imp('IMP-IA'))).toMatchObject({ onHand: 100, reserved: 10, atp: 90 });
+      expect(await atp(imp('IMP-IB'))).toMatchObject({ onHand: 100, reserved: 5, atp: 95 });
+    });
+
+    it('the guard refusals fail BY ROW, name the cell, and write no composition rows', async () => {
+      // The durable errors of the fixture import, by SKU code.
+      const rows = (await sql`
+        select row_number, sku_code, reason_code, reason_detail from catalog_import_errors
+        where tenant_id = ${tenantId} and sku_code like 'KIT-IMP-%'
+        order by row_number
+      `) as unknown as { row_number: number; sku_code: string; reason_code: string; reason_detail: string }[];
+      const byCode = new Map(rows.map((row) => [row.sku_code, row]));
+      const expectArm = (code: string, reason: string, detail: string[]): void => {
+        const row = byCode.get(code);
+        if (row === undefined) throw new Error(`no import error for ${code}`);
+        expect(row.reason_code).toBe(reason);
+        for (const fragment of detail) expect(row.reason_detail).toContain(fragment);
+      };
+      expectArm('KIT-IMP-GHOST', 'kit-component-not-found', ['NO-SUCH-CODE', 'no SKU with that code exists']);
+      expectArm('KIT-IMP-SELF', 'kit-self-reference', ['KIT-IMP-SELF']);
+      expectArm('KIT-IMP-KITCOMP', 'kit-component-is-kit', ['KIT-IMP-PRE']);
+      // The in-file mutual pair: BOTH directions refused, order-independent.
+      expectArm('KIT-IMP-M1', 'kit-component-is-kit', ['KIT-IMP-M2']);
+      expectArm('KIT-IMP-M2', 'kit-component-is-kit', ['KIT-IMP-M1']);
+      // Precision: the component's unit decides — `each` declares 0 places.
+      expectArm('KIT-IMP-P', 'validation-failed', [
+        'kit_components quantity for "IMP-CE"',
+        'whole number',
+        'each',
+      ]);
+      expectArm('KIT-IMP-FINE', 'validation-failed', [
+        'kit_components quantity for "IMP-CG"',
+        '0.0005',
+        'decimal place(s)',
+      ]);
+      // Sorted by rowNumber, the persisted contract.
+      const rowNumbers = rows.map((row) => row.row_number);
+      expect([...rowNumbers].sort((a, b) => a - b)).toEqual(rowNumbers);
+
+      // Nothing written for the refused kits — and the committed-but-refused
+      // SKU rows are plain (no composition), exactly the partial-commit shape
+      // the story's design chose: the SKU stands, the composition is retried
+      // via the kit editor's PUT route (fix mode cannot retry — the committed
+      // SKU is refused duplicate-sku-code on resubmit).
+      const leftovers = (await sql`
+        select count(*)::int as n from kit_compositions
+        where tenant_id = ${tenantId} and kit_sku_id in (
+          ${imp('KIT-IMP-GHOST')}, ${imp('KIT-IMP-SELF')}, ${imp('KIT-IMP-KITCOMP')},
+          ${imp('KIT-IMP-M1')}, ${imp('KIT-IMP-M2')}, ${imp('KIT-IMP-P')}, ${imp('KIT-IMP-FINE')}
+        )
+      `) as unknown as { n: number }[];
+      expect(Number(leftovers[0]!.n)).toBe(0);
+    });
+
+    it('cell-shape refusals refuse the WHOLE row: no SKU row, no composition', async () => {
+      const rows = (await sql`
+        select row_number, sku_code, reason_code, reason_detail from catalog_import_errors
+        where tenant_id = ${tenantId} and sku_code in ('KIT-IMP-BADCELL', 'KIT-IMP-DUPCELL', 'KIT-IMP-MANY', 'KIT-IMP-SEP', 'KIT-IMP-NOCODE', 'KIT-IMP-LONGCODE')
+        order by row_number
+      `) as unknown as { row_number: number; sku_code: string; reason_code: string; reason_detail: string }[];
+      const byCode = new Map(rows.map((row) => [row.sku_code, row]));
+      const bad = byCode.get('KIT-IMP-BADCELL');
+      expect(bad).toMatchObject({ reason_code: 'validation-failed' });
+      expect(bad!.reason_detail).toContain('code:qty');
+      const dup = byCode.get('KIT-IMP-DUPCELL');
+      expect(dup).toMatchObject({ reason_code: 'duplicate-kit-component' });
+      expect(dup!.reason_detail).toContain('IMP-IA');
+      const many = byCode.get('KIT-IMP-MANY');
+      expect(many).toMatchObject({ reason_code: 'validation-failed' });
+      expect(many!.reason_detail).toContain('at most 50');
+      // Separators only: the cell names no component at all.
+      const sep = byCode.get('KIT-IMP-SEP');
+      expect(sep).toMatchObject({ reason_code: 'empty-kit-composition' });
+      expect(sep!.reason_detail).toContain('at least one');
+      // An entry with no component code before the colon.
+      const nocode = byCode.get('KIT-IMP-NOCODE');
+      expect(nocode).toMatchObject({ reason_code: 'validation-failed' });
+      expect(nocode!.reason_detail).toContain('empty component code');
+      // A component code over the 64-character cap.
+      const longCode = byCode.get('KIT-IMP-LONGCODE');
+      expect(longCode).toMatchObject({ reason_code: 'validation-failed' });
+      expect(longCode!.reason_detail).toContain('64-character');
+
+      // The whole row refused: the SKUs do not exist.
+      const existing = (await sql`
+        select s.code from skus s
+        where s.tenant_id = ${tenantId}
+          and s.code in ('KIT-IMP-BADCELL', 'KIT-IMP-DUPCELL', 'KIT-IMP-MANY', 'KIT-IMP-SEP', 'KIT-IMP-NOCODE', 'KIT-IMP-LONGCODE')
+      `) as unknown as { code: string }[];
+      expect(existing).toHaveLength(0);
+    });
+  });
 });

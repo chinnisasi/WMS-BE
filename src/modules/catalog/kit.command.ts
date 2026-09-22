@@ -640,7 +640,13 @@ function assertComponents(
   return raw as readonly { skuId: string; quantity: number }[];
 }
 
-function kitEventPayload(snapshot: KitSnapshot): Record<string, unknown> {
+/** The `catalog.kit_created`/`kit_edited` body. The import's kit pass (11.6)
+ * emits `kit_created` through this same builder — event parity with the
+ * command path (an import-created kit is invisible to any outbox consumer
+ * otherwise). */
+export function kitEventPayload(
+  snapshot: Pick<KitSnapshot, 'skuId' | 'code' | 'components'>,
+): Record<string, unknown> {
   return {
     skuId: snapshot.skuId,
     code: snapshot.code,

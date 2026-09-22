@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { forwardRef, Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray } from 'drizzle-orm';
 import { parse as parseCsv } from 'csv-parse/sync';
 import { Workbook, type CellValue } from 'exceljs';
 import { DATABASE } from '../../shared/shared.module';
@@ -9,8 +9,11 @@ import {
   catalogImportErrors,
   catalogImports,
   idempotencyKeys,
+  kitCompositions,
   products,
+  reservations,
   skus,
+  stockOnHand,
   uomConversions,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
@@ -26,7 +29,7 @@ import { TenancyService } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { MAX_QUANTITY_BASE, validateRecordableQuantity } from '../../shared/primitives/quantity';
+import { MAX_QUANTITY_BASE, fromMilli, validateRecordableQuantity } from '../../shared/primitives/quantity';
 import {
   isFractionalUom,
   resolveUom,
@@ -42,6 +45,8 @@ import {
   assertVariantValues,
   variantValuesFingerprint,
 } from './product.command';
+import { MAX_KIT_COMPONENTS, kitEventPayload } from './kit.command';
+import { getKitSkuIdsInTx } from './kit.store';
 
 export const IMPORT_MODES = ['initial', 'fix'] as const;
 export type ImportMode = (typeof IMPORT_MODES)[number];
@@ -119,6 +124,13 @@ const OPTIONAL_COLUMNS = [
   // `uom_conversions` box:12 cell-grammar precedent.
   'product',
   'variant_values',
+  // Story 11.6 — the kit column, the last of the optional set. The cell is
+  // the `uom_conversions` grammar again (`pad:2;tape:1`), quantities in the
+  // COMPONENT's base UoM; the composition resolves AFTER every SKU row has
+  // committed, in the same transaction — a component may be an earlier row of
+  // this same file — through the kit store's guards (see the post-insert pass
+  // in `execute`).
+  'kit_components',
 ] as const;
 const KNOWN_COLUMNS: ReadonlySet<string> = new Set([...REQUIRED_COLUMNS, ...OPTIONAL_COLUMNS]);
 
@@ -156,6 +168,13 @@ interface ValidRow {
   readonly productName: string | null;
   /** Story 11.3 — the parsed `variant_values` cell, or null (blank cell → no values). */
   readonly variantValues: Record<string, string> | null;
+  /**
+   * Story 11.6 — the parsed `kit_components` cell, or null (blank cell → no
+   * composition). Shape-only here: each entry's quantity stays a RAW string
+   * because the precision it must satisfy is the COMPONENT's unit's — known
+   * only once that SKU row is resolved, after every SKU row has committed.
+   */
+  readonly kitComponents: readonly { readonly code: string; readonly qtyRaw: string }[] | null;
 }
 
 type FieldResult<T> = { ok: true; value: T } | { ok: false; error: CatalogImportErrorDto };
@@ -174,6 +193,15 @@ type ExcelBuffer = Parameters<Workbook['xlsx']['load']>[0];
  * is counted as skipped and left untouched. AD-5: one transaction + one
  * idempotency record — the payload fingerprint is sha256(file bytes) + mode,
  * and replay re-serves the exact counts + error list snapshot.
+ *
+ * Two resolution passes run after the per-row shape checks, against the
+ * tenant: the 11.3 variant pass (products resolved by name BEFORE the SKU
+ * insert — a failing row is not committed) and the 11.6 kit pass (compositions
+ * resolved by code AFTER the SKU insert — a component may be an earlier row of
+ * the same file, so a refused kit cell leaves its SKU row committed and fails
+ * as a row error; the SKU row and the failure overlap in the counts. Only the
+ * PUT route can retry the composition — fix mode cannot, because the
+ * committed SKU is refused `duplicate-sku-code` on resubmit).
  */
 @Injectable()
 export class ImportCommand {
@@ -393,12 +421,12 @@ export class ImportCommand {
 
         // One error per row, reported in document order regardless of which
         // pass produced it (validation failures collect first, duplicates in
-        // the loop below).
+        // the loop below). The 11.6 kit pass below collects after this sort
+        // and re-sorts before the errors are persisted.
         errors.sort((a, b) => a.rowNumber - b.rowNumber);
 
         const importId = uuidv7();
         const committedRows = insertable.length;
-        const failedRows = errors.length;
 
         if (committedRows > 0) {
           const skuRows = insertable.map((row) => ({
@@ -451,7 +479,177 @@ export class ImportCommand {
           for (const chunk of chunked(conversionRows)) {
             await tx.insert(uomConversions).values(chunk);
           }
+
+          // ── Story 11.6: the kit_components resolution pass. It runs AFTER
+          // every SKU row above has committed, inside the same transaction —
+          // a component may be an earlier row of this same file — through the
+          // kit store's guards, the SAME rules the kit create command runs
+          // (flat BOM, one level; a kit never holds stock; quantities in the
+          // component's base UoM against its declared precision). A refused
+          // cell leaves its SKU row committed and fails as a row error; only
+          // the PUT route can retry the composition — a fix-mode resubmit of
+          // the row is refused `duplicate-sku-code`, the SKU already
+          // committing in the earlier run.
+          const kitImports = insertable.filter((row) => row.kitComponents !== null);
+          if (kitImports.length > 0) {
+            // Same index alignment as the conversion rows: insertable's codes
+            // are unique (the duplicate checks above), so code → the id this
+            // row was inserted under.
+            const skuIdByCode = new Map(insertable.map((row, i) => [row.code, skuRows[i]!.id] as const));
+            const referencedCodes = [
+              ...new Set(kitImports.flatMap((row) => [row.code, ...row.kitComponents!.map((c) => c.code)])),
+            ];
+            // `for('update')`: the kit command's cycle lock — kit and
+            // component rows, ordered by id, so a concurrent KitCommand or
+            // GRN on the same SKUs serializes behind this pass.
+            const referencedSkuRows = await tx
+              .select({ id: skus.id, code: skus.code, uom: skus.uom })
+              .from(skus)
+              .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.code, referencedCodes)))
+              .orderBy(skus.id)
+              .for('update');
+            const skuRowByCode = new Map(referencedSkuRows.map((r) => [r.code, r]));
+            const referencedIds = referencedSkuRows.map((r) => r.id);
+            // The one "is a kit" probe, over every referenced id at once: a
+            // component that ALREADY carries composition rows is refused, so
+            // the flat one-level BOM survives even when the kit rows of this
+            // file are inserted afterwards.
+            const preexistingKitIds = new Set(await getKitSkuIdsInTx(tx, command.tenantId, referencedIds));
+            const inFileKitCodes = new Set(kitImports.map((row) => row.code));
+            const kitIds = kitImports.map((row) => skuIdByCode.get(row.code)!);
+            // Structurally unreachable for fresh imports (a brand-new SKU has
+            // neither stock nor reservations, and the pre-checks above have
+            // no gap a concurrent writer could fill under the row locks) —
+            // kept as fail-closed bulk checks so the guard set the boundary
+            // names is decided here, never assumed.
+            const stockKits = new Set(
+              (
+                await tx
+                  .select({ skuId: stockOnHand.skuId })
+                  .from(stockOnHand)
+                  .where(and(eq(stockOnHand.tenantId, command.tenantId), inArray(stockOnHand.skuId, kitIds), gt(stockOnHand.quantity, 0)))
+              ).map((r) => r.skuId),
+            );
+            const heldKits = new Set(
+              (
+                await tx
+                  .select({ skuId: reservations.skuId })
+                  .from(reservations)
+                  .where(
+                    and(
+                      eq(reservations.tenantId, command.tenantId),
+                      inArray(reservations.skuId, kitIds),
+                      inArray(reservations.state, ['held', 'committed']),
+                    ),
+                  )
+              ).map((r) => r.skuId),
+            );
+
+            const compositionRows: { id: string; tenantId: string; kitSkuId: string; componentSkuId: string; qty: number }[] = [];
+            // Event parity with KitCommand.create (story 11.4): every kit
+            // this pass creates appends `catalog.kit_created` in-transaction,
+            // so an outbox consumer sees import-created kits exactly as it
+            // sees command-created ones. Refused cells emit nothing.
+            const kitEvents: { skuId: string; code: string; components: { skuId: string; code: string; qty: number }[] }[] = [];
+            for (const row of kitImports) {
+              const kitSkuId = skuIdByCode.get(row.code)!;
+              if (stockKits.has(kitSkuId)) {
+                errors.push(rowError(row.rowNumber, row.code, 'kit-sku-holds-stock', `SKU "${row.code}" already carries on-hand stock — a kit never holds stock; ship it out and compose afterwards.`));
+                continue;
+              }
+              if (heldKits.has(kitSkuId)) {
+                errors.push(rowError(row.rowNumber, row.code, 'kit-sku-holds-stock', `SKU "${row.code}" already carries a live reservation — a kit never holds stock; release it and compose afterwards.`));
+                continue;
+              }
+              if (preexistingKitIds.has(kitSkuId)) {
+                errors.push(rowError(row.rowNumber, row.code, 'kit-already-composed', `SKU "${row.code}" already carries a composition — create is the only door into kit-ness; PUT replaces an existing kit's BOM.`));
+                continue;
+              }
+              const composition: { componentSkuId: string; qty: number }[] = [];
+              let rowFailed = false;
+              for (const component of row.kitComponents!) {
+                const componentRow = skuRowByCode.get(component.code);
+                if (componentRow === undefined) {
+                  errors.push(rowError(row.rowNumber, row.code, 'kit-component-not-found', `kit_components names component "${component.code}" — no SKU with that code exists in this tenant or in this file.`));
+                  rowFailed = true;
+                  break;
+                }
+                if (componentRow.id === kitSkuId) {
+                  errors.push(rowError(row.rowNumber, row.code, 'kit-self-reference', `kit_components names the row's own SKU "${row.code}" as a component — a kit's BOM cannot name the kit as its own component.`));
+                  rowFailed = true;
+                  break;
+                }
+                if (preexistingKitIds.has(componentRow.id) || inFileKitCodes.has(component.code)) {
+                  errors.push(rowError(row.rowNumber, row.code, 'kit-component-is-kit', `kit_components names component "${component.code}" which is itself a kit — the BOM is flat, one level; nest nothing.`));
+                  rowFailed = true;
+                  break;
+                }
+                // The explosion's rule: the quantity is in the COMPONENT's
+                // base UoM and must satisfy that unit's declared precision.
+                const checked = validateRecordableQuantity(
+                  Number(component.qtyRaw),
+                  `kit_components quantity for "${component.code}"`,
+                  componentRow.uom,
+                  uomPrecision(componentRow.uom),
+                  'non-negative',
+                );
+                if (!checked.ok) {
+                  errors.push(
+                    checked.arm === 'ceiling'
+                      ? rowError(row.rowNumber, row.code, 'validation-failed', `kit_components quantity for "${component.code}" exceeds the quantity ceiling of ${MAX_QUANTITY_BASE}.`)
+                      : rowError(row.rowNumber, row.code, 'validation-failed', checked.detail),
+                  );
+                  rowFailed = true;
+                  break;
+                }
+                composition.push({ componentSkuId: componentRow.id, qty: checked.milli });
+              }
+              if (!rowFailed) {
+                for (const entry of composition) {
+                  compositionRows.push({
+                    id: uuidv7(),
+                    tenantId: command.tenantId,
+                    kitSkuId,
+                    componentSkuId: entry.componentSkuId,
+                    qty: entry.qty,
+                  });
+                }
+                kitEvents.push({
+                  skuId: kitSkuId,
+                  code: row.code,
+                  components: row.kitComponents!.map((component, i) => ({
+                    skuId: composition[i]!.componentSkuId,
+                    code: component.code,
+                    // The event carries base units, the command's convention —
+                    // the pass's composition holds milli.
+                    qty: fromMilli(composition[i]!.qty),
+                  })),
+                });
+              }
+            }
+            for (const chunk of chunked(compositionRows)) {
+              await tx.insert(kitCompositions).values(chunk);
+            }
+            for (const kit of kitEvents) {
+              await this.outbox.append(tx, {
+                messageId: uuidv7(),
+                tenantId: command.tenantId,
+                type: 'catalog.kit_created',
+                occurredAt: nowIso(),
+                payload: kitEventPayload({
+                  skuId: kit.skuId,
+                  code: kit.code,
+                  components: kit.components,
+                }),
+              });
+            }
+          }
         }
+
+        // The kit pass collected after the earlier sort; one error per row,
+        // in document order, is the persisted contract.
+        errors.sort((a, b) => a.rowNumber - b.rowNumber);
+        const failedRows = errors.length;
 
         await tx.insert(catalogImports).values({
           id: importId,
@@ -1076,6 +1274,14 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
     parsedValues = parsed.value;
   }
 
+  // Story 11.6 — the kit column, shape-only. The grammar is the
+  // `uom_conversions` precedent; each quantity stays a RAW string here
+  // because the precision it must satisfy is the COMPONENT's unit's —
+  // known only once every SKU row has committed (the resolution pass in
+  // `execute` decides those, as row errors).
+  const kitComponentsParsed = parseKitComponentsCell(v['kit_components']?.trim() ?? '', row.rowNumber);
+  if (!kitComponentsParsed.ok) return { ok: false, error: { ...kitComponentsParsed.error, skuCode: code } };
+
   return {
     ok: true,
     row: {
@@ -1102,6 +1308,7 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       // a tenant read); shape-only errors refuse here.
       productName: productNameRaw === '' ? null : productNameRaw,
       variantValues: parsedValues,
+      kitComponents: kitComponentsParsed.value,
     },
   };
 }
@@ -1148,6 +1355,70 @@ function parseVariantValuesCell(raw: string, rowNumber: number): FieldResult<Rec
     values[axis] = value;
   }
   return { ok: true, value: values };
+}
+
+/**
+ * One `kit_components` cell (Story 11.6), the `uom_conversions` cell-grammar
+ * precedent again (`pad:2;tape:1`): split on `;`, each entry split on the
+ * FIRST `:`, both sides trimmed. Blank entries between `;`s are skipped
+ * (trailing separators); a cell of nothing but separators is the empty-kit
+ * arm, not a silent pass. Shape-only, exactly like the variant cell: the
+ * component CODE is checked for existence (and kit-ness, self-reference,
+ * stock) against the tenant and this file in the resolution pass after every
+ * SKU row has committed, and each quantity — kept here as a RAW string — is
+ * parsed to milli against the COMPONENT's declared precision there too. What
+ * IS refused here: an entry without a colon, an empty code, an over-long
+ * code, a non-positive or non-numeric quantity, a repeated component (the
+ * BOM is a set), and more components than a kit may carry.
+ */
+function parseKitComponentsCell(
+  raw: string,
+  rowNumber: number,
+): FieldResult<readonly { readonly code: string; readonly qtyRaw: string }[] | null> {
+  if (raw === '') return { ok: true, value: null };
+  const components: { code: string; qtyRaw: string }[] = [];
+  const seenCodes = new Set<string>();
+  let empty = true;
+  for (const entry of raw.split(';')) {
+    const trimmed = entry.trim();
+    if (trimmed === '') continue;
+    empty = false;
+    const colon = trimmed.indexOf(':');
+    if (colon === -1) {
+      return {
+        ok: false,
+        error: rowError(
+          rowNumber,
+          null,
+          'validation-failed',
+          `kit_components entries must look like code:qty (component code and a positive quantity) — got "${trimmed}".`,
+        ),
+      };
+    }
+    const code = trimmed.slice(0, colon).trim();
+    const qtyRaw = trimmed.slice(colon + 1).trim();
+    if (code === '') {
+      return { ok: false, error: rowError(rowNumber, null, 'validation-failed', 'kit_components carries an entry with an empty component code.') };
+    }
+    if (code.length > SKU_CODE_MAX) {
+      return { ok: false, error: rowError(rowNumber, null, 'validation-failed', `kit_components component code exceeds the ${SKU_CODE_MAX}-character SKU-code cap.`) };
+    }
+    if (!/^\d+(\.\d+)?$/.test(qtyRaw) || Number(qtyRaw) <= 0) {
+      return { ok: false, error: rowError(rowNumber, null, 'validation-failed', `kit_components quantity for "${code}" must be a positive quantity (got "${qtyRaw}").`) };
+    }
+    if (seenCodes.has(code)) {
+      return { ok: false, error: rowError(rowNumber, null, 'duplicate-kit-component', `kit_components names component "${code}" twice in one cell — the BOM is a set.`) };
+    }
+    seenCodes.add(code);
+    components.push({ code, qtyRaw });
+  }
+  if (empty) {
+    return { ok: false, error: rowError(rowNumber, null, 'empty-kit-composition', 'kit_components names no component — a kit carries at least one.') };
+  }
+  if (components.length > MAX_KIT_COMPONENTS) {
+    return { ok: false, error: rowError(rowNumber, null, 'validation-failed', `kit_components carries ${components.length} components — a kit carries at most ${MAX_KIT_COMPONENTS}.`) };
+  }
+  return { ok: true, value: components };
 }
 
 /**
