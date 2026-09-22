@@ -2494,5 +2494,10 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     );
     expect(ordinaryTask).toBeDefined();
     expect(ordinaryTask!.kitParentSkuCode).toBeNull();
+    // The kit parent itself never appears as a task: it holds no reservation,
+    // so wave planning plans only the exploded component lines.
+    expect(
+      tasks.some((task) => task.skuCode === 'PCK-KIT' && mine.some((line) => line.id === task.picklistLineId)),
+    ).toBe(false);
   });
 });
