@@ -41,6 +41,12 @@ import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerReferenceDoc } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { findReplanSlices, type ReplanSlice } from './replan';
+// Story 12-1 — the ONE conformance predicate + the draw refusal factory,
+// shared with putaway, the pool filter, merge and the class-edit guards.
+import {
+  binStorageMismatch,
+  storageClassSatisfies,
+} from '../../shared/primitives/storage-class';
 import { ORDER_OWNER_TYPE, ORDER_RESERVATION_TTL_SECONDS } from './order.command';
 import type { OrderStatus } from './order.command';
 
@@ -661,6 +667,8 @@ export class PickCommandService {
           batchTracked: skus.batchTracked,
           serialTracked: skus.serialTracked,
           catchWeightTracked: skus.catchWeightTracked,
+          // Story 12-1 — the class the draw gate rules on (FR-40).
+          storageClass: skus.storageClass,
         })
         .from(skus)
         .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
@@ -723,6 +731,8 @@ export class PickCommandService {
           blocked: bins.blocked,
           systemOwned: bins.systemOwned,
           retiredAt: bins.retiredAt,
+          // Story 12-1 — the class the draw gate rules on (FR-40).
+          storageClass: bins.storageClass,
         })
         .from(bins)
         .where(
@@ -753,6 +763,16 @@ export class PickCommandService {
       }
       if (drawBin.blocked) {
         throw binBlocked(drawBin.code);
+      }
+      // ── story 12-1: the class gate (FR-40) — after the structural arms,
+      // before anything is drawn: the refusal precedes the ledger append.
+      // 400 `bin-storage-mismatch` naming bin code, SKU code and BOTH classes
+      // — device-fault, non-retryable. Same predicate, same position as the
+      // placement's gate (the SYNC HAZARD rule — a stock row reachable here
+      // only through the recorded bypasses is never drawable by the planner,
+      // whose pool filter runs the same predicate).
+      if (!storageClassSatisfies(sku.storageClass, drawBin.storageClass)) {
+        throw binStorageMismatch(drawBin.code, sku.code, drawBin.storageClass, sku.storageClass);
       }
 
       // A SKU that is BOTH batch- and serial-tracked cannot be picked here.

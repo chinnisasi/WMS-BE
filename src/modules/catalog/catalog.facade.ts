@@ -299,6 +299,30 @@ export class CatalogFacade {
   }
 
   /**
+   * The storage classes of a SET of SKUs (Story 12-1, FR-40), inside the
+   * caller's transaction — the wave planner's and the short-pick re-plan's
+   * conformance filter (`buildStockPool`), the `getBatchesForSkusInTx` shape:
+   * one plan is ONE tenant transaction, so the plan it commits is the catalog
+   * it saw. Outbound reaches the class only through this seam (AD-6); a SKU
+   * id the catalog does not know is simply absent from the map, which the
+   * pool filter treats as unprovable — fail-closed.
+   */
+  async getSkuStorageClassesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuIds: readonly string[],
+  ): Promise<ReadonlyMap<string, string>> {
+    if (skuIds.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .select({ id: skus.id, storageClass: skus.storageClass })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, [...new Set(skuIds)])));
+    return new Map(rows.map((row) => [row.id, row.storageClass]));
+  }
+
+  /**
    * The one batch existence read (Story 2.5): null when the id is unknown or
    * foreign — the batch detail route's catalog 404 check, before any
    * inventory read. The `skuId` rides along (a batch's SKU identity).

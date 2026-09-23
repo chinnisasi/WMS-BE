@@ -27,6 +27,13 @@ import {
 } from '../../shared/primitives/quantity';
 import { uomPrecision } from '../catalog/uom';
 import { assertUtcIso, nowIso } from '../../shared/primitives/time';
+// Story 12-1 — the ONE conformance predicate + the placement refusal factory.
+// Shared with pick, the pool filter, merge and the class-edit guards by
+// design: the matching rule is encoded exactly once.
+import {
+  binStorageMismatch,
+  storageClassSatisfies,
+} from '../../shared/primitives/storage-class';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -345,6 +352,9 @@ export class PutawayCommand {
           lengthMm: skus.lengthMm,
           widthMm: skus.widthMm,
           heightMm: skus.heightMm,
+          // Story 12-1 — the class the placement gate and the re-derived
+          // suggestion both consume.
+          storageClass: skus.storageClass,
         })
         .from(skus)
         .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
@@ -484,6 +494,8 @@ export class PutawayCommand {
           widthMm: bins.widthMm,
           heightMm: bins.heightMm,
           maxWeightGrams: bins.maxWeightGrams,
+          // Story 12-1 — the class the placement gate rules on.
+          storageClass: bins.storageClass,
         })
         .from(bins)
         .where(
@@ -517,6 +529,20 @@ export class PutawayCommand {
       if (targetBin.blocked) {
         // FR-10: the rejection names the reason and the bin.
         throw binBlocked(targetBin.code);
+      }
+      // ── story 12-1: the class gate (FR-40) — after the structural arms,
+      // before the capacity gates: a bin that cannot satisfy the SKU's storage
+      // class is refused no matter how empty it is. 400
+      // `bin-storage-mismatch` naming bin code, SKU code and BOTH classes —
+      // device-fault, non-retryable. Same predicate, same position as
+      // `candidateFitsSku`'s first gate (the SYNC HAZARD rule).
+      if (!storageClassSatisfies(sku.storageClass, targetBin.storageClass)) {
+        throw binStorageMismatch(
+          targetBin.code,
+          sku.code,
+          targetBin.storageClass,
+          sku.storageClass,
+        );
       }
       // ── the load read (the gates' shared input — one query) ─────────────
       // Story 11-5: `binOccupancyInTx` is now the load-read (units + weight +
@@ -582,11 +608,14 @@ export class PutawayCommand {
         scaled.qty,
         // Story 11-5: the same SKU attributes gate the suggestion — the
         // re-derivation never points at a bin the gates would refuse.
+        // Story 12-1: the class rides with them (the class gate is
+        // `candidateFitsSku`'s first gate).
         {
           weightGrams: sku.weightGrams,
           lengthMm: sku.lengthMm,
           widthMm: sku.widthMm,
           heightMm: sku.heightMm,
+          storageClass: sku.storageClass,
         },
       );
       const suggestedBinId = suggestion?.binId ?? null;
@@ -843,18 +872,26 @@ export interface PutawayBinCandidate {
   readonly maxWeightGrams: number | null;
   readonly weightLoad: bigint;
   readonly volumeLoad: bigint;
+  // ── story 12-1: the bin's storage class (FR-40) — the candidate list stays
+  // SKU-agnostic (no WHERE arm); the class rule runs per candidate in
+  // `candidateFitsSku`, against the SKU side carried in `SkuPhysicalAttributes`.
+  readonly storageClass: string;
 }
 
 /**
  * The SKU side of the fit predicate — the static physical attributes a
- * placement or task-derivation read carries. Every field nullable: a SKU
- * without attributes contributes only units (fail-open on missing attributes).
+ * placement or task-derivation read carries. The four physical fields are
+ * nullable: a SKU without attributes contributes only units (fail-open on
+ * missing attributes). `storageClass` (story 12-1) is NOT nullable — the
+ * column is NOT NULL DEFAULT 'ambient', so every read has it.
  */
 export interface SkuPhysicalAttributes {
   readonly weightGrams: number | null;
   readonly lengthMm: number | null;
   readonly widthMm: number | null;
   readonly heightMm: number | null;
+  /** Story 12-1 — the SKU's class from the controlled vocabulary. */
+  readonly storageClass: string;
 }
 
 /**
@@ -876,12 +913,22 @@ export interface SkuPhysicalAttributes {
  * three new gates pass wherever the unit gate passes — byte-identical to
  * pre-11.5 behavior. A dimmed SKU double-counts (units AND weight/volume) —
  * the deliberate conservative coexistence (see the spec's Design Notes).
+ *
+ * Story 12-1 adds the CLASS gate — FIRST, before the unit gate, because a
+ * bin that cannot satisfy the SKU's storage class is refused no matter how
+ * empty it is (FR-40). The rule is `storageClassSatisfies` — the ONE shared
+ * predicate (the temperature hierarchy); no SQL copy exists, the candidate
+ * list is SKU-agnostic. The same arm exists in the placement command's own
+ * locked-row guard and `mergeBin`'s target loop — the SYNC HAZARD rule.
  */
 export function candidateFitsSku(
   candidate: PutawayBinCandidate,
   sku: SkuPhysicalAttributes,
   qtyMilli: number,
 ): boolean {
+  if (!storageClassSatisfies(sku.storageClass, candidate.storageClass)) {
+    return false;
+  }
   if (candidate.occupancy + qtyMilli > candidate.capacity) {
     return false;
   }
@@ -935,6 +982,9 @@ export async function binCandidatesInTx(
       widthMm: bins.widthMm,
       heightMm: bins.heightMm,
       maxWeightGrams: bins.maxWeightGrams,
+      // Story 12-1 — the class rides the candidate so the fit predicate can
+      // rule per (SKU, bin); no WHERE arm, the list is SKU-agnostic.
+      storageClass: bins.storageClass,
       occupancy: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint`,
       weightLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * coalesce(${skus.weightGrams}, 0)), 0)::numeric`,
       volumeLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * (coalesce(${skus.lengthMm}, 0) * coalesce(${skus.widthMm}, 0) * coalesce(${skus.heightMm}, 0))), 0)::numeric`,
@@ -967,6 +1017,7 @@ export async function binCandidatesInTx(
       bins.widthMm,
       bins.heightMm,
       bins.maxWeightGrams,
+      bins.storageClass,
     )
     .orderBy(asc(sql`coalesce(sum(${stockOnHand.quantity}), 0)`), asc(bins.code));
   return rows.map((row) => ({
@@ -977,6 +1028,7 @@ export async function binCandidatesInTx(
     widthMm: row.widthMm,
     heightMm: row.heightMm,
     maxWeightGrams: row.maxWeightGrams,
+    storageClass: row.storageClass,
     occupancy: Number(row.occupancy),
     weightLoad: BigInt(row.weightLoad ?? 0),
     volumeLoad: BigInt(row.volumeLoad ?? 0),

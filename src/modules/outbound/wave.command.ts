@@ -1136,21 +1136,28 @@ export class WaveCommandService {
     // can never disagree about what "pickable" means.
     const binOrder = await pickableBinsInTx(tx, command.tenantId, command.warehouseId);
 
-    // Stock composes through the facades only (AD-6).
-    const [stock, batchStock, batchIdentities] = await Promise.all([
+    // Stock composes through the facades only (AD-6). Story 12-1: the lines'
+    // storage classes join the read — the pool filter needs them (FR-40), and
+    // the wave planner previously read no SKU rows at all.
+    const [stock, batchStock, batchIdentities, skuClasses] = await Promise.all([
       this.inventory.stockByBinsInTx(tx, command.tenantId, command.warehouseId, skuIds),
       this.inventory.batchOnHandByBinsInTx(tx, command.tenantId, command.warehouseId, skuIds),
       this.catalog.getBatchesForSkusInTx(tx, command.tenantId, skuIds),
+      this.catalog.getSkuStorageClassesInTx(tx, command.tenantId, skuIds),
     ]);
 
     // The per-SKU walk: (bin in code order) × (batch in FEFO order). Pure,
     // shared with the re-plan lookup (`replan.ts`), and consumed
     // DESTRUCTIVELY below so two lines of the same SKU never both claim the
     // same units — that honesty is what makes the batch-vs-single stop-count
-    // inequality hold.
+    // inequality hold. Story 12-1: the walk skips bins that do not satisfy
+    // the SKU's storage class, so a line whose only stock sits in
+    // non-conforming bins plans `unfulfillable` — never a pick that always
+    // refuses at the bin.
     const pool = buildStockPool({
       skuIds,
       binOrder,
+      skuClassById: skuClasses,
       stock,
       batchStock,
       batchIdentities,
