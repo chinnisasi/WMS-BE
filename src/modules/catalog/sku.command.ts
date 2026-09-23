@@ -30,6 +30,16 @@ import {
   storageClassConflict,
   storageClassSatisfies,
 } from '../../shared/primitives/storage-class';
+// Story 12-2 — the vocabulary validator + the segregation-state refusal
+// factory, and the ONE compatibility predicate the binmates' gate walks;
+// the co-location read is imported from putaway (the tenancy merge gate's
+// `binBlocked` precedent).
+import {
+  assertHazardClass,
+  hazardClassesCompatible,
+  segregationStateConflict,
+} from '../../shared/primitives/hazard';
+import { occupantHazardClassesInTx } from '../putaway/putaway.command';
 import { openQcHoldsForSkuInTx } from '../inbound/qc.command';
 import {
   assertVariantValues,
@@ -87,6 +97,14 @@ export interface SkuSnapshot {
   readonly variantValues: Record<string, string> | null;
   /** Story 12-1 — the controlled-vocabulary storage class (FR-40). */
   readonly storageClass: string;
+  /**
+   * Story 12-2 — the controlled-vocabulary hazard class (FR-41), REQUIRED on
+   * the interface and nullable: toSnapshot always sets it (`row.hazardClass
+   * ?? null` — every pre-12.2 row and every import row without the cell read
+   * null), and the replay serve point's normalizer pins the required
+   * response field for legacy snapshots the same way.
+   */
+  readonly hazardClass: string | null;
   readonly reorderPoint: number;
   readonly reorderQty: number;
   readonly barcode: string;
@@ -156,6 +174,23 @@ export interface EditSkuCommand {
    * the recorded 12-1 currency (PENDING.md, putaway:57).
    */
   readonly storageClass?: string | undefined;
+  /**
+   * Story 12-2 — the SKU's hazard class (FR-41), PATCH semantics: absent =
+   * unchanged; **null = clear** (the 11.2 attribute template — unlike
+   * `storageClass` the column is nullable, so there IS a clear verb and no
+   * explicit-null 400). A class CHANGE runs the co-location guard behind the
+   * replay (409 `hazard-segregation-conflict`): every non-system bin where
+   * the SKU holds stock, tenant-wide, must hold no binmate incompatible with
+   * the new class — and the open-QC-hold quantities are attributed to their
+   * ORIGIN bins (a later release would return those units there). The
+   * hazard-changing arm takes the SKU row `.for('update')` — which
+   * serializes against the other SKU-row lockers (the +stock writers,
+   * fix-a2) but NOT against placement/pick, which read the SKU unlocked; the
+   * residual race is the recorded 12-1/12-2 currency (PENDING.md,
+   * putaway:57-58). Clearing the class always succeeds — null carries no
+   * rule in either direction.
+   */
+  readonly hazardClass?: string | null | undefined;
 }
 
 /**
@@ -267,13 +302,16 @@ export class SkuCommand {
       // Story 12-1 — the storage class counts as a field for the empty-patch
       // refusal, exactly as every other PATCH field does.
       storageClass: command.storageClass,
+      // Story 12-2 — the hazard class counts too (null = clear, a real
+      // value).
+      hazardClass: command.hazardClass,
     };
     if (Object.values(fields).every((value) => value === undefined)) {
       throw new ProblemException(
         'validation-failed',
         400,
         'Empty SKU edit',
-        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass is required.',
+        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass, hazardClass is required.',
       );
     }
     // ── story 11.2: this hash did NOT break ──────────────────────────────────
@@ -329,10 +367,20 @@ export class SkuCommand {
           // has no `storageClass` — the column did not exist. Serve the
           // migration DEFAULT the way `normalizeBin` serves the bins'
           // (`?? 'ambient'`), so a replayed legacy key still satisfies the
-          // required `SkuResponse` field instead of omitting it.
-          const stored = existing[0].responseSnapshot as SkuSnapshot & { storageClass?: string };
+          // required `SkuResponse` field instead of omitting it. Story 12-2:
+          // the same normalizer pins `hazardClass` (nullable, so absence
+          // normalizes to null — the `?? 'ambient'` pattern's nullable
+          // twin).
+          const stored = existing[0].responseSnapshot as SkuSnapshot & {
+            storageClass?: string;
+            hazardClass?: string | null;
+          };
           return {
-            snapshot: { ...stored, storageClass: stored.storageClass ?? 'ambient' },
+            snapshot: {
+              ...stored,
+              storageClass: stored.storageClass ?? 'ambient',
+              hazardClass: stored.hazardClass ?? null,
+            },
             replayed: true,
           };
         }
@@ -354,7 +402,8 @@ export class SkuCommand {
         // The same validator the import row parser calls; the DTO mirrors the
         // bounds but is not the boundary. Story 12-1: the storage class joins
         // the position — same validator shape (`assertStorageClass`), same
-        // behind-the-replay rule.
+        // behind-the-replay rule. Story 12-2: the hazard class joins too
+        // (`assertHazardClass` — it skips null, the legitimate clear verb).
         assertSkuAttributes({
           weightGrams: fields.weightGrams,
           lengthMm: fields.lengthMm,
@@ -363,14 +412,17 @@ export class SkuCommand {
           countryOfOrigin: fields.countryOfOrigin,
         });
         assertStorageClass({ storageClass: fields.storageClass });
+        assertHazardClass({ hazardClass: fields.hazardClass });
 
         // ── Story 12-1: the class-change arm. The SKU row takes `.for('update')`
-        // when the class is moving (the guard serializes against the other
-        // SKU-row lockers — the +stock writers per fix-a2 — but NOT against
-        // placement/pick, which read the SKU unlocked; that residual race is
-        // the recorded 12-1 currency, PENDING.md putaway:57), re-read through
-        // the same scope; every other arm sees the plain read (a non-class
-        // patch locks nothing, exactly as before).
+        // whenever the storage-class FIELD is present — a change, a no-op
+        // edit and (were it possible) a clear all lock (the guard serializes
+        // against the other SKU-row lockers — the +stock writers per fix-a2 —
+        // but NOT against placement/pick, which read the SKU unlocked; that
+        // residual race is the recorded 12-1 currency, PENDING.md
+        // putaway:57); the guard BODY still runs only on a change. Every
+        // other arm sees the plain read (a non-class patch locks nothing,
+        // exactly as before).
         if (fields.storageClass !== undefined) {
           const newClass = fields.storageClass;
           const lockedRows = await tx
@@ -446,6 +498,123 @@ export class SkuCommand {
                 `SKU "${current.code}" would require ${newClass} storage, but its stock sits in ` +
                   [...stockParties, ...holdParties].join('; ') +
                   ' — relocate the stock first.',
+              );
+            }
+          }
+        }
+
+        // ── Story 12-2: the hazard-edit arm. The SKU row takes `.for('update')`
+        // whenever the hazard-class FIELD is present (a change, a no-op edit
+        // and a clear all lock — the same over-lock-is-harmless shape as the
+        // 12-1 arm above), and the co-location guard BODY runs only on a
+        // CHANGE to a non-null class: a null clear carries no rule in either
+        // direction, so it always succeeds (the spec's acceptance arm).
+        //
+        // The guard (409 `hazard-segregation-conflict`): for every non-system
+        // bin where the SKU holds stock tenant-wide, the bin's OTHER
+        // occupants must all be compatible with the new class — the
+        // co-location rule is SKU × SKU-in-bin, so the binmates are the
+        // parties (read through the putaway helper, one grouped query per
+        // stocked bin). The open-QC-hold quantities are attributed to their
+        // ORIGIN bins (a later `qc.released` would return those units there;
+        // release itself stays class-free — pinned indirectly, the 12-1
+        // pattern), and the party message names the pinning hold's id so the
+        // operator can find it.
+        if (fields.hazardClass !== undefined) {
+          const hazardLockedRows = await tx
+            .select()
+            .from(skus)
+            .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
+            .limit(1)
+            .for('update');
+          const hazardLocked = hazardLockedRows[0]!;
+          const newHazardClass = fields.hazardClass;
+          if (newHazardClass !== null && hazardLocked.hazardClass !== newHazardClass) {
+            const stockBins = await tx
+              .select({
+                binId: bins.id,
+                binCode: bins.code,
+                warehouseId: bins.warehouseId,
+              })
+              .from(stockOnHand)
+              .innerJoin(bins, eq(bins.id, stockOnHand.binId))
+              .where(
+                and(
+                  eq(stockOnHand.tenantId, command.tenantId),
+                  eq(stockOnHand.skuId, command.skuId),
+                  gt(stockOnHand.quantity, 0),
+                  eq(bins.systemOwned, false),
+                ),
+              );
+            // The SKU could hold several stock rows in one bin (the batch
+            // arms fold into separate projection rows) — one co-location
+            // scan per BIN.
+            const binById = new Map(stockBins.map((row) => [row.binId, row]));
+            const parties: string[] = [];
+            for (const bin of binById.values()) {
+              const occupants = await occupantHazardClassesInTx(
+                tx,
+                command.tenantId,
+                bin.warehouseId,
+                bin.binId,
+              );
+              for (const occupant of occupants) {
+                // The SKU's own units are not binmates — they move with the
+                // edit (the same-SKU-consolidation rule).
+                if (occupant.skuId === command.skuId) {
+                  continue;
+                }
+                if (!hazardClassesCompatible(newHazardClass, occupant.hazardClass)) {
+                  parties.push(
+                    `bin "${bin.binCode}" (warehouse ${bin.warehouseId}) co-locates with ` +
+                      `"${occupant.skuCode}" (${occupant.hazardClass})`,
+                  );
+                }
+              }
+            }
+            const holds = await openQcHoldsForSkuInTx(tx, command.tenantId, command.skuId);
+            const originBinIds = [...new Set(holds.map((hold) => hold.binId))];
+            const originRows =
+              originBinIds.length === 0
+                ? []
+                : await tx
+                    .select({
+                      id: bins.id,
+                      code: bins.code,
+                      warehouseId: bins.warehouseId,
+                      systemOwned: bins.systemOwned,
+                    })
+                    .from(bins)
+                    .where(and(eq(bins.tenantId, command.tenantId), inArray(bins.id, originBinIds)));
+            const originById = new Map(originRows.map((row) => [row.id, row]));
+            for (const hold of holds) {
+              const origin = originById.get(hold.binId);
+              if (origin === undefined || origin.systemOwned) {
+                continue; // the origin bin is gone or is staging — nothing to attribute
+              }
+              const occupants = await occupantHazardClassesInTx(
+                tx,
+                command.tenantId,
+                origin.warehouseId,
+                origin.id,
+              );
+              for (const occupant of occupants) {
+                if (occupant.skuId === command.skuId) {
+                  continue;
+                }
+                if (!hazardClassesCompatible(newHazardClass, occupant.hazardClass)) {
+                  parties.push(
+                    `origin bin "${origin.code}" (warehouse ${origin.warehouseId}) co-locates with ` +
+                      `"${occupant.skuCode}" (${occupant.hazardClass}, hold "${hold.holdId}")`,
+                  );
+                }
+              }
+            }
+            if (parties.length > 0) {
+              throw segregationStateConflict(
+                `SKU "${current.code}" would carry the "${newHazardClass}" hazard class, but its bins ` +
+                  `co-locate with segregated classes: ${parties.join('; ')} — relocate the stock ` +
+                  'or release the holds first.',
               );
             }
           }
@@ -698,6 +867,9 @@ export class SkuCommand {
         // Story 12-1 — absent = unchanged (no clear verb; the column is
         // NOT NULL, a SKU always carries a class).
         if (fields.storageClass !== undefined) updates.storageClass = fields.storageClass;
+        // Story 12-2 — absent = unchanged, null = clear (the 11.2 attribute
+        // template; the column is nullable, the clear verb exists).
+        if (fields.hazardClass !== undefined) updates.hazardClass = fields.hazardClass;
         // Story 11.3 — the variant columns move only when the patch moved
         // them (`undefined` = untouched; `null` = cleared with the detach).
         if (setProductId !== undefined) updates.productId = setProductId;
@@ -788,6 +960,11 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     // Story 12-1 — the controlled-vocabulary class (required; every SKU
     // carries one, default 'ambient').
     storageClass: row.storageClass,
+    // Story 12-2 — toSnapshot is the ONLY live-row read shape and it always
+    // sets the class (`null` on every pre-12.2 row and import row without the
+    // cell); the replay serve point's `?? null` normalizer pins the required
+    // response field for legacy snapshots.
+    hazardClass: row.hazardClass ?? null,
     // Story 10.1: `toSnapshot` is the module's only SKU read shape — base
     // units leave here, milli-units stay in the column.
     reorderPoint: fromMilli(row.reorderPoint),

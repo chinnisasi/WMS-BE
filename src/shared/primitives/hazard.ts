@@ -77,7 +77,10 @@ const INCOMPATIBLE_PAIRS: ReadonlySet<string> = new Set([
  * incompatible; same-SKU consolidation is NOT the predicate's job (the
  * gates skip the moving SKU's own pairs by id).
  */
-export function hazardClassesCompatible(a: string, b: string): boolean {
+export function hazardClassesCompatible(
+  a: string | null,
+  b: string | null,
+): boolean {
   if (a === null || b === null) {
     return true;
   }

@@ -349,7 +349,7 @@ export class CatalogController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('SKU (or, on attach, the product) does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Barcode already belongs to another SKU (duplicate-barcode names it), or another SKU of this product already carries identical variantValues (duplicate-variant-values)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Barcode already belongs to another SKU (duplicate-barcode names it), another SKU of this product already carries identical variantValues (duplicate-variant-values), or a hazard-class change would strand stock co-located with an incompatible binmate (hazard-segregation-conflict names the bins and the parties)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'skuId', format: 'uuid' })
@@ -412,6 +412,12 @@ export class CatalogController {
         // unchanged; there is no null (the column is NOT NULL). The command
         // is the boundary (vocabulary re-check, the class-edit guard).
         storageClass: dto.storageClass,
+        // Story 12-2 — the hazard class passes through WYSIWYG: absent =
+        // unchanged, null = clear (the 11.2 template; the column is nullable,
+        // so there is NO explicit-null 400 like `storageClass`'s). The
+        // command is the boundary (vocabulary re-check, the co-location
+        // guard).
+        hazardClass: dto.hazardClass,
       },
       key,
     );
