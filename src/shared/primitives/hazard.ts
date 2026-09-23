@@ -58,7 +58,10 @@ export type HazardClass = (typeof HAZARD_CLASSES)[number];
  * deterministic in one direction: `incompatible(a, b)` sorts its arguments
  * and asks the set. `explosive` is NOT here — it is the universal rule in
  * the predicate (segregates from every classed SKU, whatever the pair set
- * grows to).
+ * grows to). A class OUTSIDE this set is compatible with every classed SKU
+ * — fail-open on unknown values (which cannot reach the predicate anyway:
+ * every write edge is closed by `assertHazardClass` / `@IsIn` / the DB
+ * CHECK). Widening the vocabulary happens in THIS file — pairs included.
  */
 const INCOMPATIBLE_PAIRS: ReadonlySet<string> = new Set([
   'flammable|oxidizer',

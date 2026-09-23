@@ -742,8 +742,10 @@ export class BinCommand {
         // — merging stock into a bin already holding that SKU is legitimate,
         // explosive included), rows whose class is null skip (null carries
         // no rule), and moved-vs-moved is NOT re-checked (the source bin
-        // already co-locates them). Same factory as the placement gate (400
-        // `bin-segregation-conflict`).
+        // already co-locates them) — a premise that holds while `stock.adjust`
+        // is the named bypass: it is the only writer able to FORM incompatible
+        // co-location in a source bin (recorded in PENDING). Same factory as
+        // the placement gate (400 `bin-segregation-conflict`).
         const targetOccupants = await occupantHazardClassesInTx(
           tx,
           command.tenantId,

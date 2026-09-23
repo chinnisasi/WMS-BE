@@ -1244,6 +1244,55 @@ export async function occupantHazardClassesInTx(
 }
 
 /**
+ * Story 12-2 — the SKU-edit guard's grouped read: MANY bins' hazardous
+ * occupants in ONE query (the single-bin read above runs per bin — too many
+ * round-trips inside the edit's `.for('update')` window). One row per
+ * (binId, skuId) — the group key widens with `binId`, so a (bin, binmate)
+ * pair can never come back twice and the guard's party dedupe falls out of
+ * the read. Same join shape and filters as the single-bin read, minus the
+ * warehouse filter (a bin id is unique — the caller's bin set is the
+ * authority: non-system stocked bins and non-system hold origins).
+ */
+export interface OccupantHazardPair {
+  readonly binId: string;
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly hazardClass: string;
+}
+
+export async function binOccupantHazardPairsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  binIds: readonly string[],
+): Promise<readonly OccupantHazardPair[]> {
+  if (binIds.length === 0) {
+    return [];
+  }
+  const rows = await tx
+    .select({
+      binId: stockOnHand.binId,
+      skuId: stockOnHand.skuId,
+      skuCode: skus.code,
+      hazardClass: skus.hazardClass,
+    })
+    .from(stockOnHand)
+    // The same deliberate INNER join as the single-bin read above.
+    .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+    .where(
+      and(
+        eq(stockOnHand.tenantId, tenantId),
+        inArray(stockOnHand.binId, [...binIds]),
+        gt(stockOnHand.quantity, 0),
+        isNotNull(skus.hazardClass),
+      ),
+    )
+    .groupBy(stockOnHand.binId, stockOnHand.skuId, skus.code, skus.hazardClass);
+  // The `isNotNull` filter above is the authority — the same one-time
+  // boundary narrowing as the single-bin read.
+  return rows.map((row) => ({ ...row, hazardClass: row.hazardClass as string }));
+}
+
+/**
  * The Receiving bin's on-hand for one (sku, batch) — the task "remaining"'s
  * on-hand half: the batch arm's fold on a batch-tracked SKU, the plain fold
  * otherwise (both read from the projections — the ledger's derived state).

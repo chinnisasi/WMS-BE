@@ -5,6 +5,7 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { toMilli } from '../src/shared/primitives/quantity';
 import { testAddress } from './support/shipment-address';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
+import { HAZARD_CLASSES } from '../src/shared/primitives/hazard';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -445,6 +446,14 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
       sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
           values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-HC2', 'probe', 'each', 1800, ${`BC-${ulid()}`}, null)`,
     ).resolves.toBeDefined();
+    // ...and the ACCEPTANCE side: every one of the seven vocabulary values
+    // inserts cleanly (the refusal side is the 23514 probe above).
+    for (const hazardClass of HAZARD_CLASSES) {
+      await expect(
+        sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
+            values (${uuidv7()}, ${tenantId}, ${`CHECK-PROBE-HC-${hazardClass}`}, 'probe', 'each', 1800, ${`BC-${ulid()}`}, ${hazardClass})`,
+      ).resolves.toBeDefined();
+    }
     // The 0036 migration's shape, read back from the catalog: nullable
     // column, exactly one CHECK carrying the seven-class vocabulary.
     const hazardColumn = await sql`
@@ -832,6 +841,24 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
     expect(
       (unchanged.body.items as { code: string; hazardClass: string | null }[]).find((s) => s.code === 'HC-GUARD')!.hazardClass,
     ).toBe('explosive');
+
+    // THE NO-OP SKIP: re-patching the SAME class with the same incompatible
+    // binmate present is 200 — the guard body runs only on a CHANGE (a
+    // same-class edit strands nothing new).
+    const noOp = await patchSku(guardSkuId, { hazardClass: 'explosive' }).expect(200);
+    expect(noOp.body.hazardClass).toBe('explosive');
+
+    // BOTH class fields in one body: the 12-1 storage-class gate passes (an
+    // explicit `ambient` is the SKU's current class — the field locks, its
+    // guard body skips) and the 12-2 hazard gate refuses — the guards run
+    // in their fixed order and the whole patch commits nothing.
+    const mixed = await patchSku(guardSkuId, { storageClass: 'ambient', hazardClass: 'flammable' }).expect(409);
+    expect(mixed.body).toMatchObject({ status: 409, code: 'hazard-segregation-conflict' });
+    expect(String(mixed.body.detail)).toContain('A-01');
+    const stillExplosive = await listSkus().expect(200);
+    const stillRow = (stillExplosive.body.items as { code: string; hazardClass: string | null; storageClass: string }[]).find((s) => s.code === 'HC-GUARD')!;
+    expect(stillRow.hazardClass).toBe('explosive');
+    expect(stillRow.storageClass).toBe('ambient'); // the storage arm was not applied either — nothing committed
 
     // THE PREDICATE, NOT A BLANKET: a COMPATIBLE class edits over the SAME
     // stock (explosive beside toxic is a decided-compatible pair) — 200.

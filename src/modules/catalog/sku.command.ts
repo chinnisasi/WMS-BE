@@ -39,7 +39,7 @@ import {
   hazardClassesCompatible,
   segregationStateConflict,
 } from '../../shared/primitives/hazard';
-import { occupantHazardClassesInTx } from '../putaway/putaway.command';
+import { binOccupantHazardPairsInTx } from '../putaway/putaway.command';
 import { openQcHoldsForSkuInTx } from '../inbound/qc.command';
 import {
   assertVariantValues,
@@ -514,8 +514,7 @@ export class SkuCommand {
         // bin where the SKU holds stock tenant-wide, the bin's OTHER
         // occupants must all be compatible with the new class — the
         // co-location rule is SKU × SKU-in-bin, so the binmates are the
-        // parties (read through the putaway helper, one grouped query per
-        // stocked bin). The open-QC-hold quantities are attributed to their
+        // parties. The open-QC-hold quantities are attributed to their
         // ORIGIN bins (a later `qc.released` would return those units there;
         // release itself stays class-free — pinned indirectly, the 12-1
         // pattern), and the party message names the pinning hold's id so the
@@ -547,31 +546,8 @@ export class SkuCommand {
                 ),
               );
             // The SKU could hold several stock rows in one bin (the batch
-            // arms fold into separate projection rows) — one co-location
-            // scan per BIN.
+            // arms fold into separate projection rows) — one candidate bin.
             const binById = new Map(stockBins.map((row) => [row.binId, row]));
-            const parties: string[] = [];
-            for (const bin of binById.values()) {
-              const occupants = await occupantHazardClassesInTx(
-                tx,
-                command.tenantId,
-                bin.warehouseId,
-                bin.binId,
-              );
-              for (const occupant of occupants) {
-                // The SKU's own units are not binmates — they move with the
-                // edit (the same-SKU-consolidation rule).
-                if (occupant.skuId === command.skuId) {
-                  continue;
-                }
-                if (!hazardClassesCompatible(newHazardClass, occupant.hazardClass)) {
-                  parties.push(
-                    `bin "${bin.binCode}" (warehouse ${bin.warehouseId}) co-locates with ` +
-                      `"${occupant.skuCode}" (${occupant.hazardClass})`,
-                  );
-                }
-              }
-            }
             const holds = await openQcHoldsForSkuInTx(tx, command.tenantId, command.skuId);
             const originBinIds = [...new Set(holds.map((hold) => hold.binId))];
             const originRows =
@@ -586,28 +562,45 @@ export class SkuCommand {
                     })
                     .from(bins)
                     .where(and(eq(bins.tenantId, command.tenantId), inArray(bins.id, originBinIds)));
-            const originById = new Map(originRows.map((row) => [row.id, row]));
-            for (const hold of holds) {
-              const origin = originById.get(hold.binId);
-              if (origin === undefined || origin.systemOwned) {
-                continue; // the origin bin is gone or is staging — nothing to attribute
+            // Non-system origins only (staging attributes nothing — as
+            // before), now decided BEFORE the ONE grouped occupant read.
+            const originById = new Map(
+              originRows.filter((row) => !row.systemOwned).map((row) => [row.id, row]),
+            );
+            // ONE grouped occupant read over EVERY candidate bin — the
+            // stocked bins and the hold origins together, no per-bin queries
+            // inside the row lock. One row per (bin, binmate): a bin that is
+            // both a stock bin and a hold origin yields ONE party row, and
+            // the dedupe falls out of the read — the hold-origin copy
+            // carries the richer hold-naming message whenever the bin is a
+            // hold origin.
+            const occupants = await binOccupantHazardPairsInTx(tx, command.tenantId, [
+              ...binById.keys(),
+              ...originById.keys(),
+            ]);
+            const holdIdByBin = new Map(holds.map((hold) => [hold.binId, hold.holdId]));
+            const parties: string[] = [];
+            for (const occupant of occupants) {
+              // The SKU's own units are not binmates — they move with the
+              // edit (the same-SKU-consolidation rule).
+              if (occupant.skuId === command.skuId) {
+                continue;
               }
-              const occupants = await occupantHazardClassesInTx(
-                tx,
-                command.tenantId,
-                origin.warehouseId,
-                origin.id,
-              );
-              for (const occupant of occupants) {
-                if (occupant.skuId === command.skuId) {
-                  continue;
-                }
-                if (!hazardClassesCompatible(newHazardClass, occupant.hazardClass)) {
-                  parties.push(
-                    `origin bin "${origin.code}" (warehouse ${origin.warehouseId}) co-locates with ` +
-                      `"${occupant.skuCode}" (${occupant.hazardClass}, hold "${hold.holdId}")`,
-                  );
-                }
+              if (hazardClassesCompatible(newHazardClass, occupant.hazardClass)) {
+                continue;
+              }
+              const origin = originById.get(occupant.binId);
+              if (origin !== undefined) {
+                parties.push(
+                  `origin bin "${origin.code}" (warehouse ${origin.warehouseId}) co-locates with ` +
+                    `"${occupant.skuCode}" (${occupant.hazardClass}, hold "${holdIdByBin.get(occupant.binId)}")`,
+                );
+              } else {
+                const bin = binById.get(occupant.binId)!;
+                parties.push(
+                  `bin "${bin.binCode}" (warehouse ${bin.warehouseId}) co-locates with ` +
+                    `"${occupant.skuCode}" (${occupant.hazardClass})`,
+                );
               }
             }
             if (parties.length > 0) {
