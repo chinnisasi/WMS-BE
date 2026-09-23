@@ -61,8 +61,8 @@ export type HazardClass = (typeof HAZARD_CLASSES)[number];
  * grows to).
  */
 const INCOMPATIBLE_PAIRS: ReadonlySet<string> = new Set([
-  'oxidizer|flammable',
-  'oxidizer|gas',
+  'flammable|oxidizer',
+  'gas|oxidizer',
   'corrosive-acid|corrosive-base',
   'corrosive-acid|toxic',
 ]);

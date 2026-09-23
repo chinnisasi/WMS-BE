@@ -2518,7 +2518,7 @@
             }
           },
           "409": {
-            "description": "Barcode already belongs to another SKU (duplicate-barcode names it), or another SKU of this product already carries identical variantValues (duplicate-variant-values)",
+            "description": "Barcode already belongs to another SKU (duplicate-barcode names it), another SKU of this product already carries identical variantValues (duplicate-variant-values), or a hazard-class change would strand stock co-located with an incompatible binmate (hazard-segregation-conflict names the bins and the parties)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9914,6 +9914,21 @@
             ],
             "example": "ambient"
           },
+          "hazardClass": {
+            "type": "string",
+            "enum": [
+              "explosive",
+              "oxidizer",
+              "flammable",
+              "corrosive-acid",
+              "corrosive-base",
+              "toxic",
+              "gas"
+            ],
+            "nullable": true,
+            "example": "flammable",
+            "description": "The SKU's hazard class (FR-41), or null when it carries none. Null carries no rule in either direction of the segregation matrix."
+          },
           "barcode": {
             "type": "string",
             "example": "0198f7a2-1b3c-7d4e-8f90-112233445588",
@@ -9952,6 +9967,7 @@
           "productId",
           "variantValues",
           "storageClass",
+          "hazardClass",
           "barcode",
           "uomConversions",
           "createdAt"
@@ -10205,6 +10221,21 @@
             ],
             "example": "ambient",
             "description": "The SKU's storage class (FR-40): ambient, chilled, frozen, controlled, hazardous or secure. Omit to leave unchanged."
+          },
+          "hazardClass": {
+            "type": "string",
+            "enum": [
+              "explosive",
+              "oxidizer",
+              "flammable",
+              "corrosive-acid",
+              "corrosive-base",
+              "toxic",
+              "gas"
+            ],
+            "nullable": true,
+            "example": "flammable",
+            "description": "The SKU's hazard class (FR-41): explosive, oxidizer, flammable, corrosive-acid, corrosive-base, toxic or gas. Omit to leave unchanged; null clears the class (always succeeds — null carries no rule)."
           }
         }
       },
