@@ -295,11 +295,16 @@ export class TenancyController {
         widthMm: dto.widthMm,
         heightMm: dto.heightMm,
         maxWeightGrams: dto.maxWeightGrams,
+        // Story 12-1: the storage class (FR-40) — absent = 'ambient'.
+        storageClass: dto.storageClass,
         type: dto.type,
       },
       key,
     );
-    return snapshot.bin;
+    // Story 12-1: through `normalizeBin` like every other bin response — a
+    // stored pre-12.1 create snapshot lacks `storageClass`, which reads as
+    // 'ambient' (the migration's DEFAULT).
+    return normalizeBin(snapshot.bin);
   }
 
   @Post(':tenantId/warehouses/:warehouseId/zones/:zoneId/bins/grid')
@@ -348,6 +353,8 @@ export class TenancyController {
         widthMm: dto.widthMm,
         heightMm: dto.heightMm,
         maxWeightGrams: dto.maxWeightGrams,
+        // Story 12-1: the storage class, per generated bin — absent = 'ambient'.
+        storageClass: dto.storageClass,
         type: dto.type,
       },
       key,
@@ -435,17 +442,20 @@ export class TenancyController {
       );
     }
     const hasBlocked = dto.blocked !== undefined;
+    // Story 12-1: the storage class rides the STRUCTURE arm (tenancy owns it)
+    // — a storageClass-only body routes to `editBinCapacity`.
     const hasCapacity =
       dto.lengthMm !== undefined ||
       dto.widthMm !== undefined ||
       dto.heightMm !== undefined ||
-      dto.maxWeightGrams !== undefined;
+      dto.maxWeightGrams !== undefined ||
+      dto.storageClass !== undefined;
     if (hasBlocked && hasCapacity) {
       throw new ProblemException(
         'validation-failed',
         400,
         'blocked and capacity attributes cannot change together',
-        'A blocked change and a capacity-attribute change are two different operations on this bin — send them as separate PATCH requests (one idempotency key per request).',
+        'A blocked change and a capacity-attribute change (including the storage class) are two different operations on this bin — send them as separate PATCH requests (one idempotency key per request).',
       );
     }
     if (hasCapacity) {
@@ -459,6 +469,7 @@ export class TenancyController {
           widthMm: dto.widthMm,
           heightMm: dto.heightMm,
           maxWeightGrams: dto.maxWeightGrams,
+          storageClass: dto.storageClass,
         },
         key,
       );
@@ -469,7 +480,7 @@ export class TenancyController {
         'validation-failed',
         400,
         'Nothing to change',
-        'Send `blocked` (the bin\'s operational state) or a capacity attribute (lengthMm, widthMm, heightMm, maxWeightGrams) — the body carries neither.',
+        'Send `blocked` (the bin\'s operational state) or a capacity attribute (lengthMm, widthMm, heightMm, maxWeightGrams, storageClass) — the body carries neither.',
       );
     }
     // Story 3.6: delegated to the re-homed command — the putaway module owns
@@ -597,6 +608,7 @@ function normalizeBin(bin: {
   widthMm?: number | null;
   heightMm?: number | null;
   maxWeightGrams?: number | null;
+  storageClass?: string;
 }): BinResponse {
   return {
     ...bin,
@@ -610,6 +622,10 @@ function normalizeBin(bin: {
     widthMm: bin.widthMm ?? null,
     heightMm: bin.heightMm ?? null,
     maxWeightGrams: bin.maxWeightGrams ?? null,
+    // Story 12-1: stored pre-12.1 snapshots lack the class — an absent field
+    // reads 'ambient' (the migration's DEFAULT, which is what every
+    // pre-12.1 row is; NOT NULL, so never null).
+    storageClass: bin.storageClass ?? 'ambient',
   } as BinResponse;
 }
 
