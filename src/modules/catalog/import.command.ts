@@ -1227,9 +1227,17 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
     assertStorageClass({ storageClass });
   } catch (err) {
     const response = (err as ProblemException).getResponse() as { detail?: string };
+    // The shared validator names the command field (`storageClass`); the CSV
+    // caller's column is the snake_case header, so the row error names THAT
+    // (the row error is the import user's only view of the refusal).
     return {
       ok: false,
-      error: rowError(row.rowNumber, code, 'validation-failed', response.detail ?? 'Invalid storage_class value.'),
+      error: rowError(
+        row.rowNumber,
+        code,
+        'validation-failed',
+        response.detail?.replace('storageClass', 'storage_class') ?? 'Invalid storage_class value.',
+      ),
     };
   }
 

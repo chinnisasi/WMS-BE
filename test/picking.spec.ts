@@ -2352,9 +2352,11 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     await seedStock(frozenSkuId, binFrozen, 3);
     await seedStock(frozenSkuId, binAmbient, 5);
 
-    // THE PLANNER FILTER: the wave's slice plans the frozen bin only — the
-    // ambient bin holds MORE units but is out of the pool (the bin-rank
-    // membership filter, fail-closed).
+    // THE DRAW GUARD'S STATE: the wave's slice plans the frozen bin (3 units
+    // cover the line; note the planner filter itself is discriminated by the
+    // waves suite, where the ambient bin sorts first and holds more units —
+    // here the frozen bin sorts first, so this test's own filter evidence is
+    // the replan arm below).
     const { picklist } = await releasedWave([{ skuId: frozenSkuId, quantity: 3 }], 'storage-class');
     const line = picklist.lines[0]!;
     expect(line.binId).toBe(binFrozen);

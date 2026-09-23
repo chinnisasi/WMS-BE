@@ -1278,6 +1278,14 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
         values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${zoneId}, ${`CHK-${ulid().slice(0, 6)}`}, ${toMilli(10)}, 'shelf', 100000001)`;
       await expect(badWeight).rejects.toThrow(/bins_max_weight_grams_bounded/i);
 
+      // Story 12-1: the storage-class vocabulary's DB backstop — the third
+      // layer (TS tuple / CHECK / @IsIn). The HTTP refusals happen in TS, so
+      // only a direct out-of-vocabulary write proves the CHECK exists.
+      const badClass = admin`
+        insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type, storage_class)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${zoneId}, ${`CHK-${ulid().slice(0, 6)}`}, ${toMilli(10)}, 'shelf', 'tropical')`;
+      await expect(badClass).rejects.toThrow(/bins_storage_class_check/i);
+
       // RLS still gates the table (the Story 1.3 probes, against the new
       // columns): a probe role scoped to a foreign tenant reads nothing of
       // ours, an unscoped read fails closed.
@@ -1518,5 +1526,99 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       .send({ storageClass: 'chilled' })
       .expect(200);
     expect(systemEdit.body).toMatchObject({ storageClass: 'chilled' });
+  });
+
+  it('storage-class dispatch: a class-only body routes to the structure arm, blocked and storageClass refuse to mix, an explicit null is a 400, and a pre-12.1 create snapshot replays with the ambient fallback', async () => {
+    const postBin = async (code: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf' })
+          .expect(201)
+      ).body.id as string;
+    const binDispatch = await postBin('A-92-01');
+    const binMixed = await postBin('A-92-02');
+    const binNulled = await postBin('A-92-03');
+
+    // A class-only body routes to the STRUCTURE arm (tenancy owns the class):
+    // it answers through editBinCapacity and the class changes.
+    const classOnly = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binDispatch}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'chilled' })
+      .expect(200);
+    expect(classOnly.body).toMatchObject({ id: binDispatch, storageClass: 'chilled' });
+
+    // One operation per key: a blocked change and a class change in one body
+    // is a 400 (the dispatch refusal), not a silent mix.
+    const mixed = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binMixed}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ blocked: true, storageClass: 'chilled' })
+      .expect(400);
+    expect(mixed.body).toMatchObject({ status: 400, code: 'validation-failed' });
+
+    // The 11-5 `blocked` precedent: `storageClass: null` is a 400 (the DTO's
+    // `@IsOptional` skips null, and the command treats only `undefined` as
+    // absent — without this guard a null reaches the NOT NULL column as a
+    // 500).
+    const nulled = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binNulled}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: null })
+      .expect(400);
+    expect(nulled.body).toMatchObject({ status: 400, code: 'validation-failed' });
+    expect(String(nulled.body.detail)).toContain('storageClass');
+
+    // Legacy replay: a key whose snapshot predates the 12-1 column (no
+    // `storageClass` in the stored bin) replays 200 through `normalizeBin`
+    // with the ambient fallback — and the hand-computed digest pins that a
+    // legacy-shaped body still fingerprints byte-identically (a hash-shape
+    // change would answer 422 idempotency-key-reuse here, not 200).
+    const key = ulid();
+    const payloadHash = hashCommandPayload({
+      tenantId,
+      warehouseId,
+      zoneId,
+      code: 'A-92-04',
+      capacity: 100,
+      type: 'shelf',
+      // NOTE the absence: a pre-12.1 build had no such key to emit.
+      // `JSON.stringify` drops it on today's build too (absent = unchanged),
+      // which is exactly what makes the two builds hash the same bytes.
+    });
+    const legacySnapshot = {
+      bin: {
+        id: uuidv7(),
+        tenantId,
+        warehouseId,
+        zoneId,
+        code: 'A-92-04',
+        capacity: 100,
+        type: 'shelf',
+        blocked: false,
+        createdAt: new Date().toISOString(),
+      },
+    };
+    const seed = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await seed`
+        insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+        values (${uuidv7()}, ${tenantId}, ${key}, ${payloadHash}, ${seed.json(legacySnapshot)})`;
+    } finally {
+      await seed.end();
+    }
+    const replay = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, key)
+      .send({ code: 'A-92-04', capacity: 100, type: 'shelf' })
+      .expect(201);
+    expect(replay.body).toMatchObject({ code: 'A-92-04', storageClass: 'ambient' });
   });
 });

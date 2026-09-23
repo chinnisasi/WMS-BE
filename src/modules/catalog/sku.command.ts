@@ -150,7 +150,10 @@ export interface EditSkuCommand {
    * stock tenant-wide (in non-system bins — staging is excluded) and its
    * open-QC-hold quantities (attributed to their origin bins) must all
    * satisfy the new class, or the edit strands non-conforming stock. The
-   * class-changing arm takes the SKU row `.for('update')`.
+   * class-changing arm takes the SKU row `.for('update')` — which serializes
+   * against the other SKU-row lockers (the +stock writers, fix-a2) but NOT
+   * against placement/pick, which read the SKU unlocked; the residual race is
+   * the recorded 12-1 currency (PENDING.md, putaway:57).
    */
   readonly storageClass?: string | undefined;
 }
@@ -322,8 +325,14 @@ export class SkuCommand {
           if (existing[0].payloadHash !== payloadHash) {
             throw idempotencyKeyReuse();
           }
+          // Story 12-1 (code review): a snapshot stored by a pre-12.1 build
+          // has no `storageClass` — the column did not exist. Serve the
+          // migration DEFAULT the way `normalizeBin` serves the bins'
+          // (`?? 'ambient'`), so a replayed legacy key still satisfies the
+          // required `SkuResponse` field instead of omitting it.
+          const stored = existing[0].responseSnapshot as SkuSnapshot & { storageClass?: string };
           return {
-            snapshot: existing[0].responseSnapshot as SkuSnapshot,
+            snapshot: { ...stored, storageClass: stored.storageClass ?? 'ambient' },
             replayed: true,
           };
         }
@@ -356,9 +365,12 @@ export class SkuCommand {
         assertStorageClass({ storageClass: fields.storageClass });
 
         // ── Story 12-1: the class-change arm. The SKU row takes `.for('update')`
-        // when the class is moving (the guard serializes against concurrent
-        // writers), re-read through the same scope; every other arm sees the
-        // plain read (a non-class patch locks nothing, exactly as before).
+        // when the class is moving (the guard serializes against the other
+        // SKU-row lockers — the +stock writers per fix-a2 — but NOT against
+        // placement/pick, which read the SKU unlocked; that residual race is
+        // the recorded 12-1 currency, PENDING.md putaway:57), re-read through
+        // the same scope; every other arm sees the plain read (a non-class
+        // patch locks nothing, exactly as before).
         if (fields.storageClass !== undefined) {
           const newClass = fields.storageClass;
           const lockedRows = await tx

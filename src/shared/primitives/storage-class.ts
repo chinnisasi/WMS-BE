@@ -118,8 +118,7 @@ export function binStorageMismatch(
     'bin-storage-mismatch',
     400,
     'Bin does not satisfy the SKU’s storage class',
-    `Bin "${binCode}" is ${binClass}; SKU "${skuCode}" requires ${skuClass} storage — ` +
-      'a non-conforming placement is refused by rule (FR-40), not by habit.',
+    `Bin "${binCode}" is ${binClass}; SKU "${skuCode}" requires ${skuClass} storage — a non-conforming placement is refused by rule (FR-40).`,
   );
 }
 

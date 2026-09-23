@@ -1626,6 +1626,17 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     )!;
     expect(w3Task.suggestedBin).toBeNull();
     expect(w3Task.rationale).toBe('No conforming storage bin has room for these units');
+
+    // THE EXACT-MATCH FAMILY, second member: `secure` (like `controlled`)
+    // exact-matches ALWAYS — the temperature hierarchy does not apply, in
+    // either direction. An ambient unit refused by the secure cage.
+    const bin0SE = await createClassBin('0-SE', 'secure');
+    const secureGrn = await blindGrn([{ poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const refusedBySecure = await placeForLine(secureGrn.lines[0]!, bin0SE).expect(400);
+    expect(refusedBySecure.body).toMatchObject({ status: 400, code: 'bin-storage-mismatch' });
+    expect(refusedBySecure.body.detail).toContain('0-SE');
+    expect(refusedBySecure.body.detail).toContain('secure');
+    expect(await placementRowCount(secureGrn.grnId)).toBe(0);
   });
 
   it('RLS: a non-superuser session scoped to one tenant sees no putaway rows of another tenant and cannot write foreign rows', async () => {

@@ -4,6 +4,7 @@ import request from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { toMilli } from '../src/shared/primitives/quantity';
 import { testAddress } from './support/shipment-address';
+import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -408,6 +409,13 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
   });
 
   test('the migration CHECKs are the backstop a command cannot bypass', async () => {
+    // Story 12-1: the storage-class vocabulary's DB backstop — the HTTP
+    // refusals happen in TS (`assertStorageClass` / `@IsIn`), so only a
+    // direct out-of-vocabulary write proves the 0035 CHECK exists.
+    await expect(
+      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, storage_class)
+          values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-SC', 'probe', 'each', 1800, ${`BC-${ulid()}`}, 'tropical')`,
+    ).rejects.toThrow(/skus_storage_class_check/);
     // Direct SQL writes are out of reach of every validator by definition —
     // the CHECKs exist so even those cannot store a zero weight or a
     // lowercase origin. (The row is never committed: each insert throws.)
@@ -448,7 +456,9 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
     expect(error.rowNumber).toBe(3);
     expect(error.code).toBe('validation-failed');
     expect(error.skuCode).toBe('SC-IMP-BAD');
-    expect(error.detail).toContain('storageClass');
+    // The row error names the CSV COLUMN the user misspelled, not the
+    // command field the validator saw.
+    expect(error.detail).toContain('storage_class');
 
     const list = await listSkus().expect(200);
     const byCode = new Map((list.body.items as { code: string; storageClass: string }[]).map((s) => [s.code, s]));
@@ -566,5 +576,98 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
       .expect(200);
     const releasedEdit = await patchSku(guardSku.id, { storageClass: 'ambient' }).expect(200);
     expect(releasedEdit.body.storageClass).toBe('ambient');
+  });
+
+  test('the class edit replays: an explicit null is a 400, a class-carrying edit re-serves its snapshot without re-running the guard, and a pre-12.1 snapshot replays with the ambient fallback on a byte-identical legacy digest', async () => {
+    // A SKU of its own for the replay arms.
+    await importCsv(csvFile([{ sku_code: 'SC-REPLAY', name: 'Replay base', uom: 'pcs', gst_rate: '1800' }])).expect(201);
+    const base = (await listSkus().expect(200)).body.items as { code: string; id: string }[];
+    const replaySku = base.find((s) => s.code === 'SC-REPLAY')!;
+
+    // The 11-5 `blocked` precedent, SKU side: `storageClass: null` is a 400 —
+    // `@IsOptional` skips null, the command treats only `undefined` as
+    // absent, and the column is NOT NULL.
+    const nulled = await patchSku(replaySku.id, { storageClass: null }).expect(400);
+    expect(nulled.body).toMatchObject({ status: 400, code: 'validation-failed' });
+    expect(String(nulled.body.detail)).toContain('storageClass');
+
+    // A class-carrying edit under key K, then stock parked in an ambient bin
+    // afterwards (the named adjustment bypass, written directly). The replay
+    // must RE-SERVE the snapshot — the guard sits behind the replay lookup,
+    // so re-running it here would 409 on the new stock; the 10.2 rule says it
+    // must not.
+    const key = ulid();
+    const first = await patchSku(replaySku.id, { storageClass: 'frozen' }, key).expect(200);
+    expect(first.body.storageClass).toBe('frozen');
+    const parked = await sql`
+      insert into stock_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, quantity)
+      select ${uuidv7()}, ${tenantId}, b.warehouse_id, ${replaySku.id}, b.id, ${toMilli(2)}
+      from bins b
+      where b.tenant_id = ${tenantId} and b.system_owned = false
+      limit 1
+      returning id`;
+    expect(parked).toHaveLength(1); // the guard would 409 this state if re-run — the premise must not be vacuous
+    const replay = await patchSku(replaySku.id, { storageClass: 'frozen' }, key).expect(200);
+    expect(replay.body).toEqual(first.body);
+
+    // Legacy replay: a key whose payload was minted by a pre-12.1 build
+    // (name + gstRate only — the hand-computed digest below is what THAT
+    // build hashed) and whose stored snapshot predates the column. A
+    // hash-shape change would answer 422 idempotency-key-reuse here, not
+    // 200; a missing fallback would omit the required `storageClass` field.
+    await importCsv(csvFile([{ sku_code: 'SC-LEGACY-12', name: 'Legacy digest', uom: 'pcs', gst_rate: '1800' }])).expect(201);
+    const legacyItems = (await listSkus().expect(200)).body.items as {
+      code: string;
+      id: string;
+    }[];
+    const legacySku = legacyItems.find((s) => s.code === 'SC-LEGACY-12')!;
+    const legacyKey = ulid();
+    const legacyHash = hashCommandPayload({
+      tenantId,
+      skuId: legacySku.id,
+      name: 'Legacy digest',
+      gstRateBps: 1800,
+      // NOTE the absence: a pre-12.1 build had no `storageClass` key to emit.
+      // `JSON.stringify` drops it on today's build too (absent = unchanged),
+      // which is exactly what makes the two builds hash the same bytes.
+    });
+    const legacySnapshot = {
+      id: legacySku.id,
+      tenantId,
+      code: 'SC-LEGACY-12',
+      name: 'Legacy digest',
+      uom: 'pcs',
+      uomPrecision: 0,
+      gstRateBps: 1800,
+      hsn: null,
+      batchTracked: false,
+      serialTracked: false,
+      catchWeightTracked: false,
+      weightGrams: null,
+      lengthMm: null,
+      widthMm: null,
+      heightMm: null,
+      countryOfOrigin: null,
+      productId: null,
+      variantValues: null,
+      barcode: `BC-${ulid()}`,
+      // A real pre-12.1 snapshot carried the conversions (SkuSnapshot has
+      // them since the edit command first served a snapshot); the mapper at
+      // the edge maps them.
+      uomConversions: [],
+    };
+    const seed = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await seed`
+        insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+        values (${uuidv7()}, ${tenantId}, ${legacyKey}, ${legacyHash}, ${seed.json(legacySnapshot)})`;
+    } finally {
+      await seed.end();
+    }
+    const legacyReplay = await patchSku(legacySku.id, { name: 'Legacy digest', gstRate: 1800 }, legacyKey).expect(200);
+    expect(legacyReplay.body).toMatchObject({
+      id: legacySku.id,
+      storageClass: 'ambient',
+    });
   });
 });

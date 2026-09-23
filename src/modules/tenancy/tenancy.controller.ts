@@ -441,6 +441,19 @@ export class TenancyController {
         'The PATCH body carries `blocked: null` — send `true`/`false` to change the bin\'s operational state, or omit `blocked` entirely to change a capacity attribute.',
       );
     }
+    // Story 12-1 (code review): `storageClass: null` must 400 the same way —
+    // the DTO's `@IsOptional` skips null as well as undefined, and the edit
+    // command treats only `undefined` as absent, so an explicit null would
+    // reach the NOT NULL column and answer 500 where a 400 is the answer
+    // (the same 11-5 `blocked` reasoning; the class has no clear verb).
+    if (dto.storageClass === null) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'storageClass must be a string',
+        'The PATCH body carries `storageClass: null` — the storage class has no clear verb (the column is NOT NULL); omit `storageClass` to leave the bin\'s class unchanged.',
+      );
+    }
     const hasBlocked = dto.blocked !== undefined;
     // Story 12-1: the storage class rides the STRUCTURE arm (tenancy owns it)
     // — a storageClass-only body routes to `editBinCapacity`.
@@ -455,7 +468,7 @@ export class TenancyController {
         'validation-failed',
         400,
         'blocked and capacity attributes cannot change together',
-        'A blocked change and a capacity-attribute change (including the storage class) are two different operations on this bin — send them as separate PATCH requests (one idempotency key per request).',
+        'A blocked change and a structure-attribute change (the capacity fields or the storage class) are two different operations on this bin — send them as separate PATCH requests (one idempotency key per request).',
       );
     }
     if (hasCapacity) {
@@ -480,7 +493,7 @@ export class TenancyController {
         'validation-failed',
         400,
         'Nothing to change',
-        'Send `blocked` (the bin\'s operational state) or a capacity attribute (lengthMm, widthMm, heightMm, maxWeightGrams, storageClass) — the body carries neither.',
+        'Send `blocked` (the bin\'s operational state) or a structure attribute (lengthMm, widthMm, heightMm, maxWeightGrams, storageClass) — the body carries neither.',
       );
     }
     // Story 3.6: delegated to the re-homed command — the putaway module owns

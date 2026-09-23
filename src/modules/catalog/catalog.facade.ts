@@ -303,9 +303,11 @@ export class CatalogFacade {
    * caller's transaction — the wave planner's and the short-pick re-plan's
    * conformance filter (`buildStockPool`), the `getBatchesForSkusInTx` shape:
    * one plan is ONE tenant transaction, so the plan it commits is the catalog
-   * it saw. Outbound reaches the class only through this seam (AD-6); a SKU
-   * id the catalog does not know is simply absent from the map, which the
-   * pool filter treats as unprovable — fail-closed.
+   * it saw. The wave/replan POOL filter reaches the class through this seam
+   * (AD-6); a SKU id the catalog does not know is simply absent from the map,
+   * which the pool filter treats as unprovable — fail-closed. The pick DRAW,
+   * by contrast, reads `skus.storageClass` directly in its own projection
+   * (the pre-existing outbound direct-read pattern, `pick.command.ts:671`).
    */
   async getSkuStorageClassesInTx(
     tx: TenantTx,
