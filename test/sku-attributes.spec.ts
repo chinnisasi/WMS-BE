@@ -2,6 +2,8 @@ import type { INestApplication } from '@nestjs/common';
 import postgres from 'postgres';
 import request from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { toMilli } from '../src/shared/primitives/quantity';
+import { testAddress } from './support/shipment-address';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -125,7 +127,13 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
       await cleaner.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM catalog_imports WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM uom_conversions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      // Story 12-1: the class-guard scenarios park stock in bins — the
+      // projection goes before the SKUs and bins it points at.
+      await cleaner.unsafe('DELETE FROM stock_on_hand WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM skus WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await cleaner.unsafe('DELETE FROM bins WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await cleaner.unsafe('DELETE FROM zones WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await cleaner.unsafe('DELETE FROM warehouses WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM users WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM tenants WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
     } finally {
@@ -295,7 +303,8 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
     const res = await patchSku(id, {}).expect(400);
     expect(res.body.code).toBe('validation-failed');
     // 11-3 added productId and variantValues to the optional fields the
-    // detail enumerates — an empty body still lists them alongside 11-2's.
+    // detail enumerates — an empty body still lists them alongside 11-2's;
+    // 12-1 appends storageClass the same way.
     for (const field of [
       'weightGrams',
       'lengthMm',
@@ -304,6 +313,7 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
       'countryOfOrigin',
       'productId',
       'variantValues',
+      'storageClass',
     ]) {
       expect(String(res.body.detail)).toContain(field);
     }
@@ -414,5 +424,147 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
       sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, weight_grams, country_of_origin)
           values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-3', 'probe', 'each', 1800, ${`BC-${ulid()}`}, null, null)`,
     ).resolves.toBeDefined();
+  });
+
+  // ── Story 12-1 — the storage class: import column, edit guard (FR-40) ─────
+
+  test('the import carries storage_class: a classed row lands it, a BLANK cell defaults to ambient (never null — the column is NOT NULL), and a misspelled class is a per-row error', async () => {
+    const headerWithClass = `${CSV_HEADER},storage_class`;
+    const rowWithClass = (values: Record<string, string>): string =>
+      headerWithClass.split(',').map((column) => values[column] ?? '').join(',');
+    const fileWithClass = (rows: Record<string, string>[]): Buffer =>
+      Buffer.from([headerWithClass, ...rows.map(rowWithClass)].join('\n'), 'utf8');
+
+    const run = await importCsv(
+      fileWithClass([
+        { sku_code: 'SC-IMP-FRZ', name: 'Imported frozen', uom: 'pcs', gst_rate: '1800', storage_class: 'frozen' },
+        { sku_code: 'SC-IMP-BLANK', name: 'Blank class stays ambient', uom: 'pcs', gst_rate: '1800' },
+        { sku_code: 'SC-IMP-BAD', name: 'Not a recordable class', uom: 'pcs', gst_rate: '1800', storage_class: 'tropical' },
+      ]),
+    ).expect(201);
+    expect(run.body.committedRows).toBe(2);
+    expect(run.body.failedRows).toBe(1);
+    const error = (run.body.errors as { rowNumber: number; code: string; skuCode: string | null; detail: string }[])[0]!;
+    expect(error.rowNumber).toBe(3);
+    expect(error.code).toBe('validation-failed');
+    expect(error.skuCode).toBe('SC-IMP-BAD');
+    expect(error.detail).toContain('storageClass');
+
+    const list = await listSkus().expect(200);
+    const byCode = new Map((list.body.items as { code: string; storageClass: string }[]).map((s) => [s.code, s]));
+    expect(byCode.get('SC-IMP-FRZ')!.storageClass).toBe('frozen');
+    // The blank-cell semantics: an omitted/empty cell is the DEFAULT class,
+    // never a null — every SKU carries a class from birth.
+    expect(byCode.get('SC-IMP-BLANK')!.storageClass).toBe('ambient');
+  });
+
+  test('the SKU class edit: the vocabulary is closed at the boundary; staged intake stock (a system bin) does not block the first edit; live stock in a non-conforming bin is a 409 naming the bin; an open hold pins its origin bin', async () => {
+    // A warehouse of its own: one storage bin through the real surface, and
+    // the system Receiving bin with staged stock written directly (this suite
+    // has no device/operator — the guard's exclusion of system bins is the
+    // point under test, and the real-surface hold/attribution path is
+    // bin-admin's coverage).
+    const warehouseId = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `SC-${ulid().slice(10, 16).toUpperCase()}`, name: `Storage Guard Depot ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zoneId = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A', name: 'Aisle A' })
+        .expect(201)
+    ).body.id as string;
+    const binA = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A-01', capacity: 100, type: 'shelf' })
+        .expect(201)
+    ).body.id as string;
+    const receivingBin = (
+      await sql`
+        insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type, system_owned)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${zoneId}, 'RECEIVING', 10000, 'shelf', true)
+        returning id`
+    )[0] as unknown as { id: string };
+
+    // SC-GUARD imported in the legacy shape (no class column) with THREE
+    // units staged in the system Receiving bin — the intake shape. The first
+    // class edit MUST pass despite that stock: the guard excludes system
+    // bins, or no intake SKU could ever leave ambient.
+    await importCsv(
+      csvFile([{ sku_code: 'SC-GUARD', name: 'Storage guard SKU', uom: 'pcs', gst_rate: '1800' }]),
+    ).expect(201);
+    const list = await listSkus().expect(200);
+    const guardSku = (list.body.items as { code: string; id: string; storageClass: string }[]).find((s) => s.code === 'SC-GUARD')!;
+    expect(guardSku.storageClass).toBe('ambient');
+    await sql`
+      insert into stock_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, quantity)
+      values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${guardSku.id}, ${receivingBin.id}, ${toMilli(3)})`;
+
+    const firstEdit = await patchSku(guardSku.id, { storageClass: 'frozen' }).expect(200);
+    expect(firstEdit.body.storageClass).toBe('frozen');
+
+    // The closed vocabulary, at the command boundary (the DTO mirror refuses
+    // the same shape earlier): a misspelled class is a 400 naming the field.
+    const bad = await patchSku(guardSku.id, { storageClass: 'tropical' }).expect(400);
+    expect(bad.body.code).toBe('validation-failed');
+    expect(String(bad.body.detail)).toContain('storageClass');
+
+    // THE STOCK ARM: two units of the frozen SKU parked in the ambient bin
+    // (the named adjustment bypass, written directly here) — an edit to a
+    // class the bin cannot satisfy is 409 `storage-class-conflict` naming
+    // the SKU, the new class, and the offending bin. The class stays put.
+    await sql`
+      insert into stock_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, quantity)
+      values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${guardSku.id}, ${binA}, ${toMilli(2)})`;
+    const stranded = await patchSku(guardSku.id, { storageClass: 'chilled' }).expect(409);
+    expect(stranded.body).toMatchObject({ status: 409, code: 'storage-class-conflict' });
+    expect(String(stranded.body.detail)).toContain('SC-GUARD');
+    expect(String(stranded.body.detail)).toContain('chilled');
+    expect(String(stranded.body.detail)).toContain('A-01');
+    const unchanged = await listSkus().expect(200);
+    expect(
+      (unchanged.body.items as { code: string; storageClass: string }[]).find((s) => s.code === 'SC-GUARD')!.storageClass,
+    ).toBe('frozen');
+
+    // THE HOLD ARM: the hold moves the bin's stock to the QC bin, so the bin
+    // is empty — but the hold pins its ORIGIN bin, and an edit to a class
+    // that origin bin cannot satisfy is 409 naming the origin bin and the
+    // hold. The same target class as the stock arm's refusal above, now with
+    // the bin emptied: only the hold arm is left to refuse.
+    const hold = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/qc-holds`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ warehouseId, skuId: guardSku.id, binId: binA, reason: 'temperature excursion' })
+        .expect(201)
+    ).body.qcHold as { id: string };
+    const heldEdit = await patchSku(guardSku.id, { storageClass: 'chilled' }).expect(409);
+    expect(heldEdit.body).toMatchObject({ status: 409, code: 'storage-class-conflict' });
+    expect(String(heldEdit.body.detail)).toContain('A-01');
+    expect(String(heldEdit.body.detail)).toContain(hold.id);
+
+    // Release returns the stock to the origin bin — and with it the SKU's
+    // conformance is restored for the AMBIENT class: the edit the hold was
+    // blocking indirectly now passes (the 2 returned units are ambient-class
+    // in an ambient bin, and the staged intake stock in the system bin is
+    // excluded as ever).
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/qc-holds/${hold.id}/release`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+    const releasedEdit = await patchSku(guardSku.id, { storageClass: 'ambient' }).expect(200);
+    expect(releasedEdit.body.storageClass).toBe('ambient');
   });
 });

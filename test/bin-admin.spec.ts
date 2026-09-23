@@ -1348,4 +1348,175 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       await scoped?.end();
     }
   });
+
+  // ── Story 12-1 — storage classes + the class-edit guards (FR-40/AD-18) ─────
+
+  it('storage classes: create/grid carry the class (default ambient), a merge into a non-conforming target is refused naming the offending SKUs, and a class edit is guarded by stock, open holds and system bins', async () => {
+    // A frozen-class SKU, imported and PATCHed while it still carries no
+    // stock (the SKU-side guard would refuse a change that would strand
+    // live stock).
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'BA-SC,Bin Admin Item SC,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const frozenSkuId = (skus.body.items as { code: string; id: string }[]).find((item) => item.code === 'BA-SC')!.id;
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${frozenSkuId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'frozen' })
+      .expect(200);
+
+    const postBin = async (code: string, storageClass?: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf', ...(storageClass === undefined ? {} : { storageClass }) })
+          .expect(201)
+      ).body.id as string;
+    const binChill = await postBin('A-90-01', 'chilled');
+    const binEmpty = await postBin('A-90-02'); // the default
+    const binFrozenSku = await postBin('A-90-03', 'ambient');
+    const binHeld = await postBin('A-90-04', 'ambient');
+
+    // The zone list echoes the classes; the omitted one defaulted to ambient.
+    const listed = await zoneBins(zoneId);
+    const listedByCode = new Map(listed.map((bin) => [bin.code, bin]));
+    expect(listedByCode.get('A-90-01')).toMatchObject({ storageClass: 'chilled' });
+    expect(listedByCode.get('A-90-02')).toMatchObject({ storageClass: 'ambient' });
+
+    // A grid run stamps the class on EVERY bin it generates.
+    const grid = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins/grid`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ aisleFrom: 'D', aisleTo: 'D', baysPerAisle: 1, levelsPerBay: 2, capacity: 50, type: 'shelf', storageClass: 'hazardous' })
+      .expect(201);
+    expect(grid.body).toMatchObject({ generatedCount: 2 });
+    const gridListed = await zoneBins(zoneId);
+    expect(gridListed.find((bin) => bin.code === 'D-01-01')).toMatchObject({ storageClass: 'hazardous' });
+    expect(gridListed.find((bin) => bin.code === 'D-01-02')).toMatchObject({ storageClass: 'hazardous' });
+
+    // The vocabulary is closed at the boundary: a misspelled class is a 400
+    // naming the field (the DTO `@IsIn` here; the command validator behind
+    // the replay for non-HTTP callers).
+    const bad = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ code: 'A-90-05', capacity: 100, type: 'shelf', storageClass: 'tropical' })
+      .expect(400);
+    expect(bad.body).toMatchObject({ status: 400, code: 'validation-failed' });
+    expect(String(bad.body.detail)).toContain('storageClass');
+
+    // THE MERGE CLASS GATE: the source (ambient bin) holds frozen-class stock
+    // parked there by the named adjustment bypass; merging it into the
+    // chilled target would strand that stock in a warmer bin — 400
+    // `bin-storage-mismatch` naming the offending SKU and its requirement,
+    // and NOTHING moves (the source is not retired, its stock is untouched).
+    await fill(binFrozenSku, frozenSkuId, 2);
+    const refusedMerge = await merge(binFrozenSku, binChill).expect(400);
+    expect(refusedMerge.body).toMatchObject({ status: 400, code: 'bin-storage-mismatch' });
+    expect(String(refusedMerge.body.detail)).toContain('A-90-01');
+    expect(String(refusedMerge.body.detail)).toContain('BA-SC');
+    expect(String(refusedMerge.body.detail)).toContain('frozen');
+    expect(await plainOnHand(binFrozenSku, frozenSkuId)).toBe(2);
+    const afterRefusedMerge = await zoneBins(zoneId);
+    expect(afterRefusedMerge.find((bin) => bin.code === 'A-90-03')!.retiredAt).toBeNull();
+
+    // THE CLASS-EDIT GUARD, stock arm: an edit that would strand live stock
+    // is 409 `storage-class-conflict` naming the SKU. A conforming edit over
+    // the SAME kind of stock commits (frozen satisfies the ambient stock
+    // below), so the guard is the predicate, not any blanket refusal.
+    const emptyEdit = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binEmpty}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'frozen' })
+      .expect(200);
+    expect(emptyEdit.body).toMatchObject({ code: 'A-90-02', storageClass: 'frozen' });
+
+    await fill(binHeld, plainSkuId, 1); // ambient stock in the ambient bin
+    const conformingEdit = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binHeld}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'frozen' })
+      .expect(200);
+    expect(conformingEdit.body).toMatchObject({ storageClass: 'frozen' });
+
+    const binStranded = await postBin('A-90-06', 'ambient');
+    await fill(binStranded, frozenSkuId, 1); // the named adjustment bypass
+    const stranded = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binStranded}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'chilled' })
+      .expect(409);
+    expect(stranded.body).toMatchObject({ status: 409, code: 'storage-class-conflict' });
+    expect(String(stranded.body.detail)).toContain('BA-SC');
+    // The refusal left the class — and the stock — exactly as it found them.
+    const stillListed = await zoneBins(zoneId);
+    expect(stillListed.find((bin) => bin.code === 'A-90-06')).toMatchObject({ storageClass: 'ambient' });
+    expect(await plainOnHand(binStranded, frozenSkuId)).toBe(1);
+
+    // THE CLASS-EDIT GUARD, hold arm: an OPEN hold pins its quantity to the
+    // origin bin even after qc.place moved the stock to the QC bin — the
+    // origin bin is empty, but the release must be able to return the stock,
+    // so a class the held SKU does not satisfy is 409 naming the hold and
+    // the SKU. A hold whose SKU the new class DOES satisfy does not block.
+    const holdBin = await postBin('A-90-07', 'ambient');
+    await fill(holdBin, plainSkuId, 1);
+    const conformingHold = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/qc-holds`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ warehouseId, skuId: plainSkuId, binId: holdBin, reason: 'damaged carton' })
+        .expect(201)
+    ).body.qcHold as { id: string };
+    await fill(holdBin, frozenSkuId, 1);
+    const offendingHold = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/qc-holds`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ warehouseId, skuId: frozenSkuId, binId: holdBin, reason: 'temperature excursion' })
+        .expect(201)
+    ).body.qcHold as { id: string };
+    const heldEdit = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${holdBin}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'chilled' })
+      .expect(409);
+    expect(heldEdit.body).toMatchObject({ status: 409, code: 'storage-class-conflict' });
+    expect(String(heldEdit.body.detail)).toContain(offendingHold.id);
+    expect(String(heldEdit.body.detail)).toContain('BA-SC');
+    expect(String(heldEdit.body.detail)).not.toContain(conformingHold.id);
+
+    // System bins skip the guard by design (their stock is flow, not
+    // storage): the Receiving bin's class may change freely.
+    const receiving = await receivingBinId();
+    const systemEdit = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${receiving}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'chilled' })
+      .expect(200);
+    expect(systemEdit.body).toMatchObject({ storageClass: 'chilled' });
+  });
 });

@@ -2306,6 +2306,87 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(keys).toHaveLength(0);
   });
 
+  // ── Story 12-1 — storage conformance at the pick (FR-40/AD-18) ────────────
+
+  it('a pick drawn from a non-conforming bin is refused 400 bin-storage-mismatch, the planner never planned it there, and a short pick re-plans AROUND a non-conforming bin holding stock', async () => {
+    // A frozen-class SKU, imported and PATCHed while it still carries no
+    // stock (the class-edit guard would refuse a change over live stock that
+    // the class would strand).
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'PCK-SC,Pick SKU PCK-SC,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const frozenSkuId = (skus.body.items as { code: string; id: string }[]).find((item) => item.code === 'PCK-SC')!.id;
+    const patched = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${frozenSkuId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'frozen' })
+      .expect(200);
+    expect(patched.body.storageClass).toBe('frozen');
+
+    // A frozen bin beside the suite's ambient bins. The NON-conforming stock
+    // arrives through stock.adjust — the NAMED 12-1 bypass (recorded in
+    // PENDING beside the adjustment-bypasses-capacity gap) — which is exactly
+    // the state the draw guard exists to catch on the floor.
+    const binFrozen = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ capacity: 10000, type: 'shelf', code: 'A-80-01', storageClass: 'frozen' })
+        .expect(201)
+    ).body.id as string;
+    const binAmbient = await createBin('A-80-02');
+    await seedStock(frozenSkuId, binFrozen, 3);
+    await seedStock(frozenSkuId, binAmbient, 5);
+
+    // THE PLANNER FILTER: the wave's slice plans the frozen bin only — the
+    // ambient bin holds MORE units but is out of the pool (the bin-rank
+    // membership filter, fail-closed).
+    const { picklist } = await releasedWave([{ skuId: frozenSkuId, quantity: 3 }], 'storage-class');
+    const line = picklist.lines[0]!;
+    expect(line.binId).toBe(binFrozen);
+
+    // THE DRAW GUARD: the operator scans the ambient bin — it covers the
+    // draw on live stock, and no epoch has ever moved it, but it cannot
+    // satisfy the SKU's class. 400 `bin-storage-mismatch` naming both
+    // parties, and the transaction writes NOTHING.
+    const refused = await pick(bodyFor(line, { binId: binAmbient })).expect(400);
+    expect(refused.body).toMatchObject({ status: 400, code: 'bin-storage-mismatch' });
+    expect(refused.body.detail).toContain('A-80-02');
+    expect(refused.body.detail).toContain('ambient');
+    expect(refused.body.detail).toContain('PCK-SC');
+    expect(refused.body.detail).toContain('frozen');
+    expect(await ledgerFor(line.id)).toHaveLength(0);
+    expect(await lineStatus(line.id)).toBe('planned');
+    expect(await onHand(frozenSkuId, binAmbient)).toBe(5);
+
+    // THE REPLAN FILTER: a short pick's remainder is re-planned through the
+    // same pool — the ambient bin's 5 units are invisible to it, so the line
+    // goes short with NO new slice (the partial-order path) instead of
+    // re-holding the remainder in a bin that cannot hold it.
+    const short = await pick(bodyFor(line, { qty: 2, reasonCode: 'fewer-units-than-planned' })).expect(201);
+    expect(short.body.pick.lineStatus).toBe('short');
+    expect(short.body.pick.shortfallQty).toBe(1);
+    expect(short.body.pick.replanned).toEqual([]);
+    const slices = await slicesOf(line.orderLineId);
+    expect(slices).toHaveLength(1);
+    expect(slices[0]!.status).toBe('short');
+    expect(await onHand(frozenSkuId, binAmbient)).toBe(5);
+  });
+
   // ── the schema contract: RLS + the 0019 CHECKs ────────────────────────────
 
   it('RLS on `picks` and `bin_state_epochs`: foreign rows are invisible, own rows are visible, a foreign insert is 42501; the four CHECKs hold', async () => {

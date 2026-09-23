@@ -516,7 +516,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     const oversizedTask = oversizedTasks.find((task) => task.grnLineId === oversized.lines[0]!.id)!;
     expect(oversizedTask.qty).toBe(120);
     expect(oversizedTask.suggestedBin).toBeNull();
-    expect(oversizedTask.rationale).toBe('No storage bin has room for these units');
+    expect(oversizedTask.rationale).toBe('No conforming storage bin has room for these units');
   });
 
   // ── Place happy path + replay (matrix rows 3–5) ────────────────────────────
@@ -1446,7 +1446,186 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       (entry) => entry.grnLineId === grn.lines[0]!.id,
     )!;
     expect(task.suggestedBin).toBeNull();
-    expect(task.rationale).toBe('No storage bin has room for these units');
+    expect(task.rationale).toBe('No conforming storage bin has room for these units');
+  });
+
+  // ── Story 12-1 — storage conformance (FR-40/AD-18) ─────────────────────────
+
+  it('storage conformance: the placement class gate names both classes, the temperature hierarchy admits a colder bin, the suggestion and the task derivation filter non-conforming bins', async () => {
+    // Two classed SKUs through the real surfaces: import, then the SKU edit's
+    // storageClass field. (PUT-B stays ambient — the column default.)
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'PUT-C,Putaway Item C,pcs,,1800,,false,false,,,',
+      'PUT-F,Putaway Item F,pcs,,1800,,false,false,,,',
+      'PUT-Q,Putaway Item Q,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const byCode = new Map((skus.body.items as { code: string; id: string }[]).map((item) => [item.code, item.id]));
+    const chillSkuId = byCode.get('PUT-C')!;
+    const frozenSkuId = byCode.get('PUT-F')!;
+    const controlledSkuId = byCode.get('PUT-Q')!;
+    for (const [skuId, storageClass] of [
+      [chillSkuId, 'chilled'],
+      [frozenSkuId, 'frozen'],
+      [controlledSkuId, 'controlled'],
+    ] as const) {
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ storageClass })
+        .expect(200);
+    }
+
+    // Four bins in their own zone: `0-AM` is ambient (omitted — the create
+    // contract's default), the others carry one class each.
+    const zoneS = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'S', name: 'Classed zone' })
+        .expect(201)
+    ).body.id as string;
+    const createClassBin = async (code: string, storageClass?: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneS}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf', ...(storageClass === undefined ? {} : { storageClass }) })
+          .expect(201)
+      ).body.id as string;
+    const bin0CT = await createClassBin('0-CT', 'controlled');
+    const bin0FR = await createClassBin('0-FR', 'frozen');
+    const bin0CH = await createClassBin('0-CH', 'chilled');
+    const bin0AM = await createClassBin('0-AM'); // default ambient
+
+    // The created bins echo their class; the omitted one defaults to ambient.
+    const binsRes = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneS}/bins`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const binRows = binsRes.body.items as { id: string; code: string; storageClass: string }[];
+    expect(binRows.find((row) => row.id === bin0AM)!.storageClass).toBe('ambient');
+    expect(binRows.find((row) => row.id === bin0CT)!.storageClass).toBe('controlled');
+
+    // GATE (placement): an ambient unit directed into the controlled bin is a
+    // 400 `bin-storage-mismatch` naming the bin, its class, the SKU and its
+    // requirement — the guard fires before any load read, so the GRN's ledger
+    // stays at `grn.received` alone.
+    const ambientGrn = await blindGrn([{ poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const mismatch = await placeForLine(ambientGrn.lines[0]!, bin0CT).expect(400);
+    expect(mismatch.body).toMatchObject({ status: 400, code: 'bin-storage-mismatch' });
+    expect(mismatch.body.detail).toContain('0-CT');
+    expect(mismatch.body.detail).toContain('controlled');
+    expect(mismatch.body.detail).toContain('PUT-B');
+    expect(mismatch.body.detail).toContain('ambient');
+    expect(await ledgerRows(ambientGrn.grnId)).toHaveLength(1);
+    expect(await placementRowCount(ambientGrn.grnId)).toBe(0);
+
+    // THE HIERARCHY: a colder bin satisfies a warmer SKU — the ambient unit
+    // places into the CHILLED bin (and the frozen bin would take it too).
+    const ambientGrn2 = await blindGrn([{ poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    await placeForLine(ambientGrn2.lines[0]!, bin0CH, { reasonCode: 'operator-preference' }).expect(201);
+    expect(await plainOnHand(bin0CH, plainSkuId)).toBe(1);
+
+    // The reverse pairing — a warmer bin never holds a colder SKU: a chilled
+    // unit is refused by the ambient bin (400), and a frozen unit by the
+    // chilled bin (400) — each refusal writes nothing.
+    const chillGrn2 = await blindGrn([{ poLineId: null, skuId: chillSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const warmer = await placeForLine(chillGrn2.lines[0]!, bin0AM, { reasonCode: 'operator-preference' }).expect(400);
+    expect(warmer.body).toMatchObject({ status: 400, code: 'bin-storage-mismatch' });
+    expect(warmer.body.detail).toContain('0-AM');
+    expect(warmer.body.detail).toContain('ambient');
+    expect(warmer.body.detail).toContain('chilled');
+    expect(await placementRowCount(chillGrn2.grnId)).toBe(0);
+
+    const frozenGrn = await blindGrn([{ poLineId: null, skuId: frozenSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const colder = await placeForLine(frozenGrn.lines[0]!, bin0CH, { reasonCode: 'operator-preference' }).expect(400);
+    expect(colder.body).toMatchObject({ status: 400, code: 'bin-storage-mismatch' });
+    expect(await placementRowCount(frozenGrn.grnId)).toBe(0);
+    // ...and the same unit lands in the frozen bin (exact class match).
+    const frozenGrn2 = await blindGrn([{ poLineId: null, skuId: frozenSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    await placeForLine(frozenGrn2.lines[0]!, bin0FR, { reasonCode: 'operator-preference' }).expect(201);
+
+    // THE SUGGESTION FILTER: the ambient SKU's task points at an ambient bin —
+    // never at 0-CH/0-FR/0-CT (all empty, and every one of them sorts before
+    // the stock-carrying `A-*` bins, so an ungated suggestion would pick them
+    // first). With the classed bins empty, the first CONFORMING empty bin is
+    // `0-AM`.
+    const ambientTasks = await blindGrn([{ poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const tasks = await getTasks();
+    const ambientTask = tasks.find((entry) => entry.grnLineId === ambientTasks.lines[0]!.id)!;
+    expect(ambientTask.suggestedBin).toEqual({ binId: bin0AM, binCode: '0-AM' });
+
+    // A controlled SKU's task DOES point at the controlled bin (exact match
+    // survives the filter).
+    const controlledGrn = await blindGrn([{ poLineId: null, skuId: controlledSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const controlledTasks = await getTasks();
+    const controlledTask = controlledTasks.find((entry) => entry.grnLineId === controlledGrn.lines[0]!.id)!;
+    expect(controlledTask.suggestedBin).toEqual({ binId: bin0CT, binCode: '0-CT' });
+    await placeForLine(controlledGrn.lines[0]!, bin0CT, { reasonCode: 'operator-preference' }).expect(201);
+
+    // THE TASK-DERIVATION FILTER at its extreme: a second warehouse whose
+    // ONLY bin is controlled. An ambient unit received there gets a task with
+    // NO suggestion and the unchanged rationale — the pool was empty before
+    // capacity ever ranked it.
+    const warehouse3Id = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `PUT3-${ulid().slice(10, 16).toUpperCase()}`, name: `Third Putaway Depot ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zone3Id = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouse3Id}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A', name: 'Third Aisle A' })
+        .expect(201)
+    ).body.id as string;
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses/${warehouse3Id}/zones/${zone3Id}/bins`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ code: 'C-01', capacity: 100, type: 'shelf', storageClass: 'controlled' })
+      .expect(201);
+    const w3Grn = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/goods-receipts`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        warehouseId: warehouse3Id,
+        poId: null,
+        blindReasonCode: 'unannounced-delivery',
+        occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+        lines: [{ poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 1 }],
+      })
+      .expect(201);
+    const w3 = w3Grn.body.goodsReceipt as { id: string; lines: { id: string }[] };
+    const w3TasksRes = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/putaway/tasks?warehouseId=${warehouse3Id}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const w3Task = (w3TasksRes.body.items as { grnLineId: string; suggestedBin: { binId: string } | null; rationale: string }[]).find(
+      (entry) => entry.grnLineId === w3.lines[0]!.id,
+    )!;
+    expect(w3Task.suggestedBin).toBeNull();
+    expect(w3Task.rationale).toBe('No conforming storage bin has room for these units');
   });
 
   it('RLS: a non-superuser session scoped to one tenant sees no putaway rows of another tenant and cannot write foreign rows', async () => {
