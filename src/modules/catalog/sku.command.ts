@@ -1,8 +1,8 @@
 import { forwardRef, Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { idempotencyKeys, products, skus, uomConversions } from '../../shared/db/schema';
+import { bins, idempotencyKeys, products, skus, stockOnHand, uomConversions } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
@@ -21,6 +21,16 @@ import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/qua
 import { isFractionalUom, serialTrackedFractionalUomDetail, uomPrecision } from './uom';
 import { countLiveHandlingUnitsInTx } from './handling-unit.store';
 import { assertSkuAttributes } from './sku-attributes';
+// Story 12-1 — the vocabulary validator + the class-edit refusal factory,
+// shared with tenancy and the putaway/pick gates; `stockOnHand` joins the
+// SKU-side class-edit guard, `openQcHoldsForSkuInTx` attributes held stock
+// to its origin bins (the same seam tenancy's bin guard uses).
+import {
+  assertStorageClass,
+  storageClassConflict,
+  storageClassSatisfies,
+} from '../../shared/primitives/storage-class';
+import { openQcHoldsForSkuInTx } from '../inbound/qc.command';
 import {
   assertVariantValues,
   normalizeVariantValues,
@@ -75,6 +85,8 @@ export interface SkuSnapshot {
   readonly productId: string | null;
   /** This SKU's values on the product's axes; null when unattached. */
   readonly variantValues: Record<string, string> | null;
+  /** Story 12-1 — the controlled-vocabulary storage class (FR-40). */
+  readonly storageClass: string;
   readonly reorderPoint: number;
   readonly reorderQty: number;
   readonly barcode: string;
@@ -130,6 +142,17 @@ export interface EditSkuCommand {
    * attached product is a 400 — values ride the product.
    */
   readonly variantValues?: Record<string, unknown> | null | undefined;
+  /**
+   * Story 12-1 — the SKU's storage class (FR-40), PATCH semantics: absent =
+   * unchanged; there is NO null/clear verb (the column is NOT NULL — a SKU
+   * always carries a class). A class CHANGE runs the stock-conformance guard
+   * behind the replay (409 `storage-class-conflict`): the SKU's on-hand
+   * stock tenant-wide (in non-system bins — staging is excluded) and its
+   * open-QC-hold quantities (attributed to their origin bins) must all
+   * satisfy the new class, or the edit strands non-conforming stock. The
+   * class-changing arm takes the SKU row `.for('update')`.
+   */
+  readonly storageClass?: string | undefined;
 }
 
 /**
@@ -238,13 +261,16 @@ export class SkuCommand {
       // replay 200 (the 11.2 no-break reasoning, pinned by test).
       productId: command.productId,
       variantValues: command.variantValues,
+      // Story 12-1 — the storage class counts as a field for the empty-patch
+      // refusal, exactly as every other PATCH field does.
+      storageClass: command.storageClass,
     };
     if (Object.values(fields).every((value) => value === undefined)) {
       throw new ProblemException(
         'validation-failed',
         400,
         'Empty SKU edit',
-        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues is required.',
+        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass is required.',
       );
     }
     // ── story 11.2: this hash did NOT break ──────────────────────────────────
@@ -317,7 +343,9 @@ export class SkuCommand {
         // answer 400 to an op that already committed), with the SKU's
         // existence already settled so an unknown SKU answers 404, not 400.
         // The same validator the import row parser calls; the DTO mirrors the
-        // bounds but is not the boundary.
+        // bounds but is not the boundary. Story 12-1: the storage class joins
+        // the position — same validator shape (`assertStorageClass`), same
+        // behind-the-replay rule.
         assertSkuAttributes({
           weightGrams: fields.weightGrams,
           lengthMm: fields.lengthMm,
@@ -325,6 +353,91 @@ export class SkuCommand {
           heightMm: fields.heightMm,
           countryOfOrigin: fields.countryOfOrigin,
         });
+        assertStorageClass({ storageClass: fields.storageClass });
+
+        // ── Story 12-1: the class-change arm. The SKU row takes `.for('update')`
+        // when the class is moving (the guard serializes against concurrent
+        // writers), re-read through the same scope; every other arm sees the
+        // plain read (a non-class patch locks nothing, exactly as before).
+        if (fields.storageClass !== undefined) {
+          const newClass = fields.storageClass;
+          const lockedRows = await tx
+            .select()
+            .from(skus)
+            .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
+            .limit(1)
+            .for('update');
+          const locked = lockedRows[0]!;
+          // The class-edit guard (409 `storage-class-conflict`): the SKU's
+          // stock, tenant-wide, must all satisfy the NEW class. `stock_on_hand`
+          // joined to `bins` EXCLUDES the system bins (Receiving staging, the
+          // QC-HOLD bin — otherwise every intake SKU would refuse its first
+          // class edit); open-QC-hold quantities are attributed to their ORIGIN
+          // bins, which is what pins `qc.released` (release itself stays
+          // class-free): a held unit returns to a bin that must satisfy the
+          // new class too. The hierarchy runs in TS (`storageClassSatisfies`)
+          // — no SQL copy exists.
+          if (locked.storageClass !== newClass) {
+            const stockRows = await tx
+              .select({
+                quantity: stockOnHand.quantity,
+                binCode: bins.code,
+                warehouseId: bins.warehouseId,
+                binClass: bins.storageClass,
+              })
+              .from(stockOnHand)
+              .innerJoin(bins, eq(bins.id, stockOnHand.binId))
+              .where(
+                and(
+                  eq(stockOnHand.tenantId, command.tenantId),
+                  eq(stockOnHand.skuId, command.skuId),
+                  gt(stockOnHand.quantity, 0),
+                  eq(bins.systemOwned, false),
+                ),
+              );
+            const nonConforming = stockRows.filter(
+              (row) => !storageClassSatisfies(newClass, row.binClass),
+            );
+            const holds = await openQcHoldsForSkuInTx(tx, command.tenantId, command.skuId);
+            const originBinIds = [...new Set(holds.map((hold) => hold.binId))];
+            const originRows =
+              originBinIds.length === 0
+                ? []
+                : await tx
+                    .select({
+                      id: bins.id,
+                      code: bins.code,
+                      warehouseId: bins.warehouseId,
+                      binClass: bins.storageClass,
+                      systemOwned: bins.systemOwned,
+                    })
+                    .from(bins)
+                    .where(and(eq(bins.tenantId, command.tenantId), inArray(bins.id, originBinIds)));
+            const originById = new Map(originRows.map((row) => [row.id, row]));
+            const holdParties = holds.flatMap((hold) => {
+              const origin = originById.get(hold.binId);
+              if (origin === undefined || origin.systemOwned) {
+                return []; // the origin bin is gone or is staging — nothing to attribute
+              }
+              if (storageClassSatisfies(newClass, origin.binClass)) {
+                return [];
+              }
+              return [
+                `origin bin "${origin.code}" (warehouse ${origin.warehouseId}, hold "${hold.holdId}")`,
+              ];
+            });
+            if (nonConforming.length > 0 || holdParties.length > 0) {
+              const stockParties = nonConforming.map(
+                (row) => `bin "${row.binCode}" (warehouse ${row.warehouseId}, bin is ${row.binClass})`,
+              );
+              throw storageClassConflict(
+                `SKU "${current.code}" would require ${newClass} storage, but its stock sits in ` +
+                  [...stockParties, ...holdParties].join('; ') +
+                  ' — relocate the stock first.',
+              );
+            }
+          }
+        }
 
         // ── Story 11.3: attach / detach / re-value — behind the replay
         // lookup, with the SKU's existence already settled. `setProductId` /
@@ -570,6 +683,9 @@ export class SkuCommand {
         if (reorderPointMilli !== undefined) updates.reorderPoint = reorderPointMilli;
         if (reorderQtyMilli !== undefined) updates.reorderQty = reorderQtyMilli;
         if (fields.barcode !== undefined) updates.barcode = fields.barcode;
+        // Story 12-1 — absent = unchanged (no clear verb; the column is
+        // NOT NULL, a SKU always carries a class).
+        if (fields.storageClass !== undefined) updates.storageClass = fields.storageClass;
         // Story 11.3 — the variant columns move only when the patch moved
         // them (`undefined` = untouched; `null` = cleared with the detach).
         if (setProductId !== undefined) updates.productId = setProductId;
@@ -657,6 +773,9 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     // `variantValues: null`, exactly like the 11.2 attributes.
     productId: row.productId,
     variantValues: row.variantValues ?? null,
+    // Story 12-1 — the controlled-vocabulary class (required; every SKU
+    // carries one, default 'ambient').
+    storageClass: row.storageClass,
     // Story 10.1: `toSnapshot` is the module's only SKU read shape — base
     // units leave here, milli-units stay in the column.
     reorderPoint: fromMilli(row.reorderPoint),

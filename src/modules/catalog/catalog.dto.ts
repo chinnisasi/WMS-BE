@@ -26,6 +26,9 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { IMPORT_MODES, GST_RATE_BPS_MAX } from './import.command';
+// Story 12-1: the storage-class vocabulary — the DTO mirror of the shared
+// primitive's tuple (the three-layer pattern: TS tuple / DB CHECK / @IsIn).
+import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
 import { UOMS } from './uom';
 import { MAX_SKU_DIMENSION_MM, MAX_SKU_WEIGHT_GRAMS } from './sku-attributes';
 import { AXIS_NAME_MAX, MAX_PRODUCT_AXES, PRODUCT_NAME_MAX } from './product.command';
@@ -210,6 +213,11 @@ export class SkuResponse {
     description: 'This SKU\'s values on the product\'s declared axes, present iff productId is set.',
   })
   variantValues!: Record<string, string> | null;
+
+  // Story 12-1: the controlled-vocabulary storage class (required — every SKU
+  // carries one; pre-12.1 rows read 'ambient').
+  @ApiProperty({ enum: STORAGE_CLASSES, example: 'ambient' })
+  storageClass!: string;
 
   @ApiProperty({ example: '0198f7a2-1b3c-7d4e-8f90-112233445588', description: 'Generated server-side (uuidv7) unless provided' })
   barcode!: string;
@@ -418,6 +426,23 @@ export class PatchSkuDto {
   @IsOptional()
   @IsObject()
   variantValues?: Record<string, string> | null;
+
+  // Story 12-1: the SKU's storage class (FR-40) — absent = unchanged (there
+  // is no null: the column is NOT NULL, a SKU always carries a class). The
+  // vocabulary is pinned HERE with `@IsIn` and re-checked in the command
+  // (`assertStorageClass`, behind the replay lookup — the mirror is not the
+  // boundary). A change runs the stock-conformance guard (409
+  // `storage-class-conflict`).
+  @ApiProperty({
+    required: false,
+    enum: STORAGE_CLASSES,
+    example: 'ambient',
+    description:
+      'The SKU\'s storage class (FR-40): ambient, chilled, frozen, controlled, hazardous or secure. Omit to leave unchanged.',
+  })
+  @IsOptional()
+  @IsIn(STORAGE_CLASSES)
+  storageClass?: string;
 }
 
 // ── Story 11.3 — the product (AD-19): identity only, above `skus` ──────────

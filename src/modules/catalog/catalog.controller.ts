@@ -395,6 +395,10 @@ export class CatalogController {
         // duplicate variants).
         productId: dto.productId,
         variantValues: dto.variantValues,
+        // Story 12-1 — the storage class passes through WYSIWYG: absent =
+        // unchanged; there is no null (the column is NOT NULL). The command
+        // is the boundary (vocabulary re-check, the class-edit guard).
+        storageClass: dto.storageClass,
       },
       key,
     );
