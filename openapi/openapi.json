@@ -9043,6 +9043,19 @@
             "maximum": 100000000,
             "description": "Max weight in grams. Omit to leave the bin unconstrained; null to clear. At most 100000000."
           },
+          "storageClass": {
+            "type": "string",
+            "enum": [
+              "ambient",
+              "chilled",
+              "frozen",
+              "controlled",
+              "hazardous",
+              "secure"
+            ],
+            "example": "ambient",
+            "description": "The bin's storage class (FR-40): ambient, chilled, frozen, controlled, hazardous or secure. Omit for ambient."
+          },
           "type": {
             "type": "string",
             "enum": [
@@ -9108,6 +9121,18 @@
             "nullable": true,
             "description": "Max weight in grams (null = unconstrained)"
           },
+          "storageClass": {
+            "type": "string",
+            "enum": [
+              "ambient",
+              "chilled",
+              "frozen",
+              "controlled",
+              "hazardous",
+              "secure"
+            ],
+            "example": "ambient"
+          },
           "type": {
             "type": "string",
             "enum": [
@@ -9155,6 +9180,7 @@
           "widthMm",
           "heightMm",
           "maxWeightGrams",
+          "storageClass",
           "type",
           "blocked",
           "retiredAt",
@@ -9222,6 +9248,19 @@
             "minimum": 1,
             "maximum": 100000000,
             "description": "Max weight in grams, per bin. Omit for unconstrained bins. At most 100000000."
+          },
+          "storageClass": {
+            "type": "string",
+            "enum": [
+              "ambient",
+              "chilled",
+              "frozen",
+              "controlled",
+              "hazardous",
+              "secure"
+            ],
+            "example": "ambient",
+            "description": "The storage class, per bin (FR-40). Omit for ambient."
           },
           "type": {
             "type": "string",
@@ -9331,6 +9370,19 @@
             "minimum": 1,
             "maximum": 100000000,
             "description": "Max weight in grams. Omit to leave unchanged; null to clear. Mutually exclusive with blocked."
+          },
+          "storageClass": {
+            "type": "string",
+            "enum": [
+              "ambient",
+              "chilled",
+              "frozen",
+              "controlled",
+              "hazardous",
+              "secure"
+            ],
+            "example": "ambient",
+            "description": "The bin's storage class (FR-40). Omit to leave unchanged. Mutually exclusive with blocked."
           }
         }
       },
@@ -9850,6 +9902,18 @@
             },
             "description": "This SKU's values on the product's declared axes, present iff productId is set."
           },
+          "storageClass": {
+            "type": "string",
+            "enum": [
+              "ambient",
+              "chilled",
+              "frozen",
+              "controlled",
+              "hazardous",
+              "secure"
+            ],
+            "example": "ambient"
+          },
           "barcode": {
             "type": "string",
             "example": "0198f7a2-1b3c-7d4e-8f90-112233445588",
@@ -9887,6 +9951,7 @@
           "reorderQty",
           "productId",
           "variantValues",
+          "storageClass",
           "barcode",
           "uomConversions",
           "createdAt"
@@ -10127,6 +10192,19 @@
               "colour": "Red"
             },
             "description": "The SKU's values on the product's declared axes. Must cover EXACTLY the product's axes — a missing key, an unknown key or a blank value is a 400 naming the axis. Cannot ride a detach."
+          },
+          "storageClass": {
+            "type": "string",
+            "enum": [
+              "ambient",
+              "chilled",
+              "frozen",
+              "controlled",
+              "hazardous",
+              "secure"
+            ],
+            "example": "ambient",
+            "description": "The SKU's storage class (FR-40): ambient, chilled, frozen, controlled, hazardous or secure. Omit to leave unchanged."
           }
         }
       },

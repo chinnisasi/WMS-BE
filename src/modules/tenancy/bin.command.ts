@@ -22,6 +22,16 @@ import {
   toMilli,
 } from '../../shared/primitives/quantity';
 import { nowIso } from '../../shared/primitives/time';
+// Story 12-1 — the vocabulary validator + the class-edit/merge refusal
+// factories, shared with catalog and the putaway/pick gates. The matching
+// rule itself is imported where it gates (`storageClassSatisfies` in the
+// merge loop below).
+import {
+  assertStorageClass,
+  mergeClassConflict,
+  storageClassConflict,
+  storageClassSatisfies,
+} from '../../shared/primitives/storage-class';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
@@ -66,6 +76,13 @@ export interface CreateBinCommand {
   readonly widthMm?: number | null | undefined;
   readonly heightMm?: number | null | undefined;
   readonly maxWeightGrams?: number | null | undefined;
+  /**
+   * Story 12-1 — the bin's storage class (FR-40). Optional on create: absent
+   * stores `ambient` (the column default — never an explicit null; the
+   * NOT NULL column has no clear verb). Validated by `assertStorageClass`
+   * behind the replay lookup.
+   */
+  readonly storageClass?: string | undefined;
   readonly type: string;
 }
 
@@ -86,6 +103,8 @@ export interface GenerateBinsCommand {
   readonly widthMm?: number | null | undefined;
   readonly heightMm?: number | null | undefined;
   readonly maxWeightGrams?: number | null | undefined;
+  /** Story 12-1: the storage class, per bin (see `CreateBinCommand.storageClass`). */
+  readonly storageClass?: string | undefined;
   readonly type: string;
 }
 
@@ -126,6 +145,16 @@ export interface EditBinCapacityCommand {
   readonly widthMm?: number | null | undefined;
   readonly heightMm?: number | null | undefined;
   readonly maxWeightGrams?: number | null | undefined;
+  /**
+   * Story 12-1 — the bin's storage class, PATCH semantics: absent =
+   * unchanged. There is NO null/clear verb — the column is NOT NULL (a bin
+   * always carries a class), so clearing is not an operation. A class CHANGE
+   * runs the stock-conformance guard behind the replay (409
+   * `storage-class-conflict`): the bin's on-hand stock and its open-QC-hold
+   * quantities (attributed to this origin bin) must all satisfy the new
+   * class, or the edit strands non-conforming stock.
+   */
+  readonly storageClass?: string | undefined;
 }
 
 /** The API response body for a bin (the idempotency snapshot). */
@@ -142,6 +171,8 @@ export interface BinSnapshot {
     readonly widthMm: number | null;
     readonly heightMm: number | null;
     readonly maxWeightGrams: number | null;
+    /** Story 12-1 — the controlled-vocabulary storage class (FR-40). */
+    readonly storageClass: string;
     readonly type: string;
     readonly blocked: boolean;
     /** The Receiving/QC-hold system bins (never blockable/mergeable/retirable). */
@@ -261,6 +292,10 @@ export class BinCommand {
       widthMm: command.widthMm,
       heightMm: command.heightMm,
       maxWeightGrams: command.maxWeightGrams,
+      // Story 12-1: the class rides the hash — an absent key drops out of the
+      // JSON (the 11-2 spread precedent), so a pre-12.1 request fingerprints
+      // byte-identically and its replay key keeps replaying.
+      storageClass: command.storageClass,
       type: command.type,
     });
 
@@ -307,7 +342,10 @@ export class BinCommand {
         // would answer 400 to an op that already committed). Story 11-5: the
         // capacity attributes take the same position — the one validator
         // (`assertBinCapacityAttributes`) runs behind the replay lookup too.
+        // Story 12-1: the storage class joins the position — same validator
+        // (`assertStorageClass`), same behind-the-replay rule.
         assertBinCapacityAttributes(command);
+        assertStorageClass({ storageClass: command.storageClass });
         const bin = await insertBin(tx, {
           ...command,
           capacity: assertWholeUnitCapacity(command.capacity),
@@ -371,6 +409,8 @@ export class BinCommand {
       widthMm: command.widthMm,
       heightMm: command.heightMm,
       maxWeightGrams: command.maxWeightGrams,
+      // Story 12-1: the class (the createBin hash note).
+      storageClass: command.storageClass,
       type: command.type,
     });
     // Story 10.2: BASE units (see the note on `createBin`'s payload hash).
@@ -410,7 +450,9 @@ export class BinCommand {
 
         // Story 11-5: the capacity attributes validate behind the replay
         // lookup (the createBin position — the 10.2 rule), once for the run.
+        // Story 12-1: the storage class joins the position.
         assertBinCapacityAttributes(command);
+        assertStorageClass({ storageClass: command.storageClass });
 
         // Collision pre-check in the same transaction: any generated code that
         // already exists in this warehouse (any zone — codes are unique per
@@ -438,6 +480,9 @@ export class BinCommand {
           widthMm: command.widthMm ?? null,
           heightMm: command.heightMm ?? null,
           maxWeightGrams: command.maxWeightGrams ?? null,
+          // Story 12-1: the same class on every generated bin (absent →
+          // 'ambient', the column default spelled out).
+          storageClass: command.storageClass ?? 'ambient',
           type: command.type,
         }));
         try {
@@ -644,6 +689,8 @@ export class BinCommand {
             lengthMm: skus.lengthMm,
             widthMm: skus.widthMm,
             heightMm: skus.heightMm,
+            // Story 12-1 — the class the target's class gate consumes (FR-40).
+            storageClass: skus.storageClass,
           })
           .from(stockOnHand)
           .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
@@ -656,6 +703,25 @@ export class BinCommand {
             ),
           )
           .orderBy(asc(stockOnHand.skuId));
+
+        // ── story 12-1: the class gate (FR-40) — immediately after the
+        // on-hand read, BEFORE any arm moves or capacity gate: a merge that
+        // would park a SKU the target cannot satisfy is refused whole, naming
+        // every offending SKU. Same predicate as the placement gate (the SYNC
+        // HAZARD rule — this is merge's copy of the arm list).
+        const offendingClasses = onHandRows.filter(
+          (row) => !storageClassSatisfies(row.storageClass, target.storageClass),
+        );
+        if (offendingClasses.length > 0) {
+          throw mergeClassConflict(
+            target.code,
+            target.storageClass,
+            offendingClasses.map((row) => ({
+              skuCode: row.skuCode,
+              skuClass: row.storageClass,
+            })),
+          );
+        }
 
         interface MergeArm {
           readonly skuId: string;
@@ -1111,6 +1177,8 @@ export class BinCommand {
       widthMm: command.widthMm,
       heightMm: command.heightMm,
       maxWeightGrams: command.maxWeightGrams,
+      // Story 12-1: the class rides the hash (same drop-absent precedent).
+      storageClass: command.storageClass,
     });
 
     const { snapshot } = await withTenantTransaction(
@@ -1169,8 +1237,93 @@ export class BinCommand {
         }
 
         // The one validator, behind the replay lookup (the 10.2 rule — see
-        // `assertBinCapacityAttributes`).
+        // `assertBinCapacityAttributes`). Story 12-1: the storage class joins
+        // the position.
         assertBinCapacityAttributes(command);
+        assertStorageClass({ storageClass: command.storageClass });
+
+        // ── story 12-1: the class-edit guard, behind the replay (the 10.2
+        // rule for a 409 rule: a replayed edit re-serves its snapshot above
+        // and never reaches this). Only a class CHANGE pays the guard — an
+        // absent or identical class touches no stock. The bin row is already
+        // locked `.for('update')`, so a concurrent placement cannot slip a
+        // unit in between the scans and the write.
+        //
+        // The rule: the bin's existing stock, PLUS its open-QC-hold
+        // quantities (attributed to this origin bin — the held units sit in
+        // the QC-HOLD system bin, which the on-hand scan cannot see), must all
+        // satisfy the NEW class — one conformance rule over the bin's
+        // attributed stock, whatever holds it. Otherwise the edit strands
+        // non-conforming stock (409 `storage-class-conflict`, naming the
+        // SKUs) — and, for the hold arm, a later release could return stock
+        // to a re-classed bin (`qc.released` is deliberately class-free; THIS
+        // guard is what pins it). System bins are exempt by the same
+        // exclusion the SKU-side guard applies to stock in system bins:
+        // Receiving staging and the QC-HOLD bin are staging, visible to no
+        // gate.
+        if (command.storageClass !== undefined && command.storageClass !== row.storageClass) {
+          const newClass = command.storageClass;
+          if (!row.systemOwned) {
+            const conflicting = await tx
+              .select({ skuCode: skus.code, skuClass: skus.storageClass })
+              .from(stockOnHand)
+              .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+              .where(
+                and(
+                  eq(stockOnHand.tenantId, command.tenantId),
+                  eq(stockOnHand.binId, row.id),
+                  gt(stockOnHand.quantity, 0),
+                ),
+              )
+              .orderBy(asc(skus.code));
+            const bad = conflicting.filter(
+              (entry) => !storageClassSatisfies(entry.skuClass, newClass),
+            );
+            if (bad.length > 0) {
+              throw storageClassConflict(
+                `Bin "${row.code}" would become ${newClass}, but it holds stock of ` +
+                  bad
+                    .map((entry) => `"${entry.skuCode}" (requires ${entry.skuClass})`)
+                    .join(', ') +
+                  ' — relocate it first.',
+              );
+            }
+            // The open-QC-hold arm: held stock is attributed to ITS ORIGIN
+            // bin, so a bin with held units is not empty even though its
+            // on-hand scan reads zero. A class change while the hold is open
+            // would let release return the units to a bin that no longer
+            // satisfies them.
+            const openHolds = await openQcHoldsForBinsInTx(tx, command.tenantId, command.warehouseId, [
+              row.id,
+            ]);
+            if (openHolds.length > 0) {
+              const heldClasses = await tx
+                .select({ id: skus.id, code: skus.code, storageClass: skus.storageClass })
+                .from(skus)
+                .where(
+                  and(
+                    eq(skus.tenantId, command.tenantId),
+                    inArray(
+                      skus.id,
+                      [...new Set(openHolds.map((hold) => hold.skuId))],
+                    ),
+                  ),
+                );
+              const classById = new Map(heldClasses.map((held) => [held.id, held]));
+              const badHolds = openHolds.filter((hold) => {
+                const held = classById.get(hold.skuId);
+                return held === undefined || !storageClassSatisfies(held.storageClass, newClass);
+              });
+              if (badHolds.length > 0) {
+                const first = badHolds[0]!;
+                throw storageClassConflict(
+                  `Bin "${row.code}" would become ${newClass}, but ${badHolds.length} open QC hold(s) attribute their units to it — ` +
+                    `hold "${first.holdId}" holds SKU "${classById.get(first.skuId)?.code ?? first.skuId}" — release the hold(s) first.`,
+                );
+              }
+            }
+          }
+        }
 
         const updatedRows = await tx
           .update(bins)
@@ -1181,6 +1334,8 @@ export class BinCommand {
             heightMm: command.heightMm === undefined ? row.heightMm : command.heightMm,
             maxWeightGrams:
               command.maxWeightGrams === undefined ? row.maxWeightGrams : command.maxWeightGrams,
+            // Story 12-1: absent = unchanged (no clear verb — NOT NULL).
+            storageClass: command.storageClass === undefined ? row.storageClass : command.storageClass,
             updatedAt: nowIso(),
           })
           .where(eq(bins.id, row.id))
@@ -1200,6 +1355,8 @@ export class BinCommand {
             widthMm: bin.widthMm,
             heightMm: bin.heightMm,
             maxWeightGrams: bin.maxWeightGrams,
+            // Story 12-1: the (possibly changed) class rides the event.
+            storageClass: bin.storageClass,
           },
         });
 
@@ -1366,6 +1523,9 @@ async function insertBin(
         widthMm: command.widthMm ?? null,
         heightMm: command.heightMm ?? null,
         maxWeightGrams: command.maxWeightGrams ?? null,
+        // Story 12-1: absent stores 'ambient' (the column default, spelled
+        // out — never an explicit null; the NOT NULL column has no clear verb).
+        storageClass: command.storageClass ?? 'ambient',
         type: command.type,
       })
       .returning();
@@ -1405,6 +1565,8 @@ function binFromRow(row: typeof bins.$inferSelect): BinSnapshot['bin'] {
     widthMm: row.widthMm,
     heightMm: row.heightMm,
     maxWeightGrams: row.maxWeightGrams,
+    // Story 12-1: the controlled-vocabulary class (required in the snapshot).
+    storageClass: row.storageClass,
     type: row.type,
     blocked: row.blocked,
     systemOwned: row.systemOwned,

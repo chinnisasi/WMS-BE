@@ -3,6 +3,9 @@ import { bins, picklistLines } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { InventoryFacade } from '../inventory/inventory.facade';
 import type { CatalogFacade } from '../catalog/catalog.facade';
+// Story 12-1 — the ONE conformance predicate (the temperature hierarchy),
+// shared with putaway, pick and the class-edit guards.
+import { storageClassSatisfies } from '../../shared/primitives/storage-class';
 
 /**
  * Story 4.4 — "where else is this SKU?".
@@ -45,8 +48,14 @@ export interface PoolBatchIdentity {
 
 export interface StockPoolInput {
   readonly skuIds: readonly string[];
-  /** The pickable bins in WALK order (`bins.code` ascending) — the rank. */
-  readonly binOrder: readonly { readonly id: string; readonly code: string }[];
+  /**
+   * The pickable bins in WALK order (`bins.code` ascending) — the rank.
+   * Story 12-1: each entry carries its `storageClass`, the class the pool
+   * filter rules per (SKU, bin) with `storageClassSatisfies`.
+   */
+  readonly binOrder: readonly { readonly id: string; readonly code: string; readonly storageClass: string }[];
+  /** Story 12-1 — the lines' storage classes, keyed by SKU id. */
+  readonly skuClassById: ReadonlyMap<string, string>;
   readonly stock: readonly { skuId: string; binId: string; quantity: number }[];
   readonly batchStock: readonly { skuId: string; binId: string; batchId: string; quantity: number }[];
   readonly batchIdentities: readonly PoolBatchIdentity[];
@@ -71,6 +80,13 @@ export interface StockPoolInput {
 export function buildStockPool(input: StockPoolInput): Map<string, StockSlot[]> {
   const binCodes = new Map(input.binOrder.map((bin) => [bin.id, bin.code]));
   const binRank = new Map(input.binOrder.map((bin, index) => [bin.id, index]));
+  // Story 12-1 — the classes the pool filter rules on. A bin the SKU's class
+  // does not satisfy is not in the walk at all: a wave line whose only stock
+  // sits in non-conforming bins plans a shortfall (`unfulfillable`), never a
+  // pick that always refuses at the bin (FR-40). Fail-closed: an unknown
+  // class on either side cannot be proven conforming. (Both are NOT NULL in
+  // the schema — `undefined` here means a caller forgot the projection.)
+  const binClassById = new Map(input.binOrder.map((bin) => [bin.id, bin.storageClass]));
   const batchById = new Map(input.batchIdentities.map((batch) => [batch.id, batch]));
   const drawableBatch = (batchId: string): boolean => {
     const batch = batchById.get(batchId);
@@ -86,8 +102,20 @@ export function buildStockPool(input: StockPoolInput): Map<string, StockSlot[]> 
   const pool = new Map<string, StockSlot[]>();
   for (const skuId of new Set(input.skuIds)) {
     const slots: StockSlot[] = [];
+    const skuClass = input.skuClassById.get(skuId);
     const plainRows = input.stock
       .filter((row) => row.skuId === skuId && binRank.has(row.binId))
+      // Story 12-1 — the class filter, at the bin-rank membership point: a
+      // stock row in a bin that does not satisfy the SKU's class is not
+      // drawable (fail-closed — an unknown class proves nothing).
+      .filter((row) => {
+        const binClass = binClassById.get(row.binId);
+        return (
+          skuClass !== undefined &&
+          binClass !== undefined &&
+          storageClassSatisfies(skuClass, binClass)
+        );
+      })
       .sort((a, b) => binRank.get(a.binId)! - binRank.get(b.binId)!);
     for (const row of plainRows) {
       const binCode = binCodes.get(row.binId)!;
@@ -144,9 +172,9 @@ export async function pickableBinsInTx(
   tx: TenantTx,
   tenantId: string,
   warehouseId: string,
-): Promise<{ id: string; code: string }[]> {
+): Promise<{ id: string; code: string; storageClass: string }[]> {
   return tx
-    .select({ id: bins.id, code: bins.code })
+    .select({ id: bins.id, code: bins.code, storageClass: bins.storageClass })
     .from(bins)
     .where(
       and(
@@ -220,7 +248,7 @@ export async function findReplanSlices(
   if (binOrder.length === 0) {
     return [];
   }
-  const [stock, batchStock, batchIdentities, claimed] = await Promise.all([
+  const [stock, batchStock, batchIdentities, claimed, skuClasses] = await Promise.all([
     deps.inventory.stockByBinsInTx(tx, scope.tenantId, scope.warehouseId, [scope.skuId]),
     deps.inventory.batchOnHandByBinsInTx(tx, scope.tenantId, scope.warehouseId, [scope.skuId]),
     deps.catalog.getBatchesForSkusInTx(tx, scope.tenantId, [scope.skuId]),
@@ -230,10 +258,13 @@ export async function findReplanSlices(
       scope.skuId,
       binOrder.map((bin) => bin.id),
     ),
+    // Story 12-1 — the SKU's class feeds the pool filter (fail-closed).
+    deps.catalog.getSkuStorageClassesInTx(tx, scope.tenantId, [scope.skuId]),
   ]);
   const pool = buildStockPool({
     skuIds: [scope.skuId],
     binOrder,
+    skuClassById: skuClasses,
     stock,
     batchStock,
     batchIdentities,

@@ -740,6 +740,68 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
       .expect(200);
   });
 
+  // ── Story 12-1 — storage conformance in allocation (FR-40/AD-18) ──────────
+
+  it('storage conformance: allocation plans only CONFORMING stock — a frozen SKU draws the frozen bin and names the ambient bin’s units as a shortfall it can never draw', async () => {
+    // A warehouse of its own, so the classed scenario owns every bin in it.
+    const wh = await freshWarehouse('CLASS');
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'WAV-SC,Wave SKU WAV-SC,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const frozenSkuId = (skus.body.items as { code: string; id: string }[]).find((item) => item.code === 'WAV-SC')!.id;
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${frozenSkuId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'frozen' })
+      .expect(200);
+
+    // A frozen bin beside freshWarehouse's ambient one; the ambient bin's
+    // stock arrives through stock.adjust — the NAMED 12-1 bypass (PENDING),
+    // which is precisely the stock the pool filter must never draw.
+    const zoneRow = (await sql`
+      select id from zones where warehouse_id = ${wh.warehouseId} and code = 'A'
+    `)[0] as unknown as { id: string };
+    const binFrozen = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${wh.warehouseId}/zones/${zoneRow.id}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ capacity: 10000, type: 'shelf', code: 'A-01-02', storageClass: 'frozen' })
+        .expect(201)
+    ).body.id as string;
+    await seedStock(frozenSkuId, binFrozen, 2, wh.warehouseId);
+    await seedStock(frozenSkuId, wh.binId, 7, wh.warehouseId);
+
+    // 9 reserved units, 9 on hand — but only the 2 in the frozen bin are
+    // drawable: 2 planned, 7 named as a shortfall on an unfulfillable line.
+    const orderId = await createOrder([{ skuId: frozenSkuId, quantity: 9 }], wh.warehouseId);
+    const policy = await policyId(`Class ${ulid().slice(0, 8)}`, 'single', {}, wh.warehouseId);
+    const wave = (
+      await generate({ policyId: policy, warehouseId: wh.warehouseId, orderIds: [orderId] }).expect(201)
+    ).body.wave as Wave;
+    const lines = wave.picklists[0]!.lines;
+    const drawn = lines.filter((line) => line.status !== 'unfulfillable');
+    expect(drawn).toHaveLength(1);
+    expect(drawn[0]).toMatchObject({ status: 'planned', binId: binFrozen, qty: 2 });
+    const short = lines.find((line) => line.status === 'unfulfillable')!;
+    expect(short.shortfallQty).toBe(7);
+
+    await cancelWave(wave.id).expect(200);
+  });
+
   it('generate without an explicit selection sweeps every eligible accepted order, oldest first, capped by the policy — and a claimed order is never swept twice', async () => {
     // A warehouse of its own: a sweep with no selection reads EVERY free
     // accepted order in the warehouse, so the other scenarios' leftovers

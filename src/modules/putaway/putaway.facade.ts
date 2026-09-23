@@ -279,6 +279,9 @@ export class PutawayFacade {
         lengthMm: skus.lengthMm,
         widthMm: skus.widthMm,
         heightMm: skus.heightMm,
+        // Story 12-1 — the class the class gate rules on (the row object is
+        // passed straight to `candidateFitsSku`, so the shape must match).
+        storageClass: skus.storageClass,
       })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, skuIds)));
@@ -354,7 +357,7 @@ export class PutawayFacade {
         suggestedBin: fit === undefined ? null : { binId: fit.binId, binCode: fit.binCode },
         rationale:
           fit === undefined
-            ? 'No storage bin has room for these units'
+            ? 'No conforming storage bin has room for these units'
             : `Lowest occupancy (${fromMilli(fit.occupancy)}/${fromMilli(fit.capacity)}) — room for ${fromMilli(fit.capacity - fit.occupancy)}`,
       });
     }

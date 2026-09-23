@@ -140,6 +140,9 @@ export class BinStateCommand {
           widthMm: updated.widthMm,
           heightMm: updated.heightMm,
           maxWeightGrams: updated.maxWeightGrams,
+          // Story 12-1: the controlled-vocabulary class (the snapshot is
+          // required to carry it).
+          storageClass: updated.storageClass,
           type: updated.type,
           blocked: updated.blocked,
           systemOwned: updated.systemOwned,

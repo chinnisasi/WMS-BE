@@ -102,6 +102,33 @@ export async function openQcHoldsForBinsInTx(
 }
 
 /**
+ * The same attribution, SKU-keyed (story 12-1): the open QC holds of ONE SKU,
+ * tenant-wide — the catalog's SKU class-edit guard reads these to attribute
+ * held stock to its ORIGIN bins (the held units sit in the QC-HOLD system
+ * bin, which the on-hand scan cannot see and which the guard must not see —
+ * staging is excluded there). Kept beside `openQcHoldsForBinsInTx` so both
+ * guards read the table through this module's one seam.
+ */
+export async function openQcHoldsForSkuInTx(
+  tx: TenantTx,
+  tenantId: string,
+  skuId: string,
+): Promise<readonly { binId: string; holdId: string; skuId: string }[]> {
+  const rows = await tx
+    .select({ binId: qcHolds.binId, holdId: qcHolds.id, skuId: qcHolds.skuId })
+    .from(qcHolds)
+    .where(
+      and(
+        eq(qcHolds.tenantId, tenantId),
+        eq(qcHolds.skuId, skuId),
+        eq(qcHolds.status, 'open'),
+      ),
+    )
+    .orderBy(asc(qcHolds.id));
+  return rows;
+}
+
+/**
  * The QC hold/release commands (Story 3.4): an Ops Manager quarantines a
  * (sku, bin) scope — the stock RELOCATES through the ledger into the
  * warehouse's system QC-hold bin (real `qc.held` movements, never

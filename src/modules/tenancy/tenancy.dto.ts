@@ -1,5 +1,8 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { MAX_QUANTITY_BASE } from '../../shared/primitives/quantity';
+// Story 12-1: the storage-class vocabulary — the DTO mirror of the shared
+// primitive's tuple (the three-layer pattern: TS tuple / DB CHECK / @IsIn).
+import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
 // Story 11-5: the bin capacity caps (same import the SKU-attribute DTOs make
 // to `sku-attributes.ts` — the DTO mirrors the command's bounds, the command
 // enforces them). A standalone file (the 11-5 review triage #10): importing
@@ -431,6 +434,21 @@ export class CreateBinDto {
   @Max(MAX_BIN_WEIGHT_GRAMS)
   maxWeightGrams?: number | null;
 
+  // Story 12-1: the bin's storage class (FR-40) — the vocabulary is pinned
+  // HERE with `@IsIn` and re-checked in the command (`assertStorageClass`,
+  // behind the replay lookup — the mirror is not the boundary). Absent
+  // stores 'ambient'; there is no null (the column is NOT NULL).
+  @ApiProperty({
+    required: false,
+    enum: STORAGE_CLASSES,
+    example: 'ambient',
+    description:
+      'The bin\'s storage class (FR-40): ambient, chilled, frozen, controlled, hazardous or secure. Omit for ambient.',
+  })
+  @IsOptional()
+  @IsIn(STORAGE_CLASSES)
+  storageClass?: string;
+
   @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
   @IsIn(BIN_TYPES)
   type!: BinType;
@@ -533,6 +551,18 @@ export class GenerateBinsDto {
   @Max(MAX_BIN_WEIGHT_GRAMS)
   maxWeightGrams?: number | null;
 
+  // Story 12-1: the storage class, per generated bin (the CreateBinDto mirror).
+  @ApiProperty({
+    required: false,
+    enum: STORAGE_CLASSES,
+    example: 'ambient',
+    description:
+      'The storage class, per bin (FR-40). Omit for ambient.',
+  })
+  @IsOptional()
+  @IsIn(STORAGE_CLASSES)
+  storageClass?: string;
+
   @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
   @IsIn(BIN_TYPES)
   type!: BinType;
@@ -612,6 +642,22 @@ export class PatchBinDto {
   @Min(1)
   @Max(MAX_BIN_WEIGHT_GRAMS)
   maxWeightGrams?: number | null;
+
+  // Story 12-1: the bin's storage class — absent = unchanged (there is no
+  // null: the column is NOT NULL, a bin always carries a class). Dispatched
+  // to tenancy's `editBinCapacity` with the capacity attributes; mutually
+  // exclusive with `blocked`. A change runs the stock-conformance guard
+  // (409 `storage-class-conflict`).
+  @ApiProperty({
+    required: false,
+    enum: STORAGE_CLASSES,
+    example: 'ambient',
+    description:
+      'The bin\'s storage class (FR-40). Omit to leave unchanged. Mutually exclusive with blocked.',
+  })
+  @IsOptional()
+  @IsIn(STORAGE_CLASSES)
+  storageClass?: string;
 }
 
 export class ZoneResponse {
@@ -691,6 +737,11 @@ export class BinResponse {
     description: 'Max weight in grams (null = unconstrained)',
   })
   maxWeightGrams!: number | null;
+
+  // Story 12-1: the controlled-vocabulary storage class (required — every bin
+  // carries one; pre-12.1 rows read 'ambient').
+  @ApiProperty({ enum: STORAGE_CLASSES, example: 'ambient' })
+  storageClass!: string;
 
   // `string` here (not the BinType union): the response echoes DB rows whose
   // column is text; the enum is still pinned in the OpenAPI schema below.

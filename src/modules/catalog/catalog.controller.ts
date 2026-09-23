@@ -362,6 +362,19 @@ export class CatalogController {
   ): Promise<SkuResponse> {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
+    // Story 12-1 (code review): the DTO's `@IsOptional` skips null as well as
+    // undefined, and the edit command treats only `undefined` as absent — an
+    // explicit `storageClass: null` would reach the NOT NULL column and
+    // answer 500 where a 400 is the answer (the 11-5 `blocked` precedent:
+    // the class has no clear verb).
+    if (dto.storageClass === null) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'storageClass must be a string',
+        'The PATCH body carries `storageClass: null` — the storage class has no clear verb (the column is NOT NULL); omit `storageClass` to leave the SKU\'s class unchanged.',
+      );
+    }
     const sku = await this.skuCommand.edit(
       {
         tenantId,
@@ -395,6 +408,10 @@ export class CatalogController {
         // duplicate variants).
         productId: dto.productId,
         variantValues: dto.variantValues,
+        // Story 12-1 — the storage class passes through WYSIWYG: absent =
+        // unchanged; there is no null (the column is NOT NULL). The command
+        // is the boundary (vocabulary re-check, the class-edit guard).
+        storageClass: dto.storageClass,
       },
       key,
     );
