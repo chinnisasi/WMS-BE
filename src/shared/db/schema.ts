@@ -411,6 +411,20 @@ export const skus = pgTable(
      * a non-conforming state cannot pre-exist because the vocabulary is new).
      */
     storageClass: text('storage_class').notNull().default('ambient'),
+    /**
+     * Story 12-2 — the SKU's hazard class (FR-41), nullable: most goods carry
+     * none. From the controlled vocabulary in
+     * `src/shared/primitives/hazard.ts` (HAZARD_CLASSES); the segregation
+     * matrix (`hazardClassesCompatible`) lives there — the ONE predicate
+     * behind putaway placement, suggestion, bin merge and the hazard-edit
+     * guard. The DB backstop is a CHECK declared ONLY in
+     * `drizzle/0036_hazard_class.sql` (the 0031/0035 pattern — CHECKs live
+     * only in migration SQL). Nullable with NO default: null = "not
+     * hazardous" and carries NO rule in either direction of the matrix —
+     * unlike `storage_class` there is no sensible ambient default to
+     * backfill.
+     */
+    hazardClass: text('hazard_class'),
     ...tenantTimestamps,
   },
   (table) => [
