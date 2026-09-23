@@ -249,6 +249,19 @@ export const bins = pgTable(
     heightMm: integer('height_mm'),
     /** Positive whole grams, ≤ 100,000,000 (100 tonnes). */
     maxWeightGrams: integer('max_weight_grams'),
+    /**
+     * Story 12-1 — the bin's storage class (FR-40 / AD-18), from the
+     * controlled vocabulary in `src/shared/primitives/storage-class.ts`
+     * (STORAGE_CLASSES) — never free text, unlike `type` beside it, which
+     * story 12-4 (location types) replaces. The temperature hierarchy and the
+     * exact-match classes live in that file's `storageClassSatisfies`, the ONE
+     * predicate every conformance gate imports; the DB backstop is a CHECK
+     * declared ONLY in `drizzle/0035_storage_class.sql` (the 0034 pattern —
+     * CHECKs live only in migration SQL). Defaults to `ambient` — every
+     * pre-12.1 bin reads `ambient` and stays conforming (no backfill; no
+     * non-conforming state can pre-exist because the vocabulary is new).
+     */
+    storageClass: text('storage_class').notNull().default('ambient'),
     type: text('type').notNull(),
     blocked: boolean('blocked').notNull().default(false),
     systemOwned: boolean('system_owned').notNull().default(false),
@@ -386,6 +399,18 @@ export const skus = pgTable(
      * `duplicate-variant-values`).
      */
     variantValues: jsonb('variant_values').$type<Record<string, string>>(),
+    /**
+     * Story 12-1 — the SKU's storage class (FR-40 / AD-18), from the
+     * controlled vocabulary in `src/shared/primitives/storage-class.ts`
+     * (STORAGE_CLASSES). The temperature hierarchy (`storageClassSatisfies`)
+     * lives there — the ONE predicate behind putaway placement, suggestion,
+     * pick draw, wave/replan allocation and bin merge; the DB backstop is a
+     * CHECK declared ONLY in `drizzle/0035_storage_class.sql` (the 0031
+     * pattern — CHECKs live only in migration SQL). Defaults to `ambient` —
+     * every pre-12.1 SKU reads `ambient` and stays conforming (no backfill;
+     * a non-conforming state cannot pre-exist because the vocabulary is new).
+     */
+    storageClass: text('storage_class').notNull().default('ambient'),
     ...tenantTimestamps,
   },
   (table) => [
