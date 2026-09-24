@@ -3,6 +3,12 @@ import { MAX_QUANTITY_BASE } from '../../shared/primitives/quantity';
 // Story 12-1: the storage-class vocabulary — the DTO mirror of the shared
 // primitive's tuple (the three-layer pattern: TS tuple / DB CHECK / @IsIn).
 import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
+// Story 12-4: the location-type vocabulary — same pattern, same shared
+// primitive the placement/merge gates import (one source, no copy).
+import {
+  LOCATION_TYPES,
+  type LocationType,
+} from '../../shared/primitives/location-type';
 // Story 11-5: the bin capacity caps (same import the SKU-attribute DTOs make
 // to `sku-attributes.ts` — the DTO mirrors the command's bounds, the command
 // enforces them). A standalone file (the 11-5 review triage #10): importing
@@ -331,9 +337,16 @@ export class WarehouseListResponse {
   nextCursor!: string | null;
 }
 
-/** Bin types are a fixed set (spec 1.3) — validated, never free-form. */
-export const BIN_TYPES = ['shelf', 'pallet', 'floor', 'staging'] as const;
-export type BinType = (typeof BIN_TYPES)[number];
+/**
+ * Bin types are a fixed set (spec 1.3) — validated, never free-form.
+ * Story 12-4: the vocabulary moved to the shared primitive
+ * (`location-type.ts`) and grew the four non-bin location types (yard,
+ * floor-stack, tank, silo — one table, no fork). This re-exported alias keeps
+ * the three DTO call sites (:452 create, :566 grid, :748 response) churn-free;
+ * the DB CHECK backstop lives in `drizzle/0037_location_type_check.sql`.
+ */
+export const BIN_TYPES = LOCATION_TYPES;
+export type BinType = LocationType;
 
 export class CreateZoneDto {
   @ApiProperty({ example: 'A', minLength: 1, maxLength: 32 })

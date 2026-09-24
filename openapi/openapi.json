@@ -9062,7 +9062,11 @@
               "shelf",
               "pallet",
               "floor",
-              "staging"
+              "staging",
+              "floor-stack",
+              "yard",
+              "tank",
+              "silo"
             ],
             "example": "shelf"
           }
@@ -9139,7 +9143,11 @@
               "shelf",
               "pallet",
               "floor",
-              "staging"
+              "staging",
+              "floor-stack",
+              "yard",
+              "tank",
+              "silo"
             ],
             "example": "shelf"
           },
@@ -9268,7 +9276,11 @@
               "shelf",
               "pallet",
               "floor",
-              "staging"
+              "staging",
+              "floor-stack",
+              "yard",
+              "tank",
+              "silo"
             ],
             "example": "shelf"
           }
@@ -14577,6 +14589,7 @@
               "suggested-bin-occupied",
               "consolidation-with-existing-stock",
               "operator-preference",
+              "bulk-asset",
               "other"
             ],
             "description": "The mismatch reason (required when the target bin differs from the suggested bin)"
@@ -14688,6 +14701,7 @@
               "suggested-bin-occupied",
               "consolidation-with-existing-stock",
               "operator-preference",
+              "bulk-asset",
               "other"
             ],
             "nullable": true,

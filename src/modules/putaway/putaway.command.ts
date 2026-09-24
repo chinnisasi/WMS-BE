@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, eq, gt, inArray, isNotNull, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -34,6 +34,15 @@ import {
   binStorageMismatch,
   storageClassSatisfies,
 } from '../../shared/primitives/storage-class';
+// Story 12-4 — the ONE bulk-asset occupancy predicate + the refusal factory,
+// and the type arm-key + the exclusion list behind the never-suggested rule.
+// Same one-source rule as the class/hazard predicates above.
+import {
+  BULK_ASSET_TYPES,
+  binOccupancyConflict,
+  bulkAssetOccupancyHolds,
+  isBulkAssetType,
+} from '../../shared/primitives/location-type';
 // Story 12-2 — the ONE segregation predicate + the co-location refusal
 // factory. Same one-source rule as the storage-class predicate: the matrix
 // is encoded exactly once, in TS.
@@ -66,6 +75,7 @@ export const PUTAWAY_MISMATCH_REASON_CODES = [
   'suggested-bin-occupied',
   'consolidation-with-existing-stock',
   'operator-preference',
+  'bulk-asset',
   'other',
 ] as const;
 export type PutawayMismatchReasonCode = (typeof PUTAWAY_MISMATCH_REASON_CODES)[number];
@@ -506,6 +516,8 @@ export class PutawayCommand {
           maxWeightGrams: bins.maxWeightGrams,
           // Story 12-1 — the class the placement gate rules on.
           storageClass: bins.storageClass,
+          // Story 12-4 — the location type: the bulk-asset occupancy arm's key.
+          type: bins.type,
         })
         .from(bins)
         .where(
@@ -565,6 +577,30 @@ export class PutawayCommand {
       // matrix invariant keeps the subset enforced); non-secure bins are
       // byte-identical to the pre-12.3 build.
       assertSecureBinAuthority(role, [targetBin]);
+      // ── story 12-4: the bulk-asset occupancy gate — single-SKU rule ──────
+      // After the secure authority gate, BEFORE the hazard gate and every
+      // capacity arm (a co-mix refusal is a rule answer, not a capacity
+      // answer): a TANK or SILO holds exactly ONE SKU, so placing a second,
+      // different SKU into one — even an empty-looking one whose occupant is
+      // another SKU — is refused, naming the holding SKU. A top-up of the
+      // holding SKU passes (the predicate's union is ≤ 1). ONE predicate
+      // behind every arm (`bulkAssetOccupancyHolds` — the same one `mergeBin`
+      // and `candidateFitsSku` import; the SYNC HAZARD rule).
+      // 400 `bin-occupancy-conflict`.
+      const holdingSkus = await occupantSkusInTx(
+        tx,
+        command.tenantId,
+        command.warehouseId,
+        targetBin.id,
+      );
+      if (!bulkAssetOccupancyHolds(targetBin.type, [command.skuId], holdingSkus.map((o) => o.skuId))) {
+        const holding = [...new Set(holdingSkus.map((o) => o.skuCode))];
+        throw binOccupancyConflict(
+          `Bin "${targetBin.code}" is a ${targetBin.type} (a bulk asset holds exactly ONE SKU): ` +
+            `it holds ${holding.map((code) => `"${code}"`).join(', ')} — place SKU "${sku.code}" ` +
+            'in another bulk asset, or top up the holding SKU.',
+        );
+      }
       // ── story 12-2: the hazard co-location gate (FR-41) — after the class
       // gate, before the load read, inside the bin-row `.for('update')` window
       // (a concurrent placement cannot slip an incompatible unit between the
@@ -678,6 +714,25 @@ export class PutawayCommand {
       if (suggestedBinId !== command.toBinId && command.reasonCode === null) {
         throw putawayValidation(
           `Placing into "${targetBin.code}" differs from the suggested bin — a reason code from ${JSON.stringify(PUTAWAY_MISMATCH_REASON_CODES)} is required.`,
+        );
+      }
+      // ── story 12-4: the operator-directed BULK placement reason ──────────
+      // A tank/silo is never auto-suggested (the candidate list excludes the
+      // type), so targeting one is ALWAYS a mismatch and the operator must
+      // name it as such: the `bulk-asset` reason code (12-4's addition to the
+      // enum) is REQUIRED on a bulk placement — any other in-enum code
+      // (operator-preference, …) refuses with 400 `validation-failed`, so the
+      // recorded signal stays queryable by placement class (the SM-3 pattern).
+      // Reachable only when the target is a bulk asset (a matching target
+      // would have recorded no reason; a matching SUGGESTION is impossible —
+      // the type never appears among the candidates).
+      if (
+        isBulkAssetType(targetBin.type) &&
+        command.reasonCode !== null &&
+        command.reasonCode !== 'bulk-asset'
+      ) {
+        throw putawayValidation(
+          `Placing into bulk asset "${targetBin.code}" requires the mismatch reason "bulk-asset" (got "${command.reasonCode}").`,
         );
       }
       // The recorded reason: a stale reason on a match is STRIPPED, not
@@ -934,6 +989,10 @@ export interface PutawayBinCandidate {
   // SKU-agnostic (no WHERE arm); the class rule runs per candidate in
   // `candidateFitsSku`, against the SKU side carried in `SkuPhysicalAttributes`.
   readonly storageClass: string;
+  // ── story 12-4: the bin's location type — the bulk-asset arm's key in
+  // `candidateFitsSku` (a tank/silo is never auto-suggested; the WHERE arm in
+  // `binCandidatesInTx` excludes the type first — this is the second layer).
+  readonly type: string;
   // ── story 12-2: the bin's hazardous occupants as (skuId, hazardClass)
   // PAIRS — not a class list (a class-only aggregate cannot skip the moving
   // SKU's own pairs, and counts drained residue). Aggregated over `quantity >
@@ -1001,6 +1060,15 @@ export interface SkuPhysicalAttributes {
  * carries no rule in either direction, checked before the explosive
  * universal rule). The same arm exists in the placement command's own
  * locked-row guard and `mergeBin`'s target gate — the SYNC HAZARD rule.
+ *
+ * Story 12-4 adds the BULK-ASSET arm — THIRD, after the hazard arm: a tank or
+ * a silo is NEVER auto-suggested (Design Note 3 — its suitability depends on
+ * measured fill, Epic 20), so the arm returns false unconditionally, whatever
+ * the moving SKU. `binCandidatesInTx`'s WHERE already excludes the type (the
+ * type is SKU-agnostic, unlike the class — a WHERE arm is legal there), so
+ * this arm is the second layer for any caller handed a bulk candidate by
+ * another road; the same arm exists in the placement command's own locked-row
+ * guard and `mergeBin`'s target gate — the SYNC HAZARD rule.
  */
 export function candidateFitsSku(
   candidate: PutawayBinCandidate,
@@ -1009,6 +1077,9 @@ export function candidateFitsSku(
   movingSkuId: string,
 ): boolean {
   if (!storageClassSatisfies(sku.storageClass, candidate.storageClass)) {
+    return false;
+  }
+  if (isBulkAssetType(candidate.type)) {
     return false;
   }
   for (const occupant of candidate.occupants) {
@@ -1075,6 +1146,10 @@ export async function binCandidatesInTx(
       // Story 12-1 — the class rides the candidate so the fit predicate can
       // rule per (SKU, bin); no WHERE arm, the list is SKU-agnostic.
       storageClass: bins.storageClass,
+      // Story 12-4 — the type rides the candidate for the bulk-asset arm (a
+      // tank/silo is never auto-suggested; excluded in the WHERE below, this
+      // is the arm's second layer).
+      type: bins.type,
       // Story 12-2 — the bin's hazardous occupants as (skuId, hazardClass)
       // pairs, one aggregate through the join below (no second query, no
       // N+1). The FILTER carries `quantity > 0` (drained rows persist —
@@ -1105,6 +1180,13 @@ export async function binCandidatesInTx(
         eq(bins.systemOwned, false),
         // Story 3.6: a retired bin is operationally gone — it never suggests.
         isNull(bins.retiredAt),
+        // Story 12-4: a BULK ASSET (tank/silo) is never auto-suggested — its
+        // suitability depends on measured fill (Epic 20), so until then it is
+        // an operator-directed placement (mismatch reason `bulk-asset`). The
+        // exclusion is type-driven and SKU-agnostic, unlike the class — a
+        // WHERE arm is legal here; `candidateFitsSku`'s bulk-asset arm is the
+        // second layer.
+        notInArray(bins.type, [...BULK_ASSET_TYPES]),
       ),
     )
     .groupBy(
@@ -1116,6 +1198,7 @@ export async function binCandidatesInTx(
       bins.heightMm,
       bins.maxWeightGrams,
       bins.storageClass,
+      bins.type,
     )
     .orderBy(asc(sql`coalesce(sum(${stockOnHand.quantity}), 0)`), asc(bins.code));
   return rows.map((row) => ({
@@ -1127,6 +1210,7 @@ export async function binCandidatesInTx(
     heightMm: row.heightMm,
     maxWeightGrams: row.maxWeightGrams,
     storageClass: row.storageClass,
+    type: row.type,
     // The aggregate is `::text`d jsonb — parsed at the boundary, mapped to
     // the pair objects the fit predicate walks.
     occupants: (JSON.parse(row.occupants) as [string, string][]).map(
@@ -1214,6 +1298,36 @@ export interface OccupantHazard {
   readonly skuId: string;
   readonly skuCode: string;
   readonly hazardClass: string;
+}
+
+/**
+ * Story 12-4 — the bulk-asset occupancy read: one bin's DISTINCT occupants
+ * as (skuId, skuCode) rows, `quantity > 0` — NO class filter, unlike the
+ * hazard read below: the single-SKU rule counts every occupant, a null-class
+ * SKU included. Consumed by the placement's bulk-asset occupancy gate and
+ * `mergeBin`'s (the same `.for('update')` windows), inside the same join
+ * shape as `binOccupancyInTx`.
+ */
+export async function occupantSkusInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  binId: string,
+): Promise<readonly { skuId: string; skuCode: string }[]> {
+  const rows = await tx
+    .select({ skuId: stockOnHand.skuId, skuCode: skus.code })
+    .from(stockOnHand)
+    .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+    .where(
+      and(
+        eq(stockOnHand.tenantId, tenantId),
+        eq(stockOnHand.warehouseId, warehouseId),
+        eq(stockOnHand.binId, binId),
+        gt(stockOnHand.quantity, 0),
+      ),
+    )
+    .groupBy(stockOnHand.skuId, skus.code);
+  return rows;
 }
 
 export async function occupantHazardClassesInTx(

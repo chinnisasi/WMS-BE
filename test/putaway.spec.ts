@@ -1990,4 +1990,243 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
         .expect(200);
     }
   });
+
+  // ── Story 12-4 — non-bin location types: the bulk-asset placement rules ────
+
+  it('bulk assets: a tank holding another SKU is 400 bin-occupancy-conflict BEFORE the capacity arms, a same-SKU top-up places, the type is never suggested (the tank-only warehouse), the operator reason must be bulk-asset, and yard/floor-stack place through the ordinary gates', async () => {
+    // Two plain SKUs with weights: PUT-T (100 g) and PUT-U (400 g) — the
+    // weight makes the capacity-vs-occupancy ordering provable (step 4 below
+    // would ALSO trip the weight gate, so only the earlier arm's code can
+    // answer).
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'PUT-T,Putaway Item T,pcs,,1800,,false,false,,,',
+      'PUT-U,Putaway Item U,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const byCode = new Map((skus.body.items as { code: string; id: string }[]).map((item) => [item.code, item.id]));
+    const tankSkuId = byCode.get('PUT-T')!;
+    const otherSkuId = byCode.get('PUT-U')!;
+    for (const [skuId, weightGrams] of [[tankSkuId, 100], [otherSkuId, 400]] as const) {
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ weightGrams })
+        .expect(200);
+    }
+
+    // An OWN warehouse so the candidate pool is exactly the bins this test
+    // lays out (the 12-1 warehouse3 pattern): a tank, a shelf, a yard and a
+    // floor-stack area — all empty, so the suggestion ranks by code and
+    // `0-FS` would win but for the bulk-asset exclusion.
+    const bulkWarehouseId = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `PUT5-${ulid().slice(10, 16).toUpperCase()}`, name: `Bulk Putaway Depot ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zoneB = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${bulkWarehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'B', name: 'Bulk zone' })
+        .expect(201)
+    ).body.id as string;
+    const bulkBin = async (body: Record<string, unknown>): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${bulkWarehouseId}/zones/${zoneB}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send(body)
+          .expect(201)
+      ).body.id as string;
+    const tankBin = await bulkBin({ code: '0-TK', capacity: 100, type: 'tank', maxWeightGrams: 1000 });
+    await bulkBin({ code: '0-SH', capacity: 100, type: 'shelf' });
+    const yardBin = await bulkBin({ code: '0-YD', capacity: 100, type: 'yard' });
+    const stackBin = await bulkBin({ code: '0-FS', capacity: 100, type: 'floor-stack' });
+
+    // Receipts and placements for the bulk warehouse (the hzGrn pattern —
+    // `placeForLine` pins the suite's default warehouse, so this one posts
+    // the body itself).
+    const bulkGrn = async (skuId: string, qty: number): Promise<Awaited<ReturnType<typeof blindGrn>>> => {
+      const res = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/goods-receipts`)
+        .set('Authorization', `Bearer ${operatorToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId: bulkWarehouseId,
+          poId: null,
+          blindReasonCode: 'unannounced-delivery',
+          occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+          lines: [{ poLineId: null, skuId, batchCode: null, mfgDate: null, qty }],
+        })
+        .expect(201);
+      const grn = res.body.goodsReceipt as { id: string; lines: { id: string; skuId: string; batchId: string | null; qty: number; appliedQty: number }[] };
+      return { grnId: grn.id, lines: grn.lines.map((line) => ({ ...line, grnId: grn.id })) };
+    };
+    const bulkPlace = (
+      line: { grnId: string; id: string; skuId: string; batchId: string | null; qty: number },
+      toBinId: string,
+      overrides: Partial<PlaceBody> = {},
+      key = ulid(),
+    ): SupertestTest =>
+      place(
+        {
+          warehouseId: bulkWarehouseId,
+          grnId: line.grnId,
+          grnLineId: line.id,
+          skuId: line.skuId,
+          batchId: line.batchId,
+          qty: line.qty,
+          toBinId,
+          reasonCode: null,
+          occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+          ...overrides,
+        },
+        operatorToken,
+        key,
+      );
+
+    // ── the tank holds PUT-T: 2 units = 200 g, well inside 1000 g ─────────
+    const grn1 = await bulkGrn(tankSkuId, 2);
+
+    // NEVER SUGGESTED (the decisive arm): with an empty shelf, yard and
+    // floor-stack all ranking BEFORE the tank by code order, the suggestion
+    // is `0-FS` — and, more decisively below, a TANK-ONLY warehouse's task
+    // carries no suggestion at all (the pool is empty).
+    const bulkTasksRes = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/putaway/tasks?warehouseId=${bulkWarehouseId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const bulkTask = (bulkTasksRes.body.items as { grnLineId: string; suggestedBin: { binCode: string } | null }[]).find(
+      (entry) => entry.grnLineId === grn1.lines[0]!.id,
+    )!;
+    expect(bulkTask.suggestedBin).toEqual({ binId: stackBin, binCode: '0-FS' });
+
+    // Operator-directed bulk placement: no reason is 400 (the mismatch rule
+    // — a tank is never the suggested bin); a WRONG in-enum reason is 400
+    // naming `bulk-asset`; the RIGHT one places.
+    const noReason = await bulkPlace(grn1.lines[0]!, tankBin).expect(400);
+    expect(noReason.body).toMatchObject({ status: 400, code: 'validation-failed' });
+    expect(String(noReason.body.detail)).toContain('reason');
+    const wrongReason = await bulkPlace(grn1.lines[0]!, tankBin, { reasonCode: 'operator-preference' }).expect(400);
+    expect(wrongReason.body).toMatchObject({ code: 'validation-failed' });
+    expect(String(wrongReason.body.detail)).toContain('bulk-asset');
+    await bulkPlace(grn1.lines[0]!, tankBin, { reasonCode: 'bulk-asset' }).expect(201);
+    expect(await plainOnHand(tankBin, tankSkuId)).toBe(2);
+
+    // ── DIFFERENT SKU into the holding tank → 400 `bin-occupancy-conflict`
+    // naming the holding SKU. The placed load would ALSO break the tank's
+    // weight limit (2×100 + 3×400 = 1400 g > 1000 g), so a 400 that names
+    // anything but the occupancy arm would be the wrong gate — this is the
+    // refused-before-the-capacity-arms row.
+    const grn2 = await bulkGrn(otherSkuId, 3);
+    const conflict = await bulkPlace(grn2.lines[0]!, tankBin, { reasonCode: 'bulk-asset' }).expect(400);
+    expect(conflict.body).toMatchObject({ status: 400, code: 'bin-occupancy-conflict' });
+    expect(String(conflict.body.detail)).toContain('0-TK');
+    expect(String(conflict.body.detail)).toContain('PUT-T');
+    expect(await placementRowCount(grn2.grnId)).toBe(0);
+    expect((await ledgerRows(grn2.grnId)).map((event) => event.type)).toEqual(['grn.received']);
+
+    // ── SAME SKU into the holding tank → success (the single-SKU union). ───
+    const grn3 = await bulkGrn(tankSkuId, 2);
+    await bulkPlace(grn3.lines[0]!, tankBin, { reasonCode: 'bulk-asset' }).expect(201);
+    expect(await plainOnHand(tankBin, tankSkuId)).toBe(4);
+
+    // ── YARD and FLOOR-STACK carry no extra rule: the ordinary gates govern,
+    // and any in-enum mismatch reason works — `bulk-asset` is not required
+    // (Design Note 4).
+    const grn4 = await bulkGrn(tankSkuId, 1);
+    await bulkPlace(grn4.lines[0]!, yardBin, { reasonCode: 'operator-preference' }).expect(201);
+    expect(await plainOnHand(yardBin, tankSkuId)).toBe(1);
+    const grn5 = await bulkGrn(tankSkuId, 1);
+    await bulkPlace(grn5.lines[0]!, stackBin, { reasonCode: 'operator-preference' }).expect(201);
+    expect(await plainOnHand(stackBin, tankSkuId)).toBe(1);
+
+    // ── THE TANK-ONLY WAREHOUSE: the candidate pool has exactly one bin and
+    // it is a bulk asset — the task derives with NO suggestion (the pool was
+    // empty before capacity ever ranked it), and the placement needs the
+    // bulk-asset reason.
+    const tankWarehouseId = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `PUT6-${ulid().slice(10, 16).toUpperCase()}`, name: `Tank-Only Depot ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zoneT = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${tankWarehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A', name: 'Tank Aisle' })
+        .expect(201)
+    ).body.id as string;
+    const onlyTank = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${tankWarehouseId}/zones/${zoneT}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'T-01', capacity: 100, type: 'tank', maxWeightGrams: 10_000 })
+        .expect(201)
+    ).body.id as string;
+    const tankGrnRes = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/goods-receipts`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        warehouseId: tankWarehouseId,
+        poId: null,
+        blindReasonCode: 'unannounced-delivery',
+        occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+        lines: [{ poLineId: null, skuId: tankSkuId, batchCode: null, mfgDate: null, qty: 1 }],
+      })
+      .expect(201);
+    const tankOnly = tankGrnRes.body.goodsReceipt as { id: string; lines: { id: string; skuId: string; batchId: string | null; qty: number }[] };
+    const tankTasksRes = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/putaway/tasks?warehouseId=${tankWarehouseId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const tankTask = (tankTasksRes.body.items as { grnLineId: string; suggestedBin: { binId: string } | null; rationale: string }[]).find(
+      (entry) => entry.grnLineId === tankOnly.lines[0]!.id,
+    )!;
+    expect(tankTask.suggestedBin).toBeNull();
+    expect(tankTask.rationale).toBe('No conforming storage bin has room for these units');
+    const tankOnlyPlace = (reasonCode: string | null, key = ulid()): SupertestTest =>
+      place(
+        {
+          warehouseId: tankWarehouseId,
+          grnId: tankOnly.id,
+          grnLineId: tankOnly.lines[0]!.id,
+          skuId: tankOnly.lines[0]!.skuId,
+          batchId: tankOnly.lines[0]!.batchId,
+          qty: tankOnly.lines[0]!.qty,
+          toBinId: onlyTank,
+          reasonCode,
+          occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+        },
+        operatorToken,
+        key,
+      );
+    await tankOnlyPlace(null).expect(400);
+    await tankOnlyPlace('operator-preference').expect(400);
+    await tankOnlyPlace('bulk-asset').expect(201);
+    expect(await plainOnHand(onlyTank, tankSkuId)).toBe(1);
+  });
 });

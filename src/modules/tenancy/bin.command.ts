@@ -53,6 +53,7 @@ import {
   binRetiredAsTarget,
   binVolumeExceeded,
   occupantHazardClassesInTx,
+  occupantSkusInTx,
 } from '../putaway/putaway.command';
 // Story 12-2 — the ONE segregation predicate + the co-location refusal
 // factory (shared with the placement gate; the detail is merge-worded).
@@ -60,6 +61,15 @@ import {
   hazardClassesCompatible,
   segregationConflict,
 } from '../../shared/primitives/hazard';
+// Story 12-4 — the ONE bulk-asset occupancy predicate + the refusal factory
+// (shared with the placement gate and `candidateFitsSku`; the detail is
+// merge-worded here) and the type arm-key (`isBulkAssetType`) behind the
+// bulk-asset master-data rules below.
+import {
+  binOccupancyConflict,
+  bulkAssetOccupancyHolds,
+  isBulkAssetType,
+} from '../../shared/primitives/location-type';
 import { IDEMPOTENCY_TENANT_KEY, binHoldOpen, binNotFound, binRetired409 } from './bin.errors';
 
 export interface CreateBinCommand {
@@ -353,6 +363,9 @@ export class BinCommand {
         // (`assertStorageClass`), same behind-the-replay rule.
         assertBinCapacityAttributes(command);
         assertStorageClass({ storageClass: command.storageClass });
+        // Story 12-4: a bulk asset is weight-defined — the same
+        // behind-the-replay position, the command-side mirror of the DTO.
+        assertBulkAssetWeightDefined(command.type, command.maxWeightGrams);
         const bin = await insertBin(tx, {
           ...command,
           capacity: assertWholeUnitCapacity(command.capacity),
@@ -460,6 +473,9 @@ export class BinCommand {
         // Story 12-1: the storage class joins the position.
         assertBinCapacityAttributes(command);
         assertStorageClass({ storageClass: command.storageClass });
+        // Story 12-4: bulk assets are unique, never gridded — same
+        // behind-the-replay position, refused before the collision pre-check.
+        refuseBulkAssetGrid(command.type);
 
         // Collision pre-check in the same transaction: any generated code that
         // already exists in this warehouse (any zone — codes are unique per
@@ -744,6 +760,34 @@ export class BinCommand {
         // pre-12.3 build.
         assertSecureBinAuthority(role, [source, target]);
 
+        // ── story 12-4: the bulk-asset occupancy gate — single-SKU rule ─────
+        // After the secure authority gate, BEFORE the hazard gate and every
+        // capacity arm: a TANK or SILO holds exactly ONE SKU, so a merge that
+        // would co-mix one (a moved SKU beside a different occupant, or two
+        // moved SKUs into an empty asset — the moved-vs-moved case the
+        // hazard gate deliberately skips) is refused whole, naming the
+        // holding SKU. ONE predicate behind every arm (`bulkAssetOccupancyHolds`
+        // — the same one the placement gate and `candidateFitsSku` import;
+        // the SYNC HAZARD rule). 400 `bin-occupancy-conflict`.
+        const holdingSkus = await occupantSkusInTx(
+          tx,
+          command.tenantId,
+          command.warehouseId,
+          target.id,
+        );
+        const movedSkuIds = [...new Set(onHandRows.map((row) => row.skuId))];
+        if (!bulkAssetOccupancyHolds(target.type, movedSkuIds, holdingSkus.map((o) => o.skuId))) {
+          const holding = [...new Set(holdingSkus.map((o) => o.skuCode))];
+          const moving = [...new Set(onHandRows.map((row) => row.skuCode))];
+          throw binOccupancyConflict(
+            `Merge refused — bin "${target.code}" is a ${target.type} (a bulk asset holds exactly ONE SKU): ` +
+              (holding.length > 0
+                ? `it holds ${holding.map((code) => `"${code}"`).join(', ')}`
+                : 'it is empty') +
+              `, and the merge would move ${moving.map((code) => `"${code}"`).join(', ')}.`,
+          );
+        }
+
         // ── story 12-2: the hazard co-location gate (FR-41) — after the
         // class gate, BEFORE any arm moves: a merge that would park a SKU
         // beside an incompatible target occupant is refused whole, naming
@@ -756,7 +800,10 @@ export class BinCommand {
         // already co-locates them) — a premise that holds while `stock.adjust`
         // is the named bypass: it is the only writer able to FORM incompatible
         // co-location in a source bin (recorded in PENDING). Same factory as
-        // the placement gate (400 `bin-segregation-conflict`).
+        // the placement gate (400 `bin-segregation-conflict`). Its read is
+        // the HAZARD-filtered occupant list (null-class occupants carry no
+        // rule there) — the class-free occupancy read the 12-4 gate above
+        // consumes is a separate one (`occupantSkusInTx`).
         const targetOccupants = await occupantHazardClassesInTx(
           tx,
           command.tenantId,
@@ -1297,9 +1344,12 @@ export class BinCommand {
 
         // The one validator, behind the replay lookup (the 10.2 rule — see
         // `assertBinCapacityAttributes`). Story 12-1: the storage class joins
-        // the position.
+        // the position. Story 12-4: a bulk asset's weight-defined capacity
+        // cannot be cleared (the locked row's type is in hand — the row was
+        // read `.for('update')` above).
         assertBinCapacityAttributes(command);
         assertStorageClass({ storageClass: command.storageClass });
+        refuseBulkAssetWeightClear(row, command.maxWeightGrams);
 
         // ── story 12-1: the class-edit guard, behind the replay (the 10.2
         // rule for a 409 rule: a replayed edit re-serves its snapshot above
@@ -1558,6 +1608,76 @@ export function assertBinCapacityAttributes(fields: BinCapacityAttributeFields):
       );
     }
   }
+}
+
+// ── story 12-4: the bulk-asset master-data rules ─────────────────────────────
+// A tank or a silo (`BULK_ASSET_TYPES` in the location-type primitive) is
+// WEIGHT-DEFINED and UNIQUE: its `maxWeightGrams` is required at create (the
+// 11-5 weight gate skips a null limit, so a tank with no bound would hold
+// unlimited mass), it can never be gridded (its suitability depends on
+// measured fill, Epic 20 — mass-creating identical tanks is meaningless), and
+// its weight limit can never be cleared by a later edit. All three run behind
+// the replay lookup (the 10.2 rule), at the same position as
+// `assertBinCapacityAttributes`/`assertStorageClass`.
+
+/**
+ * The create/grid weight rule: a bulk asset's capacity is weight-defined, so
+ * `maxWeightGrams` is REQUIRED — absent and null both refuse (creation has no
+ * "leave unchanged" reading — the `insertBin` comment's rule). Ordinary types
+ * are unconstrained (absent stays legal = the pre-11.5 behavior).
+ */
+function assertBulkAssetWeightDefined(
+  type: string,
+  maxWeightGrams: number | null | undefined,
+): void {
+  if (!isBulkAssetType(type) || (maxWeightGrams !== undefined && maxWeightGrams !== null)) {
+    return;
+  }
+  throw new ProblemException(
+    'validation-failed',
+    400,
+    `${type} requires a weight-defined capacity`,
+    `A ${type} is a bulk asset — its capacity is weight-defined, so maxWeightGrams is required ` +
+      `(got none). Give it a positive whole number of grams, at most ${MAX_BIN_WEIGHT_GRAMS}.`,
+  );
+}
+
+/**
+ * The grid rule: bulk assets are unique, never mass-created — the grid
+ * generator refuses them outright, naming the type.
+ */
+function refuseBulkAssetGrid(type: string): void {
+  if (!isBulkAssetType(type)) {
+    return;
+  }
+  throw new ProblemException(
+    'validation-failed',
+    400,
+    `${type} cannot be gridded`,
+    `A ${type} is a bulk asset — unique, never mass-created (its suitability depends on measured ` +
+      'fill). Create it with the single-bin form instead.',
+  );
+}
+
+/**
+ * The PATCH rule: a bulk asset's weight-defined capacity cannot be CLEARED —
+ * the PATCH verb reads null as "clear" (absent = unchanged, which stays
+ * legal), and an unbounded tank would hold unlimited mass.
+ */
+function refuseBulkAssetWeightClear(
+  bin: { readonly code: string; readonly type: string },
+  maxWeightGrams: number | null | undefined,
+): void {
+  if (!isBulkAssetType(bin.type) || maxWeightGrams !== null) {
+    return;
+  }
+  throw new ProblemException(
+    'validation-failed',
+    400,
+    'A bulk asset cannot drop its weight-defined capacity',
+    `Bin "${bin.code}" is a ${bin.type} — maxWeightGrams cannot be cleared on a bulk asset. ` +
+      'Move its stock to an ordinary bin and retire it instead.',
+  );
 }
 
 async function insertBin(

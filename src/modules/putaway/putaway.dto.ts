@@ -3,12 +3,13 @@ import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/prim
 import { ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, IsUUID, Length, Max, Min } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
-/** The fixed mismatch-reason enum (the I/O matrix — 400 outside it). */
+/** The fixed mismatch-reason enum (the I/O matrix — 400 outside it). Story 12-4 adds `bulk-asset`. */
 export const PUTAWAY_MISMATCH_REASON_ENUM = [
   'pallet-too-heavy',
   'suggested-bin-occupied',
   'consolidation-with-existing-stock',
   'operator-preference',
+  'bulk-asset',
   'other',
 ] as const;
 
