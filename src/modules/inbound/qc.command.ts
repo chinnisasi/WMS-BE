@@ -11,7 +11,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { ensureQcHoldBinInTx, QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
-import { assertPermission } from '../tenancy/permissions';
+import { assertPermission, assertSecureBinAuthority } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -174,10 +174,10 @@ export class QcCommand {
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── authority at command entry (the deliberate fail-closed order) ──
-      assertPermission(
-        await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
-        'qc.manage',
-      );
+      // The role stays in scope: story 12-3's secure-bin authority gate
+      // re-uses it below, on the locked origin bin row.
+      const role = await getMemberRoleIn(tx, command.tenantId, command.actorUserId);
+      assertPermission(role, 'qc.manage');
 
       // ── idempotency replay (before any write) ───────────────────────────
       const existing = await tx
@@ -241,7 +241,13 @@ export class QcCommand {
         );
       }
       const binRows = await tx
-        .select({ id: bins.id, code: bins.code, systemOwned: bins.systemOwned })
+        .select({
+          id: bins.id,
+          code: bins.code,
+          systemOwned: bins.systemOwned,
+          // Story 12-3 — the class the secure-origin authority gate rules on.
+          storageClass: bins.storageClass,
+        })
         .from(bins)
         .where(
           and(
@@ -272,6 +278,17 @@ export class QcCommand {
           'The system QC-hold bin cannot be a hold origin — its contents are already quarantined.',
         );
       }
+      // ── story 12-3: the secure-bin authority gate (FR-42) — on the locked
+      // origin row: held units LEAVE the origin bin, so a SECURE origin
+      // additionally requires `secure.move`, the (role, bin) authority
+      // decided on the row already in hand. Non-denying today (the matrix
+      // invariant keeps the subset enforced): `qc.manage` and `secure.move`
+      // are held by exactly the same roles. Non-secure holds are
+      // byte-identical to the pre-12.3 build. A replayed idempotency key
+      // returns the cached success before this gate — the original
+      // authorized execution already decided; that is deliberate
+      // idempotency semantics.
+      assertSecureBinAuthority(role, [originBin]);
 
       // ── one open hold per (tenant, warehouse, sku, bin) scope ──────────
       const openRows = await tx
@@ -441,10 +458,10 @@ export class QcCommand {
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── authority at command-service entry (the fail-closed order) ──────
-      assertPermission(
-        await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
-        'qc.manage',
-      );
+      // The role stays in scope: story 12-3's secure-bin authority gate
+      // re-uses it below, on the origin bin read.
+      const role = await getMemberRoleIn(tx, command.tenantId, command.actorUserId);
+      assertPermission(role, 'qc.manage');
 
       const existing = await tx
         .select()
@@ -491,7 +508,13 @@ export class QcCommand {
       // this check — a retired origin bin is operationally gone even though
       // its row remains.
       const originRows = await tx
-        .select({ id: bins.id, code: bins.code, retiredAt: bins.retiredAt })
+        .select({
+          id: bins.id,
+          code: bins.code,
+          retiredAt: bins.retiredAt,
+          // Story 12-3 — the class the secure-origin authority gate rules on.
+          storageClass: bins.storageClass,
+        })
         .from(bins)
         .where(
           and(
@@ -518,6 +541,19 @@ export class QcCommand {
           `The hold's origin bin ("${origin.code}") is retired — the held stock cannot return to a retired bin. Resolve the bin state first; the hold stays open.`,
         );
       }
+      // ── story 12-3: the secure-bin authority gate (FR-42) — on the origin
+      // read: released units RETURN to the origin bin, so a SECURE origin
+      // additionally requires `secure.move`, the (role, bin) authority
+      // decided on the row already in hand. (The PENDING `inbound:45`
+      // currency note on this read stands — story 12-3 adds the assert on
+      // the class read here, not the lock.) Non-denying today (the matrix
+      // invariant keeps the subset enforced): `qc.manage` and `secure.move`
+      // are held by exactly the same roles. Non-secure releases are
+      // byte-identical to the pre-12.3 build. A replayed idempotency key
+      // returns the cached success before this gate — the original
+      // authorized execution already decided; that is deliberate
+      // idempotency semantics.
+      assertSecureBinAuthority(role, [origin]);
 
       // The release replays the hold's OWN qc.held arms — a concurrent hold
       // of the same SKU from another origin bin never returns with this one.

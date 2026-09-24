@@ -891,4 +891,65 @@ describe('QC hold and release (e2e, story 3.4)', () => {
       insert into qc_holds (id, tenant_id, warehouse_id, sku_id, bin_id, reason, status, held_by, held_at, released_by, released_at)
       values (${uuidv7()}, ${tenantId}, ${openRow!.warehouse_id}, ${openRow!.sku_id}, ${openRow!.bin_id}, 'released twin', 'released', ${uuidv7()}, now(), ${uuidv7()}, now())`;
   });
+
+  // ── Story 12-3 — the secure-bin authority gate on hold + release (FR-42) ───
+
+  it('secure origin: a holder places and releases a hold on a secure-scope bin with byte-identical behavior (the gate fires and passes; the 403 shape is unit-pinned in users.spec)', async () => {
+    // A secure bin. The stock in it is a PLAIN-class SKU seeded through the
+    // stock.adjust bypass: the gate asks (role, bin), not (sku, bin) — the
+    // 12-1 class rule and the 12-3 authority rule are independent questions
+    // on the same bin row.
+    const binSecure = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A-95-01', capacity: 1000, type: 'shelf', storageClass: 'secure' })
+        .expect(201)
+    ).body.id as string;
+    const secBinSkuId = skuIds.get('QC-EMPTY')!;
+    await seedStock(secBinSkuId, binSecure, 2);
+
+    // THE HOLD ARM: an ops_manager (a holder) holds the secure scope — the
+    // gate is on this call and passes. The movement is the usual one.
+    const holdKey = ulid();
+    const holdRes = await placeHold(
+      { warehouseId, skuId: secBinSkuId, binId: binSecure, reason: 'secure-scope check' },
+      opsToken,
+      holdKey,
+    ).expect(201);
+    const holdId = holdRes.body.qcHold.id as string;
+    expect(await qcHoldRow(holdId)).toMatchObject({ status: 'open' });
+    const heldRows = await holdLedgerRows(holdId);
+    expect(heldRows).toHaveLength(1);
+    expect(heldRows[0]).toMatchObject({
+      type: 'qc.held',
+      quantity_delta: 2,
+      from_bin_id: binSecure,
+    });
+    expect(await onHandAtBin(binSecure, secBinSkuId)).toBe(0);
+    expect(await onHandAtBin(await qcBinId(), secBinSkuId)).toBe(2);
+
+    // THE RELEASE ARM: the same holder releases — the origin read now carries
+    // the storage class, the gate fires, and the return is the usual one.
+    await releaseHold(holdId, opsToken).expect(200);
+    expect(await qcHoldRow(holdId)).toMatchObject({ status: 'released' });
+    const releasedRows = await holdLedgerRows(holdId);
+    expect(releasedRows).toHaveLength(2);
+    expect(releasedRows[1]).toMatchObject({
+      type: 'qc.released',
+      quantity_delta: 2,
+      to_bin_id: binSecure,
+    });
+    expect(await onHandAtBin(binSecure, secBinSkuId)).toBe(2);
+
+    // The owner passes the same gates (the second holder), on a fresh scope.
+    await seedStock(secBinSkuId, binSecure, 1);
+    const ownerHold = await placeHold(
+      { warehouseId, skuId: secBinSkuId, binId: binSecure, reason: 'owner arm' },
+      ownerToken,
+    ).expect(201);
+    await releaseHold((ownerHold.body.qcHold as { id: string }).id, ownerToken).expect(200);
+    expect(await onHandAtBin(binSecure, secBinSkuId)).toBe(3);
+  });
 });

@@ -47,7 +47,7 @@ import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { deviceRevoked } from '../tenancy/enrollment.command';
 import { ensureReceivingBinInTx } from '../tenancy/receiving-bin';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
-import { assertPermission } from '../tenancy/permissions';
+import { assertPermission, assertSecureBinAuthority } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -554,6 +554,17 @@ export class PutawayCommand {
           sku.storageClass,
         );
       }
+      // ── story 12-3: the secure-bin authority gate (FR-42) — immediately
+      // after the class gate, inside the same bin-row `.for('update')`
+      // window: a SECURE target additionally requires `secure.move`, the
+      // (role, bin) authority decided on the row already in hand (no new
+      // query, no lock change). Owner + Ops Manager only — an operator's
+      // placement into the cage 403s `role-denied` naming `secure.move`
+      // before the hazard gate or any load read runs; this writer is the
+      // gate's LIVE arm (merge/hold/release are non-denying today — the
+      // matrix invariant keeps the subset enforced); non-secure bins are
+      // byte-identical to the pre-12.3 build.
+      assertSecureBinAuthority(role, [targetBin]);
       // ── story 12-2: the hazard co-location gate (FR-41) — after the class
       // gate, before the load read, inside the bin-row `.for('update')` window
       // (a concurrent placement cannot slip an incompatible unit between the

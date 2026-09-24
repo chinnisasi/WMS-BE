@@ -35,7 +35,7 @@ import {
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
-import { assertPermission } from './permissions';
+import { assertPermission, assertSecureBinAuthority } from './permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from './tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
@@ -590,10 +590,10 @@ export class BinCommand {
       command.tenantId,
       async (tx) => {
         // Authority at command-service entry (Story 1.5) — DB read, same tx.
-        assertPermission(
-          await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
-          'bin.retire',
-        );
+        // The role stays in scope: story 12-3's secure-bin authority gate
+        // re-uses it below, on the locked bin rows.
+        const role = await getMemberRoleIn(tx, command.tenantId, command.actorUserId);
+        assertPermission(role, 'bin.retire');
 
         const existing = await tx
           .select()
@@ -732,6 +732,17 @@ export class BinCommand {
             })),
           );
         }
+
+        // ── story 12-3: the secure-bin authority gate (FR-42) — immediately
+        // after the class gate, BEFORE any arm moves, with both rows already
+        // locked: a SECURE source or target additionally requires
+        // `secure.move`, the (role, bin) authority decided on the rows
+        // already in hand. Non-denying today (the matrix invariant keeps
+        // the subset enforced): `bin.retire` and `secure.move` are held by
+        // exactly the same roles — a future grant must answer the cage
+        // question in the open. Non-secure merges are byte-identical to the
+        // pre-12.3 build.
+        assertSecureBinAuthority(role, [source, target]);
 
         // ── story 12-2: the hazard co-location gate (FR-41) — after the
         // class gate, BEFORE any arm moves: a merge that would park a SKU

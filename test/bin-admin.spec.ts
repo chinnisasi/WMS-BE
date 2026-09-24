@@ -10,6 +10,7 @@ import { MAX_BIN_DIMENSION_MM } from '../src/modules/tenancy/bin-capacity';
 import { BinCommand } from '../src/modules/tenancy/bin.command';
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { importSecureSku } from './support/secure-sku';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
@@ -1749,5 +1750,45 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     await merge(togetherSource, togetherTarget).expect(200);
     expect(await plainOnHand(togetherTarget, oxId)).toBe(1);
     expect(await plainOnHand(togetherTarget, flId)).toBe(1);
+  });
+
+  // ── Story 12-3 — the secure-bin authority gate on merge (FR-42) ────────────
+
+  it('secure merge: a holder merges cage-to-cage with byte-identical behavior (the gate fires and passes; the operator-less 403 shape is unit-pinned in users.spec)', async () => {
+    // A secure-class SKU (the shared fixture — import, then patch before any
+    // stock exists) and two secure bins. The source's stock arrives through
+    // the named stock.adjust bypass — the same state the merge guard reads on
+    // the floor.
+    const secSkuId = await importSecureSku(app, tenantId, ownerToken, 'BA-SEC');
+
+    const secureBin = async (code: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf', storageClass: 'secure' })
+          .expect(201)
+      ).body.id as string;
+    const ownerSource = await secureBin('A-95-01');
+    const ownerTarget = await secureBin('A-95-02');
+    await fill(ownerSource, secSkuId, 2);
+
+    // THE OWNER ARM: both bins are secure, so the 12-3 gate is ON this call —
+    // and it passes for a holder. The merge behaves exactly as it did before
+    // the gate existed: stock moved, source retired.
+    const res = await merge(ownerSource, ownerTarget).expect(200);
+    expect(res.body.moved).toEqual({ skus: 1, units: 2 });
+    expect(res.body.source.retiredAt).not.toBeNull();
+    expect(await plainOnHand(ownerTarget, secSkuId)).toBe(2);
+    expect(await plainOnHand(ownerSource, secSkuId)).toBe(0);
+
+    // THE OPS-MANAGER ARM: the second holder passes the same firing gate.
+    const opsSource = await secureBin('A-95-03');
+    const opsTarget = await secureBin('A-95-04');
+    await fill(opsSource, secSkuId, 1);
+    await merge(opsSource, opsTarget, opsManagerToken).expect(200);
+    expect(await plainOnHand(opsTarget, secSkuId)).toBe(1);
+    expect(await plainOnHand(opsSource, secSkuId)).toBe(0);
   });
 });
