@@ -1878,4 +1878,108 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       await sql.end();
     }
   });
+
+  // ── Story 12-3 — the secure-bin authority gate (FR-42) ─────────────────────
+
+  it('secure locations: an operator is 403 role-denied moving stock into a secure bin, an owner badge-in places, and the gate runs AFTER the class gate', async () => {
+    // A secure-class SKU and a secure bin in their own zone. The class comes
+    // through the real SKU edit (import first, then patch) — and BEFORE any
+    // stock exists, because the 12-1 class-edit guard refuses a class change
+    // over live stock.
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'PUT-SEC,Putaway Item SEC,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const secSkuId = (skus.body.items as { code: string; id: string }[]).find(
+      (item) => item.code === 'PUT-SEC',
+    )!.id as string;
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${secSkuId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'secure' })
+      .expect(200);
+
+    const zoneCage = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'CAGE', name: 'Cage zone' })
+        .expect(201)
+    ).body.id as string;
+    const binCage = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneCage}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'CAGE-01', capacity: 100, type: 'shelf', storageClass: 'secure' })
+        .expect(201)
+    ).body.id as string;
+
+    // GATE (placement): the operator's GRN is fine — the floor receives —
+    // but directing the unit into the cage is 403 `role-denied` naming
+    // `secure.move`. The gate rides the class gate's slot, so the GRN's
+    // ledger stays at `grn.received` alone and no placement row is written.
+    const grn = await blindGrn([{ poLineId: null, skuId: secSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const denied = await placeForLine(grn.lines[0]!, binCage).expect(403);
+    expect(denied.body).toMatchObject({ status: 403, code: 'role-denied' });
+    expect(denied.body.detail).toContain('secure.move');
+    expect(await ledgerRows(grn.grnId)).toHaveLength(1); // grn.received only
+    expect(await placementRowCount(grn.grnId)).toBe(0);
+    expect(await plainOnHand(binCage, secSkuId)).toBe(0);
+
+    // ORDER: the same unit into a CLASS-MISMATCHED bin still answers the 12-1
+    // 400, not the 12-3 403 — storage conformance stays the outermost gate.
+    const binAmbient = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneCage}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'CAGE-A', capacity: 100, type: 'shelf' })
+        .expect(201)
+    ).body.id as string;
+    const grnMismatch = await blindGrn([{ poLineId: null, skuId: secSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
+    const classFirst = await placeForLine(grnMismatch.lines[0]!, binAmbient).expect(400);
+    expect(classFirst.body).toMatchObject({ code: 'bin-storage-mismatch' });
+    expect(await placementRowCount(grnMismatch.grnId)).toBe(0);
+
+    // THE MIRROR ARM: the same placement as owner — the operator is promoted
+    // in place, the badge-in session re-reads the role per command, so the
+    // SAME token that just got 403 places with it. (The suggestion points at
+    // the empty 0-SE cage from the 12-1 test, so the directed placement
+    // carries the mismatch reason.)
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/users/${operatorUserId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ role: 'owner' })
+      .expect(200);
+    await placeForLine(grn.lines[0]!, binCage, { reasonCode: 'operator-preference' }).expect(201);
+    expect(await plainOnHand(binCage, secSkuId)).toBe(1);
+    expect((await ledgerRows(grn.grnId)).map((event) => event.type)).toEqual([
+      'grn.received',
+      'putaway.placed',
+    ]);
+    expect(await placementRowCount(grn.grnId)).toBe(1);
+
+    // Leave the suite the way it was found: the operator is demoted back.
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/users/${operatorUserId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ role: 'operator' })
+      .expect(200);
+  });
 });

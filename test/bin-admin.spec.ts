@@ -1750,4 +1750,66 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     expect(await plainOnHand(togetherTarget, oxId)).toBe(1);
     expect(await plainOnHand(togetherTarget, flId)).toBe(1);
   });
+
+  // ── Story 12-3 — the secure-bin authority gate on merge (FR-42) ────────────
+
+  it('secure merge: a holder merges cage-to-cage with byte-identical behavior (the gate fires and passes; the operator-less 403 shape lives in users.spec)', async () => {
+    // A secure-class SKU (import, then patch before any stock exists) and two
+    // secure bins. The source's stock arrives through the named stock.adjust
+    // bypass — the same state the merge guard reads on the floor.
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'BA-SEC,Bin Admin Item SEC,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const secSkuId = (skus.body.items as { code: string; id: string }[]).find(
+      (item) => item.code === 'BA-SEC',
+    )!.id;
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${secSkuId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'secure' })
+      .expect(200);
+
+    const secureBin = async (code: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf', storageClass: 'secure' })
+          .expect(201)
+      ).body.id as string;
+    const ownerSource = await secureBin('A-95-01');
+    const ownerTarget = await secureBin('A-95-02');
+    await fill(ownerSource, secSkuId, 2);
+
+    // THE OWNER ARM: both bins are secure, so the 12-3 gate is ON this call —
+    // and it passes for a holder. The merge behaves exactly as it did before
+    // the gate existed: stock moved, source retired.
+    const res = await merge(ownerSource, ownerTarget).expect(200);
+    expect(res.body.moved).toEqual({ skus: 1, units: 2 });
+    expect(res.body.source.retiredAt).not.toBeNull();
+    expect(await plainOnHand(ownerTarget, secSkuId)).toBe(2);
+    expect(await plainOnHand(ownerSource, secSkuId)).toBe(0);
+
+    // THE OPS-MANAGER ARM: the second holder passes the same firing gate.
+    const opsSource = await secureBin('A-95-03');
+    const opsTarget = await secureBin('A-95-04');
+    await fill(opsSource, secSkuId, 1);
+    await merge(opsSource, opsTarget, opsManagerToken).expect(200);
+    expect(await plainOnHand(opsTarget, secSkuId)).toBe(1);
+    expect(await plainOnHand(opsSource, secSkuId)).toBe(0);
+  });
 });

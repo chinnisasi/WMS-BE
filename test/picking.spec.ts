@@ -2389,6 +2389,91 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(await onHand(frozenSkuId, binAmbient)).toBe(5);
   });
 
+  // ── Story 12-3 — the secure-bin authority gate at the pick (FR-42) ────────
+
+  it('a pick drawn from a secure bin is refused 403 role-denied for an operator, places for an owner badge-in, and the gate runs AFTER the class gate', async () => {
+    // A secure-class SKU (import, then patch — before any stock exists, the
+    // same 12-1 ordering), a secure bin, and stock seeded through the named
+    // stock.adjust bypass. The wave then plans the secure draw.
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'PCK-SEC,Pick SKU PCK-SEC,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const secSkuId = (skus.body.items as { code: string; id: string }[]).find(
+      (item) => item.code === 'PCK-SEC',
+    )!.id;
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${secSkuId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'secure' })
+      .expect(200);
+
+    const binSecure = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ capacity: 10000, type: 'shelf', code: 'A-81-01', storageClass: 'secure' })
+        .expect(201)
+    ).body.id as string;
+    await seedStock(secSkuId, binSecure, 3);
+
+    const { picklist } = await releasedWave([{ skuId: secSkuId, quantity: 3 }], 'secure-authority');
+    const line = picklist.lines[0]!;
+    expect(line.binId).toBe(binSecure);
+
+    // THE GATE: the operator scans the planned secure draw. The class gate
+    // passes (exact match) and the authority gate refuses — 403
+    // `role-denied` naming `secure.move`, nothing written.
+    const denied = await pick(bodyFor(line)).expect(403);
+    expect(denied.body).toMatchObject({ status: 403, code: 'role-denied' });
+    expect(denied.body.detail).toContain('secure.move');
+    expect(await ledgerFor(line.id)).toHaveLength(0);
+    expect(await lineStatus(line.id)).toBe('planned');
+    expect(await onHand(secSkuId, binSecure)).toBe(3);
+
+    // ORDER: a non-conforming draw from an ambient bin still answers the
+    // 12-1 400 — storage conformance stays the outermost gate. (The ambient
+    // bin has none of this SKU, but the class guard reads the BIN row, not
+    // the stock, so the refusal is the class one.)
+    const binAmbient = await createBin('A-81-02');
+    const classFirst = await pick(bodyFor(line, { binId: binAmbient })).expect(400);
+    expect(classFirst.body).toMatchObject({ code: 'bin-storage-mismatch' });
+    expect(await ledgerFor(line.id)).toHaveLength(0);
+
+    // THE MIRROR ARM: the operator promoted to owner places the SAME scan —
+    // the badge-in session re-reads the role per command.
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/users/${operatorUserId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ role: 'owner' })
+      .expect(200);
+    await pick(bodyFor(line)).expect(201);
+    expect(await onHand(secSkuId, binSecure)).toBe(0); // the line drew all 3
+    expect(await lineStatus(line.id)).toBe('picked');
+
+    // Leave the suite the way it was found.
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/users/${operatorUserId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ role: 'operator' })
+      .expect(200);
+  });
+
   // ── the schema contract: RLS + the 0019 CHECKs ────────────────────────────
 
   it('RLS on `picks` and `bin_state_epochs`: foreign rows are invisible, own rows are visible, a foreign insert is 42501; the four CHECKs hold', async () => {

@@ -33,7 +33,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { deviceRevoked } from '../tenancy/enrollment.command';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
-import { assertPermission } from '../tenancy/permissions';
+import { assertPermission, assertSecureBinAuthority } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -774,6 +774,14 @@ export class PickCommandService {
       if (!storageClassSatisfies(sku.storageClass, drawBin.storageClass)) {
         throw binStorageMismatch(drawBin.code, sku.code, drawBin.storageClass, sku.storageClass);
       }
+      // ── story 12-3: the secure-bin authority gate (FR-42) — immediately
+      // after the class gate, inside the bin-row `.for('update')` window,
+      // before the serial locks: a SECURE draw bin additionally requires
+      // `secure.move`, the (role, bin) authority decided on the row already
+      // in hand. Owner + Ops Manager only — an operator's draw out of the
+      // cage 403s `role-denied` naming `secure.move` and writes nothing;
+      // non-secure bins are byte-identical to the pre-12.3 build.
+      assertSecureBinAuthority(role, [drawBin]);
 
       // A SKU that is BOTH batch- and serial-tracked cannot be picked here.
       // The payload carries serial numbers but no batch, `serials` holds no

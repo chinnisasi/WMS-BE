@@ -74,6 +74,17 @@ export const CAPABILITIES = [
   // Accountant stays read-only. Mirrored into wms-fe `src/lib/users.ts` by
   // the 4.2b FE story with the other outbound capabilities.
   'dispatch.execute',
+  // Story 12-3 — FR-42's authority gate: high-value/controlled stock lives in
+  // secure/cage-class bins, and every ledger movement that touches one
+  // (placement target, merge source AND target, pick draw, QC-hold origin —
+  // held units leave it — and QC-release origin-return) asserts this
+  // capability beside that command's existing class gate, via
+  // `assertSecureBinAuthority` below. Owner + Ops Manager only (decided,
+  // human, 2026-09-24): the cage is off-limits to floor staff — badge-in
+  // sessions carry the actor's own role, so an operator's placement or pick
+  // into/out of a secure bin 403s even though the floor verbs themselves are
+  // theirs. Mirrored into wms-fe `src/lib/users.ts`.
+  'secure.move',
   // Story 4.6b — the carrier credential vault (connect a carrier account,
   // rotate its material, disconnect it). A SETTINGS capability, mirroring
   // `device.manage` / `vendor.manage`: Owner and Ops Manager only, absent
@@ -94,8 +105,9 @@ export type Capability = (typeof CAPABILITIES)[number];
  * mutations (warehouses, zones, bins, catalog import, SKU edit) but no user
  * management; Operator holds exactly the floor capabilities a device session
  * needs (`putaway.execute`, Story 3.5 — the first non-empty operator
- * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6); Accountant is read-only. Reads stay open to any
- * tenant member.
+ * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6) and NOT `secure.move` (Story 12-3 — the
+ * cage is off-limits to floor staff); Accountant is read-only. Reads stay
+ * open to any tenant member.
  */
 export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability>>> = {
   owner: new Set<Capability>(CAPABILITIES),
@@ -120,6 +132,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'pack.execute',
     'dispatch.execute',
     'carrier.manage',
+    // Story 12-3 — FR-42: the cage is a manager verb (owner holds everything).
+    'secure.move',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
@@ -149,4 +163,37 @@ export function assertPermission(role: UserRole, capability: Capability): void {
       `Role "${role}" does not include the "${capability}" capability.`,
     );
   }
+}
+
+/**
+ * FR-42's secure-bin authority gate (Story 12-3): a ledger movement whose
+ * bin row carries `storageClass: 'secure'` additionally requires the
+ * `secure.move` capability — the (role, bin) authority question, decided on
+ * the SAME bin row the class gates already hold, so the assert rides the
+ * existing gate slot with no new query and no lock change.
+ *
+ * One assert over the involved bins, not one per pair — the capability is
+ * about touching the cage at all, not about which direction the stock moves.
+ * The refusal is exactly `assertPermission`'s 403 `role-denied` shape,
+ * naming `secure.move`. A bin whose class is anything else (or null) never
+ * triggers it — non-secure movements are byte-identical to the pre-12.3
+ * build.
+ *
+ * Callers (the five movement writers — placement target, merge source AND
+ * target, pick draw, QC-hold origin, QC-release origin-return) run this
+ * beside their existing storage-class gate, with the role already re-read
+ * per AD-10. Today the gate can only fire on placement and pick —
+ * `bin.retire` and `qc.manage` are held by exactly the roles that hold
+ * `secure.move` — and the matrix-invariant test in `test/users.spec.ts`
+ * keeps that subset enforced, so a future grant must answer the cage
+ * question in the open.
+ */
+export function assertSecureBinAuthority(
+  role: UserRole,
+  bins: readonly { storageClass: string | null }[],
+): void {
+  if (!bins.some((bin) => bin.storageClass === 'secure')) {
+    return;
+  }
+  assertPermission(role, 'secure.move');
 }

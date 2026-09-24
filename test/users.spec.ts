@@ -6,6 +6,13 @@ import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
+import {
+  assertSecureBinAuthority,
+  CAPABILITIES,
+  ROLE_CAPABILITIES,
+} from '../src/modules/tenancy/permissions';
+import type { UserRole } from '../src/shared/db/schema';
+import type { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 
@@ -786,6 +793,76 @@ describe('users, roles, and permission gating (e2e)', () => {
       );
     } finally {
       await check.end();
+    }
+  });
+
+  // Story 12-3 — the matrix invariant behind the secure-bin authority gate.
+  // For merge/hold/release the gate is DEAD CODE while the subset holds: the
+  // holder sets of `bin.retire` and `qc.manage` are subsets of the
+  // `secure.move` holders. This test turns that implicit subset into an
+  // enforced one, so a future grant to bin.retire/qc.manage that forgets
+  // secure.move fails here instead of opening the cage. The other two
+  // movement capabilities are NOT in the invariant — `putaway.execute` and
+  // `picks.execute` are floor verbs the operator deliberately holds WITHOUT
+  // `secure.move` (decided 2026-09-24: the cage is off-limits to floor
+  // staff), and the gate at those two writers is live code protected by the
+  // e2e 403s in putaway.spec / picking.spec, not by this matrix test.
+  test('every role holding bin.retire or qc.manage also holds secure.move (the cage invariant)', () => {
+    const deadCodeCapabilities = ['bin.retire', 'qc.manage'] as const;
+    const roles: UserRole[] = ['owner', 'ops_manager', 'operator', 'accountant'];
+    const secureMoveHolders = roles.filter((role) => ROLE_CAPABILITIES[role].has('secure.move'));
+
+    for (const capability of deadCodeCapabilities) {
+      const holders = roles.filter((role) => ROLE_CAPABILITIES[role].has(capability));
+      // Not vacuous: the capability must actually be granted to somebody.
+      expect(holders.length).toBeGreaterThan(0);
+      // The invariant: every holder of the movement capability is inside the
+      // cage-capable set — so the merge/hold/release asserts can never 403 a
+      // legitimate holder, and a future grant that breaks the subset fails
+      // here.
+      for (const role of holders) {
+        expect(secureMoveHolders).toContain(role);
+      }
+    }
+
+    // The decided matrix (2026-09-24), spelled out: owner and ops_manager
+    // only — and the floor verbs stay out of the cage.
+    expect([...CAPABILITIES]).toHaveLength(23);
+    expect(CAPABILITIES).toContain('secure.move');
+    expect(secureMoveHolders).toEqual(['owner', 'ops_manager']);
+    expect(ROLE_CAPABILITIES.operator.has('putaway.execute')).toBe(true);
+    expect(ROLE_CAPABILITIES.operator.has('picks.execute')).toBe(true);
+    expect(ROLE_CAPABILITIES.operator.has('secure.move')).toBe(false);
+  });
+
+  // The 403 shape a secure-bin movement answers with: the standard
+  // `role-denied` problem detail naming the role and the capability — the
+  // device shows "needs a manager" from the detail alone.
+  test("the secure-bin gate's 403 names secure.move and the denied role", () => {
+    // No secure bin involved — every role passes, including the capability-less.
+    for (const role of ['owner', 'ops_manager', 'operator', 'accountant'] as const) {
+      expect(() =>
+        assertSecureBinAuthority(role, [{ storageClass: 'ambient' }, { storageClass: null }]),
+      ).not.toThrow();
+    }
+
+    // A secure bin denies a role without the capability…
+    let thrown: ProblemException | undefined;
+    try {
+      assertSecureBinAuthority('accountant', [{ storageClass: 'secure' }]);
+    } catch (error) {
+      thrown = error as ProblemException;
+    }
+    expect(thrown).toBeDefined();
+    const body = thrown!.getResponse() as { status: number; code: string; detail: string };
+    expect(body.status).toBe(403);
+    expect(body.code).toBe('role-denied');
+    expect(body.detail).toContain('accountant');
+    expect(body.detail).toContain('secure.move');
+
+    // …and lets a holder through.
+    for (const role of ['owner', 'ops_manager'] as const) {
+      expect(() => assertSecureBinAuthority(role, [{ storageClass: 'secure' }])).not.toThrow();
     }
   });
 });
