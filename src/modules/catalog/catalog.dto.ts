@@ -29,6 +29,8 @@ import { IMPORT_MODES, GST_RATE_BPS_MAX } from './import.command';
 // Story 12-1: the storage-class vocabulary — the DTO mirror of the shared
 // primitive's tuple (the three-layer pattern: TS tuple / DB CHECK / @IsIn).
 import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
+// Story 12-2 — the hazard vocabulary tuple, the same three-layer pattern.
+import { HAZARD_CLASSES } from '../../shared/primitives/hazard';
 import { UOMS } from './uom';
 import { MAX_SKU_DIMENSION_MM, MAX_SKU_WEIGHT_GRAMS } from './sku-attributes';
 import { AXIS_NAME_MAX, MAX_PRODUCT_AXES, PRODUCT_NAME_MAX } from './product.command';
@@ -218,6 +220,17 @@ export class SkuResponse {
   // carries one; pre-12.1 rows read 'ambient').
   @ApiProperty({ enum: STORAGE_CLASSES, example: 'ambient' })
   storageClass!: string;
+
+  // Story 12-2: the controlled-vocabulary hazard class (FR-41), required but
+  // NULLABLE — toSnapshot always sets it, and every pre-12.2 row (and import
+  // row without the cell) reads null.
+  @ApiProperty({
+    enum: HAZARD_CLASSES,
+    nullable: true,
+    example: 'flammable',
+    description: 'The SKU\'s hazard class (FR-41), or null when it carries none. Null carries no rule in either direction of the segregation matrix.',
+  })
+  hazardClass!: string | null;
 
   @ApiProperty({ example: '0198f7a2-1b3c-7d4e-8f90-112233445588', description: 'Generated server-side (uuidv7) unless provided' })
   barcode!: string;
@@ -443,6 +456,25 @@ export class PatchSkuDto {
   @IsOptional()
   @IsIn(STORAGE_CLASSES)
   storageClass?: string;
+
+  // Story 12-2: the SKU's hazard class (FR-41) — absent = unchanged, NULL =
+  // clear (the 11.2 attribute template; the column is nullable, so the clear
+  // verb exists and there is NO explicit-null 400 at the controller, unlike
+  // `storageClass`). The vocabulary is pinned HERE with `@IsIn` and
+  // re-checked in the command (`assertHazardClass`, which skips null — the
+  // clear verb — behind the replay lookup; the mirror is not the boundary).
+  // A change runs the co-location guard (409 `hazard-segregation-conflict`).
+  @ApiProperty({
+    required: false,
+    enum: HAZARD_CLASSES,
+    nullable: true,
+    example: 'flammable',
+    description:
+      'The SKU\'s hazard class (FR-41): explosive, oxidizer, flammable, corrosive-acid, corrosive-base, toxic or gas. Omit to leave unchanged; null clears the class (always succeeds — null carries no rule).',
+  })
+  @IsOptional()
+  @IsIn(HAZARD_CLASSES)
+  hazardClass?: string | null;
 }
 
 // ── Story 11.3 — the product (AD-19): identity only, above `skus` ──────────

@@ -5,6 +5,7 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { toMilli } from '../src/shared/primitives/quantity';
 import { testAddress } from './support/shipment-address';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
+import { HAZARD_CLASSES } from '../src/shared/primitives/hazard';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -305,7 +306,7 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
     expect(res.body.code).toBe('validation-failed');
     // 11-3 added productId and variantValues to the optional fields the
     // detail enumerates — an empty body still lists them alongside 11-2's;
-    // 12-1 appends storageClass the same way.
+    // 12-1 appends storageClass the same way; 12-2 appends hazardClass.
     for (const field of [
       'weightGrams',
       'lengthMm',
@@ -315,6 +316,7 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
       'productId',
       'variantValues',
       'storageClass',
+      'hazardClass',
     ]) {
       expect(String(res.body.detail)).toContain(field);
     }
@@ -432,6 +434,36 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
       sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, weight_grams, country_of_origin)
           values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-3', 'probe', 'each', 1800, ${`BC-${ulid()}`}, null, null)`,
     ).resolves.toBeDefined();
+    // Story 12-2: the hazard vocabulary's DB backstop — a direct
+    // out-of-vocabulary write is 23514; the NULL arm stays storable (null is
+    // the unset shape, unlike the NOT NULL storage class — a null insert
+    // must SUCCEED here, or the clear verb could not exist).
+    await expect(
+      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
+          values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-HC', 'probe', 'each', 1800, ${`BC-${ulid()}`}, 'biohazard')`,
+    ).rejects.toThrow(/skus_hazard_class_check/);
+    await expect(
+      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
+          values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-HC2', 'probe', 'each', 1800, ${`BC-${ulid()}`}, null)`,
+    ).resolves.toBeDefined();
+    // ...and the ACCEPTANCE side: every one of the seven vocabulary values
+    // inserts cleanly (the refusal side is the 23514 probe above).
+    for (const hazardClass of HAZARD_CLASSES) {
+      await expect(
+        sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
+            values (${uuidv7()}, ${tenantId}, ${`CHECK-PROBE-HC-${hazardClass}`}, 'probe', 'each', 1800, ${`BC-${ulid()}`}, ${hazardClass})`,
+      ).resolves.toBeDefined();
+    }
+    // The 0036 migration's shape, read back from the catalog: nullable
+    // column, exactly one CHECK carrying the seven-class vocabulary.
+    const hazardColumn = await sql`
+      select is_nullable from information_schema.columns
+      where table_name = 'skus' and column_name = 'hazard_class'`;
+    expect(hazardColumn[0]).toMatchObject({ is_nullable: 'YES' });
+    const hazardCheck = await sql`
+      select conname from pg_constraint
+      where conrelid = 'skus'::regclass and conname = 'skus_hazard_class_check'`;
+    expect(hazardCheck).toHaveLength(1);
   });
 
   // ── Story 12-1 — the storage class: import column, edit guard (FR-40) ─────
@@ -651,9 +683,11 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
       productId: null,
       variantValues: null,
       barcode: `BC-${ulid()}`,
-      // A real pre-12.1 snapshot carried the conversions (SkuSnapshot has
-      // them since the edit command first served a snapshot); the mapper at
-      // the edge maps them.
+      // A real pre-12.1 snapshot carried the replenishment fields (SkuSnapshot
+      // has had them since 10.1) and the conversions (since the edit command
+      // first served a snapshot); the mapper at the edge maps them.
+      reorderPoint: 0,
+      reorderQty: 0,
       uomConversions: [],
     };
     const seed = postgres(process.env.DATABASE_URL!, { max: 1 });
@@ -668,6 +702,303 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
     expect(legacyReplay.body).toMatchObject({
       id: legacySku.id,
       storageClass: 'ambient',
+      // Story 12-2: the same fallback pattern one layer deeper — the
+      // pre-12.1 snapshot carries no hazard class, and the replay pins the
+      // REQUIRED `hazardClass` field to null.
+      hazardClass: null,
+    });
+  });
+
+  // ── Story 12-2 — the hazard class: import column, edit guard (FR-41) ───────
+
+  test('the import carries hazard_class: a classed row lands it, a BLANK cell is null (the 11.2 attribute blank semantics — the column is nullable), and a misspelled class is a per-row error', async () => {
+    const headerWithHazard = `${CSV_HEADER},hazard_class`;
+    const rowWithHazard = (values: Record<string, string>): string =>
+      headerWithHazard.split(',').map((column) => values[column] ?? '').join(',');
+    const fileWithHazard = (rows: Record<string, string>[]): Buffer =>
+      Buffer.from([headerWithHazard, ...rows.map(rowWithHazard)].join('\n'), 'utf8');
+
+    const run = await importCsv(
+      fileWithHazard([
+        { sku_code: 'HC-IMP-FL', name: 'Imported flammable', uom: 'pcs', gst_rate: '1800', hazard_class: 'flammable' },
+        { sku_code: 'HC-IMP-BLANK', name: 'Blank class stays null', uom: 'pcs', gst_rate: '1800' },
+        { sku_code: 'HC-IMP-BAD', name: 'Not a recordable class', uom: 'pcs', gst_rate: '1800', hazard_class: 'biohazard' },
+      ]),
+    ).expect(201);
+    expect(run.body.committedRows).toBe(2);
+    expect(run.body.failedRows).toBe(1);
+    const error = (run.body.errors as { rowNumber: number; code: string; skuCode: string | null; detail: string }[])[0]!;
+    expect(error.rowNumber).toBe(3);
+    expect(error.code).toBe('validation-failed');
+    expect(error.skuCode).toBe('HC-IMP-BAD');
+    // The row error names the CSV COLUMN the user misspelled, not the
+    // command field the validator saw.
+    expect(error.detail).toContain('hazard_class');
+
+    const list = await listSkus().expect(200);
+    const byCode = new Map((list.body.items as { code: string; id: string; hazardClass: string | null }[]).map((s) => [s.code, s]));
+    expect(byCode.get('HC-IMP-FL')!.hazardClass).toBe('flammable');
+    // The blank-cell semantics: an omitted/empty cell is NULL — unlike the
+    // NOT NULL storage class, a hazard class is an attribute, not a default.
+    expect(byCode.get('HC-IMP-BLANK')!.hazardClass).toBeNull();
+    for (const code of ['HC-IMP-FL', 'HC-IMP-BLANK']) {
+      skuIds.set(code, byCode.get(code)!.id);
+    }
+  });
+
+  test('the SKU hazard edit: the vocabulary is closed at the boundary; its OWN stock in a bin never blocks the edit; a binmate of a segregated class is a 409 naming the bin and the binmate; a compatible class edits over the same stock; null ALWAYS clears; an open hold pins its origin bin', async () => {
+    // A warehouse of its own (the 12-1 guard test's shape): one storage bin
+    // through the real surface, and the system Receiving bin with staged
+    // intake stock written directly (this suite has no device/operator).
+    const warehouseId = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `HC-${ulid().slice(10, 16).toUpperCase()}`, name: `Hazard Guard Depot ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zoneId = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A', name: 'Aisle A' })
+        .expect(201)
+    ).body.id as string;
+    const hazardBin = async (code: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf' })
+          .expect(201)
+      ).body.id as string;
+    const binA = await hazardBin('A-01');
+    const receivingBin = (
+      await sql`
+        insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type, system_owned)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${zoneId}, 'RECEIVING', 10000, 'shelf', true)
+        returning id`
+    )[0] as unknown as { id: string };
+
+    await importCsv(
+      csvFile([
+        { sku_code: 'HC-GUARD', name: 'Hazard guard SKU', uom: 'pcs', gst_rate: '1800' },
+        { sku_code: 'HC-BM', name: 'Hazard binmate SKU', uom: 'pcs', gst_rate: '1800' },
+      ]),
+    ).expect(201);
+    const list = await listSkus().expect(200);
+    const byCode = new Map((list.body.items as { code: string; id: string }[]).map((s) => [s.code, s.id]));
+    const guardSkuId = byCode.get('HC-GUARD')!;
+    const binmateSkuId = byCode.get('HC-BM')!;
+    skuIds.set('HC-GUARD', guardSkuId);
+    skuIds.set('HC-BM', binmateSkuId);
+
+    // Intake shape: THREE staged units in the system Receiving bin BEFORE the
+    // first class is set. The edit MUST pass — the guard excludes system
+    // bins, or no intake SKU could ever take a class.
+    await sql`
+      insert into stock_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, quantity)
+      values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${guardSkuId}, ${receivingBin.id}, ${toMilli(3)})`;
+
+    // The closed vocabulary, at the command boundary (the DTO mirror refuses
+    // the same shape earlier): a misspelled class is a 400 naming the field.
+    const bad = await patchSku(guardSkuId, { hazardClass: 'biohazard' }).expect(400);
+    expect(bad.body).toMatchObject({ status: 400, code: 'validation-failed' });
+    expect(String(bad.body.detail)).toContain('hazardClass');
+
+    // FIRST SET + THE OWN-SKU SKIP: two units of the SKU itself parked in
+    // `A-01` (the named adjustment bypass, written directly). Assigning its
+    // FIRST class must pass — a bin whose only occupants are the SKU's own
+    // units can never segregate from itself.
+    await sql`
+      insert into stock_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, quantity)
+      values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${guardSkuId}, ${binA}, ${toMilli(2)})`;
+    const firstSet = await patchSku(guardSkuId, { hazardClass: 'explosive' }).expect(200);
+    expect(firstSet.body.hazardClass).toBe('explosive');
+
+    // THE STOCK ARM: an oxidizer binmate arrives in the same bin (the
+    // binmate takes its class while stockless — its own guard has nothing to
+    // strand) — now the
+    // change to `flammable` (the class the review loopback's oxidiser/fuel
+    // example pins) would strand live stock beside a segregated class: 409
+    // `hazard-segregation-conflict` naming the bin, the binmate and both
+    // classes. The class stays put.
+    await patchSku(binmateSkuId, { hazardClass: 'oxidizer' }).expect(200);
+    await sql`
+      insert into stock_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, quantity)
+      values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${binmateSkuId}, ${binA}, ${toMilli(1)})`;
+    const stranded = await patchSku(guardSkuId, { hazardClass: 'flammable' }).expect(409);
+    expect(stranded.body).toMatchObject({ status: 409, code: 'hazard-segregation-conflict' });
+    expect(String(stranded.body.detail)).toContain('HC-GUARD');
+    expect(String(stranded.body.detail)).toContain('flammable');
+    expect(String(stranded.body.detail)).toContain('A-01');
+    expect(String(stranded.body.detail)).toContain('HC-BM');
+    expect(String(stranded.body.detail)).toContain('oxidizer');
+    const unchanged = await listSkus().expect(200);
+    expect(
+      (unchanged.body.items as { code: string; hazardClass: string | null }[]).find((s) => s.code === 'HC-GUARD')!.hazardClass,
+    ).toBe('explosive');
+
+    // THE NO-OP SKIP: re-patching the SAME class with the same incompatible
+    // binmate present is 200 — the guard body runs only on a CHANGE (a
+    // same-class edit strands nothing new).
+    const noOp = await patchSku(guardSkuId, { hazardClass: 'explosive' }).expect(200);
+    expect(noOp.body.hazardClass).toBe('explosive');
+
+    // BOTH class fields in one body: the 12-1 storage-class gate passes (an
+    // explicit `ambient` is the SKU's current class — the field locks, its
+    // guard body skips) and the 12-2 hazard gate refuses — the guards run
+    // in their fixed order and the whole patch commits nothing.
+    const mixed = await patchSku(guardSkuId, { storageClass: 'ambient', hazardClass: 'flammable' }).expect(409);
+    expect(mixed.body).toMatchObject({ status: 409, code: 'hazard-segregation-conflict' });
+    expect(String(mixed.body.detail)).toContain('A-01');
+    const stillExplosive = await listSkus().expect(200);
+    const stillRow = (stillExplosive.body.items as { code: string; hazardClass: string | null; storageClass: string }[]).find((s) => s.code === 'HC-GUARD')!;
+    expect(stillRow.hazardClass).toBe('explosive');
+    expect(stillRow.storageClass).toBe('ambient'); // the storage arm was not applied either — nothing committed
+
+    // THE PREDICATE, NOT A BLANKET: a COMPATIBLE class edits over the SAME
+    // stock (explosive beside toxic is a decided-compatible pair) — 200.
+    const compatible = await patchSku(guardSkuId, { hazardClass: 'toxic' }).expect(200);
+    expect(compatible.body.hazardClass).toBe('toxic');
+
+    // THE CLEAR VERB: `null` ALWAYS succeeds — clearing carries no new rule
+    // for any bin the SKU sits in — and reads back null.
+    const cleared = await patchSku(guardSkuId, { hazardClass: null }).expect(200);
+    expect(cleared.body.hazardClass).toBeNull();
+
+    // THE HOLD ARM: the hold moves the bin's stock to the QC bin (a SYSTEM
+    // bin — excluded from the stock scan), so the bin the SKU itself stocks
+    // is `A-02` only… but the hold pins its ORIGIN bin, and an edit to a
+    // class that origin bin's REMAINING binmate segregates from is 409
+    // naming the origin bin, the binmate and the HOLD id (triage #15).
+    const hold = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/qc-holds`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ warehouseId, skuId: guardSkuId, binId: binA, reason: 'leaking drum' })
+        .expect(201)
+    ).body.qcHold as { id: string };
+    const heldEdit = await patchSku(guardSkuId, { hazardClass: 'explosive' }).expect(409);
+    expect(heldEdit.body).toMatchObject({ status: 409, code: 'hazard-segregation-conflict' });
+    expect(String(heldEdit.body.detail)).toContain(hold.id);
+    expect(String(heldEdit.body.detail)).toContain('A-01');
+    expect(String(heldEdit.body.detail)).toContain('HC-BM');
+    expect(String(heldEdit.body.detail)).toContain('oxidizer');
+    expect(String(heldEdit.body.detail)).toContain('explosive');
+
+    // Release returns the stock to the origin bin — the stock arm is live
+    // again (the same edit refuses, now from the bin row itself), and a
+    // compatible class still edits over the same stock.
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/qc-holds/${hold.id}/release`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+    const releasedRefusal = await patchSku(guardSkuId, { hazardClass: 'explosive' }).expect(409);
+    expect(String(releasedRefusal.body.detail)).toContain('A-01');
+    const releasedEdit = await patchSku(guardSkuId, { hazardClass: 'corrosive-base' }).expect(200);
+    expect(releasedEdit.body.hazardClass).toBe('corrosive-base');
+  });
+
+  test('the hazard edit replays: a class-carrying edit re-serves its snapshot without re-running the guard, and a pre-12.2 snapshot (post-12.1 shape) replays with the null fallback on a byte-identical legacy digest', async () => {
+    // A SKU of its own for the replay arms, plus its future binmate.
+    await importCsv(
+      csvFile([
+        { sku_code: 'HC-REPLAY', name: 'Hazard replay base', uom: 'pcs', gst_rate: '1800' },
+        { sku_code: 'HC-RBM', name: 'Hazard replay binmate', uom: 'pcs', gst_rate: '1800' },
+      ]),
+    ).expect(201);
+    const items = (await listSkus().expect(200)).body.items as { code: string; id: string }[];
+    const replaySku = items.find((s) => s.code === 'HC-REPLAY')!;
+    const replayBinmate = items.find((s) => s.code === 'HC-RBM')!;
+    await patchSku(replayBinmate.id, { hazardClass: 'oxidizer' }).expect(200);
+
+    // A class-carrying edit under key K, then stock parked afterwards in a
+    // non-system bin TOGETHER with a segregated binmate (written directly —
+    // the named adjustment bypass shape). The replay must RE-SERVE the
+    // snapshot — the hazard guard sits behind the replay lookup, so
+    // re-running it would 409 on flammable-vs-oxidizer; the 10.2 rule says
+    // it must not.
+    const key = ulid();
+    const first = await patchSku(replaySku.id, { hazardClass: 'flammable' }, key).expect(200);
+    expect(first.body.hazardClass).toBe('flammable');
+    const parkedBin = (
+      await sql`
+        insert into stock_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, quantity)
+        select ${uuidv7()}, ${tenantId}, b.warehouse_id, x.sku_id, b.id, x.qty
+        from bins b,
+             (values (${replaySku.id}::uuid, ${toMilli(2)}::bigint), (${replayBinmate.id}::uuid, ${toMilli(1)}::bigint)) as x(sku_id, qty)
+        where b.tenant_id = ${tenantId} and b.system_owned = false
+        limit 1
+        returning id`
+    ) as unknown as { id: string }[];
+    expect(parkedBin).toHaveLength(1); // the guard would 409 this state if re-run — the premise must not be vacuous
+    const replay = await patchSku(replaySku.id, { hazardClass: 'flammable' }, key).expect(200);
+    expect(replay.body).toEqual(first.body);
+
+    // Legacy replay: a key whose payload was minted by a pre-12.2 build
+    // (name + gstRate only — the hand-computed digest below is what THAT
+    // build hashed) and whose stored snapshot predates the 12-2 column but
+    // carries the 12-1 `storageClass`. A hash-shape change would answer 422
+    // idempotency-key-reuse here, not 200; a missing fallback would omit the
+    // required `hazardClass` field.
+    await importCsv(csvFile([{ sku_code: 'HC-LEGACY-22', name: 'Legacy digest 22', uom: 'pcs', gst_rate: '1800' }])).expect(201);
+    const legacyItems = (await listSkus().expect(200)).body.items as { code: string; id: string }[];
+    const legacySku = legacyItems.find((s) => s.code === 'HC-LEGACY-22')!;
+    const legacyKey = ulid();
+    const legacyHash = hashCommandPayload({
+      tenantId,
+      skuId: legacySku.id,
+      name: 'Legacy digest 22',
+      gstRateBps: 1800,
+      // NOTE the absence: a pre-12.2 build had no `hazardClass` key to emit.
+      // `JSON.stringify` drops it on today's build too (absent = unchanged),
+      // which is exactly what makes the two builds hash the same bytes.
+    });
+    const legacySnapshot = {
+      id: legacySku.id,
+      tenantId,
+      code: 'HC-LEGACY-22',
+      name: 'Legacy digest 22',
+      uom: 'pcs',
+      uomPrecision: 0,
+      gstRateBps: 1800,
+      hsn: null,
+      batchTracked: false,
+      serialTracked: false,
+      catchWeightTracked: false,
+      weightGrams: null,
+      lengthMm: null,
+      widthMm: null,
+      heightMm: null,
+      countryOfOrigin: null,
+      productId: null,
+      variantValues: null,
+      storageClass: 'ambient', // a post-12.1 build served the class — only the hazard column is new here
+      barcode: `BC-${ulid()}`,
+      reorderPoint: 0,
+      reorderQty: 0,
+      uomConversions: [],
+    };
+    const seed = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await seed`
+        insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+        values (${uuidv7()}, ${tenantId}, ${legacyKey}, ${legacyHash}, ${seed.json(legacySnapshot)})`;
+    } finally {
+      await seed.end();
+    }
+    const legacyReplay = await patchSku(legacySku.id, { name: 'Legacy digest 22', gstRate: 1800 }, legacyKey).expect(200);
+    expect(legacyReplay.body).toMatchObject({
+      id: legacySku.id,
+      storageClass: 'ambient',
+      hazardClass: null,
     });
   });
 });

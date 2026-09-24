@@ -40,6 +40,9 @@ import {
 import { assertSkuAttributes, type SkuAttributeFields } from './sku-attributes';
 // Story 12-1 — the one storage-class validator, beside the attributes'.
 import { assertStorageClass } from '../../shared/primitives/storage-class';
+// Story 12-2 — the hazard vocabulary validator (the same shape, skipping
+// null — the blank cell IS the null verb on this column).
+import { assertHazardClass } from '../../shared/primitives/hazard';
 import {
   AXIS_NAME_MAX,
   PRODUCT_NAME_MAX,
@@ -140,6 +143,11 @@ const OPTIONAL_COLUMNS = [
   // pre-12.1 binary is rejected wholesale, so the header contract and the row
   // parser grow together (the 11.3 precedent).
   'storage_class',
+  // Story 12-2 — the hazard class (FR-41). A blank cell maps to NULL (the
+  // column is nullable — the 12-1 blank→ambient choice was NOT NULL-specific;
+  // null = "not hazardous" and carries no rule). The closed-header contract
+  // grows again (the 11.3 precedent).
+  'hazard_class',
 ] as const;
 const KNOWN_COLUMNS: ReadonlySet<string> = new Set([...REQUIRED_COLUMNS, ...OPTIONAL_COLUMNS]);
 
@@ -186,6 +194,8 @@ interface ValidRow {
   readonly kitComponents: readonly { readonly code: string; readonly qtyRaw: string }[] | null;
   /** Story 12-1 — the storage class; a blank cell maps to 'ambient', never null. */
   readonly storageClass: string;
+  /** Story 12-2 — the hazard class; a blank cell maps to null (the clear verb — the column is nullable). */
+  readonly hazardClass: string | null;
 }
 
 type FieldResult<T> = { ok: true; value: T } | { ok: false; error: CatalogImportErrorDto };
@@ -468,6 +478,9 @@ export class ImportCommand {
             // Story 12-1 — the class from the cell (blank → 'ambient', the
             // column DEFAULT spelled out; never an explicit null).
             storageClass: row.storageClass,
+            // Story 12-2 — the hazard class from the cell (blank → null —
+            // the column is nullable; the 12-1 NOT NULL verb does not apply).
+            hazardClass: row.hazardClass,
           }));
           try {
             for (const chunk of chunked(skuRows)) {
@@ -1241,6 +1254,32 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
     };
   }
 
+  // Story 12-2 — the hazard class (FR-41). A blank cell maps to NULL — the
+  // column is nullable and null means "not hazardous", the clear verb (the
+  // 12-1 blank→ambient choice was NOT NULL-specific). `assertHazardClass`
+  // rules on every present value beside the 12-1 validator — a cell outside
+  // the controlled vocabulary is a per-row error naming the value, so the
+  // rest of the file still commits and `fix` mode can re-submit this row.
+  const hazardClassRaw = v['hazard_class']?.trim() ?? '';
+  const hazardClass = hazardClassRaw === '' ? null : hazardClassRaw;
+  try {
+    assertHazardClass({ hazardClass });
+  } catch (err) {
+    const response = (err as ProblemException).getResponse() as { detail?: string };
+    // The shared validator names the command field (`hazardClass`); the CSV
+    // caller's column is the snake_case header, so the row error names THAT
+    // (the row error is the import user's only view of the refusal).
+    return {
+      ok: false,
+      error: rowError(
+        row.rowNumber,
+        code,
+        'validation-failed',
+        response.detail?.replace('hazardClass', 'hazard_class') ?? 'Invalid hazard_class value.',
+      ),
+    };
+  }
+
   const conversions: { uom: string; factor: number }[] = [];
   const conversionsRaw = v['uom_conversions']?.trim() ?? '';
   if (conversionsRaw !== '') {
@@ -1352,6 +1391,9 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       kitComponents: kitComponentsParsed.value,
       // Story 12-1 — the parsed class (blank → 'ambient', never null).
       storageClass,
+      // Story 12-2 — the parsed hazard class (blank → null — the column is
+      // nullable; null is the row's "not hazardous" state).
+      hazardClass,
     },
   };
 }

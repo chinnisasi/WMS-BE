@@ -282,6 +282,9 @@ export class PutawayFacade {
         // Story 12-1 — the class the class gate rules on (the row object is
         // passed straight to `candidateFitsSku`, so the shape must match).
         storageClass: skus.storageClass,
+        // Story 12-2 — the hazard class the co-location arm rules on (null =
+        // carries no rule).
+        hazardClass: skus.hazardClass,
       })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, skuIds)));
@@ -342,8 +345,10 @@ export class PutawayFacade {
       }
       // Story 11-5: the same fit predicate the suggestion and the placement
       // re-derivation use — a SKU without attributes still fits wherever the
-      // unit gate passes (fail-open on missing attributes).
-      const fit = candidates.find((candidate) => candidateFitsSku(candidate, sku, remaining));
+      // unit gate passes (fail-open on missing attributes). Story 12-2: the
+      // line's SKU id rides in so the hazard arm can skip its own occupant
+      // pairs (the same-SKU-consolidation rule).
+      const fit = candidates.find((candidate) => candidateFitsSku(candidate, sku, remaining, row.skuId));
       tasks.push({
         grnId: row.grnId,
         grnCode: row.grnCode,

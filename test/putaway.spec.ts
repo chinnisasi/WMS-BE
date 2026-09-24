@@ -1639,6 +1639,193 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     expect(await placementRowCount(secureGrn.grnId)).toBe(0);
   });
 
+  // ── Story 12-2 — hazard segregation matrix (FR-41) ─────────────────────────
+
+  it('hazard segregation: the placement co-location gate names both parties, the suggestion and the task derivation filter segregated bins (the re-derived suggestion excludes an incompatible LOWER-occupancy bin), an explosive tops up its own bin without a mismatch reason, and null carries no rule in either direction', async () => {
+    // Four SKUs through the real surfaces: import, then the SKU edit's
+    // hazardClass field. PUT-B stays class-less (null carries no rule).
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'PUT-O,Putaway Item O,pcs,,1800,,false,false,,,',
+      'PUT-FL,Putaway Item FL,pcs,,1800,,false,false,,,',
+      'PUT-EX,Putaway Item EX,pcs,,1800,,false,false,,,',
+      'PUT-E2,Putaway Item E2,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const byCode = new Map((skus.body.items as { code: string; id: string }[]).map((item) => [item.code, item.id]));
+    const oxidizerSkuId = byCode.get('PUT-O')!;
+    const flammableSkuId = byCode.get('PUT-FL')!;
+    const explosiveSkuId = byCode.get('PUT-EX')!;
+    const explosive2SkuId = byCode.get('PUT-E2')!;
+    for (const [skuId, hazardClass] of [
+      [oxidizerSkuId, 'oxidizer'],
+      [flammableSkuId, 'flammable'],
+      [explosiveSkuId, 'explosive'],
+      [explosive2SkuId, 'explosive'],
+    ] as const) {
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ hazardClass })
+        .expect(200);
+    }
+
+    // An OWN warehouse so the candidate pool is exactly the bins this test
+    // lays out — the co-location walk and the occupancy ranking stay
+    // deterministic (the 12-1 test's warehouse3 pattern).
+    const hazardWarehouseId = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `PUT4-${ulid().slice(10, 16).toUpperCase()}`, name: `Hazard Putaway Depot ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zoneH = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${hazardWarehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'H', name: 'Hazard zone' })
+        .expect(201)
+    ).body.id as string;
+    const hazardBin = async (code: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${hazardWarehouseId}/zones/${zoneH}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf' })
+          .expect(201)
+      ).body.id as string;
+    const bin0H1 = await hazardBin('0-H1');
+    const bin0H2 = await hazardBin('0-H2');
+
+    // Receipts and placements for the hazard warehouse, in one place.
+    const hzGrn = async (skuId: string, qty: number): Promise<Awaited<ReturnType<typeof blindGrn>>> => {
+      const res = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/goods-receipts`)
+        .set('Authorization', `Bearer ${operatorToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId: hazardWarehouseId,
+          poId: null,
+          blindReasonCode: 'unannounced-delivery',
+          occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+          lines: [{ poLineId: null, skuId, batchCode: null, mfgDate: null, qty }],
+        })
+        .expect(201);
+      const grn = res.body.goodsReceipt as { id: string; lines: { id: string; grnId: string; skuId: string; batchId: string | null; qty: number; appliedQty: number }[] };
+      return { grnId: grn.id, lines: grn.lines.map((line) => ({ ...line, grnId: grn.id })) };
+    };
+    const hzTasks = async (): Promise<
+      { grnLineId: string; suggestedBin: { binId: string; binCode: string } | null; rationale: string }[]
+    > => {
+      const res = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/putaway/tasks?warehouseId=${hazardWarehouseId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      return res.body.items as never;
+    };
+
+    // THE SEED: 2 oxidizer units into `0-H1` (the re-derived suggestion at
+    // placement: both bins empty, `0-H1` sorts first), and 3 null-class
+    // PUT-B units parked into `0-H2` through the adjustment bypass. The
+    // occupancies are deliberate: `0-H1` (2) is the LOWER-occupancy
+    // candidate for everything that follows.
+    const oxGrn = await hzGrn(oxidizerSkuId, 2);
+    const oxPlace = await placeForLine(oxGrn.lines[0]!, bin0H1, { warehouseId: hazardWarehouseId }).expect(201);
+    expect((oxPlace.body.placement as { suggestedBinCode: string | null }).suggestedBinCode).toBe('0-H1');
+    await adjust({ warehouseId: hazardWarehouseId, skuId: plainSkuId, binId: bin0H2, quantityDelta: 3, reasonCode: 'cycle-count', note: 'seed 0-H2' }).expect(201);
+
+    // THE SUGGESTION/TASK FILTER — the load-bearing shape (review triage #1):
+    // an ungated walk picks the LOWER-occupancy `0-H1` (2 < 3); with the
+    // hazard arm the flammable task points at `0-H2` instead. The co-location
+    // filter is the ONLY reason the suggestion changed.
+    const flGrn = await hzGrn(flammableSkuId, 1);
+    const flTask = (await hzTasks()).find((entry) => entry.grnLineId === flGrn.lines[0]!.id)!;
+    expect(flTask.suggestedBin).toEqual({ binId: bin0H2, binCode: '0-H2' });
+
+    // GATE (placement): directing the flammable unit into the oxidizer bin is
+    // a 400 `bin-segregation-conflict` naming the bin, BOTH SKU codes and
+    // BOTH classes — and the guard fires before any load read, so the GRN's
+    // ledger stays at `grn.received` alone.
+    const refused = await placeForLine(flGrn.lines[0]!, bin0H1, { warehouseId: hazardWarehouseId }).expect(400);
+    expect(refused.body).toMatchObject({ status: 400, code: 'bin-segregation-conflict' });
+    expect(refused.body.detail).toContain('0-H1');
+    expect(refused.body.detail).toContain('PUT-O');
+    expect(refused.body.detail).toContain('oxidizer');
+    expect(refused.body.detail).toContain('PUT-FL');
+    expect(refused.body.detail).toContain('flammable');
+    expect(await ledgerRows(flGrn.grnId)).toHaveLength(1);
+    expect(await placementRowCount(flGrn.grnId)).toBe(0);
+
+    // The compliant placement records the RE-DERIVED suggestion — `0-H2`,
+    // not the lower-occupancy segregated bin (the review-loopback regression
+    // shape, asserted at the exact :706-708 spot).
+    const placed = await placeForLine(flGrn.lines[0]!, bin0H2, { warehouseId: hazardWarehouseId }).expect(201);
+    expect(placed.body.placement).toMatchObject({ suggestedBinId: bin0H2, suggestedBinCode: '0-H2', reasonCode: null });
+
+    // NULL CARRIES NO RULE: the null-class PUT-B unit's task points at the
+    // hazardous `0-H1` (lowest occupancy, and a null class is compatible
+    // with the oxidizer occupant), and the placement succeeds.
+    const plainGrn = await hzGrn(plainSkuId, 1);
+    const plainTask = (await hzTasks()).find((entry) => entry.grnLineId === plainGrn.lines[0]!.id)!;
+    expect(plainTask.suggestedBin).toEqual({ binId: bin0H1, binCode: '0-H1' });
+    await placeForLine(plainGrn.lines[0]!, bin0H1, { warehouseId: hazardWarehouseId }).expect(201);
+
+    // THE EXPLOSIVE UNIVERSAL RULE at the task level: with only `0-H1`
+    // (oxidizer occupant) and `0-H2` (flammable occupant) existing, an
+    // explosive unit gets NO suggestion — the candidate pool is exhausted by
+    // segregation, not by capacity (the rationale is unchanged).
+    const exGrn = await hzGrn(explosiveSkuId, 1);
+    const exTask = (await hzTasks()).find((entry) => entry.grnLineId === exGrn.lines[0]!.id)!;
+    expect(exTask.suggestedBin).toBeNull();
+    expect(exTask.rationale).toBe('No conforming storage bin has room for these units');
+    // A NEW EMPTY bin appears; the suggestion re-derivation at placement
+    // picks it — an explosive may enter an EMPTY bin (a co-location rule,
+    // not a class rule like storage's).
+    const bin0H3 = await hazardBin('0-H3');
+    const exPlace = await placeForLine(exGrn.lines[0]!, bin0H3, { warehouseId: hazardWarehouseId }).expect(201);
+    expect((exPlace.body.placement as { suggestedBinId: string | null }).suggestedBinId).toBe(bin0H3);
+
+    // THE TOP-UP (the review-loopback known-bad state, triage #16): a second
+    // explosive GRN's task suggestion skips `0-H3`'s own-SKU occupant pairs —
+    // the walk reaches `0-H3` past the incompatible `0-H1`/`0-H2` — so the
+    // placement does NOT 400 for a missing mismatch reason.
+    const exGrn2 = await hzGrn(explosiveSkuId, 1);
+    const exTask2 = (await hzTasks()).find((entry) => entry.grnLineId === exGrn2.lines[0]!.id)!;
+    expect(exTask2.suggestedBin).toEqual({ binId: bin0H3, binCode: '0-H3' });
+    const exPlace2 = await placeForLine(exGrn2.lines[0]!, bin0H3, { warehouseId: hazardWarehouseId }).expect(201);
+    expect(exPlace2.body.placement).toMatchObject({ suggestedBinId: bin0H3, suggestedBinCode: '0-H3', reasonCode: null });
+
+    // ...but a DIFFERENT explosive SKU never shares the bin (the predicate
+    // refuses its own class; the own-sku skip is by id, not by class).
+    const ex2Grn = await hzGrn(explosive2SkuId, 1);
+    const ex2Refused = await placeForLine(ex2Grn.lines[0]!, bin0H3, { warehouseId: hazardWarehouseId }).expect(400);
+    expect(ex2Refused.body).toMatchObject({ status: 400, code: 'bin-segregation-conflict' });
+    expect(ex2Refused.body.detail).toContain('PUT-EX');
+    expect(ex2Refused.body.detail).toContain('explosive');
+    expect(await placementRowCount(ex2Grn.grnId)).toBe(0);
+
+    // Null beside an explosive — the DECIDED NARROWING (triage #8): the
+    // null-class PUT-B unit places beside the explosive stock.
+    const plainGrn2 = await hzGrn(plainSkuId, 1);
+    await placeForLine(plainGrn2.lines[0]!, bin0H3, { warehouseId: hazardWarehouseId }).expect(201);
+    expect(await plainOnHand(bin0H3, plainSkuId)).toBe(1);
+  });
+
   it('RLS: a non-superuser session scoped to one tenant sees no putaway rows of another tenant and cannot write foreign rows', async () => {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     const foreignTenantId = uuidv7();

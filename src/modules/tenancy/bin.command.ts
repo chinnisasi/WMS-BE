@@ -52,7 +52,14 @@ import {
   binRetiredAsSource,
   binRetiredAsTarget,
   binVolumeExceeded,
+  occupantHazardClassesInTx,
 } from '../putaway/putaway.command';
+// Story 12-2 — the ONE segregation predicate + the co-location refusal
+// factory (shared with the placement gate; the detail is merge-worded).
+import {
+  hazardClassesCompatible,
+  segregationConflict,
+} from '../../shared/primitives/hazard';
 import { IDEMPOTENCY_TENANT_KEY, binHoldOpen, binNotFound, binRetired409 } from './bin.errors';
 
 export interface CreateBinCommand {
@@ -691,6 +698,9 @@ export class BinCommand {
             heightMm: skus.heightMm,
             // Story 12-1 — the class the target's class gate consumes (FR-40).
             storageClass: skus.storageClass,
+            // Story 12-2 — the hazard class the target's co-location gate
+            // consumes (FR-41; null = carries no rule).
+            hazardClass: skus.hazardClass,
           })
           .from(stockOnHand)
           .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
@@ -721,6 +731,44 @@ export class BinCommand {
               skuClass: row.storageClass,
             })),
           );
+        }
+
+        // ── story 12-2: the hazard co-location gate (FR-41) — after the
+        // class gate, BEFORE any arm moves: a merge that would park a SKU
+        // beside an incompatible target occupant is refused whole, naming
+        // both parties. The gate reads the TARGET bin's occupants via the
+        // putaway helper (the `binBlocked` precedent for importing it); each
+        // moved SKU's own pairs are SKIPPED (the same-SKU-consolidation rule
+        // — merging stock into a bin already holding that SKU is legitimate,
+        // explosive included), rows whose class is null skip (null carries
+        // no rule), and moved-vs-moved is NOT re-checked (the source bin
+        // already co-locates them) — a premise that holds while `stock.adjust`
+        // is the named bypass: it is the only writer able to FORM incompatible
+        // co-location in a source bin (recorded in PENDING). Same factory as
+        // the placement gate (400 `bin-segregation-conflict`).
+        const targetOccupants = await occupantHazardClassesInTx(
+          tx,
+          command.tenantId,
+          command.warehouseId,
+          target.id,
+        );
+        if (targetOccupants.length > 0) {
+          for (const row of onHandRows) {
+            if (row.hazardClass === null) {
+              continue;
+            }
+            for (const occupant of targetOccupants) {
+              if (occupant.skuId === row.skuId) {
+                continue;
+              }
+              if (!hazardClassesCompatible(row.hazardClass, occupant.hazardClass)) {
+                throw segregationConflict(
+                  `Merge refused — target bin "${target.code}" holds SKU "${occupant.skuCode}" ` +
+                    `(${occupant.hazardClass}); moved SKU "${row.skuCode}" (${row.hazardClass}) is segregated from it (FR-41).`,
+                );
+              }
+            }
+          }
         }
 
         interface MergeArm {

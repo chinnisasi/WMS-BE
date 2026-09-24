@@ -527,6 +527,10 @@ export class StockAdjustmentCommand {
    * `bins` row is tenancy master data read here only for referential
    * integrity (uuid columns, no FKs — the repo convention); stock tables
    * stay inventory-exclusive (the architecture test enforces the writes).
+   *
+   * `stock.adjust` is the NAMED bypass for the gated writers' bin gates —
+   * capacity (story 11-5) and the storage (12-1) / hazard (12-2) class
+   * gates all ride it; each bypass is recorded in PENDING.
    */
   private async assertBinInWarehouse(
     tx: TenantTx,

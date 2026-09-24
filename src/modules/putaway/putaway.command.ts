@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNotNull, isNull, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -34,6 +34,13 @@ import {
   binStorageMismatch,
   storageClassSatisfies,
 } from '../../shared/primitives/storage-class';
+// Story 12-2 — the ONE segregation predicate + the co-location refusal
+// factory. Same one-source rule as the storage-class predicate: the matrix
+// is encoded exactly once, in TS.
+import {
+  hazardClassesCompatible,
+  segregationConflict,
+} from '../../shared/primitives/hazard';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -355,6 +362,9 @@ export class PutawayCommand {
           // Story 12-1 — the class the placement gate and the re-derived
           // suggestion both consume.
           storageClass: skus.storageClass,
+          // Story 12-2 — the hazard class the co-location gate and the
+          // re-derived suggestion consume (null = carries no rule).
+          hazardClass: skus.hazardClass,
         })
         .from(skus)
         .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
@@ -544,6 +554,36 @@ export class PutawayCommand {
           sku.storageClass,
         );
       }
+      // ── story 12-2: the hazard co-location gate (FR-41) — after the class
+      // gate, before the load read, inside the bin-row `.for('update')` window
+      // (a concurrent placement cannot slip an incompatible unit between the
+      // scan and the write). Unlike the class rule this is SKU × SKU-in-bin:
+      // the gate reads the TARGET bin's occupants' classes, so an empty bin
+      // of the right class always takes hazard-capable stock. Null carries no
+      // rule in either direction (the predicate's first arm). Own-sku pairs
+      // are SKIPPED — the same-SKU-consolidation rule (an explosive may top
+      // up its own bin), identical to merge's arm. 400
+      // `bin-segregation-conflict` naming both SKU codes and both classes.
+      const occupants = await occupantHazardClassesInTx(
+        tx,
+        command.tenantId,
+        command.warehouseId,
+        targetBin.id,
+      );
+      for (const occupant of occupants) {
+        if (occupant.skuId === command.skuId) {
+          continue;
+        }
+        if (!hazardClassesCompatible(sku.hazardClass, occupant.hazardClass)) {
+          throw binSegregationConflict(
+            targetBin.code,
+            sku.code,
+            sku.hazardClass,
+            occupant.skuCode,
+            occupant.hazardClass,
+          );
+        }
+      }
       // ── the load read (the gates' shared input — one query) ─────────────
       // Story 11-5: `binOccupancyInTx` is now the load-read (units + weight +
       // volume), still inside the `.for('update')` window the unit gate
@@ -616,6 +656,11 @@ export class PutawayCommand {
           widthMm: sku.widthMm,
           heightMm: sku.heightMm,
           storageClass: sku.storageClass,
+          // Story 12-2 — the hazard class rides the walk; with `command.skuId`
+          // (in hand at this call site) it lets `candidateFitsSku` skip the
+          // moving SKU's own occupant pairs, so a top-up of the same SKU is
+          // never refused for co-locating with itself.
+          hazardClass: sku.hazardClass,
         },
       );
       const suggestedBinId = suggestion?.binId ?? null;
@@ -847,7 +892,9 @@ export async function suggestBinInTx(
 ): Promise<{ binId: string; binCode: string; rationale: string } | null> {
   const candidates = await binCandidatesInTx(tx, tenantId, warehouseId);
   for (const candidate of candidates) {
-    if (candidateFitsSku(candidate, skuAttrs, qty)) {
+    // Story 12-2: the hazard arm needs the moving SKU's identity to skip its
+    // own occupant pairs (the same-SKU-consolidation rule).
+    if (candidateFitsSku(candidate, skuAttrs, qty, skuId)) {
       const room = candidate.capacity - candidate.occupancy;
       return {
         binId: candidate.binId,
@@ -876,6 +923,14 @@ export interface PutawayBinCandidate {
   // SKU-agnostic (no WHERE arm); the class rule runs per candidate in
   // `candidateFitsSku`, against the SKU side carried in `SkuPhysicalAttributes`.
   readonly storageClass: string;
+  // ── story 12-2: the bin's hazardous occupants as (skuId, hazardClass)
+  // PAIRS — not a class list (a class-only aggregate cannot skip the moving
+  // SKU's own pairs, and counts drained residue). Aggregated over `quantity >
+  // 0` occupants with a non-null class (drained rows persist — `addToOnHand`
+  // upserts, never deletes — so a stale class would refuse placements the
+  // gate admits); the list stays SKU-agnostic (no WHERE arm — the projection
+  // is richer, the rule still runs per-candidate on the SKU side).
+  readonly occupants: readonly { readonly skuId: string; readonly hazardClass: string }[];
 }
 
 /**
@@ -892,6 +947,11 @@ export interface SkuPhysicalAttributes {
   readonly heightMm: number | null;
   /** Story 12-1 — the SKU's class from the controlled vocabulary. */
   readonly storageClass: string;
+  /**
+   * Story 12-2 — the SKU's hazard class (FR-41), nullable: a null class
+   * carries no rule in either direction of the segregation matrix.
+   */
+  readonly hazardClass: string | null;
 }
 
 /**
@@ -920,14 +980,33 @@ export interface SkuPhysicalAttributes {
  * predicate (the temperature hierarchy); no SQL copy exists, the candidate
  * list is SKU-agnostic. The same arm exists in the placement command's own
  * locked-row guard and `mergeBin`'s target loop — the SYNC HAZARD rule.
+ *
+ * Story 12-2 adds the HAZARD co-location arm (FR-41) — SECOND, after the
+ * class gate: for each of the bin's hazardous-occupant PAIRS, skip the
+ * moving SKU's OWN pair (`skuId === movingSkuId` — the same-SKU-consolidation
+ * rule the placement and merge gates carry; an explosive may top up its own
+ * bin) and refuse the candidate when any other occupant's class is
+ * incompatible with the moving SKU's (`hazardClassesCompatible` — null
+ * carries no rule in either direction, checked before the explosive
+ * universal rule). The same arm exists in the placement command's own
+ * locked-row guard and `mergeBin`'s target gate — the SYNC HAZARD rule.
  */
 export function candidateFitsSku(
   candidate: PutawayBinCandidate,
   sku: SkuPhysicalAttributes,
   qtyMilli: number,
+  movingSkuId: string,
 ): boolean {
   if (!storageClassSatisfies(sku.storageClass, candidate.storageClass)) {
     return false;
+  }
+  for (const occupant of candidate.occupants) {
+    if (occupant.skuId === movingSkuId) {
+      continue;
+    }
+    if (!hazardClassesCompatible(sku.hazardClass, occupant.hazardClass)) {
+      return false;
+    }
   }
   if (candidate.occupancy + qtyMilli > candidate.capacity) {
     return false;
@@ -985,6 +1064,14 @@ export async function binCandidatesInTx(
       // Story 12-1 — the class rides the candidate so the fit predicate can
       // rule per (SKU, bin); no WHERE arm, the list is SKU-agnostic.
       storageClass: bins.storageClass,
+      // Story 12-2 — the bin's hazardous occupants as (skuId, hazardClass)
+      // pairs, one aggregate through the join below (no second query, no
+      // N+1). The FILTER carries `quantity > 0` (drained rows persist —
+      // `addToOnHand` upserts, never deletes — and a stale class would
+      // refuse placements the gate admits) and a non-null class (a null
+      // carries no rule). Bins with no hazardous occupants aggregate to
+      // '[]'.
+      occupants: sql<string>`coalesce(jsonb_agg(jsonb_build_array(${stockOnHand.skuId}, ${skus.hazardClass})) filter (where ${stockOnHand.quantity} > 0 and ${skus.hazardClass} is not null), '[]'::jsonb)::text`,
       occupancy: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint`,
       weightLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * coalesce(${skus.weightGrams}, 0)), 0)::numeric`,
       volumeLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * (coalesce(${skus.lengthMm}, 0) * coalesce(${skus.widthMm}, 0) * coalesce(${skus.heightMm}, 0))), 0)::numeric`,
@@ -1029,6 +1116,11 @@ export async function binCandidatesInTx(
     heightMm: row.heightMm,
     maxWeightGrams: row.maxWeightGrams,
     storageClass: row.storageClass,
+    // The aggregate is `::text`d jsonb — parsed at the boundary, mapped to
+    // the pair objects the fit predicate walks.
+    occupants: (JSON.parse(row.occupants) as [string, string][]).map(
+      ([skuId, hazardClass]) => ({ skuId, hazardClass }),
+    ),
     occupancy: Number(row.occupancy),
     weightLoad: BigInt(row.weightLoad ?? 0),
     volumeLoad: BigInt(row.volumeLoad ?? 0),
@@ -1094,6 +1186,110 @@ export async function binOccupancyInTx(
     weightLoad: BigInt(rows[0]?.weightLoad ?? 0),
     volumeLoad: BigInt(rows[0]?.volumeLoad ?? 0),
   };
+}
+
+/**
+ * Story 12-2 — the hazard co-location read: one bin's DISTINCT hazardous
+ * occupants as (skuId, skuCode, hazardClass) rows, `quantity > 0` and a
+ * non-null class only (drained rows and null-class stock carry no rule).
+ * The same join shape as `binOccupancyInTx` above — one grouped query, no
+ * N+1. Consumed by the placement's co-location gate (inside the bin-row
+ * `.for('update')` window, with the moving SKU's own pairs skipped at the
+ * call site) and by `mergeBin`'s hazard gate (target occupants, moved
+ * pairs skipped per moved SKU at the call site — the helper excludes
+ * nothing, so both sites own their own-sku arm).
+ */
+export interface OccupantHazard {
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly hazardClass: string;
+}
+
+export async function occupantHazardClassesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  binId: string,
+): Promise<readonly OccupantHazard[]> {
+  const rows = await tx
+    .select({
+      skuId: stockOnHand.skuId,
+      skuCode: skus.code,
+      hazardClass: skus.hazardClass,
+    })
+    .from(stockOnHand)
+    // INNER join deliberately: a hazardous class is a SKU attribute — a
+    // stock row with no sku row cannot name a class, and the gates that
+    // consume this read rule on pairs of named classes (contrast the
+    // units-sum reads, which stay LEFT-joined for capacity truth).
+    .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+    .where(
+      and(
+        eq(stockOnHand.tenantId, tenantId),
+        eq(stockOnHand.warehouseId, warehouseId),
+        eq(stockOnHand.binId, binId),
+        gt(stockOnHand.quantity, 0),
+        isNotNull(skus.hazardClass),
+      ),
+    )
+    .groupBy(stockOnHand.skuId, skus.code, skus.hazardClass);
+  // The `isNotNull` filter above is the authority, but drizzle's inferred
+  // row type stays `string | null` (no SQL-side narrowing) — the boundary
+  // narrows it once, here.
+  return rows.map((row) => ({
+    skuId: row.skuId,
+    skuCode: row.skuCode,
+    hazardClass: row.hazardClass as string,
+  }));
+}
+
+/**
+ * Story 12-2 — the SKU-edit guard's grouped read: MANY bins' hazardous
+ * occupants in ONE query (the single-bin read above runs per bin — too many
+ * round-trips inside the edit's `.for('update')` window). One row per
+ * (binId, skuId) — the group key widens with `binId`, so a (bin, binmate)
+ * pair can never come back twice and the guard's party dedupe falls out of
+ * the read. Same join shape and filters as the single-bin read, minus the
+ * warehouse filter (a bin id is unique — the caller's bin set is the
+ * authority: non-system stocked bins and non-system hold origins).
+ */
+export interface OccupantHazardPair {
+  readonly binId: string;
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly hazardClass: string;
+}
+
+export async function binOccupantHazardPairsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  binIds: readonly string[],
+): Promise<readonly OccupantHazardPair[]> {
+  if (binIds.length === 0) {
+    return [];
+  }
+  const rows = await tx
+    .select({
+      binId: stockOnHand.binId,
+      skuId: stockOnHand.skuId,
+      skuCode: skus.code,
+      hazardClass: skus.hazardClass,
+    })
+    .from(stockOnHand)
+    // The same deliberate INNER join as the single-bin read above.
+    .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+    .where(
+      and(
+        eq(stockOnHand.tenantId, tenantId),
+        inArray(stockOnHand.binId, [...binIds]),
+        gt(stockOnHand.quantity, 0),
+        isNotNull(skus.hazardClass),
+      ),
+    )
+    .groupBy(stockOnHand.binId, stockOnHand.skuId, skus.code, skus.hazardClass);
+  // The `isNotNull` filter above is the authority — the same one-time
+  // boundary narrowing as the single-bin read.
+  return rows.map((row) => ({ ...row, hazardClass: row.hazardClass as string }));
 }
 
 /**
@@ -1275,6 +1471,26 @@ export function binBlocked(binCode: string): ProblemException {
     400,
     'Target bin is blocked',
     `Bin "${binCode}" is blocked — placements into it are refused until it is unblocked.`,
+  );
+}
+
+/**
+ * The co-location rejection (FR-41, story 12-2): 400
+ * `bin-segregation-conflict` naming the bin, BOTH SKU codes and BOTH
+ * classes — device-fault, non-retryable. Wraps the hazard primitive's
+ * `segregationConflict` (the one refusal factory for the placement/merge
+ * family); `mergeBin` builds its merge-worded detail on the same factory.
+ */
+export function binSegregationConflict(
+  binCode: string,
+  incomingSkuCode: string,
+  incomingClass: string | null,
+  occupantSkuCode: string,
+  occupantClass: string,
+): ProblemException {
+  return segregationConflict(
+    `Bin "${binCode}" holds SKU "${occupantSkuCode}" (${occupantClass}) — SKU "${incomingSkuCode}" ` +
+      `(${incomingClass ?? 'no hazard class'}) is segregated from it (FR-41).`,
   );
 }
 

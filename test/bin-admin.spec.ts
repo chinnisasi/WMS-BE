@@ -1621,4 +1621,133 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       .expect(201);
     expect(replay.body).toMatchObject({ code: 'A-92-04', storageClass: 'ambient' });
   });
+
+  // ── Story 12-2 — the merge hazard gate (FR-41) ─────────────────────────────
+
+  it('merge hazard gate: a merge whose moved rows are segregated from a target occupant is refused whole naming both parties — both directions and every decided pair; same-SKU consolidation merges, a null-class row merges, and moved-vs-moved pairs are not re-checked', async () => {
+    // Six classed SKUs (import + PATCH while stockless); BA-B stays
+    // class-less — null carries no rule in either direction.
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'HA-OX,Hazard Item OX,pcs,,1800,,false,false,,,',
+      'HA-FL,Hazard Item FL,pcs,,1800,,false,false,,,',
+      'HA-AC,Hazard Item AC,pcs,,1800,,false,false,,,',
+      'HA-BS,Hazard Item BS,pcs,,1800,,false,false,,,',
+      'HA-TO,Hazard Item TO,pcs,,1800,,false,false,,,',
+      'HA-GA,Hazard Item GA,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const byCode = new Map(
+      (skus.body.items as { code: string; id: string }[]).map((item) => [item.code, item.id]),
+    );
+    const oxId = byCode.get('HA-OX')!;
+    const flId = byCode.get('HA-FL')!;
+    const acId = byCode.get('HA-AC')!;
+    const bsId = byCode.get('HA-BS')!;
+    const toId = byCode.get('HA-TO')!;
+    const gaId = byCode.get('HA-GA')!;
+    for (const [skuId, hazardClass] of [
+      [oxId, 'oxidizer'],
+      [flId, 'flammable'],
+      [acId, 'corrosive-acid'],
+      [bsId, 'corrosive-base'],
+      [toId, 'toxic'],
+      [gaId, 'gas'],
+    ] as const) {
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ hazardClass })
+        .expect(200);
+    }
+
+    const hazardBin = async (code: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf' })
+          .expect(201)
+      ).body.id as string;
+
+    // THE GATE, four decided pairs × both directions where it matters, via
+    // the real merge surface. Each refusal names the target bin, BOTH SKU
+    // codes and BOTH classes — and NOTHING moves (the source keeps its rows
+    // and stays un-retired). Fills park stock through the named adjustment
+    // bypass; the merge is the gate under test.
+    const refusals: { source: string; target: string; occupantId: string; occupantSku: string; occupantClass: string; movedId: string; movedSku: string; movedClass: string; binCode: string }[] = [];
+    const layout = async (
+      occupantId: string,
+      occupantSku: string,
+      occupantClass: string,
+      movedId: string,
+      movedSku: string,
+      movedClass: string,
+    ) => {
+      const target = await hazardBin(`A-93-${String(refusals.length * 2 + 1).padStart(2, '0')}`);
+      const source = await hazardBin(`A-93-${String(refusals.length * 2 + 2).padStart(2, '0')}`);
+      await fill(target, occupantId, 1);
+      await fill(source, movedId, 1);
+      refusals.push({ source, target, occupantId, occupantSku, occupantClass, movedId, movedSku, movedClass, binCode: `A-93-${String(refusals.length * 2 + 1).padStart(2, '0')}` });
+    };
+    await layout(oxId, 'HA-OX', 'oxidizer', flId, 'HA-FL', 'flammable'); // FR-41's oxidiser/fuel example
+    await layout(flId, 'HA-FL', 'flammable', oxId, 'HA-OX', 'oxidizer'); // the REVERSE direction
+    await layout(acId, 'HA-AC', 'corrosive-acid', bsId, 'HA-BS', 'corrosive-base');
+    await layout(toId, 'HA-TO', 'toxic', acId, 'HA-AC', 'corrosive-acid');
+    await layout(oxId, 'HA-OX', 'oxidizer', gaId, 'HA-GA', 'gas');
+    for (const [i, refusal] of refusals.entries()) {
+      const binCode = `A-93-${String(i * 2 + 1).padStart(2, '0')}`;
+      const res = await merge(refusal.source, refusal.target).expect(400);
+      expect(res.body).toMatchObject({ status: 400, code: 'bin-segregation-conflict' });
+      expect(String(res.body.detail)).toContain(binCode);
+      expect(String(res.body.detail)).toContain(refusal.occupantSku);
+      expect(String(res.body.detail)).toContain(refusal.occupantClass);
+      expect(String(res.body.detail)).toContain(refusal.movedSku);
+      expect(String(res.body.detail)).toContain(refusal.movedClass);
+      expect(await plainOnHand(refusal.source, refusal.movedId)).toBe(1);
+      const listed = await zoneBins(zoneId);
+      expect(listed.find((bin) => bin.id === refusal.source)!.retiredAt).toBeNull();
+    }
+
+    // SAME-SKU CONSOLIDATION: the moved row's OWN pairs are skipped — two
+    // oxidizer SKUs are one SKU; the merge proceeds and the stock consolidates.
+    const oxTarget = await hazardBin('A-94-01');
+    const oxSource = await hazardBin('A-94-02');
+    await fill(oxTarget, oxId, 2);
+    await fill(oxSource, oxId, 1);
+    await merge(oxSource, oxTarget).expect(200);
+    expect(await plainOnHand(oxTarget, oxId)).toBe(3);
+
+    // A NULL-CLASS moved row beside a hazardous occupant merges (null is not
+    // a class — the decided narrowing, on the merge surface).
+    const nullTarget = await hazardBin('A-94-03');
+    const nullSource = await hazardBin('A-94-04');
+    await fill(nullTarget, oxId, 1);
+    await fill(nullSource, plainSkuId, 1);
+    await merge(nullSource, nullTarget).expect(200);
+    expect(await plainOnHand(nullTarget, plainSkuId)).toBe(1);
+
+    // MOVED-VS-MOVED is not re-checked: the two incompatible classes already
+    // co-locate in the source (the adjustment bypass put them there); the
+    // gate reads the TARGET's occupants, and this target is empty.
+    const togetherTarget = await hazardBin('A-94-05');
+    const togetherSource = await hazardBin('A-94-06');
+    await fill(togetherSource, oxId, 1);
+    await fill(togetherSource, flId, 1);
+    await merge(togetherSource, togetherTarget).expect(200);
+    expect(await plainOnHand(togetherTarget, oxId)).toBe(1);
+    expect(await plainOnHand(togetherTarget, flId)).toBe(1);
+  });
 });
