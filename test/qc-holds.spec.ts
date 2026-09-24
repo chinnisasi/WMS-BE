@@ -894,7 +894,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
 
   // ── Story 12-3 — the secure-bin authority gate on hold + release (FR-42) ───
 
-  it('secure origin: a holder places and releases a hold on a secure-scope bin with byte-identical behavior (the gate fires and passes; the 403 shape lives in users.spec)', async () => {
+  it('secure origin: a holder places and releases a hold on a secure-scope bin with byte-identical behavior (the gate fires and passes; the 403 shape is unit-pinned in users.spec)', async () => {
     // A secure bin. The stock in it is a PLAIN-class SKU seeded through the
     // stock.adjust bypass: the gate asks (role, bin), not (sku, bin) — the
     // 12-1 class rule and the 12-3 authority rule are independent questions

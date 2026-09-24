@@ -780,6 +780,8 @@ export class PickCommandService {
       // `secure.move`, the (role, bin) authority decided on the row already
       // in hand. Owner + Ops Manager only — an operator's draw out of the
       // cage 403s `role-denied` naming `secure.move` and writes nothing;
+      // this writer is the gate's LIVE arm (merge/hold/release are
+      // non-denying today — the matrix invariant keeps the subset enforced);
       // non-secure bins are byte-identical to the pre-12.3 build.
       assertSecureBinAuthority(role, [drawBin]);
 

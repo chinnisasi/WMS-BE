@@ -48,6 +48,9 @@ export const STORAGE_CLASSES = [
 
 export type StorageClass = (typeof STORAGE_CLASSES)[number];
 
+/** The cage class (FR-42, story 12-3): the one value the authority gate keys on. */
+export const SECURE_STORAGE_CLASS: StorageClass = 'secure';
+
 /**
  * The temperature rank: a bin satisfies a SKU iff both are in the temperature
  * family and the bin's rank ≥ the SKU's rank, or the two classes are equal.

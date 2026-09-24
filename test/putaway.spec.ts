@@ -8,6 +8,7 @@ import { fromMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { importSecureSku } from './support/secure-sku';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
@@ -1881,35 +1882,18 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
 
   // ── Story 12-3 — the secure-bin authority gate (FR-42) ─────────────────────
 
-  it('secure locations: an operator is 403 role-denied moving stock into a secure bin, an owner badge-in places, and the gate runs AFTER the class gate', async () => {
-    // A secure-class SKU and a secure bin in their own zone. The class comes
-    // through the real SKU edit (import first, then patch) — and BEFORE any
-    // stock exists, because the 12-1 class-edit guard refuses a class change
-    // over live stock.
-    const csv = [
-      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
-      'PUT-SEC,Putaway Item SEC,pcs,,1800,,false,false,,,',
-    ].join('\n');
-    await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/catalog/imports`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, ulid())
-      .field('mode', 'initial')
-      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
-      .expect(201);
-    const skus = await request(app.getHttpServer())
-      .get(`${API}/${tenantId}/catalog/skus`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .expect(200);
-    const secSkuId = (skus.body.items as { code: string; id: string }[]).find(
-      (item) => item.code === 'PUT-SEC',
-    )!.id as string;
-    await request(app.getHttpServer())
-      .patch(`${API}/${tenantId}/catalog/skus/${secSkuId}`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, ulid())
-      .send({ storageClass: 'secure' })
-      .expect(200);
+  it('secure locations: an operator is 403 role-denied moving stock into a secure bin, an owner badge-in places, and the gate runs AFTER the class gate and BEFORE the hazard gate', async () => {
+    // A secure-class SKU (import, then patch — before any stock exists, the
+    // 12-1 class-edit-guard ordering) and a cage zone with two secure bins.
+    const secSkuId = await importSecureSku(app, tenantId, ownerToken, 'PUT-SEC');
+    const patchHazard = async (skuId: string, hazardClass: string): Promise<void> => {
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ hazardClass })
+        .expect(200);
+    };
 
     const zoneCage = (
       await request(app.getHttpServer())
@@ -1919,14 +1903,16 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
         .send({ code: 'CAGE', name: 'Cage zone' })
         .expect(201)
     ).body.id as string;
-    const binCage = (
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneCage}/bins`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'CAGE-01', capacity: 100, type: 'shelf', storageClass: 'secure' })
-        .expect(201)
-    ).body.id as string;
+    const createCageBin = async (code: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneCage}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf', storageClass: 'secure' })
+          .expect(201)
+      ).body.id as string;
+    const binCage = await createCageBin('CAGE-01');
 
     // GATE (placement): the operator's GRN is fine — the floor receives —
     // but directing the unit into the cage is 403 `role-denied` naming
@@ -1955,31 +1941,53 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     expect(classFirst.body).toMatchObject({ code: 'bin-storage-mismatch' });
     expect(await placementRowCount(grnMismatch.grnId)).toBe(0);
 
+    // ORDER, the other neighbour: authority runs BEFORE the 12-2 hazard
+    // co-location gate. An oxidizer occupant is parked in a fresh, empty cage
+    // bin through the named stock.adjust bypass, and an operator places a
+    // CONFORMING-class but hazard-incompatible SKU at it — the co-location
+    // gate would 400 if it were reached, so the 403 `role-denied` naming
+    // `secure.move` proves the authority slot comes first.
+    const binHazard = await createCageBin('CAGE-02');
+    const oxidizerSku = await importSecureSku(app, tenantId, ownerToken, 'PUT-HAZ-O');
+    await patchHazard(oxidizerSku, 'oxidizer');
+    const flammableSku = await importSecureSku(app, tenantId, ownerToken, 'PUT-HAZ-F');
+    await patchHazard(flammableSku, 'flammable');
+    await adjust({ warehouseId, skuId: oxidizerSku, binId: binHazard, quantityDelta: 1, reasonCode: 'cycle-count', note: 'hazard occupant (named bypass)' }).expect(201);
+    const grnHazard = await blindGrn([{ poLineId: null, skuId: flammableSku, batchCode: null, mfgDate: null, qty: 1 }]);
+    const authorityFirst = await placeForLine(grnHazard.lines[0]!, binHazard).expect(403);
+    expect(authorityFirst.body).toMatchObject({ status: 403, code: 'role-denied' });
+    expect(authorityFirst.body.detail).toContain('secure.move');
+    expect(await placementRowCount(grnHazard.grnId)).toBe(0);
+    expect(await plainOnHand(binHazard, flammableSku)).toBe(0);
+
     // THE MIRROR ARM: the same placement as owner — the operator is promoted
     // in place, the badge-in session re-reads the role per command, so the
     // SAME token that just got 403 places with it. (The suggestion points at
     // the empty 0-SE cage from the 12-1 test, so the directed placement
-    // carries the mismatch reason.)
-    await request(app.getHttpServer())
-      .patch(`${API}/${tenantId}/users/${operatorUserId}`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, ulid())
-      .send({ role: 'owner' })
-      .expect(200);
-    await placeForLine(grn.lines[0]!, binCage, { reasonCode: 'operator-preference' }).expect(201);
-    expect(await plainOnHand(binCage, secSkuId)).toBe(1);
-    expect((await ledgerRows(grn.grnId)).map((event) => event.type)).toEqual([
-      'grn.received',
-      'putaway.placed',
-    ]);
-    expect(await placementRowCount(grn.grnId)).toBe(1);
-
-    // Leave the suite the way it was found: the operator is demoted back.
-    await request(app.getHttpServer())
-      .patch(`${API}/${tenantId}/users/${operatorUserId}`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, ulid())
-      .send({ role: 'operator' })
-      .expect(200);
+    // carries the mismatch reason.) The demotion-back runs in `finally` — a
+    // failing assertion must not leave the operator promoted for the rest of
+    // the file.
+    try {
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/users/${operatorUserId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ role: 'owner' })
+        .expect(200);
+      await placeForLine(grn.lines[0]!, binCage, { reasonCode: 'operator-preference' }).expect(201);
+      expect(await plainOnHand(binCage, secSkuId)).toBe(1);
+      expect((await ledgerRows(grn.grnId)).map((event) => event.type)).toEqual([
+        'grn.received',
+        'putaway.placed',
+      ]);
+      expect(await placementRowCount(grn.grnId)).toBe(1);
+    } finally {
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/users/${operatorUserId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ role: 'operator' })
+        .expect(200);
+    }
   });
 });

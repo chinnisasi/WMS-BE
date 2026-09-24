@@ -737,12 +737,11 @@ export class BinCommand {
         // after the class gate, BEFORE any arm moves, with both rows already
         // locked: a SECURE source or target additionally requires
         // `secure.move`, the (role, bin) authority decided on the rows
-        // already in hand. `bin.retire` and `secure.move` are held by
-        // exactly the same roles today, so this arm is dead code by the
-        // matrix — the invariant test in `test/users.spec.ts` keeps that
-        // subset enforced (a future grant must answer the cage question in
-        // the open). Non-secure merges are byte-identical to the pre-12.3
-        // build.
+        // already in hand. Non-denying today (the matrix invariant keeps
+        // the subset enforced): `bin.retire` and `secure.move` are held by
+        // exactly the same roles — a future grant must answer the cage
+        // question in the open. Non-secure merges are byte-identical to the
+        // pre-12.3 build.
         assertSecureBinAuthority(role, [source, target]);
 
         // ── story 12-2: the hazard co-location gate (FR-41) — after the

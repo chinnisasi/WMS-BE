@@ -281,11 +281,13 @@ export class QcCommand {
       // ── story 12-3: the secure-bin authority gate (FR-42) — on the locked
       // origin row: held units LEAVE the origin bin, so a SECURE origin
       // additionally requires `secure.move`, the (role, bin) authority
-      // decided on the row already in hand. `qc.manage` and `secure.move`
-      // are held by exactly the same roles today, so this arm is dead code
-      // by the matrix — the invariant test in `test/users.spec.ts` keeps
-      // that subset enforced. Non-secure holds are byte-identical to the
-      // pre-12.3 build.
+      // decided on the row already in hand. Non-denying today (the matrix
+      // invariant keeps the subset enforced): `qc.manage` and `secure.move`
+      // are held by exactly the same roles. Non-secure holds are
+      // byte-identical to the pre-12.3 build. A replayed idempotency key
+      // returns the cached success before this gate — the original
+      // authorized execution already decided; that is deliberate
+      // idempotency semantics.
       assertSecureBinAuthority(role, [originBin]);
 
       // ── one open hold per (tenant, warehouse, sku, bin) scope ──────────
@@ -544,11 +546,13 @@ export class QcCommand {
       // additionally requires `secure.move`, the (role, bin) authority
       // decided on the row already in hand. (The PENDING `inbound:45`
       // currency note on this read stands — story 12-3 adds the assert on
-      // the class read here, not the lock.) `qc.manage` and `secure.move`
-      // are held by exactly the same roles today, so this arm is dead code
-      // by the matrix — the invariant test in `test/users.spec.ts` keeps
-      // that subset enforced. Non-secure releases are byte-identical to the
-      // pre-12.3 build.
+      // the class read here, not the lock.) Non-denying today (the matrix
+      // invariant keeps the subset enforced): `qc.manage` and `secure.move`
+      // are held by exactly the same roles. Non-secure releases are
+      // byte-identical to the pre-12.3 build. A replayed idempotency key
+      // returns the cached success before this gate — the original
+      // authorized execution already decided; that is deliberate
+      // idempotency semantics.
       assertSecureBinAuthority(role, [origin]);
 
       // The release replays the hold's OWN qc.held arms — a concurrent hold

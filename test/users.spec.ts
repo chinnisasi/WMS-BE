@@ -797,29 +797,37 @@ describe('users, roles, and permission gating (e2e)', () => {
   });
 
   // Story 12-3 — the matrix invariant behind the secure-bin authority gate.
-  // For merge/hold/release the gate is DEAD CODE while the subset holds: the
-  // holder sets of `bin.retire` and `qc.manage` are subsets of the
-  // `secure.move` holders. This test turns that implicit subset into an
-  // enforced one, so a future grant to bin.retire/qc.manage that forgets
-  // secure.move fails here instead of opening the cage. The other two
-  // movement capabilities are NOT in the invariant — `putaway.execute` and
-  // `picks.execute` are floor verbs the operator deliberately holds WITHOUT
-  // `secure.move` (decided 2026-09-24: the cage is off-limits to floor
-  // staff), and the gate at those two writers is live code protected by the
-  // e2e 403s in putaway.spec / picking.spec, not by this matrix test.
-  test('every role holding bin.retire or qc.manage also holds secure.move (the cage invariant)', () => {
-    const deadCodeCapabilities = ['bin.retire', 'qc.manage'] as const;
-    const roles: UserRole[] = ['owner', 'ops_manager', 'operator', 'accountant'];
+  // The assert runs at every gated writer and IS the future 403; it is only
+  // NON-DENYING today where the capability's holder set is a subset of
+  // `secure.move`'s. This test turns that implicit subset into an enforced
+  // one, so a future grant that forgets secure.move fails here instead of
+  // opening the cage.
+  //
+  // `bin.retire` and `qc.manage` are gate coverage: the merge/hold/release
+  // asserts can never deny a legitimate holder while the subset holds.
+  // `stock.adjust` is BYPASS CONTAINMENT, not gate coverage — it is the one
+  // writer that can create stock in a secure bin without the gate (the
+  // named `stock.adjust` bypass), so its holders are asserted cage-capable
+  // here to keep the seeding path inside the same closed set. The floor
+  // verbs (`putaway.execute`, `picks.execute`) are NOT in the invariant: the
+  // operator deliberately holds them WITHOUT `secure.move` (decided
+  // 2026-09-24 — the cage is off-limits to floor staff), and the gate at
+  // those two writers is live code protected by the e2e 403s in
+  // putaway.spec / picking.spec, not by this matrix test.
+  test('every role holding bin.retire, qc.manage or stock.adjust also holds secure.move (the cage invariant)', () => {
+    const invariantCapabilities = ['bin.retire', 'qc.manage', 'stock.adjust'] as const;
+    const roles = Object.keys(ROLE_CAPABILITIES) as UserRole[];
     const secureMoveHolders = roles.filter((role) => ROLE_CAPABILITIES[role].has('secure.move'));
 
-    for (const capability of deadCodeCapabilities) {
+    for (const capability of invariantCapabilities) {
       const holders = roles.filter((role) => ROLE_CAPABILITIES[role].has(capability));
       // Not vacuous: the capability must actually be granted to somebody.
       expect(holders.length).toBeGreaterThan(0);
       // The invariant: every holder of the movement capability is inside the
-      // cage-capable set — so the merge/hold/release asserts can never 403 a
-      // legitimate holder, and a future grant that breaks the subset fails
-      // here.
+      // cage-capable set — so the gate's non-denying arms can never 403 a
+      // legitimate holder, the bypass can never seed the cage from outside
+      // the cage-capable set, and a future grant that breaks the subset
+      // fails here.
       for (const role of holders) {
         expect(secureMoveHolders).toContain(role);
       }

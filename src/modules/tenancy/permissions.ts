@@ -1,5 +1,6 @@
 import type { UserRole } from '../../shared/db/schema';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
+import { SECURE_STORAGE_CLASS } from '../../shared/primitives/storage-class';
 
 /**
  * Capabilities (Story 1.5) — the machine names mutations are gated on. Reads
@@ -75,15 +76,16 @@ export const CAPABILITIES = [
   // the 4.2b FE story with the other outbound capabilities.
   'dispatch.execute',
   // Story 12-3 — FR-42's authority gate: high-value/controlled stock lives in
-  // secure/cage-class bins, and every ledger movement that touches one
-  // (placement target, merge source AND target, pick draw, QC-hold origin —
-  // held units leave it — and QC-release origin-return) asserts this
-  // capability beside that command's existing class gate, via
-  // `assertSecureBinAuthority` below. Owner + Ops Manager only (decided,
-  // human, 2026-09-24): the cage is off-limits to floor staff — badge-in
-  // sessions carry the actor's own role, so an operator's placement or pick
-  // into/out of a secure bin 403s even though the floor verbs themselves are
-  // theirs. Mirrored into wms-fe `src/lib/users.ts`.
+  // secure/cage-class bins, and every ledger movement that touches one except
+  // the named `stock.adjust` bypass (placement target, merge source AND
+  // target, pick draw, QC-hold origin — held units leave it — and
+  // QC-release origin-return) asserts this capability beside that command's
+  // existing class gate, via `assertSecureBinAuthority` below. Owner + Ops
+  // Manager only (decided, human, 2026-09-24): the cage is off-limits to
+  // floor staff — badge-in sessions carry the actor's own role, so an
+  // operator's placement or pick into/out of a secure bin 403s even though
+  // the floor verbs themselves are theirs. Mirrored into wms-fe
+  // `src/lib/users.ts`.
   'secure.move',
   // Story 4.6b — the carrier credential vault (connect a carrier account,
   // rotate its material, disconnect it). A SETTINGS capability, mirroring
@@ -180,19 +182,21 @@ export function assertPermission(role: UserRole, capability: Capability): void {
  * build.
  *
  * Callers (the five movement writers — placement target, merge source AND
- * target, pick draw, QC-hold origin, QC-release origin-return) run this
- * beside their existing storage-class gate, with the role already re-read
- * per AD-10. Today the gate can only fire on placement and pick —
- * `bin.retire` and `qc.manage` are held by exactly the roles that hold
- * `secure.move` — and the matrix-invariant test in `test/users.spec.ts`
- * keeps that subset enforced, so a future grant must answer the cage
- * question in the open.
+ * target, pick draw, QC-hold origin, QC-release origin-return; `stock.adjust`
+ * is the named bypass beside all five) run this beside their existing
+ * storage-class gate, with the role already re-read per AD-10. The merge,
+ * hold and release asserts are non-denying today (the matrix invariant keeps
+ * the subset enforced) — every `bin.retire`/`qc.manage` holder also holds
+ * `secure.move` — while the placement and pick asserts are live code the
+ * operator can hit. Either way the assert runs and is the future 403; the
+ * matrix-invariant test in `test/users.spec.ts` keeps the subset enforced,
+ * so a future grant must answer the cage question in the open.
  */
 export function assertSecureBinAuthority(
   role: UserRole,
   bins: readonly { storageClass: string | null }[],
 ): void {
-  if (!bins.some((bin) => bin.storageClass === 'secure')) {
+  if (!bins.some((bin) => bin.storageClass === SECURE_STORAGE_CLASS)) {
     return;
   }
   assertPermission(role, 'secure.move');

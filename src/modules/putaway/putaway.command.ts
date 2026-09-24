@@ -560,7 +560,9 @@ export class PutawayCommand {
       // (role, bin) authority decided on the row already in hand (no new
       // query, no lock change). Owner + Ops Manager only — an operator's
       // placement into the cage 403s `role-denied` naming `secure.move`
-      // before the hazard gate or any load read runs; non-secure bins are
+      // before the hazard gate or any load read runs; this writer is the
+      // gate's LIVE arm (merge/hold/release are non-denying today — the
+      // matrix invariant keeps the subset enforced); non-secure bins are
       // byte-identical to the pre-12.3 build.
       assertSecureBinAuthority(role, [targetBin]);
       // ── story 12-2: the hazard co-location gate (FR-41) — after the class
