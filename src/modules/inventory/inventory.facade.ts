@@ -1,8 +1,9 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { batchOnHand, ledgerEvents, stockOnHand } from '../../shared/db/schema';
+import type { LedgerEvent } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
@@ -727,6 +728,120 @@ export class InventoryFacade {
           sql`${stockOnHand.quantity} > 0`,
         ),
       );
+  }
+
+  /**
+   * The ledger rows whose reference doc names one order (story 12-6, FR-45):
+   * the `dispatch.dispatched` events that say the order shipped and the
+   * `pick.picked` events that served it, seq-ordered, in the CALLER's
+   * transaction. The join key is `reference_doc->>'orderId'` — the hash-chained
+   * doc was built (story 4.3) precisely so the ledger could answer "which
+   * picks served this order" without an outbound-table join; migration 0039's
+   * expression index keeps the match off a whole-warehouse scan.
+   *
+   * This is an in-transaction feed, NOT a read model: rows come back raw —
+   * milli-unit quantities, Postgres text instants, the typed reference doc
+   * verbatim — and the caller converts at its own HTTP edge (`fromMilli` +
+   * `canonicalInstant`, the `listEvents` pattern). Warehouse-scoped like every
+   * timeline read here.
+   */
+  async ledgerEventsByOrderRefInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    orderId: string,
+  ): Promise<readonly LedgerEvent[]> {
+    return tx
+      .select()
+      .from(ledgerEvents)
+      .where(
+        and(
+          eq(ledgerEvents.tenantId, tenantId),
+          eq(ledgerEvents.warehouseId, warehouseId),
+          // Only the two types whose reference doc carries orderId — the
+          // type filter keeps the index (which is order-ref-wide) honest
+          // about what this read is for.
+          inArray(ledgerEvents.type, ['pick.picked', 'dispatch.dispatched']),
+          sql`${ledgerEvents.referenceDoc}->>'orderId' = ${orderId}`,
+        ),
+      )
+      .orderBy(asc(ledgerEvents.seq));
+  }
+
+  /**
+   * The full ledger history of a set of batch/serial scopes (story 12-6,
+   * FR-45): every event whose `batch_ref` or `serial_ref` matches, seq-ordered,
+   * in the CALLER's transaction — the `(tenant,batch_ref,seq)` /
+   * `(tenant,serial_ref,seq)` trace indexes (schema.ts) at work. A scope's
+   * chain is its COMPLETE history within the warehouse — other orders' picks
+   * included — because the batch's history is the batch's history.
+   *
+   * In-transaction feed like `ledgerEventsByOrderRefInTx` (raw rows; the
+   * caller converts at its edge). Empty ref lists short-circuit to `[]` (the
+   * `stockByBinsInTx` rule — `IN ()` is invalid SQL, never emitted).
+   */
+  async ledgerEventsByScopeRefsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    refs: { readonly batchRefs: readonly string[]; readonly serialRefs: readonly string[] },
+  ): Promise<readonly LedgerEvent[]> {
+    const batchRefs = [...new Set(refs.batchRefs)];
+    const serialRefs = [...new Set(refs.serialRefs)];
+    if (batchRefs.length === 0 && serialRefs.length === 0) {
+      return [];
+    }
+    return tx
+      .select()
+      .from(ledgerEvents)
+      .where(
+        and(
+          eq(ledgerEvents.tenantId, tenantId),
+          eq(ledgerEvents.warehouseId, warehouseId),
+          or(
+            batchRefs.length === 0
+              ? undefined
+              : inArray(ledgerEvents.batchRef, batchRefs),
+            serialRefs.length === 0
+              ? undefined
+              : inArray(ledgerEvents.serialRef, serialRefs),
+          ),
+        ),
+      )
+      .orderBy(asc(ledgerEvents.seq));
+  }
+
+  /**
+   * A warehouse's `excursion.recorded` events for a set of SKUs (story 12-6,
+   * FR-45), seq-ordered, in the CALLER's transaction — the raw material for
+   * dwell-window correlation. A separate read by SKU (not folded into the
+   * scope-ref read) because the excursion arm carries no batch/serial: one
+   * event is written per affected (sku, bin) scope, so the scope link is
+   * `skuId` + dwell window, never a ref match.
+   *
+   * In-transaction feed like its siblings — raw rows, caller converts.
+   */
+  async ledgerExcursionEventsBySkuInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuIds: readonly string[],
+  ): Promise<readonly LedgerEvent[]> {
+    if (skuIds.length === 0) {
+      return [];
+    }
+    return tx
+      .select()
+      .from(ledgerEvents)
+      .where(
+        and(
+          eq(ledgerEvents.tenantId, tenantId),
+          eq(ledgerEvents.warehouseId, warehouseId),
+          eq(ledgerEvents.type, 'excursion.recorded'),
+          inArray(ledgerEvents.skuId, [...new Set(skuIds)]),
+        ),
+      )
+      .orderBy(asc(ledgerEvents.seq));
   }
 
   /**

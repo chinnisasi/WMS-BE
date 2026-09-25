@@ -1,0 +1,11 @@
+-- Story 12-6 (FR-45): the order→pick join key on the ledger.
+-- The `pick` reference doc has carried orderId/orderLineId since story 4.3
+-- precisely so the ledger could answer "which picks served this order" without
+-- an outbound-table join. This index keeps that join off a whole-warehouse
+-- scan as the ledger grows (append-only; every other lookup key — tenant,
+-- batch/serial trace, keyset timeline — already has one).
+-- Index-only, additive: no column, no data change, and no RLS hand-append
+-- (the table already has it, 0023). The snapshot is a copy of 0038's:
+-- drizzle-kit generate is blind to expression indexes emitted by hand, so the
+-- next generate must not re-emit it.
+CREATE INDEX "ledger_events_order_ref_idx" ON "ledger_events" USING btree ((("reference_doc"->>'orderId'))) WHERE "reference_doc" ? 'orderId';
