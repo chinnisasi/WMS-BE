@@ -1082,6 +1082,35 @@ export class InventoryFacade {
   }
 
   /**
+   * Every (sku, quantity) on-hand row of ONE bin with a positive quantity
+   * (Story 12-5, the excursion sweep): the bin's affected scopes — every
+   * distinct SKU with on-hand quantity > 0 — in skuId order for a
+   * deterministic command. The caller's in-transaction passthrough shape
+   * (`qcScopeOnHandInTx` precedent); a read of the projection, never an
+   * allocation, and never a write path.
+   */
+  async onHandInBinInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    binId: string,
+  ): Promise<ReadonlyArray<{ skuId: string; quantity: number }>> {
+    const rows = await tx
+      .select({ skuId: stockOnHand.skuId, quantity: stockOnHand.quantity })
+      .from(stockOnHand)
+      .where(
+        and(
+          eq(stockOnHand.tenantId, tenantId),
+          eq(stockOnHand.warehouseId, warehouseId),
+          eq(stockOnHand.binId, binId),
+          sql`${stockOnHand.quantity} > 0`,
+        ),
+      )
+      .orderBy(asc(stockOnHand.skuId));
+    return rows;
+  }
+
+  /**
    * A hold's own `qc.held` arms (Story 3.4): the events the hold placed,
    * oldest first — the release replays exactly these (same batch refs, same
    * magnitudes) so a concurrent hold of the same SKU from another origin bin

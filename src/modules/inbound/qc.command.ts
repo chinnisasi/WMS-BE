@@ -3,6 +3,7 @@ import { and, asc, eq, inArray } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, bins, idempotencyKeys, qcHolds, skus } from '../../shared/db/schema';
+import type { UserRole } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { fromMilli, signedQuantity } from '../../shared/primitives/quantity';
 import { nowIso } from '../../shared/primitives/time';
@@ -30,6 +31,21 @@ export interface PlaceQcHoldCommand {
   /** The scope's origin bin — captured at hold time; release returns here. */
   readonly binId: string;
   /** Why the stock is quarantined (free-form, carried verbatim). */
+  readonly reason: string;
+}
+
+/**
+ * Story 12-5 — the extracted in-transaction hold core's input: the same
+ * fields `placeHold` carries, minus the command-shell concerns (the caller
+ * owns authority, replay and idempotency; the helper owns the scope's
+ * validation and every write).
+ */
+export interface HoldScopeInTxCommand {
+  readonly tenantId: string;
+  readonly warehouseId: string;
+  readonly actorUserId: string;
+  readonly skuId: string;
+  readonly binId: string;
   readonly reason: string;
 }
 
@@ -175,7 +191,7 @@ export class QcCommand {
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── authority at command entry (the deliberate fail-closed order) ──
       // The role stays in scope: story 12-3's secure-bin authority gate
-      // re-uses it below, on the locked origin bin row.
+      // re-uses it in the hold core below, on the locked origin bin row.
       const role = await getMemberRoleIn(tx, command.tenantId, command.actorUserId);
       assertPermission(role, 'qc.manage');
 
@@ -204,241 +220,276 @@ export class QcCommand {
       // Master-data integrity in the write transaction (404 before any write):
       // warehouse in tenant, SKU in tenant, bin in the tenant's warehouse.
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
-      const skuRows = await tx
-        .select({
-          id: skus.id,
-          serialTracked: skus.serialTracked,
-          catchWeightTracked: skus.catchWeightTracked,
-        })
-        .from(skus)
-        .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
-        .limit(1);
-      if (skuRows[0] === undefined) {
-        throw notFound('SKU', command.skuId);
-      }
-      // A serial-tracked scope cannot be held bulk: the movements carry no
-      // serial arms, so the serials' location records would stay at the
-      // origin bin while their stock relocates to the QC bin — divergence
-      // with no repair path. Refuse before any movement is appended.
-      if (skuRows[0].serialTracked) {
-        throw qcValidation(
-          `SKU ${command.skuId} is serial-tracked — a bulk (sku, bin) QC hold would strand its serial location records at the origin bin, so it cannot be quarantined as a whole scope.`,
-        );
-      }
-      // Story 10.3: the same reasoning, transferred verbatim to catch weight.
-      // `placeHold` moves a whole `(sku, bin)` scope and carries NO per-unit
-      // identifiers, and a handling unit has no location between receipt and
-      // pack — so nothing here could say WHICH cases were quarantined. The
-      // rule the story turns on is that every path which can consume a unit
-      // either names units explicitly or is refused: adjustment names them,
-      // and this one is refused. Accepting it silently would leave the held
-      // units `active` and packable, which is the fail-open this whole
-      // status column exists to prevent. Refused and deferred beats quietly
-      // wrong; per-unit quarantine is epic 15's, alongside move-as-unit.
-      if (skuRows[0].catchWeightTracked) {
-        throw qcValidation(
-          `SKU ${command.skuId} is catch-weight tracked — a bulk (sku, bin) QC hold names no handling units, so its cases would stay packable while their stock sat in the QC bin. Quarantining catch-weight stock is not supported; write the affected cases off by naming them on a stock adjustment instead.`,
-        );
-      }
-      const binRows = await tx
-        .select({
-          id: bins.id,
-          code: bins.code,
-          systemOwned: bins.systemOwned,
-          // Story 12-3 — the class the secure-origin authority gate rules on.
-          storageClass: bins.storageClass,
-        })
-        .from(bins)
-        .where(
-          and(
-            eq(bins.id, command.binId),
-            eq(bins.tenantId, command.tenantId),
-            eq(bins.warehouseId, command.warehouseId),
-          ),
-        )
-        .limit(1)
-        // The bin row locks here (the same row the merge/retire commands lock
-        // id-sorted), so a hold cannot commit alongside a concurrent
-        // merge/retire of its bin — stock never double-moves and a hold is
-        // never stranded on a bin that retires underneath it.
-        .for('update');
-      const originBin = binRows[0];
-      if (originBin === undefined) {
-        throw new ProblemException(
-          'not-found',
-          404,
-          'Bin not found',
-          `No bin with id "${command.binId}" exists in this warehouse.`,
-        );
-      }
-      // The QC-hold bin's contents are already held — re-holding it would
-      // fabricate a second hold whose "scope" is the hold bin itself.
-      if (originBin.systemOwned && originBin.code === QC_HOLD_BIN_CODE) {
-        throw qcValidation(
-          'The system QC-hold bin cannot be a hold origin — its contents are already quarantined.',
-        );
-      }
-      // ── story 12-3: the secure-bin authority gate (FR-42) — on the locked
-      // origin row: held units LEAVE the origin bin, so a SECURE origin
-      // additionally requires `secure.move`, the (role, bin) authority
-      // decided on the row already in hand. Non-denying today (the matrix
-      // invariant keeps the subset enforced): `qc.manage` and `secure.move`
-      // are held by exactly the same roles. Non-secure holds are
-      // byte-identical to the pre-12.3 build. A replayed idempotency key
-      // returns the cached success before this gate — the original
-      // authorized execution already decided; that is deliberate
-      // idempotency semantics.
-      assertSecureBinAuthority(role, [originBin]);
 
-      // ── one open hold per (tenant, warehouse, sku, bin) scope ──────────
-      const openRows = await tx
-        .select({ id: qcHolds.id })
-        .from(qcHolds)
-        .where(
-          and(
-            eq(qcHolds.tenantId, command.tenantId),
-            eq(qcHolds.warehouseId, command.warehouseId),
-            eq(qcHolds.skuId, command.skuId),
-            eq(qcHolds.binId, command.binId),
-            eq(qcHolds.status, 'open'),
-          ),
-        )
-        .limit(1);
-      if (openRows[0] !== undefined) {
-        throw new ProblemException(
-          'qc-hold-open',
-          409,
-          'This scope is already QC-held',
-          `An open QC hold (${openRows[0].id}) already covers this (sku, bin) scope — release it before placing another.`,
-        );
-      }
-
-      // ── the scope's stock (the movement's magnitude, per batch arm) ────
-      const scope = await this.inventory.qcScopeOnHandInTx(
-        tx,
-        command.tenantId,
-        command.warehouseId,
-        command.skuId,
-        command.binId,
-      );
-      if (scope.quantity <= 0) {
-        throw qcValidation(
-          `The (sku, bin) scope (${command.skuId} at ${command.binId}) has ${fromMilli(scope.quantity)} on-hand units — a hold quarantines stock that exists.`,
-        );
-      }
-      // The batch rows sum to the plain quantity on a batch-tracked SKU; an
-      // untracked SKU carries none and moves on one `batchRef: null` arm.
-      const arms =
-        scope.batches.length > 0
-          ? scope.batches
-          : [{ batchId: null as string | null, quantity: scope.quantity }];
-
-      // ── the movements + the hold row (one tx, the ledger is the record) ─
-      const holdId = uuidv7();
-      const qcBin = await ensureQcHoldBinInTx(tx, command.tenantId, command.warehouseId);
-      const heldAt = nowIso();
-      for (const arm of arms) {
-        if (arm.quantity <= 0) {
-          continue; // a zero batch row moves nothing (the plain sum still covers the scope)
-        }
-        const movement: LedgerMovement = {
-          tenantId: command.tenantId,
-          warehouseId: command.warehouseId,
-          type: 'qc.held',
-          skuId: command.skuId,
-          quantityDelta: signedQuantity(arm.quantity),
-          fromBinId: command.binId,
-          toBinId: qcBin.binId,
-          batchRef: arm.batchId,
-          serialRef: null,
-          actorUserId: command.actorUserId,
-          occurredAt: heldAt,
-          recordedAt: heldAt,
-          referenceDoc: {
-            kind: 'qc-hold',
-            holdId,
-            fromBinId: command.binId,
-          },
-        };
-        await this.inventory.appendLedgerEventInTx(tx, movement);
-      }
-
-      try {
-        await tx.insert(qcHolds).values({
-          id: holdId,
-          tenantId: command.tenantId,
-          warehouseId: command.warehouseId,
-          skuId: command.skuId,
-          binId: command.binId,
-          reason: command.reason,
-          status: 'open',
-          heldBy: command.actorUserId,
-          heldAt,
-        });
-      } catch (err) {
-        if (isUniqueViolationOn(err, QC_HOLDS_OPEN_SCOPE_KEY)) {
-          // A concurrent hold for the same open scope won the index — the
-          // deterministic double-hold outcome either way.
-          throw new ProblemException(
-            'qc-hold-open',
-            409,
-            'This scope is already QC-held',
-            'An open QC hold already covers this (sku, bin) scope (a concurrent hold won) — release it before placing another.',
-          );
-        }
-        throw err;
-      }
-
-      const snapshot: QcHoldSnapshot = {
-        qcHold: {
-          id: holdId,
-          tenantId: command.tenantId,
-          warehouseId: command.warehouseId,
-          skuId: command.skuId,
-          binId: command.binId,
-          reason: command.reason,
-          status: 'open',
-          heldBy: command.actorUserId,
-          heldAt,
-          releasedBy: null,
-          releasedAt: null,
-          createdAt: heldAt,
-        },
-      };
-
-      // ── in-transaction outbox append (AD-7) ─────────────────────────────
-      await this.outbox.append(tx, {
-        messageId: uuidv7(),
-        tenantId: command.tenantId,
-        type: 'qc_hold.placed',
-        occurredAt: heldAt,
-        payload: {
-          holdId,
-          tenantId: command.tenantId,
-          warehouseId: command.warehouseId,
-          skuId: command.skuId,
-          binId: command.binId,
-          reason: command.reason,
-          heldBy: command.actorUserId,
-          heldAt,
-        },
-      });
-
-      // ── the audit row + idempotency key (the invariant order's tail) ────
-      await tx.insert(auditEvents).values({
-        id: uuidv7(),
-        tenantId: command.tenantId,
-        actorUserId: command.actorUserId,
-        action: 'qc_hold.placed',
-        targetType: 'qc_hold',
-        targetId: holdId,
-        reference: idempotencyKey,
-        occurredAt: heldAt,
-      });
+      // ── the scope's validation + every write (Story 12-5 extraction) ───
+      // The movement+row-write core lives in `holdScopeInTx` so the excursion
+      // command quarantines through the ONE hold implementation; `placeHold`
+      // stays the behavior-identical shell around it (its suite pins it).
+      const snapshot = await this.holdScopeInTx(tx, command, role, idempotencyKey);
 
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
       return snapshot;
     });
+  }
+
+  /**
+   * Story 12-5 — the in-transaction hold core, extracted from `placeHold` so
+   * a sibling module (the compliance module's excursion command) quarantines
+   * a (sku, bin) scope through the ONE implementation of the hold semantics
+   * instead of a fork: SKU tracking refusals, the locked origin-bin read, the
+   * system-bin refusal, the 12-3 secure authority gate, the one-open-hold
+   * 409, the per-batch `qc.held` movements into the system QC-hold bin, the
+   * hold row, the outbox append and the audit row.
+   *
+   * The caller owns everything above the scope: authority (`assertPermission`
+   * on a fresh role read), the idempotency replay lookup and the payload-hash
+   * commit marker. `role` is passed in because the secure-bin gate rules on
+   * the CALLER's authority, already re-read per AD-10. Runs inside the
+   * CALLER's transaction (the `…InTx` convention) — it opens nothing and
+   * commits nothing itself.
+   */
+  async holdScopeInTx(
+    tx: TenantTx,
+    command: HoldScopeInTxCommand,
+    role: UserRole,
+    auditReference: string,
+  ): Promise<QcHoldSnapshot> {
+    const skuRows = await tx
+      .select({
+        id: skus.id,
+        serialTracked: skus.serialTracked,
+        catchWeightTracked: skus.catchWeightTracked,
+      })
+      .from(skus)
+      .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
+      .limit(1);
+    if (skuRows[0] === undefined) {
+      throw notFound('SKU', command.skuId);
+    }
+    // A serial-tracked scope cannot be held bulk: the movements carry no
+    // serial arms, so the serials' location records would stay at the
+    // origin bin while their stock relocates to the QC bin — divergence
+    // with no repair path. Refuse before any movement is appended.
+    if (skuRows[0].serialTracked) {
+      throw qcValidation(
+        `SKU ${command.skuId} is serial-tracked — a bulk (sku, bin) QC hold would strand its serial location records at the origin bin, so it cannot be quarantined as a whole scope.`,
+      );
+    }
+    // Story 10.3: the same reasoning, transferred verbatim to catch weight.
+    // `placeHold` moves a whole `(sku, bin)` scope and carries NO per-unit
+    // identifiers, and a handling unit has no location between receipt and
+    // pack — so nothing here could say WHICH cases were quarantined. The
+    // rule the story turns on is that every path which can consume a unit
+    // either names units explicitly or is refused: adjustment names them,
+    // and this one is refused. Accepting it silently would leave the held
+    // units `active` and packable, which is the fail-open this whole
+    // status column exists to prevent. Refused and deferred beats quietly
+    // wrong; per-unit quarantine is epic 15's, alongside move-as-unit.
+    if (skuRows[0].catchWeightTracked) {
+      throw qcValidation(
+        `SKU ${command.skuId} is catch-weight tracked — a bulk (sku, bin) QC hold names no handling units, so its cases would stay packable while their stock sat in the QC bin. Quarantining catch-weight stock is not supported; write the affected cases off by naming them on a stock adjustment instead.`,
+      );
+    }
+    const binRows = await tx
+      .select({
+        id: bins.id,
+        code: bins.code,
+        systemOwned: bins.systemOwned,
+        // Story 12-3 — the class the secure-origin authority gate rules on.
+        storageClass: bins.storageClass,
+      })
+      .from(bins)
+      .where(
+        and(
+          eq(bins.id, command.binId),
+          eq(bins.tenantId, command.tenantId),
+          eq(bins.warehouseId, command.warehouseId),
+        ),
+      )
+      .limit(1)
+      // The bin row locks here (the same row the merge/retire commands lock
+      // id-sorted), so a hold cannot commit alongside a concurrent
+      // merge/retire of its bin — stock never double-moves and a hold is
+      // never stranded on a bin that retires underneath it.
+      .for('update');
+    const originBin = binRows[0];
+    if (originBin === undefined) {
+      throw new ProblemException(
+        'not-found',
+        404,
+        'Bin not found',
+        `No bin with id "${command.binId}" exists in this warehouse.`,
+      );
+    }
+    // The QC-hold bin's contents are already held — re-holding it would
+    // fabricate a second hold whose "scope" is the hold bin itself.
+    if (originBin.systemOwned && originBin.code === QC_HOLD_BIN_CODE) {
+      throw qcValidation(
+        'The system QC-hold bin cannot be a hold origin — its contents are already quarantined.',
+      );
+    }
+    // ── story 12-3: the secure-bin authority gate (FR-42) — on the locked
+    // origin row: held units LEAVE the origin bin, so a SECURE origin
+    // additionally requires `secure.move`, the (role, bin) authority
+    // decided on the row already in hand. Non-denying today (the matrix
+    // invariant keeps the subset enforced): `qc.manage` and `secure.move`
+    // are held by exactly the same roles. Non-secure holds are
+    // byte-identical to the pre-12.3 build. A replayed idempotency key
+    // returns the cached success before this gate — the original
+    // authorized execution already decided; that is deliberate
+    // idempotency semantics.
+    assertSecureBinAuthority(role, [originBin]);
+
+    // ── one open hold per (tenant, warehouse, sku, bin) scope ──────────
+    const openRows = await tx
+      .select({ id: qcHolds.id })
+      .from(qcHolds)
+      .where(
+        and(
+          eq(qcHolds.tenantId, command.tenantId),
+          eq(qcHolds.warehouseId, command.warehouseId),
+          eq(qcHolds.skuId, command.skuId),
+          eq(qcHolds.binId, command.binId),
+          eq(qcHolds.status, 'open'),
+        ),
+      )
+      .limit(1);
+    if (openRows[0] !== undefined) {
+      throw new ProblemException(
+        'qc-hold-open',
+        409,
+        'This scope is already QC-held',
+        `An open QC hold (${openRows[0].id}) already covers this (sku, bin) scope — release it before placing another.`,
+      );
+    }
+
+    // ── the scope's stock (the movement's magnitude, per batch arm) ────
+    const scope = await this.inventory.qcScopeOnHandInTx(
+      tx,
+      command.tenantId,
+      command.warehouseId,
+      command.skuId,
+      command.binId,
+    );
+    if (scope.quantity <= 0) {
+      throw qcValidation(
+        `The (sku, bin) scope (${command.skuId} at ${command.binId}) has ${fromMilli(scope.quantity)} on-hand units — a hold quarantines stock that exists.`,
+      );
+    }
+    // The batch rows sum to the plain quantity on a batch-tracked SKU; an
+    // untracked SKU carries none and moves on one `batchRef: null` arm.
+    const arms =
+      scope.batches.length > 0
+        ? scope.batches
+        : [{ batchId: null as string | null, quantity: scope.quantity }];
+
+    // ── the movements + the hold row (one tx, the ledger is the record) ─
+    const holdId = uuidv7();
+    const qcBin = await ensureQcHoldBinInTx(tx, command.tenantId, command.warehouseId);
+    const heldAt = nowIso();
+    for (const arm of arms) {
+      if (arm.quantity <= 0) {
+        continue; // a zero batch row moves nothing (the plain sum still covers the scope)
+      }
+      const movement: LedgerMovement = {
+        tenantId: command.tenantId,
+        warehouseId: command.warehouseId,
+        type: 'qc.held',
+        skuId: command.skuId,
+        quantityDelta: signedQuantity(arm.quantity),
+        fromBinId: command.binId,
+        toBinId: qcBin.binId,
+        batchRef: arm.batchId,
+        serialRef: null,
+        actorUserId: command.actorUserId,
+        occurredAt: heldAt,
+        recordedAt: heldAt,
+        referenceDoc: {
+          kind: 'qc-hold',
+          holdId,
+          fromBinId: command.binId,
+        },
+      };
+      await this.inventory.appendLedgerEventInTx(tx, movement);
+    }
+
+    try {
+      await tx.insert(qcHolds).values({
+        id: holdId,
+        tenantId: command.tenantId,
+        warehouseId: command.warehouseId,
+        skuId: command.skuId,
+        binId: command.binId,
+        reason: command.reason,
+        status: 'open',
+        heldBy: command.actorUserId,
+        heldAt,
+      });
+    } catch (err) {
+      if (isUniqueViolationOn(err, QC_HOLDS_OPEN_SCOPE_KEY)) {
+        // A concurrent hold for the same open scope won the index — the
+        // deterministic double-hold outcome either way.
+        throw new ProblemException(
+          'qc-hold-open',
+          409,
+          'This scope is already QC-held',
+          'An open QC hold already covers this (sku, bin) scope (a concurrent hold won) — release it before placing another.',
+        );
+      }
+      throw err;
+    }
+
+    const snapshot: QcHoldSnapshot = {
+      qcHold: {
+        id: holdId,
+        tenantId: command.tenantId,
+        warehouseId: command.warehouseId,
+        skuId: command.skuId,
+        binId: command.binId,
+        reason: command.reason,
+        status: 'open',
+        heldBy: command.actorUserId,
+        heldAt,
+        releasedBy: null,
+        releasedAt: null,
+        createdAt: heldAt,
+      },
+    };
+
+    // ── in-transaction outbox append (AD-7) ─────────────────────────────
+    await this.outbox.append(tx, {
+      messageId: uuidv7(),
+      tenantId: command.tenantId,
+      type: 'qc_hold.placed',
+      occurredAt: heldAt,
+      payload: {
+        holdId,
+        tenantId: command.tenantId,
+        warehouseId: command.warehouseId,
+        skuId: command.skuId,
+        binId: command.binId,
+        reason: command.reason,
+        heldBy: command.actorUserId,
+        heldAt,
+      },
+    });
+
+    // ── the audit row (the caller owns the idempotency key) ─────────────
+    // `auditReference` is the caller's correlation value — `placeHold`
+    // passes its idempotency key (the pre-extraction behavior, unchanged);
+    // the excursion passes the excursion id.
+    await tx.insert(auditEvents).values({
+      id: uuidv7(),
+      tenantId: command.tenantId,
+      actorUserId: command.actorUserId,
+      action: 'qc_hold.placed',
+      targetType: 'qc_hold',
+      targetId: holdId,
+      reference: auditReference,
+      occurredAt: heldAt,
+    });
+
+    return snapshot;
   }
 
   /**

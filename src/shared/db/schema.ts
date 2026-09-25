@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { bigint, boolean, index, integer, jsonb, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, index, integer, jsonb, numeric, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
 /**
@@ -2234,3 +2234,65 @@ export const carrierConnections = pgTable(
 );
 
 export type CarrierConnection = typeof carrierConnections.$inferSelect;
+
+/**
+ * Temperature excursions (Story 12-5, FR-44): one row per recorded excursion
+ * — an operator-captured °C reading against an origin bin, whose affected
+ * (sku, bin) scopes were quarantined AT RECORD TIME through the inbound
+ * module's ordinary QC-hold semantics (the `hold_ids` array links this queue
+ * item to the holds it caused without compliance ever writing `qc_holds`,
+ * which stays inbound-exclusive). The affected-stock truth lives in the
+ * ledger (`excursion.recorded` events, AD-11) and in the QC holds; this row
+ * is the review queue's data — the reading, the note and the resolve state
+ * the Conflicts & Reviews surface (12-7) reads. `resolve` is a review-status
+ * flip only: it releases nothing (disposition is `qc.manage`'s).
+ *
+ * `reading_c` is `numeric(6,2)` — a measurement, deliberately not a scaled
+ * integer quantity (°C carries no UoM conversion; the story's Never list
+ * keeps unit conversion out). `status` is the two-valued review lifecycle
+ * `open | resolved`; RLS policy + the status CHECK live **only in the
+ * migration SQL** (0038, the 0008/0011 pattern). No scope uniqueness: one row
+ * per excursion, history accumulates.
+ *
+ * No FKs anywhere (repo convention): `warehouse_id` / `bin_id` /
+ * `recorded_by` / `resolved_by` are bare uuids validated in the command
+ * transaction. `hold_ids` is a uuid array of QC-hold ids, likewise
+ * validated by construction (the ids come back from the hold writes).
+ */
+export const temperatureExcursions = pgTable(
+  'temperature_excursions',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    /** The origin bin the reading was taken against (release-capable holds point back at it). */
+    binId: uuid('bin_id').notNull(),
+    /** The operator-captured reading, °C, two decimal places (bounds −100..200 at the edge). */
+    readingC: numeric('reading_c', { precision: 6, scale: 2 }).notNull(),
+    /** The operator's free-text context; null when none was given. */
+    note: text('note'),
+    /** The QC holds this excursion quarantined its affected scopes with. */
+    holdIds: uuid('hold_ids').array().notNull(),
+    status: text('status').notNull().default('open'),
+    recordedBy: uuid('recorded_by').notNull(),
+    /** Business time — when the reading was observed (device clock, AD-1). */
+    occurredAt: timestamp('occurred_at', { withTimezone: true, mode: 'string' }).notNull(),
+    resolvedBy: uuid('resolved_by'),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The excursion list's keyset pagination (created_at + id, standard cursor).
+    index('temperature_excursions_tenant_created_at_id_idx').on(
+      table.tenantId,
+      table.createdAt,
+      table.id,
+    ),
+    // The review queue's open-first read (12-7) and any status-filtered read.
+    index('temperature_excursions_tenant_status_idx').on(table.tenantId, table.status),
+  ],
+);
+
+export type TemperatureExcursion = typeof temperatureExcursions.$inferSelect;

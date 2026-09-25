@@ -97,6 +97,15 @@ export const CAPABILITIES = [
   // connection's public face only, never credential material, so there is
   // nothing for a gate to protect. Mirrored into wms-fe `src/lib/users.ts`.
   'carrier.manage',
+  // Story 12-5 — FR-44's recording verb: an operator on the floor records a
+  // temperature excursion against a bin (owner + Ops Manager + Operator,
+  // mirroring `putaway.execute`'s rationale — the floor records what it
+  // observes); Accountant stays read-only. The excursion's QUARANTINE rides
+  // the existing `qc.manage` semantics (the extracted hold helper) and its
+  // RESOLUTION is `review.decide`'s — this capability answers only "record
+  // what you observed", so it deliberately does NOT gate a resolve.
+  // Mirrored into wms-fe `src/lib/users.ts`.
+  'excursion.record',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -107,7 +116,8 @@ export type Capability = (typeof CAPABILITIES)[number];
  * mutations (warehouses, zones, bins, catalog import, SKU edit) but no user
  * management; Operator holds exactly the floor capabilities a device session
  * needs (`putaway.execute`, Story 3.5 — the first non-empty operator
- * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6) and NOT `secure.move` (Story 12-3 — the
+ * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6; `excursion.record`, Story 12-5 — the floor
+ * records what it observes) and NOT `secure.move` (Story 12-3 — the
  * cage is off-limits to floor staff); Accountant is read-only. Reads stay
  * open to any tenant member.
  */
@@ -134,6 +144,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'pack.execute',
     'dispatch.execute',
     'carrier.manage',
+    // Story 12-5 — FR-44: the manager records excursions too (owner holds
+    // everything).
+    'excursion.record',
     // Story 12-3 — FR-42: the cage is a manager verb (owner holds everything).
     'secure.move',
   ]),
@@ -142,6 +155,11 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'picks.execute',
     'pack.execute',
     'dispatch.execute',
+    // Story 12-5 — the floor records what it observes (`putaway.execute`'s
+    // rationale); a secure-bin excursion still answers the 12-3 cage gate at
+    // the hold movements it triggers, which the operator deliberately does
+    // not hold.
+    'excursion.record',
   ]),
   accountant: new Set<Capability>([]),
 };
