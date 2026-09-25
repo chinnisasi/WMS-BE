@@ -2132,7 +2132,11 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     // naming `bulk-asset`; the RIGHT one places.
     const noReason = await bulkPlace(grn1.lines[0]!, tankBin).expect(400);
     expect(noReason.body).toMatchObject({ status: 400, code: 'validation-failed' });
-    expect(String(noReason.body.detail)).toContain('reason');
+    // Review 2 (triage #28): the bulk arm runs BEFORE the generic mismatch
+    // arm, so a NO-reason bulk placement answers the specific message — not
+    // the generic one enumerating all six codes (five of which can never
+    // succeed on a bulk target).
+    expect(String(noReason.body.detail)).toContain('requires the mismatch reason "bulk-asset"');
     const wrongReason = await bulkPlace(grn1.lines[0]!, tankBin, { reasonCode: 'operator-preference' }).expect(400);
     expect(wrongReason.body).toMatchObject({ code: 'validation-failed' });
     expect(String(wrongReason.body.detail)).toContain('bulk-asset');
@@ -2172,6 +2176,17 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     const grn5 = await bulkGrn(tankSkuId, 1);
     await bulkPlace(grn5.lines[0]!, stackBin, { reasonCode: 'operator-preference' }).expect(201);
     expect(await plainOnHand(stackBin, tankSkuId)).toBe(1);
+
+    // ── SYMMETRIC ARM (review 2, triage #26): `bulk-asset` on an ORDINARY
+    // bin is refused — the code names a bulk placement, so on a yard it
+    // would pollute the queryable placement-class signal (the SM-3 pattern
+    // the arm exists to keep clean). 400 `validation-failed`, and nothing
+    // records.
+    const grn6 = await bulkGrn(tankSkuId, 1);
+    const ordinaryBulkReason = await bulkPlace(grn6.lines[0]!, yardBin, { reasonCode: 'bulk-asset' }).expect(400);
+    expect(ordinaryBulkReason.body).toMatchObject({ code: 'validation-failed' });
+    expect(String(ordinaryBulkReason.body.detail)).toContain('applies only to a bulk asset');
+    expect(await plainOnHand(yardBin, tankSkuId)).toBe(1);
 
     // ── THE TANK-ONLY WAREHOUSE: the candidate pool has exactly one bin and
     // it is a bulk asset — the task derives with NO suggestion (the pool was

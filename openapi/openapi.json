@@ -9041,7 +9041,7 @@
             "nullable": true,
             "minimum": 1,
             "maximum": 100000000,
-            "description": "Max weight in grams. Omit to leave the bin unconstrained; null to clear. At most 100000000."
+            "description": "Max weight in grams. Omit to leave the bin unconstrained; null to clear. At most 100000000. On a bulk asset (tank, silo) the field is REQUIRED and neither the omission nor a null clear is accepted."
           },
           "storageClass": {
             "type": "string",
@@ -9256,7 +9256,7 @@
             "nullable": true,
             "minimum": 1,
             "maximum": 100000000,
-            "description": "Max weight in grams, per bin. Omit for unconstrained bins. At most 100000000."
+            "description": "Max weight in grams, per bin. Omit for unconstrained bins. At most 100000000. On a bulk asset (tank, silo) the field is REQUIRED at create and cannot be cleared."
           },
           "storageClass": {
             "type": "string",
@@ -9381,7 +9381,7 @@
             "nullable": true,
             "minimum": 1,
             "maximum": 100000000,
-            "description": "Max weight in grams. Omit to leave unchanged; null to clear. Mutually exclusive with blocked."
+            "description": "Max weight in grams. Omit to leave unchanged; null to clear. Mutually exclusive with blocked. On a bulk asset (tank, silo) the field cannot be cleared, and a re-value below the mass the asset already holds is refused."
           },
           "storageClass": {
             "type": "string",

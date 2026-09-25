@@ -1960,5 +1960,56 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     const singleMerge = await merge(singleSrc, tankT2).expect(200);
     expect(singleMerge.body.moved).toEqual({ skus: 1, units: 1 });
     expect(await plainOnHand(tankT2, batchSkuId)).toBe(1);
+
+    // ── OCCUPANCY-BEFORE-HAZARD (review 2, triage #33): a merge into a bulk
+    // asset where BOTH the single-SKU occupancy arm and the hazard gate
+    // would fire answers `bin-occupancy-conflict` — the placement arm's
+    // ordering pin (putaway.spec, review 2) needs a merge counterpart, or a
+    // refactor reordering merge's gates ships undetected. The moved SKU is
+    // hazard-INCOMPATIBLE with the occupant (explosive vs flammable, the
+    // same decided pair the placement pin uses), so a hazard-first gate
+    // would answer `bin-segregation-conflict` — occupancy is EARLIER.
+    const csvOrder = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'BA-OX,Order Item OX,pcs,,1800,,false,false,,,',
+      'BA-FL,Order Item FL,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csvOrder, 'utf8'), { filename: 'catalog-order.csv', contentType: 'text/csv' })
+      .expect(201);
+    const orderSkus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const orderByCode = new Map(
+      (orderSkus.body.items as { code: string; id: string }[]).map((item) => [item.code, item.id]),
+    );
+    for (const [skuId, hazardClass] of [
+      [orderByCode.get('BA-OX')!, 'explosive'],
+      [orderByCode.get('BA-FL')!, 'flammable'],
+    ] as const) {
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ hazardClass })
+        .expect(200);
+    }
+    const tankT3 = (
+      await createTyped({ code: 'A-96-T3', capacity: 100, type: 'tank', maxWeightGrams: 1_000_000 }).expect(201)
+    ).body.id as string;
+    await fill(tankT3, orderByCode.get('BA-OX')!, 1);
+    const orderSrc = (
+      await createTyped({ code: 'A-96-S5', capacity: 100, type: 'shelf' }).expect(201)
+    ).body.id as string;
+    await fill(orderSrc, orderByCode.get('BA-FL')!, 1);
+    const orderMerge = await merge(orderSrc, tankT3).expect(400);
+    expect(orderMerge.body).toMatchObject({ code: 'bin-occupancy-conflict' });
+    expect(orderMerge.body.code).not.toBe('bin-segregation-conflict');
+    expect(await plainOnHand(orderSrc, orderByCode.get('BA-FL')!)).toBe(1);
   });
 });

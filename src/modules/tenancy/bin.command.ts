@@ -1356,6 +1356,39 @@ export class BinCommand {
         assertStorageClass({ storageClass: command.storageClass });
         refuseBulkAssetWeightClear(row, command.maxWeightGrams);
 
+        // ── story 12-4 (review 2): the re-value guard — a bulk asset's
+        // weight-defined capacity cannot be RE-VALUED below the mass the
+        // asset already holds, either. A tank holding 1000 g re-valued to
+        // 500 g would strand load above its defining limit with no later
+        // gate to flag it — the exact under-bounded asset the never-clear
+        // rule exists to prevent. The load read is `binOccupancyInTx` (the
+        // capacity gates' ONE load-read, milli-grams against
+        // `maxWeightGrams × QUANTITY_SCALE`, the merge arm's comparison);
+        // the refusal reuses `binOverweight` (the merge arm reuses it for a
+        // move the same way). The bin row is locked `.for('update')`, so a
+        // concurrent placement cannot slip mass in between the read and the
+        // write.
+        //
+        // Scope: bulk assets only. An ordinary bin's re-value below its
+        // load stays the pre-12.4 behavior (the weight cap has always been
+        // loosenable there — its clearance was unrestricted until this
+        // story, and 12-4 changes the four original types' meaning not at
+        // all). Open QC holds are NOT counted: a hold's origin attribution
+        // is (sku, origin bin) with no quantity on the hold row, so held
+        // mass is not computable from the holds — and a release that would
+        // over-fill a re-valued asset is a gap to note, not to half-guard
+        // (see the module doc's PENDING note).
+        if (
+          isBulkAssetType(row.type) &&
+          command.maxWeightGrams !== undefined &&
+          command.maxWeightGrams !== null
+        ) {
+          const load = await binOccupancyInTx(tx, command.tenantId, command.warehouseId, row.id);
+          if (load.weightLoad > BigInt(command.maxWeightGrams) * BigInt(QUANTITY_SCALE)) {
+            throw binOverweight(row.code, command.maxWeightGrams, load.weightLoad);
+          }
+        }
+
         // ── story 12-1: the class-edit guard, behind the replay (the 10.2
         // rule for a 409 rule: a replayed edit re-serves its snapshot above
         // and never reaches this). Only a class CHANGE pays the guard — an

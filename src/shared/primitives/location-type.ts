@@ -36,11 +36,14 @@
  * cover them; their dimensions serve as footprint and the per-axis oversize
  * applies as-is.
  *
- * **Conformance is a command-layer rule** (AD-18): nothing in this file runs
- * outside a command transaction. The gated writers are putaway placement,
- * suggestion/task derivation and bin merge; a pick draw from a non-shelf
- * location runs the same structural/class/secure/serial gates it always did
- * and no capacity check — a draw is not a placement rule.
+ * **Conformance is a layered rule** (AD-18): the vocabulary tuple runs in
+ * THREE layers — the DB CHECK (`0037`), the DTO `@IsIn` validators (which
+ * execute in the ValidationPipe, BEFORE any transaction — the DTO imports in
+ * `tenancy.dto.ts`), and the command-layer gates that run inside their
+ * transactions. The gated writers are putaway placement, suggestion/task
+ * derivation and bin merge; a pick draw from a non-shelf location runs the
+ * same structural/class/secure/serial gates it always did and no capacity
+ * check — a draw is not a placement rule.
  */
 
 import { ProblemException } from '../problem-details/problem.exception';

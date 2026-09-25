@@ -8,6 +8,7 @@ import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
 import {
   GRID_TYPES,
   LOCATION_TYPES,
+  type BulkAssetType,
   type LocationType,
 } from '../../shared/primitives/location-type';
 // Story 11-5: the bin capacity caps (same import the SKU-attribute DTOs make
@@ -440,7 +441,7 @@ export class CreateBinDto {
     nullable: true,
     minimum: 1,
     maximum: MAX_BIN_WEIGHT_GRAMS,
-    description: `Max weight in grams. Omit to leave the bin unconstrained; null to clear. At most ${MAX_BIN_WEIGHT_GRAMS}.`,
+    description: `Max weight in grams. Omit to leave the bin unconstrained; null to clear. At most ${MAX_BIN_WEIGHT_GRAMS}. On a bulk asset (tank, silo) the field is REQUIRED and neither the omission nor a null clear is accepted.`,
   })
   @IsOptional()
   @IsInt()
@@ -565,7 +566,7 @@ export class GenerateBinsDto {
     nullable: true,
     minimum: 1,
     maximum: MAX_BIN_WEIGHT_GRAMS,
-    description: `Max weight in grams, per bin. Omit for unconstrained bins. At most ${MAX_BIN_WEIGHT_GRAMS}.`,
+    description: `Max weight in grams, per bin. Omit for unconstrained bins. At most ${MAX_BIN_WEIGHT_GRAMS}. On a bulk asset (tank, silo) the field is REQUIRED at create and cannot be cleared.`,
   })
   @IsOptional()
   @IsInt()
@@ -596,7 +597,7 @@ export class GenerateBinsDto {
       'The location type, per bin (12-4 vocabulary). A bulk asset (tank, silo) is never gridded — the grid mints only the six conventional storage types.',
   })
   @IsIn(GRID_TYPES)
-  type!: BinType;
+  type!: Exclude<LocationType, BulkAssetType>;
 }
 
 export class PatchBinDto {
@@ -666,7 +667,7 @@ export class PatchBinDto {
     nullable: true,
     minimum: 1,
     maximum: MAX_BIN_WEIGHT_GRAMS,
-    description: `Max weight in grams. Omit to leave unchanged; null to clear. Mutually exclusive with blocked.`,
+    description: `Max weight in grams. Omit to leave unchanged; null to clear. Mutually exclusive with blocked. On a bulk asset (tank, silo) the field cannot be cleared, and a re-value below the mass the asset already holds is refused.`,
   })
   @IsOptional()
   @IsInt()

@@ -713,11 +713,6 @@ export class PutawayCommand {
         },
       );
       const suggestedBinId = suggestion?.binId ?? null;
-      if (suggestedBinId !== command.toBinId && command.reasonCode === null) {
-        throw putawayValidation(
-          `Placing into "${targetBin.code}" differs from the suggested bin — a reason code from ${JSON.stringify(PUTAWAY_MISMATCH_REASON_CODES)} is required.`,
-        );
-      }
       // ── story 12-4: the operator-directed BULK placement reason ──────────
       // A tank/silo is never auto-suggested (the candidate list excludes the
       // type), so targeting one is ALWAYS a mismatch and the operator must
@@ -728,13 +723,20 @@ export class PutawayCommand {
       // Reachable only when the target is a bulk asset (a matching target
       // would have recorded no reason; a matching SUGGESTION is impossible —
       // the type never appears among the candidates).
-      if (
-        isBulkAssetType(targetBin.type) &&
-        command.reasonCode !== null &&
-        command.reasonCode !== 'bulk-asset'
-      ) {
+      //
+      // Story 12-4 (review 2): this arm runs BEFORE the generic mismatch arm
+      // below — the most common bulk mistake is sending NO reason, and the
+      // generic arm's message would enumerate all six codes when five of
+      // them cannot ever succeed on a bulk target.
+      if (isBulkAssetType(targetBin.type) && command.reasonCode !== 'bulk-asset') {
         throw putawayValidation(
-          `Placing into bulk asset "${targetBin.code}" requires the mismatch reason "bulk-asset" (got "${command.reasonCode}").`,
+          `Placing into bulk asset "${targetBin.code}" requires the mismatch reason "bulk-asset"` +
+            (command.reasonCode === null ? '.' : ` (got "${command.reasonCode}").`),
+        );
+      }
+      if (suggestedBinId !== command.toBinId && command.reasonCode === null) {
+        throw putawayValidation(
+          `Placing into "${targetBin.code}" differs from the suggested bin — a reason code from ${JSON.stringify(PUTAWAY_MISMATCH_REASON_CODES)} is required.`,
         );
       }
       // Story 12-4 (review 2) — the arm is SYMMETRIC: `bulk-asset` names a
@@ -1072,14 +1074,19 @@ export interface SkuPhysicalAttributes {
  * universal rule). The same arm exists in the placement command's own
  * locked-row guard and `mergeBin`'s target gate — the SYNC HAZARD rule.
  *
- * Story 12-4 adds the BULK-ASSET arm — THIRD, after the hazard arm: a tank or
- * a silo is NEVER auto-suggested (Design Note 3 — its suitability depends on
- * measured fill, Epic 20), so the arm returns false unconditionally, whatever
- * the moving SKU. `binCandidatesInTx`'s WHERE already excludes the type (the
- * type is SKU-agnostic, unlike the class — a WHERE arm is legal there), so
- * this arm is the second layer for any caller handed a bulk candidate by
- * another road; the same arm exists in the placement command's own locked-row
- * guard and `mergeBin`'s target gate — the SYNC HAZARD rule.
+ * Story 12-4 adds the BULK-ASSET arm — SECOND, before the hazard walk: a tank
+ * or a silo is NEVER auto-suggested (Design Note 3 — its suitability depends
+ * on measured fill, Epic 20), so the arm returns false unconditionally,
+ * whatever the moving SKU — and because it is unconditional, its position
+ * relative to the hazard walk is immaterial HERE (it reads only the
+ * candidate's type). The placement and merge gates DO run their occupancy arm
+ * before the hazard gate (caller-observable refusal order); this site's
+ * placement is an independent choice, documented to avoid a false symmetry
+ * claim. `binCandidatesInTx`'s WHERE already excludes the type (the type is
+ * SKU-agnostic, unlike the class — a WHERE arm is legal there), so this arm
+ * is the second layer for any caller handed a bulk candidate by another
+ * road; the same arm exists in the placement command's own locked-row guard
+ * and `mergeBin`'s target gate — the SYNC HAZARD rule.
  */
 export function candidateFitsSku(
   candidate: PutawayBinCandidate,
