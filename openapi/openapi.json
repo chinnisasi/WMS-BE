@@ -9068,7 +9068,8 @@
               "tank",
               "silo"
             ],
-            "example": "shelf"
+            "example": "shelf",
+            "description": "The bin's location type (12-4 vocabulary). A bulk asset (tank, silo) is weight-defined: maxWeightGrams is REQUIRED at create and can never be cleared; a bulk asset is never gridded."
           }
         },
         "required": [
@@ -9278,11 +9279,10 @@
               "floor",
               "staging",
               "floor-stack",
-              "yard",
-              "tank",
-              "silo"
+              "yard"
             ],
-            "example": "shelf"
+            "example": "shelf",
+            "description": "The location type, per bin (12-4 vocabulary). A bulk asset (tank, silo) is never gridded — the grid mints only the six conventional storage types."
           }
         },
         "required": [
@@ -13852,7 +13852,7 @@
           },
           "type": {
             "type": "string",
-            "description": "The fixed bin type (shelf/pallet/floor/staging)"
+            "description": "The fixed location type (12-4 vocabulary): shelf, pallet, floor, staging, floor-stack, yard, tank or silo"
           },
           "capacity": {
             "type": "number",

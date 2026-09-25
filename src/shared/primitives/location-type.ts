@@ -21,7 +21,7 @@
  *
  * **The bulk-asset rule — single-SKU occupancy** (decided 2026-09-24): a
  * tank or a silo is ONE SKU's asset — you cannot co-mix a tank. The rule is
- * encoded ONCE in `bulkAssetOccupancyExceeded` and imported by every gate
+ * encoded ONCE in `bulkAssetOccupancyHolds` and imported by every gate
  * (`candidateFitsSku`, the placement guard, `mergeBin` — the marked SYNC
  * HAZARD list). A bulk asset is also NEVER auto-suggested
  * (`binCandidatesInTx` excludes the type) and never gridded: its suitability
@@ -73,6 +73,16 @@ export const BULK_ASSET_TYPES = ['tank', 'silo'] as const;
 
 export type BulkAssetType = (typeof BULK_ASSET_TYPES)[number];
 
+/**
+ * The types the grid generator may mint (story 12-4): the full vocabulary
+ * minus the bulk assets — a bulk asset is operator-directed, never gridded.
+ * The DTO layer narrows its enum to this tuple; the command's runtime
+ * refusal (`refuseBulkAssetGrid`) stays as the backstop.
+ */
+export const GRID_TYPES: readonly Exclude<LocationType, BulkAssetType>[] = LOCATION_TYPES.filter(
+  (type): type is Exclude<LocationType, BulkAssetType> => !isBulkAssetType(type),
+);
+
 /** True when the type is a bulk asset — the arm key at every gate site. */
 export function isBulkAssetType(value: string): boolean {
   return (BULK_ASSET_TYPES as readonly string[]).includes(value);
@@ -101,16 +111,17 @@ export function bulkAssetOccupancyHolds(
 }
 
 /**
- * 400 `bin-occupancy-conflict` — a placement/merge refusal naming the
- * holding SKU: a bulk asset already storing (or being asked to co-mix) more
- * than one SKU. Device-fault, non-retryable — the operator picks another
- * asset or tops up the holding SKU.
+ * 400 `bin-occupancy-conflict` — a placement/merge refusal naming the SKUs
+ * that would co-mix: a bulk asset cannot hold (or be asked to hold) more
+ * than one SKU — either beside its current occupant or through two moved
+ * SKUs landing in an empty asset. Device-fault, non-retryable — the
+ * operator picks another asset or tops up the holding SKU.
  */
 export function binOccupancyConflict(detail: string): ProblemException {
   return new ProblemException(
     'bin-occupancy-conflict',
     400,
-    'Bulk asset holds another SKU',
+    'Bulk asset cannot hold two SKUs',
     detail,
   );
 }

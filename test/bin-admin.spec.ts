@@ -1867,10 +1867,15 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     // (T2 is typed 'silo' — the variable name tracks the asset, not the type.)
 
     // ── master data: the grid rule ────────────────────────────────────────
+    // The DTO's enum narrowed to the six grid-able types (review 2): the
+    // ValidationPipe refuses a bulk type in front of the command, naming the
+    // grid-able set — the runtime `refuseBulkAssetGrid` stays as the backstop
+    // for a caller that bypasses the pipe.
     for (const bulkType of ['tank', 'silo']) {
       const res = await gridReq({ aisleFrom: 'D', aisleTo: 'D', baysPerAisle: 1, levelsPerBay: 1, capacity: 10, type: bulkType }).expect(400);
       expect(res.body).toMatchObject({ status: 400, code: 'validation-failed' });
-      expect(String(res.body.detail)).toContain(bulkType);
+      expect(String(res.body.detail)).toContain('one of the following values');
+      expect(String(res.body.detail)).not.toContain(bulkType);
     }
     // An ordinary type grids exactly as before (no collateral narrowing).
     await gridReq({ aisleFrom: 'E', aisleTo: 'E', baysPerAisle: 1, levelsPerBay: 1, capacity: 10, type: 'floor' }).expect(201);
@@ -1892,6 +1897,22 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       .send({ maxWeightGrams: 2_000_000 })
       .expect(200);
     expect(reweight.body.maxWeightGrams).toBe(2_000_000);
+    // (review 2) Null CLEARS on an ordinary bin — the never-clear rule is
+    // bulk-only: set, then clear, both 200, ending unconstrained.
+    const setOrdinary = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${floorStack}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ maxWeightGrams: 250_000 })
+      .expect(200);
+    expect(setOrdinary.body.maxWeightGrams).toBe(250_000);
+    const clearOrdinary = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${floorStack}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ maxWeightGrams: null })
+      .expect(200);
+    expect(clearOrdinary.body.maxWeightGrams).toBeNull();
 
     // ── the merge occupancy gate (single-SKU rule, the merge arm) ─────────
     // DIFFERENT SKU into a holding tank → 400 `bin-occupancy-conflict`

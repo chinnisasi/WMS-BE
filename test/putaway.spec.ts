@@ -2017,12 +2017,21 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     const byCode = new Map((skus.body.items as { code: string; id: string }[]).map((item) => [item.code, item.id]));
     const tankSkuId = byCode.get('PUT-T')!;
     const otherSkuId = byCode.get('PUT-U')!;
-    for (const [skuId, weightGrams] of [[tankSkuId, 100], [otherSkuId, 400]] as const) {
+    // The weights make the capacity-vs-occupancy ordering provable; the
+    // hazard CLASSES make the hazard-vs-occupancy ordering provable (review
+    // 2): PUT-T is explosive, PUT-U flammable — INCOMPATIBLE — so the
+    // different-SKU placement below would answer `bin-segregation-conflict`
+    // if the hazard gate ran first. Both edits land before any stock exists
+    // (the 12-1 class-edit-guard ordering).
+    for (const [skuId, weightGrams, hazardClass] of [
+      [tankSkuId, 100, 'explosive'],
+      [otherSkuId, 400, 'flammable'],
+    ] as const) {
       await request(app.getHttpServer())
         .patch(`${API}/${tenantId}/catalog/skus/${skuId}`)
         .set('Authorization', `Bearer ${ownerToken}`)
         .set(KEY_HEADER, ulid())
-        .send({ weightGrams })
+        .send({ weightGrams, hazardClass })
         .expect(200);
     }
 
@@ -2134,10 +2143,16 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     // naming the holding SKU. The placed load would ALSO break the tank's
     // weight limit (2×100 + 3×400 = 1400 g > 1000 g), so a 400 that names
     // anything but the occupancy arm would be the wrong gate — this is the
-    // refused-before-the-capacity-arms row.
+    // refused-before-the-capacity-arms row. And it is the
+    // OCCUPANCY-BEFORE-HAZARD row (review 2): the mover (PUT-U, flammable)
+    // is hazard-INCOMPATIBLE with the occupant (PUT-T, explosive), so a
+    // hazard-first gate would answer `bin-segregation-conflict` — the
+    // single-SKU occupancy arm is EARLIER, and that is the only code that
+    // may answer.
     const grn2 = await bulkGrn(otherSkuId, 3);
     const conflict = await bulkPlace(grn2.lines[0]!, tankBin, { reasonCode: 'bulk-asset' }).expect(400);
     expect(conflict.body).toMatchObject({ status: 400, code: 'bin-occupancy-conflict' });
+    expect(conflict.body.code).not.toBe('bin-segregation-conflict');
     expect(String(conflict.body.detail)).toContain('0-TK');
     expect(String(conflict.body.detail)).toContain('PUT-T');
     expect(await placementRowCount(grn2.grnId)).toBe(0);

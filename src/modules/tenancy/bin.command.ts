@@ -768,24 +768,29 @@ export class BinCommand {
         // hazard gate deliberately skips) is refused whole, naming the
         // holding SKU. ONE predicate behind every arm (`bulkAssetOccupancyHolds`
         // — the same one the placement gate and `candidateFitsSku` import;
-        // the SYNC HAZARD rule). 400 `bin-occupancy-conflict`.
-        const holdingSkus = await occupantSkusInTx(
-          tx,
-          command.tenantId,
-          command.warehouseId,
-          target.id,
-        );
-        const movedSkuIds = [...new Set(onHandRows.map((row) => row.skuId))];
-        if (!bulkAssetOccupancyHolds(target.type, movedSkuIds, holdingSkus.map((o) => o.skuId))) {
-          const holding = [...new Set(holdingSkus.map((o) => o.skuCode))];
-          const moving = [...new Set(onHandRows.map((row) => row.skuCode))];
-          throw binOccupancyConflict(
-            `Merge refused — bin "${target.code}" is a ${target.type} (a bulk asset holds exactly ONE SKU): ` +
-              (holding.length > 0
-                ? `it holds ${holding.map((code) => `"${code}"`).join(', ')}`
-                : 'it is empty') +
-              `, and the merge would move ${moving.map((code) => `"${code}"`).join(', ')}.`,
+        // the SYNC HAZARD rule). 400 `bin-occupancy-conflict`. The occupant
+        // read is gated behind the type arm — an ordinary target pays no
+        // extra grouped join (the predicate is vacuously true for non-bulk
+        // types).
+        if (isBulkAssetType(target.type)) {
+          const holdingSkus = await occupantSkusInTx(
+            tx,
+            command.tenantId,
+            command.warehouseId,
+            target.id,
           );
+          const movedSkuIds = [...new Set(onHandRows.map((row) => row.skuId))];
+          if (!bulkAssetOccupancyHolds(target.type, movedSkuIds, holdingSkus.map((o) => o.skuId))) {
+            const holding = [...new Set(holdingSkus.map((o) => o.skuCode))];
+            const moving = [...new Set(onHandRows.map((row) => row.skuCode))];
+            throw binOccupancyConflict(
+              `Merge refused — bin "${target.code}" is a ${target.type} (a bulk asset holds exactly ONE SKU): ` +
+                (holding.length > 0
+                  ? `it holds ${holding.map((code) => `"${code}"`).join(', ')}`
+                  : 'it is empty') +
+                `, and the merge would move ${moving.map((code) => `"${code}"`).join(', ')}.`,
+            );
+          }
         }
 
         // ── story 12-2: the hazard co-location gate (FR-41) — after the

@@ -6,6 +6,7 @@ import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
 // Story 12-4: the location-type vocabulary — same pattern, same shared
 // primitive the placement/merge gates import (one source, no copy).
 import {
+  GRID_TYPES,
   LOCATION_TYPES,
   type LocationType,
 } from '../../shared/primitives/location-type';
@@ -462,7 +463,15 @@ export class CreateBinDto {
   @IsIn(STORAGE_CLASSES)
   storageClass?: string;
 
-  @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
+  // Story 12-4: the location type documents the bulk-asset create rules —
+  // the DTO is the API contract; the weight requirement and the grid refusal
+  // stay command-enforced (behind the replay lookup, the 10.2 rule).
+  @ApiProperty({
+    enum: BIN_TYPES,
+    example: 'shelf',
+    description:
+      "The bin's location type (12-4 vocabulary). A bulk asset (tank, silo) is weight-defined: maxWeightGrams is REQUIRED at create and can never be cleared; a bulk asset is never gridded.",
+  })
   @IsIn(BIN_TYPES)
   type!: BinType;
 }
@@ -576,8 +585,17 @@ export class GenerateBinsDto {
   @IsIn(STORAGE_CLASSES)
   storageClass?: string;
 
-  @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
-  @IsIn(BIN_TYPES)
+  // Story 12-4: the grid's enum narrows to the SIX grid-able types — a bulk
+  // asset is operator-directed, never gridded, so the contract must not
+  // advertise types the route always refuses. The command's runtime refusal
+  // (`refuseBulkAssetGrid`) stays as the backstop.
+  @ApiProperty({
+    enum: GRID_TYPES,
+    example: 'shelf',
+    description:
+      'The location type, per bin (12-4 vocabulary). A bulk asset (tank, silo) is never gridded — the grid mints only the six conventional storage types.',
+  })
+  @IsIn(GRID_TYPES)
   type!: BinType;
 }
 

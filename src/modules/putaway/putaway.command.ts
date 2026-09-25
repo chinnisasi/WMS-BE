@@ -68,17 +68,15 @@ import { InventoryFacade } from '../inventory/inventory.facade';
  * The fixed mismatch-reason enum (the I/O matrix — 400 outside it): required
  * in the placement payload whenever the actual bin differs from the
  * server's re-derived suggestion. The `blindReasonCode` pattern — fixed,
- * required, report- and summary-labelable (SM-3).
+ * required, report- and summary-labelable (SM-3). One source lives in
+ * `./mismatch-reason` (the 11-5 standalone-constant rule — the DTO layer
+ * consumes it without pulling this command graph).
  */
-export const PUTAWAY_MISMATCH_REASON_CODES = [
-  'pallet-too-heavy',
-  'suggested-bin-occupied',
-  'consolidation-with-existing-stock',
-  'operator-preference',
-  'bulk-asset',
-  'other',
-] as const;
-export type PutawayMismatchReasonCode = (typeof PUTAWAY_MISMATCH_REASON_CODES)[number];
+export {
+  PUTAWAY_MISMATCH_REASON_CODES,
+  type PutawayMismatchReasonCode,
+} from './mismatch-reason';
+import { PUTAWAY_MISMATCH_REASON_CODES, type PutawayMismatchReasonCode } from './mismatch-reason';
 
 export interface PlacePutawayCommand {
   readonly tenantId: string;
@@ -586,20 +584,24 @@ export class PutawayCommand {
       // holding SKU passes (the predicate's union is ≤ 1). ONE predicate
       // behind every arm (`bulkAssetOccupancyHolds` — the same one `mergeBin`
       // and `candidateFitsSku` import; the SYNC HAZARD rule).
-      // 400 `bin-occupancy-conflict`.
-      const holdingSkus = await occupantSkusInTx(
-        tx,
-        command.tenantId,
-        command.warehouseId,
-        targetBin.id,
-      );
-      if (!bulkAssetOccupancyHolds(targetBin.type, [command.skuId], holdingSkus.map((o) => o.skuId))) {
-        const holding = [...new Set(holdingSkus.map((o) => o.skuCode))];
-        throw binOccupancyConflict(
-          `Bin "${targetBin.code}" is a ${targetBin.type} (a bulk asset holds exactly ONE SKU): ` +
-            `it holds ${holding.map((code) => `"${code}"`).join(', ')} — place SKU "${sku.code}" ` +
-            'in another bulk asset, or top up the holding SKU.',
+      // 400 `bin-occupancy-conflict`. The occupant read is gated behind the
+      // type arm — an ordinary bin pays no extra grouped join (the predicate
+      // is vacuously true for non-bulk types).
+      if (isBulkAssetType(targetBin.type)) {
+        const holdingSkus = await occupantSkusInTx(
+          tx,
+          command.tenantId,
+          command.warehouseId,
+          targetBin.id,
         );
+        if (!bulkAssetOccupancyHolds(targetBin.type, [command.skuId], holdingSkus.map((o) => o.skuId))) {
+          const holding = [...new Set(holdingSkus.map((o) => o.skuCode))];
+          throw binOccupancyConflict(
+            `Bin "${targetBin.code}" is a ${targetBin.type} (a bulk asset holds exactly ONE SKU): ` +
+              `it holds ${holding.map((code) => `"${code}"`).join(', ')} — place SKU "${sku.code}" ` +
+              'in another bulk asset, or top up the holding SKU.',
+          );
+        }
       }
       // ── story 12-2: the hazard co-location gate (FR-41) — after the class
       // gate, before the load read, inside the bin-row `.for('update')` window
@@ -733,6 +735,15 @@ export class PutawayCommand {
       ) {
         throw putawayValidation(
           `Placing into bulk asset "${targetBin.code}" requires the mismatch reason "bulk-asset" (got "${command.reasonCode}").`,
+        );
+      }
+      // Story 12-4 (review 2) — the arm is SYMMETRIC: `bulk-asset` names a
+      // bulk placement, so on an ORDINARY bin it would pollute the queryable
+      // placement-class signal — refuse it the same way.
+      // 400 `validation-failed`.
+      if (!isBulkAssetType(targetBin.type) && command.reasonCode === 'bulk-asset') {
+        throw putawayValidation(
+          `The mismatch reason "bulk-asset" applies only to a bulk asset (tank, silo) — "${targetBin.code}" is a ${targetBin.type}.`,
         );
       }
       // The recorded reason: a stale reason on a match is STRIPPED, not
