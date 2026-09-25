@@ -175,6 +175,16 @@ function dwellWindows(
       }
     }
   }
+  // Business times are client-supplied, so a backdated draw can invert a
+  // window (departure < arrival) — left alone, the correlation predicate
+  // would be unsatisfiable and silently drop every excursion at that bin.
+  // Clamp to a point window at the arrival instead: the units provably dwelt
+  // AT the arrival instant, and a reading at that instant still correlates.
+  for (const [binId, window] of windows) {
+    if (window.departure !== null && window.departure < window.arrival) {
+      windows.set(binId, { arrival: window.arrival, departure: window.arrival });
+    }
+  }
   return windows;
 }
 
@@ -197,11 +207,14 @@ function orderNotFound(): ProblemException {
  * complete chain via the tenant batch/serial trace indexes.
  *
  * Everything here is a read: the facade composes the inventory facade's
- * in-transaction ledger feeds, the outbound facade's order-identity read
- * (AD-6 — sibling state through facades only) and a direct `bins` read (the
- * shared-substrate precedent 12-5 set) into one consistent snapshot, and
- * converts to the response shape at its own edge (`fromMilli` +
- * `canonicalInstant`). No capability gate, no idempotency, no writes.
+ * in-transaction ledger feeds, a direct `bins` read (the shared-substrate
+ * precedent 12-5 set) and the outbound facade's order-identity read — the
+ * ledger feeds and the bins read share ONE transaction; the order identity
+ * is a separate facade call in its own transaction (AD-6 keeps it outside,
+ * sibling state through facades only), so the composite is not a single
+ * snapshot. Conversion to the response shape happens at this facade's own
+ * edge (`fromMilli` + `canonicalInstant`). No capability gate, no
+ * idempotency, no writes.
  */
 @Injectable()
 export class ColdChainFacade {
@@ -251,8 +264,9 @@ export class ColdChainFacade {
       const pickEvents = orderEvents.filter((e) => e.type === 'pick.picked');
 
       // ── lines from the dispatch events (seq order) ───────────────────────
-      // One dispatch event per line; a line that somehow dispatched twice is
-      // reported once (first event wins) rather than duplicated.
+      // One dispatch event per order line — dispatch is the terminal
+      // transition with a single writer and a status guard (dispatch.command),
+      // so no dedupe is needed; the loop simply reports what shipped.
       const carrierName = firstDefined(
         dispatchEvents,
         (e) => refAs<DispatchRefDoc>(e).carrierName,
@@ -285,8 +299,8 @@ export class ColdChainFacade {
       const serialRefs: string[] = [];
       for (const pickEvent of pickEvents) {
         const ref = refAs<PickRefDoc>(pickEvent);
-        // A serial-tracked SKU's pick events carry only the serial arm (a SKU
-        // tracked both ways is refused at pick time); a batch pick carries
+        // A serial-tracked SKU's pick events carry only the serial arm (the
+        // pick command refuses a SKU tracked both ways); a batch pick carries
         // only the batch arm.
         const batchRef = pickEvent.serialRef === null ? pickEvent.batchRef : null;
         const serialRef = pickEvent.serialRef;
@@ -310,8 +324,9 @@ export class ColdChainFacade {
       // (other orders' picks included — the batch's history is the batch's
       // history). One query for every scope of the order; the grouping below
       // matches each event to its scope key. Serial-armed events group under
-      // their serial; batch-armed events under their batch (the registry
-      // refuses a SKU tracked both ways, so an event carries one arm at most).
+      // their serial; batch-armed events under their batch (the pick command
+      // refuses a SKU tracked both ways — pick.command.ts — so an event
+      // carries one arm at most).
       const scopeEvents = await this.inventory.ledgerEventsByScopeRefsInTx(
         tx,
         tenantId,

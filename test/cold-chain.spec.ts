@@ -176,6 +176,9 @@ describe('cold-chain trace: the FR-45 reconstruction read (e2e, story 12-6)', ()
       `CC-BATCH,Cold-chain batch SKU,pcs,,1800,,true,false,,,,chilled`,
       `CC-MULTI,Multi-scope ambient SKU,pcs,,1800,,true,false,,,,ambient`,
       `CC-ACCEPT,Undispatched-order SKU,pcs,,1800,,false,false,,,,ambient`,
+      `CC-SERIAL,Serial-tracked SKU,pcs,,1800,,false,true,,,,ambient`,
+      `CC-LINEA,Excursion line A SKU,pcs,,1800,,true,false,,,,ambient`,
+      `CC-LINEB,Excursion line B SKU,pcs,,1800,,true,false,,,,ambient`,
     ].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
@@ -427,7 +430,11 @@ describe('cold-chain trace: the FR-45 reconstruction read (e2e, story 12-6)', ()
     return { waveId, orderId, picklist };
   }
 
-  async function pickAllLines(picklist: Picklist, occurredAt?: string): Promise<void> {
+  async function pickAllLines(
+    picklist: Picklist,
+    occurredAt?: string,
+    serialsByLine?: Map<string, string[]>,
+  ): Promise<void> {
     for (const line of picklist.lines) {
       await request(app.getHttpServer())
         .post(`${API}/${tenantId}/outbound/picks`)
@@ -441,6 +448,7 @@ describe('cold-chain trace: the FR-45 reconstruction read (e2e, story 12-6)', ()
           binId: line.binId!,
           qty: line.qty,
           occurredAt: occurredAt ?? at(0),
+          ...(serialsByLine === undefined ? {} : { serials: serialsByLine.get(line.id) }),
         })
         .expect(201);
     }
@@ -448,15 +456,14 @@ describe('cold-chain trace: the FR-45 reconstruction read (e2e, story 12-6)', ()
 
   async function packAndDispatch(
     orderId: string,
-    skuId: string,
-    qty: number,
+    scanned: { skuId: string; qty: number }[],
     dispatchBody: Record<string, unknown> = {},
   ): Promise<void> {
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/orders/${orderId}/pack`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ scanned: [{ skuId, qty }] })
+      .send({ scanned })
       .expect(201);
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/orders/${orderId}/dispatch`)
@@ -576,7 +583,7 @@ describe('cold-chain trace: the FR-45 reconstruction read (e2e, story 12-6)', ()
     orderId = wave.orderId;
     expect(wave.picklist.lines.length).toBe(2); // 2 from CH-01 + 2 from FR-01
     await pickAllLines(wave.picklist, at(-30));
-    await packAndDispatch(orderId, sku('CC-BATCH'), 4, {
+    await packAndDispatch(orderId, [{ skuId: sku('CC-BATCH'), qty: 4 }], {
       carrierName: 'blue_dart',
       trackingNumber: 'CC-TRK-1',
     });
@@ -701,7 +708,7 @@ describe('cold-chain trace: the FR-45 reconstruction read (e2e, story 12-6)', ()
     const wave = await releasedWave([{ skuId: sku('CC-MULTI'), quantity: 4 }]);
     expect(wave.picklist.lines.length).toBe(2);
     await pickAllLines(wave.picklist, at(-5));
-    await packAndDispatch(wave.orderId, sku('CC-MULTI'), 4);
+    await packAndDispatch(wave.orderId, [{ skuId: sku('CC-MULTI'), qty: 4 }]);
 
     const body = (await trace(wave.orderId).expect(200)).body as Trace;
     // No carrier facts on the dispatch → nulls, and the clean line → [].
@@ -748,6 +755,171 @@ describe('cold-chain trace: the FR-45 reconstruction read (e2e, story 12-6)', ()
       .get(`${API}/${tenantId}/warehouses/${warehouseId}/cold-chain/orders/not-a-uuid`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .expect(400);
+  });
+
+  it('cross-tenant session: 403 permission-denied (the path names the first tenant, the token does not)', async () => {
+    const emailB = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await request(app.getHttpServer())
+      .post(API)
+      .set(KEY_HEADER, ulid())
+      .send({ name: `Other Co ${ulid()}`, ownerEmail: emailB, password: 'correct-horse-battery' })
+      .expect(201);
+    createdTenantIds.push(registered.body.tenant.id as string);
+    const tokenB = await request(app.getHttpServer())
+      .post(`${API}/sign-in`)
+      .send({ email: emailB, password: 'correct-horse-battery' })
+      .expect(200)
+      .then((res) => res.body.accessToken as string);
+
+    const res = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/warehouses/${warehouseId}/cold-chain/orders/${orderId}`)
+      .set('Authorization', `Bearer ${tokenB}`)
+      .expect(403);
+    expect(res.body).toMatchObject({ code: 'permission-denied' });
+  });
+
+  it('serial-tracked order: one scope per serial, batchRef null, each serial carrying its own ledger chain', async () => {
+    const binSer = await createBin('SER-01', 'ambient');
+    const serialA = `CC-SN-${ulid().slice(10, 14)}`;
+    const serialB = `CC-SN-${ulid().slice(10, 14)}`;
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/inventory/adjustments`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        warehouseId,
+        skuId: sku('CC-SERIAL'),
+        binId: binSer,
+        quantityDelta: 2,
+        reasonCode: 'cycle-count',
+        note: 'cold-chain-suite serial seed',
+        serials: [serialA, serialB],
+        occurredAt: at(-3),
+      })
+      .expect(201);
+
+    const wave = await releasedWave([{ skuId: sku('CC-SERIAL'), quantity: 2 }]);
+    expect(wave.picklist.lines).toHaveLength(1);
+    await pickAllLines(wave.picklist, at(-2), new Map([[wave.picklist.lines[0]!.id, [serialA, serialB]]]));
+    await packAndDispatch(wave.orderId, [{ skuId: sku('CC-SERIAL'), qty: 2 }]);
+
+    // The ledger's serial arms carry the RESOLVED serial identities (the
+    // catalog `serials.id`), not the raw numbers the client scanned.
+    const serialIds = (
+      await sql`select id from serials where tenant_id = ${tenantId} and sku_id = ${sku('CC-SERIAL')} and serial_number in (${serialA}, ${serialB})`
+    ).map((row) => (row as unknown as { id: string }).id);
+    expect(serialIds).toHaveLength(2);
+
+    const body = (await trace(wave.orderId).expect(200)).body as Trace;
+    expect(body.lines).toHaveLength(1);
+    const line = body.lines[0]!;
+    expect(line.dispatchedQty).toBe(2);
+    expect(line.excursions).toEqual([]);
+    // One serial pick = one event per serial unit → one scope per serial.
+    expect(line.scopes).toHaveLength(2);
+    for (const scope of line.scopes) {
+      expect(scope.serialRef).not.toBeNull();
+      expect(scope.batchRef).toBeNull();
+      expect(serialIds).toContain(scope.serialRef);
+      // The serial's own chain: its intake and its pick, both serial-armed.
+      expect(scope.chain.map((e) => e.type)).toEqual(['stock.adjusted', 'pick.picked']);
+      for (const event of scope.chain) {
+        expect(event.serialRef).toBe(scope.serialRef);
+        expect(event.batchRef).toBeNull();
+      }
+      const picked = scope.chain[1]!;
+      expect(picked.quantityDelta).toBe(-1); // one serial is one whole unit
+      expect(picked.fromBinId).toBe(binSer);
+      expect(picked.fromBinStorageClass).toBe('ambient');
+    }
+  });
+
+  it('multi-line order: an excursion at a bin holding only line A\'s batch lands on line A and never on line B', async () => {
+    const binLineA = await createBin('AMB-03', 'ambient');
+    const binLineB = await createBin('AMB-04', 'ambient');
+    await seedStockBatch(sku('CC-LINEA'), binLineA, 2, 'CC-LA', at(-8));
+    await seedStockBatch(sku('CC-LINEB'), binLineB, 2, 'CC-LB', at(-8));
+
+    // The excursion is committed while line A's batch sits in AMB-03 (its
+    // business time, -7m, is inside that scope's dwell window); the release
+    // returns the quarantined units so the pick can draw them.
+    const excursion = await recordExcursion({
+      warehouseId,
+      binId: binLineA,
+      readingC: 5.5,
+      note: 'line A only',
+      occurredAt: at(-7),
+    }).expect(201);
+    const excursionId = excursion.body.excursion.id as string;
+    await releaseHold((excursion.body.excursion.holdIds as string[])[0]!);
+
+    const wave = await releasedWave([
+      { skuId: sku('CC-LINEA'), quantity: 2 },
+      { skuId: sku('CC-LINEB'), quantity: 2 },
+    ]);
+    await pickAllLines(wave.picklist, at(-6));
+    await packAndDispatch(wave.orderId, [
+      { skuId: sku('CC-LINEA'), qty: 2 },
+      { skuId: sku('CC-LINEB'), qty: 2 },
+    ]);
+
+    const body = (await trace(wave.orderId).expect(200)).body as Trace;
+    expect(body.lines).toHaveLength(2);
+    const lineA = body.lines.find((l) => l.skuId === sku('CC-LINEA'))!;
+    const lineB = body.lines.find((l) => l.skuId === sku('CC-LINEB'))!;
+    expect(lineA.excursions).toHaveLength(1);
+    expect(lineA.excursions[0]).toMatchObject({ excursionId, binId: binLineA, readingC: 5.5 });
+    // Line B's scopes dwell in AMB-04 only, and the excursion's skuId is
+    // line A's — the excursion must not leak onto line B.
+    expect(lineB.excursions).toEqual([]);
+    expect(lineB.scopes.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('open-ended dwell: an excursion at a chain bin the batch never left correlates after the dispatch (departure null)', async () => {
+    // One batch seeded into TWO bins (same batch code → one batch id); the
+    // order draws a single unit from one bin, so the OTHER bin keeps its
+    // stock: an arrival with NO departure — the open-ended window.
+    const binLeft = await createBin('AMB-05', 'ambient');
+    const binRight = await createBin('AMB-06', 'ambient');
+    await seedStockBatch(sku('CC-LINEA'), binLeft, 1, 'CC-OP', at(-4));
+    await seedStockBatch(sku('CC-LINEA'), binRight, 1, 'CC-OP', at(-4));
+
+    const wave = await releasedWave([{ skuId: sku('CC-LINEA'), quantity: 1 }]);
+    expect(wave.picklist.lines).toHaveLength(1);
+    await pickAllLines(wave.picklist, at(-3));
+    await packAndDispatch(wave.orderId, [{ skuId: sku('CC-LINEA'), qty: 1 }]);
+
+    const body = (await trace(wave.orderId).expect(200)).body as Trace;
+    const line = body.lines[0]!;
+    expect(line.scopes).toHaveLength(1);
+    const chain = line.scopes[0]!.chain;
+    expect(chain.map((e) => e.type)).toEqual(['stock.adjusted', 'stock.adjusted', 'pick.picked']);
+    // The open-ended bin: an arrival (toBinId) with no departure (fromBinId)
+    // anywhere in the chain.
+    const departedBins = new Set(chain.map((e) => e.fromBinId).filter((b): b is string => b !== null));
+    const openBin = chain
+      .map((e) => e.toBinId)
+      .find((b) => b !== null && !departedBins.has(b));
+    expect(openBin).toBeDefined();
+    expect(chain.every((e) => e.fromBinId !== openBin)).toBe(true);
+
+    // Recorded AFTER the dispatch, at the bin the batch still occupies —
+    // the open-ended (departure null) window must correlate it.
+    const later = await recordExcursion({
+      warehouseId,
+      binId: openBin!,
+      readingC: 1.5,
+      note: 'after dispatch, still in the bin',
+    }).expect(201);
+    const laterId = later.body.excursion.id as string;
+
+    const after = (await trace(wave.orderId).expect(200)).body as Trace;
+    expect(after.lines[0]!.excursions).toHaveLength(1);
+    expect(after.lines[0]!.excursions[0]).toMatchObject({
+      excursionId: laterId,
+      binId: openBin,
+      readingC: 1.5,
+    });
   });
 
   it('openapi: the cold-chain route is published', async () => {

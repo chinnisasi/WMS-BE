@@ -737,7 +737,10 @@ export class InventoryFacade {
    * transaction. The join key is `reference_doc->>'orderId'` — the hash-chained
    * doc was built (story 4.3) precisely so the ledger could answer "which
    * picks served this order" without an outbound-table join; migration 0039's
-   * expression index keeps the match off a whole-warehouse scan.
+   * PARTIAL expression index serves the match only because the WHERE clause
+   * carries the index's own `reference_doc ? 'orderId'` qual — Postgres cannot
+   * prove that predicate implied by the `->>'orderId'` match alone, and
+   * without the qual the plan degrades to a seq scan.
    *
    * This is an in-transaction feed, NOT a read model: rows come back raw —
    * milli-unit quantities, Postgres text instants, the typed reference doc
@@ -758,10 +761,14 @@ export class InventoryFacade {
         and(
           eq(ledgerEvents.tenantId, tenantId),
           eq(ledgerEvents.warehouseId, warehouseId),
-          // Only the two types whose reference doc carries orderId — the
-          // type filter keeps the index (which is order-ref-wide) honest
-          // about what this read is for.
+          // A deliberate choice of the two types whose docs name this
+          // order's pick/dispatch facts — NOT the set of orderId-carrying
+          // types (`pack.packed`'s doc carries orderId too; the trace reads
+          // neither its facts nor its line linkage).
           inArray(ledgerEvents.type, ['pick.picked', 'dispatch.dispatched']),
+          // The 0039 partial index's own predicate — repeated here so the
+          // planner can use the index (see the doc comment above).
+          sql`${ledgerEvents.referenceDoc} ? 'orderId'`,
           sql`${ledgerEvents.referenceDoc}->>'orderId' = ${orderId}`,
         ),
       )
@@ -777,8 +784,10 @@ export class InventoryFacade {
    * included — because the batch's history is the batch's history.
    *
    * In-transaction feed like `ledgerEventsByOrderRefInTx` (raw rows; the
-   * caller converts at its edge). Empty ref lists short-circuit to `[]` (the
-   * `stockByBinsInTx` rule — `IN ()` is invalid SQL, never emitted).
+   * caller converts at its edge). Empty ref lists short-circuit to `[]` —
+   * a behavior-preserving cheap path (drizzle would render the empty
+   * `inArray` as `sql`false``; skipping the query costs nothing and
+   * touches the DB not at all).
    */
   async ledgerEventsByScopeRefsInTx(
     tx: TenantTx,
