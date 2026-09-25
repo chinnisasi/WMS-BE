@@ -25,7 +25,10 @@ export class RecordExcursionDto {
     maximum: MAX_READING_C,
   })
   @Type(() => Number)
-  @IsNumber()
+  // maxDecimalPlaces: the column is numeric(6,2) and the docs say two
+  // decimals — 8.999 is refused here, not silently rounded to 9 (the
+  // command's 2dp normalization stays as the non-DTO backstop).
+  @IsNumber({ maxDecimalPlaces: 2 })
   @Min(MIN_READING_C)
   @Max(MAX_READING_C)
   readingC!: number;

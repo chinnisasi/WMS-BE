@@ -59,7 +59,7 @@ export class ComplianceController {
   })
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, an out-of-bounds readingC, an empty or system-owned bin, a bin with no on-hand stock, or serial-tracked / catch-weight stock in the bin — the whole excursion is refused naming the offenders (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
-  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks excursion.record (role-denied)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks excursion.record (role-denied), or the bin is secure/cage-class and the caller — an operator recording from the floor — lacks secure.move (role-denied from the hold core; held units leave the origin bin, FR-42)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or bin does not exist in this tenant (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })

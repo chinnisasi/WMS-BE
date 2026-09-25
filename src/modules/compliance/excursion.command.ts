@@ -138,7 +138,12 @@ export class ExcursionCommand {
         `readingC must be a °C reading between ${MIN_READING_C} and ${MAX_READING_C} (got ${command.readingC}).`,
       );
     }
-    if (command.note !== null && (command.note.trim() === '' || command.note.length > MAX_NOTE_LENGTH)) {
+    // An explicitly empty / whitespace-only note IS the absent note (the
+    // DTO's @Length(0, 200) allows the empty string) — normalized to null
+    // BEFORE the hash, so both spellings of "no note" fingerprint — and
+    // therefore replay — identically.
+    const note = command.note !== null && command.note.trim() === '' ? null : command.note;
+    if (note !== null && note.length > MAX_NOTE_LENGTH) {
       throw excursionValidation(
         `note must be empty or at most ${MAX_NOTE_LENGTH} characters of context.`,
       );
@@ -170,7 +175,7 @@ export class ExcursionCommand {
       warehouseId: command.warehouseId,
       binId: command.binId,
       readingC: command.readingC,
-      note: command.note,
+      note,
       occurredAt: command.occurredAt,
     });
 
@@ -277,15 +282,25 @@ export class ExcursionCommand {
         const named = unquarantinable
           .map((row) => `${row.code} (${row.id})`)
           .join(', ');
-        const why = unquarantinable.some((row) => row.serialTracked)
-          ? 'a bulk (sku, bin) hold would strand a serial-tracked SKU\'s location records at the origin bin'
-          : 'a bulk (sku, bin) hold names no handling units, so a catch-weight SKU\'s cases would stay packable while their stock sat in the QC bin';
+        // The justification is composed per applicable class — a bin holding
+        // both a serial-tracked and a catch-weight SKU is refused for BOTH
+        // reasons, not just whichever class sorts first.
+        const why = [
+          ...(unquarantinable.some((row) => row.serialTracked)
+            ? ['a bulk (sku, bin) hold would strand a serial-tracked SKU\'s location records at the origin bin']
+            : []),
+          ...(unquarantinable.some((row) => row.catchWeightTracked)
+            ? ['a bulk (sku, bin) hold names no handling units, so a catch-weight SKU\'s cases would stay packable while their stock sat in the QC bin']
+            : []),
+        ].join('; and ');
         throw excursionValidation(
           `Bin ${bin.code} holds stock that cannot be quarantined as a whole scope — ${named} — because ${why}. The excursion is refused in full (nothing written); quarantine the affected cases by naming them on stock adjustments, or relocate the offending SKUs first.`,
         );
       }
 
-      // ── already-held scopes are SKIPPED (already out of ATP), not a 409 ──
+      // ── already-held scopes are SKIPPED for the QUARANTINE (already out of
+      // ATP), not a 409 — the ledger events below still cover every affected
+      // scope, held or not ──
       const openHolds = await this.qc.openHoldsForBinsInTx(
         tx,
         command.tenantId,
@@ -304,10 +319,10 @@ export class ExcursionCommand {
       const excursionId = uuidv7();
       const holdIds: string[] = [];
       for (const scope of scopes) {
-        const reason =
-          command.note === null
-            ? 'temperature-excursion'
-            : `temperature-excursion: ${command.note}`.slice(0, 200);
+        // The hold's reason names why, within the QC reason cap; a cut note
+        // carries the ellipsis rather than vanishing silently.
+        const base = note === null ? 'temperature-excursion' : `temperature-excursion: ${note}`;
+        const reason = base.length > MAX_NOTE_LENGTH ? `${base.slice(0, MAX_NOTE_LENGTH - 1)}…` : base;
         const hold = await this.qc.holdScopeInTx(
           tx,
           {
@@ -325,27 +340,35 @@ export class ExcursionCommand {
       }
 
       // ── the excursion row (the review queue's data) ─────────────────────
-      await tx.insert(temperatureExcursions).values({
-        id: excursionId,
-        tenantId: command.tenantId,
-        warehouseId: command.warehouseId,
-        binId: command.binId,
-        readingC: readingC.toFixed(2),
-        note: command.note,
-        holdIds,
-        status: 'open',
-        recordedBy: command.actorUserId,
-        occurredAt,
-      });
+      const inserted = await tx
+        .insert(temperatureExcursions)
+        .values({
+          id: excursionId,
+          tenantId: command.tenantId,
+          warehouseId: command.warehouseId,
+          binId: command.binId,
+          readingC: readingC.toFixed(2),
+          note,
+          holdIds,
+          status: 'open',
+          recordedBy: command.actorUserId,
+          occurredAt,
+        })
+        // The row's actual created_at (the keyset cursor field) — the record
+        // snapshot must agree with what list/resolve later report.
+        .returning({ createdAt: temperatureExcursions.createdAt });
 
       // ── the per-scope ZERO-delta ledger events (AD-11) ──────────────────
-      // One `excursion.recorded` event per affected scope: `skuId` is never
-      // null on a ledger event, hence one event per scope; both bin arms
+      // One `excursion.recorded` event per AFFECTED scope — every distinct
+      // SKU with on-hand > 0 in the bin, INCLUDING the scopes skipped above
+      // (an excursion that quarantined nothing new is still ledger-visible,
+      // and FR-45 reconstructs the bin's exposure from the events alone).
+      // Both bin arms
       // stay null (the zero-quantity envelope rule) and both identity arms
       // are registry-closed. The relocation of the affected units is the
       // `qc.held` movements' work above — the event records the excursion
       // itself, reference doc carrying enough for FR-45 reconstruction.
-      for (const scope of scopes) {
+      for (const scope of affected) {
         const movement: LedgerMovement = {
           tenantId: command.tenantId,
           warehouseId: command.warehouseId,
@@ -376,14 +399,14 @@ export class ExcursionCommand {
           warehouseId: command.warehouseId,
           binId: command.binId,
           readingC,
-          note: command.note,
+          note,
           holdIds,
           status: 'open',
           recordedBy: command.actorUserId,
           occurredAt,
           resolvedBy: null,
           resolvedAt: null,
-          createdAt: occurredAt,
+          createdAt: canonicalInstant(inserted[0]!.createdAt),
         },
       };
 
@@ -399,9 +422,11 @@ export class ExcursionCommand {
           warehouseId: command.warehouseId,
           binId: command.binId,
           readingC,
-          note: command.note,
+          note,
           holdIds,
-          affectedSkus: scopes.map((scope) => scope.skuId),
+          // Every affected scope — including the skipped ones, matching the
+          // ledger events (the reach of the excursion, holds or not).
+          affectedSkus: affected.map((scope) => scope.skuId),
           recordedBy: command.actorUserId,
           occurredAt,
         },

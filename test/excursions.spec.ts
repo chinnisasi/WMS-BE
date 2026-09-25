@@ -51,6 +51,7 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
   let binCatchWeight: string; // catch-weight only (the other refusal arm)
   let binSkip: string; // the already-held-scope arm
   let binPlaceHold: string; // the replay + resolve + placeHold-regression bin
+  let secureExcursionId = ''; // the secure-bin arm's excursion (the resolve-denial arm's row)
   const skuIds = new Map<string, string>();
 
   let suiteDb: SuiteDatabase;
@@ -398,6 +399,9 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
     });
     expect((excursion.holdIds as string[]).length).toBe(2);
     expect(Date.parse(excursion.occurredAt as string)).toBe(Date.parse('2026-09-25T06:30:00.000Z'));
+    // The cursor field is the ROW's created_at (the commit time), never the
+    // business time — what list/resolve later report.
+    expect(Math.abs(Date.now() - Date.parse(excursion.createdAt as string))).toBeLessThan(60_000);
 
     const holdIds = excursion.holdIds as string[];
     // holdIds round-trip: the ids are exactly the open qc_holds rows.
@@ -573,13 +577,72 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
     expect(holdRows.find((row) => row.id === holdIds[0])!.sku_id).toBe(batchId);
 
     // The skipped scope's stock stays in the origin bin (untouched); the
-    // batch scope relocated. The ledger events cover the quarantined scope
-    // only — holdIds, holds and events all tell the same story.
+    // batch scope relocated. The ledger events cover EVERY affected scope —
+    // including the skipped plain scope (the excursion's ledger reach,
+    // holds or not); holdIds still names only the new hold.
     expect(await onHandAtBin(binSkip, plainId)).toBe(7);
     expect(await onHandAtBin(binSkip, batchId)).toBe(0);
     const events = await excursionLedgerRows(excursion.id as string);
+    expect(events).toHaveLength(2);
+    expect(events.map((event) => event.sku_id).sort()).toEqual([plainId, batchId].sort());
+    for (const event of events) {
+      expect(event.type).toBe('excursion.recorded');
+      expect(event.quantity_delta).toBe(0);
+      expect(event.reference_doc).toMatchObject({ kind: 'excursion', excursionId: excursion.id });
+    }
+    const recordedPayloads = await outboxRows('excursion.recorded');
+    const thisPayload = recordedPayloads.find((p) => p.excursionId === excursion.id)!;
+    expect(thisPayload.affectedSkus).toEqual(expect.arrayContaining([plainId, batchId]));
+  });
+
+  it('every scope already held: the excursion still commits — holdIds [], one zero-delta event per affected scope, zero NEW holds; a whitespace-only note IS the absent note', async () => {
+    const plainId = skuIds.get('EX-PLAIN')!;
+    const binAllHeld = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A-01-07', capacity: 1000, type: 'shelf' })
+        .expect(201)
+    ).body.id as string;
+    // The only scope is already held; fresh stock arrived back into the bin
+    // afterwards — the excursion's sweep sees on-hand but quarantines nothing.
+    await seedStock(plainId, binAllHeld, 5);
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/qc-holds`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ warehouseId, skuId: plainId, binId: binAllHeld, reason: 'already held' })
+      .expect(201);
+    await seedStock(plainId, binAllHeld, 3);
+
+    // The whitespace-only note normalizes to the absent note.
+    const res = await recordExcursion({
+      warehouseId,
+      binId: binAllHeld,
+      readingC: 7,
+      note: '   ',
+    }).expect(201);
+    const excursion = res.body.excursion as Record<string, unknown>;
+    expect(excursion).toMatchObject({ status: 'open', holdIds: [], note: null });
+
+    // Ledger-visible despite quarantining nothing new: one zero-delta event
+    // for the (affected) scope; no second hold row for it.
+    const events = await excursionLedgerRows(excursion.id as string);
     expect(events).toHaveLength(1);
-    expect(events[0]!.sku_id).toBe(batchId);
+    expect(events[0]).toMatchObject({
+      type: 'excursion.recorded',
+      quantity_delta: 0,
+      sku_id: plainId,
+      from_bin_id: null,
+      to_bin_id: null,
+      reference_doc: { kind: 'excursion', excursionId: excursion.id, binId: binAllHeld, readingC: 7 },
+    });
+    expect(await countRows('qc_holds', `tenant_id = '${tenantId}'::uuid and bin_id = '${binAllHeld}'::uuid`)).toBe(1);
+    expect(await countRows('temperature_excursions', `tenant_id = '${tenantId}'::uuid and bin_id = '${binAllHeld}'::uuid`)).toBe(1);
+    const recordedPayloads = await outboxRows('excursion.recorded');
+    const payload = recordedPayloads.find((p) => p.excursionId === excursion.id)!;
+    expect(payload.affectedSkus).toEqual([plainId]);
   });
 
   it('replay: the same idempotency key + payload re-serves the snapshot (no duplicate excursion/holds/movements); a different payload is 422', async () => {
@@ -624,7 +687,8 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
       select hold_ids from temperature_excursions where tenant_id = ${tenantId} and id = ${open.id}`)[0] as unknown as { hold_ids: string[] };
     const holdId = holdRow.hold_ids[0]!;
 
-    const res = await resolveExcursion(open.id).expect(200);
+    const key = ulid();
+    const res = await resolveExcursion(open.id, opsToken, key).expect(200);
     expect(res.body.excursion).toMatchObject({
       id: open.id,
       status: 'resolved',
@@ -643,6 +707,15 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
       select action from audit_events
       where tenant_id = ${tenantId} and action = 'excursion.resolved' and target_id = ${open.id}`;
     expect(audits).toHaveLength(1);
+
+    // Replay: the same key + payload re-serves the identical snapshot and
+    // writes no second audit row.
+    const replay = await resolveExcursion(open.id, opsToken, key).expect(200);
+    expect(replay.body).toEqual(res.body);
+    const auditsAfterReplay = await sql`
+      select action from audit_events
+      where tenant_id = ${tenantId} and action = 'excursion.resolved' and target_id = ${open.id}`;
+    expect(auditsAfterReplay).toHaveLength(1);
 
     // Terminal: a second resolve is a deterministic 409, and the resolved
     // excursion answers the resolved status filter.
@@ -669,12 +742,187 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
     // the operator token) — asserted there by construction.
   });
 
-  it('reading bounds: out-of-range readings are 400 validation-failed before any write', async () => {
+  it('reading bounds: out-of-range readings and a third decimal are 400 validation-failed before any write', async () => {
     const over = await recordExcursion({ warehouseId, binId: binMixed, readingC: 200.01 }).expect(400);
     expect(over.body.code).toBe('validation-failed');
     const under = await recordExcursion({ warehouseId, binId: binMixed, readingC: -100.5 }).expect(400);
     expect(under.body.code).toBe('validation-failed');
+    // The docs say two decimal places — 8.999 is refused by the DTO, not
+    // silently rounded to 9.
+    const precision = await recordExcursion({ warehouseId, binId: binMixed, readingC: 8.999 }).expect(400);
+    expect(precision.body.code).toBe('validation-failed');
     expect(await countRows('temperature_excursions', `tenant_id = '${tenantId}'::uuid and bin_id = '${binMixed}'::uuid and reading_c <> 8.5`)).toBe(0);
+  });
+
+  it('request-shape refusals, nothing written: a non-Z occurredAt, an oversized note, and a malformed Idempotency-Key are all 400', async () => {
+    const rowsBefore = await countRows('temperature_excursions', `tenant_id = '${tenantId}'::uuid`);
+
+    // occurredAt without the Z suffix is not a UTC instant.
+    const occurred = await recordExcursion({
+      warehouseId,
+      binId: binPlaceHold,
+      readingC: 4,
+      occurredAt: '2026-09-25T06:30:00',
+    }).expect(400);
+    expect(occurred.body.code).toBe('validation-failed');
+
+    // The note ceiling is the DTO's @Length — 201 characters are refused.
+    const oversized = await recordExcursion({
+      warehouseId,
+      binId: binPlaceHold,
+      readingC: 4,
+      note: 'x'.repeat(201),
+    }).expect(400);
+    expect(oversized.body.code).toBe('validation-failed');
+
+    // The Idempotency-Key is a ULID — anything else is refused before the
+    // command body runs.
+    const badKey = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/excursions`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .set(KEY_HEADER, 'not-a-ulid')
+      .send({ warehouseId, binId: binPlaceHold, readingC: 4 })
+      .expect(400);
+    expect(badKey.body.code).toBe('idempotency-key-invalid');
+
+    expect(await countRows('temperature_excursions', `tenant_id = '${tenantId}'::uuid`)).toBe(rowsBefore);
+    expect(await countRows('qc_holds', `tenant_id = '${tenantId}'::uuid and bin_id = '${binPlaceHold}'::uuid`)).toBe(1);
+  });
+
+  it('secure bin: the hold core\'s secure.move gate refuses an operator 403 (nothing written) and accepts an ops manager', async () => {
+    const plainId = skuIds.get('EX-PLAIN')!;
+    const binSecure = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A-95-01', capacity: 1000, type: 'shelf', storageClass: 'secure' })
+        .expect(201)
+    ).body.id as string;
+    await seedStock(plainId, binSecure, 2);
+
+    // Held units LEAVE the origin bin (FR-42), so recording on a cage-class
+    // bin rides the hold core's `secure.move` gate — the operator is refused
+    // AFTER the sweep, in the same transaction: nothing written.
+    const denied = await recordExcursion({ warehouseId, binId: binSecure, readingC: 5 }, operatorToken).expect(403);
+    expect(denied.body.code).toBe('role-denied');
+    expect(denied.body.detail as string).toContain('secure.move');
+    expect(await countRows('temperature_excursions', `tenant_id = '${tenantId}'::uuid and bin_id = '${binSecure}'::uuid`)).toBe(0);
+    expect(await countRows('qc_holds', `tenant_id = '${tenantId}'::uuid and bin_id = '${binSecure}'::uuid`)).toBe(0);
+    expect(await onHandAtBin(binSecure, plainId)).toBe(2);
+
+    // An ops manager (a holder of secure.move) records the same excursion.
+    const allowed = await recordExcursion({ warehouseId, binId: binSecure, readingC: 5 }, opsToken).expect(201);
+    const excursion = allowed.body.excursion as Record<string, unknown>;
+    expect((excursion.holdIds as string[]).length).toBe(1);
+    expect(await countRows('qc_holds', `tenant_id = '${tenantId}'::uuid and bin_id = '${binSecure}'::uuid`)).toBe(1);
+    secureExcursionId = excursion.id as string;
+  });
+
+  it('resolve authority: an operator holds excursion.record but not review.decide — 403, the excursion stays open', async () => {
+    const denied = await resolveExcursion(secureExcursionId, operatorToken).expect(403);
+    expect(denied.body.code).toBe('role-denied');
+    expect(denied.body.detail as string).toContain('review.decide');
+    const row = (await sql`
+      select status from temperature_excursions where tenant_id = ${tenantId} and id = ${secureExcursionId}`)[0] as unknown as { status: string };
+    expect(row.status).toBe('open');
+  });
+
+  it('list: keyset pagination walks without repeats, a crafted cursor is 400 invalid-cursor, the warehouseId filter returns only its rows, a foreign warehouseId is 404', async () => {
+    // A second warehouse with its own excursion — the filter's contrast.
+    const wh2 = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `EXC2-${ulid().slice(10, 16).toUpperCase()}`, name: `Excursion WH2 ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zone2 = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${wh2}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A', name: 'Zone A' })
+        .expect(201)
+    ).body.id as string;
+    const bin2 = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${wh2}/zones/${zone2}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ capacity: 1000, type: 'shelf', code: 'A-01-01' })
+        .expect(201)
+    ).body.id as string;
+    const plainId = skuIds.get('EX-PLAIN')!;
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/inventory/adjustments`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        warehouseId: wh2,
+        skuId: plainId,
+        binId: bin2,
+        quantityDelta: 1,
+        reasonCode: 'cycle-count',
+        note: 'excursions-suite wh2 seed',
+      })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/excursions`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ warehouseId: wh2, binId: bin2, readingC: 6 })
+      .expect(201);
+
+    const listUrl = `${API}/${tenantId}/excursions`;
+    const pageOf = async (qs: string): Promise<{ items: Record<string, unknown>[]; nextCursor: string | null }> => {
+      const res = await request(app.getHttpServer())
+        .get(`${listUrl}${qs}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      return {
+        items: res.body.items as Record<string, unknown>[],
+        nextCursor: (res.body.nextCursor ?? null) as string | null,
+      };
+    };
+
+    // The warehouseId filter returns only that warehouse's rows.
+    const wh2Page = await pageOf(`?warehouseId=${wh2}`);
+    expect(wh2Page.items.length).toBeGreaterThan(0);
+    for (const item of wh2Page.items) {
+      expect(item.warehouseId).toBe(wh2);
+    }
+    const wh1Page = await pageOf(`?warehouseId=${warehouseId}`);
+    expect(wh1Page.items.every((it) => it.warehouseId === warehouseId)).toBe(true);
+
+    // A warehouseId belonging to no warehouse of the tenant is 404.
+    const foreign = await request(app.getHttpServer())
+      .get(`${listUrl}?warehouseId=${uuidv7()}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(404);
+    expect(foreign.body.code).toBe('not-found');
+
+    // Walking limit=1 pages visits every row exactly once.
+    const all = await pageOf('');
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await pageOf(cursor === null ? '?limit=1' : `?limit=1&cursor=${cursor}`);
+      for (const item of page.items) {
+        seen.push(item.id as string);
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(seen.length).toBe(all.items.length);
+
+    // A crafted cursor is a 400, not a 500.
+    const bad = await request(app.getHttpServer())
+      .get(`${listUrl}?cursor=${Buffer.from('garbage').toString('base64')}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(400);
+    expect(bad.body.code).toBe('invalid-cursor');
   });
 
   it('placeHold regression: the extracted hold core keeps the ordinary QC-hold command behavior byte-identical', async () => {
