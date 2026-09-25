@@ -8,11 +8,13 @@ import { OutboundController } from './outbound.controller';
 import { ReceivingController } from './receiving.controller';
 import { PutawayController } from './putaway.controller';
 import { CarriersController } from './carriers.controller';
+import { ComplianceController } from './compliance.controller';
 import { OpenApiController } from './openapi.controller';
 import { NotFoundController } from './not-found.controller';
 import { OpenApiDocumentHolder } from './openapi-document.holder';
 import { InventoryModule } from '../modules/inventory/inventory.module';
 import { InboundModule } from '../modules/inbound/inbound.module';
+import { ComplianceModule } from '../modules/compliance/compliance.module';
 import { OutboundModule } from '../modules/outbound/outbound.module';
 import { PutawayModule } from '../modules/putaway/putaway.module';
 import { CarriersModule } from '../modules/carriers/carriers.module';
@@ -54,7 +56,7 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
  * response DTO, so the shell has nothing to redact.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule],
+  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule],
   controllers: [
     HealthController,
     EchoController,
@@ -65,6 +67,10 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
     ReceivingController,
     PutawayController,
     CarriersController,
+    // Story 12-5 — the compliance surface (excursion record/list/resolve)
+    // rides the same shape: `ComplianceModule` is a spine-singleton already
+    // imported by the root; every mutation goes through `ExcursionFacade`.
+    ComplianceController,
     OpenApiController,
     NotFoundController,
   ],

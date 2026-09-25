@@ -197,6 +197,25 @@ export type LedgerReferenceDoc =
       readonly carrierName?: string;
       /** Optional free-text tracking reference; absent when none was given. */
       readonly trackingNumber?: string;
+    }
+  // Story 12-5 — the excursion arm (FR-44): every `excursion.recorded` event
+  // names the excursion row it belongs to, the origin bin the reading was
+  // taken against, and the reading itself. The event is the ledger's ONLY
+  // record of the excursion (AD-6/AD-11 — no side book), so the arm carries
+  // enough for FR-45 to reconstruct the excursion from the ledger alone.
+  // One event is written per AFFECTED (sku, bin) scope — `skuId` is never
+  // null on a ledger event, so a bin holding several SKUs produces one event
+  // per scope — and the event is ZERO-quantity like pack/dispatch (the
+  // quarantine of the affected units is the QC-hold movements' work, which
+  // ride their own `qc.held` events beside these). NEW union arm — the
+  // earlier kinds are never reshaped.
+  | {
+      readonly kind: 'excursion';
+      readonly excursionId: string;
+      /** The origin bin the reading was recorded against. */
+      readonly binId: string;
+      /** The operator-captured reading, °C. */
+      readonly readingC: number;
     };
 // Later stories extend this union with NEW kinds (transfer, …) — never by
 // reshaping an existing arm.
@@ -392,6 +411,33 @@ registerLedgerEventType({
   type: 'dispatch.dispatched',
   sinceVersion: 1,
   referenceKinds: ['dispatch'],
+  allowsBatchArm: false,
+  allowsSerialArm: false,
+});
+
+/**
+ * Grammar v1, Story 12-5 — the temperature excursion (FR-44): one ZERO-delta
+ * event per AFFECTED (sku, bin) scope, recording that a temperature excursion
+ * was observed against the bin and that the scope's stock was quarantined.
+ * The third non-movement type, for the same reason as pack/dispatch: the
+ * affected units' actual relocation is the ordinary QC-hold semantics'
+ * `qc.held` movements (the excursion records a hold per scope beside these
+ * events), so the event carries `quantityDelta: 0` with both bin arms null
+ * and folds no projection. What it durably records is the excursion itself —
+ * the reference doc names the excursion row, the origin bin and the reading,
+ * which is the whole FR-45 reconstruction contract from the ledger alone.
+ *
+ * Both identity arms stay CLOSED, like pack/dispatch: the excursion recounts
+ * neither batches nor serials (it is a reading against a bin, and the
+ * per-scope identity rides `skuId`), and opening an arm would let a caller
+ * record a batch/serial claim the reading never made. Registers
+ * sinceVersion 1 — no new grammar version; the reference-doc union appends
+ * only.
+ */
+registerLedgerEventType({
+  type: 'excursion.recorded',
+  sinceVersion: 1,
+  referenceKinds: ['excursion'],
   allowsBatchArm: false,
   allowsSerialArm: false,
 });

@@ -3,6 +3,7 @@ import { and, desc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { qcHolds } from '../../shared/db/schema';
+import type { UserRole } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
@@ -10,12 +11,14 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { canonicalInstant } from '../../shared/primitives/time';
-import { QcCommand } from './qc.command';
+import { openQcHoldsForBinsInTx, QcCommand } from './qc.command';
 import type {
+  HoldScopeInTxCommand,
   PlaceQcHoldCommand,
   QcHoldSnapshot,
   ReleaseQcHoldCommand,
 } from './qc.command';
+import type { TenantTx } from '../../shared/db/tenant-scope';
 
 /** One QC-hold row of the holds-list read (the release/hold history cards). */
 export interface QcHoldEntry {
@@ -95,6 +98,40 @@ export class QcFacade {
   /** `qc-holds/:id/release` — the Ops Manager release command (`qc.manage`). */
   async releaseHold(command: ReleaseQcHoldCommand, idempotencyKey: string): Promise<QcHoldSnapshot> {
     return this.qc.releaseHold(command, idempotencyKey);
+  }
+
+  /**
+   * Story 12-5 — the in-transaction hold core (the `holdScopeInTx` command
+   * method, extracted from `placeHold`) exposed to the one composing sibling:
+   * the excursion command quarantines each affected (sku, bin) scope through
+   * this so the hold semantics keep exactly one implementation. Runs inside
+   * the CALLER's transaction; the caller owns authority, replay and the
+   * idempotency commit marker, and passes its fresh role read for the 12-3
+   * secure-bin gate plus the audit row's reference value.
+   */
+  async holdScopeInTx(
+    tx: TenantTx,
+    command: HoldScopeInTxCommand,
+    role: UserRole,
+    auditReference: string,
+  ): Promise<QcHoldSnapshot> {
+    return this.qc.holdScopeInTx(tx, command, role, auditReference);
+  }
+
+  /**
+   * The open holds riding the named bins, inside the caller's transaction —
+   * the file-level `openQcHoldsForBinsInTx` helper surfaced through the
+   * facade so the excursion command can SKIP already-held scopes (a scope
+   * under an open hold is already out of ATP, not a 409) without reaching
+   * into `qc_holds` itself.
+   */
+  async openHoldsForBinsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    binIds: readonly string[],
+  ): Promise<readonly { binId: string; holdId: string; skuId: string }[]> {
+    return openQcHoldsForBinsInTx(tx, tenantId, warehouseId, binIds);
   }
 
   /**
