@@ -3,6 +3,14 @@ import { MAX_QUANTITY_BASE } from '../../shared/primitives/quantity';
 // Story 12-1: the storage-class vocabulary — the DTO mirror of the shared
 // primitive's tuple (the three-layer pattern: TS tuple / DB CHECK / @IsIn).
 import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
+// Story 12-4: the location-type vocabulary — same pattern, same shared
+// primitive the placement/merge gates import (one source, no copy).
+import {
+  GRID_TYPES,
+  LOCATION_TYPES,
+  type BulkAssetType,
+  type LocationType,
+} from '../../shared/primitives/location-type';
 // Story 11-5: the bin capacity caps (same import the SKU-attribute DTOs make
 // to `sku-attributes.ts` — the DTO mirrors the command's bounds, the command
 // enforces them). A standalone file (the 11-5 review triage #10): importing
@@ -331,9 +339,16 @@ export class WarehouseListResponse {
   nextCursor!: string | null;
 }
 
-/** Bin types are a fixed set (spec 1.3) — validated, never free-form. */
-export const BIN_TYPES = ['shelf', 'pallet', 'floor', 'staging'] as const;
-export type BinType = (typeof BIN_TYPES)[number];
+/**
+ * Bin types are a fixed set (spec 1.3) — validated, never free-form.
+ * Story 12-4: the vocabulary moved to the shared primitive
+ * (`location-type.ts`) and grew the four non-bin location types (yard,
+ * floor-stack, tank, silo — one table, no fork). This re-exported alias keeps
+ * the three DTO call sites (:452 create, :566 grid, :748 response) churn-free;
+ * the DB CHECK backstop lives in `drizzle/0037_location_type_check.sql`.
+ */
+export const BIN_TYPES = LOCATION_TYPES;
+export type BinType = LocationType;
 
 export class CreateZoneDto {
   @ApiProperty({ example: 'A', minLength: 1, maxLength: 32 })
@@ -426,7 +441,7 @@ export class CreateBinDto {
     nullable: true,
     minimum: 1,
     maximum: MAX_BIN_WEIGHT_GRAMS,
-    description: `Max weight in grams. Omit to leave the bin unconstrained; null to clear. At most ${MAX_BIN_WEIGHT_GRAMS}.`,
+    description: `Max weight in grams. Omit to leave the bin unconstrained; null to clear. At most ${MAX_BIN_WEIGHT_GRAMS}. On a bulk asset (tank, silo) the field is REQUIRED and neither the omission nor a null clear is accepted.`,
   })
   @IsOptional()
   @IsInt()
@@ -449,7 +464,15 @@ export class CreateBinDto {
   @IsIn(STORAGE_CLASSES)
   storageClass?: string;
 
-  @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
+  // Story 12-4: the location type documents the bulk-asset create rules —
+  // the DTO is the API contract; the weight requirement and the grid refusal
+  // stay command-enforced (behind the replay lookup, the 10.2 rule).
+  @ApiProperty({
+    enum: BIN_TYPES,
+    example: 'shelf',
+    description:
+      "The bin's location type (12-4 vocabulary). A bulk asset (tank, silo) is weight-defined: maxWeightGrams is REQUIRED at create and can never be cleared; a bulk asset is never gridded.",
+  })
   @IsIn(BIN_TYPES)
   type!: BinType;
 }
@@ -543,7 +566,7 @@ export class GenerateBinsDto {
     nullable: true,
     minimum: 1,
     maximum: MAX_BIN_WEIGHT_GRAMS,
-    description: `Max weight in grams, per bin. Omit for unconstrained bins. At most ${MAX_BIN_WEIGHT_GRAMS}.`,
+    description: `Max weight in grams, per bin. Omit for unconstrained bins. At most ${MAX_BIN_WEIGHT_GRAMS}. On a bulk asset (tank, silo) the field is REQUIRED at create and cannot be cleared.`,
   })
   @IsOptional()
   @IsInt()
@@ -563,9 +586,18 @@ export class GenerateBinsDto {
   @IsIn(STORAGE_CLASSES)
   storageClass?: string;
 
-  @ApiProperty({ enum: BIN_TYPES, example: 'shelf' })
-  @IsIn(BIN_TYPES)
-  type!: BinType;
+  // Story 12-4: the grid's enum narrows to the SIX grid-able types — a bulk
+  // asset is operator-directed, never gridded, so the contract must not
+  // advertise types the route always refuses. The command's runtime refusal
+  // (`refuseBulkAssetGrid`) stays as the backstop.
+  @ApiProperty({
+    enum: GRID_TYPES,
+    example: 'shelf',
+    description:
+      'The location type, per bin (12-4 vocabulary). A bulk asset (tank, silo) is never gridded — the grid mints only the six conventional storage types.',
+  })
+  @IsIn(GRID_TYPES)
+  type!: Exclude<LocationType, BulkAssetType>;
 }
 
 export class PatchBinDto {
@@ -635,7 +667,7 @@ export class PatchBinDto {
     nullable: true,
     minimum: 1,
     maximum: MAX_BIN_WEIGHT_GRAMS,
-    description: `Max weight in grams. Omit to leave unchanged; null to clear. Mutually exclusive with blocked.`,
+    description: `Max weight in grams. Omit to leave unchanged; null to clear. Mutually exclusive with blocked. On a bulk asset (tank, silo) the field cannot be cleared, and a re-value below the mass the asset already holds is refused.`,
   })
   @IsOptional()
   @IsInt()

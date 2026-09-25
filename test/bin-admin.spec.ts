@@ -8,6 +8,8 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { MAX_BIN_DIMENSION_MM } from '../src/modules/tenancy/bin-capacity';
 import { BinCommand } from '../src/modules/tenancy/bin.command';
+// Story 12-4: the vocabulary tuple — the round-trip walks it directly.
+import { LOCATION_TYPES } from '../src/shared/primitives/location-type';
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { importSecureSku } from './support/secure-sku';
@@ -1790,5 +1792,224 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     await merge(opsSource, opsTarget, opsManagerToken).expect(200);
     expect(await plainOnHand(opsTarget, secSkuId)).toBe(1);
     expect(await plainOnHand(opsSource, secSkuId)).toBe(0);
+  });
+
+  // ── Story 12-4 — non-bin location types + the bulk-asset rules ─────────────
+
+  it('0037 round-trip: the bins_type_check CHECK exists, every location type in the vocabulary conforms, and an out-of-vocabulary write is DB-rejected', async () => {
+    const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const checks = await admin`
+        select conname from pg_constraint
+        where conrelid = 'bins'::regclass and contype = 'c' and conname = 'bins_type_check'`;
+      expect(checks).toHaveLength(1);
+
+      // The vocabulary's DB backstop (the third layer — TS tuple / CHECK /
+      // @IsIn): every value the TS tuple names is storable by ANY writer,
+      // and the four pre-existing types among them prove zero data mutation.
+      for (const type of LOCATION_TYPES) {
+        const ok = admin`
+          insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type)
+          values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${zoneId}, ${`CHK-${ulid()}`}, ${toMilli(10)}, ${type})`;
+        await expect(ok).resolves.toBeDefined();
+      }
+
+      // And anything outside the tuple is rejected by the CHECK itself —
+      // the migration-level I/O row.
+      const badType = admin`
+        insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type)
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${zoneId}, ${`CHK-${ulid()}`}, ${toMilli(10)}, 'walk-in-cooler')`;
+      await expect(badType).rejects.toThrow(/bins_type_check/i);
+    } finally {
+      await admin.end();
+    }
+  });
+
+  it('bulk assets: tank/silo require maxWeightGrams at create, grids refuse them, PATCH cannot clear the weight; yard/floor-stack carry no extra rule — and a merge into a tank holding another SKU is 400 bin-occupancy-conflict naming the holding SKU, while same-SKU and single-SKU merges land', async () => {
+    const createTyped = (body: Record<string, unknown>): SupertestTest =>
+      request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send(body);
+    const gridReq = (body: Record<string, unknown>): SupertestTest =>
+      request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins/grid`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send(body);
+
+    // ── master data: the weight rule ──────────────────────────────────────
+    // A tank/silo WITHOUT maxWeightGrams is 400 validation-failed — both the
+    // absent and the explicit-null shape (creation has no "leave unchanged").
+    const tankNoWeight = await createTyped({ code: 'A-96-T0', capacity: 100, type: 'tank' }).expect(400);
+    expect(tankNoWeight.body).toMatchObject({ status: 400, code: 'validation-failed' });
+    expect(String(tankNoWeight.body.detail)).toContain('maxWeightGrams');
+    const tankNullWeight = await createTyped({ code: 'A-96-T0', capacity: 100, type: 'tank', maxWeightGrams: null }).expect(400);
+    expect(tankNullWeight.body).toMatchObject({ code: 'validation-failed' });
+
+    // WITH the weight, both bulk types create cleanly; yard and floor-stack
+    // carry NO extra rule (Design Note 4 — absent stays legal = unconstrained).
+    const tankT1 = (
+      await createTyped({ code: 'A-96-T1', capacity: 100, type: 'tank', maxWeightGrams: 1_000_000 }).expect(201)
+    ).body.id as string;
+    const tankT2 = (
+      await createTyped({ code: 'A-96-T2', capacity: 100, type: 'silo', maxWeightGrams: 500_000 }).expect(201)
+    ).body.id as string;
+    const yard = (
+      await createTyped({ code: 'A-96-Y1', capacity: 1000, type: 'yard' }).expect(201)
+    ).body.id as string;
+    const floorStack = (
+      await createTyped({ code: 'A-96-F1', capacity: 1000, type: 'floor-stack' }).expect(201)
+    ).body.id as string;
+    expect(yard).toBeDefined();
+    expect(floorStack).toBeDefined();
+    // (T2 is typed 'silo' — the variable name tracks the asset, not the type.)
+
+    // ── master data: the grid rule ────────────────────────────────────────
+    // The DTO's enum narrowed to the six grid-able types (review 2): the
+    // ValidationPipe refuses a bulk type in front of the command, naming the
+    // grid-able set — the runtime `refuseBulkAssetGrid` stays as the backstop
+    // for a caller that bypasses the pipe.
+    for (const bulkType of ['tank', 'silo']) {
+      const res = await gridReq({ aisleFrom: 'D', aisleTo: 'D', baysPerAisle: 1, levelsPerBay: 1, capacity: 10, type: bulkType }).expect(400);
+      expect(res.body).toMatchObject({ status: 400, code: 'validation-failed' });
+      expect(String(res.body.detail)).toContain('one of the following values');
+      expect(String(res.body.detail)).not.toContain(bulkType);
+    }
+    // An ordinary type grids exactly as before (no collateral narrowing).
+    await gridReq({ aisleFrom: 'E', aisleTo: 'E', baysPerAisle: 1, levelsPerBay: 1, capacity: 10, type: 'floor' }).expect(201);
+
+    // ── master data: the PATCH rule — null clears on an ordinary bin, never
+    // on a bulk asset; a re-value stays legal ─────────────────────────────
+    const clear = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${tankT1}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ maxWeightGrams: null })
+      .expect(400);
+    expect(clear.body).toMatchObject({ status: 400, code: 'validation-failed' });
+    expect(String(clear.body.detail)).toContain('tank');
+    const reweight = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${tankT1}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ maxWeightGrams: 2_000_000 })
+      .expect(200);
+    expect(reweight.body.maxWeightGrams).toBe(2_000_000);
+    // (review 2) Null CLEARS on an ordinary bin — the never-clear rule is
+    // bulk-only: set, then clear, both 200, ending unconstrained.
+    const setOrdinary = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${floorStack}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ maxWeightGrams: 250_000 })
+      .expect(200);
+    expect(setOrdinary.body.maxWeightGrams).toBe(250_000);
+    const clearOrdinary = await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${floorStack}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ maxWeightGrams: null })
+      .expect(200);
+    expect(clearOrdinary.body.maxWeightGrams).toBeNull();
+
+    // ── the merge occupancy gate (single-SKU rule, the merge arm) ─────────
+    // DIFFERENT SKU into a holding tank → 400 `bin-occupancy-conflict`
+    // naming the holding SKU; NOTHING moves and the source stays un-retired
+    // (the gate is before every arm — the class gate here passes, both
+    // ambient).
+    await fill(tankT1, plainSkuId, 1);
+    const wrongSrc = (
+      await createTyped({ code: 'A-96-S1', capacity: 100, type: 'shelf' }).expect(201)
+    ).body.id as string;
+    await fill(wrongSrc, batchSkuId, 1, { batchCode: "LOT-BA-96-A" });
+    const wrongMerge = await merge(wrongSrc, tankT1).expect(400);
+    expect(wrongMerge.body).toMatchObject({ status: 400, code: 'bin-occupancy-conflict' });
+    expect(String(wrongMerge.body.detail)).toContain('BA-B');
+    expect(await plainOnHand(wrongSrc, batchSkuId)).toBe(1);
+    const stillLive = await zoneBins(zoneId);
+    expect(stillLive.find((bin) => bin.id === wrongSrc)!.retiredAt).toBeNull();
+
+    // SAME-SKU top-up merges (the predicate's union stays at one SKU).
+    const topUpSrc = (
+      await createTyped({ code: 'A-96-S2', capacity: 100, type: 'shelf' }).expect(201)
+    ).body.id as string;
+    await fill(topUpSrc, plainSkuId, 1);
+    await merge(topUpSrc, tankT1).expect(200);
+    expect(await plainOnHand(tankT1, plainSkuId)).toBe(2);
+
+    // TWO moved SKUs into an EMPTY bulk asset refuse (moved-vs-moved — the
+    // single-SKU rule covers what the hazard gate deliberately skips).
+    const multiSrc = (
+      await createTyped({ code: 'A-96-S3', capacity: 100, type: 'shelf' }).expect(201)
+    ).body.id as string;
+    await fill(multiSrc, batchSkuId, 1, { batchCode: "LOT-BA-96-A" });
+    await fill(multiSrc, plainSkuId, 1);
+    const multiMerge = await merge(multiSrc, tankT2).expect(400);
+    expect(multiMerge.body).toMatchObject({ code: 'bin-occupancy-conflict' });
+    expect(String(multiMerge.body.detail)).toContain('BA-A');
+    expect(String(multiMerge.body.detail)).toContain('BA-B');
+    expect(await plainOnHand(multiSrc, batchSkuId)).toBe(1);
+
+    // ONE moved SKU into the still-empty asset merges cleanly.
+    const singleSrc = (
+      await createTyped({ code: 'A-96-S4', capacity: 100, type: 'shelf' }).expect(201)
+    ).body.id as string;
+    await fill(singleSrc, batchSkuId, 1, { batchCode: "LOT-BA-96-A" });
+    const singleMerge = await merge(singleSrc, tankT2).expect(200);
+    expect(singleMerge.body.moved).toEqual({ skus: 1, units: 1 });
+    expect(await plainOnHand(tankT2, batchSkuId)).toBe(1);
+
+    // ── OCCUPANCY-BEFORE-HAZARD (review 2, triage #33): a merge into a bulk
+    // asset where BOTH the single-SKU occupancy arm and the hazard gate
+    // would fire answers `bin-occupancy-conflict` — the placement arm's
+    // ordering pin (putaway.spec, review 2) needs a merge counterpart, or a
+    // refactor reordering merge's gates ships undetected. The moved SKU is
+    // hazard-INCOMPATIBLE with the occupant (explosive vs flammable, the
+    // same decided pair the placement pin uses), so a hazard-first gate
+    // would answer `bin-segregation-conflict` — occupancy is EARLIER.
+    const csvOrder = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'BA-OX,Order Item OX,pcs,,1800,,false,false,,,',
+      'BA-FL,Order Item FL,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csvOrder, 'utf8'), { filename: 'catalog-order.csv', contentType: 'text/csv' })
+      .expect(201);
+    const orderSkus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const orderByCode = new Map(
+      (orderSkus.body.items as { code: string; id: string }[]).map((item) => [item.code, item.id]),
+    );
+    for (const [skuId, hazardClass] of [
+      [orderByCode.get('BA-OX')!, 'explosive'],
+      [orderByCode.get('BA-FL')!, 'flammable'],
+    ] as const) {
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${skuId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ hazardClass })
+        .expect(200);
+    }
+    const tankT3 = (
+      await createTyped({ code: 'A-96-T3', capacity: 100, type: 'tank', maxWeightGrams: 1_000_000 }).expect(201)
+    ).body.id as string;
+    await fill(tankT3, orderByCode.get('BA-OX')!, 1);
+    const orderSrc = (
+      await createTyped({ code: 'A-96-S5', capacity: 100, type: 'shelf' }).expect(201)
+    ).body.id as string;
+    await fill(orderSrc, orderByCode.get('BA-FL')!, 1);
+    const orderMerge = await merge(orderSrc, tankT3).expect(400);
+    expect(orderMerge.body).toMatchObject({ code: 'bin-occupancy-conflict' });
+    expect(orderMerge.body.code).not.toBe('bin-segregation-conflict');
+    expect(await plainOnHand(orderSrc, orderByCode.get('BA-FL')!)).toBe(1);
   });
 });

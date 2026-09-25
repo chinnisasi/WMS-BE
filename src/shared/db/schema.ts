@@ -252,8 +252,8 @@ export const bins = pgTable(
     /**
      * Story 12-1 — the bin's storage class (FR-40 / AD-18), from the
      * controlled vocabulary in `src/shared/primitives/storage-class.ts`
-     * (STORAGE_CLASSES) — never free text, unlike `type` beside it, which
-     * story 12-4 (location types) replaces. The temperature hierarchy and the
+     * (STORAGE_CLASSES) — never free text (since story 12-4, `type` beside it
+     * is a CHECK-backed vocabulary too). The temperature hierarchy and the
      * exact-match classes live in that file's `storageClassSatisfies`, the ONE
      * predicate every conformance gate imports; the DB backstop is a CHECK
      * declared ONLY in `drizzle/0035_storage_class.sql` (the 0034 pattern —
@@ -262,6 +262,19 @@ export const bins = pgTable(
      * non-conforming state can pre-exist because the vocabulary is new).
      */
     storageClass: text('storage_class').notNull().default('ambient'),
+    /**
+     * Story 12-4 — the location type, from the controlled vocabulary in
+     * `src/shared/primitives/location-type.ts` (LOCATION_TYPES — the four
+     * pre-existing bin types first, then the non-bin location types yard,
+     * floor-stack, tank, silo; one table, no fork). No longer free text: the
+     * DB backstop is a CHECK declared ONLY in
+     * `drizzle/0037_location_type_check.sql` (the 0035 pattern — CHECKs live
+     * only in migration SQL); the bulk-asset rule (`tank`/`silo`: single-SKU
+     * occupancy, weight-defined capacity, never auto-suggested) lives in that
+     * primitive and is imported by every placement gate. All pre-12.4 rows
+     * conform with zero data mutation — the old four types come first in the
+     * tuple unchanged.
+     */
     type: text('type').notNull(),
     blocked: boolean('blocked').notNull().default(false),
     systemOwned: boolean('system_owned').notNull().default(false),

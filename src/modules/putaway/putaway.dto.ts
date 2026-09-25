@@ -2,15 +2,7 @@ import { Type } from 'class-transformer';
 import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
 import { ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, IsUUID, Length, Max, Min } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
-
-/** The fixed mismatch-reason enum (the I/O matrix — 400 outside it). */
-export const PUTAWAY_MISMATCH_REASON_ENUM = [
-  'pallet-too-heavy',
-  'suggested-bin-occupied',
-  'consolidation-with-existing-stock',
-  'operator-preference',
-  'other',
-] as const;
+import { PUTAWAY_MISMATCH_REASON_CODES as PUTAWAY_MISMATCH_REASON_ENUM } from './mismatch-reason';
 
 // ── putaway.place input ──────────────────────────────────────────────────────
 
@@ -260,7 +252,7 @@ export class PutawayBinDto {
   @ApiProperty()
   zoneCode!: string;
 
-  @ApiProperty({ description: 'The fixed bin type (shelf/pallet/floor/staging)' })
+  @ApiProperty({ description: 'The fixed location type (12-4 vocabulary): shelf, pallet, floor, staging, floor-stack, yard, tank or silo' })
   type!: string;
 
   @ApiProperty({ description: 'Capacity in base-UoM units' })

@@ -2691,4 +2691,72 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
       tasks.some((task) => task.skuCode === 'PCK-KIT' && mine.some((line) => line.id === task.picklistLineId)),
     ).toBe(false);
   });
+
+  // ── Story 12-4 — non-bin location types: the draw path is untouched ────────
+
+  it('12-4: a pick line whose stock sits in a yard, a tank or a floor-stack location draws through the ordinary gates — no capacity check, no type arm', async () => {
+    // A fresh SKU keeps the walk deterministic: the wave pool can only see
+    // the three non-shelf locations this test seeds (the A-01-* shelf bins
+    // never hold this SKU).
+    const csv = [
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+      'PCK-NONBIN,Non-Bin Location SKU,pcs,,1800,,false,false,,,',
+    ].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+    const skus = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/skus`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const nonBinSkuId = (skus.body.items as { code: string; id: string }[]).find(
+      (item) => item.code === 'PCK-NONBIN',
+    )!.id;
+
+    // Three non-shelf locations (12-4's types). The tank carries a
+    // weight-defined capacity (the 12-4 create rule) — a draw runs NO
+    // capacity gate, so its stock is drawable regardless.
+    const createTyped = async (code: string, body: Record<string, unknown>): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 100, type: 'shelf', ...body, code })
+          .expect(201)
+      ).body.id as string;
+    const stackBin = await createTyped('A-60-01', { type: 'floor-stack' });
+    const tankBin = await createTyped('A-60-02', { type: 'tank', maxWeightGrams: 500_000 });
+    const yardBin = await createTyped('A-60-03', { type: 'yard' });
+    await seedStock(nonBinSkuId, stackBin, 4);
+    await seedStock(nonBinSkuId, tankBin, 5);
+    await seedStock(nonBinSkuId, yardBin, 3);
+
+    const { picklist } = await releasedWave([{ skuId: nonBinSkuId, quantity: 10 }], 'nonbin');
+    // The walk reads the same stock_on_hand rows: 4 + 5 + 3 ≥ 10, sliced
+    // across the three locations in bin-code order — every one of them a
+    // non-shelf type.
+    const planned = picklist.lines.filter((line) => line.status === 'planned');
+    expect(planned).toHaveLength(3);
+    expect(planned.map((line) => line.binId).sort()).toEqual([stackBin, tankBin, yardBin].sort());
+    expect(planned.reduce((sum, line) => sum + line.qty, 0)).toBe(10);
+
+    // Each stop draws through the existing gates (scan-verified, FEFO pool)
+    // and commits — the pick command needed no structural change. The last
+    // stop is a partial draw (10 planned of 12 stocked), so the assertion is
+    // per-bin against the pre-pick balance.
+    const beforeByBin = new Map(
+      await Promise.all(planned.map(async (line) => [line.binId!, await onHand(nonBinSkuId, line.binId!)] as const)),
+    );
+    for (const line of planned) {
+      const res = await pick(bodyFor(line)).expect(201);
+      expect(res.body.pick.lineStatus).toBe('picked');
+      expect(await onHand(nonBinSkuId, line.binId!)).toBe(beforeByBin.get(line.binId!)! - line.qty);
+    }
+    expect(await lineStatus(planned[0]!.id)).toBe('picked');
+  });
 });
