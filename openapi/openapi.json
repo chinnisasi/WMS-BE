@@ -8889,6 +8889,114 @@
           "compliance"
         ]
       }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/cold-chain/orders/{orderId}": {
+      "get": {
+        "description": "READ-ONLY reconstruction from `ledger_events` alone — never from projections, never from the temperature_excursions rows. The join chain: the dispatch events whose reference doc names the order → the pick events with the same orderId → those picks’ batch/serial scopes → each scope’s complete chain (other orders’ picks included — the batch’s history is the batch’s history). STORAGE-CLASS CAVEAT: every chain event is annotated with the bins’ CURRENT storage class. The report never fabricates historical classes it cannot prove; the annotation is honest because the class-edit guards refuse a change that would strand stock (temperature classes may only have moved colder for bins that held stock). Excursion correlation is dwell-window based, from the ledger alone: an excursion.recorded event attaches to a scope when its skuId matches the line, its reference doc’s binId is a bin on that scope’s chain, and its business time falls inside that bin’s dwell window — [first arrival, last departure], open-ended when the scope was still there at pick time. An excursion recorded before arrival or after departure does not appear.",
+        "operationId": "ComplianceController_getOrderColdChainTrace",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "description": "The warehouse the order dispatched from",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The reconstructed trace: order facts, the bins dictionary, and per line the scopes and their dwell-window excursions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ColdChainTraceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed warehouseId or orderId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse or the order does not exist in this tenant/warehouse — an order in another warehouse of the same tenant is as invisible here as a missing one (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order has no dispatch events in the ledger — a cold-chain trace is defined only for dispatched orders (order-not-dispatched)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Reconstructs a dispatched order’s cold-chain trace (FR-45) from the ledger alone — per order line, every picked scope’s complete batch/serial ledger chain annotated with each bin’s current storage class, plus the excursions whose reading fell inside a scope dwell window at a chain bin",
+        "tags": [
+          "compliance"
+        ]
+      }
     }
   },
   "info": {
@@ -15495,6 +15603,253 @@
         },
         "required": [
           "items"
+        ]
+      },
+      "ColdChainOrderDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "description": "The order's current status ('dispatched' on a traced order)"
+          },
+          "carrierName": {
+            "type": "string",
+            "nullable": true,
+            "description": "The carrier the dispatch recorded; null when none was named"
+          },
+          "trackingNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "The tracking reference the dispatch recorded; null when none was given"
+          },
+          "dispatchedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — the dispatch business time (the dispatch event occurredAt)"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "carrierName",
+          "trackingNumber",
+          "dispatchedAt"
+        ]
+      },
+      "ColdChainBinDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "The bin code"
+          },
+          "storageClass": {
+            "type": "string",
+            "description": "The bin's CURRENT storage class (12-1 guard makes annotating it honest)"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "storageClass"
+        ]
+      },
+      "ColdChainEventDto": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "number",
+            "description": "The gap-free per-warehouse ledger sequence number"
+          },
+          "type": {
+            "type": "string",
+            "description": "The ledger event type (grn.received, putaway.placed, pick.picked, qc.held, …)"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantityDelta": {
+            "type": "number",
+            "description": "Signed quantity in base units (raw row is signed milli-units)"
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "fromBinStorageClass": {
+            "type": "string",
+            "nullable": true,
+            "description": "The from-bin’s CURRENT storage class; null when the bin row is gone"
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "toBinStorageClass": {
+            "type": "string",
+            "nullable": true,
+            "description": "The to-bin’s CURRENT storage class; null when the bin row is gone"
+          },
+          "batchRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "serialRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — the event’s business time"
+          },
+          "referenceDoc": {
+            "type": "object",
+            "description": "The typed reference doc verbatim — the ledger context (UX-DR30)"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "skuId",
+          "quantityDelta",
+          "fromBinId",
+          "fromBinStorageClass",
+          "toBinId",
+          "toBinStorageClass",
+          "batchRef",
+          "serialRef",
+          "occurredAt",
+          "referenceDoc"
+        ]
+      },
+      "ColdChainScopeDto": {
+        "type": "object",
+        "properties": {
+          "batchRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The batch the scope picked (null for a serial scope)"
+          },
+          "serialRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The serial the scope picked (null for a batch scope)"
+          },
+          "chain": {
+            "description": "The scope’s COMPLETE batch/serial ledger history, chronological by seq",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColdChainEventDto"
+            }
+          }
+        },
+        "required": [
+          "batchRef",
+          "serialRef",
+          "chain"
+        ]
+      },
+      "ColdChainExcursionDto": {
+        "type": "object",
+        "properties": {
+          "excursionId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The temperature_excursions row the ledger event names"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The bin the reading was recorded against (a chain bin, inside the dwell window)"
+          },
+          "readingC": {
+            "type": "number",
+            "description": "The operator-captured reading, °C"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — when the reading was observed"
+          }
+        },
+        "required": [
+          "excursionId",
+          "binId",
+          "readingC",
+          "occurredAt"
+        ]
+      },
+      "ColdChainLineDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "dispatchedQty": {
+            "type": "number",
+            "description": "Units shipped for this line (base units — the dispatch reference doc)"
+          },
+          "scopes": {
+            "description": "One chain per picked batch/serial scope",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColdChainScopeDto"
+            }
+          },
+          "excursions": {
+            "description": "Excursions whose reading fell inside a scope dwell window at a chain bin; empty when the chain is clean",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColdChainExcursionDto"
+            }
+          }
+        },
+        "required": [
+          "orderLineId",
+          "skuId",
+          "dispatchedQty",
+          "scopes",
+          "excursions"
+        ]
+      },
+      "ColdChainTraceResponse": {
+        "type": "object",
+        "properties": {
+          "order": {
+            "$ref": "#/components/schemas/ColdChainOrderDto"
+          },
+          "bins": {
+            "description": "Every bin on any chain event, by id → code + storage class",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColdChainBinDto"
+            }
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColdChainLineDto"
+            }
+          }
+        },
+        "required": [
+          "order",
+          "bins",
+          "lines"
         ]
       }
     }
