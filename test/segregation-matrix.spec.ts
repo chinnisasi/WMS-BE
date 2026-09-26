@@ -34,6 +34,7 @@ const KEY_HEADER = 'Idempotency-Key';
  * |---|---|
  * | 200 with the exact 7-class vocabulary + the exact 11-pair set | `answers the matrix` |
  * | every unordered pair cross-checked against `hazardClassesCompatible` | `agrees with the predicate over all 28 pairs` |
+ * | member session (operator) → 200, the read is open to any member | `a member session reads the same matrix` |
  * | foreign session → 403 `permission-denied` | `a foreign session is refused` |
  * | unauthenticated → 401 | `an unauthenticated call is refused` |
  * | OpenAPI path | `the OpenAPI document exposes` |
@@ -156,6 +157,38 @@ describe('segregation matrix (e2e, story 12-7)', () => {
         expect(incompatible.has(sortedKey(a, b))).toBe(!hazardClassesCompatible(a, b));
       }
     }
+  });
+
+  test('a member session reads the same matrix (200 — the read is open to any member)', async () => {
+    // The route's load-bearing claim is UNGATED: any member — an operator,
+    // not just the owner — sees the card. A future capability check landing
+    // here would hide the matrix from operators silently; this pin fails
+    // first. The vocabulary must equal the owner's read exactly.
+    const email = `operator-${ulid().toLowerCase()}@example.com`;
+    const invited = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/users`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ email, role: 'operator' })
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/accept-invite`)
+      .set(KEY_HEADER, ulid())
+      .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
+      .expect(200);
+    const memberToken = await request(app.getHttpServer())
+      .post(`${API}/sign-in`)
+      .send({ email, password: 'correct-horse-battery' })
+      .expect(200)
+      .then((res) => res.body.accessToken as string);
+
+    const res = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/segregation-matrix`)
+      .set('Authorization', `Bearer ${memberToken}`)
+      .expect(200)
+      .expect('Content-Type', /json/);
+    expect(res.body.classes).toEqual([...HAZARD_CLASSES]);
+    expect(res.body.incompatible).toEqual(enumerateIncompatiblePairs());
   });
 
   test('a foreign session is refused (403 permission-denied)', async () => {
