@@ -95,6 +95,44 @@ export function hazardClassesCompatible(
 }
 
 /**
+ * One unordered incompatible pair as the segregation-matrix read (story
+ * 12-7) carries it — `a` before `b` under the SAME sorted-key convention
+ * `INCOMPATIBLE_PAIRS` is encoded in, so the pair is deterministic in one
+ * direction and directly comparable to the set's own spelling.
+ */
+export interface SegregationPair {
+  readonly a: HazardClass;
+  readonly b: HazardClass;
+}
+
+/**
+ * The FULLY EXPANDED incompatible unordered-pair set over `HAZARD_CLASSES`:
+ * the explosive universal rule enumerated as pairs (including
+ * `explosive|explosive` — an explosive segregates from every classed SKU,
+ * its own class included) plus the explicit `INCOMPATIBLE_PAIRS`. Derived by
+ * asking the predicate itself over all 28 unordered pairs — not a second
+ * list — so widening the vocabulary or the pair set in THIS file flows to
+ * the matrix read with nothing to drift. Null enumerates no pairs (it is
+ * not a class; the null-compatibility rule lives in the predicate alone).
+ * Today this is 11 pairs: 7 explosive (incl. self) + the 4 explicit ones.
+ */
+export function enumerateIncompatiblePairs(): SegregationPair[] {
+  const pairs: SegregationPair[] = [];
+  for (let i = 0; i < HAZARD_CLASSES.length; i++) {
+    for (let j = i; j < HAZARD_CLASSES.length; j++) {
+      const a = HAZARD_CLASSES[i]!;
+      const b = HAZARD_CLASSES[j]!;
+      if (!hazardClassesCompatible(a, b)) {
+        // Sorted keys — the set's own convention above.
+        const [x, y] = a < b ? [a, b] : [b, a];
+        pairs.push({ a: x, b: y });
+      }
+    }
+  }
+  return pairs;
+}
+
+/**
  * The shared vocabulary validator — the `assertStorageClass` shape
  * (`src/shared/primitives/storage-class.ts`): iterates the fields, skips
  * `undefined`/`null` (PATCH semantics — the column is nullable, so null is

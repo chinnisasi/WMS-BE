@@ -2095,6 +2095,64 @@
         ]
       }
     },
+    "/tenants/{tenantId}/catalog/segregation-matrix": {
+      "get": {
+        "operationId": "CatalogController_getSegregationMatrix",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SegregationMatrixResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Returns the hazard segregation matrix — the vocabulary plus every incompatible unordered pair, fully expanded from the server's own predicate",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
     "/tenants/{tenantId}/catalog/products": {
       "post": {
         "operationId": "CatalogController_createProduct",
@@ -10468,6 +10526,81 @@
         "required": [
           "items",
           "nextCursor"
+        ]
+      },
+      "SegregationPairResponse": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "string",
+            "enum": [
+              "explosive",
+              "oxidizer",
+              "flammable",
+              "corrosive-acid",
+              "corrosive-base",
+              "toxic",
+              "gas"
+            ],
+            "example": "oxidizer"
+          },
+          "b": {
+            "type": "string",
+            "enum": [
+              "explosive",
+              "oxidizer",
+              "flammable",
+              "corrosive-acid",
+              "corrosive-base",
+              "toxic",
+              "gas"
+            ],
+            "example": "flammable"
+          }
+        },
+        "required": [
+          "a",
+          "b"
+        ]
+      },
+      "SegregationMatrixResponse": {
+        "type": "object",
+        "properties": {
+          "classes": {
+            "type": "array",
+            "example": [
+              "explosive",
+              "oxidizer",
+              "flammable",
+              "corrosive-acid",
+              "corrosive-base",
+              "toxic",
+              "gas"
+            ],
+            "items": {
+              "type": "string",
+              "enum": [
+                "explosive",
+                "oxidizer",
+                "flammable",
+                "corrosive-acid",
+                "corrosive-base",
+                "toxic",
+                "gas"
+              ]
+            }
+          },
+          "incompatible": {
+            "description": "Every incompatible unordered pair, fully expanded (11 today: the 7 explosive pairs incl. self + the 4 explicit ones)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SegregationPairResponse"
+            }
+          }
+        },
+        "required": [
+          "classes",
+          "incompatible"
         ]
       },
       "CreateProductDto": {
