@@ -8,8 +8,10 @@ import type { TenantSession } from '../modules/tenancy/jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ExcursionFacade } from '../modules/compliance/excursion.facade';
+import { ColdChainFacade } from '../modules/compliance/cold-chain.facade';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
+  ColdChainTraceResponse,
   ExcursionListQuery,
   ExcursionListResponse,
   ExcursionResponse,
@@ -26,13 +28,15 @@ const IDEMPOTENCY_HEADER = [
 ];
 
 /**
- * The compliance HTTP surface (Story 12-5, FR-44): the temperature-excursion
- * record/list/resolve routes. Every mutation goes through
- * `ExcursionFacade`, whose commands re-evaluate the caller's role against the
- * DB at entry (the token is transport, never authority) — recording is
- * `excursion.record` (Owner + Ops Manager + Operator), resolving is the
- * existing `review.decide`. The quarantine itself rides the inbound module's
- * QC-hold semantics inside the command; this controller holds no rules.
+ * The compliance HTTP surface (Stories 12-5, 12-6): the temperature-excursion
+ * record/list/resolve routes and the FR-45 cold-chain read. Every mutation
+ * goes through `ExcursionFacade`, whose commands re-evaluate the caller's
+ * role against the DB at entry (the token is transport, never authority) —
+ * recording is `excursion.record` (Owner + Ops Manager + Operator), resolving
+ * is the existing `review.decide`. The quarantine itself rides the inbound
+ * module's QC-hold semantics inside the command. The cold-chain trace is a
+ * read (`ColdChainFacade`) — reads are never capability-gated; this
+ * controller holds no rules.
  */
 @ApiTags('compliance')
 @ApiExtraModels(ProblemDetailsDto)
@@ -40,6 +44,7 @@ const IDEMPOTENCY_HEADER = [
 export class ComplianceController {
   constructor(
     @Inject(ExcursionFacade) private readonly excursions: ExcursionFacade,
+    @Inject(ColdChainFacade) private readonly coldChain: ColdChainFacade,
   ) {}
 
   @Post(':tenantId/excursions')
@@ -160,10 +165,45 @@ export class ComplianceController {
       nextCursor: page.nextCursor,
     };
   }
+
+  @Get(':tenantId/warehouses/:warehouseId/cold-chain/orders/:orderId')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Reconstructs a dispatched order’s cold-chain trace (FR-45) from the ledger alone — per order line, every picked scope’s complete batch/serial ledger chain annotated with each bin’s current storage class, plus the excursions whose reading fell inside a scope dwell window at a chain bin',
+    description:
+      'READ-ONLY reconstruction from `ledger_events` alone — never from projections, never from the temperature_excursions rows. The join chain: the dispatch events whose reference doc names the order → the pick events with the same orderId → those picks’ batch/serial scopes → each scope’s complete chain (other orders’ picks included — the batch’s history is the batch’s history). ' +
+      'STORAGE-CLASS CAVEAT: every chain event is annotated with the bins’ CURRENT storage class. The report never fabricates historical classes it cannot prove; the annotation is honest because the class-edit guards refuse a change that would strand stock (temperature classes may only have moved colder for bins that held stock). ' +
+      'Excursion correlation is dwell-window based, from the ledger alone: an excursion.recorded event attaches to a scope when its skuId matches the line, its reference doc’s binId is a bin on that scope’s chain, and its business time falls inside that bin’s dwell window — [first arrival, last departure], open-ended when the scope was still there at pick time. An excursion recorded before arrival or after departure does not appear.',
+  })
+  @ApiOkResponse({
+    type: ColdChainTraceResponse,
+    description: 'The reconstructed trace: order facts, the bins dictionary, and per line the scopes and their dwell-window excursions',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed warehouseId or orderId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse or the order does not exist in this tenant/warehouse — an order in another warehouse of the same tenant is as invisible here as a missing one (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order has no dispatch events in the ledger — a cold-chain trace is defined only for dispatched orders (order-not-dispatched)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid', description: 'The warehouse the order dispatched from' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async getOrderColdChainTrace(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('orderId') orderId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ColdChainTraceResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    assertUuidParam(orderId, 'orderId');
+    return this.coldChain.getOrderColdChainTrace(tenantId, warehouseId, orderId);
+  }
 }
 
-/** Excursion uuid path/query params fail 400 (not a 500 from the `::uuid` cast). */
-function assertUuidParam(value: string, name: 'excursionId' | 'warehouseId'): void {
+/** Path/query uuid params fail 400 (not a 500 from the `::uuid` cast). */
+function assertUuidParam(value: string, name: 'excursionId' | 'warehouseId' | 'orderId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',
