@@ -921,6 +921,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
         batchTracked: boolean;
         variantValues: Record<string, string> | null;
         axes: string[] | null;
+        storageClass: string;
       }[];
       openPurchaseOrders: { id: string; code: string; lines: { openQty: number }[] }[];
     };
@@ -930,6 +931,18 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     const batchSku = snapshot.skus.find((sku) => sku.id === batchSkuId)!;
     expect(batchSku.batchTracked).toBe(true);
     expect(typeof batchSku.barcode).toBe('string');
+
+    // Story 12.8 (UX-DR29): the SKU's storage class rides the snapshot arm.
+    // The CSV import sets no class, so every seeded SKU reads the column's
+    // `ambient` default (0035_storage_class.sql) — the device's conformance
+    // mirror needs the field present, never absent.
+    expect(snapshot.skus.map((sku) => [sku.code, sku.storageClass])).toEqual(
+      expect.arrayContaining([
+        ['RCV-A', 'ambient'],
+        ['RCV-B', 'ambient'],
+        ['RCV-C', 'ambient'],
+      ]),
+    );
 
     // Story 11.7: the variant fields ride the SKU arm — the attached product's
     // axes in declaration order and the SKU's values on them, both null on an

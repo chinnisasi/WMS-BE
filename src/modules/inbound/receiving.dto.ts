@@ -4,6 +4,7 @@ import {
   QUANTITY_DECIMALS,
   QUANTITY_FIELD_DESCRIPTION,
 } from '../../shared/primitives/quantity';
+import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
 import { UOMS } from '../catalog/uom';
 import {
   ArrayMaxSize,
@@ -500,6 +501,14 @@ export class CatalogSnapshotSkuDto {
       'Story 11.7: the attached product\'s declared variant axes, in declaration order — the order a variant label is read in. Null when the SKU is unattached.',
   })
   axes!: string[] | null;
+
+  @ApiProperty({
+    enum: [...STORAGE_CLASSES],
+    example: 'ambient',
+    description:
+      'Story 12.8 (UX-DR29): the SKU\'s storage class (defaults to `ambient`). It rides the snapshot beside the bin arm\'s class so the device\'s offline conformance mirror can refuse a non-conforming placement or draw in the Rejected banner — a refusal only the server knew about would queue in a dead zone and come back hours later as a rejection the operator can no longer act on.',
+  })
+  storageClass!: string;
 }
 
 /** One open PO of the device snapshot (header + line quantities). */

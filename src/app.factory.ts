@@ -39,6 +39,10 @@ export async function createApp(withListener = false): Promise<INestApplication>
     // Bearer session scheme — the warehouse endpoints' `security` entries
     // reference this (Swagger UI can then exercise them with a sign-in token).
     .addBearerAuth()
+    // Story 12.8 (UX-DR30): the device-token scheme, named because the
+    // excursion record route accepts EITHER family — its `security` entry
+    // lists both, and a second anonymous scheme would collide with the first.
+    .addBearerAuth({ type: 'http', scheme: 'bearer', bearerFormat: 'JWT' }, 'device')
     .build();
   const document = SwaggerModule.createDocument(app, config);
 

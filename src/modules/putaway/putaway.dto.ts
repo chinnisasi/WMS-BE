@@ -1,5 +1,6 @@
 import { Type } from 'class-transformer';
 import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
+import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
 import { ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, IsUUID, Length, Max, Min } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { PUTAWAY_MISMATCH_REASON_CODES as PUTAWAY_MISMATCH_REASON_ENUM } from './mismatch-reason';
@@ -263,4 +264,11 @@ export class PutawayBinDto {
 
   @ApiProperty({ description: 'System bins (Receiving/QC-hold) are never placement targets' })
   systemOwned!: boolean;
+
+  @ApiProperty({
+    enum: [...STORAGE_CLASSES],
+    description:
+      'Story 12.8 (UX-DR29): the bin\'s storage class (defaults to `ambient`). It rides the snapshot beside the SKU arm\'s class (the catalog snapshot) so the device\'s offline conformance mirror can refuse a non-conforming placement in the Rejected banner — before anything queues.',
+  })
+  storageClass!: string;
 }

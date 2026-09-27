@@ -8593,6 +8593,7 @@
     },
     "/tenants/{tenantId}/excursions": {
       "post": {
+        "description": "Accepts EITHER session family on the one route (Story 12-8, UX-DR30): a web session (the 12-5 surface, unchanged) or a device badge-in session (the floor's arm). The family is chosen by the `device_id` claim's presence. The device arm re-resolves the device row inside the command's tenant transaction — a revoked or unbadged device is refused there (403 device-revoked / 401 unauthenticated), so revocation bites.",
         "operationId": "ComplianceController_recordExcursion",
         "parameters": [
           {
@@ -8650,7 +8651,7 @@
             }
           },
           "401": {
-            "description": "Missing or invalid session token",
+            "description": "Missing or invalid session token of either family (unauthenticated), or a device token without a badge-in session — the device arm is badge-in required (unauthenticated)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8660,7 +8661,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied), the caller lacks excursion.record (role-denied), or the bin is secure/cage-class and the caller — an operator recording from the floor — lacks secure.move (role-denied from the hold core; held units leave the origin bin, FR-42)",
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks excursion.record (role-denied), an unknown or revoked device on the device arm (device-revoked), or the bin is secure/cage-class and the caller — an operator recording from the floor — lacks secure.move (role-denied from the hold core; held units leave the origin bin, FR-42)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8701,6 +8702,9 @@
           }
         },
         "security": [
+          {
+            "device": []
+          },
           {
             "bearer": []
           }
@@ -9080,6 +9084,11 @@
   "components": {
     "securitySchemes": {
       "bearer": {
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "type": "http"
+      },
+      "device": {
         "scheme": "bearer",
         "bearerFormat": "JWT",
         "type": "http"
@@ -14381,6 +14390,19 @@
             "items": {
               "type": "string"
             }
+          },
+          "storageClass": {
+            "type": "string",
+            "enum": [
+              "ambient",
+              "chilled",
+              "frozen",
+              "controlled",
+              "hazardous",
+              "secure"
+            ],
+            "example": "ambient",
+            "description": "Story 12.8 (UX-DR29): the SKU's storage class (defaults to `ambient`). It rides the snapshot beside the bin arm's class so the device's offline conformance mirror can refuse a non-conforming placement or draw in the Rejected banner — a refusal only the server knew about would queue in a dead zone and come back hours later as a rejection the operator can no longer act on."
           }
         },
         "required": [
@@ -14394,7 +14416,8 @@
           "serialTracked",
           "catchWeightTracked",
           "variantValues",
-          "axes"
+          "axes",
+          "storageClass"
         ]
       },
       "CatalogSnapshotPoDto": {
@@ -14463,6 +14486,18 @@
           "systemOwned": {
             "type": "boolean",
             "description": "System bins (Receiving/QC-hold) are never placement targets"
+          },
+          "storageClass": {
+            "type": "string",
+            "enum": [
+              "ambient",
+              "chilled",
+              "frozen",
+              "controlled",
+              "hazardous",
+              "secure"
+            ],
+            "description": "Story 12.8 (UX-DR29): the bin's storage class (defaults to `ambient`). It rides the snapshot beside the SKU arm's class (the catalog snapshot) so the device's offline conformance mirror can refuse a non-conforming placement in the Rejected banner — before anything queues."
           }
         },
         "required": [
@@ -14473,7 +14508,8 @@
           "type",
           "capacity",
           "blocked",
-          "systemOwned"
+          "systemOwned",
+          "storageClass"
         ]
       },
       "SuggestedBinDto": {

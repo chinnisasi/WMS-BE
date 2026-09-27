@@ -463,6 +463,15 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
 
     // The device snapshot (additive fields): every bin incl. blocked/system
     // ones, and the derived tasks with the nested suggestion.
+    // Story 12.8 (UX-DR29): the bin arm carries each bin's storage class. A-05
+    // is empty here, so its class may move colder freely (the 12-3 edit
+    // guard) — the snapshot then reads the EDITED class, not the default.
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${binA05}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'chilled' })
+      .expect(200);
     const snapshot = await request(app.getHttpServer())
       .get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`)
       .set('Authorization', `Bearer ${operatorToken}`)
@@ -473,6 +482,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       capacity: number;
       blocked: boolean;
       systemOwned: boolean;
+      storageClass: string;
     }[];
     const putawayTasks = snapshot.body.putawayTasks as typeof tasks;
     // `capacity` is asserted because the device uses it for the pre-queue bin
@@ -484,8 +494,10 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       capacity: 100,
       blocked: false,
       systemOwned: false,
+      storageClass: 'ambient',
     });
     expect(bins.find((bin) => bin.code === 'RECEIVING')).toMatchObject({ systemOwned: true, blocked: false });
+    expect(bins.find((bin) => bin.id === binA05)!.storageClass).toBe('chilled');
     expect(putawayTasks.find((task) => task.grnLineId === line.id)).toMatchObject({
       qty: 40,
       suggestedBin: { binId: binA01, binCode: 'A-01' },

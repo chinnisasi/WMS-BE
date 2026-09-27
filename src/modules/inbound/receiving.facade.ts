@@ -84,6 +84,14 @@ export interface CatalogSnapshot {
     readonly variantValues: Record<string, string> | null;
     /** Story 11.7: the attached product's declared axes, in declaration order. Null when unattached. */
     readonly axes: string[] | null;
+    /**
+     * Story 12.8 (UX-DR29): the SKU's storage class, null when unset — the
+     * device's offline conformance mirror. Fourth mirror of the `SkuSummary`
+     * arm (the 10.2/10.3/11.7 precedent): keep in lockstep or this mirror
+     * ships stale. Never null on the wire — the column defaults to `ambient`
+     * (0035_storage_class.sql).
+     */
+    readonly storageClass: string;
   }[];
   readonly openPurchaseOrders: readonly {
     readonly id: string;
@@ -103,6 +111,8 @@ export interface CatalogSnapshot {
     readonly capacity: number;
     readonly blocked: boolean;
     readonly systemOwned: boolean;
+    /** Story 12.8 (UX-DR29): the bin's storage class — the device's offline conformance mirror. Never null on the wire (the column defaults to `ambient`). */
+    readonly storageClass: string;
   }[];
   /** The derived putaway tasks (suggestions baked in are advisory — the server re-derives and re-gates at placement). */
   readonly putawayTasks: readonly {

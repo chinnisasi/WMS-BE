@@ -90,6 +90,15 @@ export interface PutawayBinSummary {
   readonly capacity: number;
   readonly blocked: boolean;
   readonly systemOwned: boolean;
+  /**
+   * Story 12.8 (UX-DR29): the bin's storage class — the other half of the
+   * device's offline conformance mirror. It rides the snapshot beside the
+   * SKU arm's class (catalog facade) so the device can refuse a
+   * non-conforming placement or draw in its own Rejected banner, offline,
+   * in under 500 ms. Never null on the wire: the column defaults to
+   * `ambient` (0035_storage_class.sql), so every bin reads a class.
+   */
+  readonly storageClass: string;
 }
 
 /**
@@ -398,6 +407,10 @@ export class PutawayFacade {
         capacity: bins.capacity,
         blocked: bins.blocked,
         systemOwned: bins.systemOwned,
+        // Story 12.8 (UX-DR29): the class rides beside the type — the
+        // device's offline conformance mirror reads both arms (bin here, SKU
+        // on the catalog facade) beside the fields it already gates on.
+        storageClass: bins.storageClass,
       })
       .from(bins)
       .innerJoin(zones, eq(zones.id, bins.zoneId))

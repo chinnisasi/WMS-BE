@@ -4,6 +4,7 @@ import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
 import { TenantSessionGuard, CurrentSession } from '../modules/tenancy/tenant-session.guard';
+import { AnySessionGuard, CurrentAnySession, type AnySession } from '../modules/tenancy/any-session.guard';
 import type { TenantSession } from '../modules/tenancy/jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
@@ -49,11 +50,15 @@ export class ComplianceController {
 
   @Post(':tenantId/excursions')
   @HttpCode(HttpStatus.CREATED)
-  @UseGuards(TenantSessionGuard)
+  @UseGuards(AnySessionGuard)
   @ApiBearerAuth()
+  @ApiBearerAuth('device')
   @ApiOperation({
     summary:
       'excursion record — records a temperature excursion against a bin (excursion.record): quarantines every affected (sku, bin) scope through ordinary QC holds and appends one zero-quantity excursion.recorded ledger event per scope',
+    description:
+      'Accepts EITHER session family on the one route (Story 12-8, UX-DR30): a web session (the 12-5 surface, unchanged) or a device badge-in session (the floor\'s arm). The family is chosen by the `device_id` claim\'s presence. ' +
+      'The device arm re-resolves the device row inside the command\'s tenant transaction — a revoked or unbadged device is refused there (403 device-revoked / 401 unauthenticated), so revocation bites.',
   })
   @ApiBody({ type: RecordExcursionDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
@@ -63,8 +68,8 @@ export class ComplianceController {
     description: 'Excursion recorded: the open row with the hold ids it created (the idempotency snapshot)',
   })
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, an out-of-bounds readingC, an empty or system-owned bin, a bin with no on-hand stock, or serial-tracked / catch-weight stock in the bin — the whole excursion is refused naming the offenders (validation-failed)') })
-  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
-  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks excursion.record (role-denied), or the bin is secure/cage-class and the caller — an operator recording from the floor — lacks secure.move (role-denied from the hold core; held units leave the origin bin, FR-42)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token of either family (unauthenticated), or a device token without a badge-in session — the device arm is badge-in required (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks excursion.record (role-denied), an unknown or revoked device on the device arm (device-revoked), or the bin is secure/cage-class and the caller — an operator recording from the floor — lacks secure.move (role-denied from the hold core; held units leave the origin bin, FR-42)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or bin does not exist in this tenant (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
@@ -72,15 +77,31 @@ export class ComplianceController {
   async recordExcursion(
     @Param('tenantId') tenantId: string,
     @IdempotencyKey() idempotencyKey: string | undefined,
-    @CurrentSession() session: TenantSession,
+    @CurrentAnySession() session: AnySession,
     @Body() dto: RecordExcursionDto,
   ): Promise<ExcursionResponse> {
-    assertOwnTenantToken(session.tenantId, tenantId);
+    assertOwnTenantToken(session.session.tenantId, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
+    // The device arm is badge-in required: a bare enrollment credential carries
+    // no operator, and `actorUserId: string` cannot take one (the badgeInRequired
+    // pattern every device route answers with). The web path sends
+    // `deviceId: null` and the command skips its device arm.
+    let deviceId: string | null = null;
+    let actorUserId: string;
+    if (session.family === 'device') {
+      if (session.session.userId === null) {
+        throw badgeInRequired();
+      }
+      deviceId = session.session.deviceId;
+      actorUserId = session.session.userId;
+    } else {
+      actorUserId = session.session.userId;
+    }
     const snapshot = await this.excursions.recordExcursion(
       {
         tenantId,
-        actorUserId: session.userId,
+        actorUserId,
+        deviceId,
         warehouseId: dto.warehouseId,
         binId: dto.binId,
         readingC: dto.readingC,
@@ -223,4 +244,13 @@ function assertOwnTenantToken(tokenTenantId: string, tenantId: string): void {
       'The session token tenant does not own this path.',
     );
   }
+}
+
+function badgeInRequired(): ProblemException {
+  return new ProblemException(
+    'unauthenticated',
+    401,
+    'Badge-in required',
+    'This endpoint requires an operator badge-in session.',
+  );
 }
