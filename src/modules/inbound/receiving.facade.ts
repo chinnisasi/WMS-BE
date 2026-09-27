@@ -85,11 +85,11 @@ export interface CatalogSnapshot {
     /** Story 11.7: the attached product's declared axes, in declaration order. Null when unattached. */
     readonly axes: string[] | null;
     /**
-     * Story 12.8 (UX-DR29): the SKU's storage class, null when unset — the
-     * device's offline conformance mirror. Fourth mirror of the `SkuSummary`
-     * arm (the 10.2/10.3/11.7 precedent): keep in lockstep or this mirror
-     * ships stale. Never null on the wire — the column defaults to `ambient`
-     * (0035_storage_class.sql).
+     * Story 12.8 (UX-DR29): the SKU's storage class — the device's offline
+     * conformance mirror. Fourth mirror of the `SkuSummary` arm (the
+     * 10.2/10.3/11.7 precedent): keep in lockstep or this mirror ships
+     * stale. Never null on the wire — the column is NOT NULL DEFAULT
+     * `ambient` (0035_storage_class.sql).
      */
     readonly storageClass: string;
   }[];

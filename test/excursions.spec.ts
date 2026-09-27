@@ -320,14 +320,21 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
     };
   }
 
-  /** Badge the operator in on the device: the operator-bound session token. */
-  async function badgeIn(deviceToken: string): Promise<string> {
+  /**
+   * Badge the operator in on the device: the operator-bound session token
+   * AND the operator's id (patch round 1, P6/P7 — the recordedBy assertion
+   * and the web-visibility read both need it).
+   */
+  async function badgeIn(deviceToken: string): Promise<{ accessToken: string; operatorId: string }> {
     const res = await request(app.getHttpServer())
       .post(`${API}/${tenantId}/devices/badge-in`)
       .set('Authorization', `Bearer ${deviceToken}`)
       .send({ operatorEmail, pin: '1357' })
       .expect(200);
-    return res.body.accessToken as string;
+    return {
+      accessToken: res.body.accessToken as string,
+      operatorId: (res.body.operator as { id: string }).id,
+    };
   }
 
   async function revokeDevice(deviceId: string): Promise<void> {
@@ -1013,11 +1020,32 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
 
     const res = await recordExcursion(
       { warehouseId, binId: binDevice, readingC: 9.5, note: 'recorded from the floor device' },
-      badged,
+      badged.accessToken,
     ).expect(201);
     const excursion = res.body.excursion as Record<string, unknown>;
-    expect(excursion).toMatchObject({ status: 'open', binId: binDevice, readingC: 9.5 });
+    // Patch round 1 (P6): the title claims recordedBy the badged operator —
+    // the body now CHECKS it (the badge-in response's operator id).
+    expect(excursion).toMatchObject({
+      status: 'open',
+      binId: binDevice,
+      readingC: 9.5,
+      recordedBy: badged.operatorId,
+    });
     expect((excursion.holdIds as string[]).length).toBe(1);
+
+    // Patch round 1 (P7): the device-recorded excursion is visible through
+    // the WEB read — one listExcursions read: status open, the excursion
+    // present, its holdIds intact. The floor record and the review queue are
+    // one fact, not two.
+    const webRead = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/excursions?status=open`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    const webItems = webRead.body.items as { id: string; holdIds: string[]; status: string }[];
+    const webMatch = webItems.find((item) => item.id === excursion.id);
+    expect(webMatch).toBeDefined();
+    expect(webMatch!.status).toBe('open');
+    expect(webMatch!.holdIds).toEqual(excursion.holdIds);
 
     // Same ledger shape as the web arm: the zero-delta per-scope events.
     const events = await excursionLedgerRows(excursion.id as string);
@@ -1057,7 +1085,7 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
     // closed: the device row is no longer `active`.
     const denied = await recordExcursion(
       { warehouseId, binId: binRevoked, readingC: 6 },
-      badged,
+      badged.accessToken,
     ).expect(403);
     expect(denied.body.code).toBe('device-revoked');
 
