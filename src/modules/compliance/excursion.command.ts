@@ -5,6 +5,7 @@ import type { Database } from '../../shared/db/db';
 import {
   auditEvents,
   bins,
+  devices,
   idempotencyKeys,
   skus,
   temperatureExcursions,
@@ -15,6 +16,7 @@ import { assertUtcIso, canonicalInstant, nowIso } from '../../shared/primitives/
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
+import { deviceRevoked } from '../tenancy/enrollment.command';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { assertPermission } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -30,6 +32,13 @@ export interface RecordExcursionCommand {
   readonly tenantId: string;
   /** The session user — authority is re-read from the DB at command entry. */
   readonly actorUserId: string;
+  /**
+   * Story 12.8 (UX-DR30): the recording device's id on the device arm, null on
+   * the web path. NOT part of the payload hash — the pre-12.8 command's
+   * fingerprint is unchanged, so keys written by a web session keep replaying;
+   * the id decides only whether the in-tx device re-authorization below runs.
+   */
+  readonly deviceId: string | null;
   readonly warehouseId: string;
   /** The bin the reading was taken against (the holds' origin bin). */
   readonly binId: string;
@@ -180,6 +189,24 @@ export class ExcursionCommand {
     });
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      // ── device re-authorization (Story 12.8, the putaway/grn.submit mirror)
+      // — fail-closed, only on the device arm. The guard deliberately cannot
+      // do this (device-session.guard.ts: resolution happens in the command's
+      // tenant transaction), and this is what makes revocation bite on the
+      // floor's excursion path.
+      if (command.deviceId !== null) {
+        const deviceRows = await tx
+          .select()
+          .from(devices)
+          .where(and(eq(devices.id, command.deviceId), eq(devices.tenantId, command.tenantId)))
+          .for('update')
+          .limit(1);
+        const device = deviceRows[0];
+        if (!device || device.status !== 'active' || device.pinHash === null) {
+          throw deviceRevoked();
+        }
+      }
+
       // ── authority at command entry (the deliberate fail-closed order) ──
       // The role stays in scope: the hold core's 12-3 secure-bin gate
       // re-uses it below, on the locked origin bin row.

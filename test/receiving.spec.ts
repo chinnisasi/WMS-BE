@@ -905,6 +905,17 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
   });
 
   it('the device catalog snapshot: badge-in session required — SKUs with barcodes + open PO lines; a closed PO is absent; the bare credential is 401', async () => {
+    // Story 12.8 (patch round 1, P8): one seeded SKU is made NON-ambient
+    // before the read, so the SKU arm's class is pinned BY VALUE, not just
+    // by the `ambient` default. RCV-B's on-hand stock sits only in the
+    // RECEIVING system bin at this point (the guard excludes system bins),
+    // so the class edit passes its stock-conformance guard.
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${plainSkuId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ storageClass: 'chilled' })
+      .expect(200);
     const device = await enrollDevice('Handheld 3');
     const badged = await badgeInOperator(device.deviceToken);
     const res = await request(app.getHttpServer())
@@ -921,6 +932,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
         batchTracked: boolean;
         variantValues: Record<string, string> | null;
         axes: string[] | null;
+        storageClass: string;
       }[];
       openPurchaseOrders: { id: string; code: string; lines: { openQty: number }[] }[];
     };
@@ -930,6 +942,18 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     const batchSku = snapshot.skus.find((sku) => sku.id === batchSkuId)!;
     expect(batchSku.batchTracked).toBe(true);
     expect(typeof batchSku.barcode).toBe('string');
+
+    // Story 12.8 (UX-DR29): the SKU's storage class rides the snapshot arm —
+    // pinned BY VALUE for all three (patch round 1, P8): RCV-B was edited to
+    // `chilled` above (the edit flowing through to the read), while the
+    // untouched RCV-A/RCV-C read the column's `ambient` default
+    // (0035_storage_class.sql) — the device's conformance mirror needs the
+    // field present, never absent.
+    expect(snapshot.skus.map((sku) => [sku.code, sku.storageClass]).sort((a, b) => String(a[0]).localeCompare(String(b[0])))).toEqual([
+      ['RCV-A', 'ambient'],
+      ['RCV-B', 'chilled'],
+      ['RCV-C', 'ambient'],
+    ]);
 
     // Story 11.7: the variant fields ride the SKU arm — the attached product's
     // axes in declaration order and the SKU's values on them, both null on an

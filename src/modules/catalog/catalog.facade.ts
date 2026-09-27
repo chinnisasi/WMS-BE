@@ -154,6 +154,17 @@ export interface SkuSummary {
    * (left join on `products`).
    */
   readonly axes: string[] | null;
+  /**
+   * Story 12.8 (UX-DR29): the SKU's storage class — the other half of the
+   * device's offline conformance mirror. It rides the snapshot beside the
+   * bin arm's class so the device can refuse a non-conforming placement or
+   * draw in its own Rejected banner, offline, in under 500 ms; a refusal
+   * only the server knew about queues in a dead zone and comes back hours
+   * later as a rejection the operator can no longer act on. Never null on the
+   * wire: the column defaults to `ambient` (0035_storage_class.sql), so every
+   * SKU reads a class.
+   */
+  readonly storageClass: string;
 }
 
 @Injectable()
@@ -270,6 +281,10 @@ export class CatalogFacade {
         // a left join — an unattached SKU carries null on both.
         variantValues: skus.variantValues,
         axes: products.axes,
+        // Story 12.8 (UX-DR29): the class rides beside the variant identity —
+        // the device's offline conformance mirror reads both arms (SKU here,
+        // bin on the putaway facade) beside the fields it already gates on.
+        storageClass: skus.storageClass,
       })
       .from(skus)
       .leftJoin(products, eq(products.id, skus.productId))

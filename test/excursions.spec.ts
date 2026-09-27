@@ -42,6 +42,7 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
   let opsToken: string;
   let opsUserId: string;
   let operatorToken: string;
+  let operatorEmail: string;
   let accountantToken: string;
   let warehouseId: string;
   let zoneId: string;
@@ -153,7 +154,9 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
     const ops = await createMember('ops_manager');
     opsToken = ops.token;
     opsUserId = ops.userId;
-    operatorToken = (await createMember('operator')).token;
+    const operator = await createMember('operator');
+    operatorToken = operator.token;
+    operatorEmail = operator.email;
     accountantToken = (await createMember('accountant')).token;
 
     // Cold-start bootstrap: the ATP reads below need the warehouse's counter
@@ -179,6 +182,7 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
     try {
       // Children before parents: excursion rows → hold rows → ledger →
       // projections → spine.
+      await cleaner.unsafe('DELETE FROM devices WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM temperature_excursions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM qc_holds WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('set session_replication_role = replica');
@@ -216,7 +220,7 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
   // ── helpers ────────────────────────────────────────────────────────────────
 
   /** One invite → accept → sign-in round trip: an active team user of a role. */
-  async function createMember(role: 'ops_manager' | 'operator' | 'accountant'): Promise<{ userId: string; token: string }> {
+  async function createMember(role: 'ops_manager' | 'operator' | 'accountant'): Promise<{ userId: string; email: string; token: string }> {
     const email = `${role}-${ulid().toLowerCase()}@example.com`;
     const invited = await request(app.getHttpServer())
       .post(`${API}/${tenantId}/users`)
@@ -236,7 +240,7 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
         .send({ email, password: 'correct-horse-battery' })
         .expect(200)
     ).body.accessToken as string;
-    return { userId, token };
+    return { userId, email, token };
   }
 
   /** Seeds committed on-hand via the stock.adjustment command (HTTP). */
@@ -293,6 +297,53 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
       .set('Authorization', `Bearer ${token}`)
       .set(KEY_HEADER, key)
       .send(body);
+  }
+
+  // ── device-arm helpers (story 12-8: the badge-in session records too) ─────
+
+  /** Mint + enroll: one enrolled device with its bare credential. */
+  async function enrollDevice(label: string): Promise<{ deviceId: string; deviceToken: string }> {
+    const minted = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/devices/enrollment-codes`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(201);
+    const enrolled = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/devices/enroll`)
+      .set(KEY_HEADER, ulid())
+      .send({ code: minted.body.code as string, label, pin: '1357' })
+      .expect(201);
+    return {
+      deviceId: enrolled.body.device.id as string,
+      deviceToken: enrolled.body.deviceToken as string,
+    };
+  }
+
+  /**
+   * Badge the operator in on the device: the operator-bound session token
+   * AND the operator's id (patch round 1, P6/P7 — the recordedBy assertion
+   * and the web-visibility read both need it).
+   */
+  async function badgeIn(deviceToken: string): Promise<{ accessToken: string; operatorId: string }> {
+    const res = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/devices/badge-in`)
+      .set('Authorization', `Bearer ${deviceToken}`)
+      .send({ operatorEmail, pin: '1357' })
+      .expect(200);
+    return {
+      accessToken: res.body.accessToken as string,
+      operatorId: (res.body.operator as { id: string }).id,
+    };
+  }
+
+  async function revokeDevice(deviceId: string): Promise<void> {
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/devices/${deviceId}/revoke`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
   }
 
   function resolveExcursion(excursionId: string, token: string = opsToken, key = ulid()): SupertestTest {
@@ -948,6 +999,123 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
       select reference from audit_events
       where tenant_id = ${tenantId} and action = 'qc_hold.placed' and target_id = ${String(hold.id)}`;
     expect((audits[0] as unknown as { reference: string }).reference).toHaveLength(26);
+  });
+
+  // ── story 12-8: the device arm (UX-DR30 — the floor records offline) ──────
+
+  it('device arm: a badge-in session records the excursion through the same command — holds + zero-delta events, recordedBy the badged operator', async () => {
+    const plainId = skuIds.get('EX-PLAIN')!;
+    const binDevice = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A-01-08', capacity: 1000, type: 'shelf' })
+        .expect(201)
+    ).body.id as string;
+    await seedStock(plainId, binDevice, 4);
+
+    const device = await enrollDevice('Excursion scanner 1');
+    const badged = await badgeIn(device.deviceToken);
+
+    const res = await recordExcursion(
+      { warehouseId, binId: binDevice, readingC: 9.5, note: 'recorded from the floor device' },
+      badged.accessToken,
+    ).expect(201);
+    const excursion = res.body.excursion as Record<string, unknown>;
+    // Patch round 1 (P6): the title claims recordedBy the badged operator —
+    // the body now CHECKS it (the badge-in response's operator id).
+    expect(excursion).toMatchObject({
+      status: 'open',
+      binId: binDevice,
+      readingC: 9.5,
+      recordedBy: badged.operatorId,
+    });
+    expect((excursion.holdIds as string[]).length).toBe(1);
+
+    // Patch round 1 (P7): the device-recorded excursion is visible through
+    // the WEB read — one listExcursions read: status open, the excursion
+    // present, its holdIds intact. The floor record and the review queue are
+    // one fact, not two.
+    const webRead = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/excursions?status=open`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    const webItems = webRead.body.items as { id: string; holdIds: string[]; status: string }[];
+    const webMatch = webItems.find((item) => item.id === excursion.id);
+    expect(webMatch).toBeDefined();
+    expect(webMatch!.status).toBe('open');
+    expect(webMatch!.holdIds).toEqual(excursion.holdIds);
+
+    // Same ledger shape as the web arm: the zero-delta per-scope events.
+    const events = await excursionLedgerRows(excursion.id as string);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: 'excursion.recorded',
+      quantity_delta: 0,
+      sku_id: plainId,
+      from_bin_id: null,
+      to_bin_id: null,
+    });
+
+    // The stock relocated into the system QC-hold bin (the ordinary sweep).
+    const qcBin = await qcBinId();
+    expect(await onHandAtBin(binDevice, plainId)).toBe(0);
+    expect(await onHandAtBin(qcBin, plainId)).toBeGreaterThanOrEqual(4);
+  });
+
+  it('device arm: a revoked device is 403 device-revoked at the in-tx re-auth, nothing written', async () => {
+    const plainId = skuIds.get('EX-PLAIN')!;
+    const binRevoked = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A-01-09', capacity: 1000, type: 'shelf' })
+        .expect(201)
+    ).body.id as string;
+    await seedStock(plainId, binRevoked, 2);
+
+    const device = await enrollDevice('Revoked scanner');
+    const badged = await badgeIn(device.deviceToken);
+    await revokeDevice(device.deviceId);
+
+    // The session JWT itself still verifies (device_id claim → the device
+    // family) — the COMMAND's in-transaction device re-read is what fails it
+    // closed: the device row is no longer `active`.
+    const denied = await recordExcursion(
+      { warehouseId, binId: binRevoked, readingC: 6 },
+      badged.accessToken,
+    ).expect(403);
+    expect(denied.body.code).toBe('device-revoked');
+
+    expect(await countRows('temperature_excursions', `tenant_id = '${tenantId}'::uuid and bin_id = '${binRevoked}'::uuid`)).toBe(0);
+    expect(await countRows('qc_holds', `tenant_id = '${tenantId}'::uuid and bin_id = '${binRevoked}'::uuid`)).toBe(0);
+    expect(await onHandAtBin(binRevoked, plainId)).toBe(2);
+  });
+
+  it('device arm: the bare (pre-badge-in) credential is 401 unauthenticated — the badge-in-required arm, nothing written', async () => {
+    const plainId = skuIds.get('EX-PLAIN')!;
+    const binBare = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A-01-10', capacity: 1000, type: 'shelf' })
+        .expect(201)
+    ).body.id as string;
+    await seedStock(plainId, binBare, 1);
+
+    const device = await enrollDevice('Unbadged scanner');
+
+    const denied = await recordExcursion(
+      { warehouseId, binId: binBare, readingC: 5 },
+      device.deviceToken,
+    ).expect(401);
+    expect(denied.body.code).toBe('unauthenticated');
+    expect(denied.body.detail as string).toContain('badge-in');
+
+    expect(await countRows('temperature_excursions', `tenant_id = '${tenantId}'::uuid and bin_id = '${binBare}'::uuid`)).toBe(0);
   });
 
   it('RLS: a tenant-scoped non-superuser session cannot read another tenant’s excursion rows; the write side is fail-closed', async () => {
