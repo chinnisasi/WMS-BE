@@ -37,6 +37,8 @@ import { ProductCommand } from './product.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { KitCommand } from './kit.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { CatalogFacade } from './catalog.facade';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ImportCatalogDto } from './catalog.dto';
 import {
   CatalogImportResponse,
@@ -48,6 +50,7 @@ import {
   ProductListResponse,
   ProductResponse,
   PutKitDto,
+  SegregationMatrixResponse,
   SkuListResponse,
   SkuResponse,
 } from './catalog.dto';
@@ -152,6 +155,7 @@ export class CatalogController {
     private readonly skuCommand: SkuCommand,
     private readonly productCommand: ProductCommand,
     private readonly kitCommand: KitCommand,
+    private readonly catalogFacade: CatalogFacade,
   ) {}
 
   @Post(':tenantId/catalog/imports')
@@ -236,6 +240,35 @@ export class CatalogController {
     return {
       items: page.items.map((item) => ({ ...item, uomConversions: item.uomConversions.map((c) => ({ ...c })) })),
       nextCursor: page.nextCursor,
+    };
+  }
+
+  // Story 12-7 — the segregation matrix as data (FR-41, the admin view): an
+  // UNGATED read (no capability, no idempotency — reads are never gated)
+  // mirroring the guard pattern of `GET :tenantId/catalog/skus` above. The
+  // response is the hazard vocabulary plus the FULLY EXPANDED incompatible
+  // unordered-pair set enumerated from the shared primitive, so the web
+  // renders `compatible(a, b) = !incompatible.includes(pair)` with zero
+  // logic of its own and nothing hardcoded to drift.
+  @Get(':tenantId/catalog/segregation-matrix')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Returns the hazard segregation matrix — the vocabulary plus every incompatible unordered pair, fully expanded from the server\'s own predicate',
+  })
+  @ApiOkResponse({ type: SegregationMatrixResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async getSegregationMatrix(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<SegregationMatrixResponse> {
+    assertOwnTenant(session, tenantId);
+    const matrix = this.catalogFacade.getSegregationMatrix();
+    return {
+      classes: [...matrix.classes],
+      incompatible: matrix.incompatible.map((pair) => ({ ...pair })),
     };
   }
 

@@ -250,6 +250,33 @@ export class SkuListResponse {
   nextCursor!: string | null;
 }
 
+// ── Story 12-7 — the segregation matrix read (FR-41, the admin view) ────────
+
+/** One incompatible unordered pair — sorted keys (`a` < `b` lexicographically). */
+export class SegregationPairResponse {
+  @ApiProperty({ enum: HAZARD_CLASSES, example: 'oxidizer' })
+  a!: string;
+
+  @ApiProperty({ enum: HAZARD_CLASSES, example: 'flammable' })
+  b!: string;
+}
+
+/**
+ * The hazard segregation matrix as data: the closed vocabulary and the FULLY
+ * EXPANDED incompatible unordered-pair set — the explosive universal rule
+ * enumerated as pairs (incl. `explosive|explosive`) plus the explicit pairs.
+ * The web renders `compatible(a, b) = !incompatible.includes(pair)` with zero
+ * logic of its own; a null hazard class is not a class and carries no rule
+ * (it never appears here and is always compatible).
+ */
+export class SegregationMatrixResponse {
+  @ApiProperty({ type: [String], enum: HAZARD_CLASSES, example: [...HAZARD_CLASSES] })
+  classes!: string[];
+
+  @ApiProperty({ type: [SegregationPairResponse], description: 'Every incompatible unordered pair, fully expanded (11 today: the 7 explosive pairs incl. self + the 4 explicit ones)' })
+  incompatible!: SegregationPairResponse[];
+}
+
 /** PATCH fields (spec 1.4): SKU code is immutable; barcode is changeable. */
 export class PatchSkuDto {
   @ApiProperty({ required: false, minLength: 1, maxLength: 200 })

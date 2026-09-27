@@ -7,6 +7,13 @@ import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { uuidv7 } from '../../shared/primitives/ids';
+// Story 12-7 — the segregation matrix is code in the shared primitive, not
+// a table this module owns; the facade read enumerates it (see the method).
+import {
+  enumerateIncompatiblePairs,
+  HAZARD_CLASSES,
+} from '../../shared/primitives/hazard';
+import type { HazardClass, SegregationPair } from '../../shared/primitives/hazard';
 import type { ImportMode } from './import.command';
 import { uomPrecision } from './uom';
 // The handling-unit seam lives in its own file (see the block inside the
@@ -80,6 +87,12 @@ export interface EnsureBatchInput {
   readonly code: string;
   readonly mfgDate?: string | undefined;
   readonly expiryDate?: string | undefined;
+}
+
+/** The hazard segregation matrix as the story 12-7 admin read carries it. */
+export interface CatalogSegregationMatrix {
+  readonly classes: readonly HazardClass[];
+  readonly incompatible: readonly SegregationPair[];
 }
 
 /**
@@ -181,6 +194,23 @@ export class CatalogFacade {
           : null,
       };
     });
+  }
+
+  /**
+   * Story 12-7 — the segregation-matrix read: the hazard vocabulary plus the
+   * FULLY EXPANDED incompatible unordered-pair set, enumerated from the
+   * shared predicate (`enumerateIncompatiblePairs` in hazard.ts — the
+   * explosive universal rule included, `explosive|explosive` with it) so the
+   * web renders the server's truth instead of a drift-prone hand copy. A
+   * pure read of code — no table, no transaction, the one facade method
+   * without one; path ownership stays the controller's `assertOwnTenant`,
+   * exactly as for every other GET here.
+   */
+  getSegregationMatrix(): CatalogSegregationMatrix {
+    return {
+      classes: [...HAZARD_CLASSES],
+      incompatible: enumerateIncompatiblePairs().map((pair) => ({ ...pair })),
+    };
   }
 
   /** The one SKU identity read (null when the id is foreign or unknown). */
