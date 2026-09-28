@@ -283,7 +283,7 @@ describe('reconciliation over fractional stock (e2e, story 10.4)', () => {
         skuId,
         binId,
         quantityDelta,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'recon-fractional spec',
         ...(batch !== undefined ? { batch } : {}),
       })

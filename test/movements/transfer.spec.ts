@@ -246,7 +246,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       skuId: skuIds.get(PLAIN),
       binId: binSrc,
       quantityDelta: 20,
-      reasonCode: 'cycle-count',
+      reasonCode: 'stock-count',
       note: 'transfer-suite seed',
     });
     await seed({
@@ -254,7 +254,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       skuId: skuIds.get(PLAIN),
       binId: binSpare,
       quantityDelta: 3,
-      reasonCode: 'cycle-count',
+      reasonCode: 'stock-count',
       note: 'transfer-suite serial-elsewhere arm',
     });
     await seed({
@@ -262,7 +262,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       skuId: skuIds.get(BATCH),
       binId: binSrc,
       quantityDelta: 5,
-      reasonCode: 'cycle-count',
+      reasonCode: 'stock-count',
       note: 'transfer-suite batch seed',
       batch: { code: 'LOT-TB-1' },
     });
@@ -271,7 +271,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       skuId: skuIds.get(SERIAL),
       binId: binSrc,
       quantityDelta: 3,
-      reasonCode: 'cycle-count',
+      reasonCode: 'stock-count',
       note: 'transfer-suite serial seed',
       serials: ['TR-SN-1', 'TR-SN-2', 'TR-SN-3'],
     });
@@ -280,7 +280,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       skuId: skuIds.get(SERIAL),
       binId: binSpare,
       quantityDelta: 1,
-      reasonCode: 'cycle-count',
+      reasonCode: 'stock-count',
       note: 'transfer-suite serial-elsewhere seed',
       serials: ['TR-SN-9'],
     });
@@ -291,7 +291,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       skuId: skuIds.get(PLAIN),
       binId: binSpare2,
       quantityDelta: 1,
-      reasonCode: 'cycle-count',
+      reasonCode: 'stock-count',
       note: 'transfer-suite epoch-touch',
     });
     // Cold-start bootstrap: the ATP reads below need the warehouses' counters
@@ -1031,7 +1031,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
           skuId: skuIds.get(PLAIN),
           binId: inTransitBinSource,
           quantityDelta: 1,
-          reasonCode: 'cycle-count',
+          reasonCode: 'stock-count',
           note: 'transfer-suite system-bin arm',
         })
         .expect(400);
@@ -1093,7 +1093,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
           skuId: compSkuId,
           binId: binSrc,
           quantityDelta: 1,
-          reasonCode: 'cycle-count',
+          reasonCode: 'stock-count',
           note: 'transfer-suite V6 secure seed',
         })
         .expect(201);
@@ -1139,7 +1139,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
           skuId: skuIds.get(SERIAL),
           binId: binSpare,
           quantityDelta: 2,
-          reasonCode: 'cycle-count',
+          reasonCode: 'stock-count',
           note: 'transfer-suite V7 serial seed',
           serials: ['TR-SN-7', 'TR-SN-8'],
         })

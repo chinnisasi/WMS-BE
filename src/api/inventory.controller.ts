@@ -1,5 +1,6 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Put, Query, Res, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import type { Response } from 'express';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
@@ -16,11 +17,16 @@ import type {
   BatchOnHandEntry,
   LedgerTimelineQuery,
 } from '../modules/inventory/inventory.facade';
-import type { AdjustStockBatch } from '../modules/inventory/inventory.command';
+import type { AdjustStockBatch, AdjustStockCommand } from '../modules/inventory/inventory.command';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
+  AdjustmentDecisionResponse,
+  AdjustmentPendingListResponse,
+  AdjustmentPendingsQuery,
+  AdjustmentPolicyDto,
+  AdjustmentPolicyResponse,
   BatchDetailResponse,
   BatchListQuery,
   BatchListItemDto,
@@ -29,6 +35,7 @@ import {
   LedgerEventsQuery,
   SerialDetailResponse,
   StockAdjustmentDto,
+  StockAdjustmentPendingResponse,
   StockAdjustmentResponse,
   StockListQuery,
   StockListResponse,
@@ -76,7 +83,7 @@ export class InventoryController {
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
   @ApiOperation({
-    summary: 'Records a manual stock adjustment (one ledger event + on-hand projection in one commit)',
+    summary: 'Records a manual stock adjustment (one ledger event + on-hand projection in one commit; over a tenant approval threshold it PENDS instead — 202)',
   })
   @ApiBody({ type: StockAdjustmentDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
@@ -85,7 +92,12 @@ export class InventoryController {
     type: StockAdjustmentResponse,
     description: 'Adjustment committed: the ledger event snapshot plus the resulting on-hand quantity',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, or a quantityDelta that does not equal the serial count') })
+  @ApiResponse({
+    status: HttpStatus.ACCEPTED,
+    type: StockAdjustmentPendingResponse,
+    description: 'Story 5-2: |quantityDelta| exceeds the tenant\'s policy threshold — the adjustment PENDS (no ledger event, no on-hand change) until an Owner approves or rejects; the body is the pend snapshot with its threshold context',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, a quantityDelta that does not equal the serial count, or a reasonCode outside the closed adjustment vocabulary') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks stock.adjust (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, bin, or SKU does not exist in this tenant (not-found), or an explicit batch code does not exist for the SKU (not-found)') })
@@ -97,14 +109,19 @@ export class InventoryController {
     @IdempotencyKey() idempotencyKey: string | undefined,
     @CurrentSession() session: TenantSession,
     @Body() dto: StockAdjustmentDto,
-  ): Promise<StockAdjustmentResponse> {
+    // Story 5-2 — the response's STATUS is dynamic: 201 when the adjustment
+    // applied, 202 when it pended. The passthrough `res` (the openapi
+    // controller's precedent) flips the status per request; the @HttpCode(201)
+    // decorator stays the non-pend default.
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<StockAdjustmentResponse | StockAdjustmentPendingResponse> {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     // Pure normalization first (review loop 1): null arms behave as absent,
     // serials are trimmed, an empty array is absent — the normalized values
     // feed BOTH identity creation and the idempotency fingerprint.
     const arms = normalizeArms(dto);
-    const command = {
+    const command: AdjustStockCommand = {
       tenantId,
       actorUserId: session.userId,
       warehouseId: dto.warehouseId,
@@ -149,18 +166,25 @@ export class InventoryController {
       // the answer for a retry — even when the FEFO batch has since been
       // exhausted or the bin's batch state changed. The payload hash is
       // command-owned (via the facade) and hashes the RAW request arms, so
-      // no current-state input can poison the replay decision.
+      // no current-state input can poison the replay decision. Story 5-2:
+      // the stored shape is whichever outcome the original request produced
+      // (201 applied / 202 pended) — a replayed pend creation re-serves its
+      // 202 (frozen matrix row: nothing below replay runs on a replay).
       const replayed = await this.inventoryFacade.replayAdjustment(
         tenantId,
         key,
         this.inventoryFacade.adjustmentFingerprint(command),
       );
       if (replayed !== null) {
+        if ('pendingAdjustment' in replayed) {
+          res.status(HttpStatus.ACCEPTED);
+          return replayed as StockAdjustmentPendingResponse;
+        }
         return replayed;
       }
     }
     const { batchRef, serialRefs } = await this.composeBatchSerialArms(tenantId, dto, arms, sku);
-    return this.inventoryFacade.adjustStock(
+    const result = await this.inventoryFacade.adjustStock(
       {
         ...command,
         batchRef,
@@ -168,6 +192,190 @@ export class InventoryController {
       },
       key,
     );
+    if (result.kind === 'pending') {
+      res.status(HttpStatus.ACCEPTED);
+      return result.pending;
+    }
+    return result.snapshot;
+  }
+
+  // ── Story 5-2: the adjustment approval-threshold surface (FR-19) ─────────
+
+  @Put(':tenantId/inventory/adjustment-policies')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Sets the tenant's stock adjustment approval threshold (FR-19) — an adjustment whose |quantityDelta| strictly exceeds it pends for Owner approval instead of applying",
+  })
+  @ApiBody({ type: AdjustmentPolicyDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({
+    type: AdjustmentPolicyResponse,
+    description: "The tenant's adjustment policy row (created or updated; the write is idempotent under the Idempotency-Key)",
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid quantityThreshold (validation-failed): negative, non-integer, or over the int4 max of 2147483647 (the column is an integer — an oversized threshold is this 400, never a range 500)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks adjustments.approve (role-denied) — the policy write rides the same owner-only capability the decisions carry') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Concurrent request on the same Idempotency-Key, or two concurrent first-time policy writes (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async setAdjustmentPolicy(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: AdjustmentPolicyDto,
+  ): Promise<AdjustmentPolicyResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return this.inventoryFacade.setAdjustmentPolicy(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        // Required and non-null by the DTO (a null threshold means flow
+        // disabled — deleting the row is how a tenant disables the flow).
+        quantityThreshold: dto.quantityThreshold,
+      },
+      key,
+    );
+  }
+
+  @Get(':tenantId/inventory/adjustment-policies')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: "Reads the tenant's stock adjustment approval threshold (404 when no policy row exists — the approval flow is disabled)",
+  })
+  @ApiOkResponse({ type: AdjustmentPolicyResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No policy row exists for this tenant (not-found) — with no row the approval flow is disabled and every adjustment applies immediately') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async getAdjustmentPolicy(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<AdjustmentPolicyResponse> {
+    assertOwnTenant(session, tenantId);
+    const policy = await this.inventoryFacade.getAdjustmentPolicy(tenantId);
+    if (policy === null) {
+      throw new ProblemException(
+        'not-found',
+        404,
+        'No adjustment policy configured',
+        'No adjustment policy exists for this tenant — the approval flow is disabled (every adjustment applies immediately).',
+      );
+    }
+    return policy;
+  }
+
+  @Get(':tenantId/inventory/adjustment-pendings')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Lists the tenant\'s pending stock adjustments (keyset cursor pagination, status-filterable — the approval queue read; a read, never capability-gated)',
+  })
+  @ApiOkResponse({
+    type: AdjustmentPendingListResponse,
+    description: 'The pending queue page (newest first): each row carries the resolved arms, the threshold context, and — after a decision — who decided',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed status, cursor, or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async listAdjustmentPendings(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: AdjustmentPendingsQuery,
+  ): Promise<AdjustmentPendingListResponse> {
+    assertOwnTenant(session, tenantId);
+    const page = await this.inventoryFacade.listAdjustmentPendings(tenantId, {
+      status: query.status as 'pending' | 'approved' | 'rejected' | undefined,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items, nextCursor: page.nextCursor };
+  }
+
+  @Post(':tenantId/inventory/adjustment-pendings/:pendingId/approve')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Approves a pending stock adjustment (adjustments.approve) — the stored arms re-execute as ledger events at decision time (actor = approver); audited',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: AdjustmentDecisionResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed pendingId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks adjustments.approve (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No pending adjustment with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Already approved/rejected (adjustment-pending-decided), a kit SKU since the pend (kit-cannot-hold-stock), a concurrent idempotent request (conflict), or the world moved since the pend and the re-execution hit a guard whose 409 applies (e.g. a handling unit no longer active)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or the re-execution failed a guard whose 422 applies (insufficient-on-hand — the pending row STAYS pending; the whole decide transaction rolls back)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'pendingId', format: 'uuid' })
+  async approveAdjustment(
+    @Param('tenantId') tenantId: string,
+    @Param('pendingId') pendingId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<AdjustmentDecisionResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(pendingId, 'pendingId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.inventoryFacade.decideAdjustment(
+      { tenantId, actorUserId: session.userId, pendingAdjustmentId: pendingId, decision: 'approve' },
+      key,
+    );
+    return {
+      id: snapshot.pendingAdjustment.id,
+      status: snapshot.pendingAdjustment.status,
+      decidedBy: snapshot.pendingAdjustment.decidedBy!,
+      decidedAt: snapshot.pendingAdjustment.decidedAt!,
+      events: snapshot.events,
+      onHand: snapshot.onHand,
+    };
+  }
+
+  @Post(':tenantId/inventory/adjustment-pendings/:pendingId/reject')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Rejects a pending stock adjustment (adjustments.approve) — no stock write, the adjustment never applies; audited',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: AdjustmentDecisionResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed pendingId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks adjustments.approve (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No pending adjustment with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Already approved/rejected (adjustment-pending-decided), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'pendingId', format: 'uuid' })
+  async rejectAdjustment(
+    @Param('tenantId') tenantId: string,
+    @Param('pendingId') pendingId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<AdjustmentDecisionResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(pendingId, 'pendingId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.inventoryFacade.decideAdjustment(
+      { tenantId, actorUserId: session.userId, pendingAdjustmentId: pendingId, decision: 'reject' },
+      key,
+    );
+    return {
+      id: snapshot.pendingAdjustment.id,
+      status: snapshot.pendingAdjustment.status,
+      decidedBy: snapshot.pendingAdjustment.decidedBy!,
+      decidedAt: snapshot.pendingAdjustment.decidedAt!,
+      events: snapshot.events,
+      onHand: snapshot.onHand,
+    };
   }
 
   /**
@@ -664,6 +872,18 @@ function assertOwnTenant(session: TenantSession, tenantId: string): void {
       403,
       'Session belongs to another tenant',
       'The session token tenant does not own this path.',
+    );
+  }
+}
+
+/** Story 5-2 — the decision routes' path-param guard (the receiving controller's shape, per-file). */
+function assertUuidParam(value: string, name: 'pendingId'): void {
+  if (!UUID_RE.test(value)) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      `${name} must be a uuid`,
+      `The "${name}" parameter must be a uuid (got "${value}").`,
     );
   }
 }

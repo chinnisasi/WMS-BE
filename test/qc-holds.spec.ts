@@ -248,7 +248,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
         skuId,
         binId,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'qc-holds-suite seed',
         ...(batchCode === undefined ? {} : { batch: { code: batchCode } }),
       })

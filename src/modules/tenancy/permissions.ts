@@ -122,6 +122,21 @@ export const CAPABILITIES = [
   // The inbound confirm is an operator task (the Transfer inbox tab's op);
   // Owner + Ops Manager + Operator, mirroring `putaway.execute`.
   'transfers.execute',
+  // Story 5-2 — FR-19's approval-threshold decisions: approve or reject a
+  // stock adjustment that pended because |quantityDelta| exceeded the
+  // tenant's policy threshold. OWNER-ONLY (decided, human, 2026-09-28 — the
+  // review-loop-1 intent: the person who set the bar is the person who
+  // watches it crossed; an Ops Manager can still LOWER an adjustment below
+  // the threshold with `stock.adjust` and apply it immediately, so the
+  // owner-only gate is a review control, not a lockout). The capability also
+  // gates the POLICY write (`setAdjustmentPolicy`) — a policy IS the approval
+  // rule, so gating it separately would let a role that cannot approve
+  // redefine what approval means (the `waves.manage` rationale). This is the
+  // FR-19 Owner routing the Story 3.3 `review.decide` comment deferred.
+  // Deliberately NOT mirrored onto any other role: ops_manager, operator and
+  // accountant all stay as they were. Mirrored into wms-fe
+  // `src/lib/users.ts` (FE commit 8c1bfc7 — do not re-create).
+  'adjustments.approve',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];

@@ -263,7 +263,7 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
       .post(`${API}/${tenantId}/inventory/adjustments`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId, skuId, binId, quantityDelta: quantity, reasonCode: 'cycle-count', note: 'bench seed' })
+      .send({ warehouseId, skuId, binId, quantityDelta: quantity, reasonCode: 'stock-count', note: 'bench seed' })
       .expect(201);
   }
 

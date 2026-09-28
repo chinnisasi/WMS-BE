@@ -269,7 +269,7 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
       .post(`${API}/${tenantId}/inventory/adjustments`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId: warehouse, skuId, binId, quantityDelta, reasonCode: 'cycle-count', note: 'recon spec' })
+      .send({ warehouseId: warehouse, skuId, binId, quantityDelta, reasonCode: 'stock-count', note: 'recon spec' })
       .expect(201)
       .then((res) => res.body.event.seq as number);
   }

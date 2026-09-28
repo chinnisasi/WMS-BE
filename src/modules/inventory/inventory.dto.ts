@@ -6,6 +6,7 @@ import {
 import {
   ArrayMaxSize,
   IsArray,
+  IsIn,
   IsInt,
   IsNumber,
   IsOptional,
@@ -18,6 +19,8 @@ import {
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
+import { ADJUSTMENT_PENDING_STATUSES } from '../../shared/db/schema';
+import { ADJUSTMENT_REASON_CODES } from './adjustment-reason';
 
 /** Trim at the validation boundary (the tenancy DTO pattern). */
 function Trim() {
@@ -135,10 +138,17 @@ export class StockAdjustmentDto {
   @Max(MAX_QUANTITY_BASE)
   quantityDelta!: number;
 
-  @ApiProperty({ description: 'Machine reason for the correction (e.g. stock-count)' })
+  @ApiProperty({
+    description:
+      // Story 5-2: the reason is the closed eight-value vocabulary — a
+      // spelling nobody thought of is a 400 at this boundary, never a
+      // silently-accepted free-form string. `other` carries its human note in
+      // the (already-required) `note` field below.
+      'Machine reason for the correction — one of the closed adjustment vocabulary',
+    enum: ADJUSTMENT_REASON_CODES,
+  })
   @Trim()
-  @IsString()
-  @Length(1, 64)
+  @IsIn(ADJUSTMENT_REASON_CODES)
   reasonCode!: string;
 
   @ApiProperty({ description: "The Ops Manager's note, carried verbatim on the event" })
@@ -235,13 +245,22 @@ export class OnHandSnapshotDto {
   quantity!: number;
 }
 
-/** The appended ledger event as the API returns it (the snapshot). */
+/**
+ * The appended ledger event as the API returns it (the snapshot).
+ *
+ * Story 5-2 (retro A4, multi-serial arm only): a MULTI-serial adjustment
+ * appends one event per serial unit, so no single (id, seq) can represent
+ * the response — the snapshot carries `id: null, seq: null` with the
+ * AGGREGATE `quantityDelta`. A SINGLE-serial adjustment keeps its exact
+ * `id`/`seq` pairing (the pre-story contract), and non-serial snapshots are
+ * byte-identical to before. The outbox payload mirrors this pairing.
+ */
 export class LedgerEventSnapshotDto {
-  @ApiProperty({ format: 'uuid' })
-  id!: string;
+  @ApiProperty({ type: String, format: 'uuid', nullable: true })
+  id!: string | null;
 
-  @ApiProperty({ description: 'Gap-free per-warehouse replay order' })
-  seq!: number;
+  @ApiProperty({ type: Number, nullable: true, description: 'Gap-free per-warehouse replay order (null on a multi-serial aggregate snapshot)' })
+  seq!: number | null;
 
   @ApiProperty({ example: 'stock.adjusted' })
   type!: string;
@@ -634,4 +653,188 @@ export class SerialDetailResponse {
 
   @ApiProperty({ type: [SerialLedgerEntryDto], description: 'Full movement history (oldest first, one query)' })
   history!: readonly SerialLedgerEntryDto[];
+}
+
+// ── Story 5-2: adjustment approval thresholds (FR-19) ──────────────────────
+
+/**
+ * PUT …/inventory/adjustment-policies body. `quantityThreshold` is REQUIRED
+ * and non-null (a null threshold means "flow disabled" — deleting the row is
+ * how a tenant disables the flow, so PUT never accepts null and silently
+ * half-disables). The `@Max(2147483647)` is load-bearing: the column is
+ * Postgres `integer`, and without it an oversized threshold would pass this
+ * DTO and die as a range 500 instead of a clean 400.
+ */
+export class AdjustmentPolicyDto {
+  @ApiProperty({
+    description:
+      'The |quantityDelta| ceiling in base UoM above which an adjustment pends for Owner approval (strictly greater pends; at-threshold applies immediately)',
+    minimum: 0,
+    maximum: 2147483647,
+    example: 100,
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(2147483647)
+  quantityThreshold!: number;
+}
+
+/** GET/PUT …/inventory/adjustment-policies response (the tenant's config row). */
+export class AdjustmentPolicyResponse {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({
+    type: Number,
+    nullable: false,
+    description: 'The threshold in base UoM (null would mean flow disabled — PUT requires it non-null)',
+  })
+  quantityThreshold!: number;
+
+  @ApiProperty({ description: 'ISO-8601 UTC row creation time' })
+  createdAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC row last-update time' })
+  updatedAt!: string;
+}
+
+/**
+ * One row of the pending-queue read and the 202 response's `pendingAdjustment`
+ * payload: the REQUEST's resolved arms, frozen at request time — including the
+ * threshold context (`thresholdQuantityAtRequest`) the approval card renders,
+ * which a later policy PUT cannot rewrite.
+ */
+export class AdjustmentPendingDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ description: 'Signed base-UoM delta frozen at request' })
+  quantityDelta!: number;
+
+  @ApiProperty({ description: 'The closed adjustment vocabulary value' })
+  reasonCode!: string;
+
+  @ApiProperty({ description: "The requester's note, carried verbatim" })
+  note!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: 'The override draw’s FEFO-override reason (present only on override draws; restored into the approved event’s referenceDoc)',
+  })
+  batchOverrideReason!: string | null;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'The resolved catalog batch id (null when the request had none)' })
+  batchId!: string | null;
+
+  @ApiProperty({ type: [String], nullable: true, description: 'The resolved serial ids, request order (null when the request had none)' })
+  serialIds!: readonly string[] | null;
+
+  @ApiProperty({ type: [String], format: 'uuid', nullable: true, description: 'The named handling units (catch-weight arm), request order (null when absent)' })
+  handlingUnitIds!: readonly string[] | null;
+
+  @ApiProperty({ description: 'ISO-8601 UTC business time of the requested adjustment' })
+  occurredAt!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The requester' })
+  requestedBy!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC request commit time' })
+  requestedAt!: string;
+
+  @ApiProperty({ description: "pending | approved | rejected — 'pending' on the 202, the decided value on the queue after a decision" })
+  status!: string;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true })
+  decidedBy!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  decidedAt!: string | null;
+
+  @ApiProperty({ description: 'The policy threshold (base UoM) as it read at request time — frozen context' })
+  thresholdQuantityAtRequest!: number;
+}
+
+/** POST …/inventory/adjustments 202 body (the pend creation snapshot). */
+export class StockAdjustmentPendingResponse {
+  @ApiProperty({ type: AdjustmentPendingDto })
+  pendingAdjustment!: AdjustmentPendingDto;
+}
+
+/** Query of the pending-queue read (keyset cursor pagination, UX-DR25). */
+export class AdjustmentPendingsQuery {
+  @ApiProperty({ required: false, description: "Filter by decision state — omitted means every status" })
+  @IsOptional()
+  @IsIn(ADJUSTMENT_PENDING_STATUSES as unknown as string[])
+  status?: string;
+
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
+/** GET …/inventory/adjustment-pendings response. */
+export class AdjustmentPendingListResponse {
+  @ApiProperty({ type: [AdjustmentPendingDto] })
+  items!: readonly AdjustmentPendingDto[];
+
+  @ApiProperty({ type: String, nullable: true, required: false })
+  nextCursor?: string | null;
+}
+
+/**
+ * POST …/adjustment-pendings/:pendingId/approve response: the applied ledger
+ * event snapshots (one per serial unit on a serial arm; the aggregate
+ * multi-serial snapshot carries `id/seq = null`) plus the settled on-hand.
+ * The events' `occurredAt` is the DECISION time; the pend row preserves the
+ * request's. A reject answers the same shape with `events: []` and no
+ * on-hand change (no stock write).
+ */
+export class AdjustmentDecisionResponse {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: "'approved' | 'rejected'" })
+  status!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The decider' })
+  decidedBy!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC decision time' })
+  decidedAt!: string;
+
+  @ApiProperty({ type: [LedgerEventSnapshotDto], description: 'The applied events (approve arm only; empty on reject)' })
+  events!: readonly LedgerEventSnapshotDto[];
+
+  @ApiProperty({
+    type: OnHandSnapshotDto,
+    nullable: true,
+    description: 'The settled on-hand (approve arm only; null on reject)',
+  })
+  onHand!: OnHandSnapshotDto | null;
 }

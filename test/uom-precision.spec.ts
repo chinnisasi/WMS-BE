@@ -510,7 +510,7 @@ describe('story 10.2: UoM is a closed vocabulary with a declared precision (e2e)
       .post(`${API}/${tenantId}/inventory/adjustments`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, key)
-      .send({ warehouseId, skuId, binId, quantityDelta, reasonCode: 'cycle-count', note: 'vocab' });
+      .send({ warehouseId, skuId, binId, quantityDelta, reasonCode: 'stock-count', note: 'vocab' });
   }
 
   async function storedUom(code: string): Promise<string> {

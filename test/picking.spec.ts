@@ -393,7 +393,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
         skuId,
         binId,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'picking-suite seed',
         ...extra,
       })
@@ -411,7 +411,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
         skuId,
         binId,
         quantityDelta: -quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'picking-suite drain',
       })
       .expect(201);

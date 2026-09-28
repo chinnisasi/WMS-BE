@@ -169,7 +169,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
         skuId,
         binId,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'reservation-suite seed',
       })
       .expect(201);

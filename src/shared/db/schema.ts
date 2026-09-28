@@ -2635,3 +2635,139 @@ export const transferOrderLines = pgTable(
 );
 
 export type TransferOrderLine = typeof transferOrderLines.$inferSelect;
+
+/**
+ * The closed adjustment reason vocabulary (story 5-2): the TS side of the
+ * three mirrored layers. The API layer (`inventory.dto.ts` `@IsIn`) and the
+ * DB CHECK (`stock_adjustment_pendings_reason_code_check`, migration 0044)
+ * both enumerate these values; the tuple itself lives beside the owning
+ * module in `src/modules/inventory/adjustment-reason.ts` — the
+ * standalone-constant rule (story 11-5) — so the DTO import does not pull
+ * the command graph.
+ */
+export const ADJUSTMENT_PENDING_STATUSES = ['pending', 'approved', 'rejected'] as const;
+export type AdjustmentPendingStatus = (typeof ADJUSTMENT_PENDING_STATUSES)[number];
+
+/**
+ * Adjustment approval policies (story 5-2, FR-19): the per-tenant threshold
+ * that turns an over-threshold `stock.adjust` into a PENDING row instead of
+ * a ledger event. Config-not-code (epic-5 technical decisions): the row's
+ * existence is the opt-in — **with no policy row the approval flow is
+ * disabled** and every adjustment applies immediately (default-on would 202
+ * every existing adjustment). One row per tenant (the unique index); a null
+ * `quantityThreshold` approves nothing either — the threshold branch treats
+ * it exactly like an absent row, so the column is nullable without any
+ * "require approval always" reading hiding inside it.
+ *
+ * The value half of the threshold (a cost ceiling beside the quantity one)
+ * is deferred to PENDING.md until cost data exists — quantity-only is the
+ * human-approved decision (2026-09-28).
+ *
+ * The policy write is idempotent (PUT with an Idempotency-Key) and gated on
+ * the owner-only `adjustments.approve` capability — the same capability the
+ * approve/reject decisions carry. Audit row: `stock_adjustment.policy_updated`.
+ *
+ * RLS policy + the threshold CHECK live **only in the migration SQL** (0044).
+ */
+export const stockAdjustmentPolicies = pgTable(
+  'stock_adjustment_policies',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    /**
+     * The |quantityDelta| ceiling in BASE units above which an adjustment
+     * pends for Owner approval (strictly greater pends; at-threshold applies
+     * immediately). Null disables the flow — the same semantics as a missing
+     * row.
+     */
+    quantityThreshold: integer('quantity_threshold'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One policy per tenant — the config row IS the tenant's opt-in.
+    uniqueIndex('stock_adjustment_policies_tenant_id_unique').on(table.tenantId),
+  ],
+);
+
+export type StockAdjustmentPolicy = typeof stockAdjustmentPolicies.$inferSelect;
+
+/**
+ * Pending stock adjustments (story 5-2, FR-19): an over-threshold adjustment
+ * parks here instead of writing the ledger — no `stock.adjusted` event, no
+ * on-hand/ATP change, no Valkey counter touch — until an
+ * `adjustments.approve`-capability holder approves (the stored arms apply as
+ * ledger events at decision time) or rejects. `status` is
+ * `pending → approved | rejected` (conditional UPDATE — a second decision is
+ * a deterministic 409 `adjustment-pending-decided`).
+ *
+ * The row stores the REQUEST's resolved arms so the approval re-executes
+ * them byte-identically to what the same request would have produced
+ * immediately: the converted signed `quantity_milli`, the reason/note, the
+ * resolved batch identity (or null), the resolved serial/handling-unit id
+ * lists (jsonb), and — the review-loop-1 finding — the override draw's
+ * `batch_override_reason`, which the approved event's `referenceDoc` must
+ * carry or the ledger would hold an override draw whose audit field the
+ * immediate path always records. `occurred_at` preserves the REQUEST's
+ * business time; the approved events themselves carry the DECISION time as
+ * their business time (occurredAt = decision time — the apply runs then).
+ * `threshold_quantity_at_request` is the threshold context the approval card
+ * renders — frozen at request, so a later policy PUT cannot rewrite what the
+ * requester was told.
+ *
+ * RLS policies + the status/reason/quantity CHECKs live **only in the
+ * migration SQL** (0044).
+ */
+export const stockAdjustmentPendings = pgTable(
+  'stock_adjustment_pendings',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    binId: uuid('bin_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** Signed milli-units — the converted delta, frozen at request. */
+    quantityMilli: bigint('quantity_milli', { mode: 'number' }).notNull(),
+    /** The closed reason vocabulary (CHECK in the migration). */
+    reasonCode: text('reason_code').notNull(),
+    note: text('note').notNull(),
+    /**
+     * The override draw's mandatory FEFO-override reason, restored into the
+     * approved event's referenceDoc. Null on every other adjustment — the
+     * immediate path 400-requires it exactly on override draws, so its
+     * presence here means the approval must carry it.
+     */
+    batchOverrideReason: text('batch_override_reason'),
+    /** The resolved catalog batch identity — null when the request had none. */
+    batchId: uuid('batch_id'),
+    /** The resolved serial identities, request order; null when absent. */
+    serialIds: jsonb('serial_ids').$type<string[]>(),
+    /** The named handling units (catch-weight arm), request order; null when absent. */
+    handlingUnitIds: jsonb('handling_unit_ids').$type<string[]>(),
+    /** The REQUEST's business time — preserved; the apply stamps its own. */
+    occurredAt: timestamp('occurred_at', { withTimezone: true, mode: 'string' }).notNull(),
+    requestedBy: uuid('requested_by').notNull(),
+    requestedAt: timestamp('requested_at', { withTimezone: true, mode: 'string' }).notNull(),
+    status: text('status').notNull().default('pending'),
+    decidedBy: uuid('decided_by'),
+    decidedAt: timestamp('decided_at', { withTimezone: true, mode: 'string' }),
+    /** The policy threshold as it read at request time (base units). */
+    thresholdQuantityAtRequest: integer('threshold_quantity_at_request').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The pending-queue read (status filter first — the over-receipts
+    // queue's keyset shape).
+    index('stock_adjustment_pendings_tenant_status_created_at_id_idx').on(
+      table.tenantId,
+      table.status,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type StockAdjustmentPending = typeof stockAdjustmentPendings.$inferSelect;

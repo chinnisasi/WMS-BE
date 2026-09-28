@@ -361,7 +361,7 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
         skuId,
         binId,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'dispatch-suite seed',
       })
       .expect(201);

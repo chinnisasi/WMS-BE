@@ -259,7 +259,7 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
         skuId,
         binId,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'excursions-suite seed',
         ...(batchCode === undefined ? {} : { batch: { code: batchCode } }),
       })
@@ -280,7 +280,7 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
         skuId,
         binId,
         quantityDelta: serials.length,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'excursions-suite serial seed',
         serials,
       })
@@ -915,7 +915,7 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
         skuId: plainId,
         binId: bin2,
         quantityDelta: 1,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'excursions-suite wh2 seed',
       })
       .expect(201);

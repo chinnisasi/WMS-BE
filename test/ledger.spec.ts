@@ -37,6 +37,8 @@ interface AdjustBody {
   note: string;
   /** Business time; omitted by default (the commit clock then applies). */
   occurredAt?: string;
+  /** Story 5-2's retro-A4 arm — the serial unit numbers (serial-tracked SKUs). */
+  serials?: string[];
 }
 
 describe('append-only ledger core and derived quantities (e2e, story 2.1)', () => {
@@ -55,6 +57,8 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
   let binA: string;
   let binB: string;
   let skuId: string;
+  // Story 5-2 — the serial-tracked SKU the retro-A4 assertions drive.
+  let serialSkuId: string;
 
   let suiteDb: SuiteDatabase;
 
@@ -121,7 +125,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       skuId,
       binId: binA,
       quantityDelta: 5,
-      reasonCode: 'cycle-count',
+      reasonCode: 'stock-count',
       note: 'count correction',
       ...overrides,
     };
@@ -241,9 +245,15 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       .expect(201);
     binB = secondBin.body.id as string;
 
-    // One SKU via catalog import (the only SKU-creation path).
+    // Two SKUs via catalog import (the only SKU-creation path): the plain
+    // adjustment SKU and — story 5-2's retro-A4 assertion needs it — a
+    // SERIAL-tracked SKU (one ledger event per serial unit).
     const csvHeader = 'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode';
-    const csv = `${csvHeader}\nSKU-1,Turmeric,pcs,,1800,,,,,`;
+    const csv = [
+      csvHeader,
+      'SKU-1,Turmeric,pcs,,1800,,false,false,,,',
+      'SKU-SER,Serial Widgets,pcs,,1800,,false,true,,,',
+    ].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
       .set('Authorization', `Bearer ${ownerToken}`)
@@ -259,6 +269,9 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       (item) => item.code === 'SKU-1',
     )!;
     skuId = sku.id;
+    serialSkuId = (skus.body.items as { code: string; id: string }[]).find(
+      (item) => item.code === 'SKU-SER',
+    )!.id;
   });
 
   it('happy path: one commit writes exactly one event + the projection, and the response carries event id/seq/on-hand', async () => {
@@ -353,12 +366,76 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
     }
   });
 
+  it('multi-serial adjustment: the response is the AGGREGATE snapshot (event.id/seq null, aggregate delta) while the timeline carries one exact event per serial (retro A4)', async () => {
+    const before = await eventCount();
+    const res = await adjust(opsToken, {
+      warehouseId,
+      skuId: serialSkuId,
+      binId: binA,
+      quantityDelta: 3,
+      reasonCode: 'stock-count',
+      note: 'serial intake',
+      serials: ['SN-A4-1', 'SN-A4-2', 'SN-A4-3'],
+    }).expect(201);
+    // The aggregate pairing: no single event can represent three appends.
+    expect(res.body.event).toMatchObject({
+      type: 'stock.adjusted',
+      skuId: serialSkuId,
+      binId: binA,
+      quantityDelta: 3,
+    });
+    expect(res.body.event.id).toBeNull();
+    expect(res.body.event.seq).toBeNull();
+    // The projection is still the real thing — three units landed.
+    expect(res.body.onHand).toEqual({ skuId: serialSkuId, binId: binA, quantity: 3 });
+    expect(await eventCount()).toBe(before + 3);
+
+    // The timeline carries exactly one event per serial unit, each with its
+    // own id/seq/serialRef and a ±1 delta — the response's aggregate cannot
+    // be reconciled against any one of them, which is the defect.
+    const timeline = await listEvents(opsToken, { skuId: serialSkuId }).expect(200);
+    const serialEvents = (timeline.body.items as {
+      id: string | null;
+      seq: number;
+      serialRef: string | null;
+      quantityDelta: number;
+    }[]).filter((event) => event.serialRef !== null);
+    expect(serialEvents).toHaveLength(3);
+    expect(new Set(serialEvents.map((event) => event.serialRef)).size).toBe(3);
+    for (const event of serialEvents) {
+      expect(typeof event.id).toBe('string');
+      expect(typeof event.seq).toBe('number');
+      expect(event.quantityDelta).toBe(1);
+    }
+  });
+
+  it('single-serial adjustment keeps its exact id/seq pairing (retro A4 is scoped to multi-serial only)', async () => {
+    const before = await eventCount();
+    // A DRAW of the serial the multi-serial intake above put into binA —
+    // one serial is one whole unit moving out.
+    const res = await adjust(opsToken, {
+      warehouseId,
+      skuId: serialSkuId,
+      binId: binA,
+      quantityDelta: -1,
+      reasonCode: 'damaged',
+      note: 'one unit written off',
+      serials: ['SN-A4-1'],
+    }).expect(201);
+    expect(res.body.event.quantityDelta).toBe(-1);
+    expect(typeof res.body.event.id).toBe('string');
+    expect(typeof res.body.event.seq).toBe('number');
+    expect(await eventCount()).toBe(before + 1);
+  });
+
   it('capability missing: an operator adjustment is 403 role-denied naming role + capability', async () => {
+    const before = await eventCount();
     const denied = await adjust(operatorToken, adjustmentBody({ quantityDelta: 1 })).expect(403);
     expect(denied.body).toMatchObject({ status: 403, code: 'role-denied' });
     expect(denied.body.detail).toContain('operator');
     expect(denied.body.detail).toContain('stock.adjust');
-    expect(await eventCount()).toBe(5);
+    // The refusal wrote nothing — the count is exactly what it was.
+    expect(await eventCount()).toBe(before);
   });
 
   it('actor demoted after the original request: the replay is 403 before the snapshot is served', async () => {
