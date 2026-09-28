@@ -137,6 +137,18 @@ export const CAPABILITIES = [
   // accountant all stay as they were. Mirrored into wms-fe
   // `src/lib/users.ts` (FE commit 8c1bfc7 — do not re-create).
   'adjustments.approve',
+  // Story 5-3 — FR-cycle-count's verbs. `counts.manage` plans: the on-demand
+  // count create (a planner pointing a bin at a count) AND the per-warehouse
+  // policy write (a policy IS the schedule — gating it separately would let
+  // a role that cannot manage counts redefine when counts happen, the
+  // `waves.manage` rationale). `counts.execute` is the floor verb —
+  // submitting the counted quantities through the inbox Count tab, mirroring
+  // `transfers.execute`/`picks.execute`: the operator counts what it walks.
+  // Accountant stays read-only. Mirrored into wms-fe `src/lib/users.ts`.
+  'counts.manage',
+  // The count submit is an operator task (the Count inbox tab's op; the
+  // floor-verb pattern — `putaway.execute`'s rationale).
+  'counts.execute',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -147,7 +159,7 @@ export type Capability = (typeof CAPABILITIES)[number];
  * mutations (warehouses, zones, bins, catalog import, SKU edit) but no user
  * management; Operator holds exactly the floor capabilities a device session
  * needs (`putaway.execute`, Story 3.5 — the first non-empty operator
- * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6; `labels.execute`, Story 4.6c; `excursion.record`, Story 12-5; `transfers.execute`, Story 5-1 — the floor
+ * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6; `labels.execute`, Story 4.6c; `excursion.record`, Story 12-5; `transfers.execute`, Story 5-1; `counts.execute`, Story 5-3 — the floor
  * records what it observes) and NOT `secure.move` (Story 12-3 — the
  * cage is off-limits to floor staff); Accountant is read-only. Reads stay
  * open to any tenant member.
@@ -188,6 +200,10 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // Story 5-1 — the manager may confirm an inbound leg too (the floor
     // verb's holder set mirrors `putaway.execute`).
     'transfers.execute',
+    // Story 5-3 — the count planner verbs + the floor verb (owner holds
+    // everything; the execute holder set mirrors `putaway.execute`).
+    'counts.manage',
+    'counts.execute',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
@@ -207,6 +223,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // arrived). A secure/cage dest bin still answers the 12-3 gate at the
     // intake movement, which the operator deliberately does not hold.
     'transfers.execute',
+    // Story 5-3 — the floor counts the bin (the Count inbox tab's op,
+    // mirroring `transfers.execute`).
+    'counts.execute',
   ]),
   accountant: new Set<Capability>([]),
 };

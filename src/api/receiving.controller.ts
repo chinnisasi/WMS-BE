@@ -186,12 +186,18 @@ export class ReceivingController {
     // warehouse, the inbound-confirm tasks. Same sequential composition: the
     // shell never nests one facade's transaction inside another's.
     const transferTasks = await this.movements.getTransferTasks(tenantId, query.warehouseId);
+    // Story 5-3: the Count inbox arm — STORED pending count tasks for this
+    // warehouse, with the expectations frozen at task start (the first
+    // stored task feed; every other arm derives on read). Same sequential
+    // composition.
+    const countTasks = await this.movements.getCountTasks(tenantId, query.warehouseId);
     return {
       ...snapshot,
       pickTasks: pickTasks.map((task) => ({ ...task })),
       packTasks: packWork.packTasks.map((task) => ({ ...task })),
       handlingUnits: packWork.handlingUnits.map((unit) => ({ ...unit })),
       transferTasks: transferTasks.map((task) => ({ ...task, lines: task.lines.map((line) => ({ ...line })) })),
+      countTasks: countTasks.map((task) => ({ ...task, lines: task.lines.map((line) => ({ ...line })) })),
     };
   }
 

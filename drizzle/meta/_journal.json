@@ -316,6 +316,13 @@
       "when": 1790603894424,
       "tag": "0044_adjustment_approval",
       "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "7",
+      "when": 1790609932169,
+      "tag": "0045_cycle_counts",
+      "breakpoints": true
     }
   ]
 }

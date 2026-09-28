@@ -5,6 +5,8 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
   bins,
+  countTaskLines,
+  countTasks,
   skus,
   transferOrderLines,
   transferOrders,
@@ -28,6 +30,12 @@ import {
   type TransferLegEventSnapshot,
   type TransferOrderSnapshot,
 } from './transfer.command';
+import {
+  CountService,
+  type CountPoliciesSnapshot,
+  type CreateCountSnapshot,
+  type SubmitCountSnapshot,
+} from './count.command';
 
 /**
  * The movements module's public seam (Story 5-1): every other module (and the
@@ -45,6 +53,10 @@ import {
 export const DEFAULT_TRANSFER_PAGE_SIZE = 50;
 /** The cap on the snapshot's Transfer inbox tasks (the pick/pack precedent). */
 export const MAX_SNAPSHOT_TRANSFER_TASKS = 500;
+/** The cap on the snapshot's Count inbox tasks (the same precedent). */
+export const MAX_SNAPSHOT_COUNT_TASKS = 500;
+/** The scheduler's per-warehouse-per-tick task bound (PENDING: tunable). */
+export const MAX_SCHEDULED_TASKS_PER_TICK = 200;
 
 export interface ListTransfersQuery {
   readonly status?: string | undefined;
@@ -92,6 +104,33 @@ export interface TransferTask {
   readonly note: string | null;
   readonly outboundConfirmedAt: string;
   readonly lines: readonly TransferTaskLine[];
+}
+
+/**
+ * One card of the device snapshot's Count inbox tasks (Story 5-3): a STORED
+ * `pending` count task for this warehouse — unlike every other inbox feed,
+ * its per-SKU expectations were FROZEN at task start (the task table, not a
+ * derived read). The lines carry the frozen expectations in base units; the
+ * submit names every line with a counted quantity (0 explicitly is valid).
+ */
+export interface CountTaskLine {
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly skuName: string | null;
+  /** The frozen expectation, base units at the edge (story 10.1). */
+  readonly expectedQuantity: number;
+}
+
+export interface CountTaskCard {
+  readonly taskId: string;
+  readonly warehouseId: string;
+  readonly binId: string;
+  readonly binCode: string;
+  readonly origin: string;
+  /** The bin state frozen at task start — the submit quotes it back. */
+  readonly binStateEpoch: number | null;
+  readonly createdAt: string;
+  readonly lines: readonly CountTaskLine[];
 }
 
 export interface TransferDetail {
@@ -155,6 +194,7 @@ export class MovementsFacade {
     @Inject(DATABASE) private readonly db: Database,
     // One-way: the facade consumes the commands; the commands never see it.
     @Inject(TransferService) private readonly commands: TransferService,
+    @Inject(CountService) private readonly countCommands: CountService,
     // The epoch read for the task cards (the same-tx capture the pick
     // command's task read established) and — nothing else; every stock write
     // already went through the command's facade passthroughs.
@@ -183,6 +223,48 @@ export class MovementsFacade {
 
   cancelTransfer(command: Parameters<TransferService['cancelTransfer']>[0], idempotencyKey: string) {
     return this.commands.cancelTransfer(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  // ── count command passthroughs (story 5-3; the api layer's only count
+  //    mutations) ──────────────────────────────────────────────────────────
+
+  createCount(
+    command: Parameters<CountService['createCount']>[0],
+    idempotencyKey: string,
+  ): Promise<CreateCountSnapshot> {
+    return this.countCommands.createCount(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  submitCount(
+    command: Parameters<CountService['submitCount']>[0],
+    idempotencyKey: string,
+  ): Promise<SubmitCountSnapshot> {
+    return this.countCommands.submitCount(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  upsertCountPolicies(
+    command: Parameters<CountService['upsertCountPolicies']>[0],
+    idempotencyKey: string,
+  ): Promise<CountPoliciesSnapshot> {
+    return this.countCommands
+      .upsertCountPolicies(command, idempotencyKey)
+      .then((result) => result.snapshot);
+  }
+
+  /**
+   * The CountSchedulerWorker's entry (the reaper precedent — the worker
+   * drives the facade, no HTTP command layer): one warehouse's due tasks,
+   * generated in ONE tenant transaction the worker opens. All-or-nothing
+   * per warehouse; the warehouse advisory lock is taken inside.
+   */
+  generateScheduledCountTasks(
+    tenantId: string,
+    warehouseId: string,
+    maxTasks: number,
+  ): Promise<readonly string[]> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.countCommands.generateScheduledTasksInTx(tx, tenantId, warehouseId, maxTasks),
+    );
   }
 
   // ── reads ────────────────────────────────────────────────────────────────
@@ -496,7 +578,118 @@ export class MovementsFacade {
       lines: linesByTransfer.get(order.id) ?? [],
     }));
   }
+
+  /**
+   * The device snapshot's Count inbox tasks (Story 5-3): one card per
+   * STORED `pending` count task for this warehouse — the movements module's
+   * first stored task feed (unlike the putaway/pick/transfer feeds, the
+   * per-SKU expectations were frozen at task start and are READ here, never
+   * recomputed). Oldest task first; the MAX+1 truncation shape (the
+   * transfer feed's precedent).
+   */
+  async getCountTasks(tenantId: string, warehouseId: string): Promise<readonly CountTaskCard[]> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.getCountTasksInTx(tx, tenantId, warehouseId),
+    );
+  }
+
+  /**
+   * The same read inside the CALLER'S transaction (the
+   * `getTransferTasksInTx` shape): the device catalog snapshot composes this
+   * beside its other reads in ONE tenant transaction.
+   */
+  async getCountTasksInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<readonly CountTaskCard[]> {
+    await assertWarehouseInTenant(tx, tenantId, warehouseId);
+
+    // Pending tasks for this warehouse, oldest first. One row over the
+    // ceiling: reading it is how we learn the result was truncated.
+    const taskRows = await tx
+      .select({
+        id: countTasks.id,
+        binId: countTasks.binId,
+        origin: countTasks.origin,
+        binStateEpoch: countTasks.binStateEpoch,
+        createdAt: countTasks.createdAt,
+      })
+      .from(countTasks)
+      .where(
+        and(
+          eq(countTasks.tenantId, tenantId),
+          eq(countTasks.warehouseId, warehouseId),
+          eq(countTasks.status, 'pending'),
+        ),
+      )
+      .orderBy(asc(countTasks.createdAt), asc(countTasks.id))
+      .limit(MAX_SNAPSHOT_COUNT_TASKS + 1);
+    const tasks = taskRows.slice(0, MAX_SNAPSHOT_COUNT_TASKS);
+    if (tasks.length === 0) {
+      return [];
+    }
+
+    const taskIds = tasks.map((task) => task.id);
+    const lineRows = await tx
+      .select({
+        taskId: countTaskLines.taskId,
+        skuId: countTaskLines.skuId,
+        skuCode: skus.code,
+        skuName: skus.name,
+        expectedQuantity: countTaskLines.expectedQuantity,
+      })
+      .from(countTaskLines)
+      .innerJoin(skus, eq(skus.id, countTaskLines.skuId))
+      .where(
+        and(eq(countTaskLines.tenantId, tenantId), inArray(countTaskLines.taskId, taskIds)),
+      )
+      .orderBy(asc(countTaskLines.taskId), asc(countTaskLines.skuId));
+    const linesByTask = new Map<string, CountTaskLine[]>();
+    for (const line of lineRows) {
+      const list = linesByTask.get(line.taskId) ?? [];
+      list.push({
+        skuId: line.skuId,
+        skuCode: line.skuCode,
+        skuName: line.skuName,
+        expectedQuantity: fromMilli(line.expectedQuantity),
+      });
+      linesByTask.set(line.taskId, list);
+    }
+
+    // The tasks' bin codes (a bare identity read; the task ids already
+    // scope them tenant-side).
+    const binIds = tasks.map((task) => task.binId);
+    const binRows = await tx
+      .select({ id: bins.id, code: bins.code })
+      .from(bins)
+      .where(and(eq(bins.tenantId, tenantId), inArray(bins.id, binIds)));
+    const binCodeById = new Map(binRows.map((row) => [row.id, row.code]));
+
+    return tasks.map((task) => ({
+      taskId: task.id,
+      warehouseId,
+      binId: task.binId,
+      // A task's bin always names its code (the bin row exists — validated
+      // at task creation and locked at submit), so an absent code is a
+      // corrupt row, not a task (the pick card's requireBinCode stance).
+      binCode: binCodeById.get(task.binId) ?? '',
+      origin: task.origin,
+      // The FROZEN epoch from the task row, not a live re-read: "expected =
+      // bin state at count start" — a live epoch would defeat the compare
+      // the submit runs under locks.
+      binStateEpoch: task.binStateEpoch,
+      createdAt: canonicalInstant(task.createdAt),
+      lines: linesByTask.get(task.id) ?? [],
+    }));
+  }
 }
 
 export type { TransferOrderSnapshot, TransferConfirmSnapshot, TransferLegEventSnapshot };
+export type {
+  CreateCountSnapshot,
+  SubmitCountSnapshot,
+  CountPoliciesSnapshot,
+  CountVarianceSnapshot,
+} from './count.command';
 export type { TransferOrder, TransferOrderLine };

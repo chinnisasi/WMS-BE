@@ -39,6 +39,8 @@ import {
   hazardClassesCompatible,
   segregationStateConflict,
 } from '../../shared/primitives/hazard';
+// Story 5-3 — the ABC class vocabulary validator (the hazard shape).
+import { assertAbcClass } from '../../shared/primitives/abc-class';
 import { binOccupantHazardPairsInTx } from '../putaway/putaway.command';
 import { openQcHoldsForSkuInTx } from '../inbound/qc.command';
 import {
@@ -105,6 +107,15 @@ export interface SkuSnapshot {
    * response field for legacy snapshots the same way.
    */
   readonly hazardClass: string | null;
+  /**
+   * Story 5-3 — the controlled-vocabulary ABC class (FR-cycle-count),
+   * REQUIRED on the interface and nullable (the `hazardClass` twin):
+   * toSnapshot always sets it (`row.abcClass ?? null` — every pre-5.3 row
+   * and every import row without the cell reads null = "not yet
+   * classified", OQ-1), and the replay serve point's normalizer pins the
+   * required response field for legacy snapshots the same way.
+   */
+  readonly abcClass: string | null;
   readonly reorderPoint: number;
   readonly reorderQty: number;
   readonly barcode: string;
@@ -191,6 +202,15 @@ export interface EditSkuCommand {
    * rule in either direction.
    */
   readonly hazardClass?: string | null | undefined;
+  /**
+   * Story 5-3 — the ABC class counts as a field for the empty-patch
+   * refusal, exactly as every other PATCH field does. Absent = unchanged,
+   * null = clear (the `hazardClass` twin — the column is nullable, the
+   * clear verb exists: an un-classified SKU is excluded from scheduled
+   * generation, OQ-1). A present value is vocabulary-checked beside the
+   * other class validators.
+   */
+  readonly abcClass?: string | null | undefined;
 }
 
 /**
@@ -305,13 +325,15 @@ export class SkuCommand {
       // Story 12-2 — the hazard class counts too (null = clear, a real
       // value).
       hazardClass: command.hazardClass,
+      // Story 5-3 — the ABC class counts too (null = clear, a real value).
+      abcClass: command.abcClass,
     };
     if (Object.values(fields).every((value) => value === undefined)) {
       throw new ProblemException(
         'validation-failed',
         400,
         'Empty SKU edit',
-        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass, hazardClass is required.',
+        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass, hazardClass, abcClass is required.',
       );
     }
     // ── story 11.2: this hash did NOT break ──────────────────────────────────
@@ -374,12 +396,16 @@ export class SkuCommand {
           const stored = existing[0].responseSnapshot as SkuSnapshot & {
             storageClass?: string;
             hazardClass?: string | null;
+            abcClass?: string | null;
           };
           return {
             snapshot: {
               ...stored,
               storageClass: stored.storageClass ?? 'ambient',
               hazardClass: stored.hazardClass ?? null,
+              // Story 5-3: the same normalizer pins `abcClass` (nullable, so
+              // absence normalizes to null — the hazardClass twin).
+              abcClass: stored.abcClass ?? null,
             },
             replayed: true,
           };
@@ -413,6 +439,10 @@ export class SkuCommand {
         });
         assertStorageClass({ storageClass: fields.storageClass });
         assertHazardClass({ hazardClass: fields.hazardClass });
+        // Story 5-3 — the ABC class rides the same validator slot (the
+        // `hazardClass` shape; absent/null skip, a present value must be in
+        // the vocabulary).
+        assertAbcClass({ abcClass: fields.abcClass });
 
         // ── Story 12-1: the class-change arm. The SKU row takes `.for('update')`
         // whenever the storage-class FIELD is present — a change, a no-op
@@ -863,6 +893,9 @@ export class SkuCommand {
         // Story 12-2 — absent = unchanged, null = clear (the 11.2 attribute
         // template; the column is nullable, the clear verb exists).
         if (fields.hazardClass !== undefined) updates.hazardClass = fields.hazardClass;
+        // Story 5-3 — absent = unchanged, null = clear (the hazardClass
+        // twin; null = not yet classified, OQ-1).
+        if (fields.abcClass !== undefined) updates.abcClass = fields.abcClass;
         // Story 11.3 — the variant columns move only when the patch moved
         // them (`undefined` = untouched; `null` = cleared with the detach).
         if (setProductId !== undefined) updates.productId = setProductId;
@@ -953,11 +986,14 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     // Story 12-1 — the controlled-vocabulary class (required; every SKU
     // carries one, default 'ambient').
     storageClass: row.storageClass,
-    // Story 12-2 — toSnapshot is the ONLY live-row read shape and it always
+    // Story 12-2 — toSnapshot is the module's only SKU read shape and it always
     // sets the class (`null` on every pre-12.2 row and import row without the
     // cell); the replay serve point's `?? null` normalizer pins the required
     // response field for legacy snapshots.
     hazardClass: row.hazardClass ?? null,
+    // Story 5-3 — the ABC class rides the same always-set shape (`null` on
+    // every pre-5.3 row and import row without the cell, OQ-1).
+    abcClass: row.abcClass ?? null,
     // Story 10.1: `toSnapshot` is the module's only SKU read shape — base
     // units leave here, milli-units stay in the column.
     reorderPoint: fromMilli(row.reorderPoint),

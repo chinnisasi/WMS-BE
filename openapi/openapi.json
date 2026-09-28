@@ -10797,6 +10797,388 @@
         ]
       }
     },
+    "/tenants/{tenantId}/movements/counts": {
+      "post": {
+        "operationId": "MovementsController_createCount",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCountDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Count task pending (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateCountResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse or the bin does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The bin already has a pending count task (count-task-open), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Creates an on-demand count task (counts.manage): one open task per bin, with the per-SKU expected quantities and the bin's state epoch FROZEN at task start — an epoch-mismatch recount or the scheduler creates the other tasks",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/counts/{taskId}/submit": {
+      "post": {
+        "description": "Accepts EITHER session family on the one route (the compliance controller's precedent): a web session or a device badge-in session — the Count inbox task's submit. Every task line must be counted; a line the body does not name is 400 count-incomplete (a 0 count must be EXPLICITLY entered).",
+        "operationId": "MovementsController_submitCount",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "taskId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitCountDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Count completed: the variances and, on an epoch conflict, the recount task (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubmitCountResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid body, or a task line the body never counted (count-incomplete)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token of either family, or a device token without a badge-in session (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks counts.execute (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The count task or a named SKU does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The task is already completed (count-task-completed), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "device": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Submits a count (counts.execute — either session family): every task line is recorded with its counted quantity; counted ≠ expected appends an open variance row; the bin's epoch is compared for EQUALITY under the locks — a mismatch flags the variances AND auto-creates a fresh recount task (never a stock write)",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/warehouses/{warehouseId}/count-policies": {
+      "put": {
+        "operationId": "MovementsController_upsertCountPolicies",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertCountPoliciesDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The warehouse's policy set after the upsert (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CountPoliciesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — an unknown abc_class or a non-positive interval (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent first write of the same policy lost the unique-index race (conflict — retry), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Upserts the warehouse's cycle-count policies (counts.manage): one row per (tenant, warehouse, ABC class) naming the scheduled count interval in days — a class with no row is never scheduled",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
     "/tenants/{tenantId}/movements/transfers/{transferId}": {
       "get": {
         "operationId": "MovementsController_getTransfer",
@@ -12297,6 +12679,17 @@
             "example": "flammable",
             "description": "The SKU's hazard class (FR-41), or null when it carries none. Null carries no rule in either direction of the segregation matrix."
           },
+          "abcClass": {
+            "type": "string",
+            "enum": [
+              "a",
+              "b",
+              "c"
+            ],
+            "nullable": true,
+            "example": "a",
+            "description": "The SKU's ABC classification the cycle-count scheduler schedules from, or null when it is not yet classified — a null class is EXCLUDED from scheduled count generation (on-demand still covers its bin, OQ-1)."
+          },
           "barcode": {
             "type": "string",
             "example": "0198f7a2-1b3c-7d4e-8f90-112233445588",
@@ -12336,6 +12729,7 @@
           "variantValues",
           "storageClass",
           "hazardClass",
+          "abcClass",
           "barcode",
           "uomConversions",
           "createdAt"
@@ -12679,6 +13073,17 @@
             "nullable": true,
             "example": "flammable",
             "description": "The SKU's hazard class (FR-41): explosive, oxidizer, flammable, corrosive-acid, corrosive-base, toxic or gas. Omit to leave unchanged; null clears the class (always succeeds — null carries no rule)."
+          },
+          "abcClass": {
+            "type": "string",
+            "enum": [
+              "a",
+              "b",
+              "c"
+            ],
+            "nullable": true,
+            "example": "a",
+            "description": "The SKU's ABC classification (FR-cycle-count): a, b or c. Omit to leave unchanged; null clears the class (excludes the SKU from scheduled count generation, on-demand still covers it)."
           }
         }
       },
@@ -17287,6 +17692,90 @@
           "lines"
         ]
       },
+      "CatalogCountTaskLineDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string",
+            "nullable": true
+          },
+          "expectedQuantity": {
+            "type": "number",
+            "description": "The expectation frozen at task start. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "skuId",
+          "skuCode",
+          "skuName",
+          "expectedQuantity"
+        ]
+      },
+      "CatalogCountTaskDto": {
+        "type": "object",
+        "properties": {
+          "taskId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The count task awaiting submit"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binCode": {
+            "type": "string",
+            "description": "The bin the count walks (the scan that opens the flow)"
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "on_demand",
+              "scheduled",
+              "recount"
+            ],
+            "description": "How the task was born"
+          },
+          "binStateEpoch": {
+            "type": "number",
+            "nullable": true,
+            "description": "The bin state epoch FROZEN at task start — the submit quotes it back for the equality compare"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "When the task was created (ISO-8601 UTC)"
+          },
+          "lines": {
+            "description": "The FROZEN expectations — every line must be counted at submit",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogCountTaskLineDto"
+            }
+          }
+        },
+        "required": [
+          "taskId",
+          "warehouseId",
+          "binId",
+          "binCode",
+          "origin",
+          "binStateEpoch",
+          "createdAt",
+          "lines"
+        ]
+      },
       "CatalogSnapshotResponse": {
         "type": "object",
         "properties": {
@@ -17352,6 +17841,13 @@
             "items": {
               "$ref": "#/components/schemas/CatalogTransferTaskDto"
             }
+          },
+          "countTasks": {
+            "description": "Story 5-3 (additive): the STORED pending count tasks of this warehouse — the Count inbox tasks whose submit the operator executes (every task line must be counted; 0 is a valid explicit count). The expectations were FROZEN at task start and are read here, never recomputed",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogCountTaskDto"
+            }
           }
         },
         "required": [
@@ -17364,7 +17860,8 @@
           "pickTasks",
           "packTasks",
           "handlingUnits",
-          "transferTasks"
+          "transferTasks",
+          "countTasks"
         ]
       },
       "GoodsReceiptEntryDto": {
@@ -18861,6 +19358,221 @@
             "maxLength": 500
           }
         }
+      },
+      "CreateCountDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse holding the bin"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The bin to count (in that warehouse)"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock",
+            "minLength": 20,
+            "maxLength": 35
+          }
+        },
+        "required": [
+          "warehouseId",
+          "binId"
+        ]
+      },
+      "CountTaskLineResponseDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedQuantity": {
+            "type": "number",
+            "description": "The frozen expectation at task start. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "skuId",
+          "expectedQuantity"
+        ]
+      },
+      "CreateCountResponse": {
+        "type": "object",
+        "properties": {
+          "countTask": {
+            "type": "object"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CountTaskLineResponseDto"
+            }
+          }
+        },
+        "required": [
+          "countTask",
+          "lines"
+        ]
+      },
+      "SubmitCountLineDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "countedQuantity": {
+            "type": "number",
+            "description": "What the operator counted. 0 is a valid count. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0,
+            "maximum": 9007199254740
+          }
+        },
+        "required": [
+          "skuId",
+          "countedQuantity"
+        ]
+      },
+      "SubmitCountDto": {
+        "type": "object",
+        "properties": {
+          "lines": {
+            "maxItems": 500,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubmitCountLineDto"
+            }
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock",
+            "minLength": 20,
+            "maxLength": 35
+          }
+        },
+        "required": [
+          "lines"
+        ]
+      },
+      "CountVarianceResponseDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedQuantity": {
+            "type": "number",
+            "minimum": 0
+          },
+          "countedQuantity": {
+            "type": "number",
+            "minimum": 0
+          },
+          "delta": {
+            "type": "number",
+            "description": "counted − expected (may be negative)"
+          },
+          "epochConflict": {
+            "type": "boolean",
+            "description": "A movement moved the bin between task start and submit (OQ-2)"
+          }
+        },
+        "required": [
+          "skuId",
+          "expectedQuantity",
+          "countedQuantity",
+          "delta",
+          "epochConflict"
+        ]
+      },
+      "SubmitCountResponse": {
+        "type": "object",
+        "properties": {
+          "countTask": {
+            "type": "object"
+          },
+          "variances": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CountVarianceResponseDto"
+            }
+          },
+          "recountTaskId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The auto-created recount task when the epoch conflicted (OQ-2)"
+          }
+        },
+        "required": [
+          "countTask",
+          "variances",
+          "recountTaskId"
+        ]
+      },
+      "CountPolicyDto": {
+        "type": "object",
+        "properties": {
+          "abcClass": {
+            "type": "string",
+            "enum": [
+              "a",
+              "b",
+              "c"
+            ]
+          },
+          "intervalDays": {
+            "type": "number",
+            "description": "Count every due bin of this class at most this often",
+            "minimum": 1,
+            "maximum": 3650
+          }
+        },
+        "required": [
+          "abcClass",
+          "intervalDays"
+        ]
+      },
+      "UpsertCountPoliciesDto": {
+        "type": "object",
+        "properties": {
+          "policies": {
+            "maxItems": 3,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CountPolicyDto"
+            }
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock",
+            "minLength": 20,
+            "maxLength": 35
+          }
+        },
+        "required": [
+          "policies"
+        ]
+      },
+      "CountPoliciesResponse": {
+        "type": "object",
+        "properties": {
+          "policies": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        },
+        "required": [
+          "policies"
+        ]
       },
       "TransferListResponse": {
         "type": "object",

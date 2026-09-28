@@ -43,6 +43,9 @@ import { assertStorageClass } from '../../shared/primitives/storage-class';
 // Story 12-2 — the hazard vocabulary validator (the same shape, skipping
 // null — the blank cell IS the null verb on this column).
 import { assertHazardClass } from '../../shared/primitives/hazard';
+// Story 5-3 — the ABC class vocabulary validator (the same shape, skipping
+// null — the blank cell IS the null verb on this column).
+import { assertAbcClass } from '../../shared/primitives/abc-class';
 import {
   AXIS_NAME_MAX,
   PRODUCT_NAME_MAX,
@@ -149,6 +152,12 @@ const OPTIONAL_COLUMNS = [
   // null = "not hazardous" and carries no rule). The closed-header contract
   // grows again (the 11.3 precedent).
   'hazard_class',
+  // Story 5-3 (FR-cycle-count) — the ABC class the count scheduler schedules
+  // from (OQ-1). A blank cell maps to NULL (the hazard_class precedent — the
+  // column is nullable; null = "not yet classified" and EXCLUDES the SKU
+  // from scheduled generation; on-demand still covers its bin). The
+  // closed-header contract grows again (the 11.3 precedent).
+  'abc_class',
 ] as const;
 const KNOWN_COLUMNS: ReadonlySet<string> = new Set([...REQUIRED_COLUMNS, ...OPTIONAL_COLUMNS]);
 
@@ -197,6 +206,8 @@ interface ValidRow {
   readonly storageClass: string;
   /** Story 12-2 — the hazard class; a blank cell maps to null (the clear verb — the column is nullable). */
   readonly hazardClass: string | null;
+  /** Story 5-3 — the ABC class; a blank cell maps to null (null = not yet classified, OQ-1). */
+  readonly abcClass: string | null;
 }
 
 type FieldResult<T> = { ok: true; value: T } | { ok: false; error: CatalogImportErrorDto };
@@ -487,6 +498,9 @@ export class ImportCommand {
             // Story 12-2 — the hazard class from the cell (blank → null —
             // the column is nullable; the 12-1 NOT NULL verb does not apply).
             hazardClass: row.hazardClass,
+            // Story 5-3 — the ABC class from the cell (blank → null; null =
+            // not yet classified, excluded from scheduled generation, OQ-1).
+            abcClass: row.abcClass,
           }));
           try {
             for (const chunk of chunked(skuRows)) {
@@ -1286,6 +1300,32 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
     };
   }
 
+  // Story 5-3 (FR-cycle-count) — the ABC class (OQ-1). A blank cell maps to
+  // NULL — the column is nullable and null means "not yet classified" (the
+  // hazard_class precedent; the 12-1 blank→ambient choice was NOT
+  // NULL-specific). `assertAbcClass` rules on every present value beside the
+  // validator — a cell outside the controlled vocabulary is a per-row error
+  // naming the value, so the rest of the file still commits and `fix` mode
+  // can re-submit this row.
+  const abcClassRaw = v['abc_class']?.trim() ?? '';
+  const abcClass = abcClassRaw === '' ? null : abcClassRaw;
+  try {
+    assertAbcClass({ abcClass });
+  } catch (err) {
+    const response = (err as ProblemException).getResponse() as { detail?: string };
+    // The shared validator names the command field (`abcClass`); the CSV
+    // caller's column is the snake_case header, so the row error names THAT.
+    return {
+      ok: false,
+      error: rowError(
+        row.rowNumber,
+        code,
+        'validation-failed',
+        response.detail?.replace('abcClass', 'abc_class') ?? 'Invalid abc_class value.',
+      ),
+    };
+  }
+
   const conversions: { uom: string; factor: number }[] = [];
   const conversionsRaw = v['uom_conversions']?.trim() ?? '';
   if (conversionsRaw !== '') {
@@ -1400,6 +1440,9 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       // Story 12-2 — the parsed hazard class (blank → null — the column is
       // nullable; null is the row's "not hazardous" state).
       hazardClass,
+      // Story 5-3 — the parsed ABC class (blank → null; null = excluded
+      // from scheduled generation, OQ-1).
+      abcClass,
     },
   };
 }
