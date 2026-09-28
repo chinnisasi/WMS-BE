@@ -14,6 +14,7 @@ import {
   Length,
   Max,
   Min,
+  ValidateNested,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
@@ -101,6 +102,10 @@ export class CreateTransferDto {
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(500)
+  // The global ValidationPipe only descends into nested objects when told to
+  // — without `@ValidateNested`, TransferLineDto's constraints never run and
+  // a line with no skuId/garbage quantity reaches the command.
+  @ValidateNested({ each: true })
   lines!: TransferLineDto[];
 }
 
@@ -148,6 +153,10 @@ export class ConfirmOutboundDto {
   @Type(() => ConfirmOutboundLineDto)
   @IsArray()
   @ArrayMaxSize(500)
+  // Same nested-validation rule as `CreateTransferDto.lines` — the pipe does
+  // not descend without it, so a malformed arm (e.g. a blank serial string)
+  // would otherwise sail through to the command.
+  @ValidateNested({ each: true })
   lines?: ConfirmOutboundLineDto[];
 }
 

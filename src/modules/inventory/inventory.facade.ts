@@ -1554,6 +1554,28 @@ export class InventoryFacade {
         }
       }
     }
+    // The moving SKUs against EACH OTHER (story 5-1 review): the occupants
+    // loop skips a moving SKU's own rows, so two mutually segregated SKUs
+    // landing in one bin within a single confirm would pass against empty
+    // occupants — and the transfer inbound confirm is the FIRST writer that
+    // can create such a pair in one transaction (no prior writer lands two
+    // SKUs at once).
+    for (let i = 0; i < skuIds.length; i++) {
+      for (let j = i + 1; j < skuIds.length; j++) {
+        const a = skuById.get(skuIds[i]!)!;
+        const b = skuById.get(skuIds[j]!)!;
+        if (!hazardClassesCompatible(a.hazardClass, b.hazardClass)) {
+          throw new ProblemException(
+            'bin-segregation-conflict',
+            409,
+            'Landing SKUs are segregated from each other',
+            `SKUs "${a.code}" (${a.hazardClass ?? 'no hazard class'}) and "${b.code}" ` +
+              `(${b.hazardClass ?? 'no hazard class'}) are segregated from each other and cannot ` +
+              `land in bin "${bin.code}" together (FR-41).`,
+          );
+        }
+      }
+    }
 
     // The load read (the gates' shared input — one query, the
     // `binOccupancyInTx` shape: LEFT join so the units sum stays

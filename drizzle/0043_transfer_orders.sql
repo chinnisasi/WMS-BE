@@ -20,16 +20,24 @@ BEGIN
 END $$;--> statement-breakpoint
 
 -- ── 1. the pre-flight block ───────────────────────────────────────────────
--- The seed maps every warehouse to ITS OWN tenant's IN-TRANSIT bin, so the
--- only unmappable row is a warehouse whose `tenant_id` has no `tenants` row —
--- an orphan that no INSERT can repair (the bin row would carry a tenant_id
--- no RLS policy ever matches, invisible to every reader). The block lists
--- EVERY orphan at once, so an operator fixes all of them in one pass.
--- Orphan bins/zones under a live warehouse cannot exist for this seed: the
--- zone/bin codes are new ('IN-TRANSIT'), so nothing pre-exists to collide.
+-- Two ways the seed below cannot produce a correct system bin, both listed
+-- EVERY-occurrences-at-once so an operator fixes them all in one pass:
+--
+-- a) a warehouse whose `tenant_id` has no `tenants` row — an orphan the seed
+--    maps to no tenant's bin (the bin row would carry a tenant_id no RLS
+--    policy ever matches, invisible to every reader);
+--
+-- b) a warehouse already holding a USER bin coded 'IN-TRANSIT' — the bin
+--    insert's ON CONFLICT (warehouse_id, code) would silently no-op onto the
+--    user's bin, and the seed would leave it non-system-owned, so the ATP
+--    hook (which reads code + system_owned) would count zero parked units.
+--    The remediation is the same the runtime ensure throws on 409
+--    (`transfer-in-transit-bin-conflict`): rename or retire the user bin,
+--    then re-run the migration.
 DO $$
 DECLARE
 	orphans text;
+	squatters text;
 	wh_count bigint;
 BEGIN
 	SELECT string_agg(format('warehouse %s claims tenant %s', w.id, w.tenant_id), ', ' ORDER BY w.id)
@@ -38,6 +46,14 @@ BEGIN
 	WHERE t.id IS NULL;
 	IF orphans IS NOT NULL THEN
 		RAISE EXCEPTION 'migration 0043 pre-flight failed: warehouses whose tenant does not exist, unmappable to any IN-TRANSIT bin (%)', orphans;
+	END IF;
+	SELECT string_agg(format('warehouse %s (%s)', w.id, w.code), ', ' ORDER BY w.id)
+	INTO squatters
+	FROM warehouses w
+	JOIN bins b ON b.warehouse_id = w.id AND b.code = 'IN-TRANSIT' AND NOT b.system_owned
+	WHERE b.id IS NOT NULL;
+	IF squatters IS NOT NULL THEN
+		RAISE EXCEPTION 'migration 0043 pre-flight failed: warehouses holding a user bin coded "IN-TRANSIT" — the system bin cannot be seeded there; rename or retire the user bin and re-run (%)', squatters;
 	END IF;
 	SELECT count(*) INTO wh_count FROM warehouses;
 	RAISE NOTICE 'migration 0043: seeding the IN-TRANSIT zone + bin for % warehouse(s)', wh_count;
@@ -107,8 +123,10 @@ CREATE POLICY "transfer_order_lines_tenant_isolation" ON "transfer_order_lines"
 -- ── 2. the data migration: one IN-TRANSIT zone + bin per warehouse ───────
 -- The system in-transit bin (story 5-1): the QC-hold bin's mirror (3.4).
 -- Every warehouse gets exactly one, seeded HERE for the warehouses that
--- already exist and at warehouse creation for the new ones
--- (`ensureInTransitBinInTx`, beside `ensureQcHoldBinInTx`). Identity is the
+-- already exist and lazily ensured by the transfer legs' first use for
+-- warehouses created afterwards (`ensureInTransitBinInTx` in
+-- src/modules/tenancy/receiving-bin.ts — the QC-hold ensure's mirror;
+-- nothing is created at warehouse creation). Identity is the
 -- fixed code pair — zone `IN-TRANSIT`, bin `IN-TRANSIT` — `system_owned`
 -- flags it (putaway suggestions, picking and placements exclude it; the ATP
 -- hook `inTransitUnits` counts the stock sitting in it by code +

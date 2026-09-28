@@ -8,6 +8,7 @@ import { AUTH_DATABASE, DATABASE } from '../../src/shared/shared.module';
 import { InventoryFacade } from '../../src/modules/inventory/inventory.facade';
 import { getLedgerEventType } from '../../src/modules/inventory/ledger-registry';
 import { useSuiteDatabase, type SuiteDatabase } from '../support/suite-db';
+import type { ProblemException } from '../../src/shared/problem-details/problem.exception';
 import { testAddress } from '../support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
@@ -52,6 +53,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
   let operatorToken: string;
   let operatorEmail = '';
   let deviceOperatorToken: string; // the operator's badge-in (device) session
+  let bareDeviceToken: string; // the SAME device's pre-badge-in enrollment credential
   let accountantToken: string;
   let sourceWarehouseId: string; // W1 — the stock lives here
   let destWarehouseId: string; // W2 — the cross-warehouse landing
@@ -221,6 +223,7 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       .set(KEY_HEADER, ulid())
       .send({ code: minted.body.code, label: 'transfer-suite device', pin: '1357' })
       .expect(201);
+    bareDeviceToken = enrolled.body.deviceToken as string;
     deviceOperatorToken = (
       await request(app.getHttpServer())
         .post(`${API}/${tenantId}/devices/badge-in`)
@@ -963,6 +966,240 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
     });
   });
 
+  // ── review-round arms (story 5-1, review triage V1-V7) ────────────────────
+  describe('review-round arms', () => {
+    it('V1: the inbound confirm answers a device badge-in session (200, completes) and refuses a bare enrollment credential (401 unauthenticated)', async () => {
+      const skuId = skuIds.get(PLAIN)!;
+      const created = await createTransfer({
+        sourceWarehouseId,
+        destWarehouseId: sourceWarehouseId,
+        lines: [{ skuId, quantity: 1, fromBinId: binSrc, toBinId: binSameWh }],
+      }).expect(201);
+      const transferId = created.body.transfer.id as string;
+      await outboundConfirm(transferId).expect(200);
+
+      // The bare (pre-badge-in) device credential has no operator — 401, and
+      // the confirm wrote nothing (the putaway/picking authority precedent).
+      await inboundConfirm(transferId, {}, bareDeviceToken)
+        .expect(401)
+        .then((res) => expect(res.body).toMatchObject({ code: 'unauthenticated' }));
+      expect(await transferEvents(transferId)).toHaveLength(1); // outbound only
+
+      // The operator's badge-in session IS the floor verb's session family.
+      const inbound = await inboundConfirm(transferId, { destBinId: binSameWh }, deviceOperatorToken).expect(200);
+      expect(inbound.body.transfer).toMatchObject({ id: transferId, status: 'completed' });
+      expect(inbound.body.events).toHaveLength(1);
+      expect(inbound.body.events[0]).toMatchObject({ type: 'transfer.inbound', quantity: 1 });
+    });
+
+    it('V2: the parked units are unpromisable — a grant whose request only fits when the in-transit term is ignored refuses 409 naming the in-transit units', async () => {
+      // The blocked-bin + replay transfers still hold 2 PLAIN units parked in
+      // W1's IN-TRANSIT bin — and a parked row IS a stock_on_hand row, so
+      // on-hand (15: 3 binSrc + 7 binSameWh + 3 binSpare + 2 parked) still
+      // counts them. The in-transit ceiling term is what turns a 14-unit
+      // request — one that fits the physical on-hand — into a refusal.
+      let refused: { code: string; detail?: string } | undefined;
+      try {
+        await reservations.grantReservation({
+          tenantId,
+          warehouseId: sourceWarehouseId,
+          skuId: skuIds.get(PLAIN)!,
+          ownerType: 'transfer-spec',
+          ownerId: `grant-${ulid()}`,
+          quantity: 14000, // milli — 14 base units: fits on-hand, not the ceiling
+        });
+      } catch (error) {
+        refused = (error as ProblemException).getResponse() as { code: string; detail?: string };
+      }
+      expect(refused).toBeDefined();
+      expect(refused!.code).toBe('unavailable');
+      // The refusal NAMES the parked units (the qcHeld precedent, story 5-1).
+      expect(String(refused!.detail)).toContain('in transit');
+      // The ceiling figure: 15 on-hand minus the 2 parked = 13 sellable.
+      expect(String(refused!.detail)).toContain('has 13 sellable');
+      // Nothing was parked differently by the refused grant.
+      expect((await reservations.atp(tenantId, sourceWarehouseId, skuIds.get(PLAIN)!)).inTransit).toBe(2000);
+    });
+
+    it('V3: stock.adjust targeting the system IN-TRANSIT bin answers the system-bin refusal', async () => {
+      const refused = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/inventory/adjustments`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId: sourceWarehouseId,
+          skuId: skuIds.get(PLAIN),
+          binId: inTransitBinSource,
+          quantityDelta: 1,
+          reasonCode: 'cycle-count',
+          note: 'transfer-suite system-bin arm',
+        })
+        .expect(400);
+      expect(refused.body.code).toBe('qc-bin-not-adjustable');
+      // The system-bin refusal names the system bins in its title (the
+      // adjustment surface's own gate — a transfer intake targeting a system
+      // bin answers the facade's 400 'validation-failed' arm instead).
+      expect(String(refused.body.title)).toContain('system');
+    });
+
+    it('V4: an inbound-confirm retry with the same Idempotency-Key and payload replays the stored snapshot — one leg, not two', async () => {
+      const skuId = skuIds.get(PLAIN)!;
+      const created = await createTransfer({
+        sourceWarehouseId,
+        destWarehouseId: sourceWarehouseId,
+        lines: [{ skuId, quantity: 1, fromBinId: binSrc, toBinId: binSameWh }],
+      }).expect(201);
+      const transferId = created.body.transfer.id as string;
+      await outboundConfirm(transferId).expect(200);
+
+      const key = ulid();
+      const first = await inboundConfirm(transferId, { destBinId: binSameWh }, operatorToken, key).expect(200);
+      const second = await inboundConfirm(transferId, { destBinId: binSameWh }, operatorToken, key).expect(200);
+      expect(second.body).toEqual(first.body);
+      // The replay appended nothing: 1 outbound + 1 inbound, exactly.
+      expect(await transferEvents(transferId)).toHaveLength(2);
+      expect(await onHandMilli(sourceWarehouseId, skuId, binSameWh)).toBe(8000); // 7 (V1 included) + 1
+    });
+
+    it('V6: a secure/cage dest bin confirmed without secure.move answers 403 role-denied; a secure.move holder confirms', async () => {
+      // The cage: a storageClass 'secure' bin in W2 (story 12-1's bin field).
+      const zoneRows = await sql`
+        select id from zones where warehouse_id = ${destWarehouseId}::uuid and code = 'B' limit 1`;
+      const secureBin = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${destWarehouseId}/zones/${(zoneRows[0] as { id: string }).id}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 1000, type: 'shelf', code: 'B-01-04', storageClass: 'secure' })
+          .expect(201)
+      ).body.id as string;
+
+      // The cage's SKU: TR-COMP holds no stock, so its class edits freely to
+      // 'secure' (an ambient-stock SKU would answer storageClassConflict) —
+      // and only a secure-class SKU passes the 12-1 class gate into the cage.
+      const compSkuId = skuIds.get(COMPONENT)!;
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${compSkuId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ storageClass: 'secure' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/inventory/adjustments`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId: sourceWarehouseId,
+          skuId: compSkuId,
+          binId: binSrc,
+          quantityDelta: 1,
+          reasonCode: 'cycle-count',
+          note: 'transfer-suite V6 secure seed',
+        })
+        .expect(201);
+
+      const created = await createTransfer({
+        sourceWarehouseId,
+        destWarehouseId,
+        lines: [{ skuId: compSkuId, quantity: 1, fromBinId: binSrc, toBinId: secureBin }],
+      }).expect(201);
+      const transferId = created.body.transfer.id as string;
+      await outboundConfirm(transferId).expect(200);
+
+      // The operator holds transfers.execute but NOT secure.move — the cage
+      // authority (12-3) refuses the inbound leg, the order stays in_transit.
+      await inboundConfirm(transferId, { destBinId: secureBin }, operatorToken)
+        .expect(403)
+        .then((res) => {
+          expect(res.body.code).toBe('role-denied');
+          expect(JSON.stringify(res.body.detail ?? res.body)).toContain('secure.move');
+        });
+      const detail = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/movements/transfers/${transferId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      expect(detail.body.transfer.status).toBe('in_transit');
+      expect(await onHandMilli(destWarehouseId, compSkuId, secureBin)).toBeNull();
+
+      // The ops manager holds secure.move: the same confirm lands the units.
+      await inboundConfirm(transferId, { destBinId: secureBin }, opsToken).expect(200);
+      expect(await onHandMilli(destWarehouseId, compSkuId, secureBin)).toBe(1000);
+    });
+
+    it('V7: two lines of the SAME serial-tracked SKU complete both legs — each line replays only ITS OWN serials', async () => {
+      // Fresh serials: TR-SN-1/2/3 moved cross-warehouse in the serial happy
+      // path; this arm seeds its own pair so the drain derivation is observed
+      // on serials whose only prior movement is this transfer.
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/inventory/adjustments`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId: sourceWarehouseId,
+          skuId: skuIds.get(SERIAL),
+          binId: binSpare,
+          quantityDelta: 2,
+          reasonCode: 'cycle-count',
+          note: 'transfer-suite V7 serial seed',
+          serials: ['TR-SN-7', 'TR-SN-8'],
+        })
+        .expect(201);
+
+      const skuId = skuIds.get(SERIAL)!;
+      const created = await createTransfer({
+        sourceWarehouseId,
+        destWarehouseId: sourceWarehouseId,
+        lines: [
+          { skuId, quantity: 1, fromBinId: binSpare, toBinId: binSameWh },
+          { skuId, quantity: 1, fromBinId: binSpare, toBinId: binSameWh },
+        ],
+      }).expect(201);
+      const transferId = created.body.transfer.id as string;
+      const [line1, line2] = created.body.lines as { id: string }[];
+      await outboundConfirm(transferId, {
+        lines: [
+          { lineId: line1!.id, serials: ['TR-SN-7'] },
+          { lineId: line2!.id, serials: ['TR-SN-8'] },
+        ],
+      }).expect(200);
+      await inboundConfirm(transferId, {}).expect(200);
+
+      const serialIdByCode = new Map<string, string>(
+        (
+          await sql`
+            select serial_number, id from serials
+            where tenant_id = ${tenantId} and sku_id = ${skuId}::uuid`
+        ).map((row) => [(row as { serial_number: string; id: string }).serial_number, (row as { id: string }).id]),
+      );
+      const sn7 = serialIdByCode.get('TR-SN-7')!;
+      const sn8 = serialIdByCode.get('TR-SN-8')!;
+
+      // 2 outbound relocations + 2 inbound relocations (same-warehouse: one
+      // relocation per leg per serial) — and critically, each line's arm
+      // carries exactly its OWN serial (the per-line `referenceDoc->>'lineId'`
+      // derivation; a bySku grouping would replay BOTH serials per line and
+      // fail the second line's arm on an already-drained serial).
+      const events = await transferEvents(transferId);
+      expect(events).toHaveLength(4);
+      const outbound = events.filter((event) => event.type === 'transfer.outbound');
+      const inbound = events.filter((event) => event.type === 'transfer.inbound');
+      expect(outbound).toHaveLength(2);
+      expect(inbound).toHaveLength(2);
+      for (const event of outbound) {
+        expect(event).toMatchObject({ from_bin_id: binSpare, to_bin_id: inTransitBinSource, quantity_delta: '1000' });
+      }
+      for (const event of inbound) {
+        expect(event).toMatchObject({ from_bin_id: inTransitBinSource, to_bin_id: binSameWh, quantity_delta: '1000' });
+      }
+      // Each leg moved exactly the two distinct serials — no serial moved
+      // twice (the bySku bug's signature).
+      expect(outbound.map((event) => event.serial_ref).sort()).toEqual([sn7, sn8].sort());
+      expect(inbound.map((event) => event.serial_ref).sort()).toEqual([sn7, sn8].sort());
+      expect(new Set(inbound.map((event) => event.serial_ref)).size).toBe(2);
+      expect(await onHandMilli(sourceWarehouseId, skuId, binSameWh)).toBe(2000);
+    });
+  });
+
   // ── reads + the device snapshot ───────────────────────────────────────────
   describe('reads and the device snapshot arm', () => {
     it('the list reads with status filter and keyset cursor', async () => {
@@ -1091,6 +1328,45 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
           await probe.unsafe(
             `insert into transfer_orders (tenant_id, source_warehouse_id, dest_warehouse_id, status, created_by)
              values ('${tenantId}', '${sourceWarehouseId}', '${destWarehouseId}', 'draft', '00000000-0000-0000-0000-000000000000')`,
+          );
+        } catch {
+          writeRefused = true;
+        }
+        expect(writeRefused).toBe(true);
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('RLS: transfer_order_lines answers the same tenant-isolation policy (read scoping + WITH CHECK write refusal)', async () => {
+      const probe = postgres(process.env.DATABASE_URL!.replace('://wms:wms@', '://wms_rls_probe:wms_rls_probe@'), {
+        max: 1,
+      });
+      try {
+        // Tenant A's setting: exactly tenant A's lines are visible.
+        await probe.unsafe(`set app.tenant_id = '${tenantId}'`);
+        const mine = await probe.unsafe('select count(*)::int as n from transfer_order_lines');
+        const allMine = await sql`select count(*)::int as n from transfer_order_lines where tenant_id = ${tenantId}`;
+        expect(Number((mine[0] as unknown as { n: number }).n)).toBe(
+          Number((allMine[0] as unknown as { n: number }).n),
+        );
+        expect(Number((mine[0] as unknown as { n: number }).n)).toBeGreaterThan(0);
+        // Flip to tenant B: tenant A's lines vanish, and a write naming
+        // tenant A is refused by the WITH CHECK arm.
+        await probe.unsafe(`set app.tenant_id = '${otherTenantId}'`);
+        const foreign = await probe.unsafe(
+          'select count(*)::int as n from transfer_order_lines where tenant_id = ' + `'${tenantId}'`,
+        );
+        expect(Number((foreign[0] as unknown as { n: number }).n)).toBe(0);
+        const anyMine = await sql`select * from transfer_order_lines where tenant_id = ${tenantId} limit 1`;
+        let writeRefused = false;
+        try {
+          await probe.unsafe(
+            `insert into transfer_order_lines (tenant_id, transfer_id, sku_id, quantity_milli, from_bin_id, to_bin_id)
+             values ('${tenantId}', '${(anyMine[0] as { transfer_id: string }).transfer_id}',
+                     '${(anyMine[0] as { sku_id: string }).sku_id}', 1000,
+                     '${(anyMine[0] as { from_bin_id: string }).from_bin_id}',
+                     '${(anyMine[0] as { to_bin_id: string }).to_bin_id}')`,
           );
         } catch {
           writeRefused = true;

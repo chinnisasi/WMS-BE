@@ -3,6 +3,7 @@ import { bins, zones } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { QUANTITY_SCALE } from '../../shared/primitives/quantity';
+import { ProblemException } from '../../shared/problem-details/problem.exception';
 
 /**
  * The system Receiving bin (Story 3.3): every warehouse owns exactly one,
@@ -50,16 +51,18 @@ export const QC_HOLD_BIN_CAPACITY = 1_000_000 * QUANTITY_SCALE;
 
 /**
  * The system IN-TRANSIT bin (Story 5-1): every warehouse owns exactly one,
- * seeded by migration 0043 for the warehouses that already exist and ensured
- * beside the QC-hold bin for the new ones — the QC-hold mirror once more.
- * Only the movements module's transfer legs ever move stock through it: the
- * outbound confirm parks the drawn units here and the inbound confirm drains
- * them out, so the serial-in-exactly-one-bin invariant survives and the ATP
- * exclusion (`inTransitUnits`) is one subtraction term keyed on code +
- * system-owned — the same identity `qcHeldUnits` reads. `system_owned`
- * excludes it from putaway suggestions and picking like the other system
- * bins; the type is `staging` and the capacity a generous sentinel — parking
- * units in transit is never capacity-gated.
+ * seeded by migration 0043 for the warehouses that already exist and lazily
+ * ensured by the transfer legs' first use for warehouses created afterwards —
+ * the QC-hold mirror once more (both system bins are lazy-ensured at first
+ * use; nothing is created at warehouse creation). Only the movements module's
+ * transfer legs ever move stock through it: the outbound confirm parks the
+ * drawn units here and the inbound confirm drains them out, so the
+ * serial-in-exactly-one-bin invariant survives and the ATP exclusion
+ * (`inTransitUnits`) is one subtraction term keyed on code + system-owned —
+ * the same identity `qcHeldUnits` reads. `system_owned` excludes it from
+ * putaway suggestions and picking like the other system bins; the type is
+ * `staging` and the capacity a generous sentinel — parking units in transit
+ * is never capacity-gated.
  */
 export const IN_TRANSIT_ZONE_CODE = 'IN-TRANSIT';
 export const IN_TRANSIT_BIN_CODE = 'IN-TRANSIT';
@@ -266,7 +269,19 @@ export async function ensureInTransitBinInTx(
     .limit(1);
   const bin = binRows[0];
   if (bin === undefined) {
-    throw new Error(`in-transit bin missing after ensure: ${tenantId}/${warehouseId}`);
+    // A user-created bin named `IN-TRANSIT` occupies the code (the insert
+    // above was a no-op on the unique (warehouse, code) index) — adopting it
+    // would park stock where the ATP hook counts zero, so the refusal is a
+    // typed problem the caller can render, naming the remediation, not an
+    // untyped 500 (review round 1; the migration's pre-flight is the bulk
+    // remediation, this is the per-warehouse answer for master data created
+    // after it ran).
+    throw new ProblemException(
+      'transfer-in-transit-bin-conflict',
+      409,
+      'A user bin named IN-TRANSIT exists',
+      `Warehouse "${warehouseId}" already holds a user bin coded "IN-TRANSIT" — the system in-transit bin cannot be ensured. Rename or retire that bin, then retry the transfer.`,
+    );
   }
   return { zoneId: zone.id, binId: bin.id };
 }

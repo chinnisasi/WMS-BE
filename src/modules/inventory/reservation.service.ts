@@ -1093,8 +1093,9 @@ export class ReservationService implements OnModuleInit {
     const onHand = await this.committedOnHand(tx, tenantId, warehouseId, skuId);
     const qcHeld = await qcHeldUnits(tx, tenantId, warehouseId, skuId);
     // Story 5-1: the in-transit hook is a ceiling term, not just a read-model
-    // arm — a grant validates against THIS ceiling, so parked units must be
-    // unsubtracted here for an order acceptance to consume them. (`qcHeld`
+    // arm — a grant validates against THIS ceiling, so parked units are
+    // subtracted here: units sitting in the IN-TRANSIT bin are already
+    // committed to a transfer and must not be promiseable again. (`qcHeld`
     // rides beside it; the in-transit stock is unpromisable exactly like
     // quarantined stock.)
     const inTransit = await inTransitUnits(tx, tenantId, warehouseId, skuId);

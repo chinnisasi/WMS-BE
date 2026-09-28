@@ -51,9 +51,13 @@ import { InventoryFacade } from '../inventory/inventory.facade';
  *   event on the SOURCE chain (IN-TRANSIT bin → `toBinId: null`, the
  *   `pick.picked` precedent) and (b) an intake event on the DESTINATION
  *   chain (→ destination bin), in ONE transaction — a rollback rolls back
- *   BOTH chains. The two warehouse advisory locks are acquired in one
- *   deterministic order (sorted by warehouse uuid — `lockSerialsInTx`'s
- *   sorted-order rule generalized), then bin-row locks sorted by bin uuid.
+ *   BOTH chains. Locks are taken in the codebase's canonical acyclic order
+ *   (putaway's documented bins-row → serial → warehouse, the
+ *   `lockWarehouseInTx` doc in inventory.facade.ts): bin-row locks first,
+ *   then the tenant-wide serial advisory locks sorted, then the warehouse
+ *   advisory lock(s) — sorted by warehouse uuid when there are two. An
+ *   advisory taken before the bin-row locks would deadlock against
+ *   putaway/pick on a shared bin.
  *
  * The inbound confirm runs the destination placement gates through
  * `InventoryFacade.assertPlacementGatesInTx` — a transfer is a new stock
@@ -293,19 +297,27 @@ async function resolveTransferSerialRefsInTx(
  * The outbound leg's serial arms, per SKU, in seq order (the
  * `qcHeldArmsInTx` precedent — the hash chain is the movement record, no
  * second source of truth). The inbound leg derives its serial arms from
- * these: the units that were parked are the units that arrive, so the
- * inbound events replay the outbound events' serial refs exactly, and a
- * serial the outbound leg never scanned cannot appear at the inbound leg.
+ * these — PER LINE, keyed on the reference doc's `lineId` (review round 1):
+ * the units that were parked are the units that arrive, so each line's
+ * inbound events replay exactly ITS OWN outbound serial refs, and a serial
+ * the outbound leg never scanned cannot appear at the inbound leg. Keying by
+ * skuId instead would replay BOTH same-SKU lines' serials on each line —
+ * the second line's drains would hit serials already drained in the same
+ * transaction and the confirm would fail forever.
  *
  * All outbound events live on the one source chain, so `seq` orders them.
  */
-async function transferOutboundSerialArmsInTx(
+async function transferOutboundSerialArmsByLineInTx(
   tx: TenantTx,
   tenantId: string,
   transferId: string,
 ): Promise<ReadonlyMap<string, string[]>> {
   const rows = await tx
-    .select({ skuId: ledgerEvents.skuId, seq: ledgerEvents.seq, serialRef: ledgerEvents.serialRef })
+    .select({
+      lineId: sql<string>`${ledgerEvents.referenceDoc}->>'lineId'`,
+      seq: ledgerEvents.seq,
+      serialRef: ledgerEvents.serialRef,
+    })
     .from(ledgerEvents)
     .where(
       and(
@@ -318,16 +330,16 @@ async function transferOutboundSerialArmsInTx(
       ),
     )
     .orderBy(asc(ledgerEvents.seq));
-  const bySku = new Map<string, string[]>();
+  const byLine = new Map<string, string[]>();
   for (const row of rows) {
-    if (row.serialRef === null) {
+    if (row.serialRef === null || row.lineId === null) {
       continue;
     }
-    const list = bySku.get(row.skuId) ?? [];
+    const list = byLine.get(row.lineId) ?? [];
     list.push(row.serialRef);
-    bySku.set(row.skuId, list);
+    byLine.set(row.lineId, list);
   }
-  return bySku;
+  return byLine;
 }
 
 /**
@@ -411,24 +423,6 @@ export class TransferService {
         batchRef: line.batchRef,
         note: line.note,
       })),
-    });
-  }
-
-  /** The api layer's replay pre-check (the `replayPriorSnapshot` shape). */
-  async replayPriorCreateSnapshot(
-    tenantId: string,
-    idempotencyKey: string,
-    payloadHash: string,
-  ): Promise<TransferOrderSnapshot | null> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      const existing = await this.lookupIdempotencyKey(tx, tenantId, idempotencyKey);
-      if (existing === undefined) {
-        return null;
-      }
-      if (existing.payloadHash !== payloadHash) {
-        throw idempotencyKeyReuse();
-      }
-      return existing.responseSnapshot as TransferOrderSnapshot;
     });
   }
 
@@ -668,6 +662,33 @@ export class TransferService {
             index,
             assertRecordableQuantity(line.quantity, 'quantity', sku.uom, uomPrecision(sku.uom)),
           );
+          if (sku.serialTracked) {
+            // The serial-tracked line's scannability guards (review round 1):
+            // a serial line moves ONE unit per scanned serial, so its
+            // base-unit quantity must be a whole number (a fractional draft
+            // can never pass the outbound confirm's integer unit-count
+            // check) and at most 200 (the per-confirm serial cap,
+            // `ConfirmOutboundLineDto`'s `@ArrayMaxSize(200)` — a larger
+            // draft can never supply enough scans). Both belong at create,
+            // where the draft can be corrected.
+            const unitCount = milliByIndex.get(index)! / QUANTITY_SCALE;
+            if (!Number.isInteger(unitCount)) {
+              throw new ProblemException(
+                'validation-failed',
+                400,
+                'A serial-tracked line moves whole units',
+                `SKU "${sku.code}" is serial-tracked — the line moves ${line.quantity} base unit(s), and serials scan one per whole unit; use a whole-unit quantity.`,
+              );
+            }
+            if (unitCount > 200) {
+              throw new ProblemException(
+                'validation-failed',
+                400,
+                'A serial-tracked line exceeds the serial cap',
+                `SKU "${sku.code}" is serial-tracked and the line moves ${unitCount} unit(s) — a confirm supplies at most 200 serial scans; split the transfer into smaller orders.`,
+              );
+            }
+          }
         }
 
         // ── writes (order + lines) ────────────────────────────────────────
@@ -752,23 +773,6 @@ export class TransferService {
         lineId: line.lineId,
         serials: line.serials == null ? undefined : [...line.serials],
       })),
-    });
-  }
-
-  async replayPriorOutboundSnapshot(
-    tenantId: string,
-    idempotencyKey: string,
-    payloadHash: string,
-  ): Promise<TransferConfirmSnapshot | null> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      const existing = await this.lookupIdempotencyKey(tx, tenantId, idempotencyKey);
-      if (existing === undefined) {
-        return null;
-      }
-      if (existing.payloadHash !== payloadHash) {
-        throw idempotencyKeyReuse();
-      }
-      return existing.responseSnapshot as TransferConfirmSnapshot;
     });
   }
 
@@ -910,10 +914,17 @@ export class TransferService {
           }
         }
 
-        // Locks, in the deterministic order: the source warehouse advisory
-        // lock (the append re-acquires it as a no-op), then the source bin
-        // rows sorted by uuid, then the whole serial set tenant-wide sorted.
-        await this.inventory.lockWarehouseInTx(tx, command.tenantId, order.sourceWarehouseId);
+        // Locks, in the codebase's canonical acyclic order (putaway's
+        // documented bins-row → serial → warehouse, inventory.facade.ts's
+        // lockWarehouseInTx doc): the source bin rows sorted by uuid, then
+        // the whole serial set tenant-wide sorted. The source warehouse
+        // advisory comes LAST — the first append acquires it inside
+        // `appendLedgerEventInTx` (a re-entrant no-op for the serial locks),
+        // exactly like putaway; acquiring it here, before the bin-row
+        // locks, would invert the order and deadlock against putaway/pick
+        // on a shared bin (both hold the bin row and block on the advisory
+        // inside their own append while this command holds the advisory and
+        // blocks on the bin row).
         const fromBinIds = [...new Set(lines.map((line) => line.fromBinId))].sort();
         await tx
           .select({ id: bins.id })
@@ -1157,23 +1168,6 @@ export class TransferService {
     });
   }
 
-  async replayPriorInboundSnapshot(
-    tenantId: string,
-    idempotencyKey: string,
-    payloadHash: string,
-  ): Promise<TransferConfirmSnapshot | null> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      const existing = await this.lookupIdempotencyKey(tx, tenantId, idempotencyKey);
-      if (existing === undefined) {
-        return null;
-      }
-      if (existing.payloadHash !== payloadHash) {
-        throw idempotencyKeyReuse();
-      }
-      return existing.responseSnapshot as TransferConfirmSnapshot;
-    });
-  }
-
   async confirmInbound(
     command: ConfirmInboundCommand,
     idempotencyKey: string,
@@ -1232,6 +1226,19 @@ export class TransferService {
           landingBinByLine.set(line.id, command.destBinId ?? line.toBinId);
         }
         const landingBinIds = [...new Set(landingBinByLine.values())].sort();
+
+        // Locks, in the codebase's canonical acyclic order (putaway's
+        // documented bins-row → serial → warehouse, inventory.facade.ts's
+        // lockWarehouseInTx doc): the landing bin rows sorted by uuid first,
+        // then the inbound serial arms' whole serial set tenant-wide sorted,
+        // then the warehouse advisory lock(s) — sorted by warehouse uuid
+        // when there are two (a same-warehouse transfer's single lock
+        // trivially satisfies it). The append re-acquires each as a
+        // re-entrant no-op; acquiring an advisory before the bin-row locks
+        // would invert the order and deadlock against putaway/pick on a
+        // shared bin (both hold the bin row and block on the advisory
+        // inside their own append while this command holds the advisory
+        // and blocks on the bin row).
         const landingBinRows = await tx
           .select({ id: bins.id, code: bins.code })
           .from(bins)
@@ -1241,7 +1248,8 @@ export class TransferService {
               eq(bins.warehouseId, order.destWarehouseId),
               inArray(bins.id, landingBinIds),
             ),
-          );
+          )
+          .for('update');
         const landingBinCode = new Map(landingBinRows.map((row) => [row.id, row.code]));
         for (const binId of landingBinIds) {
           if (!landingBinCode.has(binId)) {
@@ -1254,11 +1262,33 @@ export class TransferService {
           }
         }
 
+        // The inbound serial arms derive from the outbound leg's own events
+        // — PER LINE, keyed on the reference doc's lineId (a same-SKU
+        // keying would replay both same-SKU lines' serials on each line) —
+        // locked tenant-wide in sorted order before the first append.
+        const outboundSerialArms = await transferOutboundSerialArmsByLineInTx(
+          tx,
+          command.tenantId,
+          command.transferId,
+        );
+        const allSerialRefs = [...outboundSerialArms.values()].flat();
+        if (allSerialRefs.length > 0) {
+          await this.inventory.lockSerialsInTx(tx, command.tenantId, allSerialRefs);
+        }
+
+        const warehouseIds = [...new Set([order.sourceWarehouseId, order.destWarehouseId])].sort();
+        for (const warehouseId of warehouseIds) {
+          await this.inventory.lockWarehouseInTx(tx, command.tenantId, warehouseId);
+        }
+
         // The epoch gate (the matrix's re-plannable refusal): the op's
         // epoch, quoted from the task read, must still be the landing bins'
         // live epoch — captured on the same transaction as the task (the
-        // pick precedent), so the compare is one consistent read. Absent on
-        // the op = match.
+        // pick precedent). The read and compare sit UNDER the locks: an
+        // epoch read taken before them would race a concurrent
+        // epoch-bumping write between read and lock, and a staleness gate
+        // that read a pre-lock epoch would slip a genuinely moved bin past
+        // the refusal. Absent on the op = match.
         if (command.binStateEpoch != null) {
           const epochs = await this.inventory.binStateEpochsInTx(
             tx,
@@ -1274,35 +1304,37 @@ export class TransferService {
           }
         }
 
-        // Locks, in the deterministic order the spec fixed: the TWO warehouse
-        // advisory locks sorted by warehouse uuid (the `lockSerialsInTx`
-        // sorted-order rule generalized — a same-warehouse transfer's single
-        // lock trivially satisfies it), then the landing bin rows sorted by
-        // bin uuid. The warehouse locks come FIRST — before any read the
-        // guards rule on — because the append re-acquires the (re-entrant)
-        // advisory lock and the gate's bin-row lock is the same row this
-        // command just locked.
-        const warehouseIds = [...new Set([order.sourceWarehouseId, order.destWarehouseId])].sort();
-        for (const warehouseId of warehouseIds) {
-          await this.inventory.lockWarehouseInTx(tx, command.tenantId, warehouseId);
-        }
-        await tx
-          .select({ id: bins.id })
-          .from(bins)
-          .where(and(eq(bins.tenantId, command.tenantId), inArray(bins.id, landingBinIds)))
+        // The kit/catch-weight refusals repeat the create/outbound guards
+        // DELIBERATELY (the outbound confirm's own rationale): the SKU row
+        // can flip between the outbound confirm and the inbound confirm (a
+        // kit created against the parked line's SKU, a catch-weight flip
+        // via sku.edit), and the inbound confirm is the write that would
+        // land the unrepresentable stock — parked units are exactly the
+        // stock these guards exist to keep out.
+        const skuIds = [...new Set(lines.map((line) => line.skuId))];
+        const skuRows = await tx
+          .select({ id: skus.id, code: skus.code, catchWeightTracked: skus.catchWeightTracked })
+          .from(skus)
+          .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.id, skuIds)))
           .for('update');
-
-        // The inbound serial arms derive from the outbound leg's own events
-        // (the qc.released replay precedent) — locked tenant-wide in sorted
-        // order before the first append.
-        const outboundSerialArms = await transferOutboundSerialArmsInTx(
-          tx,
-          command.tenantId,
-          command.transferId,
-        );
-        const allSerialRefs = [...outboundSerialArms.values()].flat();
-        if (allSerialRefs.length > 0) {
-          await this.inventory.lockSerialsInTx(tx, command.tenantId, allSerialRefs);
+        const skuById = new Map(skuRows.map((row) => [row.id, row]));
+        const kitSkuIds = await getKitSkuIdsInTx(tx, command.tenantId, skuIds);
+        const kitCodes = kitSkuIds
+          .map((id) => skuById.get(id)?.code)
+          .filter((code): code is string => code !== undefined);
+        if (kitCodes.length > 0) {
+          throw kitCannotHoldStock('transfer', kitCodes);
+        }
+        for (const line of lines) {
+          const sku = skuById.get(line.skuId)!;
+          if (sku.catchWeightTracked) {
+            throw new ProblemException(
+              'validation-failed',
+              400,
+              'A catch-weight SKU cannot be transferred',
+              `SKU "${sku.code}" is catch-weight tracked — the transfer cannot be confirmed; create a compensating order instead.`,
+            );
+          }
         }
 
         // The placement gates, ONE call per landing bin with the SUMMED
@@ -1344,7 +1376,7 @@ export class TransferService {
             transferId: command.transferId,
             lineId: line.id,
           };
-          const serialRefs = outboundSerialArms.get(line.skuId) ?? [];
+          const serialRefs = outboundSerialArms.get(line.id) ?? [];
           if (sameWarehouse) {
             // One relocation event per arm on the single chain: IN-TRANSIT
             // bin → destination bin.
@@ -1525,23 +1557,6 @@ export class TransferService {
     return hashCommandPayload({
       transferId: command.transferId,
       note: command.note,
-    });
-  }
-
-  async replayPriorCancelSnapshot(
-    tenantId: string,
-    idempotencyKey: string,
-    payloadHash: string,
-  ): Promise<TransferOrderSnapshot | null> {
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      const existing = await this.lookupIdempotencyKey(tx, tenantId, idempotencyKey);
-      if (existing === undefined) {
-        return null;
-      }
-      if (existing.payloadHash !== payloadHash) {
-        throw idempotencyKeyReuse();
-      }
-      return existing.responseSnapshot as TransferOrderSnapshot;
     });
   }
 

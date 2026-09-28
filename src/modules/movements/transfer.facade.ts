@@ -235,8 +235,11 @@ export class MovementsFacade {
             .from(bins)
             .where(and(eq(bins.tenantId, tenantId), inArray(bins.id, binIds)));
     const binCodeById = new Map(binRows.map((row) => [row.id, row.code]));
-    // Both legs' events, in order (source chain first, then dest), each
-    // carrying `referenceDoc {kind:'transfer', transferId}` — the epic AC's
+    // Both legs' events, ordered by `transferLegEventsInTx` as (warehouseId
+    // uuid, seq) — deterministic, but NOT source-first: when the destination
+    // warehouse's uuid sorts below the source's, its inbound chain reads
+    // before the source's outbound chain. Each row carries
+    // `referenceDoc {kind:'transfer', transferId}` — the epic AC's
     // "the ledger answers which movements served this transfer" read.
     const legRows = await transferLegEventsInTx(tx, tenantId, transferId);
     return {
