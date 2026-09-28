@@ -842,8 +842,11 @@ describe('users, roles, and permission gating (e2e)', () => {
     // it), still outside the cage's holder set; story 5-2 grows it to 28
     // with `adjustments.approve` — OWNER-ONLY (the FR-19 approval
     // decisions + the policy write): ops_manager/operator/accountant all
-    // stay as they were.
-    expect([...CAPABILITIES]).toHaveLength(28);
+    // stay as they were; story 5-3 grows it to 30 with
+    // `counts.manage`/`counts.execute` — manage plans (on-demand create +
+    // the policy write, owner + ops_manager), execute is the floor verb
+    // (the Count inbox tab's op, floor holds it).
+    expect([...CAPABILITIES]).toHaveLength(30);
     expect(CAPABILITIES).toContain('secure.move');
     expect(secureMoveHolders).toEqual(['owner', 'ops_manager']);
     expect(CAPABILITIES).toContain('adjustments.approve');
@@ -851,6 +854,16 @@ describe('users, roles, and permission gating (e2e)', () => {
     expect(ROLE_CAPABILITIES.ops_manager.has('adjustments.approve')).toBe(false);
     expect(ROLE_CAPABILITIES.operator.has('adjustments.approve')).toBe(false);
     expect(ROLE_CAPABILITIES.accountant.has('adjustments.approve')).toBe(false);
+    expect(CAPABILITIES).toContain('counts.manage');
+    expect(CAPABILITIES).toContain('counts.execute');
+    expect(ROLE_CAPABILITIES.owner.has('counts.manage')).toBe(true);
+    expect(ROLE_CAPABILITIES.owner.has('counts.execute')).toBe(true);
+    expect(ROLE_CAPABILITIES.ops_manager.has('counts.manage')).toBe(true);
+    expect(ROLE_CAPABILITIES.ops_manager.has('counts.execute')).toBe(true);
+    expect(ROLE_CAPABILITIES.operator.has('counts.manage')).toBe(false);
+    expect(ROLE_CAPABILITIES.operator.has('counts.execute')).toBe(true);
+    expect(ROLE_CAPABILITIES.accountant.has('counts.manage')).toBe(false);
+    expect(ROLE_CAPABILITIES.accountant.has('counts.execute')).toBe(false);
     expect(ROLE_CAPABILITIES.operator.has('putaway.execute')).toBe(true);
     expect(ROLE_CAPABILITIES.operator.has('picks.execute')).toBe(true);
     expect(ROLE_CAPABILITIES.operator.has('excursion.record')).toBe(true);

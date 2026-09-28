@@ -812,6 +812,73 @@ export class InventoryFacade {
   }
 
   /**
+   * Story 5-3 (the review's seam fix): the DISTINCT bin ids of THIS
+   * warehouse holding a POSITIVE quantity of any SKU whose ABC class equals
+   * the argument, in the caller's transaction — the count scheduler's
+   * candidate scan. The stockOnHand→skus join lives HERE because inventory
+   * is the projection's owner: movements never projects stock tables
+   * directly (movements.md's module boundary), so every stock read a
+   * movements command makes goes through this facade (the
+   * `stockByBinsInTx`/`onHandInBinInTx` precedent). This is a READ of the
+   * projection, never an allocation (the `stockByBinsInTx` note).
+   */
+  async stockedBinIdsForAbcClassInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    abcClass: string,
+  ): Promise<ReadonlyArray<string>> {
+    const rows = await tx
+      .selectDistinct({ binId: stockOnHand.binId })
+      .from(stockOnHand)
+      .innerJoin(skus, and(eq(skus.id, stockOnHand.skuId), eq(skus.tenantId, tenantId)))
+      .where(
+        and(
+          eq(stockOnHand.tenantId, tenantId),
+          eq(stockOnHand.warehouseId, warehouseId),
+          eq(skus.abcClass, abcClass),
+          sql`${stockOnHand.quantity} > 0`,
+        ),
+      );
+    return rows.map((row) => row.binId);
+  }
+
+  /**
+   * Story 5-3 (the review's seam fix): the per-bin on-hand arms for a set
+   * of bins — the `stockByBinsInTx` shape keyed by BINS (whose callers key
+   * by SKUs) — per (bin, sku) on-hand > 0 in the caller's transaction,
+   * ordered binId then skuId (the count scheduler's expected-quantity
+   * fan-out composes in that stable order). This is a READ of the
+   * projection, never an allocation.
+   */
+  async stockArmsInBinsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    binIds: readonly string[],
+  ): Promise<ReadonlyArray<{ binId: string; skuId: string; quantity: number }>> {
+    if (binIds.length === 0) {
+      return [];
+    }
+    return tx
+      .select({
+        binId: stockOnHand.binId,
+        skuId: stockOnHand.skuId,
+        quantity: stockOnHand.quantity,
+      })
+      .from(stockOnHand)
+      .where(
+        and(
+          eq(stockOnHand.tenantId, tenantId),
+          eq(stockOnHand.warehouseId, warehouseId),
+          inArray(stockOnHand.binId, [...new Set(binIds)]),
+          sql`${stockOnHand.quantity} > 0`,
+        ),
+      )
+      .orderBy(asc(stockOnHand.binId), asc(stockOnHand.skuId));
+  }
+
+  /**
    * The ledger rows whose reference doc names one order (story 12-6, FR-45):
    * the `dispatch.dispatched` events that say the order shipped and the
    * `pick.picked` events that served it, seq-ordered, in the CALLER's

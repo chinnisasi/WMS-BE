@@ -31,6 +31,9 @@ import { IMPORT_MODES, GST_RATE_BPS_MAX } from './import.command';
 import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
 // Story 12-2 — the hazard vocabulary tuple, the same three-layer pattern.
 import { HAZARD_CLASSES } from '../../shared/primitives/hazard';
+// Story 5-3: the ABC-class vocabulary — the DTO mirror of the shared
+// primitive's tuple (the three-layer pattern).
+import { ABC_CLASSES } from '../../shared/primitives/abc-class';
 import { UOMS } from './uom';
 import { MAX_SKU_DIMENSION_MM, MAX_SKU_WEIGHT_GRAMS } from './sku-attributes';
 import { AXIS_NAME_MAX, MAX_PRODUCT_AXES, PRODUCT_NAME_MAX } from './product.command';
@@ -231,6 +234,18 @@ export class SkuResponse {
     description: 'The SKU\'s hazard class (FR-41), or null when it carries none. Null carries no rule in either direction of the segregation matrix.',
   })
   hazardClass!: string | null;
+
+  // Story 5-3: the controlled-vocabulary ABC class (FR-cycle-count), required
+  // but NULLABLE (the hazardClass twin) — toSnapshot always sets it, and
+  // every pre-5.3 row (and import row without the cell) reads null.
+  @ApiProperty({
+    enum: ABC_CLASSES,
+    nullable: true,
+    example: 'a',
+    description:
+      'The SKU\'s ABC classification the cycle-count scheduler schedules from, or null when it is not yet classified — a null class is EXCLUDED from scheduled count generation (on-demand still covers its bin, OQ-1).',
+  })
+  abcClass!: string | null;
 
   @ApiProperty({ example: '0198f7a2-1b3c-7d4e-8f90-112233445588', description: 'Generated server-side (uuidv7) unless provided' })
   barcode!: string;
@@ -502,6 +517,24 @@ export class PatchSkuDto {
   @IsOptional()
   @IsIn(HAZARD_CLASSES)
   hazardClass?: string | null;
+
+  // Story 5-3: the SKU's ABC class (FR-cycle-count) — absent = unchanged,
+  // NULL = clear (the `hazardClass` twin; the column is nullable, so the
+  // clear verb exists — a null class is excluded from scheduled count
+  // generation, OQ-1). The vocabulary is pinned HERE with `@IsIn` and
+  // re-checked in the command (`assertAbcClass`, which skips null — the
+  // clear verb — behind the replay lookup; the mirror is not the boundary).
+  @ApiProperty({
+    required: false,
+    enum: ABC_CLASSES,
+    nullable: true,
+    example: 'a',
+    description:
+      'The SKU\'s ABC classification (FR-cycle-count): a, b or c. Omit to leave unchanged; null clears the class (excludes the SKU from scheduled count generation, on-demand still covers it).',
+  })
+  @IsOptional()
+  @IsIn(ABC_CLASSES)
+  abcClass?: string | null;
 }
 
 // ── Story 11.3 — the product (AD-19): identity only, above `skus` ──────────

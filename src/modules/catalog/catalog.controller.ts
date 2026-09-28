@@ -451,6 +451,10 @@ export class CatalogController {
         // command is the boundary (vocabulary re-check, the co-location
         // guard).
         hazardClass: dto.hazardClass,
+        // Story 5-3 — the ABC class passes through WYSIWYG (the hazardClass
+        // twin): absent = unchanged, null = clear. The command is the
+        // boundary (the vocabulary re-check).
+        abcClass: dto.abcClass,
       },
       key,
     );

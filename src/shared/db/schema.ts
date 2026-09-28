@@ -509,6 +509,18 @@ export const skus = pgTable(
      * backfill.
      */
     hazardClass: text('hazard_class'),
+    /**
+     * Story 5-3 (FR-cycle-count) — the SKU's ABC classification, nullable:
+     * most SKUs start unclassified and null = excluded from SCHEDULED count
+     * generation (OQ-1 — it is still countable on demand, and its bin still
+     * counts when a classed SKU in it is due). From the controlled vocabulary
+     * in `src/shared/primitives/abc-class.ts` (ABC_CLASSES); the DB backstop
+     * is a CHECK declared ONLY in `drizzle/0045_cycle_counts.sql` (the
+     * 0035/0036 pattern). Set through the catalog import's OPTIONAL
+     * `abc_class` column and the SKU edit PATCH — no backfill (a guessed
+     * class would silently schedule every legacy SKU for counts).
+     */
+    abcClass: text('abc_class'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -2771,3 +2783,213 @@ export const stockAdjustmentPendings = pgTable(
 );
 
 export type StockAdjustmentPending = typeof stockAdjustmentPendings.$inferSelect;
+
+/**
+ * The count task's lifecycle vocabulary (story 5-3): the TS side of the
+ * three mirrored layers (DB CHECK in `drizzle/0045_cycle_counts.sql`, DTO
+ * `@IsIn` in `src/modules/movements/count.dto.ts`). A task is `pending`
+ * until its submit settles it to `completed` — there is no cancel in 5-3
+ * (a stale task is simply submitted or superseded by a recount).
+ */
+export const COUNT_TASK_STATUSES = ['pending', 'completed'] as const;
+export type CountTaskStatus = (typeof COUNT_TASK_STATUSES)[number];
+
+/** How a count task came to exist (CHECK + DTO mirror; story 5-3). */
+export const COUNT_TASK_ORIGINS = ['on_demand', 'scheduled', 'recount'] as const;
+export type CountTaskOrigin = (typeof COUNT_TASK_ORIGINS)[number];
+
+/**
+ * Cycle count policies (story 5-3, FR-cycle-count): per-warehouse scheduling
+ * config — one row per (tenant, warehouse, ABC class) naming the count
+ * interval in days. Config-not-code (the `stockAdjustmentPolicies`
+ * precedent): **with no policy row for a class, that class is never
+ * scheduled** — no default interval hides in the worker; a warehouse
+ * counts only what someone configured it to count.
+ *
+ * Upsert is PUT (`/warehouses/:id/count-policies`, idempotent, gated on
+ * `counts.manage`): one row per key, a race loser 409s on the unique index.
+ * RLS policy + the class/interval CHECKs live **only in the migration SQL**
+ * (0045).
+ */
+export const countPolicies = pgTable(
+  'count_policies',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    /** The classed vocabulary ('a'|'b'|'c' — CHECK in the migration). */
+    abcClass: text('abc_class').notNull(),
+    /** Count every due bin holding a SKU of this class at most this often. */
+    intervalDays: integer('interval_days').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One policy per (tenant, warehouse, class) — the row IS the schedule.
+    uniqueIndex('count_policies_tenant_wh_class_unique').on(
+      table.tenantId,
+      table.warehouseId,
+      table.abcClass,
+    ),
+  ],
+);
+
+export type CountPolicy = typeof countPolicies.$inferSelect;
+
+/**
+ * Stored count tasks (story 5-3): one task per BIN — the movements module's
+ * FIRST STORED TASK TABLE (putaway/transfer tasks are derived on read, but a
+ * count task must FREEZE its expected quantities and bin epoch at creation;
+ * a derived task would recompute them and break "expected = bin state at
+ * count start"). The frozen expectations live on `count_task_lines`; the
+ * epoch lives here as a scalar snapshot.
+ *
+ * `binStateEpoch` is the `bin_state_epochs` value read AT TASK START (the
+ * inventory facade's read, under the creation tx's locks); null = the bin
+ * had no epoch row yet. At submit it is compared for EQUALITY against the
+ * live epoch — `null` matches null only in effect via the `?? null`
+ * coalescing both sides share; a mismatch flags the variances
+ * (`epoch_conflict`) and auto-creates a fresh recount task (OQ-2). It is an
+ * OBSERVATION, not a guard against writes: counting never locks stock, and
+ * a movement during the count is flagged, not prevented.
+ *
+ * `createdBy` is the on-demand creator's user id; **null = the scheduler
+ * minted the task** (no system-actor uuid exists in this codebase and the
+ * reaper precedent writes no actor column — a nullable column with a
+ * documented null meaning is the honest shape). `completedBy`/`completedAt`
+ * stamp the submit (null while pending). `status` is
+ * `pending → completed` — the submit's conditional UPDATE makes a second
+ * submit of the same task by a DIFFERENT key a deterministic 409
+ * `count-task-completed` (the same ULID replays from the idempotency key
+ * instead).
+ *
+ * RLS policies + the status/origin/epoch CHECKs live **only in the
+ * migration SQL** (0045).
+ */
+export const countTasks = pgTable(
+  'count_tasks',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    binId: uuid('bin_id').notNull(),
+    /** The closed lifecycle vocabulary (CHECK in the migration). */
+    status: text('status').notNull().default('pending'),
+    /** How the task was born (CHECK in the migration). */
+    origin: text('origin').notNull(),
+    /** The bin state frozen at task start — the submit's equality compare. */
+    binStateEpoch: bigint('bin_state_epoch', { mode: 'number' }),
+    /** The on-demand creator; null = minted by the scheduler worker. */
+    createdBy: uuid('created_by'),
+    completedBy: uuid('completed_by'),
+    completedAt: timestamp('completed_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The open-task-per-bin rule's enforcement probe (one pending row max)
+    // and the scheduler's due/past-interval filters both resolve through
+    // this shape.
+    index('count_tasks_tenant_wh_bin_status_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.binId,
+      table.status,
+    ),
+    // The device snapshot's count feed: pending tasks for a warehouse.
+    index('count_tasks_wh_status_idx').on(table.warehouseId, table.status),
+  ],
+);
+
+export type CountTask = typeof countTasks.$inferSelect;
+
+/**
+ * One (SKU, expected, counted) row of a count task. `expectedQuantity` is
+ * the bin's on-hand for the SKU AT TASK START in milli-units (AD-9; base
+ * units cross the wire), frozen at creation and never recomputed at submit.
+ * `countedQuantity` stays null while uncounted; 0 is a valid count only
+ * when EXPLICITLY entered (an absent value refuses the submit — 400
+ * `count-incomplete`). A SKU found in the bin beyond the task's lines gets
+ * a line APPENDED with `expectedQuantity` 0 at submit time.
+ *
+ * RLS policy + the quantity CHECKs live **only in the migration SQL** (0045).
+ */
+export const countTaskLines = pgTable(
+  'count_task_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    taskId: uuid('task_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** Milli-units — the bin's on-hand at task start (frozen). */
+    expectedQuantity: bigint('expected_quantity_milli', { mode: 'number' }).notNull(),
+    /** Milli-units — what the operator counted; null = not yet counted. */
+    countedQuantity: bigint('counted_quantity_milli', { mode: 'number' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The task detail's line read and the submit's completeness probe.
+    index('count_task_lines_task_id_idx').on(table.taskId, table.skuId),
+  ],
+);
+
+export type CountTaskLine = typeof countTaskLines.$inferSelect;
+
+/**
+ * Count variances (story 5-3): written AT SUBMIT, one row per SKU whose
+ * counted ≠ expected — never a stock write, never a ledger event (5-3
+ * inserts and NEVER touches a variance row afterwards; resolution states
+ * are 5-4's vocabulary). `expectedQuantity`/`countedQuantity` are
+ * milli-units as frozen/entered; `deltaMilli` is the signed difference
+ * (counted − expected). `epochConflict` marks the whole task's baseline as
+ * having moved during the count (the epoch compare failed) — every variance
+ * row of such a submit carries the flag, and the fresh recount task the
+ * same transaction creates is 5-4's re-plan input (AD-14 case-3 shape).
+ *
+ * `status` is exactly `open` in 5-3 — the single-value vocabulary the
+ * module doc names, CHECK-pinned so 5-4's states arrive as their own
+ * migration. RLS policies + the CHECKs live **only in the migration SQL**
+ * (0045).
+ */
+export const countVariances = pgTable(
+  'count_variances',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    taskId: uuid('task_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    binId: uuid('bin_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** Milli-units — the task line's frozen expectation. */
+    expectedQuantity: bigint('expected_quantity_milli', { mode: 'number' }).notNull(),
+    /** Milli-units — what the operator counted. */
+    countedQuantity: bigint('counted_quantity_milli', { mode: 'number' }).notNull(),
+    /** Signed difference (counted − expected), milli-units. */
+    deltaMilli: bigint('delta_milli', { mode: 'number' }).notNull(),
+    /** A movement moved the bin between task start and submit (OQ-2). */
+    epochConflict: boolean('epoch_conflict').notNull().default(false),
+    /** Exactly `open` in 5-3 — 5-4 owns every later state. */
+    status: text('status').notNull().default('open'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The variance queue read (5-4's resolution surface; status filter
+    // first — the pendings queue's keyset shape).
+    index('count_variances_tenant_status_created_at_id_idx').on(
+      table.tenantId,
+      table.status,
+      table.createdAt,
+      table.id,
+    ),
+    // The variance list's warehouse filter.
+    index('count_variances_warehouse_id_idx').on(table.warehouseId),
+  ],
+);
+
+export type CountVariance = typeof countVariances.$inferSelect;

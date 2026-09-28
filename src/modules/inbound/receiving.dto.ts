@@ -625,6 +625,55 @@ export class CatalogTransferTaskDto {
   lines!: readonly CatalogTransferTaskLineDto[];
 }
 
+/**
+ * One line of the device snapshot's Count inbox task (story 5-3, additive)
+ * — the FROZEN expectation the operator counts against.
+ */
+export class CatalogCountTaskLineDto {
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  skuName!: string | null;
+
+  @ApiProperty({ description: `The expectation frozen at task start. ${QUANTITY_FIELD_DESCRIPTION}`, minimum: 0 })
+  expectedQuantity!: number;
+}
+
+/** One stored count task of the device snapshot (story 5-3, additive) — the Count inbox task. */
+export class CatalogCountTaskDto {
+  @ApiProperty({ format: 'uuid', description: 'The count task awaiting submit' })
+  taskId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty({ description: 'The bin the count walks (the scan that opens the flow)' })
+  binCode!: string;
+
+  @ApiProperty({ enum: ['on_demand', 'scheduled', 'recount'], description: 'How the task was born' })
+  origin!: string;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: 'The bin state epoch FROZEN at task start — the submit quotes it back for the equality compare',
+  })
+  binStateEpoch!: number | null;
+
+  @ApiProperty({ description: 'When the task was created (ISO-8601 UTC)' })
+  createdAt!: string;
+
+  @ApiProperty({ type: [CatalogCountTaskLineDto], description: 'The FROZEN expectations — every line must be counted at submit' })
+  lines!: readonly CatalogCountTaskLineDto[];
+}
+
 export class CatalogSnapshotResponse {
   @ApiProperty({ description: 'ISO-8601 UTC capture time' })
   generatedAt!: string;
@@ -655,4 +704,11 @@ export class CatalogSnapshotResponse {
 
   @ApiProperty({ type: [CatalogTransferTaskDto], description: 'Story 5-1 (additive): the in-transit transfers TO this warehouse — the Transfer inbox tasks whose inbound confirm the operator executes (one confirm completes the whole order)' })
   transferTasks!: readonly CatalogTransferTaskDto[];
+
+  @ApiProperty({
+    type: [CatalogCountTaskDto],
+    description:
+      'Story 5-3 (additive): the STORED pending count tasks of this warehouse — the Count inbox tasks whose submit the operator executes (every task line must be counted; 0 is a valid explicit count). The expectations were FROZEN at task start and are read here, never recomputed',
+  })
+  countTasks!: readonly CatalogCountTaskDto[];
 }

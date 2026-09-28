@@ -1,9 +1,13 @@
 import { Inject, Injectable, Logger, Module, type OnApplicationBootstrap, type OnApplicationShutdown } from '@nestjs/common';
-import { SharedModule } from '../shared/shared.module';
+import { sql } from 'drizzle-orm';
+import { SharedModule, AUTH_DATABASE } from '../shared/shared.module';
+import type { Database } from '../shared/db/db';
 import { OUTBOX_RELAY } from '../shared/events/outbox.seam';
 import type { OutboxRelay } from '../shared/events/outbox.seam';
 import { InventoryModule } from '../modules/inventory/inventory.module';
 import { InventoryFacade } from '../modules/inventory/inventory.facade';
+import { MovementsModule } from '../modules/movements/movements.module';
+import { MovementsFacade, MAX_SCHEDULED_TASKS_PER_TICK } from '../modules/movements/transfer.facade';
 
 /** Per-cycle drain bound (AD-17): a cycle publishes at most this many rows. */
 export const DEFAULT_OUTBOX_DRAIN_LIMIT = 100;
@@ -62,6 +66,27 @@ export function parseReservationReaperPollMs(raw: string | undefined): number {
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(
       `RESERVATION_REAPER_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
+    );
+  }
+  return parsed;
+}
+
+/**
+ * The count scheduler's poll interval, in milliseconds, from
+ * `COUNT_SCHEDULER_POLL_MS` — the same env-gate conventions as the relay /
+ * reconciliation / reaper workers (unset/`0` is OFF — a deployment that
+ * schedules cycle counts sets e.g. `3600000`; a non-negative integer is
+ * required or the boot fails loudly; tests drive the facade's
+ * `generateScheduledCountTasks()` directly).
+ */
+export function parseCountSchedulerPollMs(raw: string | undefined): number {
+  if (raw === undefined || raw === '') {
+    return 0;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(
+      `COUNT_SCHEDULER_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
     );
   }
   return parsed;
@@ -258,16 +283,114 @@ export class ReservationReaper implements OnApplicationBootstrap, OnApplicationS
 }
 
 /**
+ * The count scheduler worker (Story 5-3): an interval poll loop over
+ * `MovementsFacade.generateScheduledCountTasks(tenantId, warehouseId, …)` —
+ * one tick enumerates every (tenant, warehouse) that owns at least one ABC
+ * policy cross-tenant (the reaper's `expireDue` read shape — an AUTH
+ * connection, read-only), then generates that warehouse's due tasks in ONE
+ * tenant transaction each (the matrix's all-or-nothing batch; a failing
+ * warehouse is logged and retried next tick — the reaper's per-row
+ * precedent). Env-gated OFF when `COUNT_SCHEDULER_POLL_MS` is unset/`0`
+ * (tests drive the facade directly), shed via the in-process `running`
+ * flag, `unref`'d timer, and a shutdown hook.
+ */
+@Injectable()
+export class CountSchedulerWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('CountSchedulerWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+
+  constructor(
+    // The cross-tenant DUE enumeration read (BYPASSRLS — the reaper's
+    // `authDb` precedent); every WRITE stays on the facade's tenant
+    // transactions.
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(MovementsFacade) private readonly movements: MovementsFacade,
+  ) {
+    this.pollMs = parseCountSchedulerPollMs(process.env.COUNT_SCHEDULER_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off (tests, or a deployment that schedules elsewhere)
+    }
+    this.logger.log(`Count scheduler worker started (poll every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    // Never hold the process open on the timer alone: shutdown hooks end it.
+    this.timer.unref?.();
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  private async tick(): Promise<void> {
+    if (this.running) {
+      return; // shed: one cycle at a time in this process
+    }
+    this.running = true;
+    try {
+      // The cross-tenant enumeration (read-only — the reaper's
+      // auth-time/connection shape): every warehouse owning at least one
+      // policy, distinct. RLS scopes nothing here — the connection carries
+      // BYPASSRLS precisely for these context-free reads.
+      const scopes = (await this.authDb.execute(sql`
+        select distinct on (tenant_id, warehouse_id)
+          tenant_id as "tenantId", warehouse_id as "warehouseId"
+        from count_policies
+        order by tenant_id asc, warehouse_id asc
+      `)) as unknown as { tenantId: string; warehouseId: string }[];
+      let created = 0;
+      for (const scope of scopes) {
+        // One warehouse = one tenant transaction — all-or-nothing per
+        // warehouse (the matrix's "partial failure → whole tick rolls
+        // back", at the RLS boundary). A poison warehouse (a repeatedly
+        // failing tx) must not starve the rest — log and retry next tick,
+        // the reaper's per-row rationale.
+        try {
+          const taskIds = await this.movements.generateScheduledCountTasks(
+            scope.tenantId,
+            scope.warehouseId,
+            MAX_SCHEDULED_TASKS_PER_TICK,
+          );
+          created += taskIds.length;
+        } catch (error) {
+          this.logger.error(
+            `Count scheduler could not generate tasks for warehouse ${scope.warehouseId} — skipped this cycle: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (created > 0) {
+        this.logger.log(`Count scheduler generated ${created} count task(s)`);
+      }
+    } catch (error) {
+      this.logger.error(
+        `Count scheduler cycle failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
+/**
  * jobs shell — background/relay workers (outbox relay, reconciliation,
- * reservation reaper, import batches, notifications dispatch). The event bus
- * + outbox seams live in shared/events and are provided by SharedModule. All
- * workers are env-gated OFF unless `OUTBOX_RELAY_POLL_MS` /
- * `OUTBOX_RECONCILE_POLL_MS` / `RESERVATION_REAPER_POLL_MS` is set (tests
- * exercise `drain()` / `reconcileNext()` / `expireDueReservations()` directly).
+ * reservation reaper, count scheduler, import batches, notifications
+ * dispatch). The event bus + outbox seams live in shared/events and are
+ * provided by SharedModule. All workers are env-gated OFF unless
+ * `OUTBOX_RELAY_POLL_MS` / `OUTBOX_RECONCILE_POLL_MS` /
+ * `RESERVATION_REAPER_POLL_MS` / `COUNT_SCHEDULER_POLL_MS` is set (tests
+ * exercise `drain()` / `reconcileNext()` / `expireDueReservations()` /
+ * `generateScheduledCountTasks()` directly).
  */
 @Module({
-  imports: [SharedModule, InventoryModule],
-  providers: [OutboxRelayWorker, ReconciliationWorker, ReservationReaper],
+  imports: [SharedModule, InventoryModule, MovementsModule],
+  providers: [OutboxRelayWorker, ReconciliationWorker, ReservationReaper, CountSchedulerWorker],
   exports: [],
 })
 export class JobsModule {}
