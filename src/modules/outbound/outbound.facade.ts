@@ -42,6 +42,8 @@ import { ShipmentCommandService } from './shipment.command';
 import type { CreateShipmentLabelCommand, ShipmentSnapshot, ShipmentStatus } from './shipment.command';
 import { ManifestCommandService } from './manifest.command';
 import type { CreateManifestCommand, ManifestSnapshot } from './manifest.command';
+import { RateService } from './rate.service';
+import type { OrderRatesSnapshot } from './rate.service';
 import type {
   CreateWavePolicyCommand,
   GenerateWaveCommand,
@@ -266,6 +268,7 @@ export class OutboundFacade {
     @Inject(DispatchCommandService) private readonly dispatchCommand: DispatchCommandService,
     @Inject(ShipmentCommandService) private readonly shipmentCommand: ShipmentCommandService,
     @Inject(ManifestCommandService) private readonly manifestCommand: ManifestCommandService,
+    @Inject(RateService) private readonly rateService: RateService,
   ) {}
 
   /** `POST .../outbound/orders/{orderId}/label` — the 4.6c label command. */
@@ -303,6 +306,16 @@ export class OutboundFacade {
       }
       return toShipmentView(row);
     });
+  }
+
+  /**
+   * The order's rate-shopping read (Story 4.6d): one quoted-or-refused item
+   * per live carrier connection, recomputed per request and never stored.
+   * Unknown or foreign order id is null → the api layer 404s (the
+   * `getShipmentForOrder` shape). A read — never capability-gated.
+   */
+  async getOrderRates(tenantId: string, orderId: string): Promise<OrderRatesSnapshot | null> {
+    return this.rateService.getOrderRates(tenantId, orderId);
   }
 
   /** `POST .../outbound/orders` — manual entry and (adapter-ready) ingestion. */

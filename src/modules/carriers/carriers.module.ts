@@ -25,9 +25,10 @@ import { CarriersFacade } from './carriers.facade';
  * facade's IN-TX passthroughs, with the `sandbox` carrier's deterministic
  * in-process arm as the stand-in and the three DIRECT carriers answering with
  * typed refusals — so the outbound module's label command is the facade's
- * first sibling caller. `rate()` and `track()` remain undeclared (rating is
- * deferred; tracking writeback is the outbox event, Epic 7): a method
- * signature guessed before its first caller is a shipped interface to unpick.
+ * first sibling caller. Story 4.6d grew the second arm (`rateThroughAdapter`)
+ * the same way, consumed by the rate read. `track()` remains undeclared
+ * (tracking writeback is the outbox event, Epic 7): a method signature
+ * guessed before its first caller is a shipped interface to unpick.
  *
  * Imports `SharedModule` only (DATABASE, OUTBOX_SINK — the spine
  * primitives); the tenancy helpers the command uses at entry

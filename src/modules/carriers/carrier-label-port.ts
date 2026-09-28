@@ -1,7 +1,8 @@
 /**
  * The carrier label port (Story 4.6c) — the port's first real arm, grown from
  * `carrier-registry.ts` exactly as that file's header promised ("the port
- * grows those arms in the story that consumes them").
+ * grows those arms in the story that consumes them"). Story 4.6d grows the
+ * second arm — `rate` — in the story that consumes it, beside the label arm.
  *
  * Shape: a label arm takes the adapter-use credential (request-scoped
  * plaintext, `openCredentialForAdapterUse`'s contract) plus the request, and
@@ -17,6 +18,14 @@
  * arm that makes the whole label → dispatch → manifest path real end-to-end
  * without a network. Its determinism is the point — the same request always
  * answers the same tracking number, so replay and e2e assertions are exact.
+ *
+ * The rate arms (4.6d) mirror the label pair: `unconfiguredRateArm` is THE
+ * SAME typed verbatim 501 the label arm throws (one refusal per deployment —
+ * the carriers module has no second unconfigured message to drift), and
+ * `sandboxRateArm` prices deterministically in-process off the pincode pair
+ * and the shippable weight. A rate arm answers an integer paise amount and
+ * nothing else — never money in any other unit, never anything about the
+ * credential.
  *
  * This file imports only TYPES from `carrier-registry.ts` — the registry
  * imports THIS file's arm functions, so keeping the reverse edge type-only
@@ -100,3 +109,72 @@ export function sandboxLabelArm(): CarrierLabelArm {
  * `carrier-registry.ts`, so the registry → port → (type-only) import graph
  * has no runtime cycle at all.
  */
+
+// ── the rate arm (Story 4.6d) ─────────────────────────────────────────────────
+
+/** What the rate read asks the carrier for. All identity is system-side. */
+export interface CarrierRateRequest {
+  /** The order reference being priced (read-only — rating writes nothing). */
+  readonly orderRef: string;
+  /**
+   * The origin pincode — the warehouse's, read at rate time. Null on rows
+   * created before 11-1 made the address required (the column reads null).
+   */
+  readonly originPincode: string | null;
+  /** The destination pincode — the order's, point-in-time at create. Null on pre-11-1 rows. */
+  readonly destinationPincode: string | null;
+  /**
+   * The order's shippable weight in grams — the line×SKU aggregate. Null when
+   * the caller cannot weight the order (the outbound side refuses such an
+   * order with 409 before any arm runs — the type stays honest for arms
+   * consumed outside that guard).
+   */
+  readonly weightGrams: number | null;
+}
+
+/**
+ * What a rate arm answers: the quote in INTEGER PAISE (AD-9 — money is an
+ * integer paise amount everywhere in this codebase; no float, no rupee
+ * decimal, no currency code — the quote is an INR rate).
+ */
+export interface CarrierRateResult {
+  readonly amountPaise: number;
+}
+
+/** One rate arm — the credential contract is the label arm's, verbatim. */
+export type CarrierRateArm = (
+  credential: CarrierCredential,
+  request: CarrierRateRequest,
+) => Promise<CarrierRateResult>;
+
+/**
+ * The DIRECT carriers' rate arm until their real transports land: THE SAME
+ * typed verbatim 501 `carrier-transport-unconfigured` the label arm throws —
+ * the same refusal, the same retryable shape, rendered as a refused item by
+ * the rate read rather than as the whole response's failure.
+ */
+export function unconfiguredRateArm(carrierCode: string): CarrierRateArm {
+  return async (): Promise<CarrierRateResult> => {
+    throw carrierTransportUnconfigured(carrierCode);
+  };
+}
+
+/**
+ * The sandbox carrier's deterministic rate arm (4.6d's Design Notes): base +
+ * per-kg + a pincode-pair jitter band, all integer paise — a formula, not a
+ * bare hash, so heavier orders quote more (the quote must respond sensibly to
+ * its inputs) while staying exactly reproducible in tests by recomputation.
+ * An unweighted request prices at zero carried weight (the base fare).
+ */
+export function sandboxRateArm(): CarrierRateArm {
+  return async (_credential, request) => {
+    const weight = request.weightGrams === null ? 0 : request.weightGrams;
+    const digest = createHash('sha256')
+      .update(
+        `sandbox-rate|${request.originPincode ?? ''}|${request.destinationPincode ?? ''}`,
+      )
+      .digest();
+    const jitter = digest.readUInt32BE(0) % 1500;
+    return { amountPaise: 2500 + 500 * Math.ceil(weight / 1000) + jitter };
+  };
+}
