@@ -216,9 +216,20 @@ export type LedgerReferenceDoc =
       readonly binId: string;
       /** The operator-captured reading, °C. */
       readonly readingC: number;
+    }
+  // Story 5-1 — the transfer arm: every `transfer.outbound` /
+  // `transfer.inbound` movement names the transfer order and the line whose
+  // units moved (the pick arm's line-level precedent — the two legs correlate
+  // by `transferId`, and the detail read re-derives both legs from the events
+  // alone). NEW union arm — the earlier kinds are never reshaped.
+  | {
+      readonly kind: 'transfer';
+      readonly transferId: string;
+      /** Absent on a ZERO-line transfer (which cannot exist today — ≥1 line). */
+      readonly lineId?: string;
     };
-// Later stories extend this union with NEW kinds (transfer, …) — never by
-// reshaping an existing arm.
+// Later stories extend this union with NEW kinds — never by reshaping an
+// existing arm.
 
 /** One registered grammar entry: an event type and what it may carry. */
 export interface LedgerEventTypeDefinition {
@@ -440,6 +451,51 @@ registerLedgerEventType({
   referenceKinds: ['excursion'],
   allowsBatchArm: false,
   allowsSerialArm: false,
+});
+
+/**
+ * Grammar v1, Story 5-1 — the transfer outbound leg: one event per (sku,
+ * batch) arm of each line, moving the units from the line's source bin into
+ * the source warehouse's system IN-TRANSIT bin (a RELOCATION — fromBin +
+ * toBin carried on ONE event, the putaway/merge convention; the magnitude
+ * folds both projections from the single delta). The units leave the source
+ * bin and the source warehouse's ATP drops by exactly that quantity
+ * (`inTransitUnits` — the stock now sits in the IN-TRANSIT bin, which the
+ * hook counts). Serial-tracked lines carry one event per serial unit
+ * (magnitude 1, the batch arm carried with it — the putaway convention), and
+ * the outbound leg's serial events are the identity source the inbound leg
+ * derives its arms from (the qc.released precedent). Registers sinceVersion
+ * 1 — no new grammar version; the reference-doc union appends only.
+ */
+registerLedgerEventType({
+  type: 'transfer.outbound',
+  sinceVersion: 1,
+  referenceKinds: ['transfer'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 5-1 — the transfer inbound leg: one event per (sku,
+ * batch) arm moving the parked units out of the in-transit bin. TWO shapes,
+ * one per warehouse topology, both carrying `referenceDoc {kind:'transfer'}`:
+ * - same warehouse: a RELOCATION from the warehouse's system IN-TRANSIT bin
+ *   into the destination bin (both bin arms carried, one chain);
+ * - cross warehouse: a pure DRAW on the SOURCE chain (`fromBinId` = the
+ *   source IN-TRANSIT bin, `toBinId` null — the `pick.picked` precedent: the
+ *   units leave that chain entirely) beside an INTAKE on the DESTINATION
+ *   chain (`fromBinId` null, `toBinId` = the destination bin), written in ONE
+ *   transaction so a rollback rolls back both chains. Serial arms derive
+ *   from the outbound leg's own events — exactly the units that were parked,
+ *   never a re-scan. Registers sinceVersion 1 — no new grammar version; the
+ *   reference-doc union appends only.
+ */
+registerLedgerEventType({
+  type: 'transfer.inbound',
+  sinceVersion: 1,
+  referenceKinds: ['transfer'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
 });
 
 /** The registered definition — `undefined` for an unregistered type. */

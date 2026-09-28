@@ -11,6 +11,7 @@ import { UUID_RE } from '../shared/primitives/ids';
 import { ReceivingFacade } from '../modules/inbound/receiving.facade';
 import { OutboundFacade } from '../modules/outbound/outbound.facade';
 import { QcFacade } from '../modules/inbound/qc.facade';
+import { MovementsFacade } from '../modules/movements/transfer.facade';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -61,6 +62,9 @@ export class ReceivingController {
     // Story 4.3: the snapshot's `pickTasks` arm — cross-facade composition at
     // the shell, which is where AD-6 puts it.
     @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
+    // Story 5-1: the snapshot's `transferTasks` arm — the same composition
+    // (the transfer aggregate is movements-exclusive).
+    @Inject(MovementsFacade) private readonly movements: MovementsFacade,
   ) {}
 
   @Post(':tenantId/receiving/goods-receipts')
@@ -178,11 +182,16 @@ export class ReceivingController {
     // the warehouse's active handling units. Same sequential composition: the
     // shell never nests one facade's transaction inside another's.
     const packWork = await this.outbound.getPackTasks(tenantId, query.warehouseId);
+    // Story 5-1: the Transfer inbox arm — in-transit transfers TO this
+    // warehouse, the inbound-confirm tasks. Same sequential composition: the
+    // shell never nests one facade's transaction inside another's.
+    const transferTasks = await this.movements.getTransferTasks(tenantId, query.warehouseId);
     return {
       ...snapshot,
       pickTasks: pickTasks.map((task) => ({ ...task })),
       packTasks: packWork.packTasks.map((task) => ({ ...task })),
       handlingUnits: packWork.handlingUnits.map((unit) => ({ ...unit })),
+      transferTasks: transferTasks.map((task) => ({ ...task, lines: task.lines.map((line) => ({ ...line })) })),
     };
   }
 

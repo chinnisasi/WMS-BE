@@ -9637,6 +9637,731 @@
           "compliance"
         ]
       }
+    },
+    "/tenants/{tenantId}/movements/transfers": {
+      "post": {
+        "operationId": "MovementsController_createTransfer",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTransferDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Transfer created in draft (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferOrderResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — a catch-weight SKU, a batch- and serial-tracked SKU, a missing/forbidden batch arm, a system bin on either end, or a quantity finer than the SKU's unit allows (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks transfers.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A warehouse, bin, SKU, or batch does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A line names a kit SKU — a kit never holds stock (kit-cannot-hold-stock), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Creates a transfer order (transfers.manage): a draft two-leg plan — per line, draw from a source bin and land in a planned destination bin",
+        "tags": [
+          "movements"
+        ]
+      },
+      "get": {
+        "operationId": "MovementsController_listTransfers",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "draft",
+                "in_transit",
+                "completed",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "sourceWarehouseId",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "destWarehouseId",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The transfer page (newest first, per-transfer line/unit sums)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor (invalid-cursor), malformed warehouse filter, or out-of-range limit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A warehouse filter names a warehouse outside this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists transfer orders (keyset cursor pagination — the read-only web surface, open to any member)",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/transfers/{transferId}/outbound-confirm": {
+      "post": {
+        "operationId": "MovementsController_confirmOutbound",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "transferId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmOutboundDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Outbound confirmed: the leg events (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferConfirmResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid body, or a serial-tracked line whose serial scans do not match its quantity (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks transfers.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The transfer, a line, or a scanned serial does not exist in this tenant (not-found, serial-unknown)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not draft (transfer-wrong-state), a source bin is short of the planned draw (transfer-source-short), a serial is already located elsewhere or scanned twice (serial-elsewhere, duplicate-serial), the source on-hand cannot cover the draw (insufficient-on-hand), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Confirms the outbound leg (transfers.manage): draws each line from its source bin into the source warehouse's system IN-TRANSIT bin — one ledger event per arm, the order flips to in_transit",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/transfers/{transferId}/inbound-confirm": {
+      "post": {
+        "description": "Accepts EITHER session family on the one route (the compliance controller's precedent): a web session or a device badge-in session — the Transfer inbox task's confirm. The command re-evaluates the actor's role and the destination placement gates against the DB at entry.",
+        "operationId": "MovementsController_confirmInbound",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "transferId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmInboundDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Inbound confirmed: both legs' events on a cross-warehouse transfer (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferConfirmResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token of either family, or a device token without a badge-in session (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks transfers.execute (role-denied), or the destination bin is secure/cage-class and the actor lacks secure.move (role-denied — the cage is off-limits to floor staff, FR-42)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The transfer or the scanned destination bin does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not in_transit (transfer-wrong-state), the scanned bin's state epoch is stale (transfer-bin-changed — the mobile client re-plans), or a destination placement gate refused — retired, blocked, storage-class mismatch (bin-retired, bin-blocked, bin-storage-mismatch), hazard co-location (bin-segregation-conflict), bulk-asset occupancy (bin-occupancy-conflict), or the load gates (bin-full, bin-overweight, bin-volume-exceeded, bin-item-oversize) — the order stays in_transit; or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "device": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Confirms the inbound leg (transfers.execute — either session family): lands each line in its scanned or planned destination bin and completes the order — one ledger event per arm (cross-warehouse: a drain on the source chain AND an intake on the destination chain, ONE transaction)",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/transfers/{transferId}/cancel": {
+      "post": {
+        "operationId": "MovementsController_cancelTransfer",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "transferId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelTransferDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Transfer cancelled (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferOrderResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks transfers.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The transfer does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not draft (transfer-wrong-state), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Cancels a DRAFT transfer order (transfers.manage) — no stock has moved, so the cancel is pure state; an in-transit or completed order refuses (409 transfer-wrong-state)",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/transfers/{transferId}": {
+      "get": {
+        "operationId": "MovementsController_getTransfer",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "transferId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The transfer detail (the two-leg audit read)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed transferId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The transfer does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The transfer detail: the order, its lines, and BOTH legs' ledger events in order, each carrying referenceDoc {kind:\"transfer\", transferId}",
+        "tags": [
+          "movements"
+        ]
+      }
     }
   },
   "info": {
@@ -15686,6 +16411,109 @@
           "skuId"
         ]
       },
+      "CatalogTransferTaskLineDto": {
+        "type": "object",
+        "properties": {
+          "lineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "description": "Base units to land. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0.001
+          },
+          "batchRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The catalog batch identity on a batch-tracked line"
+          },
+          "destBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The PLANNED destination bin — the confirm scan pre-fills from it"
+          },
+          "destBinCode": {
+            "type": "string"
+          },
+          "binStateEpoch": {
+            "type": "number",
+            "nullable": true,
+            "description": "The dest bin's state epoch, captured with the task"
+          }
+        },
+        "required": [
+          "lineId",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "qty",
+          "batchRef",
+          "destBinId",
+          "destBinCode",
+          "binStateEpoch"
+        ]
+      },
+      "CatalogTransferTaskDto": {
+        "type": "object",
+        "properties": {
+          "transferId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The transfer order awaiting inbound confirm"
+          },
+          "sourceWarehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse the units came from"
+          },
+          "sourceWarehouseCode": {
+            "type": "string"
+          },
+          "sourceWarehouseName": {
+            "type": "string"
+          },
+          "destWarehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "outboundConfirmedAt": {
+            "type": "string",
+            "description": "When the outbound confirm put the units in transit (ISO-8601 UTC)"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogTransferTaskLineDto"
+            }
+          }
+        },
+        "required": [
+          "transferId",
+          "sourceWarehouseId",
+          "sourceWarehouseCode",
+          "sourceWarehouseName",
+          "destWarehouseId",
+          "note",
+          "outboundConfirmedAt",
+          "lines"
+        ]
+      },
       "CatalogSnapshotResponse": {
         "type": "object",
         "properties": {
@@ -15744,6 +16572,13 @@
             "items": {
               "$ref": "#/components/schemas/CatalogHandlingUnitDto"
             }
+          },
+          "transferTasks": {
+            "description": "Story 5-1 (additive): the in-transit transfers TO this warehouse — the Transfer inbox tasks whose inbound confirm the operator executes (one confirm completes the whole order)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogTransferTaskDto"
+            }
           }
         },
         "required": [
@@ -15755,7 +16590,8 @@
           "putawayTasks",
           "pickTasks",
           "packTasks",
-          "handlingUnits"
+          "handlingUnits",
+          "transferTasks"
         ]
       },
       "GoodsReceiptEntryDto": {
@@ -16960,6 +17796,341 @@
           "order",
           "bins",
           "lines"
+        ]
+      },
+      "TransferLineDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantity": {
+            "type": "number",
+            "description": "Quantity to move. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source bin the units draw from (source warehouse)"
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The PLANNED destination bin (destination warehouse)"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Catalog batch identity (required for batch-tracked SKUs, forbidden otherwise)"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 500
+          }
+        },
+        "required": [
+          "skuId",
+          "quantity",
+          "fromBinId",
+          "toBinId"
+        ]
+      },
+      "CreateTransferDto": {
+        "type": "object",
+        "properties": {
+          "sourceWarehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse the stock leaves"
+          },
+          "destWarehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse the units land in (MAY equal the source)"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 500
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock",
+            "minLength": 20,
+            "maxLength": 35
+          },
+          "lines": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TransferLineDto"
+            }
+          }
+        },
+        "required": [
+          "sourceWarehouseId",
+          "destWarehouseId",
+          "lines"
+        ]
+      },
+      "TransferLineResponseDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantity": {
+            "type": "number",
+            "description": "The line quantity. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0.001
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The catalog batch identity on a batch-tracked line"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "id",
+          "skuId",
+          "quantity",
+          "fromBinId",
+          "toBinId",
+          "batchRef",
+          "note"
+        ]
+      },
+      "TransferOrderResponse": {
+        "type": "object",
+        "properties": {
+          "transfer": {
+            "type": "object"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TransferLineResponseDto"
+            }
+          }
+        },
+        "required": [
+          "transfer",
+          "lines"
+        ]
+      },
+      "ConfirmOutboundLineDto": {
+        "type": "object",
+        "properties": {
+          "lineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "serials": {
+            "maxItems": 200,
+            "description": "The raw serial numbers of a serial-tracked line (one per unit, no duplicates)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "lineId"
+        ]
+      },
+      "ConfirmOutboundDto": {
+        "type": "object",
+        "properties": {
+          "occurredAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock",
+            "minLength": 20,
+            "maxLength": 35
+          },
+          "lines": {
+            "description": "Per-line serial scans — only for serial-tracked lines",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConfirmOutboundLineDto"
+            }
+          }
+        }
+      },
+      "TransferLegEventResponseDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The chain the event sits on"
+          },
+          "seq": {
+            "type": "number"
+          },
+          "type": {
+            "type": "string",
+            "description": "transfer.outbound | transfer.inbound"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantity": {
+            "type": "number",
+            "description": "The event's magnitude. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0.001
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "batchRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "serialRef": {
+            "type": "string",
+            "nullable": true
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC)"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "seq",
+          "type",
+          "skuId",
+          "quantity",
+          "fromBinId",
+          "toBinId",
+          "batchRef",
+          "serialRef",
+          "occurredAt"
+        ]
+      },
+      "TransferConfirmResponse": {
+        "type": "object",
+        "properties": {
+          "transfer": {
+            "type": "object"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TransferLegEventResponseDto"
+            }
+          }
+        },
+        "required": [
+          "transfer",
+          "events"
+        ]
+      },
+      "ConfirmInboundDto": {
+        "type": "object",
+        "properties": {
+          "destBinId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The operator's SCANNED destination bin — authoritative when carried (redirecting every line), else each line lands in its planned bin"
+          },
+          "binStateEpoch": {
+            "type": "number",
+            "nullable": true,
+            "description": "The dest bin's state epoch the task read captured; null/absent = match, a stale epoch answers 409 transfer-bin-changed",
+            "minimum": 0
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock",
+            "minLength": 20,
+            "maxLength": 35
+          }
+        }
+      },
+      "CancelTransferDto": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 500
+          }
+        }
+      },
+      "TransferListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "TransferDetailResponse": {
+        "type": "object",
+        "properties": {
+          "transfer": {
+            "type": "object"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TransferLegEventResponseDto"
+            }
+          }
+        },
+        "required": [
+          "transfer",
+          "lines",
+          "events"
         ]
       }
     }

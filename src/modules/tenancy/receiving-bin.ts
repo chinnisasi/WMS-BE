@@ -48,6 +48,25 @@ export const QC_HOLD_BIN_TYPE = 'staging';
 /** Effectively unbounded: quarantining stock is never capacity-gated (milli-units). */
 export const QC_HOLD_BIN_CAPACITY = 1_000_000 * QUANTITY_SCALE;
 
+/**
+ * The system IN-TRANSIT bin (Story 5-1): every warehouse owns exactly one,
+ * seeded by migration 0043 for the warehouses that already exist and ensured
+ * beside the QC-hold bin for the new ones — the QC-hold mirror once more.
+ * Only the movements module's transfer legs ever move stock through it: the
+ * outbound confirm parks the drawn units here and the inbound confirm drains
+ * them out, so the serial-in-exactly-one-bin invariant survives and the ATP
+ * exclusion (`inTransitUnits`) is one subtraction term keyed on code +
+ * system-owned — the same identity `qcHeldUnits` reads. `system_owned`
+ * excludes it from putaway suggestions and picking like the other system
+ * bins; the type is `staging` and the capacity a generous sentinel — parking
+ * units in transit is never capacity-gated.
+ */
+export const IN_TRANSIT_ZONE_CODE = 'IN-TRANSIT';
+export const IN_TRANSIT_BIN_CODE = 'IN-TRANSIT';
+export const IN_TRANSIT_BIN_TYPE = 'staging';
+/** Effectively unbounded: parking units in transit is never capacity-gated (milli-units). */
+export const IN_TRANSIT_BIN_CAPACITY = 1_000_000 * QUANTITY_SCALE;
+
 export async function ensureReceivingBinInTx(
   tx: TenantTx,
   tenantId: string,
@@ -173,6 +192,81 @@ export async function ensureQcHoldBinInTx(
   const bin = binRows[0];
   if (bin === undefined) {
     throw new Error(`qc-hold bin missing after ensure: ${tenantId}/${warehouseId}`);
+  }
+  return { zoneId: zone.id, binId: bin.id };
+}
+
+/**
+ * `ensureInTransitBinInTx` — the QC-hold ensure's mirror (Story 5-1): zone
+ * first, then the bin, each ensure-or-reselect inside the CALLER's
+ * transaction; a concurrent first transfer races on the unique indexes and
+ * the loser re-selects the winner's rows, both landing on one bin. Migration
+ * 0043 seeded this pair for every warehouse that already existed; this helper
+ * covers warehouses created afterwards (and re-selects the 0043 rows when a
+ * transfer is the warehouse's first movement).
+ */
+export async function ensureInTransitBinInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+): Promise<ReceivingBinRef> {
+  await tx
+    .insert(zones)
+    .values({
+      id: uuidv7(),
+      tenantId,
+      warehouseId,
+      code: IN_TRANSIT_ZONE_CODE,
+      name: 'In Transit',
+    })
+    .onConflictDoNothing({ target: [zones.warehouseId, zones.code] });
+  const zoneRows = await tx
+    .select({ id: zones.id })
+    .from(zones)
+    .where(
+      and(eq(zones.tenantId, tenantId), eq(zones.warehouseId, warehouseId), eq(zones.code, IN_TRANSIT_ZONE_CODE)),
+    )
+    .limit(1);
+  const zone = zoneRows[0];
+  if (zone === undefined) {
+    // Unreachable short of an RLS/scope bug — fail loudly rather than
+    // guess an id.
+    throw new Error(`in-transit zone missing after ensure: ${tenantId}/${warehouseId}`);
+  }
+
+  await tx
+    .insert(bins)
+    .values({
+      id: uuidv7(),
+      tenantId,
+      warehouseId,
+      zoneId: zone.id,
+      code: IN_TRANSIT_BIN_CODE,
+      capacity: IN_TRANSIT_BIN_CAPACITY,
+      type: IN_TRANSIT_BIN_TYPE,
+      systemOwned: true,
+    })
+    .onConflictDoNothing({ target: [bins.warehouseId, bins.code] });
+  const binRows = await tx
+    .select({ id: bins.id })
+    .from(bins)
+    .where(
+      and(
+        eq(bins.tenantId, tenantId),
+        eq(bins.warehouseId, warehouseId),
+        eq(bins.code, IN_TRANSIT_BIN_CODE),
+        // The identity that feeds `inTransitUnits` is code + system-owned: a
+        // user-created bin named `IN-TRANSIT` is not the in-transit bin —
+        // adopting it would park stock where the ATP hook counts zero.
+        // Refuse loudly rather than silently break the hook (the QC-hold
+        // ensure's precedent).
+        eq(bins.systemOwned, true),
+      ),
+    )
+    .limit(1);
+  const bin = binRows[0];
+  if (bin === undefined) {
+    throw new Error(`in-transit bin missing after ensure: ${tenantId}/${warehouseId}`);
   }
   return { zoneId: zone.id, binId: bin.id };
 }

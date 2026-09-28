@@ -866,3 +866,95 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
     expect(ledger).toContain('ensureSelfClientInTx');
   });
 });
+
+describe('architecture: the transfer aggregate is movements-module-owned (story 5-1)', () => {
+  /**
+   * Story 5-1 populates the movements spine with the transfer aggregate
+   * (`transfer_orders`, `transfer_order_lines`) — module-exclusive exactly
+   * like the order aggregate is outbound-exclusive (AD-6): every other
+   * module reads transfer state through `MovementsFacade` and composes its
+   * stock through `InventoryFacade`. The legs are LEDGER events — the
+   * command writes no stock table itself, so the ledger stays the
+   * PROJECTION_OWNER and there is no second quantity-mutation path.
+   */
+  const TRANSFER_TABLES = ['transferOrders', 'transferOrderLines'] as const;
+  const RAW_TRANSFER_TABLES = 'transfer_orders|transfer_order_lines';
+  const movementsRoot = join(SRC_ROOT, 'modules', 'movements');
+
+  it('no transfer-table write happens outside the movements module', () => {
+    const outside = files.filter((file) => !file.path.startsWith(movementsRoot));
+    const offenders: string[] = [];
+    for (const file of outside) {
+      for (const pattern of [
+        ...TRANSFER_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_TRANSFER_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) {
+          offenders.push(`${file.path}: /${pattern.source}/`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no other module reaches into the movements module past the facade', () => {
+    // The mirror of the inventory/outbound guards (both import forms; the
+    // allowed suffixes must END the specifier). The facade file for this
+    // aggregate is `transfer.facade` (the seam), so its import is whitelisted
+    // beside the `movements.facade` legacy suffix.
+    const movementsInternals = new RegExp(
+      '(?:modules/movements|\\.\\./movements)/' +
+        '(?!movements\\.(facade|module|dto)[\'"])(?!transfer\\.facade[\'"])',
+    );
+    const siblingModules = files.filter(
+      (file) =>
+        file.path.startsWith(join(SRC_ROOT, 'modules')) &&
+        !file.path.startsWith(movementsRoot) &&
+        /(?:modules\/movements|\.\.\/movements)\//.test(file.source),
+    );
+    // Story 5-1 brought the first consumers (the transfer.command + facade
+    // pair, plus the api shell's snapshot arm), but the meaningfulness assert
+    // stays pinned directly (the outbound block's precedent): the detector
+    // must catch a reach-through, not just find files.
+    for (const reaching of [
+      "from '../movements/transfer.command'",
+      "from '../movements/movements.facade.internal'",
+      "from 'src/modules/movements/transfer.command'",
+    ]) {
+      expect(movementsInternals.test(reaching)).toBe(true);
+    }
+    for (const allowed of [
+      "from '../movements/transfer.facade'",
+      "from '../movements/movements.module'",
+      "from '../movements/movements.dto'",
+      "from 'src/modules/movements/transfer.facade'",
+    ]) {
+      expect(movementsInternals.test(allowed)).toBe(false);
+    }
+    const offenders: string[] = [];
+    for (const file of siblingModules) {
+      if (movementsInternals.test(file.source)) {
+        offenders.push(file.path);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the movements module writes its own tables and moves stock only through the inventory facade (the test is meaningful)', () => {
+    const source = readFileSync(join(movementsRoot, 'transfer.command.ts'), 'utf8');
+    // The aggregate's writes live here — and nowhere else.
+    expect(drizzleWriteOn('transferOrders').test(source)).toBe(true);
+    expect(drizzleWriteOn('transferOrderLines').test(source)).toBe(true);
+    // The legs ride the ledger passthrough — no second quantity-mutation path
+    // (AD-6/16), the pick/dispatch commands' guard mirrored.
+    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'binStateEpochs', 'reservations'] as const) {
+      expect(drizzleWriteOn(table).test(source)).toBe(false);
+    }
+    expect(source).toContain('this.inventory.appendLedgerEventInTx');
+    // The facade is read-only over the aggregate (the seam, not a writer).
+    const facade = readFileSync(join(movementsRoot, 'transfer.facade.ts'), 'utf8');
+    for (const table of ['transferOrders', 'transferOrderLines'] as const) {
+      expect(drizzleWriteOn(table).test(facade)).toBe(false);
+    }
+  });
+});

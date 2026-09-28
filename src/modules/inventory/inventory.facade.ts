@@ -2,15 +2,29 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { batchOnHand, ledgerEvents, stockOnHand } from '../../shared/db/schema';
-import type { LedgerEvent } from '../../shared/db/schema';
+import { batchOnHand, bins, ledgerEvents, skus, stockOnHand } from '../../shared/db/schema';
+import type { LedgerEvent, UserRole } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
-import { fromMilli } from '../../shared/primitives/quantity';
+import { fromMilli, QUANTITY_DECIMALS, QUANTITY_SCALE } from '../../shared/primitives/quantity';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
+// Story 5-1 — the destination placement gates' shared predicates. The SYNC
+// HAZARD rule: one predicate behind every arm (storage class, hazard
+// co-location, bulk-asset occupancy), imported — never copied. The
+// `binOccupancyInTx`-shaped load read lives BELOW as this facade's own (the
+// putaway command cannot be imported: it imports THIS facade — a module
+// evaluation cycle), reusing the same primitives so the rules stay single-
+// sourced even where the read is duplicated.
+import { hazardClassesCompatible } from '../../shared/primitives/hazard';
+import {
+  bulkAssetOccupancyHolds,
+  isBulkAssetType,
+} from '../../shared/primitives/location-type';
+import { storageClassSatisfies } from '../../shared/primitives/storage-class';
+import { assertSecureBinAuthority } from '../tenancy/permissions';
 import {
   canonicalInstant,
   LedgerService,
@@ -1308,6 +1322,361 @@ export class InventoryFacade {
       batchRef: row.batchRef,
     }));
   }
+
+  // ── Story 5-1: the destination placement gates (the movements module's
+  // inbound confirm) ────────────────────────────────────────────────────────
+
+  /**
+   * The destination placement gates, as ONE additive arm (Story 5-1): a
+   * transfer's inbound confirm is a new stock writer of the adjustment shape,
+   * and the spec's Boundaries forbid it from bypassing the gates
+   * `stock.adjust` bypasses. The gate set and its ORDER are the
+   * `putaway.place` composition's (the SYNC HAZARD rule — one arm list per
+   * gate family, one predicate behind every arm), run here so the movements
+   * module reuses, not re-implements, the 12-1/12-2/12-3/12-4 + 11-5 gates:
+   *
+   *   bin-row `.for('update')` (the capacity mutex) → system-owned → retired
+   *   → blocked → storage class (12-1) → secure authority (12-3) → bulk-asset
+   *   occupancy (12-4) → hazard co-location (12-2) → the load gates —
+   *   capacity → weight → volume → per-axis dim fit (11-5).
+   *
+   * The `intakes` are AGGREGATED by the caller: one call per destination bin,
+   * one intake per (skuId) landing in it with the SUM of that SKU's line
+   * quantities, so two lines of one SKU into one bin are one gate answer and
+   * the capacity read carries the whole planned intake. The refusal arms
+   * carry the gate's OWN machine codes — the transfer surface answers 409 for
+   * the gate family (the spec's matrix fixes the status; putaway's own
+   * refusals of the same codes answer 400), while `assertSecureBinAuthority`
+   * keeps its own 403 `role-denied` shape — a (role, bin) authority answer,
+   * not a gate-status one.
+   *
+   * The caller's in-transaction passthrough shape (`qcScopeOnHandInTx`
+   * precedent); a gate runner, never a write path.
+   */
+  async assertPlacementGatesInTx(
+    tx: TenantTx,
+    args: {
+      readonly tenantId: string;
+      readonly warehouseId: string;
+      readonly binId: string;
+      readonly intakes: readonly { readonly skuId: string; readonly qtyMilli: number }[];
+      readonly role: UserRole;
+    },
+  ): Promise<{ readonly binId: string; readonly binCode: string }> {
+    // The bin row, `.for('update')` — the same mutex the placement command
+    // takes (two concurrent intakes would otherwise both pass capacity and
+    // then append serially — over capacity). The putaway order — bin-row →
+    // serial-lock → warehouse-lock — stays acyclic; the movements command
+    // acquires its warehouse advisory locks BEFORE calling here, and the
+    // advisory lock is re-entrant inside the same transaction, so the fold's
+    // own acquisition never self-deadlocks.
+    const binRows = await tx
+      .select({
+        id: bins.id,
+        code: bins.code,
+        capacity: bins.capacity,
+        blocked: bins.blocked,
+        systemOwned: bins.systemOwned,
+        retiredAt: bins.retiredAt,
+        // Story 11-5: the bin's physical limits (null = unconstrained).
+        lengthMm: bins.lengthMm,
+        widthMm: bins.widthMm,
+        heightMm: bins.heightMm,
+        maxWeightGrams: bins.maxWeightGrams,
+        // Story 12-1 — the class the placement gate rules on.
+        storageClass: bins.storageClass,
+        // Story 12-4 — the location type: the bulk-asset occupancy arm's key.
+        type: bins.type,
+      })
+      .from(bins)
+      .where(
+        and(
+          eq(bins.id, args.binId),
+          eq(bins.tenantId, args.tenantId),
+          eq(bins.warehouseId, args.warehouseId),
+        ),
+      )
+      .for('update')
+      .limit(1);
+    const bin = binRows[0];
+    if (bin === undefined) {
+      throw new ProblemException(
+        'not-found',
+        404,
+        'Bin not found',
+        `No bin with id "${args.binId}" exists in this warehouse.`,
+      );
+    }
+    // The structural arms. A SYSTEM bin is never an intake target (the
+    // in-transit/receiving/QC-hold bins are system-internal staging) — an
+    // invalid request, not a state conflict. Retired/blocked are state
+    // conflicts (409, the gate family's own machine codes; putaway's
+    // refusals of the same codes answer 400 for its surface, the transfer
+    // matrix fixes 409 for this one).
+    if (bin.systemOwned) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Bin is a system bin',
+        `Bin "${bin.code}" is a system bin (Receiving/QC-hold/In-Transit) — transfer intake lands in storage bins only.`,
+      );
+    }
+    if (bin.retiredAt !== null) {
+      throw new ProblemException(
+        'bin-retired',
+        409,
+        'Target bin is retired',
+        `Bin "${bin.code}" is retired — transfer intake into it is refused; retirement is terminal.`,
+      );
+    }
+    if (bin.blocked) {
+      throw new ProblemException(
+        'bin-blocked',
+        409,
+        'Target bin is blocked',
+        `Bin "${bin.code}" is blocked — transfer intake into it is refused until it is unblocked.`,
+      );
+    }
+
+    // Aggregate the intake per SKU (the caller may land two lines of one SKU
+    // in this bin) and read the SKU rows once.
+    const bySku = new Map<string, number>();
+    for (const intake of args.intakes) {
+      bySku.set(intake.skuId, (bySku.get(intake.skuId) ?? 0) + intake.qtyMilli);
+    }
+    const skuIds = [...bySku.keys()].sort();
+    const skuRows = await tx
+      .select({
+        id: skus.id,
+        code: skus.code,
+        storageClass: skus.storageClass,
+        hazardClass: skus.hazardClass,
+        weightGrams: skus.weightGrams,
+        lengthMm: skus.lengthMm,
+        widthMm: skus.widthMm,
+        heightMm: skus.heightMm,
+      })
+      .from(skus)
+      .where(and(eq(skus.tenantId, args.tenantId), inArray(skus.id, skuIds)));
+    const skuById = new Map(skuRows.map((row) => [row.id, row]));
+    for (const skuId of skuIds) {
+      if (!skuById.has(skuId)) {
+        throw new ProblemException(
+          'not-found',
+          404,
+          'SKU not found',
+          `No SKU with id "${skuId}" exists in this tenant.`,
+        );
+      }
+    }
+
+    // The class gate (12-1) per moving SKU, then the secure authority
+    // (12-3) — ONE assert over the involved bin, the placement arm's
+    // position (immediately after the class gate).
+    for (const skuId of skuIds) {
+      const sku = skuById.get(skuId)!;
+      if (!storageClassSatisfies(sku.storageClass, bin.storageClass)) {
+        throw new ProblemException(
+          'bin-storage-mismatch',
+          409,
+          'Bin does not satisfy the SKU’s storage class',
+          `Bin "${bin.code}" is ${bin.storageClass}; SKU "${sku.code}" requires ${sku.storageClass} storage — a non-conforming intake is refused by rule (FR-40).`,
+        );
+      }
+    }
+    assertSecureBinAuthority(args.role, [bin]);
+    // The bulk-asset occupancy gate (12-4): a tank/silo holds exactly ONE
+    // SKU — the predicate over the moving set and the bin's occupants, the
+    // same one `mergeBin` and `candidateFitsSku` import.
+    if (isBulkAssetType(bin.type)) {
+      const occupants = await tx
+        .select({ skuId: stockOnHand.skuId, skuCode: skus.code })
+        .from(stockOnHand)
+        .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+        .where(
+          and(
+            eq(stockOnHand.tenantId, args.tenantId),
+            eq(stockOnHand.warehouseId, args.warehouseId),
+            eq(stockOnHand.binId, args.binId),
+            sql`${stockOnHand.quantity} > 0`,
+          ),
+        )
+        .groupBy(stockOnHand.skuId, skus.code);
+      if (
+        !bulkAssetOccupancyHolds(
+          bin.type,
+          skuIds,
+          occupants.map((o) => o.skuId),
+        )
+      ) {
+        const holding = [...new Set(occupants.map((o) => o.skuCode))];
+        const moving = skuIds.map((id) => skuById.get(id)!.code);
+        throw new ProblemException(
+          'bin-occupancy-conflict',
+          409,
+          'Bulk asset cannot hold two SKUs',
+          `Bin "${bin.code}" is a ${bin.type} (a bulk asset holds exactly ONE SKU): ` +
+            `it holds ${holding.map((code) => `"${code}"`).join(', ')} and the transfer would land ` +
+            `${moving.map((code) => `"${code}"`).join(', ')} — land it in another bulk asset, or ` +
+            'top up the holding SKU.',
+        );
+      }
+    }
+    // The hazard co-location gate (12-2): the bin's classed occupants, the
+    // moving SKUs' own pairs skipped (the same-SKU-consolidation rule).
+    const hazardOccupants = await tx
+      .select({ skuId: stockOnHand.skuId, skuCode: skus.code, hazardClass: skus.hazardClass })
+      .from(stockOnHand)
+      .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+      .where(
+        and(
+          eq(stockOnHand.tenantId, args.tenantId),
+          eq(stockOnHand.warehouseId, args.warehouseId),
+          eq(stockOnHand.binId, args.binId),
+          sql`${stockOnHand.quantity} > 0`,
+          sql`${skus.hazardClass} is not null`,
+        ),
+      );
+    for (const occupant of hazardOccupants) {
+      if (skuIds.includes(occupant.skuId)) {
+        continue;
+      }
+      for (const skuId of skuIds) {
+        const sku = skuById.get(skuId)!;
+        if (!hazardClassesCompatible(sku.hazardClass, occupant.hazardClass)) {
+          throw new ProblemException(
+            'bin-segregation-conflict',
+            409,
+            'Target bin holds a segregated hazard class',
+            `Bin "${bin.code}" holds SKU "${occupant.skuCode}" (${occupant.hazardClass}) — SKU "${sku.code}" ` +
+              `(${sku.hazardClass ?? 'no hazard class'}) is segregated from it (FR-41).`,
+          );
+        }
+      }
+    }
+
+    // The load read (the gates' shared input — one query, the
+    // `binOccupancyInTx` shape: LEFT join so the units sum stays
+    // join-independent, `::numeric` sums so an adversarial
+    // (huge-qty × max-attr) product cannot overflow an int8).
+    const loadRows = await tx
+      .select({
+        units: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint`,
+        weightLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * coalesce(${skus.weightGrams}, 0)), 0)::numeric`,
+        volumeLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * (coalesce(${skus.lengthMm}, 0) * coalesce(${skus.widthMm}, 0) * coalesce(${skus.heightMm}, 0))), 0)::numeric`,
+      })
+      .from(stockOnHand)
+      .leftJoin(skus, eq(skus.id, stockOnHand.skuId))
+      .where(
+        and(
+          eq(stockOnHand.tenantId, args.tenantId),
+          eq(stockOnHand.warehouseId, args.warehouseId),
+          eq(stockOnHand.binId, args.binId),
+        ),
+      );
+    const units = Number(loadRows[0]?.units ?? 0);
+    const weightLoad = BigInt(loadRows[0]?.weightLoad ?? 0);
+    const volumeLoad = BigInt(loadRows[0]?.volumeLoad ?? 0);
+
+    const totalIntakeMilli = [...bySku.values()].reduce((sum, qty) => sum + qty, 0);
+    if (units + totalIntakeMilli > bin.capacity) {
+      throw new ProblemException(
+        'bin-full',
+        409,
+        'Target bin is full',
+        `Bin "${bin.code}" holds ${fromMilli(units)} of ${fromMilli(bin.capacity)} — ` +
+          `intaking ${fromMilli(totalIntakeMilli)} more would exceed its capacity.`,
+      );
+    }
+    // The 11-5 family, in the placement's own order: weight → volume → dim
+    // fit, per moving SKU's attributes against the whole planned intake's
+    // contribution (the conservative coexistence — a dimmed SKU counts toward
+    // both). A bin without the matching limit skips the gate (fail-open on
+    // missing attributes); a SKU without the attribute contributes zero.
+    if (bin.maxWeightGrams !== null) {
+      const weightLimit = BigInt(bin.maxWeightGrams) * BigInt(QUANTITY_SCALE);
+      let weightAfter = weightLoad;
+      for (const skuId of skuIds) {
+        const sku = skuById.get(skuId)!;
+        weightAfter += BigInt(bySku.get(skuId)!) * BigInt(sku.weightGrams ?? 0);
+      }
+      if (weightAfter > weightLimit) {
+        throw new ProblemException(
+          'bin-overweight',
+          409,
+          'Target bin would exceed its weight capacity',
+          `Bin "${bin.code}" would carry ${fromMilliTextFacade(weightAfter)} g of its ${bin.maxWeightGrams} g ` +
+            'max weight — the transfer would exceed its weight capacity.',
+        );
+      }
+    }
+    if (bin.lengthMm !== null && bin.widthMm !== null && bin.heightMm !== null) {
+      const binVolume = BigInt(bin.lengthMm * bin.widthMm * bin.heightMm);
+      let volumeAfter = volumeLoad;
+      for (const skuId of skuIds) {
+        const sku = skuById.get(skuId)!;
+        const perUnitVolume = (sku.lengthMm ?? 0) * (sku.widthMm ?? 0) * (sku.heightMm ?? 0);
+        volumeAfter += BigInt(bySku.get(skuId)!) * BigInt(perUnitVolume);
+      }
+      if (volumeAfter > binVolume * BigInt(QUANTITY_SCALE)) {
+        throw new ProblemException(
+          'bin-volume-exceeded',
+          409,
+          'Target bin would exceed its volumetric capacity',
+          `Bin "${bin.code}" would hold ${fromMilliTextFacade(volumeAfter)} mm³ of its ` +
+            `${bin.lengthMm * bin.widthMm * bin.heightMm} mm³ — the transfer would exceed its volumetric capacity.`,
+        );
+      }
+    }
+    for (const skuId of skuIds) {
+      const sku = skuById.get(skuId)!;
+      if (sku.lengthMm !== null && bin.lengthMm !== null && sku.lengthMm > bin.lengthMm) {
+        throw binItemOversizeFacade(bin.code, 'length', sku.lengthMm, bin.lengthMm, sku.code);
+      }
+      if (sku.widthMm !== null && bin.widthMm !== null && sku.widthMm > bin.widthMm) {
+        throw binItemOversizeFacade(bin.code, 'width', sku.widthMm, bin.widthMm, sku.code);
+      }
+      if (sku.heightMm !== null && bin.heightMm !== null && sku.heightMm > bin.heightMm) {
+        throw binItemOversizeFacade(bin.code, 'height', sku.heightMm, bin.heightMm, sku.code);
+      }
+    }
+    return { binId: bin.id, binCode: bin.code };
+  }
+}
+
+/**
+ * Milli-units to operator-facing text for loads that are BigInt — the
+ * putaway command's `fromMilliText` (the 11-5 pattern), re-homed here rather
+ * than imported from `putaway.command` (that file imports THIS facade — the
+ * cycle rule). Kept byte-equivalent in wording so the two gates' messages
+ * read the same.
+ */
+function fromMilliTextFacade(milli: bigint): string {
+  const negative = milli < 0n;
+  const abs = negative ? -milli : milli;
+  const whole = (abs / BigInt(QUANTITY_SCALE)).toString();
+  const frac = (abs % BigInt(QUANTITY_SCALE))
+    .toString()
+    .padStart(QUANTITY_DECIMALS, '0')
+    .replace(/0+$/, '');
+  const text = frac.length === 0 ? whole : `${whole}.${frac}`;
+  return negative ? `-${text}` : text;
+}
+
+/** The per-axis oversize refusal (the 11-5 gate's own machine code). */
+function binItemOversizeFacade(
+  binCode: string,
+  dimension: 'length' | 'width' | 'height',
+  skuMm: number,
+  binMm: number,
+  skuCode: string,
+): ProblemException {
+  return new ProblemException(
+    'bin-item-oversize',
+    409,
+    'SKU does not fit the bin',
+    `Bin "${binCode}" is too small for SKU "${skuCode}": the bin's ${dimension} is ${binMm} mm but the SKU's ${dimension} is ${skuMm} mm.`,
+  );
 }
 
 interface QcScopeBatch {

@@ -836,9 +836,11 @@ describe('users, roles, and permission gating (e2e)', () => {
     // The decided matrix (2026-09-24), spelled out: owner and ops_manager
     // only — and the floor verbs stay out of the cage. Story 12-5 grows the
     // vocabulary to 24 with `excursion.record` (the floor records what it
-    // observes); story 4.6c grows it to 25 with `labels.execute` — neither
-    // touching the cage's holder set.
-    expect([...CAPABILITIES]).toHaveLength(25);
+    // observes); story 4.6c grows it to 25 with `labels.execute`; story 5-1
+    // grows it to 27 with `transfers.manage`/`transfers.execute` — the
+    // inbound confirm's holder set mirrors `putaway.execute` (floor holds
+    // it), still outside the cage's holder set.
+    expect([...CAPABILITIES]).toHaveLength(27);
     expect(CAPABILITIES).toContain('secure.move');
     expect(secureMoveHolders).toEqual(['owner', 'ops_manager']);
     expect(ROLE_CAPABILITIES.operator.has('putaway.execute')).toBe(true);

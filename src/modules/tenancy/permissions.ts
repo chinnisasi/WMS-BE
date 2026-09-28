@@ -112,6 +112,16 @@ export const CAPABILITIES = [
   // manifest. Accountant stays read-only. Mirrored into wms-fe
   // `src/lib/users.ts` by the 4.6c FE task.
   'labels.execute',
+  // Story 5-1 — the transfer-order commands (FR-18/FR-29). `transfers.manage`
+  // plans and confirms the outbound leg (create + cancel + outbound confirm —
+  // the planner verbs); `transfers.execute` confirms the inbound leg, the
+  // floor verb, mirroring `picks.execute`/`putaway.execute`'s rationale: the
+  // operator puts the units that arrived away. Accountant stays read-only.
+  // Mirrored into wms-fe `src/lib/users.ts` by the FE story.
+  'transfers.manage',
+  // The inbound confirm is an operator task (the Transfer inbox tab's op);
+  // Owner + Ops Manager + Operator, mirroring `putaway.execute`.
+  'transfers.execute',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -122,7 +132,7 @@ export type Capability = (typeof CAPABILITIES)[number];
  * mutations (warehouses, zones, bins, catalog import, SKU edit) but no user
  * management; Operator holds exactly the floor capabilities a device session
  * needs (`putaway.execute`, Story 3.5 — the first non-empty operator
- * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6; `labels.execute`, Story 4.6c; `excursion.record`, Story 12-5 — the floor
+ * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6; `labels.execute`, Story 4.6c; `excursion.record`, Story 12-5; `transfers.execute`, Story 5-1 — the floor
  * records what it observes) and NOT `secure.move` (Story 12-3 — the
  * cage is off-limits to floor staff); Accountant is read-only. Reads stay
  * open to any tenant member.
@@ -158,6 +168,11 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'labels.execute',
     // Story 12-3 — FR-42: the cage is a manager verb (owner holds everything).
     'secure.move',
+    // Story 5-1 — the transfer planner verbs (owner holds everything).
+    'transfers.manage',
+    // Story 5-1 — the manager may confirm an inbound leg too (the floor
+    // verb's holder set mirrors `putaway.execute`).
+    'transfers.execute',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
@@ -172,6 +187,11 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // the hold movements it triggers, which the operator deliberately does
     // not hold.
     'excursion.record',
+    // Story 5-1 — the floor confirms the inbound leg (the Transfer inbox
+    // task's op; `putaway.execute`'s rationale — the operator puts away what
+    // arrived). A secure/cage dest bin still answers the 12-3 gate at the
+    // intake movement, which the operator deliberately does not hold.
+    'transfers.execute',
   ]),
   accountant: new Set<Capability>([]),
 };

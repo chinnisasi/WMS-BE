@@ -8,7 +8,7 @@ import { bins, inventoryQuarantines, reservations, stockOnHand } from '../../sha
 import type { Reservation } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
-import { QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
+import { IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
 import { nowIso } from '../../shared/primitives/time';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { isUniqueViolationOn, ProblemException } from '../../shared/problem-details/problem.exception';
@@ -42,13 +42,15 @@ export const COUNTER_TTL_SECONDS = 7 * 24 * 3600;
 export const REAP_BATCH = 100;
 
 /**
- * The named hooks (story 2.3 boundary): QC holds and channel buffers
- * subtract from ATP. Story 3.4 populates the QC hook — the held quantity is
- * exactly the stock sitting in the warehouse's system QC-hold bin (a real
- * ledger movement put it there), so the computation reads `stock_on_hand`
- * joined to the `QC-HOLD` system bin — no cross-module hold-table read.
- * `bufferUnits` stays the zero-valued placeholder Epic 7 plugs in, so the
- * formula `on-hand − reserved − QC-held − buffer` never changes.
+ * The named hooks (story 2.3 boundary): QC holds, in-transit stock and
+ * channel buffers subtract from ATP. Story 3.4 populates the QC hook — the
+ * held quantity is exactly the stock sitting in the warehouse's system
+ * QC-hold bin (a real ledger movement put it there), so the computation reads
+ * `stock_on_hand` joined to the `QC-HOLD` system bin — no cross-module
+ * hold-table read. Story 5-1 populates the in-transit hook the same way (the
+ * system `IN-TRANSIT` bin, both legs of a transfer riding the ledger). The
+ * `bufferUnits` placeholder stays zero-valued for Epic 7, so the formula
+ * `on-hand − reserved − QC-held − in-transit − buffer` never changes.
  */
 export async function qcHeldUnits(
   tx: TenantTx,
@@ -78,6 +80,45 @@ export async function qcHeldUnits(
       ),
     );
   return Number(rows[0]?.held ?? 0);
+}
+
+/**
+ * The in-transit hook (Story 5-1, FR-18): the quantity parked in the
+ * warehouse's system IN-TRANSIT bin by a transfer's outbound confirm, waiting
+ * for its inbound confirm. The QC-held mirror — the computation reads
+ * `stock_on_hand` joined to the system `IN-TRANSIT` bin (code + system-owned
+ * identity, no transfer-table read), so the exclusion is structural over the
+ * ledger's own projection and replay-reconciliation reproduces it for free.
+ * Subtracted in BOTH `atp` and `committedCeiling`: parked units are not
+ * sellable at their source, and an order acceptance's grant must not consume
+ * them (the ceiling is what a grant validates against, not the read model).
+ * `::bigint` never `::int`, `Number(...)` at the boundary — the
+ * `qcHeldUnits` pattern verbatim.
+ */
+export async function inTransitUnits(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  skuId: string,
+): Promise<number> {
+  const rows = await tx
+    .select({ inTransit: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint` })
+    .from(stockOnHand)
+    .innerJoin(bins, eq(bins.id, stockOnHand.binId))
+    .where(
+      and(
+        eq(stockOnHand.tenantId, tenantId),
+        eq(stockOnHand.warehouseId, warehouseId),
+        eq(stockOnHand.skuId, skuId),
+        // The in-transit bin is system master data (tenancy-owned) read here
+        // only to locate the stock scope — no write, ever.
+        eq(bins.tenantId, tenantId),
+        eq(bins.warehouseId, warehouseId),
+        eq(bins.code, IN_TRANSIT_BIN_CODE),
+        eq(bins.systemOwned, true),
+      ),
+    );
+  return Number(rows[0]?.inTransit ?? 0);
 }
 
 /**
@@ -128,9 +169,14 @@ export interface AtpSnapshot {
   readonly reserved: number;
   /** Story 3.4: the units parked in the warehouse's system QC-hold bin. */
   readonly qcHeld: number;
+  /**
+   * Story 5-1: the units parked in the warehouse's system IN-TRANSIT bin by a
+   * transfer's outbound confirm — the QC-held figure's mirror.
+   */
+  readonly inTransit: number;
   /** Named hook — zero in this story (Epic 7 populates it). */
   readonly buffer: number;
-  /** `max(0, onHand − reserved − qcHeld − buffer)` — never oversells. */
+  /** `max(0, onHand − reserved − qcHeld − inTransit − buffer)` — never oversells. */
   readonly atp: number;
 }
 
@@ -326,6 +372,9 @@ export class ReservationService implements OnModuleInit {
       // Story 3.4: a refused grant names the QC-held units when any — the
       // ceiling is lower than plain on-hand because a hold parked stock.
       qcHeld: await qcHeldUnits(tx, tenantId, warehouseId, skuId),
+      // Story 5-1: the in-transit units lower the ceiling the same way — a
+      // refused grant names them too.
+      inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
     }));
     if (probe.existing !== undefined) {
       return this.idempotentHit(probe.existing, command);
@@ -345,6 +394,7 @@ export class ReservationService implements OnModuleInit {
       throw unavailable(
         `SKU ${skuId} has ${fromMilli(probe.ceiling)} sellable unit(s) in warehouse ${warehouseId}` +
           (probe.qcHeld > 0 ? ` (of which ${fromMilli(probe.qcHeld)} are QC-held)` : '') +
+          (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
           ` — the request for ${fromMilli(command.quantity)} cannot be reserved.`,
       );
     }
@@ -586,11 +636,15 @@ export class ReservationService implements OnModuleInit {
     requireUuid(tenantId, 'tenantId');
     requireUuid(warehouseId, 'warehouseId');
     requireUuid(skuId, 'skuId');
-    const { onHand, qcHeld } = await withTenantTransaction(this.db, tenantId, async (tx) => ({
+    const { onHand, qcHeld, inTransit } = await withTenantTransaction(this.db, tenantId, async (tx) => ({
       onHand: await this.committedOnHand(tx, tenantId, warehouseId, skuId),
       // Story 3.4: the QC hook reads its real source — the stock sitting in
       // the warehouse's system QC-hold bin (same committed-read tx).
       qcHeld: await qcHeldUnits(tx, tenantId, warehouseId, skuId),
+      // Story 5-1: the in-transit hook reads its real source — the stock
+      // parked in the warehouse's system IN-TRANSIT bin (same committed-read
+      // tx).
+      inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
     }));
     const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
     const readyKey = reservationReadyKey(tenantId, warehouseId);
@@ -635,8 +689,11 @@ export class ReservationService implements OnModuleInit {
       onHand,
       reserved,
       qcHeld,
+      // Story 5-1 — the in-transit figure beside the QC-held one (additive to
+      // the wire shape; the subtraction is what changes ATP).
+      inTransit,
       buffer,
-      atp: Math.max(0, onHand - reserved - qcHeld - buffer),
+      atp: Math.max(0, onHand - reserved - qcHeld - inTransit - buffer),
     };
   }
 
@@ -1035,7 +1092,13 @@ export class ReservationService implements OnModuleInit {
   ): Promise<number> {
     const onHand = await this.committedOnHand(tx, tenantId, warehouseId, skuId);
     const qcHeld = await qcHeldUnits(tx, tenantId, warehouseId, skuId);
-    return Math.max(0, onHand - qcHeld - bufferUnits());
+    // Story 5-1: the in-transit hook is a ceiling term, not just a read-model
+    // arm — a grant validates against THIS ceiling, so parked units must be
+    // unsubtracted here for an order acceptance to consume them. (`qcHeld`
+    // rides beside it; the in-transit stock is unpromisable exactly like
+    // quarantined stock.)
+    const inTransit = await inTransitUnits(tx, tenantId, warehouseId, skuId);
+    return Math.max(0, onHand - qcHeld - inTransit - bufferUnits());
   }
 
   /** Committed on-hand, excluding every open-quarantined (sku, bin) scope. */
