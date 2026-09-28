@@ -10846,7 +10846,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or an invalid body (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, an invalid body, or a system bin (Receiving/QC-hold/In-Transit — counts target storage bins only) (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -10876,7 +10876,7 @@
             }
           },
           "404": {
-            "description": "The warehouse or the bin does not exist in this tenant (not-found)",
+            "description": "The warehouse or the bin does not exist in this tenant — including a bin deleted between the listing and the create (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11006,7 +11006,7 @@
             }
           },
           "404": {
-            "description": "The count task or a named SKU does not exist in this tenant (not-found)",
+            "description": "The count task, a named SKU, or the count task's bin does not exist in this tenant — the bin may have been deleted while the count was in progress (\"The count task's bin no longer exists in this tenant.\") (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -19384,6 +19384,56 @@
           "binId"
         ]
       },
+      "CountTaskResponseDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binCode": {
+            "type": "string"
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "on_demand",
+              "scheduled",
+              "recount"
+            ]
+          },
+          "binStateEpoch": {
+            "type": "number",
+            "nullable": true,
+            "description": "The bin state epoch FROZEN at task start"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC)"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "warehouseId",
+          "binId",
+          "binCode",
+          "origin",
+          "binStateEpoch",
+          "createdAt"
+        ]
+      },
       "CountTaskLineResponseDto": {
         "type": "object",
         "properties": {
@@ -19406,7 +19456,7 @@
         "type": "object",
         "properties": {
           "countTask": {
-            "type": "object"
+            "$ref": "#/components/schemas/CountTaskResponseDto"
           },
           "lines": {
             "type": "array",
@@ -19460,6 +19510,42 @@
           "lines"
         ]
       },
+      "CountTaskSettledResponseDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "completedAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC)"
+          },
+          "epochConflict": {
+            "type": "boolean",
+            "description": "A movement moved the bin between task start and submit (OQ-2)"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "warehouseId",
+          "binId",
+          "completedAt",
+          "epochConflict"
+        ]
+      },
       "CountVarianceResponseDto": {
         "type": "object",
         "properties": {
@@ -19496,7 +19582,7 @@
         "type": "object",
         "properties": {
           "countTask": {
-            "type": "object"
+            "$ref": "#/components/schemas/CountTaskSettledResponseDto"
           },
           "variances": {
             "type": "array",
@@ -19566,7 +19652,7 @@
           "policies": {
             "type": "array",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/CountPolicyDto"
             }
           }
         },

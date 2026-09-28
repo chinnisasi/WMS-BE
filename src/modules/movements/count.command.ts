@@ -275,7 +275,7 @@ export class CountService {
         // before any write.
         await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
         const binRows = await tx
-          .select({ id: bins.id, code: bins.code })
+          .select({ id: bins.id, code: bins.code, systemOwned: bins.systemOwned })
           .from(bins)
           .where(
             and(
@@ -297,6 +297,20 @@ export class CountService {
             404,
             'Bin not found',
             `No bin with id "${command.binId}" exists in this warehouse.`,
+          );
+        }
+        // FROZEN AMENDMENT (story 5-3, user-ratified 2026-09-28): a
+        // system-owned bin is not countable. Receiving/QC-hold/In-Transit
+        // bins are moved by their own commands — counting them would freeze
+        // a stock projection the movement commands are mid-way through
+        // writing, so the count targets storage bins only (the transfer
+        // command's source-bin gate, mirrored).
+        if (bin.systemOwned) {
+          throw new ProblemException(
+            'validation-failed',
+            400,
+            'Bin is a system bin',
+            `Bin "${bin.code}" is a system bin (Receiving/QC-hold/In-Transit) — counts target storage bins only; the system bins are moved by their own commands.`,
           );
         }
 
@@ -851,6 +865,13 @@ export class CountService {
 
         await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
 
+        // The same tenant-scoped warehouse advisory lock the count commands
+        // take: a policy write serializes against in-flight count commands
+        // and scheduler ticks for this warehouse, so the schedule a tick
+        // just read cannot flip underneath it while it runs (the interval
+        // facts a tick's write acts on are the ones it read).
+        await this.inventory.lockWarehouseInTx(tx, command.tenantId, command.warehouseId);
+
         for (const policy of command.policies) {
           const updatedRows = await tx
             .update(countPolicies)
@@ -970,9 +991,14 @@ export class CountService {
     warehouseId: string,
     maxTasks: number,
   ): Promise<string[]> {
-    // The per-class candidate scan (a pre-lock read is fine: every due-bin
-    // fact is RE-CHECKED under the locks before the write). One query per
-    // policy class — the class filter cannot ride one join for several
+    // The per-class candidate scan — a PRE-LOCK read: the policy rows are
+    // NOT re-checked under the locks. Policy writes serialize on the same
+    // warehouse advisory lock this tick takes below (the upsert takes it
+    // too), so a flip mid-cycle lands before or after the whole tick, never
+    // inside it. What the write RE-CHECKS under the locks is the due-bin
+    // facts: the open-task fact, the last-counted fact, and a bin emptied
+    // between the scan and the locks is skipped at its arms read. One query
+    // per policy class — the class filter cannot ride one join for several
     // classes without a class→bin fan-out map.
     const policyRows = await tx
       .select({ abcClass: countPolicies.abcClass, intervalDays: countPolicies.intervalDays })
@@ -1063,13 +1089,20 @@ export class CountService {
     // submit completed, between the due query and the locks would otherwise
     // double-open or re-count a bin inside its interval).
     const binRows = await tx
-      .select({ id: bins.id })
+      .select({ id: bins.id, systemOwned: bins.systemOwned })
       .from(bins)
       .where(
         and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId), inArray(bins.id, dueBinIds)),
       )
       .orderBy(asc(bins.id))
       .for('update');
+    // FROZEN AMENDMENT (story 5-3, user-ratified 2026-09-28): a system-owned
+    // bin never receives a scheduled task. The candidate scan reads the
+    // stock projection, and system bins (Receiving/QC-hold/In-Transit) HOLD
+    // classed SKUs' on-hand rows — without this filter every tick would
+    // mint a recurring count task for a bin whose own commands are mid-way
+    // through moving that stock. Post-filtered on the rows already read.
+    const storageBinRows = binRows.filter((binRow) => !binRow.systemOwned);
     await this.inventory.lockWarehouseInTx(tx, tenantId, warehouseId);
 
     const recheckOpen = await tx
@@ -1120,7 +1153,7 @@ export class CountService {
         : await this.inventory.binStateEpochsInTx(tx, tenantId, warehouseId, dueBinIds);
 
     const createdIds: string[] = [];
-    for (const binRow of binRows) {
+    for (const binRow of storageBinRows) {
       const binId = binRow.id;
       if (openUnderLock.has(binId)) {
         continue; // a concurrent create got here first — the rule holds

@@ -152,18 +152,69 @@ export class CountTaskLineResponseDto {
   expectedQuantity!: number;
 }
 
+/**
+ * The count task of the CREATE response — the id-keyed shape the command's
+ * snapshot serves (`id`, not the snapshot card's `taskId`; the card lives in
+ * `receiving.dto.ts`'s `CatalogCountTaskDto`, the served class the device
+ * snapshot documents).
+ */
+export class CountTaskResponseDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty()
+  status!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty()
+  binCode!: string;
+
+  @ApiProperty({ enum: COUNT_TASK_ORIGINS })
+  origin!: string;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: 'The bin state epoch FROZEN at task start',
+  })
+  binStateEpoch!: number | null;
+
+  @ApiProperty({ description: 'Business time (ISO-8601 UTC)' })
+  createdAt!: string;
+}
+
+/**
+ * The count task of the SUBMIT response — the settled shape (completion
+ * instant + the OQ-2 conflict flag the receipt renders).
+ */
+export class CountTaskSettledResponseDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty()
+  status!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty({ description: 'Business time (ISO-8601 UTC)' })
+  completedAt!: string;
+
+  @ApiProperty({ description: 'A movement moved the bin between task start and submit (OQ-2)' })
+  epochConflict!: boolean;
+}
+
 export class CreateCountResponse {
-  @ApiProperty({})
-  countTask!: {
-    id: string;
-    status: string;
-    warehouseId: string;
-    binId: string;
-    binCode: string;
-    origin: string;
-    binStateEpoch: number | null;
-    createdAt: string;
-  };
+  @ApiProperty({ type: CountTaskResponseDto })
+  countTask!: CountTaskResponseDto;
 
   @ApiProperty({ type: [CountTaskLineResponseDto] })
   lines!: CountTaskLineResponseDto[];
@@ -187,15 +238,8 @@ export class CountVarianceResponseDto {
 }
 
 export class SubmitCountResponse {
-  @ApiProperty({})
-  countTask!: {
-    id: string;
-    status: string;
-    warehouseId: string;
-    binId: string;
-    completedAt: string;
-    epochConflict: boolean;
-  };
+  @ApiProperty({ type: CountTaskSettledResponseDto })
+  countTask!: CountTaskSettledResponseDto;
 
   @ApiProperty({ type: [CountVarianceResponseDto] })
   variances!: CountVarianceResponseDto[];
@@ -209,51 +253,6 @@ export class SubmitCountResponse {
 }
 
 export class CountPoliciesResponse {
-  @ApiProperty({ type: [Object] })
-  policies!: { abcClass: string; intervalDays: number }[];
-}
-
-/** The count task card of the device catalog snapshot's `countTasks` arm. */
-export class CatalogCountTaskLineDto {
-  @ApiProperty({ format: 'uuid' })
-  skuId!: string;
-
-  @ApiProperty()
-  skuCode!: string;
-
-  @ApiProperty({ type: String, nullable: true })
-  skuName!: string | null;
-
-  @ApiProperty({ description: 'The frozen expectation, base units', minimum: 0 })
-  expectedQuantity!: number;
-}
-
-export class CatalogCountTaskDto {
-  @ApiProperty({ format: 'uuid' })
-  taskId!: string;
-
-  @ApiProperty({ format: 'uuid' })
-  warehouseId!: string;
-
-  @ApiProperty({ format: 'uuid' })
-  binId!: string;
-
-  @ApiProperty()
-  binCode!: string;
-
-  @ApiProperty({ enum: COUNT_TASK_ORIGINS })
-  origin!: string;
-
-  @ApiProperty({
-    type: Number,
-    nullable: true,
-    description: 'The bin state epoch FROZEN at task start — the submit quotes it back',
-  })
-  binStateEpoch!: number | null;
-
-  @ApiProperty({ description: 'Business time (ISO-8601 UTC)' })
-  createdAt!: string;
-
-  @ApiProperty({ type: [CatalogCountTaskLineDto] })
-  lines!: CatalogCountTaskLineDto[];
+  @ApiProperty({ type: [CountPolicyDto] })
+  policies!: CountPolicyDto[];
 }

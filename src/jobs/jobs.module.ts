@@ -339,9 +339,10 @@ export class CountSchedulerWorker implements OnApplicationBootstrap, OnApplicati
       // policy, distinct. RLS scopes nothing here — the connection carries
       // BYPASSRLS precisely for these context-free reads.
       const scopes = (await this.authDb.execute(sql`
-        select tenant_id as "tenantId", warehouse_id as "warehouseId"
+        select distinct on (tenant_id, warehouse_id)
+          tenant_id as "tenantId", warehouse_id as "warehouseId"
         from count_policies
-        order by warehouse_id asc
+        order by tenant_id asc, warehouse_id asc
       `)) as unknown as { tenantId: string; warehouseId: string }[];
       let created = 0;
       for (const scope of scopes) {

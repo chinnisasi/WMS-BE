@@ -288,10 +288,10 @@ export class MovementsController {
     type: CreateCountResponse,
     description: 'Count task pending (the idempotency snapshot)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, or a system bin (Receiving/QC-hold/In-Transit — counts target storage bins only) (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse or the bin does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse or the bin does not exist in this tenant — including a bin deleted between the listing and the create (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('The bin already has a pending count task (count-task-open), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
@@ -340,7 +340,7 @@ export class MovementsController {
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, or a task line the body never counted (count-incomplete)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token of either family, or a device token without a badge-in session (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks counts.execute (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('The count task or a named SKU does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The count task, a named SKU, or the count task\'s bin does not exist in this tenant — the bin may have been deleted while the count was in progress ("The count task\'s bin no longer exists in this tenant.") (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('The task is already completed (count-task-completed), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })

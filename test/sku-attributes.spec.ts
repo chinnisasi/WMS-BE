@@ -6,6 +6,7 @@ import { toMilli } from '../src/shared/primitives/quantity';
 import { testAddress } from './support/shipment-address';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { HAZARD_CLASSES } from '../src/shared/primitives/hazard';
+import { ABC_CLASSES } from '../src/shared/primitives/abc-class';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -744,6 +745,76 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
     for (const code of ['HC-IMP-FL', 'HC-IMP-BLANK']) {
       skuIds.set(code, byCode.get(code)!.id);
     }
+  });
+
+  // ── Story 5-3 — the ABC class: import column + edit verb (FR-cycle-count) ─
+
+  test('the import carries abc_class: a classed row lands it, a BLANK cell is null (not yet classified — never a guessed class), and an out-of-vocabulary class is a per-row error', async () => {
+    const headerWithAbc = `${CSV_HEADER},abc_class`;
+    const rowWithAbc = (values: Record<string, string>): string =>
+      headerWithAbc.split(',').map((column) => values[column] ?? '').join(',');
+    const fileWithAbc = (rows: Record<string, string>[]): Buffer =>
+      Buffer.from([headerWithAbc, ...rows.map(rowWithAbc)].join('\n'), 'utf8');
+
+    const run = await importCsv(
+      fileWithAbc([
+        { sku_code: 'ABC-IMP-A', name: 'Imported class a', uom: 'pcs', gst_rate: '1800', abc_class: 'a' },
+        { sku_code: 'ABC-IMP-BLANK', name: 'Blank class stays null', uom: 'pcs', gst_rate: '1800' },
+        { sku_code: 'ABC-IMP-BAD', name: 'Not a recordable class', uom: 'pcs', gst_rate: '1800', abc_class: 'z' },
+      ]),
+    ).expect(201);
+    expect(run.body.committedRows).toBe(2);
+    expect(run.body.failedRows).toBe(1);
+    const error = (run.body.errors as { rowNumber: number; code: string; skuCode: string | null; detail: string }[])[0]!;
+    expect(error.rowNumber).toBe(3);
+    expect(error.code).toBe('validation-failed');
+    expect(error.skuCode).toBe('ABC-IMP-BAD');
+    // The row error names the CSV COLUMN the user misspelled, not the
+    // command field the validator saw (the shared validator's rename).
+    expect(error.detail).toContain('abc_class');
+
+    const list = await listSkus().expect(200);
+    const byCode = new Map((list.body.items as { code: string; abcClass: string | null }[]).map((s) => [s.code, s]));
+    expect(byCode.get('ABC-IMP-A')!.abcClass).toBe('a');
+    // The blank-cell semantics: an omitted/empty cell is NULL — "not yet
+    // classified" (the hazard twin), which keeps the SKU OUT of scheduled
+    // count generation (OQ-1) without hiding it from on-demand counts.
+    expect(byCode.get('ABC-IMP-BLANK')!.abcClass).toBeNull();
+  });
+
+  test('the SKU abc_class edit: every vocabulary value lands, an out-of-vocabulary value is a 400 naming abcClass, and null clears the class (the scheduler-exclusion verb, OQ-1)', async () => {
+    await importCsv(csvFile([{ sku_code: 'ABC-EDIT', name: 'ABC edit SKU', uom: 'pcs', gst_rate: '1800' }])).expect(201);
+    const list = await listSkus().expect(200);
+    const abcSku = (list.body.items as { code: string; id: string; abcClass: string | null }[]).find(
+      (s) => s.code === 'ABC-EDIT',
+    )!;
+    expect(abcSku.abcClass).toBeNull(); // the import-row shape: unclassified
+
+    // Every vocabulary value lands and echoes (the closed vocabulary).
+    for (const abcClass of ABC_CLASSES) {
+      const res = await patchSku(abcSku.id, { abcClass }).expect(200);
+      expect(res.body.abcClass).toBe(abcClass);
+    }
+    const landed = await listSkus().expect(200);
+    const landedSku = (landed.body.items as { code: string; abcClass: string | null }[]).find(
+      (s) => s.code === 'ABC-EDIT',
+    )!;
+    expect(landedSku.abcClass).toBe('c'); // the loop's last write persisted
+
+    // The vocabulary is closed at the boundary (the DTO's `@IsIn` mirror).
+    const bad = await patchSku(abcSku.id, { abcClass: 'z' }).expect(400);
+    expect(bad.body).toMatchObject({ status: 400, code: 'validation-failed' });
+    expect(String(bad.body.detail)).toContain('abcClass');
+
+    // Null is the legitimate CLEAR verb (the assertAbcClass skip): the class
+    // leaves, the SKU exits scheduled generation, on-demand still covers it.
+    const cleared = await patchSku(abcSku.id, { abcClass: null }).expect(200);
+    expect(cleared.body.abcClass).toBeNull();
+    const clearedList = await listSkus().expect(200);
+    const clearedSku = (clearedList.body.items as { code: string; abcClass: string | null }[]).find(
+      (s) => s.code === 'ABC-EDIT',
+    )!;
+    expect(clearedSku.abcClass).toBeNull();
   });
 
   test('the SKU hazard edit: the vocabulary is closed at the boundary; its OWN stock in a bin never blocks the edit; a binmate of a segregated class is a 409 naming the bin and the binmate; a compatible class edits over the same stock; null ALWAYS clears; an open hold pins its origin bin', async () => {

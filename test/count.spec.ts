@@ -1,4 +1,5 @@
 import type { INestApplication } from '@nestjs/common';
+import { Logger } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
@@ -6,7 +7,8 @@ import Redis from 'ioredis';
 import { ulid } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
-import { MovementsFacade, MAX_SCHEDULED_TASKS_PER_TICK } from '../src/modules/movements/transfer.facade';
+import { MovementsFacade, MAX_SCHEDULED_TASKS_PER_TICK, MAX_SNAPSHOT_COUNT_TASKS } from '../src/modules/movements/transfer.facade';
+import { CountSchedulerWorker, parseCountSchedulerPollMs } from '../src/jobs/jobs.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 
@@ -423,12 +425,41 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       .set('Authorization', `Bearer ${deviceOperatorToken}`);
   }
 
-  /** The live bin-state epoch; 0 when the bin has never been touched. */
-  async function binEpoch(warehouse: string, binId: string): Promise<number> {
+  /**
+   * The live bin-state epoch; null when the bin has never been touched —
+   * exactly what the server freezes for a pristine bin (`bin_state_epoch`
+   * is `number | null` on the wire; the epoch's first value is 1, so null,
+   * not 0, is the "never moved" sentinel the submit's equality compares).
+   */
+  async function binEpoch(warehouse: string, binId: string): Promise<number | null> {
     const rows = await sql`
       select epoch from bin_state_epochs
       where tenant_id = ${tenantId} and warehouse_id = ${warehouse} and bin_id = ${binId}::uuid`;
-    return rows.length === 0 ? 0 : Number((rows[0] as { epoch: string }).epoch);
+    return rows.length === 0 ? null : Number((rows[0] as { epoch: string }).epoch);
+  }
+
+  /**
+   * A system-owned bin (Receiving/QC-hold/In-Transit shape) in the given
+   * warehouse — minted directly (this suite never drives the commands that
+   * ensure one), the frozen amendment's subject.
+   */
+  async function systemBinId(warehouse: string, code: string): Promise<string> {
+    const existing = (await sql`
+      select id from bins
+      where tenant_id = ${tenantId}::uuid and warehouse_id = ${warehouse}::uuid
+        and code = ${code} and system_owned`) as unknown as { id: string }[];
+    if (existing.length > 0) {
+      return existing[0]!.id;
+    }
+    const zone = (await sql`
+      insert into zones (id, tenant_id, warehouse_id, code, name)
+      values (${randomUUID()}::uuid, ${tenantId}::uuid, ${warehouse}::uuid, ${`${code}-ZONE`}, ${`Zone ${code}`})
+      returning id`) as unknown as { id: string }[];
+    const bin = (await sql`
+      insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type, system_owned)
+      values (${randomUUID()}::uuid, ${tenantId}::uuid, ${warehouse}::uuid, ${zone[0]!.id}, ${code}, 1000000, 'staging', true)
+      returning id`) as unknown as { id: string }[];
+    return bin[0]!.id;
   }
 
   /** The on-hand milli of one (warehouse, sku, bin) scope; null when no row. */
@@ -519,6 +550,22 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       expect(replay.body.lines).toEqual(first.body.lines);
       const drifted = await createCount({ warehouseId, binId: binSnap }, opsToken, key).expect(422);
       expect(drifted.body.code).toBe('idempotency-key-reuse');
+    });
+
+    it('refuses a system-owned bin with 400 validation-failed — counts target storage bins only (the frozen amendment)', async () => {
+      // The Receiving/QC-hold/In-Transit bins are moved by their own
+      // commands; counting one would freeze a stock projection a movement is
+      // mid-way through writing (the transfer command's source-bin gate,
+      // mirrored).
+      const sysBin = await systemBinId(warehouseId, 'IN-TRANSIT');
+      const res = await createCount({ warehouseId, binId: sysBin }).expect(400);
+      expect(res.body.code).toBe('validation-failed');
+      expect(String(res.body.detail)).toContain('system bin');
+      // The refusal stored nothing — the system bin has no task.
+      const pending = await sql`
+        select id from count_tasks
+        where tenant_id = ${tenantId}::uuid and bin_id = ${sysBin}::uuid and status = 'pending'`;
+      expect(pending).toHaveLength(0);
     });
   });
 
@@ -755,6 +802,150 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
         ],
       }, operatorToken).expect(200);
     });
+
+    it('404s a line naming an unknown (or foreign-tenant) SKU and leaves the task pending', async () => {
+      const task = await createCount({ warehouseId, binId: binA }, opsToken, ulid()).expect(201);
+      const taskId = task.body.countTask.id as string;
+      const unknownSkuId = randomUUID();
+      const res = await submitCount(taskId, {
+        lines: [
+          { skuId: plainSku(), countedQuantity: 20 },
+          { skuId: skuIds.get(MID), countedQuantity: 4 },
+          { skuId: unknownSkuId, countedQuantity: 1 },
+        ],
+      }).expect(404);
+      expect(res.body.code).toBe('not-found');
+      expect(String(res.body.detail)).toContain('SKU');
+      // The failed submit stored nothing — the task is still pending and no
+      // line exists for the unknown SKU.
+      const rows = await sql`
+        select status from count_tasks where tenant_id = ${tenantId}::uuid and id = ${taskId}::uuid`;
+      expect((rows[0] as { status: string }).status).toBe('pending');
+      const unknownLine = await sql`
+        select id from count_task_lines where task_id = ${taskId}::uuid and sku_id = ${unknownSkuId}::uuid`;
+      expect(unknownLine).toHaveLength(0);
+      // Complete the task properly — the next arms need the bin free.
+      await submitCount(taskId, {
+        lines: [
+          { skuId: plainSku(), countedQuantity: 20 },
+          { skuId: skuIds.get(MID), countedQuantity: 4 },
+        ],
+      }).expect(200);
+    });
+
+    it('400s two lines naming one SKU (one counted entry per SKU — a client bug, not a state)', async () => {
+      const task = await createCount({ warehouseId, binId: binA }, opsToken, ulid()).expect(201);
+      const taskId = task.body.countTask.id as string;
+      const res = await submitCount(taskId, {
+        lines: [
+          { skuId: plainSku(), countedQuantity: 12 },
+          { skuId: plainSku(), countedQuantity: 8 },
+          { skuId: skuIds.get(MID), countedQuantity: 4 },
+        ],
+      }).expect(400);
+      expect(res.body.code).toBe('validation-failed');
+      expect(String(res.body.detail)).toContain('two lines');
+      // The task is still pending — the refusal stored nothing.
+      const rows = await sql`
+        select status from count_tasks where tenant_id = ${tenantId}::uuid and id = ${taskId}::uuid`;
+      expect((rows[0] as { status: string }).status).toBe('pending');
+      // …and the task stays completable afterwards (the merged entry).
+      const done = await submitCount(taskId, {
+        lines: [
+          { skuId: plainSku(), countedQuantity: 20 },
+          { skuId: skuIds.get(MID), countedQuantity: 4 },
+        ],
+      }).expect(200);
+      expect(done.body.countTask.status).toBe('completed');
+    });
+
+    it('completes a pristine-bin count: a null epoch frozen, a null live epoch, no conflict', async () => {
+      // A bin no movement has ever touched: no epoch row (the freeze is
+      // null, NOT 0 — the epoch starts at 1) and no arms (the task has no
+      // lines).
+      const zone = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'P', name: 'Zone P' })
+        .expect(201);
+      const pristine = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zone.body.id as string}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 1000, type: 'shelf', code: 'P-01-01' })
+          .expect(201)
+      ).body.id as string;
+      expect(await binEpoch(warehouseId, pristine)).toBeNull();
+
+      const created = await createCount({ warehouseId, binId: pristine }).expect(201);
+      expect(created.body.countTask.binStateEpoch).toBeNull(); // the null freeze
+      expect(created.body.lines).toEqual([]);
+      const res = await submitCount(created.body.countTask.id as string, { lines: [] }).expect(200);
+      expect(res.body.countTask.status).toBe('completed');
+      // null matches null — counting an untouched bin is never a conflict.
+      expect(res.body.countTask.epochConflict).toBe(false);
+      expect(res.body.variances).toEqual([]);
+      expect(res.body.recountTaskId).toBeNull();
+    });
+
+    it('flags a pristine-bin epoch conflict: null frozen, the bin moved live, a fresh recount', async () => {
+      const zone = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'Q', name: 'Zone Q' })
+        .expect(201);
+      const pristine = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zone.body.id as string}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 1000, type: 'shelf', code: 'Q-01-01' })
+          .expect(201)
+      ).body.id as string;
+      const frozen = await createCount({ warehouseId, binId: pristine }).expect(201);
+      const frozenTaskId = frozen.body.countTask.id as string;
+      expect(frozen.body.countTask.binStateEpoch).toBeNull();
+
+      // Move stock INTO the bin after the freeze — the first epoch bump is
+      // 1, so null ≠ 1: the OQ-2 conflict arm on a pristine bin.
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/inventory/adjustments`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId,
+          skuId: skuIds.get(PLAIN),
+          binId: pristine,
+          quantityDelta: 3,
+          reasonCode: 'stock-count',
+          note: 'count-suite pristine-bin epoch mover',
+        })
+        .expect(201);
+      const liveEpoch = await binEpoch(warehouseId, pristine);
+      expect(liveEpoch).not.toBeNull();
+
+      const res = await submitCount(frozenTaskId, {
+        lines: [{ skuId: skuIds.get(PLAIN), countedQuantity: 3 }],
+      }).expect(200);
+      expect(res.body.countTask.epochConflict).toBe(true);
+      // The moved-in SKU is a beyond-task line (expected 0) — flagged too.
+      expect(res.body.variances).toHaveLength(1);
+      expect(res.body.variances[0]).toMatchObject({
+        skuId: skuIds.get(PLAIN),
+        expectedQuantity: 0,
+        countedQuantity: 3,
+        epochConflict: true,
+      });
+      // The recount task re-freezes the LIVE epoch — no longer null.
+      const recountId = res.body.recountTaskId as string;
+      expect(recountId).toBeTruthy();
+      const recount = await sql`
+        select bin_state_epoch from count_tasks where tenant_id = ${tenantId}::uuid and id = ${recountId}::uuid`;
+      expect(Number((recount[0] as { bin_state_epoch: string }).bin_state_epoch)).toBe(liveEpoch);
+    });
   });
 
   // ── the snapshot's countTasks arm ─────────────────────────────────────────
@@ -780,6 +971,33 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       expect(card!.lines).toHaveLength(1);
       expect(card!.lines[0]!.skuCode).toBe(UNCLASSED);
       expect(card!.lines[0]!.expectedQuantity).toBe(1);
+    });
+
+    it('caps the card list at MAX_SNAPSHOT_COUNT_TASKS and WARNS about the truncation (computed-then-dropped is surfaced, not silent)', async () => {
+      // Mint MAX+1 extra pending tasks directly (the one-open-per-bin rule is
+      // command-level, not a DB constraint) — the over-read row IS the
+      // truncation signal the facade must surface.
+      const inserted = (await sql`
+        insert into count_tasks (id, tenant_id, warehouse_id, bin_id, status, origin)
+        select gen_random_uuid(), ${tenantId}::uuid, ${warehouseId}::uuid, ${binSnap}::uuid, 'pending', 'scheduled'
+        from generate_series(1, ${MAX_SNAPSHOT_COUNT_TASKS + 1})
+        returning id`) as unknown as { id: string }[];
+      expect(inserted).toHaveLength(MAX_SNAPSHOT_COUNT_TASKS + 1);
+      const insertedIds = inserted.map((row) => row.id);
+      const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        const res = await snapshot().expect(200);
+        // The device contract holds: exactly MAX cards.
+        expect((res.body.countTasks ?? []) as unknown[]).toHaveLength(MAX_SNAPSHOT_COUNT_TASKS);
+        // …and the computed-then-dropped breach is LOUD, naming the scope.
+        const warned = warnSpy.mock.calls.map((call) => String(call[0])).join('\n');
+        expect(warned).toContain('truncated');
+        expect(warned).toContain(tenantId);
+        expect(warned).toContain(warehouseId);
+      } finally {
+        warnSpy.mockRestore();
+        await sql`delete from count_tasks where id = any(${insertedIds}::uuid[])`;
+      }
     });
   });
 
@@ -826,6 +1044,22 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
         sql`insert into count_policies (id, tenant_id, warehouse_id, abc_class, interval_days)
             values (${randomUUID()}::uuid, ${tenantId}::uuid, ${warehouseId}::uuid, 'z', 7)`,
       ).rejects.toThrow(/count_policies_abc_class_check/);
+    });
+
+    it('refuses a reused policy key with a different payload (422 idempotency-key-reuse)', async () => {
+      const key = ulid();
+      // The upsert is per-class (the set's rows persist beside it), so the
+      // first write lands 'a' beside the class-'b' row the earlier arm set.
+      const first = await putPolicies(warehouseId, { policies: [{ abcClass: 'a', intervalDays: 7 }] }, ownerToken, key).expect(200);
+      expect(first.body.policies).toEqual(
+        expect.arrayContaining([{ abcClass: 'a', intervalDays: 7 }]),
+      );
+      const drifted = await putPolicies(warehouseId, { policies: [{ abcClass: 'a', intervalDays: 30 }] }, ownerToken, key).expect(422);
+      expect(drifted.body.code).toBe('idempotency-key-reuse');
+      // The replay side stays intact — the same key with the FIRST payload
+      // still re-serves its snapshot.
+      const replay = await putPolicies(warehouseId, { policies: [{ abcClass: 'a', intervalDays: 7 }] }, ownerToken, key).expect(200);
+      expect(replay.body).toEqual(first.body);
     });
   });
 
@@ -924,6 +1158,105 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       expect(again).toHaveLength(0);
     });
 
+    it('counts a mixed-classes bin under the SHORTEST effective interval (a bin is counted once — the tightest policy governs)', async () => {
+      // A bin holding BOTH a class-a and a class-b SKU; policies a:30, b:7 —
+      // the bin's effective interval is min(30, 7) = 7.
+      await putPolicies(schedulerWarehouseId, {
+        policies: [
+          { abcClass: 'b', intervalDays: 7 },
+          { abcClass: 'a', intervalDays: 30 },
+        ],
+      }, ownerToken).expect(200);
+      const zone = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${schedulerWarehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'M', name: 'Zone M' })
+        .expect(201);
+      const binMixed = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${schedulerWarehouseId}/zones/${zone.body.id as string}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 1000, type: 'shelf', code: 'M-01-01' })
+          .expect(201)
+      ).body.id as string;
+      for (const [sku, qty] of [[PLAIN, 3], [MID, 5]] as const) {
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/inventory/adjustments`)
+          .set('Authorization', `Bearer ${opsToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({
+            warehouseId: schedulerWarehouseId,
+            skuId: skuIds.get(sku),
+            binId: binMixed,
+            quantityDelta: qty,
+            reasonCode: 'stock-count',
+            note: 'count-suite mixed-classes seed',
+          })
+          .expect(201);
+      }
+
+      // Never counted → due immediately, alongside nothing else (the other
+      // storage bins hold open tasks).
+      const first = await movements.generateScheduledCountTasks(tenantId, schedulerWarehouseId, MAX_SCHEDULED_TASKS_PER_TICK);
+      expect(first).toHaveLength(1);
+      const mixedTask = (await sql`
+        select bin_id from count_tasks where tenant_id = ${tenantId}::uuid and id = ${first[0]!}::uuid`) as unknown as { bin_id: string }[];
+      expect(mixedTask[0]!.bin_id).toBe(binMixed);
+      // The task lines carry BOTH classes' SKUs — the bin is counted once.
+      const lines = (await sql`
+        select sku_id, expected_quantity_milli from count_task_lines where task_id = ${first[0]!}::uuid order by sku_id`) as unknown as { sku_id: string; expected_quantity_milli: string }[];
+      expect(lines).toHaveLength(2);
+
+      const completeExact = async (taskId: string): Promise<void> => {
+        await submitCount(taskId, {
+          lines: [
+            { skuId: skuIds.get(PLAIN), countedQuantity: 3 },
+            { skuId: skuIds.get(MID), countedQuantity: 5 },
+          ],
+        }, operatorToken).expect(200);
+      };
+      await completeExact(first[0]!);
+
+      // Age the completed count to 10 days: inside a (wrongly) LONGEST-interval
+      // reading (30d) but past the SHORTEST (7d). The bin must come due —
+      // min wins.
+      await sql`update count_tasks set completed_at = now() - interval '10 days' where id = ${first[0]!}::uuid`;
+      const second = await movements.generateScheduledCountTasks(tenantId, schedulerWarehouseId, MAX_SCHEDULED_TASKS_PER_TICK);
+      expect(second).toHaveLength(1);
+      const reCount = (await sql`
+        select bin_id from count_tasks where tenant_id = ${tenantId}::uuid and id = ${second[0]!}::uuid`) as unknown as { bin_id: string }[];
+      expect(reCount[0]!.bin_id).toBe(binMixed);
+      await completeExact(second[0]!);
+
+      // …and a count 3 days old sits INSIDE the 7-day effective interval —
+      // the bin is not due again (the interval is real, not vacuous).
+      await sql`update count_tasks set completed_at = now() - interval '3 days' where id = ${second[0]!}::uuid`;
+      const third = await movements.generateScheduledCountTasks(tenantId, schedulerWarehouseId, MAX_SCHEDULED_TASKS_PER_TICK);
+      expect(third).toHaveLength(0);
+    });
+
+    it('never schedules a system-owned bin, even one holding classed stock (the frozen amendment)', async () => {
+      // A system In-Transit bin in the scheduler warehouse, holding class-b
+      // stock written directly — exactly the projection state a movement
+      // command is mid-way through writing when a tick fires. The candidate
+      // scan (stock-driven) shortlists it; the system-owned filter must
+      // drop it.
+      const sysBin = await systemBinId(schedulerWarehouseId, 'IN-TRANSIT');
+      await sql`
+        insert into stock_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, quantity)
+        values (${randomUUID()}::uuid, ${tenantId}::uuid, ${schedulerWarehouseId}::uuid, ${skuIds.get(MID)!}::uuid, ${sysBin}::uuid, 4000)`;
+      // Every storage bin is open (binSched, binExtra) or within its interval
+      // (the mixed bin above) — the system bin is this tick's only due
+      // candidate, and it must mint NOTHING.
+      const taskIds = await movements.generateScheduledCountTasks(tenantId, schedulerWarehouseId, MAX_SCHEDULED_TASKS_PER_TICK);
+      expect(taskIds).toHaveLength(0);
+      const sysTasks = await sql`
+        select id from count_tasks where tenant_id = ${tenantId}::uuid and bin_id = ${sysBin}::uuid`;
+      expect(sysTasks).toHaveLength(0);
+    });
+
     it('ignores a warehouse with no policies at all', async () => {
       const taskIds = await movements.generateScheduledCountTasks(
         tenantId,
@@ -931,6 +1264,204 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
         MAX_SCHEDULED_TASKS_PER_TICK,
       );
       expect(taskIds).toHaveLength(0);
+    });
+  });
+});
+
+// ── the worker shell (unit, the reaper-plumbing pattern) ─────────────────────
+
+describe('count scheduler plumbing (unit, story 5-3)', () => {
+  const ENV_KEY = 'COUNT_SCHEDULER_POLL_MS';
+
+  function setEnv(value: string | undefined): void {
+    if (value === undefined) {
+      delete process.env[ENV_KEY];
+    } else {
+      process.env[ENV_KEY] = value;
+    }
+  }
+
+  const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function waitFor(condition: () => boolean, timeoutMs = 2_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!condition()) {
+      if (Date.now() > deadline) {
+        throw new Error('waitFor: condition never became true');
+      }
+      await delay(5);
+    }
+  }
+
+  afterEach(() => {
+    setEnv(undefined);
+  });
+
+  describe('parseCountSchedulerPollMs', () => {
+    it('unset and empty are off (0)', () => {
+      expect(parseCountSchedulerPollMs(undefined)).toBe(0);
+      expect(parseCountSchedulerPollMs('')).toBe(0);
+    });
+
+    it('non-negative integers pass through (0 included)', () => {
+      expect(parseCountSchedulerPollMs('3600000')).toBe(3_600_000);
+      expect(parseCountSchedulerPollMs('0')).toBe(0);
+    });
+
+    it('anything not a non-negative integer fails the boot loudly', () => {
+      expect(() => parseCountSchedulerPollMs('hourly')).toThrow(/COUNT_SCHEDULER_POLL_MS/);
+      expect(() => parseCountSchedulerPollMs('1.5')).toThrow(/COUNT_SCHEDULER_POLL_MS/);
+      expect(() => parseCountSchedulerPollMs('-5')).toThrow(/COUNT_SCHEDULER_POLL_MS/);
+    });
+  });
+
+  describe('CountSchedulerWorker', () => {
+    const SCOPE = { tenantId: 't-1', warehouseId: 'w-1' };
+
+    /** An AUTH-database stub answering the tick's enumeration read. */
+    function stubAuthDb(scopes: { tenantId: string; warehouseId: string }[]): { execute(): Promise<unknown> } {
+      return { execute: async () => scopes };
+    }
+
+    /**
+     * A facade stub recording generation calls, able to hold one in flight
+     * (the reaper stub's shape — the shed test's fixture).
+     */
+    function stubFacade(): {
+      calls: { tenantId: string; warehouseId: string; maxTasks: number }[];
+      hold: boolean;
+      generateScheduledCountTasks(tenantId: string, warehouseId: string, maxTasks: number): Promise<string[]>;
+      release(): void;
+    } {
+      const calls: { tenantId: string; warehouseId: string; maxTasks: number }[] = [];
+      let held: (() => void) | undefined;
+      return {
+        calls,
+        hold: false,
+        async generateScheduledCountTasks(tenantId, warehouseId, maxTasks) {
+          calls.push({ tenantId, warehouseId, maxTasks });
+          if (this.hold && held === undefined) {
+            await new Promise<void>((resolve) => {
+              held = resolve;
+            });
+          }
+          return [];
+        },
+        release() {
+          held?.();
+          held = undefined;
+        },
+      };
+    }
+
+    it('an invalid env fails the constructor (loud boot, not a silent worker)', () => {
+      for (const bad of ['hourly', '1.5', '-5']) {
+        setEnv(bad);
+        expect(() => new CountSchedulerWorker(stubAuthDb([]) as never, stubFacade() as never)).toThrow(
+          /COUNT_SCHEDULER_POLL_MS/,
+        );
+      }
+    });
+
+    it('pollMs=0 (env unset) schedules nothing', async () => {
+      setEnv(undefined);
+      const facade = stubFacade();
+      const worker = new CountSchedulerWorker(stubAuthDb([SCOPE]) as never, facade as never);
+      worker.onApplicationBootstrap();
+      await delay(60);
+      expect(facade.calls).toHaveLength(0);
+      worker.onApplicationShutdown();
+    });
+
+    it('bootstrap with a poll interval enumerates scopes and drives generation on the timer', async () => {
+      setEnv('20');
+      const facade = stubFacade();
+      const worker = new CountSchedulerWorker(
+        stubAuthDb([SCOPE, { tenantId: 't-1', warehouseId: 'w-2' }]) as never,
+        facade as never,
+      );
+      worker.onApplicationBootstrap();
+      try {
+        await waitFor(() => facade.calls.length >= 4);
+        // Each tick walks EVERY enumerated scope (cross-tenant enumeration →
+        // one tenant transaction per warehouse), with the tick's cap.
+        expect(facade.calls.slice(0, 4)).toEqual([
+          { tenantId: 't-1', warehouseId: 'w-1', maxTasks: MAX_SCHEDULED_TASKS_PER_TICK },
+          { tenantId: 't-1', warehouseId: 'w-2', maxTasks: MAX_SCHEDULED_TASKS_PER_TICK },
+          { tenantId: 't-1', warehouseId: 'w-1', maxTasks: MAX_SCHEDULED_TASKS_PER_TICK },
+          { tenantId: 't-1', warehouseId: 'w-2', maxTasks: MAX_SCHEDULED_TASKS_PER_TICK },
+        ]);
+      } finally {
+        worker.onApplicationShutdown();
+      }
+    });
+
+    it('a poison warehouse is skipped and the NEXT scope still generates (per-warehouse all-or-nothing, never starves the tick)', async () => {
+      setEnv('20');
+      const errorSpy = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      const calls: { warehouseId: string; maxTasks: number }[] = [];
+      const poisoned = {
+        async generateScheduledCountTasks(
+          tenantId: string,
+          warehouseId: string,
+          maxTasks: number,
+        ): Promise<string[]> {
+          calls.push({ warehouseId, maxTasks });
+          void tenantId;
+          if (warehouseId === 'w-1') {
+            throw new Error('boom');
+          }
+          return [];
+        },
+      };
+      const worker = new CountSchedulerWorker(
+        stubAuthDb([SCOPE, { tenantId: 't-1', warehouseId: 'w-2' }]) as never,
+        poisoned as never,
+      );
+      worker.onApplicationBootstrap();
+      try {
+        await waitFor(() => calls.length >= 4);
+        expect(errorSpy.mock.calls.map((call) => String(call[0])).join('\n')).toContain(
+          'Count scheduler could not generate tasks for warehouse w-1',
+        );
+        // The failure did not starve the second scope — every tick reached it.
+        expect(calls.filter((call) => call.warehouseId === 'w-2').length).toBeGreaterThanOrEqual(2);
+        // …and every call carries the tick's cap.
+        expect(calls.every((call) => call.maxTasks === MAX_SCHEDULED_TASKS_PER_TICK)).toBe(true);
+      } finally {
+        worker.onApplicationShutdown();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it('an in-flight cycle sheds the next ticks until it settles', async () => {
+      setEnv('15');
+      const facade = stubFacade();
+      facade.hold = true;
+      const worker = new CountSchedulerWorker(stubAuthDb([SCOPE]) as never, facade as never);
+      worker.onApplicationBootstrap();
+      try {
+        await waitFor(() => facade.calls.length === 1);
+        await delay(60);
+        expect(facade.calls).toHaveLength(1);
+        facade.release();
+        await waitFor(() => facade.calls.length >= 2);
+      } finally {
+        facade.release();
+        worker.onApplicationShutdown();
+      }
+    });
+
+    it('shutdown clears the timer (no further cycles)', async () => {
+      setEnv('15');
+      const facade = stubFacade();
+      const worker = new CountSchedulerWorker(stubAuthDb([SCOPE]) as never, facade as never);
+      worker.onApplicationBootstrap();
+      await waitFor(() => facade.calls.length >= 1);
+      worker.onApplicationShutdown();
+      const atShutdown = facade.calls.length;
+      await delay(80);
+      expect(facade.calls.length).toBe(atShutdown);
     });
   });
 });
