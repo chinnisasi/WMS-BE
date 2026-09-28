@@ -288,6 +288,13 @@
       "when": 1790567549271,
       "tag": "0040_client_dimension",
       "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1790574612058,
+      "tag": "0041_client_isolation_rls",
+      "breakpoints": true
     }
   ]
 }
