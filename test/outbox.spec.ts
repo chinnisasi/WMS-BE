@@ -507,7 +507,7 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
         skuId,
         binId,
         quantityDelta: 5,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'outbox row assertion',
       })
       .expect(201);

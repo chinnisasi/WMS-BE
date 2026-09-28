@@ -412,7 +412,7 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
         skuId,
         binId: binA,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'kits-suite seed',
       })
       .expect(201);
@@ -848,7 +848,7 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
           skuId: sku('KIT-KE1'),
           binId: binA,
           quantityDelta: 5,
-          reasonCode: 'cycle-count',
+          reasonCode: 'stock-count',
           note: 'kit-suite guard probe',
         })
         .expect(409);
@@ -908,7 +908,7 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
           skuId: sku('HOLD-R1'),
           binId: binA,
           quantityDelta: -10,
-          reasonCode: 'cycle-count',
+          reasonCode: 'stock-count',
           note: 'kits-suite: isolate the reservation arm',
         })
         .expect(201);
@@ -967,7 +967,7 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
           skuId: sku('OVR-KIT'),
           binId: recvBin[0]!.bin_id,
           quantityDelta: -10,
-          reasonCode: 'cycle-count',
+          reasonCode: 'stock-count',
           note: 'kits-suite: empty the SKU',
         })
         .expect(201);
@@ -1010,7 +1010,7 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
               skuId: sku(kitCode),
               binId: binA,
               quantityDelta: 5,
-              reasonCode: 'cycle-count',
+              reasonCode: 'stock-count',
               note: 'kits-suite: adjustment-vs-kit-create race',
             }),
         ]);
@@ -1097,7 +1097,7 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
             skuId: sku(ovrCode),
             binId: recvBin[0]!.bin_id,
             quantityDelta: -10,
-            reasonCode: 'cycle-count',
+            reasonCode: 'stock-count',
             note: 'kits-suite: empty the SKU before the race',
           })
           .expect(201);

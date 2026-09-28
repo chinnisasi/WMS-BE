@@ -309,6 +309,13 @@
       "when": 1790594492036,
       "tag": "0043_transfer_orders",
       "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1790603894424,
+      "tag": "0044_adjustment_approval",
+      "breakpoints": true
     }
   ]
 }

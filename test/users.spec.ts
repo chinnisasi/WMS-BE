@@ -839,10 +839,18 @@ describe('users, roles, and permission gating (e2e)', () => {
     // observes); story 4.6c grows it to 25 with `labels.execute`; story 5-1
     // grows it to 27 with `transfers.manage`/`transfers.execute` — the
     // inbound confirm's holder set mirrors `putaway.execute` (floor holds
-    // it), still outside the cage's holder set.
-    expect([...CAPABILITIES]).toHaveLength(27);
+    // it), still outside the cage's holder set; story 5-2 grows it to 28
+    // with `adjustments.approve` — OWNER-ONLY (the FR-19 approval
+    // decisions + the policy write): ops_manager/operator/accountant all
+    // stay as they were.
+    expect([...CAPABILITIES]).toHaveLength(28);
     expect(CAPABILITIES).toContain('secure.move');
     expect(secureMoveHolders).toEqual(['owner', 'ops_manager']);
+    expect(CAPABILITIES).toContain('adjustments.approve');
+    expect(ROLE_CAPABILITIES.owner.has('adjustments.approve')).toBe(true);
+    expect(ROLE_CAPABILITIES.ops_manager.has('adjustments.approve')).toBe(false);
+    expect(ROLE_CAPABILITIES.operator.has('adjustments.approve')).toBe(false);
+    expect(ROLE_CAPABILITIES.accountant.has('adjustments.approve')).toBe(false);
     expect(ROLE_CAPABILITIES.operator.has('putaway.execute')).toBe(true);
     expect(ROLE_CAPABILITIES.operator.has('picks.execute')).toBe(true);
     expect(ROLE_CAPABILITIES.operator.has('excursion.record')).toBe(true);

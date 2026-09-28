@@ -206,16 +206,16 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
     // Seed the stock every read below composes against: untracked (PLAIN-1
     // in both bins), batch-tracked (BT-1 batch SL-A in binA), serial-tracked
     // (ST-1 two units in binA).
-    await adjust({ warehouseId, skuId: skuIds.get('PLAIN-1')!, binId: binA, quantityDelta: 2, reasonCode: 'cycle-count', note: 'plain stock for surfaces' }).expect(201);
-    await adjust({ warehouseId, skuId: skuIds.get('PLAIN-1')!, binId: binB, quantityDelta: 3, reasonCode: 'cycle-count', note: 'plain stock for surfaces' }).expect(201);
+    await adjust({ warehouseId, skuId: skuIds.get('PLAIN-1')!, binId: binA, quantityDelta: 2, reasonCode: 'stock-count', note: 'plain stock for surfaces' }).expect(201);
+    await adjust({ warehouseId, skuId: skuIds.get('PLAIN-1')!, binId: binB, quantityDelta: 3, reasonCode: 'stock-count', note: 'plain stock for surfaces' }).expect(201);
     await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: 5,
-      reasonCode: 'cycle-count', note: 'batch intake for surfaces',
+      reasonCode: 'stock-count', note: 'batch intake for surfaces',
       batch: { code: 'SL-A', expiryDate: daysFromNow(300) },
     }).expect(201);
     await adjust({
       warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: 2,
-      reasonCode: 'cycle-count', note: 'serial intake for surfaces',
+      reasonCode: 'stock-count', note: 'serial intake for surfaces',
       serials: ['SN-S1', 'SN-S2'],
     }).expect(201);
   });
@@ -292,10 +292,10 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
   it('batch list: FEFO order is data (expiry ASC, nulls last, expired still listed), joined with on-hand', async () => {
     const sku = skuIds.get('BT-1')!;
     // Seed four batches into binB: BX (+10d), BY (+2d), BZ (null), BE (expired).
-    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 5, reasonCode: 'cycle-count', note: 'BX', batch: { code: 'BX', expiryDate: daysFromNow(10) } }).expect(201);
-    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 4, reasonCode: 'cycle-count', note: 'BY', batch: { code: 'BY', expiryDate: daysFromNow(2) } }).expect(201);
-    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 3, reasonCode: 'cycle-count', note: 'BZ', batch: { code: 'BZ' } }).expect(201);
-    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 7, reasonCode: 'cycle-count', note: 'BE expired', batch: { code: 'BE', expiryDate: daysFromNow(-1) } }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 5, reasonCode: 'stock-count', note: 'BX', batch: { code: 'BX', expiryDate: daysFromNow(10) } }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 4, reasonCode: 'stock-count', note: 'BY', batch: { code: 'BY', expiryDate: daysFromNow(2) } }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 3, reasonCode: 'stock-count', note: 'BZ', batch: { code: 'BZ' } }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 7, reasonCode: 'stock-count', note: 'BE expired', batch: { code: 'BE', expiryDate: daysFromNow(-1) } }).expect(201);
 
     const res = await get(`/warehouses/${warehouseId}/inventory/batches?skuId=${sku}`).expect(200);
     const items = res.body.items as { code: string; expiryDate: string | null; quantity: number }[];
@@ -364,7 +364,7 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
     // A draw grows the history (the ledger is the audit log) and drains the bin.
     await adjust({
       warehouseId, skuId: sku, binId: binB, quantityDelta: -1,
-      reasonCode: 'damage', note: 'detail test draw',
+      reasonCode: 'damaged', note: 'detail test draw',
       batch: { code: 'BX', overrideReason: 'one unit counted out' },
     }).expect(201);
     const after = await get(`/inventory/batches/${batchId}`).expect(200);
@@ -398,7 +398,7 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
     ).body.id as string;
     await adjust({
       warehouseId: w2Id, skuId: sku, binId: w2bin, quantityDelta: 2,
-      reasonCode: 'cycle-count', note: 'cross-warehouse BX',
+      reasonCode: 'stock-count', note: 'cross-warehouse BX',
       batch: { code: 'BX', expiryDate: bxExpiry },
     }).expect(201);
 
@@ -456,7 +456,7 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
 
     // Draw SN-S1 out of stock: the history grows, the location stays the
     // ledger's last-known bin (the derived state, never a projection).
-    await adjust({ warehouseId, skuId: sku, binId: binA, quantityDelta: -1, reasonCode: 'damage', note: 'serial draw for surfaces', serials: ['SN-S1'] }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binA, quantityDelta: -1, reasonCode: 'damaged', note: 'serial draw for surfaces', serials: ['SN-S1'] }).expect(201);
     const after = await get(`/inventory/serials/${sn1Id!}`).expect(200);
     expect(after.body.location).toEqual({ warehouseId, binId: binA });
     expect(after.body.history).toHaveLength(2);
@@ -480,7 +480,7 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
     const sku = skuIds.get('BS-1')!;
     const res = await adjust({
       warehouseId, skuId: sku, binId: binB, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'combined arms for surfaces',
+      reasonCode: 'stock-count', note: 'combined arms for surfaces',
       batch: { code: 'C-BOTH', expiryDate: daysFromNow(120) },
       serials: ['SN-B1'],
     }).expect(201);
@@ -528,7 +528,7 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
       (item) => item.skuId === skuIds.get('PLAIN-1') && item.quantityDelta === 2,
     )!;
     expect(plain).toMatchObject({ type: 'stock.adjusted', batchRef: null, serialRef: null });
-    expect(plain.referenceDoc).toMatchObject({ kind: 'manual-adjustment', reasonCode: 'cycle-count', note: 'plain stock for surfaces' });
+    expect(plain.referenceDoc).toMatchObject({ kind: 'manual-adjustment', reasonCode: 'stock-count', note: 'plain stock for surfaces' });
     expect('overrideReason' in (plain.referenceDoc as Record<string, unknown>)).toBe(false);
 
     // … the batch intake carries its batchRef and the doc rides verbatim.

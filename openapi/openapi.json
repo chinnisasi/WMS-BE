@@ -3646,8 +3646,18 @@
               }
             }
           },
+          "202": {
+            "description": "Story 5-2: |quantityDelta| exceeds the tenant's policy threshold — the adjustment PENDS (no ledger event, no on-hand change) until an Owner approves or rejects; the body is the pend snapshot with its threshold context",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StockAdjustmentPendingResponse"
+                }
+              }
+            }
+          },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, or a quantityDelta that does not equal the serial count",
+            "description": "Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, a quantityDelta that does not equal the serial count, or a reasonCode outside the closed adjustment vocabulary",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3712,7 +3722,518 @@
             "bearer": []
           }
         ],
-        "summary": "Records a manual stock adjustment (one ledger event + on-hand projection in one commit)",
+        "summary": "Records a manual stock adjustment (one ledger event + on-hand projection in one commit; over a tenant approval threshold it PENDS instead — 202)",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/adjustment-policies": {
+      "put": {
+        "operationId": "InventoryController_setAdjustmentPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdjustmentPolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The tenant's adjustment policy row (created or updated; the write is idempotent under the Idempotency-Key)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdjustmentPolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid quantityThreshold (validation-failed): negative, non-integer, or over the int4 max of 2147483647 (the column is an integer — an oversized threshold is this 400, never a range 500)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks adjustments.approve (role-denied) — the policy write rides the same owner-only capability the decisions carry",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Concurrent request on the same Idempotency-Key, or two concurrent first-time policy writes (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Sets the tenant's stock adjustment approval threshold (FR-19) — an adjustment whose |quantityDelta| strictly exceeds it pends for Owner approval instead of applying",
+        "tags": [
+          "inventory"
+        ]
+      },
+      "get": {
+        "operationId": "InventoryController_getAdjustmentPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdjustmentPolicyResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No policy row exists for this tenant (not-found) — with no row the approval flow is disabled and every adjustment applies immediately",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Reads the tenant's stock adjustment approval threshold (404 when no policy row exists — the approval flow is disabled)",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/adjustment-pendings": {
+      "get": {
+        "operationId": "InventoryController_listAdjustmentPendings",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Filter by decision state — omitted means every status",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The pending queue page (newest first): each row carries the resolved arms, the threshold context, and — after a decision — who decided",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdjustmentPendingListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed status, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's pending stock adjustments (keyset cursor pagination, status-filterable — the approval queue read; a read, never capability-gated)",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/adjustment-pendings/{pendingId}/approve": {
+      "post": {
+        "operationId": "InventoryController_approveAdjustment",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "pendingId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdjustmentDecisionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed pendingId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks adjustments.approve (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No pending adjustment with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already approved/rejected (adjustment-pending-decided), a kit SKU since the pend (kit-cannot-hold-stock), a concurrent idempotent request (conflict), or the world moved since the pend and the re-execution hit a guard whose 409 applies (e.g. a handling unit no longer active)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse), or the re-execution failed a guard whose 422 applies (insufficient-on-hand — the pending row STAYS pending; the whole decide transaction rolls back)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Approves a pending stock adjustment (adjustments.approve) — the stored arms re-execute as ledger events at decision time (actor = approver); audited",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inventory/adjustment-pendings/{pendingId}/reject": {
+      "post": {
+        "operationId": "InventoryController_rejectAdjustment",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "pendingId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdjustmentDecisionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed pendingId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks adjustments.approve (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No pending adjustment with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already approved/rejected (adjustment-pending-decided), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Rejects a pending stock adjustment (adjustments.approve) — no stock write, the adjustment never applies; audited",
         "tags": [
           "inventory"
         ]
@@ -12679,7 +13200,17 @@
           },
           "reasonCode": {
             "type": "string",
-            "description": "Machine reason for the correction (e.g. stock-count)"
+            "description": "Machine reason for the correction — one of the closed adjustment vocabulary",
+            "enum": [
+              "stock-count",
+              "damaged",
+              "expired",
+              "shrinkage",
+              "found",
+              "recall",
+              "system-correction",
+              "other"
+            ]
           },
           "note": {
             "type": "string",
@@ -12729,11 +13260,13 @@
         "properties": {
           "id": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "nullable": true
           },
           "seq": {
             "type": "number",
-            "description": "Gap-free per-warehouse replay order"
+            "nullable": true,
+            "description": "Gap-free per-warehouse replay order (null on a multi-serial aggregate snapshot)"
           },
           "type": {
             "type": "string",
@@ -12806,6 +13339,246 @@
         },
         "required": [
           "event",
+          "onHand"
+        ]
+      },
+      "AdjustmentPendingDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantityDelta": {
+            "type": "number",
+            "description": "Signed base-UoM delta frozen at request"
+          },
+          "reasonCode": {
+            "type": "string",
+            "description": "The closed adjustment vocabulary value"
+          },
+          "note": {
+            "type": "string",
+            "description": "The requester's note, carried verbatim"
+          },
+          "batchOverrideReason": {
+            "type": "string",
+            "nullable": true,
+            "description": "The override draw’s FEFO-override reason (present only on override draws; restored into the approved event’s referenceDoc)"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The resolved catalog batch id (null when the request had none)"
+          },
+          "serialIds": {
+            "nullable": true,
+            "description": "The resolved serial ids, request order (null when the request had none)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "handlingUnitIds": {
+            "nullable": true,
+            "description": "The named handling units (catch-weight arm), request order (null when absent)",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC business time of the requested adjustment"
+          },
+          "requestedBy": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The requester"
+          },
+          "requestedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC request commit time"
+          },
+          "status": {
+            "type": "string",
+            "description": "pending | approved | rejected — 'pending' on the 202, the decided value on the queue after a decision"
+          },
+          "decidedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "decidedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "thresholdQuantityAtRequest": {
+            "type": "number",
+            "description": "The policy threshold (base UoM) as it read at request time — frozen context"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "binId",
+          "skuId",
+          "quantityDelta",
+          "reasonCode",
+          "note",
+          "batchOverrideReason",
+          "batchId",
+          "serialIds",
+          "handlingUnitIds",
+          "occurredAt",
+          "requestedBy",
+          "requestedAt",
+          "status",
+          "decidedBy",
+          "decidedAt",
+          "thresholdQuantityAtRequest"
+        ]
+      },
+      "StockAdjustmentPendingResponse": {
+        "type": "object",
+        "properties": {
+          "pendingAdjustment": {
+            "$ref": "#/components/schemas/AdjustmentPendingDto"
+          }
+        },
+        "required": [
+          "pendingAdjustment"
+        ]
+      },
+      "AdjustmentPolicyDto": {
+        "type": "object",
+        "properties": {
+          "quantityThreshold": {
+            "type": "number",
+            "description": "The |quantityDelta| ceiling in base UoM above which an adjustment pends for Owner approval (strictly greater pends; at-threshold applies immediately)",
+            "minimum": 0,
+            "maximum": 2147483647,
+            "example": 100
+          }
+        },
+        "required": [
+          "quantityThreshold"
+        ]
+      },
+      "AdjustmentPolicyResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantityThreshold": {
+            "type": "number",
+            "nullable": false,
+            "description": "The threshold in base UoM (null would mean flow disabled — PUT requires it non-null)"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC row creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC row last-update time"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "quantityThreshold",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "AdjustmentPendingListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AdjustmentPendingDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "AdjustmentDecisionResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "description": "'approved' | 'rejected'"
+          },
+          "decidedBy": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The decider"
+          },
+          "decidedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC decision time"
+          },
+          "events": {
+            "description": "The applied events (approve arm only; empty on reject)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LedgerEventSnapshotDto"
+            }
+          },
+          "onHand": {
+            "nullable": true,
+            "description": "The settled on-hand (approve arm only; null on reject)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OnHandSnapshotDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "decidedBy",
+          "decidedAt",
+          "events",
           "onHand"
         ]
       },

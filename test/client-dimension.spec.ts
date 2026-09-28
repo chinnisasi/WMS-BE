@@ -524,7 +524,7 @@ describe('story 21-1: the client dimension — one system-owned self client per 
           skuId,
           binId,
           quantityDelta: 500,
-          reasonCode: 'cycle-count',
+          reasonCode: 'stock-count',
           note: 'client-dim',
         })
         .expect(201);

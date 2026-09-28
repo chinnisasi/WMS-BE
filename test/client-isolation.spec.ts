@@ -619,8 +619,10 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       }[];
       // 0040 left 44 policies; 0041 recreated five; 0042 (story 4.6c) added
       // two — shipments and manifests; 0043 (story 5-1) added two more —
-      // transfer_orders and transfer_order_lines. None lost.
-      expect(policies).toHaveLength(48);
+      // transfer_orders and transfer_order_lines; 0044 (story 5-2) added two
+      // more — stock_adjustment_pendings and stock_adjustment_policies. None
+      // lost.
+      expect(policies).toHaveLength(50);
 
       for (const expected of CLIENT_POLICIES) {
         const found = policies.find(

@@ -407,7 +407,7 @@ describe('carrier rate shopping: the read that prices one order against every li
         skuId,
         binId: ctx.binId,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'rate-suite seed',
       })
       .expect(201);

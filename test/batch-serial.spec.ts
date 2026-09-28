@@ -225,7 +225,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
     const expiry = daysFromNow(300);
     const res = await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: 5,
-      reasonCode: 'cycle-count', note: 'batch intake',
+      reasonCode: 'stock-count', note: 'batch intake',
       batch: { code: 'B-2401', mfgDate: mfg, expiryDate: expiry },
     }).expect(201);
 
@@ -250,7 +250,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       // `quantity_delta` is milli-units (story 10.1); assert in base units.
       expect(fromMilli(Number(event.quantity_delta))).toBe(5);
       // Intake is not an override — the reference doc carries no reason.
-      expect(event.reference_doc).toMatchObject({ kind: 'manual-adjustment', reasonCode: 'cycle-count' });
+      expect(event.reference_doc).toMatchObject({ kind: 'manual-adjustment', reasonCode: 'stock-count' });
       expect('overrideReason' in event.reference_doc).toBe(false);
 
       const bohRows = await sql`
@@ -277,7 +277,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
 
       const second = await adjust({
         warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: 3,
-        reasonCode: 'cycle-count', note: 'same batch again',
+        reasonCode: 'stock-count', note: 'same batch again',
         batch: { code: 'B-2401', mfgDate: daysFromNow(-999), expiryDate: daysFromNow(999) },
       }).expect(201);
       expect(second.body.onHand.quantity).toBe(8);
@@ -305,11 +305,11 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('batch-tracked intake without the batch arm is a 400; a bad batch date is a 400', async () => {
     await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'no batch',
+      reasonCode: 'stock-count', note: 'no batch',
     }).expect(400);
     await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'bad date',
+      reasonCode: 'stock-count', note: 'bad date',
       batch: { code: 'B-X', expiryDate: 'not-a-date' },
     }).expect(400);
   });
@@ -317,17 +317,17 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('untracked SKUs carrying the new arms are a 400 (per arm)', async () => {
     await adjust({
       warehouseId, skuId: skuIds.get('PLAIN-1')!, binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'batch on flagless',
+      reasonCode: 'stock-count', note: 'batch on flagless',
       batch: { code: 'B-NOPE' },
     }).expect(400);
     await adjust({
       warehouseId, skuId: skuIds.get('PLAIN-1')!, binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'serials on flagless',
+      reasonCode: 'stock-count', note: 'serials on flagless',
       serials: ['SN-X'],
     }).expect(400);
     await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'serials on batch-only',
+      reasonCode: 'stock-count', note: 'serials on batch-only',
       serials: ['SN-X'],
     }).expect(400);
   });
@@ -335,16 +335,16 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('serial-tracked movement without serials is a 400; qty ≠ serial count is a 400', async () => {
     await adjust({
       warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: 2,
-      reasonCode: 'cycle-count', note: 'no serials',
+      reasonCode: 'stock-count', note: 'no serials',
     }).expect(400);
     await adjust({
       warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: 2,
-      reasonCode: 'cycle-count', note: 'one serial, two units',
+      reasonCode: 'stock-count', note: 'one serial, two units',
       serials: ['SN-A'],
     }).expect(400);
     await adjust({
       warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: -1,
-      reasonCode: 'cycle-count', note: 'two serials, one unit out',
+      reasonCode: 'stock-count', note: 'two serials, one unit out',
       serials: ['SN-A', 'SN-B'],
     }).expect(400);
   });
@@ -354,7 +354,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('serial intake: exactly one ledger event per serial unit (qty +1 each, own serialRef), location derived', async () => {
     const res = await adjust({
       warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: 2,
-      reasonCode: 'cycle-count', note: 'serial intake',
+      reasonCode: 'stock-count', note: 'serial intake',
       serials: ['SN-1', 'SN-2'],
     }).expect(201);
     expect(res.body.onHand.quantity).toBe(2);
@@ -392,7 +392,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('duplicate scan: intake of a serial that lives in a bin is a 409 duplicate-serial NAMING that bin (other bin or the same one)', async () => {
     const otherBin = await adjust({
         warehouseId, skuId: skuIds.get('ST-1')!, binId: binB, quantityDelta: 1,
-        reasonCode: 'cycle-count', note: 'duplicate scan elsewhere',
+        reasonCode: 'stock-count', note: 'duplicate scan elsewhere',
         serials: ['SN-1'],
       }).expect(409);
       expect(otherBin.body).toMatchObject({ status: 409, code: 'duplicate-serial' });
@@ -400,7 +400,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
 
       const sameBin = await adjust({
         warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: 1,
-        reasonCode: 'cycle-count', note: 'duplicate scan same bin',
+        reasonCode: 'stock-count', note: 'duplicate scan same bin',
         serials: ['SN-1'],
       }).expect(409);
       expect(sameBin.body).toMatchObject({ status: 409, code: 'duplicate-serial' });
@@ -410,7 +410,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('serial draw: per-unit out events; a serial elsewhere is 409 naming its bin; unknown is 404; a drawn serial can re-enter', async () => {
     const draw = await adjust({
       warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: -1,
-      reasonCode: 'damage', note: 'serial draw',
+      reasonCode: 'damaged', note: 'serial draw',
       serials: ['SN-1'],
     }).expect(201);
     expect(draw.body.event.quantityDelta).toBe(-1);
@@ -430,7 +430,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       // Drawing it again: out of stock — 409 naming the last-known bin.
       const redraw = await adjust({
         warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: -1,
-        reasonCode: 'damage', note: 'double draw',
+        reasonCode: 'damaged', note: 'double draw',
         serials: ['SN-1'],
       }).expect(409);
       expect(redraw.body).toMatchObject({ status: 409, code: 'serial-elsewhere' });
@@ -438,7 +438,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       // SN-2 lives in binA — drawing it from binB is a 409 naming binA.
       const elsewhere = await adjust({
         warehouseId, skuId: skuIds.get('ST-1')!, binId: binB, quantityDelta: -1,
-        reasonCode: 'damage', note: 'wrong bin draw',
+        reasonCode: 'damaged', note: 'wrong bin draw',
         serials: ['SN-2'],
       }).expect(409);
       expect(elsewhere.body).toMatchObject({ status: 409, code: 'serial-elsewhere' });
@@ -447,7 +447,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       // A serial the ledger has never seen draws as 404.
       await adjust({
         warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: -1,
-        reasonCode: 'damage', note: 'unknown serial',
+        reasonCode: 'damaged', note: 'unknown serial',
         serials: ['SN-GHOST'],
       }).expect(404);
     } finally {
@@ -458,7 +458,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
     // (binB starts at zero — the movement itself is its first stock there).
     const reentry = await adjust({
       warehouseId, skuId: skuIds.get('ST-1')!, binId: binB, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 're-intake after draw',
+      reasonCode: 'stock-count', note: 're-intake after draw',
       serials: ['SN-1'],
     }).expect(201);
     expect(reentry.body.onHand.quantity).toBe(1);
@@ -472,7 +472,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
     const key = ulid();
     const body: AdjustBody = {
       warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'idempotent serials',
+      reasonCode: 'stock-count', note: 'idempotent serials',
       serials: ['SN-IDEM'],
     };
     const first = await adjust(body, key).expect(201);
@@ -488,7 +488,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('a batch+serial-tracked SKU carries BOTH arms: one per-unit event with the batch and the serial', async () => {
     const res = await adjust({
       warehouseId, skuId: skuIds.get('BS-1')!, binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'both arms',
+      reasonCode: 'stock-count', note: 'both arms',
       batch: { code: 'C-9001', expiryDate: daysFromNow(60) },
       serials: ['SN-C1'],
     }).expect(201);
@@ -518,14 +518,14 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('explicit batch draw is an override: missing reason is a 400, a reason rides the ledger reference doc', async () => {
     const noReason = await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: -1,
-      reasonCode: 'damage', note: 'override without reason',
+      reasonCode: 'damaged', note: 'override without reason',
       batch: { code: 'B-2401' },
     }).expect(400);
     expect(noReason.body.detail).toContain('overrideReason');
 
     const override = await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: -1,
-      reasonCode: 'damage', note: 'override with reason',
+      reasonCode: 'damaged', note: 'override with reason',
       batch: { code: 'B-2401', overrideReason: 'oldest pallet damaged — counted out' },
     }).expect(201);
 
@@ -551,7 +551,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('over-draw beyond the batch bin quantity is a 422 insufficient-on-hand naming the batch CODE; unknown batch is a 404', async () => {
     const overdraw = await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: -99,
-      reasonCode: 'damage', note: 'batch over-draw',
+      reasonCode: 'damaged', note: 'batch over-draw',
       batch: { code: 'B-2401', overrideReason: 'counted out in one go' },
     }).expect(422);
     expect(overdraw.body).toMatchObject({ status: 422, code: 'insufficient-on-hand' });
@@ -559,7 +559,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
 
     const unknownBatch = await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: -1,
-      reasonCode: 'damage', note: 'unknown batch',
+      reasonCode: 'damaged', note: 'unknown batch',
       batch: { code: 'B-GHOST', overrideReason: 'typo code' },
     }).expect(404);
     expect(unknownBatch.body).toMatchObject({ status: 404, code: 'not-found' });
@@ -568,10 +568,10 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('FEFO default draw: earliest non-expired batch with stock in the bin; expired skipped; null expiry last; exhausted bin is 422', async () => {
     const sku = skuIds.get('BT-1')!;
     // Seed four batches in binB: BX (expiry +10d), BY (+2d), BZ (null), BE (expired).
-    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 5, reasonCode: 'cycle-count', note: 'BX', batch: { code: 'BX', expiryDate: daysFromNow(10) } }).expect(201);
-    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 4, reasonCode: 'cycle-count', note: 'BY', batch: { code: 'BY', expiryDate: daysFromNow(2) } }).expect(201);
-    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 3, reasonCode: 'cycle-count', note: 'BZ', batch: { code: 'BZ' } }).expect(201);
-    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 7, reasonCode: 'cycle-count', note: 'BE expired', batch: { code: 'BE', expiryDate: daysFromNow(-1) } }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 5, reasonCode: 'stock-count', note: 'BX', batch: { code: 'BX', expiryDate: daysFromNow(10) } }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 4, reasonCode: 'stock-count', note: 'BY', batch: { code: 'BY', expiryDate: daysFromNow(2) } }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 3, reasonCode: 'stock-count', note: 'BZ', batch: { code: 'BZ' } }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 7, reasonCode: 'stock-count', note: 'BE expired', batch: { code: 'BE', expiryDate: daysFromNow(-1) } }).expect(201);
 
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     const batchIds = new Map<string, string>();
@@ -582,7 +582,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       }
 
       // Draw 1: BY (earliest non-expired expiry).
-      const draw1 = await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: -1, reasonCode: 'pick-stand-in', note: 'fefo 1' }).expect(201);
+      const draw1 = await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: -1, reasonCode: 'other', note: 'fefo 1' }).expect(201);
       const seq1 = await sql`select batch_ref from ledger_events where tenant_id = ${tenantId} and seq = ${draw1.body.event.seq}`;
       expect((seq1[0] as { batch_ref: string }).batch_ref).toBe(batchIds.get('BY'));
 
@@ -590,16 +590,16 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       // never default-drawn and no batch is drawn twice out of order.
       const expectedOrder = ['BY', 'BY', 'BY', 'BX', 'BX', 'BX', 'BX', 'BX', 'BZ', 'BZ', 'BZ'];
       for (const expected of expectedOrder) {
-        const draw = await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: -1, reasonCode: 'pick-stand-in', note: 'fefo n' }).expect(201);
+        const draw = await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: -1, reasonCode: 'other', note: 'fefo n' }).expect(201);
         const seq = await sql`select batch_ref from ledger_events where tenant_id = ${tenantId} and seq = ${draw.body.event.seq}`;
         expect((seq[0] as { batch_ref: string }).batch_ref).toBe(batchIds.get(expected));
       }
 
       // Every non-expired batch is exhausted: the default draw refuses —
       // an explicit (override) draw of the expired BE is still possible.
-      await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: -1, reasonCode: 'pick-stand-in', note: 'nothing non-expired' }).expect(422);
+      await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: -1, reasonCode: 'other', note: 'nothing non-expired' }).expect(422);
       const explicit = await adjust({
-        warehouseId, skuId: sku, binId: binB, quantityDelta: -1, reasonCode: 'damage', note: 'expired override',
+        warehouseId, skuId: sku, binId: binB, quantityDelta: -1, reasonCode: 'damaged', note: 'expired override',
         batch: { code: 'BE', overrideReason: 'supervisor approved the expired write-off' },
       }).expect(201);
       expect(explicit.body.onHand.quantity).toBe(6); // BE was never default-drawn: 7 − 1
@@ -611,7 +611,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('untracked passthrough: a flagless-SKU adjustment without the new fields behaves exactly as before', async () => {
     const res = await adjust({
       warehouseId, skuId: skuIds.get('PLAIN-1')!, binId: binA, quantityDelta: 4,
-      reasonCode: 'cycle-count', note: 'plain adjustment',
+      reasonCode: 'stock-count', note: 'plain adjustment',
     }).expect(201);
     expect(res.body.event).toMatchObject({
       type: 'stock.adjusted',
@@ -699,21 +699,31 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
 
   it('one-query traceability: serial history, serial location, and batch history each return in a single read', async () => {
     const sku = skuIds.get('BS-1')!;
-    // One combined intake → history for the batch and the serial.
-    const res = await adjust({
+    // One combined intake → history for the batch and the serial. The
+    // response is the A4 aggregate (event.id/seq null) — the pairing lives
+    // in the timeline, read below.
+    await adjust({
       warehouseId, skuId: sku, binId: binA, quantityDelta: 2,
-      reasonCode: 'cycle-count', note: 'one-query readback',
+      reasonCode: 'stock-count', note: 'one-query readback',
       batch: { code: 'C-9002', expiryDate: daysFromNow(90) },
       serials: ['SN-D1', 'SN-D2'],
     }).expect(201);
 
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
-      const events = await sql`
-        select batch_ref, serial_ref from ledger_events where tenant_id = ${tenantId} and seq = ${res.body.event.seq}
+      // Story 5-2 (retro A4): a multi-serial intake's response is the
+      // AGGREGATE snapshot — event.id/seq are null by design — so the
+      // per-serial pairing is read from the timeline, not from event.seq.
+      const batchRows = await sql`
+        select id from batches where tenant_id = ${tenantId} and code = 'C-9002'
       `;
-      const batchId = (events[0] as { batch_ref: string }).batch_ref;
-      const serialId = (events[0] as { serial_ref: string }).serial_ref;
+      const batchId = (batchRows[0] as { id: string }).id;
+      const timeline = await facade.listEvents(tenantId, warehouseId, { skuId: sku });
+      const intakeEvents = timeline.items.filter(
+        (event) => event.batchRef === batchId && event.serialRef !== null,
+      );
+      expect(intakeEvents).toHaveLength(2);
+      const serialId = intakeEvents[0]!.serialRef!;
 
       // The batch's history covers BOTH serial units of this intake (each
       // per-unit event carries the batchRef) — still one query.
@@ -796,12 +806,12 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       const batchKey = ulid();
       await adjust({
         warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: 1,
-        reasonCode: 'cycle-count', note: 'idem arms A',
+        reasonCode: 'stock-count', note: 'idem arms A',
         batch: { code: 'B-IDEM-A' },
       }, batchKey).expect(201);
       const differentCode = await adjust({
         warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: 1,
-        reasonCode: 'cycle-count', note: 'idem arms A — different code',
+        reasonCode: 'stock-count', note: 'idem arms A — different code',
         batch: { code: 'B-IDEM-B' },
       }, batchKey).expect(422);
       expect(differentCode.body).toMatchObject({ status: 422, code: 'idempotency-key-reuse' });
@@ -809,12 +819,12 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       const serialKey = ulid();
       await adjust({
         warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: 1,
-        reasonCode: 'cycle-count', note: 'idem arms S',
+        reasonCode: 'stock-count', note: 'idem arms S',
         serials: ['SN-IDEM-R1'],
       }, serialKey).expect(201);
       const differentSerials = await adjust({
         warehouseId, skuId: skuIds.get('ST-1')!, binId: binA, quantityDelta: 1,
-        reasonCode: 'cycle-count', note: 'idem arms S — different serials',
+        reasonCode: 'stock-count', note: 'idem arms S — different serials',
         serials: ['SN-IDEM-R2'],
       }, serialKey).expect(422);
       expect(differentSerials.body).toMatchObject({ status: 422, code: 'idempotency-key-reuse' });
@@ -842,7 +852,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       // default draw must resolve the fresh batch).
       await adjust({
         warehouseId, skuId: sku, binId: binB, quantityDelta: 5,
-        reasonCode: 'cycle-count', note: 'BR seed',
+        reasonCode: 'stock-count', note: 'BR seed',
         batch: { code: 'BR', expiryDate: daysFromNow(30) },
       }).expect(201);
 
@@ -850,7 +860,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       const key = ulid();
       const body: AdjustBody = {
         warehouseId, skuId: sku, binId: binB, quantityDelta: -1,
-        reasonCode: 'pick-stand-in', note: 'fefo replay',
+        reasonCode: 'other', note: 'fefo replay',
       };
       const first = await adjust(body, key).expect(201);
       expect(first.body.event.quantityDelta).toBe(-1);
@@ -891,7 +901,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       // New movement INSIDE the next window, then tamper its projection row.
       const seeded = await adjust({
         warehouseId, skuId: sku, binId: binA, quantityDelta: 3,
-        reasonCode: 'cycle-count', note: 'scan seed',
+        reasonCode: 'stock-count', note: 'scan seed',
         batch: { code: 'B-SCAN', expiryDate: daysFromNow(45) },
       }).expect(201);
       const batchRows = await sql`
@@ -943,7 +953,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
           skuId: skuIds.get('BT-1')!,
           binId: binA,
           quantityDelta: 1,
-          reasonCode: 'cycle-count',
+          reasonCode: 'stock-count',
           note: 'denied armed adjust',
           batch: { code: 'B-DENIED' },
         })
@@ -1014,7 +1024,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('an unknown skuId carrying an arm is a 404 not-found (before any identity work)', async () => {
     await adjust({
       warehouseId, skuId: uuidv7(), binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'arm on unknown sku',
+      reasonCode: 'stock-count', note: 'arm on unknown sku',
       batch: { code: 'B-GHOST-SKU' },
     }).expect(404);
   });
@@ -1022,7 +1032,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('intake carrying batch.overrideReason is a 400 (the reason is the override-draw audit field only)', async () => {
     await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'intake with a reason',
+      reasonCode: 'stock-count', note: 'intake with a reason',
       batch: { code: 'B-REASON-INTAKE', overrideReason: 'not a draw' },
     }).expect(400);
   });
@@ -1030,7 +1040,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('an inverted-dated batch (expiry before mfg) is a 400 at intake — FEFO never sees it', async () => {
     await adjust({
       warehouseId, skuId: skuIds.get('BT-1')!, binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'inverted dates',
+      reasonCode: 'stock-count', note: 'inverted dates',
       batch: { code: 'B-INVERTED', mfgDate: daysFromNow(30), expiryDate: daysFromNow(-30) },
     }).expect(400);
   });
@@ -1038,14 +1048,14 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('a FEFO default draw larger than the resolved batch holds reaches the ledger fold guard: 422 insufficient-on-hand', async () => {
     const sku = skuIds.get('BT-1')!;
     // Small earliest-expiry batch (FEFO resolves it) + a larger later one.
-    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 2, reasonCode: 'cycle-count', note: 'small', batch: { code: 'B-SMALL', expiryDate: daysFromNow(5) } }).expect(201);
-    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 10, reasonCode: 'cycle-count', note: 'large', batch: { code: 'B-LARGE', expiryDate: daysFromNow(50) } }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 2, reasonCode: 'stock-count', note: 'small', batch: { code: 'B-SMALL', expiryDate: daysFromNow(5) } }).expect(201);
+    await adjust({ warehouseId, skuId: sku, binId: binB, quantityDelta: 10, reasonCode: 'stock-count', note: 'large', batch: { code: 'B-LARGE', expiryDate: daysFromNow(50) } }).expect(201);
 
     // Draw more than the earliest batch holds in one movement: no spanning —
     // the ledger's batch fold guard rejects naming the resolved batchRef.
     const overdraw = await adjust({
       warehouseId, skuId: sku, binId: binB, quantityDelta: -5,
-      reasonCode: 'pick-stand-in', note: 'beyond the earliest batch',
+      reasonCode: 'other', note: 'beyond the earliest batch',
     }).expect(422);
     expect(overdraw.body).toMatchObject({ status: 422, code: 'insufficient-on-hand' });
   });
@@ -1054,14 +1064,14 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
     const sku = skuIds.get('BS-1')!;
     await adjust({
       warehouseId, skuId: sku, binId: binA, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'both-arms intake for the draw',
+      reasonCode: 'stock-count', note: 'both-arms intake for the draw',
       batch: { code: 'C-9004', expiryDate: daysFromNow(20) },
       serials: ['SN-O1'],
     }).expect(201);
 
     const draw = await adjust({
       warehouseId, skuId: sku, binId: binA, quantityDelta: -1,
-      reasonCode: 'damage', note: 'both arms out, explicit batch',
+      reasonCode: 'damaged', note: 'both arms out, explicit batch',
       batch: { code: 'C-9004', overrideReason: 'damaged unit counted out of its batch' },
       serials: ['SN-O1'],
     }).expect(201);
@@ -1087,7 +1097,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
   it('two concurrent adjustments of the SAME serial: exactly one wins, the loser fails, one ledger event exists', async () => {
     const body: AdjustBody = {
       warehouseId, skuId: skuIds.get('ST-1')!, binId: binB, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'concurrent scan',
+      reasonCode: 'stock-count', note: 'concurrent scan',
       serials: ['SN-RACE'],
     };
     const settled = await Promise.allSettled([adjust(body), adjust(body)]);

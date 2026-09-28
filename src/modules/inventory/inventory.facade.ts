@@ -24,6 +24,7 @@ import {
   isBulkAssetType,
 } from '../../shared/primitives/location-type';
 import { storageClassSatisfies } from '../../shared/primitives/storage-class';
+import { fullPrecisionInstant } from '../../shared/primitives/time';
 import { assertSecureBinAuthority } from '../tenancy/permissions';
 import {
   canonicalInstant,
@@ -58,7 +59,16 @@ import type {
   ReplayReport,
 } from './ledger.service';
 import { StockAdjustmentCommand } from './inventory.command';
-import type { AdjustStockCommand, StockAdjustmentSnapshot } from './inventory.command';
+import type { AdjustStockCommand, StockAdjustmentResult, StockAdjustmentSnapshot, StockAdjustmentPendingSnapshot } from './inventory.command';
+import { AdjustmentApprovalCommand } from './adjustment-approval.command';
+import type {
+  AdjustmentDecisionSnapshot,
+  AdjustmentPendingEntry,
+  AdjustmentPolicySnapshot,
+  DecideAdjustmentCommand,
+  ListAdjustmentPendingsQuery,
+  SetAdjustmentPolicyCommand,
+} from './adjustment-approval.command';
 import { ReconciliationService } from './reconcile';
 import type { ReconcileReport } from './reconcile';
 import { ReservationService } from './reservation.service';
@@ -229,6 +239,9 @@ export class InventoryFacade {
     // No cycle: the command/facade layer consumes the ledger one-way.
     @Inject(LedgerService) private readonly ledger: LedgerService,
     @Inject(StockAdjustmentCommand) private readonly stockAdjustment: StockAdjustmentCommand,
+    // Story 5-2 — the approval-threshold commands behind the same seam.
+    @Inject(AdjustmentApprovalCommand)
+    private readonly adjustmentApproval: AdjustmentApprovalCommand,
     // Continuous reconciliation (Story 2.2) — background work; the jobs shell
     // drives it through this facade. No HTTP route.
     @Inject(ReconciliationService) private readonly reconciliation: ReconciliationService,
@@ -238,12 +251,40 @@ export class InventoryFacade {
     @Inject(ReservationService) private readonly reservations: ReservationService,
   ) {}
 
-  /** `stock.adjustment` — the first movement producer (Story 2.1). */
-  async adjustStock(
-    command: AdjustStockCommand,
+  /** `stock.adjustment` — the first movement producer (Story 2.1); Story 5-2 adds the `pending` outcome (the over-threshold 202). */
+  async adjustStock(command: AdjustStockCommand, idempotencyKey: string): Promise<StockAdjustmentResult> {
+    return this.stockAdjustment.adjust(command, idempotencyKey);
+  }
+
+  // ── Story 5-2: the approval-threshold surface ─────────────────────────────
+
+  /** PUT …/inventory/adjustment-policies — the tenant's threshold row (adjustments.approve). */
+  async setAdjustmentPolicy(
+    command: SetAdjustmentPolicyCommand,
     idempotencyKey: string,
-  ): Promise<StockAdjustmentSnapshot> {
-    return this.stockAdjustment.adjust(command, idempotencyKey).then((result) => result.snapshot);
+  ): Promise<AdjustmentPolicySnapshot> {
+    return this.adjustmentApproval.setAdjustmentPolicy(command, idempotencyKey);
+  }
+
+  /** GET …/inventory/adjustment-policies — null when no row exists (flow disabled). */
+  async getAdjustmentPolicy(tenantId: string): Promise<AdjustmentPolicySnapshot | null> {
+    return this.adjustmentApproval.getAdjustmentPolicy(tenantId);
+  }
+
+  /** GET …/inventory/adjustment-pendings — the pending queue (a read). */
+  async listAdjustmentPendings(
+    tenantId: string,
+    query: ListAdjustmentPendingsQuery = {},
+  ): Promise<Page<AdjustmentPendingEntry>> {
+    return this.adjustmentApproval.listAdjustmentPendings(tenantId, query);
+  }
+
+  /** POST …/adjustment-pendings/:pendingId/approve | /reject — the terminal decision. */
+  async decideAdjustment(
+    command: DecideAdjustmentCommand,
+    idempotencyKey: string,
+  ): Promise<AdjustmentDecisionSnapshot> {
+    return this.adjustmentApproval.decideAdjustment(command, idempotencyKey);
   }
 
   /**
@@ -294,7 +335,7 @@ export class InventoryFacade {
     tenantId: string,
     idempotencyKey: string,
     payloadHash: string,
-  ): Promise<StockAdjustmentSnapshot | null> {
+  ): Promise<StockAdjustmentSnapshot | StockAdjustmentPendingSnapshot | null> {
     return this.stockAdjustment.replayPriorSnapshot(tenantId, idempotencyKey, payloadHash);
   }
 
@@ -335,6 +376,13 @@ export class InventoryFacade {
           recordedAt: ledgerEvents.recordedAt,
           eventHash: ledgerEvents.eventHash,
           createdAt: ledgerEvents.createdAt,
+          // Story 5-2: the CURSOR needs the raw `::text` instant — the
+          // driver's own parse (and `canonicalInstant`) truncates to
+          // milliseconds, and a multi-serial adjustment appends its per-serial
+          // events in ONE transaction, so they share one `now()` to the
+          // microsecond. A truncated cursor's strict `<` would skip the tail
+          // of that tie group on the next page. See `fullPrecisionInstant`.
+          createdAtText: sql<string>`${ledgerEvents.createdAt}::text`,
         })
         .from(ledgerEvents)
         .where(
@@ -352,7 +400,11 @@ export class InventoryFacade {
       // The rows carry `timestamptz` in Postgres's own text shape —
       // normalize every instant to the canonical ISO-8601 UTC form the
       // verifier and cursors rely on (one shared normalizer, no dup).
-      const items = rows.map((row) => ({
+      const items = rows.map(({ createdAtText, ...row }) => {
+        // `createdAtText` is the cursor-only projection (below) — it must
+        // never leak into the response body.
+        void createdAtText;
+        return {
         ...row,
         // jsonb selects as `unknown` — the timeline's typed passthrough (the
         // verifier's own cast pattern, ledger.service).
@@ -367,8 +419,23 @@ export class InventoryFacade {
         occurredAt: canonicalInstant(row.occurredAt),
         recordedAt: canonicalInstant(row.recordedAt),
         createdAt: canonicalInstant(row.createdAt),
-      }));
-      return buildPage(items, pageSize);
+        };
+      });
+      // buildPage encodes the cursor from the items' `createdAt` — feed it
+      // the FULL-precision instants (microseconds), then canonicalize the
+      // surfaced items back to the body's ms shape.
+      const page = buildPage(
+        rows.map((row, index) => ({
+          createdAt: fullPrecisionInstant(row.createdAtText),
+          id: row.id,
+          entry: items[index]!,
+        })),
+        pageSize,
+      );
+      return {
+        items: page.items.map((wrapped) => wrapped.entry),
+        nextCursor: page.nextCursor,
+      };
     });
   }
 

@@ -319,7 +319,7 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
         skuId,
         binId,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'packing-suite seed',
       })
       .expect(201);

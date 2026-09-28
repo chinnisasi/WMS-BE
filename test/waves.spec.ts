@@ -351,7 +351,7 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
         skuId,
         binId,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: `waves-suite batch ${batch.code}`,
         batch,
       })
@@ -379,7 +379,7 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
         skuId,
         binId,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'waves-suite seed',
       })
       .expect(201);

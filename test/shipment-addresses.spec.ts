@@ -220,7 +220,7 @@ describe('shipment addresses (e2e, story 11-1): destination + origin I/O, the re
         skuId,
         binId: binA,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'addresses-suite seed',
       })
       .expect(201);

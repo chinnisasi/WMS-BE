@@ -252,7 +252,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
         skuId,
         binId: binA,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'orders-suite seed',
       })
       .expect(201);
@@ -810,7 +810,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
           skuId,
           binId: binA,
           quantityDelta: -5,
-          reasonCode: 'cycle-count',
+          reasonCode: 'stock-count',
           note: 'orders-suite race',
         }),
       postOrder(opsToken, createBody([{ skuId, quantity: 5 }])).then(

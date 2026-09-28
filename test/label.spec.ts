@@ -386,7 +386,7 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
         skuId,
         binId,
         quantityDelta: quantity,
-        reasonCode: 'cycle-count',
+        reasonCode: 'stock-count',
         note: 'label-suite seed',
       })
       .expect(201);

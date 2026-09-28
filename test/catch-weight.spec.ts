@@ -618,7 +618,7 @@ describe('catch weight and handling units (e2e, story 10.3)', () => {
       skuId: sku(skuCode),
       binId: binA,
       quantityDelta: quantity,
-      reasonCode: 'cycle-count',
+      reasonCode: 'stock-count',
       note: 'catch-weight suite plain seed',
     }).expect(201);
   }

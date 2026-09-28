@@ -271,7 +271,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       skuId,
       binId,
       quantityDelta: qty,
-      reasonCode: 'cycle-count',
+      reasonCode: 'stock-count',
       note: 'bin-admin fill',
       ...(opts.batchCode === undefined ? {} : { batch: { code: opts.batchCode, mfgDate: '2026-01-01T00:00:00.000Z' } }),
       ...(opts.serials === undefined ? {} : { serials: opts.serials }),
@@ -583,7 +583,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       skuId: plainSkuId,
       binId: binA01,
       quantityDelta: 1,
-      reasonCode: 'cycle-count',
+      reasonCode: 'stock-count',
       note: 'into retired',
     }).expect(400);
     expect(adjustInto.body).toMatchObject({ code: 'bin-retired' });

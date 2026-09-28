@@ -515,7 +515,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       .set(KEY_HEADER, ulid())
       .send({ blocked: true })
       .expect(200);
-    await adjust({ warehouseId, skuId: plainSkuId, binId: binA06, quantityDelta: 5, reasonCode: 'cycle-count', note: 'fill A-06' }).expect(201);
+    await adjust({ warehouseId, skuId: plainSkuId, binId: binA06, quantityDelta: 5, reasonCode: 'stock-count', note: 'fill A-06' }).expect(201);
 
     const second = await blindGrn([{ poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 12 }]);
     const tasks = await getTasks();
@@ -974,7 +974,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     // adjustment (a placement moves intaken stock — it creates none).
     await adjust({
       warehouseId, skuId: serialSkuId, binId: bin, quantityDelta: 2,
-      reasonCode: 'cycle-count', note: 'serial intake for putaway', serials: ['PW-SN-1', 'PW-SN-2'],
+      reasonCode: 'stock-count', note: 'serial intake for putaway', serials: ['PW-SN-1', 'PW-SN-2'],
     }).expect(201);
 
     // No serials on a serial-tracked SKU → 400.
@@ -1027,7 +1027,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     // (PW-SN-3 intakes straight into A-01, never the Receiving bin).
     await adjust({
       warehouseId, skuId: serialSkuId, binId: binA01, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'serial intaken elsewhere', serials: ['PW-SN-3'],
+      reasonCode: 'stock-count', note: 'serial intaken elsewhere', serials: ['PW-SN-3'],
     }).expect(201);
     await placeForLine(line, binA03, { qty: 1, serials: ['PW-SN-3'], reasonCode: 'operator-preference' })
       .expect(409)
@@ -1074,11 +1074,11 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     const receiving = await receivingBinId();
     await adjust({
       warehouseId, skuId: serialSkuId, binId: receiving, quantityDelta: 1,
-      reasonCode: 'cycle-count', note: 'intake for the drawn-out arm', serials: ['PW-SN-D1'],
+      reasonCode: 'stock-count', note: 'intake for the drawn-out arm', serials: ['PW-SN-D1'],
     }).expect(201);
     await adjust({
       warehouseId, skuId: serialSkuId, binId: receiving, quantityDelta: -1,
-      reasonCode: 'cycle-count', note: 'drawn out for the arm', serials: ['PW-SN-D1'],
+      reasonCode: 'stock-count', note: 'drawn out for the arm', serials: ['PW-SN-D1'],
     }).expect(201);
     const drawnOut = await placeForLine(serialLine, binA04, { qty: 1, serials: ['PW-SN-D1'], reasonCode: 'operator-preference' })
       .expect(409);
@@ -1366,7 +1366,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     // 1,000,000,000 mm³ (via the adjustment surface — the load read over
     // stock_on_hand), the seventeenth overflows it.
     const volGrn = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 17 }]);
-    await adjust({ warehouseId, skuId: dimSkuId, binId: bin0V, quantityDelta: 16, reasonCode: 'cycle-count', note: 'prefill 0-V' }).expect(201);
+    await adjust({ warehouseId, skuId: dimSkuId, binId: bin0V, quantityDelta: 16, reasonCode: 'stock-count', note: 'prefill 0-V' }).expect(201);
     const volumeRes = await placeForLine(volGrn.lines[0]!, bin0V, { qty: 1, reasonCode: 'operator-preference' }).expect(400);
     expect(volumeRes.body).toMatchObject({ status: 400, code: 'bin-volume-exceeded' });
     expect(volumeRes.body.detail).toContain('0-V');
@@ -1381,7 +1381,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     // rejection is `bin-full` naming capacity and occupancy, never
     // `bin-overweight`.
     const bin0U = await createDimBin('0-U', { capacity: 1, maxWeightGrams: 5000, lengthMm: 500, widthMm: 500, heightMm: 500 });
-    await adjust({ warehouseId, skuId: dimSkuId, binId: bin0U, quantityDelta: 1, reasonCode: 'cycle-count', note: 'prefill 0-U' }).expect(201);
+    await adjust({ warehouseId, skuId: dimSkuId, binId: bin0U, quantityDelta: 1, reasonCode: 'stock-count', note: 'prefill 0-U' }).expect(201);
     const orderGrn = await blindGrn([{ poLineId: null, skuId: dimSkuId, batchCode: null, mfgDate: null, qty: 1 }]);
     const orderRes = await placeForLine(orderGrn.lines[0]!, bin0U, { reasonCode: 'operator-preference' }).expect(400);
     expect(orderRes.body).toMatchObject({ status: 400, code: 'bin-full' });
@@ -1760,7 +1760,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     const oxGrn = await hzGrn(oxidizerSkuId, 2);
     const oxPlace = await placeForLine(oxGrn.lines[0]!, bin0H1, { warehouseId: hazardWarehouseId }).expect(201);
     expect((oxPlace.body.placement as { suggestedBinCode: string | null }).suggestedBinCode).toBe('0-H1');
-    await adjust({ warehouseId: hazardWarehouseId, skuId: plainSkuId, binId: bin0H2, quantityDelta: 3, reasonCode: 'cycle-count', note: 'seed 0-H2' }).expect(201);
+    await adjust({ warehouseId: hazardWarehouseId, skuId: plainSkuId, binId: bin0H2, quantityDelta: 3, reasonCode: 'stock-count', note: 'seed 0-H2' }).expect(201);
 
     // THE SUGGESTION/TASK FILTER — the load-bearing shape (review triage #1):
     // an ungated walk picks the LOWER-occupancy `0-H1` (2 < 3); with the
@@ -1964,7 +1964,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     await patchHazard(oxidizerSku, 'oxidizer');
     const flammableSku = await importSecureSku(app, tenantId, ownerToken, 'PUT-HAZ-F');
     await patchHazard(flammableSku, 'flammable');
-    await adjust({ warehouseId, skuId: oxidizerSku, binId: binHazard, quantityDelta: 1, reasonCode: 'cycle-count', note: 'hazard occupant (named bypass)' }).expect(201);
+    await adjust({ warehouseId, skuId: oxidizerSku, binId: binHazard, quantityDelta: 1, reasonCode: 'stock-count', note: 'hazard occupant (named bypass)' }).expect(201);
     const grnHazard = await blindGrn([{ poLineId: null, skuId: flammableSku, batchCode: null, mfgDate: null, qty: 1 }]);
     const authorityFirst = await placeForLine(grnHazard.lines[0]!, binHazard).expect(403);
     expect(authorityFirst.body).toMatchObject({ status: 403, code: 'role-denied' });
