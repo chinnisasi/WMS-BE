@@ -69,7 +69,7 @@ ALTER TABLE "shipments" ADD CONSTRAINT "shipments_manifest_pairing" CHECK (("sta
 -- Arms are present together or not at all.
 ALTER TABLE "shipments" ADD CONSTRAINT "shipments_weight_grams_range" CHECK ("weight_grams" IS NULL OR ("weight_grams" > 0 AND "weight_grams" <= 1000000));--> statement-breakpoint
 ALTER TABLE "shipments" ADD CONSTRAINT "shipments_dimensions_arms_paired" CHECK (("length_mm" IS NULL) = ("width_mm" IS NULL) AND ("width_mm" IS NULL) = ("height_mm" IS NULL));--> statement-breakpoint
-ALTER TABLE "shipments" ADD CONSTRAINT "shipments_dimension_mm_range" CHECK ("length_mm" IS NULL OR ("length_mm" > 0 AND "length_mm" <= 1000000 AND "width_mm" > 0 AND "width_mm" <= 1000000 AND "height_mm" > 0 AND "height_mm" <= 1000000));--> statement-breakpoint
+ALTER TABLE "shipments" ADD CONSTRAINT "shipments_dimension_mm_range" CHECK ("length_mm" IS NULL OR ("length_mm" > 0 AND "length_mm" <= 100000 AND "width_mm" > 0 AND "width_mm" <= 100000 AND "height_mm" > 0 AND "height_mm" <= 100000));--> statement-breakpoint
 -- The adapter-issued identity the whole writeback path rides: a blank
 -- tracking number or document ref would be a label that says nothing.
 ALTER TABLE "shipments" ADD CONSTRAINT "shipments_tracking_number_nonblank" CHECK (length(btrim("tracking_number")) > 0);--> statement-breakpoint

@@ -1400,6 +1400,15 @@ export class ManifestDto {
   @ApiProperty({ description: 'How many shipments the manifest closed' })
   shipmentCount!: number;
 
+  @ApiProperty({
+    type: [String],
+    format: 'uuid',
+    required: false,
+    description:
+      'The closed shipment ids — carried by the CREATE response only (the idempotency snapshot); list rows are header rows (the shipments point back through their manifestId)',
+  })
+  shipmentIds?: readonly string[];
+
   @ApiProperty({ format: 'uuid', description: 'The operator who created it' })
   createdBy!: string;
 

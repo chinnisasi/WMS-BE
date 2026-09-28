@@ -13814,6 +13814,14 @@
             "type": "number",
             "description": "How many shipments the manifest closed"
           },
+          "shipmentIds": {
+            "description": "The closed shipment ids — carried by the CREATE response only (the idempotency snapshot); list rows are header rows (the shipments point back through their manifestId)",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
           "createdBy": {
             "type": "string",
             "format": "uuid",

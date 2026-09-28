@@ -11,6 +11,7 @@ import {
   MAX_WEIGHT_GRAMS,
 } from '../src/modules/outbound/pack.command';
 import { SHIPMENT_STATUSES } from '../src/modules/outbound/shipment.command';
+import { sealCredential } from '../src/modules/carriers/carrier-credentials';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
@@ -116,6 +117,8 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     'LBL-MMIX1', // the mixed-connections first shipment
     'LBL-MMIX2', // …and the second, through the RE-connected connection
     'LBL-AUTH', // the authority arms
+    'LBL-WH2', // the second-warehouse manifest refusal
+    'LBL-SEAL', // the unreadable-sealed-credential 503
   ] as const;
 
   beforeAll(async () => {
@@ -367,13 +370,19 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     return id;
   }
 
-  async function seedStock(skuId: string, binId: string, quantity: number): Promise<void> {
+  /** A warehouse context the packed-order fixtures ride (the main one by default). */
+  interface WarehouseCtx {
+    readonly warehouseId: string;
+    readonly binId: string;
+  }
+
+  async function seedStock(skuId: string, binId: string, quantity: number, wh = warehouseId): Promise<void> {
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/inventory/adjustments`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
       .send({
-        warehouseId,
+        warehouseId: wh,
         skuId,
         binId,
         quantityDelta: quantity,
@@ -383,22 +392,25 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
       .expect(201);
   }
 
-  async function createOrder(lines: { skuId: string; quantity: number }[]): Promise<string> {
+  async function createOrder(
+    lines: { skuId: string; quantity: number }[],
+    wh = warehouseId,
+  ): Promise<string> {
     const res = await request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/orders`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId, lines, destination: testAddress() })
+      .send({ warehouseId: wh, lines, destination: testAddress() })
       .expect(201);
     return res.body.order.id as string;
   }
 
-  async function policyId(name: string): Promise<string> {
+  async function policyId(name: string, wh = warehouseId): Promise<string> {
     const res = await request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/wave-policies`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId, name, grouping: 'single' })
+      .send({ warehouseId: wh, name, grouping: 'single' })
       .expect(201);
     return res.body.policy.id as string;
   }
@@ -407,14 +419,15 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
   async function releasedWave(
     lines: { skuId: string; quantity: number }[],
     tag: string,
+    wh = warehouseId,
   ): Promise<{ waveId: string; orderId: string; picklist: Picklist }> {
-    const orderId = await createOrder(lines);
-    const policy = await policyId(`${tag}-${ulid().slice(10, 18)}`);
+    const orderId = await createOrder(lines, wh);
+    const policy = await policyId(`${tag}-${ulid().slice(10, 18)}`, wh);
     const generated = await request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/waves`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId, policyId: policy, orderIds: [orderId] })
+      .send({ warehouseId: wh, policyId: policy, orderIds: [orderId] })
       .expect(201);
     const waveId = generated.body.wave.id as string;
     await request(app.getHttpServer())
@@ -438,13 +451,13 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
   }
 
   /** Records one pick through the device session (the 4.3 command). */
-  function pick(line: PickLine, overrides: Record<string, unknown> = {}): SupertestTest {
+  function pick(line: PickLine, overrides: Record<string, unknown> = {}, wh = warehouseId): SupertestTest {
     return request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/picks`)
       .set('Authorization', `Bearer ${operatorToken}`)
       .set(KEY_HEADER, ulid())
       .send({
-        warehouseId,
+        warehouseId: wh,
         picklistId: line.picklistId,
         picklistLineId: line.id,
         skuId: line.skuId,
@@ -538,13 +551,52 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     quantity: number,
     tag: string,
     seed = quantity + 10,
+    wh: WarehouseCtx = { warehouseId, binId: binA },
   ): Promise<{ orderId: string; skuId: string }> {
     const skuId = sku(code);
-    await seedStock(skuId, binA, seed);
-    const { orderId, picklist } = await releasedWave([{ skuId, quantity }], tag);
-    await pick(picklist.lines[0]!).expect(201);
+    await seedStock(skuId, wh.binId, seed, wh.warehouseId);
+    const { orderId, picklist } = await releasedWave([{ skuId, quantity }], tag, wh.warehouseId);
+    await pick(picklist.lines[0]!, {}, wh.warehouseId).expect(201);
     await packOrder(orderId, [{ skuId, qty: quantity }]).expect(201);
     return { orderId, skuId };
+  }
+
+  /**
+   * A SECOND warehouse of the SAME tenant — the manifest's wrong-warehouse
+   * arm needs a shipment that is foreign to the route's warehouse but not to
+   * the tenant (RLS passes; the command's warehouse predicate is what refuses).
+   */
+  async function secondWarehouse(): Promise<WarehouseCtx> {
+    const whId = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `LBL2-${ulid().slice(10, 16).toUpperCase()}`, name: `Label WH2 ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zone = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${whId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'B', name: 'Aisle B' })
+        .expect(201)
+    ).body.id as string;
+    const bin = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${whId}/zones/${zone}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ capacity: 10000, type: 'shelf', code: 'B-01-01' })
+        .expect(201)
+    ).body.id as string;
+    return { warehouseId: whId, binId: bin };
+  }
+
+  async function manifestCount(): Promise<number> {
+    const rows = await sql`select count(*)::int as n from manifests where tenant_id = ${tenantId}`;
+    return Number((rows[0] as unknown as { n: number }).n);
   }
 
   async function orderStatus(orderId: string): Promise<string> {
@@ -798,6 +850,40 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     expect(await shipmentCount(orderId)).toBe(1);
   });
 
+  // ── the 503 credential-unreadable arm ─────────────────────────────────────
+
+  it('refuses with 503 carrier-credential-unreadable when the sealed blob does not open under the current key, writing nothing', async () => {
+    const { orderId } = await packedOrder('LBL-SEAL', 2, 'seal');
+    // The DELHIVERY connection is the victim: its blob is RE-SEALED under a
+    // different master key. The format still passes the 0025 envelope CHECK
+    // ('v1:%'), but AES-GCM authenticates — opening it under the real key
+    // fails closed instead of handing back garbage. The realistic trigger is
+    // a key changed after this material was sealed. (No fresh connection is
+    // created: one sandbox connection already fills the tenant+carrier
+    // unique index, and no later arm of the suite reads this blob.)
+    const previous = process.env.CARRIER_ENCRYPTION_KEY;
+    let foreignSealed: string;
+    try {
+      process.env.CARRIER_ENCRYPTION_KEY = 'e2e-other-key-material-0123456789abcdefghij';
+      foreignSealed = sealCredential({ accountToken: 'canary-other-key-token-9a8b7c' });
+    } finally {
+      process.env.CARRIER_ENCRYPTION_KEY = previous;
+    }
+    await sql`
+      update carrier_connections set credential_sealed = ${foreignSealed}
+      where id = ${delhiveryConnectionId}::uuid and tenant_id = ${tenantId}::uuid
+    `;
+
+    const refused = await labelOrder(orderId, delhiveryConnectionId).expect(503);
+    expect(refused.body.code).toBe('carrier-credential-unreadable');
+    expect(refused.body.detail).toContain(delhiveryConnectionId);
+    expect(refused.body.detail).toContain('rotate the connection');
+
+    // Nothing was written — the adapter call sits behind every guard.
+    expect(await shipmentCount(orderId)).toBe(0);
+    expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
+  });
+
   // ── the authority arms ────────────────────────────────────────────────────
 
   it('refuses the wrong authority on both commands: a role without labels.execute', async () => {
@@ -869,6 +955,22 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     expect(reManifested.body.detail).toContain('manifested');
     expect(reManifested.body.detail).toContain('not in the labelled state');
 
+    // The auto-stamp reads only a `labelled` shipment (4.6c): dispatching the
+    // manifested order with NO free text carries NEITHER carrier arm — the
+    // manifest closure took the shipment out of the auto-stamp's read.
+    const dispatched = await dispatchOrder(first.orderId).expect(201);
+    expect(dispatched.body.dispatch.carrierName).toBeNull();
+    expect(dispatched.body.dispatch.trackingNumber).toBeNull();
+    const events = (await sql`
+      select reference_doc from ledger_events
+      where tenant_id = ${tenantId} and type = 'dispatch.dispatched'
+        and reference_doc->>'orderId' = ${first.orderId}
+    `) as unknown as { reference_doc: Record<string, unknown> }[];
+    expect(events).toHaveLength(1);
+    expect(events[0]!.reference_doc).toMatchObject({ kind: 'dispatch', orderId: first.orderId });
+    expect(events[0]!.reference_doc.carrierName).toBeUndefined();
+    expect(events[0]!.reference_doc.trackingNumber).toBeUndefined();
+
     // The writeback event and the audit row ride the same transaction.
     const outbox = await sql`
       select payload from outbox_messages
@@ -902,6 +1004,33 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
       status: 'labelled',
       manifest_id: null,
     });
+  });
+
+  it('refuses a manifest naming a shipment from ANOTHER warehouse of the SAME tenant, writing nothing', async () => {
+    // Same tenant, different warehouse: RLS resolves the row fine — the
+    // command's warehouse predicate is the guard that refuses.
+    const wh2 = await secondWarehouse();
+    // Cold-start bootstrap (the orders-suite precedent): the new warehouse's
+    // reservation counters must be armed before its first order create,
+    // which would otherwise answer 503 not-ready.
+    await app.get(InventoryFacade).rebuildReservationCounters(tenantId, wh2.warehouseId);
+    const { orderId } = await packedOrder('LBL-WH2', 2, 'wh2', 12, wh2);
+    const labelled = await labelOrder(orderId, sandboxConnectionId).expect(201);
+    const shipmentId = labelled.body.shipment.id as string;
+    expect(labelled.body.shipment.warehouseId).toBe(wh2.warehouseId);
+
+    const manifestsBefore = await manifestCount();
+    const refused = await createManifest([shipmentId]).expect(409);
+    expect(refused.body.code).toBe('conflict');
+    expect(refused.body.detail).toContain('belong to another warehouse');
+    expect(refused.body.detail).toContain(shipmentId);
+
+    // Nothing was written: no manifest row, and the shipment stays labelled.
+    expect(await manifestCount()).toBe(manifestsBefore);
+    const row = (await sql`
+      select status, manifest_id from shipments where id = ${shipmentId}::uuid
+    `) as unknown as { status: string; manifest_id: string | null }[];
+    expect(row[0]).toEqual({ status: 'labelled', manifest_id: null });
   });
 
   it('refuses a manifest spanning TWO carrier connections, naming the connections, writing nothing', async () => {
@@ -950,6 +1079,14 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     const nonUuid = await createManifest(['not-a-uuid']).expect(400);
     expect(nonUuid.body.code).toBe('validation-failed');
     expect(nonUuid.body.detail).toContain('shipmentIds');
+
+    // The 500-set cap: a 501-uuid array is refused at the boundary — one
+    // element past the DTO's ArrayMaxSize — before anything is read.
+    const manifestsBefore = await manifestCount();
+    const overCap = await createManifest(Array.from({ length: 501 }, () => uuidv7())).expect(400);
+    expect(overCap.body.code).toBe('validation-failed');
+    expect(overCap.body.detail).toContain('500');
+    expect(await manifestCount()).toBe(manifestsBefore);
   });
 
   it('lists the warehouse manifests newest first, with a keyset cursor that walks the pages', async () => {

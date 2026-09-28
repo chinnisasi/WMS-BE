@@ -109,12 +109,14 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
  * FACE only: the sealed blob is not even selected (`CONNECTION_COLUMNS`), so
  * there is no path by which a list row could grow a secret.
  *
- * Story 4.6c grew the port's first real arm: `label()` (and the in-transaction
- * passthroughs + `labelThroughAdapter` the label command uses) — the DIRECT
- * carriers' arms are typed refusals and `sandbox` is the in-process stand-in,
- * so there are still **no network calls** and the backend gains no HTTP
- * client. `rate()` and `track()` remain undeclared (rating: deferred;
- * tracking writeback: the outbox event, Epic 7).
+ * Story 4.6c grew the port's first real arm — `labelThroughAdapter` plus the
+ * IN-TX passthroughs below, which the shipment command's label arm uses
+ * inside its own transaction (the standalone facade `label()` that opened a
+ * second transaction had no caller and is gone) — the DIRECT carriers' arms
+ * are typed refusals and `sandbox` is the in-process stand-in, so there are
+ * still **no network calls** and the backend gains no HTTP client. `rate()`
+ * and `track()` remain undeclared (rating: deferred; tracking writeback: the
+ * outbox event, Epic 7).
  */
 @Injectable()
 export class CarriersFacade {
@@ -184,81 +186,6 @@ export class CarriersFacade {
     });
   }
 
-  /** One connection by id, or null — cross-tenant ids are simply invisible. */
-  async resolveConnection(
-    tenantId: string,
-    connectionId: string,
-  ): Promise<CarrierConnectionView | null> {
-    if (!UUID_RE.test(connectionId)) {
-      return null;
-    }
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      const rows = await tx
-        .select(CONNECTION_COLUMNS)
-        .from(carrierConnections)
-        .where(
-          and(eq(carrierConnections.id, connectionId), eq(carrierConnections.tenantId, tenantId)),
-        )
-        .limit(1);
-      const row = rows[0];
-      return row === undefined ? null : toConnectionView(row);
-    });
-  }
-
-  /**
-   * **The adapter-use seam, and the only read that opens the envelope.**
-   *
-   * It exists for the stories that actually call a carrier — 4-6c's labels,
-   * and rating when it lands: they resolve a connection id, open its material
-   * here, and hand it straight to the carrier client they own. Nothing in
-   * THIS story calls it (4.6b makes no network calls).
-   *
-   * The rules for any caller, and they are not negotiable: the returned
-   * record is request-scoped plaintext — never logged, never in a response
-   * DTO, an outbox payload, an audit row, a ledger reference doc or an
-   * idempotency snapshot, and never persisted anywhere. A caller that must
-   * remember WHICH credential it used stores the connection id and
-   * `credentialVersion`, which is exactly why rotation keeps the row id.
-   */
-  async openCredentialForAdapterUse(
-    tenantId: string,
-    connectionId: string,
-  ): Promise<CarrierCredential> {
-    if (!UUID_RE.test(connectionId)) {
-      throw carrierConnectionNotFound();
-    }
-    return withTenantTransaction(this.db, tenantId, (tx) =>
-      this.openCredentialForAdapterUseInTx(tx, tenantId, connectionId),
-    );
-  }
-
-  /**
-   * **Story 4.6c — the label arm.** Resolve the connection → open its
-   * credential (the adapter-use rules above apply verbatim) → call the
-   * adapter's label arm → answer the result. Nothing is persisted or logged
-   * here — the credential is request-scoped plaintext and dies with this
-   * call; the caller that must remember WHICH credential it used stores the
-   * connection id (and the shipment row stores the adapter's answer, never
-   * the material).
-   *
-   * The tenant predicate is the whole security story (the 4-6c spec pins the
-   * e2e FIRST, alongside the first caller): a foreign tenant's connection id
-   * resolves to nothing inside a transaction stamped with THIS tenant's
-   * `app.tenant_id` — it reads as a plain 404, never a cross-tenant read.
-   */
-  async label(
-    tenantId: string,
-    connectionId: string,
-    request: CarrierLabelRequest,
-  ): Promise<CarrierLabelResult> {
-    const connection = await this.resolveConnection(tenantId, connectionId);
-    if (connection === null) {
-      throw carrierConnectionNotFound();
-    }
-    const credential = await this.openCredentialForAdapterUse(tenantId, connectionId);
-    return labelThroughAdapter(connection.carrierCode, credential, request);
-  }
-
   /**
    * The in-transaction passthroughs (the `getPickTasksInTx` precedent):
    * 4-6c's shipment command runs ONE `withTenantTransaction`, and calling a
@@ -314,9 +241,8 @@ export class CarriersFacade {
 }
 
 /**
- * The one credential-open mapping, shared by the standalone and in-tx arms:
- * a missing key and an unopenable blob are the same 503s either way — never
- * a raw 500.
+ * The one credential-open mapping (the in-tx adapter-use arm's): a missing
+ * key and an unopenable blob are the same 503s either way — never a raw 500.
  */
 function openSealedCredential(sealed: string, connectionId: string): CarrierCredential {
   try {

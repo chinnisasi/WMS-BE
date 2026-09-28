@@ -21,13 +21,13 @@ import { CarriersFacade } from './carriers.facade';
  *    secret material at rest after the operator asked for it to be gone.
  *
  * Scope, deliberately: **no network calls and no HTTP client dependency.**
- * Story 4.6c grew the port's first real arm — `label()` on `CarriersFacade`,
- * with the `sandbox` carrier's deterministic in-process arm as the stand-in
- * and the three DIRECT carriers answering with typed refusals — so the
- * outbound module's label command is the facade's first sibling caller.
- * `rate()` and `track()` remain undeclared (rating is deferred; tracking
- * writeback is the outbox event, Epic 7): a method signature guessed before
- * its first caller is a shipped interface to unpick.
+ * Story 4.6c grew the port's first real arm — `labelThroughAdapter` plus the
+ * facade's IN-TX passthroughs, with the `sandbox` carrier's deterministic
+ * in-process arm as the stand-in and the three DIRECT carriers answering with
+ * typed refusals — so the outbound module's label command is the facade's
+ * first sibling caller. `rate()` and `track()` remain undeclared (rating is
+ * deferred; tracking writeback is the outbox event, Epic 7): a method
+ * signature guessed before its first caller is a shipped interface to unpick.
  *
  * Imports `SharedModule` only (DATABASE, OUTBOX_SINK — the spine
  * primitives); the tenancy helpers the command uses at entry

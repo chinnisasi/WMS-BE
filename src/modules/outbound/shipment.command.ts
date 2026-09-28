@@ -113,8 +113,9 @@ export interface ShipmentSnapshot {
  * passthroughs (`resolveConnectionInTx` / `openCredentialForAdapterUseInTx`,
  * the `getPickTasksInTx` precedent) on the same `tx` it already holds.
  *
- * The credential is REQUEST-SCOPED plaintext under `openCredentialForAdapterUse`'s
- * non-negotiable rules: handed straight to the adapter arm and never
+ * The credential is REQUEST-SCOPED plaintext under the facade's
+ * non-negotiable adapter-use rules: handed straight to the adapter arm and
+ * never
  * persisted, logged, or written into the snapshot, the outbox payload, the
  * audit row or the idempotency snapshot — the row stores the adapter's ANSWER
  * (tracking number, document ref) and the connection id.
