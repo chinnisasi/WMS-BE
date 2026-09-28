@@ -786,9 +786,15 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
       await sql`
         insert into vendors (id, tenant_id, code, name)
         values (${uuidv7()}, ${foreignTenantId}, 'FOREIGN-V', 'Foreign Vendor')`;
+      // Story 21-1: the four client-stamped tables are NOT NULL — a fixture
+      // tenant that never registered still needs its self client row.
+      const foreignClientId = uuidv7();
       await sql`
-        insert into purchase_orders (id, tenant_id, warehouse_id, vendor_id, code, status)
-        values (${uuidv7()}, ${foreignTenantId}, ${uuidv7()}, ${uuidv7()}, 'FOREIGN-PO', 'open')`;
+        insert into clients (id, tenant_id, code, name, status, system_owned)
+        values (${foreignClientId}, ${foreignTenantId}, 'self', 'Foreign Vendor', 'active', true)`;
+      await sql`
+        insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code, status)
+        values (${uuidv7()}, ${foreignTenantId}, ${foreignClientId}, ${uuidv7()}, ${uuidv7()}, 'FOREIGN-PO', 'open')`;
       await sql`
         insert into purchase_order_lines (id, tenant_id, po_id, sku_id, ordered_qty, received_qty, unit_cost_paise, status)
         values (${uuidv7()}, ${foreignTenantId}, ${uuidv7()}, ${uuidv7()}, 1, 0, 100, 'open')`;
@@ -817,8 +823,8 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
         await expect(
           rls.begin(async (tx) => {
             await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
-            await tx`insert into purchase_orders (id, tenant_id, warehouse_id, vendor_id, code, status)
-              values (${uuidv7()}, ${foreignTenantId}, ${uuidv7()}, ${uuidv7()}, 'RLS-REJECT', 'open')`;
+            await tx`insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code, status)
+              values (${uuidv7()}, ${foreignTenantId}, ${foreignClientId}, ${uuidv7()}, ${uuidv7()}, 'RLS-REJECT', 'open')`;
           }),
         ).rejects.toThrow(/row-level security/i);
       } finally {

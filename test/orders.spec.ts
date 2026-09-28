@@ -893,19 +893,19 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     const orderId = uuidv7();
     await expect(
       sql`
-        insert into orders (id, tenant_id, warehouse_id, status, source)
-        values (${orderId}, ${tenantId}, ${warehouseId}, 'bogus', 'manual')
+        insert into orders (id, tenant_id, client_id, warehouse_id, status, source)
+        values (${orderId}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), ${warehouseId}, 'bogus', 'manual')
       `,
     ).rejects.toMatchObject({ code: '23514' });
     await expect(
       sql`
-        insert into orders (id, tenant_id, warehouse_id, status, source)
-        values (${orderId}, ${tenantId}, ${warehouseId}, 'accepted', 'bogus')
+        insert into orders (id, tenant_id, client_id, warehouse_id, status, source)
+        values (${orderId}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), ${warehouseId}, 'accepted', 'bogus')
       `,
     ).rejects.toMatchObject({ code: '23514' });
     await sql`
-      insert into orders (id, tenant_id, warehouse_id, status, source)
-      values (${orderId}, ${tenantId}, ${warehouseId}, 'accepted', 'manual')
+      insert into orders (id, tenant_id, client_id, warehouse_id, status, source)
+      values (${orderId}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), ${warehouseId}, 'accepted', 'manual')
     `;
     await expect(
       sql`
@@ -989,8 +989,8 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     // exists returns 0 with RLS on or off, which proves nothing).
     const foreignOrderId = uuidv7();
     await sql`
-      insert into orders (id, tenant_id, warehouse_id, status, source)
-      values (${foreignOrderId}, ${foreignTenantId}, ${warehouseId}, 'accepted', 'manual')
+      insert into orders (id, tenant_id, client_id, warehouse_id, status, source)
+      values (${foreignOrderId}, ${foreignTenantId}, (select id from clients where tenant_id = ${foreignTenantId} and code = 'self' and system_owned limit 1), ${warehouseId}, 'accepted', 'manual')
     `;
     await sql`
       insert into order_lines (id, tenant_id, order_id, sku_id, qty, reserved_qty, status)
@@ -1023,14 +1023,14 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
       // naming a foreign tenant under the session's own scope is a 42501.
       await expect(
         rls.unsafe(
-          `insert into orders (id, tenant_id, warehouse_id, status, source)
-           values ('${uuidv7()}'::uuid, '${foreignTenantId}'::uuid, '${warehouseId}'::uuid, 'accepted', 'manual')`,
+          `insert into orders (id, tenant_id, client_id, warehouse_id, status, source)
+           values ('${uuidv7()}'::uuid, '${foreignTenantId}'::uuid, (select id from clients where tenant_id = '${foreignTenantId}'::uuid and code = 'self' and system_owned limit 1), '${warehouseId}'::uuid, 'accepted', 'manual')`,
         ),
       ).rejects.toMatchObject({ code: '42501' });
       // …while the allowed arm (own tenant_id) inserts cleanly.
       await rls.unsafe(
-        `insert into orders (id, tenant_id, warehouse_id, status, source)
-         values ('${uuidv7()}'::uuid, '${tenantId}'::uuid, '${warehouseId}'::uuid, 'accepted', 'manual')`,
+        `insert into orders (id, tenant_id, client_id, warehouse_id, status, source)
+         values ('${uuidv7()}'::uuid, '${tenantId}'::uuid, (select id from clients where tenant_id = '${tenantId}'::uuid and code = 'self' and system_owned limit 1), '${warehouseId}'::uuid, 'accepted', 'manual')`,
       );
     } finally {
       await rls.end();

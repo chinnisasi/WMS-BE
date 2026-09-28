@@ -762,8 +762,8 @@ describe('catalog (e2e)', () => {
 
       const foreignSkuInsert = scoped.begin(async (tx) => {
         await tx`select set_config('app.tenant_id', ${tenantA}, true)`;
-        await tx`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode)
-          values (${uuidv7()}, ${tenantB}, ${`RLS-${ulid().slice(0, 6)}`}, 'rls probe', 'each', 500, ${uuidv7()})`;
+        await tx`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode)
+          values (${uuidv7()}, ${tenantB}, (select id from clients where tenant_id = ${tenantB} and code = 'self' and system_owned limit 1), ${`RLS-${ulid().slice(0, 6)}`}, 'rls probe', 'each', 500, ${uuidv7()})`;
       });
       await expect(foreignSkuInsert).rejects.toThrow(/row-level security/i);
 

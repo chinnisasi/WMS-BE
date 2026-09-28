@@ -19,6 +19,7 @@ import { LEDGER_GRAMMAR_VERSION, getLedgerEventType } from './ledger-registry';
 import type { LedgerReferenceDoc } from './ledger-registry';
 import { LEDGER_ANCHOR_STORE } from './anchor-store';
 import type { LedgerAnchorStore } from './anchor-store';
+import { ensureSelfClientInTx } from '../clients/ensure-self-client';
 
 /** Genesis `prev_hash` — the chain's fixed zero digest (64 hex zeros). */
 export const GENESIS_PREV_HASH = '0'.repeat(64);
@@ -481,6 +482,12 @@ export class LedgerService {
     // or a wrong-bin draw fails the whole transaction naming the conflict.
     await assertSerialArmLegal(tx, movement);
 
+    // Story 21-1 (AD-23): every event records whose movement it is. The
+    // tenant's `self` client is the D2C answer — idempotent, one indexed
+    // probe, no mode branch. NOT an input to `event_hash` (the hash covers
+    // the canonical fields only), so the chain is untouched by the column.
+    const clientId = await ensureSelfClientInTx(tx, movement.tenantId);
+
     const headRows = await tx
       .select({ seq: ledgerEvents.seq, eventHash: ledgerEvents.eventHash })
       .from(ledgerEvents)
@@ -521,6 +528,7 @@ export class LedgerService {
     await tx.insert(ledgerEvents).values({
       id: eventId,
       tenantId: movement.tenantId,
+      clientId,
       warehouseId: movement.warehouseId,
       seq,
       type: movement.type,

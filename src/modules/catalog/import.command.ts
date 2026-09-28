@@ -52,6 +52,7 @@ import {
 } from './product.command';
 import { MAX_KIT_COMPONENTS, kitEventPayload } from './kit.command';
 import { getKitSkuIdsInTx } from './kit.store';
+import { ensureSelfClientInTx } from '../clients/ensure-self-client';
 
 export const IMPORT_MODES = ['initial', 'fix'] as const;
 export type ImportMode = (typeof IMPORT_MODES)[number];
@@ -450,9 +451,14 @@ export class ImportCommand {
         const committedRows = insertable.length;
 
         if (committedRows > 0) {
+          // Story 21-1 (AD-23): every SKU belongs to a client — the source
+          // of truth every SKU-referencing row inherits. D2C tenants stamp
+          // their `self` client; no mode branch.
+          const clientId = await ensureSelfClientInTx(tx, command.tenantId);
           const skuRows = insertable.map((row) => ({
             id: uuidv7(),
             tenantId: command.tenantId,
+            clientId,
             code: row.code,
             name: row.name,
             uom: row.uom,

@@ -415,43 +415,43 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
     // refusals happen in TS (`assertStorageClass` / `@IsIn`), so only a
     // direct out-of-vocabulary write proves the 0035 CHECK exists.
     await expect(
-      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, storage_class)
-          values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-SC', 'probe', 'each', 1800, ${`BC-${ulid()}`}, 'tropical')`,
+      sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode, storage_class)
+          values (${uuidv7()}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), 'CHECK-PROBE-SC', 'probe', 'each', 1800, ${`BC-${ulid()}`}, 'tropical')`,
     ).rejects.toThrow(/skus_storage_class_check/);
     // Direct SQL writes are out of reach of every validator by definition —
     // the CHECKs exist so even those cannot store a zero weight or a
     // lowercase origin. (The row is never committed: each insert throws.)
     await expect(
-      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, weight_grams)
-          values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-1', 'probe', 'each', 1800, ${`BC-${ulid()}`}, 0)`,
+      sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode, weight_grams)
+          values (${uuidv7()}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), 'CHECK-PROBE-1', 'probe', 'each', 1800, ${`BC-${ulid()}`}, 0)`,
     ).rejects.toThrow(/skus_weight_grams_bounded/);
     await expect(
-      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, country_of_origin)
-          values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-2', 'probe', 'each', 1800, ${`BC-${ulid()}`}, 'in')`,
+      sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode, country_of_origin)
+          values (${uuidv7()}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), 'CHECK-PROBE-2', 'probe', 'each', 1800, ${`BC-${ulid()}`}, 'in')`,
     ).rejects.toThrow(/skus_country_of_origin_iso_alpha2/);
     // NULL is legal for every attribute — the unset shape must stay storable.
     await expect(
-      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, weight_grams, country_of_origin)
-          values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-3', 'probe', 'each', 1800, ${`BC-${ulid()}`}, null, null)`,
+      sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode, weight_grams, country_of_origin)
+          values (${uuidv7()}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), 'CHECK-PROBE-3', 'probe', 'each', 1800, ${`BC-${ulid()}`}, null, null)`,
     ).resolves.toBeDefined();
     // Story 12-2: the hazard vocabulary's DB backstop — a direct
     // out-of-vocabulary write is 23514; the NULL arm stays storable (null is
     // the unset shape, unlike the NOT NULL storage class — a null insert
     // must SUCCEED here, or the clear verb could not exist).
     await expect(
-      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
-          values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-HC', 'probe', 'each', 1800, ${`BC-${ulid()}`}, 'biohazard')`,
+      sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
+          values (${uuidv7()}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), 'CHECK-PROBE-HC', 'probe', 'each', 1800, ${`BC-${ulid()}`}, 'biohazard')`,
     ).rejects.toThrow(/skus_hazard_class_check/);
     await expect(
-      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
-          values (${uuidv7()}, ${tenantId}, 'CHECK-PROBE-HC2', 'probe', 'each', 1800, ${`BC-${ulid()}`}, null)`,
+      sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
+          values (${uuidv7()}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), 'CHECK-PROBE-HC2', 'probe', 'each', 1800, ${`BC-${ulid()}`}, null)`,
     ).resolves.toBeDefined();
     // ...and the ACCEPTANCE side: every one of the seven vocabulary values
     // inserts cleanly (the refusal side is the 23514 probe above).
     for (const hazardClass of HAZARD_CLASSES) {
       await expect(
-        sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
-            values (${uuidv7()}, ${tenantId}, ${`CHECK-PROBE-HC-${hazardClass}`}, 'probe', 'each', 1800, ${`BC-${ulid()}`}, ${hazardClass})`,
+        sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode, hazard_class)
+            values (${uuidv7()}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), ${`CHECK-PROBE-HC-${hazardClass}`}, 'probe', 'each', 1800, ${`BC-${ulid()}`}, ${hazardClass})`,
       ).resolves.toBeDefined();
     }
     // The 0036 migration's shape, read back from the catalog: nullable

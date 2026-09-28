@@ -631,8 +631,8 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       const foreignEvent = scoped.begin(async (tx) => {
         await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
         await tx`
-          insert into ledger_events (id, tenant_id, warehouse_id, seq, type, schema_version, sku_id, quantity_delta, actor_user_id, occurred_at, recorded_at, prev_hash, event_hash, reference_doc)
-          values (${uuidv7()}, ${otherTenant}, ${uuidv7()}, 1, 'stock.adjusted', 1, ${uuidv7()}, 1, ${uuidv7()}, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ${GENESIS}, ${GENESIS}, '{"kind":"manual-adjustment"}')
+          insert into ledger_events (id, tenant_id, client_id, warehouse_id, seq, type, schema_version, sku_id, quantity_delta, actor_user_id, occurred_at, recorded_at, prev_hash, event_hash, reference_doc)
+          values (${uuidv7()}, ${otherTenant}, (select id from clients where tenant_id = ${otherTenant} and code = 'self' and system_owned limit 1), ${uuidv7()}, 1, 'stock.adjusted', 1, ${uuidv7()}, 1, ${uuidv7()}, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ${GENESIS}, ${GENESIS}, '{"kind":"manual-adjustment"}')
         `;
       });
       await expect(foreignEvent).rejects.toThrow(/row-level security/i);

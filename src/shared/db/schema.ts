@@ -87,12 +87,68 @@ export const users = pgTable('users', {
   passwordHash: text('password_hash').notNull(),
   role: userRoleEnum('role').notNull().default('operator'),
   status: text('status').notNull().default('active'),
+  /**
+   * Story 21-1 — the client-portal persona arm (AD-23): null = a member of
+   * the tenant's own staff; set = a client-portal user. Nullable BY DESIGN
+   * (the attribute, not a scoping column) and INERT until a portal session
+   * exists (21-2/21-7 own the persona question and the RLS clause).
+   */
+  clientId: uuid('client_id'),
   inviteTokenHash: text('invite_token_hash'),
   inviteExpiresAt: timestamp('invite_expires_at', { withTimezone: true, mode: 'string' }),
   ...tenantTimestamps,
 });
 
 export type User = typeof users.$inferSelect;
+
+/**
+ * Story 21-1 — the client dimension (AD-23): one row per client brand whose
+ * goods this tenant stores and ships. Every tenant has EXACTLY ONE
+ * system-owned `self` client (AD-23), created in the same transaction as the
+ * tenant by `ensureSelfClientInTx` (`src/modules/clients/ensure-self-client.ts`)
+ * and backfilled for pre-existing tenants by migration 0040 — D2C is the
+ * one-client case of the 3PL model, never a mode branch.
+ *
+ * `code` is the operator-facing short code, unique per tenant. `system_owned`
+ * follows the `bins.system_owned` precedent and marks the tenant's own goods;
+ * the partial unique index on `(tenant_id) WHERE system_owned` is what makes
+ * "exactly one self client per tenant" a DB invariant, not a convention.
+ * `status` is the full designed vocabulary frozen at birth (widening a CHECK
+ * needs DROP + re-ADD — the 0023/0024 precedent); the
+ * `system_owned ⇒ NOT departed` pairing is a CHECK declared ONLY in
+ * `drizzle/0040_client_dimension.sql` (CHECKs live only in migration SQL).
+ */
+export const CLIENT_STATUSES = ['active', 'suspended', 'departed'] as const;
+export type ClientStatus = (typeof CLIENT_STATUSES)[number];
+
+/** The fixed code the system-owned client always carries. */
+export const SELF_CLIENT_CODE = 'self';
+
+export const clients = pgTable(
+  'clients',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    code: text('code').notNull(),
+    name: text('name').notNull(),
+    status: text('status').notNull().default('active'),
+    systemOwned: boolean('system_owned').notNull().default(false),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('clients_tenant_id_code_unique').on(table.tenantId, table.code),
+    // AD-23: exactly one system-owned client per tenant — the partial unique
+    // index refuses a second, in any transaction, including a concurrent
+    // ensure.
+    uniqueIndex('clients_tenant_system_owned_unique')
+      .on(table.tenantId)
+      .where(sql`system_owned`),
+  ],
+);
+
+export type Client = typeof clients.$inferSelect;
 
 /**
  * Append-only audit trail for user/role actions (Story 1.5): one row per
@@ -223,6 +279,14 @@ export const bins = pgTable(
     warehouseId: uuid('warehouse_id').notNull(),
     zoneId: uuid('zone_id').notNull(),
     code: text('code').notNull(),
+    /**
+     * Story 21-1 — the dedicated-storage attribute (AD-23): null = commingled
+     * (the default — most 3PLs commingle); set = this bin holds only that
+     * client's goods. Nullable BY DESIGN: this is an attribute, not a scoping
+     * column, and pre-21.1 bins (all commingled) read null. Inert until 21-2+
+     * give it a consumer.
+     */
+    dedicatedClientId: uuid('dedicated_client_id'),
     /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
     capacity: bigint('capacity', { mode: 'number' }).notNull(),
     /**
@@ -341,6 +405,13 @@ export const skus = pgTable(
       .primaryKey()
       .$defaultFn(() => uuidv7()),
     tenantId: uuid('tenant_id').notNull(),
+    /**
+     * Story 21-1 (AD-23) — the client whose goods this SKU is (the SOURCE OF
+     * TRUTH: everything referencing a SKU inherits the client for free).
+     * NOT NULL with no default — a nullable scoping column is where isolation
+     * bugs live. Backfilled to the tenant's `self` client by migration 0040.
+     */
+    clientId: uuid('client_id').notNull(),
     code: text('code').notNull(),
     name: text('name').notNull(),
     uom: text('uom').notNull(),
@@ -816,6 +887,14 @@ export const ledgerEvents = pgTable(
       .primaryKey()
       .$defaultFn(() => uuidv7()),
     tenantId: uuid('tenant_id').notNull(),
+    /**
+     * Story 21-1 (AD-23) — the client whose movement this event records.
+     * NOT NULL — billing aggregates over this table constantly, and the join
+     * through `skus` on every metering pass is the one denormalisation worth
+     * its cost. Backfilled to the tenant's `self` client by migration 0040.
+     * NOT part of the event hash: `event_hash` is unchanged, no re-derivation.
+     */
+    clientId: uuid('client_id').notNull(),
     warehouseId: uuid('warehouse_id').notNull(),
     seq: integer('seq').notNull(),
     type: text('type').notNull(),
@@ -1325,6 +1404,12 @@ export const purchaseOrders = pgTable(
       .primaryKey()
       .$defaultFn(() => uuidv7()),
     tenantId: uuid('tenant_id').notNull(),
+    /**
+     * Story 21-1 (AD-23) — the client the inbound document is authored for.
+     * NOT NULL with no default; backfilled to the tenant's `self` client by
+     * migration 0040.
+     */
+    clientId: uuid('client_id').notNull(),
     warehouseId: uuid('warehouse_id').notNull(),
     vendorId: uuid('vendor_id').notNull(),
     code: text('code').notNull(),
@@ -1747,6 +1832,12 @@ export const orders = pgTable(
       .primaryKey()
       .$defaultFn(() => uuidv7()),
     tenantId: uuid('tenant_id').notNull(),
+    /**
+     * Story 21-1 (AD-23) — the client the order is for (one order, one
+     * client, by definition). NOT NULL with no default; backfilled to the
+     * tenant's `self` client by migration 0040.
+     */
+    clientId: uuid('client_id').notNull(),
     warehouseId: uuid('warehouse_id').notNull(),
     status: text('status').notNull().default('accepted'),
     source: text('source').notNull().default('manual'),

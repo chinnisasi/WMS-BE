@@ -12,6 +12,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { hashPassword } from './passwords';
 import { hashCommandPayload } from './idempotency-guard';
 import { setTenantScope } from '../../shared/db/tenant-scope';
+import { ensureSelfClientInTx } from '../clients/ensure-self-client';
 
 /** Registration command input (AD-10: state changes enter command services). */
 export interface RegisterTenantCommand {
@@ -94,6 +95,13 @@ export class RegistrationCommand {
         .values({ id: tenantId, tenantId, name: command.name })
         .returning();
       const tenant = tenantRows[0]!;
+
+      // Story 21-1 (AD-23): the tenant is born client-ready — its ONE
+      // system-owned `self` client commits in this same transaction, so a
+      // failed registration leaves no client and no clientless tenant is
+      // possible. Reaches the clients module through its ensure function
+      // (the `ensureReceivingBinInTx` seam) — never a direct table write.
+      await ensureSelfClientInTx(tx, tenantId, { selfClientName: tenant.name });
 
       let owner: { id: string; email: string };
       try {

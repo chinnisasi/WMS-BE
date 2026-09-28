@@ -776,3 +776,59 @@ describe('architecture: no int4 trap sits over a milli-unit quantity (story 10.1
     expect(UNTYPED_QUANTITY_PARAM.test('sql`${stockOnHand.quantity} > 0`')).toBe(false);
   });
 });
+
+describe('architecture: clients are clients-module-owned (story 21-1)', () => {
+  /**
+   * Story 21-1 stands up the client dimension (AD-23): the `clients` table
+   * is the new clients module's alone, exactly like the stock tables are
+   * inventory-exclusive — every other module resolves the tenant's `self`
+   * client through the module's `ensureSelfClientInTx` helper (the
+   * `ensureReceivingBinInTx` seam: a file-level function other modules
+   * import directly, NOT a past-the-facade reach) and stamps its column.
+   * The guard is written now, while the table is new, so 21-2…21-8 inherit
+   * an answered ownership question instead of re-litigating it.
+   *
+   * Deliberately NOT guarded: the imports of `ensure-self-client.ts` /
+   * `clients.schema.ts` by sibling modules — that IS the seam (the
+   * receiving-bin precedent); the invariant that matters is who WRITES the
+   * table.
+   */
+  const CLIENT_TABLES = ['clients'] as const;
+  const RAW_CLIENT_TABLES = 'clients';
+  const clientsRoot = join(SRC_ROOT, 'modules', 'clients');
+
+  it('no clients-table write happens outside the clients module', () => {
+    const outside = files.filter((file) => !file.path.startsWith(clientsRoot));
+    const offenders: string[] = [];
+    for (const file of outside) {
+      for (const pattern of [
+        ...CLIENT_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_CLIENT_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) {
+          offenders.push(`${file.path}: /${pattern.source}/`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the clients module owns the write, and tenancy + inventory reach it through the module (the test is meaningful)', () => {
+    // A guard whose subject stopped being written would pass vacuously
+    // forever — the ensure really does write the table.
+    const ensure = readFileSync(join(clientsRoot, 'ensure-self-client.ts'), 'utf8');
+    expect(drizzleWriteOn('clients').test(ensure)).toBe(true);
+    // Registration creates the self client in ITS OWN transaction — through
+    // the module's ensure function, never a direct `clients` write.
+    const registration = readFileSync(
+      join(SRC_ROOT, 'modules', 'tenancy', 'registration.command.ts'),
+      'utf8',
+    );
+    expect(registration).toContain('ensureSelfClientInTx');
+    expect(drizzleWriteOn('clients').test(registration)).toBe(false);
+    // The ledger stamps every event's client through the same helper — the
+    // one write path into `ledger_events` carries the dimension.
+    const ledger = readFileSync(join(SRC_ROOT, 'modules', 'inventory', 'ledger.service.ts'), 'utf8');
+    expect(ledger).toContain('ensureSelfClientInTx');
+  });
+});
