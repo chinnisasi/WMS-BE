@@ -106,6 +106,12 @@ export const CAPABILITIES = [
   // what you observed", so it deliberately does NOT gate a resolve.
   // Mirrored into wms-fe `src/lib/users.ts`.
   'excursion.record',
+  // Story 4.6c — the label + manifest commands. Owner + Ops Manager +
+  // Operator, mirroring `pack.execute` exactly: the label is a station verb
+  // — the person who packed the parcel prints its label and closes its
+  // manifest. Accountant stays read-only. Mirrored into wms-fe
+  // `src/lib/users.ts` by the 4.6c FE task.
+  'labels.execute',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -116,7 +122,7 @@ export type Capability = (typeof CAPABILITIES)[number];
  * mutations (warehouses, zones, bins, catalog import, SKU edit) but no user
  * management; Operator holds exactly the floor capabilities a device session
  * needs (`putaway.execute`, Story 3.5 — the first non-empty operator
- * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6; `excursion.record`, Story 12-5 — the floor
+ * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6; `labels.execute`, Story 4.6c; `excursion.record`, Story 12-5 — the floor
  * records what it observes) and NOT `secure.move` (Story 12-3 — the
  * cage is off-limits to floor staff); Accountant is read-only. Reads stay
  * open to any tenant member.
@@ -147,6 +153,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // Story 12-5 — FR-44: the manager records excursions too (owner holds
     // everything).
     'excursion.record',
+    // Story 4.6c — the label + manifest station verbs, mirroring
+    // `pack.execute` (owner holds everything).
+    'labels.execute',
     // Story 12-3 — FR-42: the cage is a manager verb (owner holds everything).
     'secure.move',
   ]),
@@ -155,6 +164,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'picks.execute',
     'pack.execute',
     'dispatch.execute',
+    // Story 4.6c — the label + manifest station verbs, mirroring
+    // `pack.execute` / `dispatch.execute`.
+    'labels.execute',
     // Story 12-5 — the floor records what it observes (`putaway.execute`'s
     // rationale); a secure-bin excursion still answers the 12-3 cage gate at
     // the hold movements it triggers, which the operator deliberately does

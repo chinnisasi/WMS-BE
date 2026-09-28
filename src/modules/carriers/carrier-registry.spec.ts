@@ -5,6 +5,7 @@ import {
   listCarrierAdapters,
   registerCarrierAdapter,
 } from './carrier-registry';
+import { unconfiguredLabelArm } from './carrier-label-port';
 
 /**
  * The registry's guards (Story 4.6b). They run at IMPORT time, so a violation
@@ -21,6 +22,7 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
       registerCarrierAdapter({
         code: 'delhivery',
         displayName: 'Delhivery (again)',
+        label: unconfiguredLabelArm('delhivery'),
         credentialFields: [field],
       }),
     ).toThrow('Carrier adapter already registered: delhivery');
@@ -30,7 +32,12 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
 
   it('refuses an adapter with no credential fields — there would be nothing to seal', () => {
     expect(() =>
-      registerCarrierAdapter({ code: 'spec-empty', displayName: 'Empty', credentialFields: [] }),
+      registerCarrierAdapter({
+        code: 'spec-empty',
+        displayName: 'Empty',
+        label: unconfiguredLabelArm('spec-empty'),
+        credentialFields: [],
+      }),
     ).toThrow('declares no credential fields');
     expect(isKnownCarrierCode('spec-empty')).toBe(false);
   });
@@ -40,6 +47,7 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
       registerCarrierAdapter({
         code: 'spec-dupe-field',
         displayName: 'Dupe',
+        label: unconfiguredLabelArm('spec-dupe-field'),
         credentialFields: [field, { ...field, label: 'Other' }],
       }),
     ).toThrow('duplicate field: apiToken');
@@ -47,7 +55,9 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
   });
 
   it('registers the three direct carriers, code-sorted, and knows nothing else', () => {
-    expect(knownCarrierCodes()).toEqual(['blue_dart', 'delhivery', 'ecom_express']);
+    // Story 4.6c: `sandbox` joins — the deterministic in-process stand-in
+    // carrier (documented decision, 2026-09-28).
+    expect(knownCarrierCodes()).toEqual(['blue_dart', 'delhivery', 'ecom_express', 'sandbox']);
     expect(listCarrierAdapters().map((adapter) => adapter.code)).toEqual(knownCarrierCodes());
     // Shiprocket is an aggregator and is deliberately out (the OQ1 decision).
     expect(getCarrierAdapter('shiprocket')).toBeUndefined();

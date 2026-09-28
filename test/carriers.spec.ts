@@ -190,7 +190,7 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
 
   // ── the registry ───────────────────────────────────────────────────────────
 
-  it('the catalogue names the three direct carriers and what each one needs', async () => {
+  it('the catalogue names the three direct carriers, the sandbox stand-in, and what each one needs', async () => {
     const { tenantId, token } = await freshTenant();
     const res = await request(app.getHttpServer())
       .get(`${API}/${tenantId}/carriers`)
@@ -202,7 +202,15 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
       displayName: string;
       credentialFields: { name: string; required: boolean }[];
     }[];
-    expect(items.map((item) => item.code)).toEqual(['blue_dart', 'delhivery', 'ecom_express']);
+    // Story 4.6c: `sandbox` joins the registry as the deterministic
+    // in-process stand-in carrier (the documented decision, 2026-09-28) —
+    // the whole label → dispatch → manifest path is exercisable through it.
+    expect(items.map((item) => item.code)).toEqual([
+      'blue_dart',
+      'delhivery',
+      'ecom_express',
+      'sandbox',
+    ]);
     // OQ1's decision: Shiprocket is an AGGREGATOR and is deliberately out.
     expect(items.map((item) => item.code)).not.toContain('shiprocket');
 
@@ -717,6 +725,9 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
     const seen = [...first.body.items, ...second.body.items].map(
       (item: { carrierCode: string }) => item.carrierCode,
     );
+    // This tenant connects the three DIRECT carriers — the list reflects the
+    // tenant's own connections, not the registry's catalogue (which carries
+    // `sandbox` too; see the catalogue test).
     expect([...seen].sort()).toEqual(['blue_dart', 'delhivery', 'ecom_express']);
 
     const bad = await listConnections(token, tenantId, '?cursor=not-a-cursor').expect(400);

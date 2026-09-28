@@ -2387,3 +2387,139 @@ export const temperatureExcursions = pgTable(
 );
 
 export type TemperatureExcursion = typeof temperatureExcursions.$inferSelect;
+
+/**
+ * Shipments (Story 4.6c): one label per order — the outbound module's
+ * record of the carrier's adapter-issued label. A shipment is created by
+ * `createShipmentLabel` (the label command) when a `ready_to_dispatch`
+ * order is labelled through a carrier connection: the adapter's
+ * deterministic label arm answers a tracking number and a document
+ * reference, and THIS row is the only durable record of it (no ledger
+ * event — a label is a document, not a quantity movement, AD-1).
+ *
+ * `status` is the shipment's two-arm lifecycle:
+ * - `labelled` — the label exists, dispatch may auto-stamp from it, and
+ *   the manifest command may pick it up;
+ * - `manifested` — the shipment closed onto a manifest (`manifest_id`
+ *   names it); it can no longer be picked up.
+ *
+ * One `labelled` shipment per order is the DATABASE-level partial unique
+ * index on `(tenant_id, order_id) where status = 'labelled'` (the race
+ * backstop behind the command's 409); a `manifested` shipment stops
+ * participating, and its row persists as the order's shipment record.
+ * `carrier_name` is the point-in-time registry display name resolved at
+ * label time (the 11-1 destination-address precedent) so dispatch's
+ * auto-stamp reads it without a carriers-module dependency.
+ *
+ * `weight_grams` / the three dimension arms are the label request's
+ * optional measurements (same bounds as pack — the pack measurements
+ * lived only in the ledger reference doc with no read path; the label is
+ * the first consumer that needs them on a row). `label_document_ref` is
+ * the adapter's opaque handle for the label document (never the bytes).
+ *
+ * No FKs anywhere (repo convention): `order_id`, `warehouse_id`,
+ * `carrier_connection_id`, `labelled_by`, `manifest_id` are bare uuids
+ * validated in the command transaction. RLS policy + the status /
+ * bounds / pairing CHECKs live **only in the migration SQL** (0042, the
+ * 0025/0017 pattern).
+ */
+export const shipments = pgTable(
+  'shipments',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    status: text('status').notNull().default('labelled'),
+    /** The connection the label was generated through (the manifest groups by it). */
+    carrierConnectionId: uuid('carrier_connection_id').notNull(),
+    /** The adapter code at label time (`sandbox`, `delhivery`, …). */
+    carrierCode: text('carrier_code').notNull(),
+    /** The registry display name resolved at label time (point-in-time, 11-1 precedent). */
+    carrierName: text('carrier_name').notNull(),
+    /** The adapter-issued tracking number — what dispatch auto-stamps. */
+    trackingNumber: text('tracking_number').notNull(),
+    /** The adapter's opaque handle for the label document — never the bytes. */
+    labelDocumentRef: text('label_document_ref').notNull(),
+    /** The label request's optional weight (grams), same bounds as pack. */
+    weightGrams: integer('weight_grams'),
+    /** The label request's optional dimensions (mm), same bounds as pack. */
+    lengthMm: integer('length_mm'),
+    widthMm: integer('width_mm'),
+    heightMm: integer('height_mm'),
+    labelledBy: uuid('labelled_by').notNull(),
+    labelledAt: timestamp('labelled_at', { withTimezone: true, mode: 'string' }).notNull(),
+    /** Set when the shipment closes onto a manifest (status flips to `manifested`). */
+    manifestId: uuid('manifest_id'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One LABELLED shipment per order — the race backstop behind the
+    // command's already-labelled 409. Partial: a manifested shipment stops
+    // participating (its row is the order's shipment record).
+    uniqueIndex('shipments_tenant_order_labelled_unique')
+      .on(table.tenantId, table.orderId)
+      .where(sql`status = 'labelled'`),
+    // The warehouse-scoped list's keyset index from day one (UX-DR25).
+    index('shipments_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+    // The order's shipment read-back (GET .../orders/{orderId}/shipment).
+    index('shipments_order_id_idx').on(table.orderId),
+    // One manifest's shipments, in labelled order (the detail read).
+    index('shipments_manifest_id_idx').on(table.manifestId),
+  ],
+);
+
+export type Shipment = typeof shipments.$inferSelect;
+
+/**
+ * Manifests (Story 4.6c): the carrier hand-over document — one row per
+ * `createManifest`, closing a set of `labelled` shipments (all on the SAME
+ * carrier connection, same warehouse) onto the carrier. The manifest row
+ * is deliberately thin: the connection it closed shipments for and the
+ * count; the shipment rows carry the per-shipment truth and point back
+ * here through `manifest_id`. No ledger event (AD-1 — a manifest is a
+ * document); the outbox `manifest.created` event is the writeback Epic 7
+ * subscribes to. No un-manifest (the spec's Never list): the flip is
+ * terminal.
+ *
+ * No FKs anywhere (repo convention): `warehouse_id` /
+ * `carrier_connection_id` / `created_by` are bare uuids validated in the
+ * command transaction. RLS policy + the shipment-count CHECK live **only
+ * in the migration SQL** (0042).
+ */
+export const manifests = pgTable(
+  'manifests',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    /** The one connection every manifested shipment labelled through. */
+    carrierConnectionId: uuid('carrier_connection_id').notNull(),
+    /** The adapter code at manifest time (mirrors the connection). */
+    carrierCode: text('carrier_code').notNull(),
+    /** How many shipments the manifest closed (CHECK: ≥ 1). */
+    shipmentCount: integer('shipment_count').notNull(),
+    createdBy: uuid('created_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The warehouse-scoped list's keyset index from day one (UX-DR25).
+    index('manifests_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type Manifest = typeof manifests.$inferSelect;

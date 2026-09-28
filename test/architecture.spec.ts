@@ -220,9 +220,12 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     'picklistLines',
     // Story 4.3 — the pick settlement record joins the same ownership.
     'picks',
+    // Story 4.6c — the label + manifest records join the same ownership.
+    'shipments',
+    'manifests',
   ] as const;
   const RAW_ORDER_TABLES =
-    'orders|order_lines|wave_policies|waves|picklists|picklist_lines|picks';
+    'orders|order_lines|wave_policies|waves|picklists|picklist_lines|picks|shipments|manifests';
   const outboundRoot = join(SRC_ROOT, 'modules', 'outbound');
 
   it('no order-table write happens outside the outbound module', () => {
@@ -304,6 +307,17 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     const pickSource = readFileSync(join(outboundRoot, 'pick.command.ts'), 'utf8');
     expect(drizzleWriteOn('picks').test(pickSource)).toBe(true);
     expect(drizzleWriteOn('picklistLines').test(pickSource)).toBe(true);
+    // Story 4.6c's half: the label command writes the shipment record and
+    // the manifest command writes the manifest row AND flips the shipments;
+    // dispatch READS a labelled shipment (auto-stamp) and writes neither.
+    const shipmentSource = readFileSync(join(outboundRoot, 'shipment.command.ts'), 'utf8');
+    expect(drizzleWriteOn('shipments').test(shipmentSource)).toBe(true);
+    const manifestSource = readFileSync(join(outboundRoot, 'manifest.command.ts'), 'utf8');
+    expect(drizzleWriteOn('manifests').test(manifestSource)).toBe(true);
+    expect(drizzleWriteOn('shipments').test(manifestSource)).toBe(true);
+    const dispatchSource = readFileSync(join(outboundRoot, 'dispatch.command.ts'), 'utf8');
+    expect(drizzleWriteOn('shipments').test(dispatchSource)).toBe(false);
+    expect(drizzleWriteOn('manifests').test(dispatchSource)).toBe(false);
   });
 
   it('the pick command moves stock ONLY through the inventory facade (4.3)', () => {
@@ -593,13 +607,13 @@ describe('architecture: carrier credentials are carriers-module-owned (story 4.6
         !file.path.startsWith(carriersRoot) &&
         /(?:modules\/carriers|\.\.\/carriers)\//.test(file.source),
     );
-    // No sibling module consumes carriers YET (4-6c's labels bring the
-    // first), so the inventory twin's `siblingModules.length > 0`
-    // meaningfulness assert cannot carry this one — it would fail on an
-    // empty-but-correct codebase. Pin the detector directly instead (the
-    // outbound block's precedent), so a typo or a regex that stops matching
-    // an import form fails HERE rather than going unnoticed while the guard
-    // silently scans nothing forever.
+    // Story 4.6c brought the first consumer (the outbound label command
+    // imports `../carriers/carriers.facade` and nothing else), but the
+    // `siblingModules.length > 0` meaningfulness assert would still be
+    // vacuous against a DETECTOR typo (the list is one file). Pin the
+    // detector directly too (the outbound block's precedent), so a typo or a
+    // regex that stops matching an import form fails HERE rather than going
+    // unnoticed while the guard silently scans nothing forever.
     for (const reaching of [
       "from '../carriers/carrier.command'",
       "from '../carriers/carrier-credentials'",
@@ -624,6 +638,26 @@ describe('architecture: carrier credentials are carriers-module-owned (story 4.6
       }
     }
     expect(offenders).toEqual([]);
+    // Story 4.6c — the facade-only import is now EXERCISED by real code: the
+    // outbound label command is the first sibling consumer, and it must touch
+    // carriers through the facade (and its `labelThroughAdapter` export)
+    // alone. Meaningfulness for the scan above — if this file stops
+    // importing carriers, the scan above is asserting the absence of
+    // something that exists nowhere.
+    const shipmentSource = readFileSync(
+      join(SRC_ROOT, 'modules', 'outbound', 'shipment.command.ts'),
+      'utf8',
+    );
+    expect(/from\s+'\.\.\/carriers\/carriers\.facade'/.test(shipmentSource)).toBe(true);
+    for (const forbidden of [
+      '../carriers/carrier.command',
+      '../carriers/carrier-registry',
+      '../carriers/carrier-credentials',
+      '../carriers/carrier-label-port',
+      '../carriers/carriers.errors',
+    ]) {
+      expect(shipmentSource).not.toContain(forbidden);
+    }
   });
 
   it('the carriers module itself writes the table (the test is meaningful)', () => {

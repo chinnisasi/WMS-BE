@@ -93,6 +93,23 @@ export function carrierConnectionNotFound(): ProblemException {
 }
 
 /**
+ * 501 `carrier-transport-unconfigured` — the carrier is known and connected,
+ * but its transport integration has not landed (Story 4.6c: the three DIRECT
+ * carriers register `unconfiguredLabelArm` until their real HTTP
+ * integrations arrive with 4-6d or later). The refusal is a first-class,
+ * verbatim, retryable rendered arm — nothing is written anywhere, and the
+ * message names the CARRIER, never any credential material.
+ */
+export function carrierTransportUnconfigured(carrierCode: string): ProblemException {
+  return new ProblemException(
+    'carrier-transport-unconfigured',
+    501,
+    'Carrier transport not configured',
+    `Carrier "${carrierCode}" has no label transport on this deployment — its real integration has not been configured. Retry once it lands.`,
+  );
+}
+
+/**
  * 503 `carrier-encryption-unavailable` — the deployment has no (or a too
  * short) `CARRIER_ENCRYPTION_KEY`. Mirrors 3.2's
  * `device-encryption-unavailable`: a raw throw from inside the transaction

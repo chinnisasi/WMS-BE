@@ -24,6 +24,9 @@ process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
 process.env.DEVICE_ENCRYPTION_KEY ??= 'e2e-only-device-encryption-key-0123456789abcdef';
 process.env.VALKEY_URL ??= 'redis://localhost:56379/0';
+// Story 4.6c: the label path opens carrier credentials — the suite needs the
+// key the connect/rotate suites already set (the same e2e-only value).
+process.env.CARRIER_ENCRYPTION_KEY ??= 'e2e-only-carrier-encryption-key-0123456789abcdef';
 delete process.env.OUTBOX_RELAY_POLL_MS;
 delete process.env.OUTBOX_RECONCILE_POLL_MS;
 delete process.env.RESERVATION_REAPER_POLL_MS;
@@ -95,6 +98,8 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
 
   let deviceToken: string;
   let operatorToken: string; // the badge-in DEVICE session (picking)
+  /** Story 4.6c — the sandbox carrier connection (label + auto-stamp). */
+  let sandboxConnectionId: string;
 
   /** SKU fixtures — one scenario each, so no two dispatches share stock. */
   const SKU_CODES = [
@@ -124,6 +129,8 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
     'DSP-ARGS', // the documented 400 arms
     'DSP-CONCA', // the concurrent same-key race…
     'DSP-CONCB', // …and its second order
+    'DSP-SBX', // the 4.6c auto-stamp: label first, dispatch with no free text
+    'DSP-SBXOVR', // …and the free-text override that wins per-arm
   ] as const;
 
   let suiteDb: SuiteDatabase;
@@ -195,6 +202,11 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
     }
     expect(skuIds.size).toBeGreaterThanOrEqual(SKU_CODES.length);
 
+    // Story 4.6c: the sandbox carrier connection the label/auto-stamp tests
+    // generate through (the deterministic in-process stand-in arm).
+    const sandbox = await connectSandbox().expect(201);
+    sandboxConnectionId = sandbox.body.id as string;
+
     // The floor device + its badge-in operator (picking feeds every fixture).
     const minted = await request(app.getHttpServer())
       .post(`${API}/${tenantId}/devices/enrollment-codes`)
@@ -251,7 +263,18 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
     if (createdTenantIds.length === 0) return;
     const cleaner = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
-      for (const table of ['picks', 'picklist_lines', 'picklists', 'waves', 'wave_policies', 'order_lines', 'orders']) {
+      for (const table of [
+        'picks',
+        'picklist_lines',
+        'picklists',
+        'waves',
+        'wave_policies',
+        // Story 4.6c tables join the cleanup.
+        'shipments',
+        'manifests',
+        'order_lines',
+        'orders',
+      ]) {
         await cleaner.unsafe(`DELETE FROM ${table} WHERE tenant_id = ANY($1::uuid[])`, [createdTenantIds]);
       }
       await cleaner.unsafe('set session_replication_role = replica');
@@ -439,6 +462,33 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
       .set('Authorization', `Bearer ${token}`)
       .set(KEY_HEADER, key)
       .send(body);
+  }
+
+  /** Story 4.6c — the sandbox connection the label fixtures generate through. */
+  function connectSandbox(token = ownerToken): SupertestTest {
+    return request(app.getHttpServer())
+      .post(`${API}/${tenantId}/carriers/connections`)
+      .set('Authorization', `Bearer ${token}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        carrierCode: 'sandbox',
+        accountLabel: `Sandbox ${ulid().slice(10, 16)}`,
+        credential: { accountToken: 'e2e-sandbox-token' },
+      });
+  }
+
+  function labelOrder(
+    orderId: string,
+    connectionId: string,
+    body: Record<string, unknown> = {},
+    token = operatorWebToken,
+    key = ulid(),
+  ): SupertestTest {
+    return request(app.getHttpServer())
+      .post(`${API}/${tenantId}/outbound/orders/${orderId}/label`)
+      .set('Authorization', `Bearer ${token}`)
+      .set(KEY_HEADER, key)
+      .send({ carrierConnectionId: connectionId, ...body });
   }
 
   /** A fully-picked, PACKED order of ONE line in ONE bin — dispatchable. */
@@ -733,6 +783,71 @@ describe('dispatch: the terminal order transition (e2e, story 4.6)', () => {
     const holds = await holdsOfOrder(orderId);
     expect(holds.filter((hold) => hold.state === 'released')).toHaveLength(holds.length);
     expect((await atp(skuId)).reserved).toBe(0);
+  });
+
+  // ── Story 4.6c: the auto-stamp ─────────────────────────────────────────────
+
+  it('auto-stamps the labelled shipment carrier/tracking when the caller sends no free text (4.6c)', async () => {
+    const { orderId, skuId } = await packedOrder('DSP-SBX', 3, 'sbx');
+
+    // Label first: the shipment is the adapter's answer, and the ORDER STATUS
+    // DOES NOT MOVE — the label is a station act beside the state machine.
+    const labelled = await labelOrder(orderId, sandboxConnectionId).expect(201);
+    const tracking = labelled.body.shipment.trackingNumber as string;
+    expect(tracking).toMatch(/^SBX-/);
+    expect(labelled.body.shipment.status).toBe('labelled');
+    expect(labelled.body.shipment.carrierCode).toBe('sandbox');
+    expect(labelled.body.shipment.carrierName).toBe('Sandbox');
+    expect(await orderStatus(orderId)).toBe('ready_to_dispatch');
+
+    // Dispatch with NO free text: the labelled shipment's adapter-issued
+    // carrier/tracking auto-stamps onto the snapshot and the reference docs.
+    const dispatched = await dispatchOrder(orderId).expect(201);
+    expect(dispatched.body.dispatch.carrierName).toBe('Sandbox');
+    expect(dispatched.body.dispatch.trackingNumber).toBe(tracking);
+    const events = await dispatchEvents(orderId);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.reference_doc).toMatchObject({
+      kind: 'dispatch',
+      carrierName: 'Sandbox',
+      trackingNumber: tracking,
+    });
+    // The shipment is untouched by the dispatch (the manifest flips it,
+    // nothing else).
+    const shipment = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/outbound/orders/${orderId}/shipment`)
+      .set('Authorization', `Bearer ${accountantToken}`)
+      .expect(200);
+    expect(shipment.body.shipment.status).toBe('labelled');
+    expect(shipment.body.shipment.manifestId).toBeNull();
+    expect((await atp(skuId)).reserved).toBe(0);
+  });
+
+  it('free text wins per-arm over the labelled shipment, and the shipment is untouched (4.6c)', async () => {
+    const { orderId } = await packedOrder('DSP-SBXOVR', 2, 'sbx-ovr');
+    const labelled = await labelOrder(orderId, sandboxConnectionId).expect(201);
+    const tracking = labelled.body.shipment.trackingNumber as string;
+
+    // The carrierName arm is given (a manual courier recorded by hand) — it
+    // wins; the tracking arm is ABSENT — it auto-stamps from the shipment.
+    const dispatched = await dispatchOrder(orderId, { carrierName: 'Manual Courier' }).expect(201);
+    expect(dispatched.body.dispatch.carrierName).toBe('Manual Courier');
+    expect(dispatched.body.dispatch.trackingNumber).toBe(tracking);
+    const events = await dispatchEvents(orderId);
+    expect(events[0]!.reference_doc).toMatchObject({
+      kind: 'dispatch',
+      carrierName: 'Manual Courier',
+      trackingNumber: tracking,
+    });
+
+    // The shipment row is untouched by the override — the manifest owns the
+    // flip, dispatch only READS.
+    const shipment = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/outbound/orders/${orderId}/shipment`)
+      .set('Authorization', `Bearer ${accountantToken}`)
+      .expect(200);
+    expect(shipment.body.shipment.trackingNumber).toBe(tracking);
+    expect(shipment.body.shipment.status).toBe('labelled');
   });
 
   it('refuses an over-long carrier or tracking value before anything is written', async () => {
