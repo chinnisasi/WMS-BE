@@ -10,7 +10,6 @@ import {
   countVariances,
   idempotencyKeys,
   skus,
-  stockOnHand,
   type CountTask,
 } from '../../shared/db/schema';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
@@ -986,24 +985,21 @@ export class CountService {
 
     // The per-bin EFFECTIVE interval: the shortest interval among the
     // classes the bin's stock matches (a bin is counted once, so the
-    // tightest policy governs it).
+    // tightest policy governs it). The stock read goes through the
+    // inventory facade — inventory owns the projection; movements never
+    // projects stock tables directly (the review's seam fix).
     const candidateBins = new Map<string, number>();
     for (const policy of policyRows) {
-      const holderRows = await tx
-        .selectDistinct({ binId: stockOnHand.binId })
-        .from(stockOnHand)
-        .innerJoin(skus, and(eq(skus.id, stockOnHand.skuId), eq(skus.tenantId, tenantId)))
-        .where(
-          and(
-            eq(stockOnHand.tenantId, tenantId),
-            eq(stockOnHand.warehouseId, warehouseId),
-            eq(skus.abcClass, policy.abcClass),
-          ),
-        );
-      for (const row of holderRows) {
-        const current = candidateBins.get(row.binId);
+      const holderBinIds = await this.inventory.stockedBinIdsForAbcClassInTx(
+        tx,
+        tenantId,
+        warehouseId,
+        policy.abcClass,
+      );
+      for (const binId of holderBinIds) {
+        const current = candidateBins.get(binId);
         if (current === undefined || policy.intervalDays < current) {
-          candidateBins.set(row.binId, policy.intervalDays);
+          candidateBins.set(binId, policy.intervalDays);
         }
       }
     }
@@ -1103,25 +1099,14 @@ export class CountService {
       .groupBy(countTasks.binId);
     const lastUnderLock = new Map(recheckLast.map((row) => [row.binId, row.completedAt]));
 
-    // The candidates' per-bin on-hand, one query over the batch (a per-bin
-    // query inside the loop would be N round-trips where one join serves);
-    // the per-bin fan-out composes below.
-    const onHandRows = await tx
-      .select({ binId: stockOnHand.binId, skuId: stockOnHand.skuId, quantity: stockOnHand.quantity })
-      .from(stockOnHand)
-      .where(
-        and(
-          eq(stockOnHand.tenantId, tenantId),
-          eq(stockOnHand.warehouseId, warehouseId),
-          inArray(stockOnHand.binId, dueBinIds),
-        ),
-      )
-      .orderBy(asc(stockOnHand.binId), asc(stockOnHand.skuId));
+    // The candidates' per-bin on-hand, one batched read through the
+    // inventory facade (inventory owns the projection; the same facade read
+    // a per-bin query inside the loop would turn into N round-trips) — the
+    // per-bin fan-out composes below. The facade returns POSITIVE rows
+    // only, binId-then-skuId ordered.
+    const onHandRows = await this.inventory.stockArmsInBinsInTx(tx, tenantId, warehouseId, dueBinIds);
     const onHandByBin = new Map<string, { skuId: string; quantity: number }[]>();
     for (const row of onHandRows) {
-      if (row.quantity === 0) {
-        continue;
-      }
       const list = onHandByBin.get(row.binId) ?? [];
       list.push({ skuId: row.skuId, quantity: row.quantity });
       onHandByBin.set(row.binId, list);

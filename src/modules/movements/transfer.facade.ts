@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { DATABASE } from '../../shared/shared.module';
@@ -190,6 +190,9 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
 
 @Injectable()
 export class MovementsFacade {
+  // The snapshot feed's truncation signal (story 5-3 review): the facade has
+  // no logger of its own, so the standard Nest logger pattern carries it.
+  private readonly logger = new Logger('MovementsFacade');
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     // One-way: the facade consumes the commands; the commands never see it.
@@ -626,6 +629,18 @@ export class MovementsFacade {
       .orderBy(asc(countTasks.createdAt), asc(countTasks.id))
       .limit(MAX_SNAPSHOT_COUNT_TASKS + 1);
     const tasks = taskRows.slice(0, MAX_SNAPSHOT_COUNT_TASKS);
+    // Story 5-3 (review): the over-read row IS the truncation signal —
+    // computed-then-dropped is exactly the shape the spec's Code Map says
+    // not to repeat (5-1's PENDING note). The returned rows stay MAX-capped
+    // (the device contract); the warning surfaces that this warehouse's
+    // older pending counts are silently invisible so the breach is
+    // actionable (refresh the seal after counting some) instead of silent.
+    if (taskRows.length > tasks.length) {
+      this.logger.warn(
+        `Catalog snapshot count tasks truncated — tenant=${tenantId} warehouse=${warehouseId} ` +
+          `holds more than ${MAX_SNAPSHOT_COUNT_TASKS} pending count task(s); older tasks are not shown`,
+      );
+    }
     if (tasks.length === 0) {
       return [];
     }

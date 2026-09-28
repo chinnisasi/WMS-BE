@@ -735,7 +735,7 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
         where tenant_id = ${tenantId} and task_id = ${task2.body.countTask.id as string}::uuid
           and sku_id = ${skuIds.get(UNCLASSED)!}::uuid`;
       expect(line.length).toBe(1);
-      expect(Number((line[0] as { counted_quantity: string }).counted_quantity_milli)).toBe(0);
+      expect(Number((line[0] as { counted_quantity_milli: string }).counted_quantity_milli)).toBe(0);
     });
 
     it('403s the accountant (no counts.execute) but lets the operator submit', async () => {
