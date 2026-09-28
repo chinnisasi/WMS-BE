@@ -628,20 +628,20 @@ describe('product variants (e2e, story 11-3)', () => {
     // a product ref without values. (The rows are never committed: each
     // insert throws.)
     await expect(
-      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, product_id, variant_values)
-          values (${uuidv7()}, ${tenantId}, 'CHECK-VAR-1', 'probe', 'each', 1800, ${`BC-${ulid()}`}, null, ${sql.json({ size: 'M' })})`,
+      sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode, product_id, variant_values)
+          values (${uuidv7()}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), 'CHECK-VAR-1', 'probe', 'each', 1800, ${`BC-${ulid()}`}, null, ${sql.json({ size: 'M' })})`,
     ).rejects.toThrow(/skus_variant_values_pairing/);
     await expect(
-      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, product_id, variant_values)
-          values (${uuidv7()}, ${tenantId}, 'CHECK-VAR-2', 'probe', 'each', 1800, ${`BC-${ulid()}`}, ${uuidv7()}, null)`,
+      sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode, product_id, variant_values)
+          values (${uuidv7()}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), 'CHECK-VAR-2', 'probe', 'each', 1800, ${`BC-${ulid()}`}, ${uuidv7()}, null)`,
     ).rejects.toThrow(/skus_variant_values_pairing/);
     // The paired shape — both set, the values a proper object — stays storable
     // (and so does the fully-null pre-11.3 shape, which every scenario row
     // above already proves). `sql.json` because a bare string parameter is
     // double-encoded by the driver into a jsonb STRING, not an object.
     await expect(
-      sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode, product_id, variant_values)
-          values (${uuidv7()}, ${tenantId}, 'CHECK-VAR-3', 'probe', 'each', 1800, ${`BC-${ulid()}`}, ${uuidv7()}, ${sql.json({ size: 'M' })})`,
+      sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode, product_id, variant_values)
+          values (${uuidv7()}, ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), 'CHECK-VAR-3', 'probe', 'each', 1800, ${`BC-${ulid()}`}, ${uuidv7()}, ${sql.json({ size: 'M' })})`,
     ).resolves.toBeDefined();
   });
 

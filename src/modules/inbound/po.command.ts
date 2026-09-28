@@ -18,6 +18,7 @@ import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
+import { ensureSelfClientInTx } from '../clients/ensure-self-client';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
@@ -213,6 +214,10 @@ export class PurchaseOrderCommand {
       const lines = this.scaleLines(command.lines, uomBySku);
       const lineRows = lines.map((line) => this.lineInsert(command.tenantId, null, line));
 
+      // Story 21-1 (AD-23): an inbound document is authored for one client —
+      // the tenant's `self` client on a D2C tenant, idempotent, no branch.
+      const clientId = await ensureSelfClientInTx(tx, command.tenantId);
+
       let po: { id: string };
       try {
         const rows = await tx
@@ -220,6 +225,7 @@ export class PurchaseOrderCommand {
           .values({
             id: uuidv7(),
             tenantId: command.tenantId,
+            clientId,
             warehouseId: command.warehouseId,
             vendorId: command.vendorId,
             code: command.code,
@@ -463,6 +469,8 @@ export class PurchaseOrderCommand {
         await tx.insert(purchaseOrders).values({
           id: successorId,
           tenantId: command.tenantId,
+          // The successor inherits the original's client (same tenant).
+          clientId: po.clientId,
           warehouseId: po.warehouseId,
           vendorId: po.vendorId,
           code: successorCode,

@@ -281,6 +281,13 @@
       "when": 1790305671463,
       "tag": "0039_cold_chain_order_index",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1790567549271,
+      "tag": "0040_client_dimension",
+      "breakpoints": true
     }
   ]
 }

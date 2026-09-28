@@ -176,6 +176,9 @@ describe('migration 0027, applied to pre-vocabulary data', () => {
 
     // Three spellings no vocabulary has ever seen: an alias, an alias wearing
     // spreadsheet punctuation, and a plural.
+    // (Pre-0040 schema — no clients table, no client_id. This Part-A DB is
+    // frozen at 0026; the current drizzle code never writes here, only raw
+    // SQL reads, so no client scaffolding is needed.)
     await sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, reorder_point, reorder_qty, barcode)
       values (${pcsSkuId}, ${tenantId}, 'PRE-PCS', 'Counted', 'pcs', 1800, 1500, 2400, 'BAR-PCS')`;
     await sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, reorder_point, reorder_qty, barcode)
@@ -577,8 +580,8 @@ describe('story 10.2: UoM is a closed vocabulary with a declared precision (e2e)
 
     it('the DB refuses a unit outside the vocabulary (23514 — the backstop)', async () => {
       await expect(
-        sql`insert into skus (id, tenant_id, code, name, uom, gst_rate_bps, barcode)
-            values (gen_random_uuid(), ${tenantId}, ${`CHK-${ulid().slice(0, 8)}`}, 'probe', 'furlong', 500, ${ulid()})`,
+        sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode)
+            values (gen_random_uuid(), ${tenantId}, (select id from clients where tenant_id = ${tenantId} and code = 'self' and system_owned limit 1), ${`CHK-${ulid().slice(0, 8)}`}, 'probe', 'furlong', 500, ${ulid()})`,
       ).rejects.toMatchObject({ code: '23514' });
     });
   });

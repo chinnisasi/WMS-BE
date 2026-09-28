@@ -41,6 +41,7 @@ import {
 } from '../../shared/primitives/address';
 import type { AddressInput, AddressSnapshot } from '../../shared/primitives/address';
 import { uomPrecision } from '../catalog/uom';
+import { ensureSelfClientInTx } from '../clients/ensure-self-client';
 
 // ── state machine + policy constants (the outbound module exclusively owns
 // the order state machine, AD-6 — no other module may add or transition
@@ -541,10 +542,14 @@ export class OrderCommandService {
     try {
       return await withTenantTransaction(this.db, command.tenantId, async (tx) => {
         const orderId = uuidv7();
+        // Story 21-1 (AD-23): an order is for one client by definition — the
+        // tenant's `self` client on a D2C tenant, idempotent, no branch.
+        const clientId = await ensureSelfClientInTx(tx, command.tenantId);
         try {
           await tx.insert(orders).values({
             id: orderId,
             tenantId: command.tenantId,
+            clientId,
             warehouseId: command.warehouseId,
             status: 'accepted',
             source: command.source,

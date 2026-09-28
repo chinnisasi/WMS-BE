@@ -154,8 +154,31 @@ describe('story 10.1: fractional quantities are scaled integers in milli-units',
       // runner applies a migration file — drizzle wraps each one. Applying the
       // statements in a bare loop would exercise a weaker atomicity model than
       // production and hide a failure that leaves the schema half-migrated.
-      beforeState = await captureSchema();
       await seedPreMigrationRows();
+
+      // Story 21-1 scaffolding (story 21-1 changed the SHARED drizzle schema,
+      // not just a migration): `schema.ts` now declares `client_id` on
+      // ledger_events and the other stamped tables, so ANY drizzle read — the
+      // chain verifier below is one — fails with `column does not exist`
+      // against a schema frozen at 0025. The harness therefore applies the
+      // 21-1 migration to this seeded state first (it is data-independent:
+      // guard, pre-flight, backfill and assertion are all row-agnostic). It
+      // adds the clients table + the NOT NULL scoping columns and backfills
+      // every seeded row with its tenant's self client; it touches no column
+      // 0026 cares about, so every assertion below is still 0026's alone.
+      await sql.begin(async (tx) => {
+        for (const statement of readFileSync(
+          resolve(process.cwd(), 'drizzle/0040_client_dimension.sql'),
+          'utf8',
+        )
+          .split('--> statement-breakpoint')
+          .map((statement) => statement.trim())
+          .filter((statement) => statement.length > 0)) {
+          await tx.unsafe(statement);
+        }
+      });
+
+      beforeState = await captureSchema();
       seededEventHashes = (
         (await sql`select seq, event_hash from ledger_events order by seq`) as unknown as {
           seq: number;
