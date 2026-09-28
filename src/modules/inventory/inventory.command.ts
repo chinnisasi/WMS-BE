@@ -453,19 +453,27 @@ export class StockAdjustmentCommand {
         // Master-data integrity, the kit refusal, conversion + the precision
         // refusal, the catch-weight refusals, the arm-required parity checks
         // and the handling-unit guards all live in `assertAdjustableInTx`.
-        // The threshold branch below sits AFTER the full guard set — only an
-        // adjustment that would have applied can pend (a request failing a
-        // shape/stock guard answers its 4xx, never pends).
+        // The threshold branch below sits after that guard set — a request
+        // failing one of THOSE guards answers its 4xx, never a 202. The
+        // write-side refusals (the ledger fold's insufficient-on-hand, a
+        // serial last seen in another bin, the handling-unit write-off's
+        // 409) all run BELOW the branch: an over-draw the fold would refuse
+        // still pends, and the decision re-runs those refusals — the whole
+        // decide transaction rolls back and the row stays pending.
         const { delta, handlingUnitIds } = await this.assertAdjustableInTx(tx, command);
 
         // ── story 5-2: the approval-threshold branch ────────────────────────
         // POSITION IS LOAD-BEARING: behind the replay lookup (a committed
         // adjustment replays its stored snapshot whatever today's threshold
-        // says), after the full guard set (only an executable adjustment
-        // pends), and immediately before the ledger writes — a pending
-        // adjustment writes NO ledger event, NO on-hand/ATP change, NO
-        // handling-unit status change (the HU write-off runs in
-        // `applyAdjustmentInTx`, below this branch).
+        // says), after the arm-required parity guard set (those 4xx still
+        // answer before any pend), and immediately before the ledger writes
+        // — a pending adjustment writes NO ledger event, NO on-hand/ATP
+        // change, NO handling-unit status change (the HU write-off runs in
+        // `applyAdjustmentInTx`, below this branch). The WRITE-side guards
+        // (the fold's insufficient-on-hand, serial-elsewhere, the moved-count
+        // 409) run below it too: an over-draw the fold would refuse still
+        // pends — the decision re-runs those refusals, and its rollback
+        // leaves the row pending.
         //
         // Semantics (frozen I/O note): approval is required when
         // |quantityDelta| > threshold, STRICTLY greater — at-threshold
@@ -767,14 +775,26 @@ export class StockAdjustmentCommand {
     // lookup, tighten-only: the immediate path ALWAYS satisfies these (the
     // controller resolves a batchRef for every batch-tracked movement and
     // requires serials on every serial-tracked one), so no immediate
-    // adjustment changes behavior. The serial count parity is the
-    // above-the-transaction shape check (an array length is a unit count).
+    // adjustment changes behavior. The serial-COUNT parity is checked HERE,
+    // not only at the controller: the approval path rebuilds the command
+    // from the stored arms and never runs the controller's composition, so
+    // a |delta| that stopped matching the stored serial count (a flipped
+    // flag mid-flight) must refuse exactly where the other parity checks
+    // do.
     if (sku.serialTracked && serialRefs.length === 0) {
       throw new ProblemException(
         'validation-failed',
         400,
         'serials are required for a serial-tracked movement',
         'A serial-tracked movement writes one ledger event per serial unit — supply serials: [s1..sN] with quantityDelta = N.',
+      );
+    }
+    if (serialRefs.length > 0 && Math.abs(delta) !== serialRefs.length * QUANTITY_SCALE) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'quantityDelta must match the serial count',
+        `A serial-tracked movement writes one ledger event per serial unit — ${serialRefs.length} serials cannot move ${fromMilli(Math.abs(delta))} units.`,
       );
     }
     if (sku.batchTracked && (command.batchRef ?? null) === null) {

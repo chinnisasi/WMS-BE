@@ -3,7 +3,7 @@ import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { ulid } from '../src/shared/primitives/ids';
+import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { fromMilli } from '../src/shared/primitives/quantity';
 import { ADJUSTMENT_REASON_CODES } from '../src/modules/inventory/adjustment-reason';
 import { createApp } from '../src/app.factory';
@@ -454,8 +454,9 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
         .expect(201)
     ).body.id as string;
 
-    // Six fixture SKUs: two flagless (one stays stockless to become a kit),
-    // batch-tracked, serial-tracked, catch-weight, and a kit component.
+    // Eight fixture SKUs: two flagless (one stays stockless to become a kit),
+    // batch-tracked, serial-tracked, catch-weight, a kit component, and two
+    // flagless end-of-suite SKUs the flag-flip tests PATCH mid-flight.
     const csvHeader =
       'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,catch_weight_tracked,reorder_point,reorder_qty,barcode';
     const csv = [
@@ -466,6 +467,8 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
       'ST-1,Serial Widgets,pcs,,1800,,false,true,false,,,',
       'CW-1,Beef cases,case,,1800,,false,false,true,,,',
       'COMP-1,Kit component,pcs,,1800,,false,false,false,,,',
+      'PLAIN-3,Flag-flip fodder,pcs,,1800,,false,false,false,,,',
+      'PLAIN-4,Flag-flip fodder 2,pcs,,1800,,false,false,false,,,',
     ].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
@@ -481,7 +484,7 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
     for (const item of catalog.body.items as { code: string; id: string }[]) {
       skuIds.set(item.code, item.id);
     }
-    expect(skuIds.size).toBe(6);
+    expect(skuIds.size).toBe(8);
 
     // The floor device + its badge-in operator (every receipt rides it) —
     // the catch-weight units can only come from a real receipt.
@@ -803,6 +806,27 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
     expect(again.body.code).toBe('adjustment-pending-decided');
   });
 
+  it('the decision gate is owner-only: ops_manager and operator actors are 403 role-denied on both arms; the owner is allowed', async () => {
+    const res = await adjust({
+      warehouseId, skuId: sku('PLAIN-1'), binId: binA,
+      quantityDelta: 11, reasonCode: 'other', note: 'gate fodder',
+    }).expect(202);
+    const pendingId = res.body.pendingAdjustment.id as string;
+
+    const worker = await inviteMember('operator');
+    for (const token of [opsToken, worker.token]) {
+      const deniedApprove = await approve(pendingId, ulid(), token).expect(403);
+      expect(deniedApprove.body.code).toBe('role-denied');
+      const deniedReject = await reject(pendingId, ulid(), token).expect(403);
+      expect(deniedReject.body.code).toBe('role-denied');
+    }
+    // The denials decided nothing — the row is untouched.
+    expect((await pendRow(pendingId))!.status).toBe('pending');
+
+    // The owner (the happy paths above) is the allowed actor.
+    await approve(pendingId).expect(200);
+  });
+
   // ── the stored arms ride into the approved event ─────────────────────────
 
   it('a batch-tracked pend approves with the stored batch: the approved event carries the pend batchId as batch_ref', async () => {
@@ -1027,6 +1051,112 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
     expect((await auditRows('stock_adjustment.approved')).filter((row) => row.target_id === pendingId)).toHaveLength(1);
   });
 
+  it('two concurrent FIRST-TIME policy PUTs race the unique index: one 200, the loser 409, exactly one row', async () => {
+    // A tenant with NO policy row — the suite tenant already has one, so a
+    // fresh inline tenant is the only way to race the first insert.
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registered = await request(app.getHttpServer())
+      .post(API)
+      .set(KEY_HEADER, ulid())
+      .send({ name: `Policy Race Co ${ulid()}`, ownerEmail: email, password: 'correct-horse-battery' })
+      .expect(201);
+    const raceTenantId = registered.body.tenant.id as string;
+    createdTenantIds.push(raceTenantId);
+    const raceToken = (
+      await request(app.getHttpServer())
+        .post(`${API}/sign-in`)
+        .send({ email, password: 'correct-horse-battery' })
+        .expect(200)
+    ).body.accessToken as string;
+
+    const put = (key: string): SupertestTest =>
+      request(app.getHttpServer())
+        .put(`${API}/${raceTenantId}/inventory/adjustment-policies`)
+        .set('Authorization', `Bearer ${raceToken}`)
+        .set(KEY_HEADER, key)
+        .send({ quantityThreshold: 7 });
+
+    const [first, second] = await Promise.all([
+      put(ulid()).then((r) => ({ status: r.status, body: r.body })),
+      put(ulid()).then((r) => ({ status: r.status, body: r.body })),
+    ]);
+    expect([first.status, second.status].sort()).toEqual([200, 409]);
+    const winner = first.status === 200 ? first : second;
+    expect(winner.body.quantityThreshold).toBe(7);
+
+    // The unique index held: one policy row, not two.
+    const rowCount = await withSql(async (sql) => {
+      const rows = await sql`
+        select count(*)::int as n from stock_adjustment_policies where tenant_id = ${raceTenantId}
+      `;
+      return (rows[0] as { n: number }).n;
+    });
+    expect(rowCount).toBe(1);
+  });
+
+  // ── the branch sits ABOVE the fold: over-draws pend, decisions re-refuse ─
+
+  it('the fold sits below the branch: an over-threshold draw beyond on-hand pends (202) while the same at-threshold draw is the fold 422; the approval then refuses 422 and the row stays pending', async () => {
+    // PLAIN-1 binA holds 11 here. An at-threshold draw of 10 applies — down to 1.
+    await adjust({
+      warehouseId, skuId: sku('PLAIN-1'), binId: binA,
+      quantityDelta: -10, reasonCode: 'damaged', note: 'drain below the threshold',
+    }).expect(201);
+    expect(await onHandFor(binA, sku('PLAIN-1'))).toBe(1);
+
+    // AT the threshold with only 1 on hand: the branch does not open (10 is
+    // not > 10) and the fold refuses — 422, never a 202.
+    const atThreshold = await adjust({
+      warehouseId, skuId: sku('PLAIN-1'), binId: binA,
+      quantityDelta: -10, reasonCode: 'damaged', note: 'at threshold, over on-hand',
+    }).expect(422);
+    expect(atThreshold.body.code).toBe('insufficient-on-hand');
+
+    // The same overdraw one unit deeper crosses the threshold: the branch
+    // opens FIRST — 202 pend, the fold never ran, the bin is untouched.
+    const res = await adjust({
+      warehouseId, skuId: sku('PLAIN-1'), binId: binA,
+      quantityDelta: -11, reasonCode: 'damaged', note: 'over threshold, over on-hand',
+    }).expect(202);
+    const pendingId = res.body.pendingAdjustment.id as string;
+    expect(await onHandFor(binA, sku('PLAIN-1'))).toBe(1);
+
+    // The decision re-runs the fold: 422 insufficient-on-hand, row pending.
+    const refused = await approve(pendingId).expect(422);
+    expect(refused.body.code).toBe('insufficient-on-hand');
+    expect((await pendRow(pendingId))!.status).toBe('pending');
+  });
+
+  it('an over-threshold request that ALSO fails a shape guard answers the guard, never a 202 (frozen matrix row 8)', async () => {
+    const pendingsBefore = (await listPendings('?status=pending&limit=200').expect(200)).body.items.length;
+
+    // Zero delta: a movement of nothing is a 400 at the command's front door.
+    const zero = await adjust({
+      warehouseId, skuId: sku('PLAIN-1'), binId: binA,
+      quantityDelta: 0, reasonCode: 'stock-count', note: 'zero delta',
+    }).expect(400);
+    expect(zero.body.code).toBe('validation-failed');
+
+    // Serial-count mismatch: over threshold AND |delta| != serials.length.
+    const mismatch = await adjust({
+      warehouseId, skuId: sku('ST-1'), binId: binA,
+      quantityDelta: -12, reasonCode: 'damaged', note: 'two serials, twelve units',
+      serials: ['SN-MISMATCH-1', 'SN-MISMATCH-2'],
+    }).expect(400);
+    expect(mismatch.body.code).toBe('validation-failed');
+
+    // Unknown bin: over threshold, but the guard set answers before the branch.
+    const unknownBin = await adjust({
+      warehouseId, skuId: sku('PLAIN-1'), binId: uuidv7(),
+      quantityDelta: 11, reasonCode: 'stock-count', note: 'no such bin',
+    }).expect(404);
+    expect(unknownBin.body.code).toBe('not-found');
+
+    // None of the three created a pend — the guard's answer is final.
+    const pendingsAfter = (await listPendings('?status=pending&limit=200').expect(200)).body.items.length;
+    expect(pendingsAfter).toBe(pendingsBefore);
+  });
+
   // ── the multi-serial aggregate rides the approve path (retro A4) ────────
 
   it('a multi-serial pend approves into the aggregate snapshot: null event id/seq, one timeline event per serial', async () => {
@@ -1061,6 +1191,58 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
       expect(event.id).toBeDefined();
       expect(event.seq).toBeGreaterThan(0);
     }
+
+    // The outbox payload mirrors the response snapshot's aggregate pairing
+    // (retro A4): eventId/seq null with the aggregate delta on a multi-serial
+    // apply — no single (id, seq) is THE event.
+    const notices = await outboxRows('stock_adjustment.approved');
+    const notice = notices.find(
+      (row) => row.payload.pendingAdjustmentId === res.body.pendingAdjustment.id,
+    );
+    expect(notice).toBeDefined();
+    expect(notice!.payload.eventId).toBeNull();
+    expect(notice!.payload.seq).toBeNull();
+    expect(notice!.payload.quantityDelta).toBe(11);
+  });
+
+  it('an immediate multi-serial adjustment audits stock_adjustment.recorded against the FIRST appended serial event (min seq of the batch)', async () => {
+    const beforeMax = await withSql(async (sql) => {
+      const rows = await sql`
+        select coalesce(max(seq), 0)::int as m from ledger_events
+        where tenant_id = ${tenantId} and sku_id = ${sku('ST-1')}
+      `;
+      return (rows[0] as { m: number }).m;
+    });
+    const serials = Array.from({ length: 3 }, () => `SN-${ulid().slice(0, 16).toUpperCase()}`);
+    const key = ulid();
+    const res = await adjust(
+      {
+        warehouseId, skuId: sku('ST-1'), binId: binA,
+        quantityDelta: 3, reasonCode: 'stock-count', note: 'three serials in, under threshold',
+        serials,
+      },
+      key,
+    ).expect(201);
+    // The immediate path returns the same aggregate snapshot (A4).
+    expect(res.body.event.id).toBeNull();
+
+    // The three appended events (seq is per-warehouse gap-free; anything of
+    // this SKU above its prior max IS this batch).
+    const fresh = await withSql(async (sql) => {
+      return (await sql`
+        select id, seq from ledger_events
+        where tenant_id = ${tenantId} and sku_id = ${sku('ST-1')} and seq > ${beforeMax}
+        order by seq
+      `) as unknown as { id: string; seq: number }[];
+    });
+    expect(fresh).toHaveLength(3);
+    const firstEvent = fresh[0]!;
+
+    const audits = await auditRows('stock_adjustment.recorded');
+    const mine = audits.find((row) => row.reference === key);
+    expect(mine).toBeDefined();
+    expect(mine!.target_type).toBe('ledger_event');
+    expect(mine!.target_id).toBe(firstEvent.id);
   });
 
   // ── the closed reason vocabulary is pinned at BOTH layers ────────────────
@@ -1143,5 +1325,91 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
       post: { responses: Record<string, unknown> };
     };
     expect(adjustOps.post.responses['202']).toBeDefined();
+  });
+
+  // ── end-of-suite: the threshold drops to 0 ───────────────────────────────
+  // Every earlier test assumed threshold 10. These LAST tests lower it to 0 —
+  // after which EVERY adjust pends, and a single-serial pend (|delta| = 1 > 0)
+  // becomes expressible for the first time in the suite.
+
+  it('the owner lowers the threshold to 0; the GET reads it back', async () => {
+    const put = await putPolicy(0, ulid()).expect(200);
+    expect(put.body.quantityThreshold).toBe(0);
+    expect((await getPolicy().expect(200)).body.quantityThreshold).toBe(0);
+  });
+
+  it('flag flip to serial-tracked: a pend raised while the SKU was untracked refuses approval with the parity guard — the row stays pending', async () => {
+    // The pend is created while PLAIN-3 is flagless: serialIds frozen null.
+    const res = await adjust({
+      warehouseId, skuId: sku('PLAIN-3'), binId: binA,
+      quantityDelta: 5, reasonCode: 'stock-count', note: 'pends untracked',
+    }).expect(202);
+    const pendingId = res.body.pendingAdjustment.id as string;
+    expect(res.body.pendingAdjustment.serialIds).toBeNull();
+
+    // The SKU flips to serial-tracked while the pend waits.
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${sku('PLAIN-3')}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ serialTracked: true })
+      .expect(200);
+
+    // The approval rebuilds the command from the stored arms (no serials)
+    // against a now-serial-tracked SKU — the arm-required parity guard
+    // refuses, and the refusal is the pend's permanent answer.
+    const refused = await approve(pendingId).expect(400);
+    expect(refused.body.code).toBe('validation-failed');
+    // The filter renders the guard's detail prose as the title — the serial
+    // arm's parity guard, not some other 400.
+    expect(refused.body.title).toContain('supply serials');
+    expect((await pendRow(pendingId))!.status).toBe('pending');
+  });
+
+  it('flag flip to batch-tracked: the same refusal from the batch parity arm', async () => {
+    const res = await adjust({
+      warehouseId, skuId: sku('PLAIN-4'), binId: binA,
+      quantityDelta: 5, reasonCode: 'stock-count', note: 'pends untracked, batch flip',
+    }).expect(202);
+    const pendingId = res.body.pendingAdjustment.id as string;
+    expect(res.body.pendingAdjustment.batchId).toBeNull();
+
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${sku('PLAIN-4')}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ batchTracked: true })
+      .expect(200);
+
+    const refused = await approve(pendingId).expect(400);
+    expect(refused.body.code).toBe('validation-failed');
+    expect(refused.body.title).toContain('resolved batchRef must name it');
+    expect((await pendRow(pendingId))!.status).toBe('pending');
+  });
+
+  it('a single-serial pend approves with its exact id/seq pairing in both the snapshot and the outbox payload', async () => {
+    // |delta| = 1 > threshold 0 — the only way a single-serial movement pends.
+    const serial = `SN-${ulid().slice(0, 16).toUpperCase()}`;
+    const res = await adjust({
+      warehouseId, skuId: sku('ST-1'), binId: binA,
+      quantityDelta: 1, reasonCode: 'stock-count', note: 'one serial in under threshold 0',
+      serials: [serial],
+    }).expect(202);
+    const pendingId = res.body.pendingAdjustment.id as string;
+
+    const decision = await approve(pendingId).expect(200);
+    expect(decision.body.events).toHaveLength(1);
+    const event = decision.body.events[0];
+    // A SINGLE-serial apply keeps the pre-story contract: the exact pairing,
+    // not the aggregate null/null.
+    expect(event.id).not.toBeNull();
+    expect(event.seq).not.toBeNull();
+
+    // The outbox payload carries the SAME pairing — null on multi, exact here.
+    const notices = await outboxRows('stock_adjustment.approved');
+    const notice = notices.find((row) => row.payload.pendingAdjustmentId === pendingId);
+    expect(notice).toBeDefined();
+    expect(notice!.payload.eventId).toBe(event.id);
+    expect(notice!.payload.seq).toBe(event.seq);
   });
 });

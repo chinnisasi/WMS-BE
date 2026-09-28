@@ -19,6 +19,7 @@ import {
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
+import { ADJUSTMENT_PENDING_STATUSES } from '../../shared/db/schema';
 import { ADJUSTMENT_REASON_CODES } from './adjustment-reason';
 
 /** Trim at the validation boundary (the tenancy DTO pattern). */
@@ -780,7 +781,7 @@ export class StockAdjustmentPendingResponse {
 export class AdjustmentPendingsQuery {
   @ApiProperty({ required: false, description: "Filter by decision state — omitted means every status" })
   @IsOptional()
-  @IsIn(['pending', 'approved', 'rejected'])
+  @IsIn(ADJUSTMENT_PENDING_STATUSES as unknown as string[])
   status?: string;
 
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })

@@ -134,6 +134,19 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${skuAId}, ${binId}, ${batchAId}, 5000)`;
     await sql`insert into batch_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, batch_id, quantity)
       values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${skuBId}, ${binId}, ${batchBId}, 7000)`;
+
+    // Story 5-2's two tables — tenant-scoped RLS with the same fail-closed
+    // idiom but NO client column. Seeded so the no-tenant probe's zero below
+    // is the policy's answer, not an empty table.
+    await sql`insert into stock_adjustment_policies (id, tenant_id, quantity_threshold)
+      values (${uuidv7()}, ${tenantId}, 10)`;
+    await sql`insert into stock_adjustment_pendings (
+      id, tenant_id, warehouse_id, bin_id, sku_id, quantity_milli, reason_code, note,
+      occurred_at, requested_by, requested_at, status, threshold_quantity_at_request
+    ) values (
+      ${uuidv7()}, ${tenantId}, ${warehouseId}, ${binId}, ${skuAId}, 11000, 'stock-count', 'probe seed',
+      ${at}, ${actorId}, ${at}, 'pending', 10
+    )`;
   }, 60_000);
 
   afterAll(async () => {
@@ -368,10 +381,31 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
         expect(byClient.get(clientA)).toBeGreaterThan(0);
         expect(byClient.get(clientB)).toBeGreaterThan(0);
       }
+
+      // The 5-2 tables carry no client column — tenant-scoped, so the
+      // operator shape sees the seeded rows. This is what makes the
+      // no-tenant probe's zero (below) the policy's answer, not an empty
+      // table.
+      const pendings = await operator((tx) =>
+        tx`select count(*)::int as n from stock_adjustment_pendings where tenant_id = ${tenantId}`,
+      );
+      expect(countOf(pendings)).toBe(1);
+      const policies = await operator((tx) =>
+        tx`select count(*)::int as n from stock_adjustment_policies where tenant_id = ${tenantId}`,
+      );
+      expect(countOf(policies)).toBe(1);
     });
 
     it('a session with NO tenant variable sees zero rows (the existing fail-closed idiom is intact)', async () => {
-      for (const table of [...STAMPED_TABLES, 'clients']) {
+      // Story 5-2's two tables ride the same idiom — probed here so a table
+      // stamped with the tenant-isolation policy later without a probe here
+      // cannot ship fail-open.
+      for (const table of [
+        ...STAMPED_TABLES,
+        'clients',
+        'stock_adjustment_pendings',
+        'stock_adjustment_policies',
+      ]) {
         const unscoped = await probe.unsafe(
           `select count(*)::int as n from ${table} where tenant_id = '${tenantId}'::uuid`,
         );
