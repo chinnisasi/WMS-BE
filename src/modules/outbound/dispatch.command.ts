@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { auditEvents, idempotencyKeys, orderLines, orders, picks, skus } from '../../shared/db/schema';
+import { auditEvents, idempotencyKeys, orderLines, orders, picks, shipments, skus } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { assertExactQuantity, fromMilli, signedQuantity } from '../../shared/primitives/quantity';
 import { canonicalInstant, nowIso } from '../../shared/primitives/time';
@@ -261,6 +261,34 @@ export class DispatchCommandService {
         );
       }
 
+      // ── Story 4.6c auto-stamp: the order's labelled shipment, if any ────
+      // When the caller sends no free-text carrier arm, the adapter-issued
+      // carrier/tracking from the labelled shipment (4.6c) rides the
+      // dispatch record instead — the tracking lands on the ledger's
+      // reference docs (the durable shipment record this system already
+      // has) and on the snapshot. PER-ARM: a given free-text arm still wins
+      // (a manual courier recorded by hand is exactly the case the
+      // free-text fields exist for), and the PAYLOAD HASH is unchanged —
+      // the auto-stamp is not intent, so an existing key replays exactly
+      // as before this story.
+      const shipmentRows = await tx
+        .select({
+          carrierName: shipments.carrierName,
+          trackingNumber: shipments.trackingNumber,
+        })
+        .from(shipments)
+        .where(
+          and(
+            eq(shipments.tenantId, command.tenantId),
+            eq(shipments.orderId, order.id),
+            eq(shipments.status, 'labelled'),
+          ),
+        )
+        .limit(1);
+      const labelledShipment = shipmentRows[0] ?? null;
+      const stampedCarrierName = carrierName ?? labelledShipment?.carrierName ?? null;
+      const stampedTracking = trackingNumber ?? labelledShipment?.trackingNumber ?? null;
+
       // ── the flip (conditional — the exactly-once backstop) ──────────────
       const dispatchedAt = nowIso();
       const flipped = await tx
@@ -334,9 +362,11 @@ export class DispatchCommandService {
           // on the ledger timeline, so it speaks base units.
           dispatchedQty: fromMilli(dispatchedQty),
           // Optional and additive: the keys serialize only when present, so
-          // a dispatch with no carrier recorded carries neither.
-          ...(carrierName === null ? {} : { carrierName }),
-          ...(trackingNumber === null ? {} : { trackingNumber }),
+          // a dispatch with no carrier recorded carries neither. 4.6c: the
+          // labelled shipment's adapter-issued arms auto-stamp when the
+          // caller sent no free text (per-arm — a given arm wins).
+          ...(stampedCarrierName === null ? {} : { carrierName: stampedCarrierName }),
+          ...(stampedTracking === null ? {} : { trackingNumber: stampedTracking }),
         };
         const appended = await this.inventory.appendLedgerEventInTx(tx, {
           tenantId: command.tenantId,
@@ -425,8 +455,10 @@ export class DispatchCommandService {
           externalEventId: order.externalEventId,
           dispatchedBy: command.actorUserId,
           dispatchedAt: canonicalInstant(dispatchedAt),
-          carrierName,
-          trackingNumber,
+          // 4.6c: the labelled shipment's carrier/tracking auto-stamp when no
+          // free text was given (per-arm); free text wins when present.
+          carrierName: stampedCarrierName,
+          trackingNumber: stampedTracking,
           totalUnits: fromMilli(totalUnits),
           retiredReservationIds,
           lines: dispatchedLines,

@@ -4,6 +4,7 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { carrierConnections } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import type { TenantTx } from '../../shared/db/tenant-scope';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import type { Page } from '../../shared/primitives/pagination';
@@ -14,7 +15,7 @@ import type {
   DisconnectCarrierCommand,
   RotateCarrierCredentialCommand,
 } from './carrier.command';
-import { listCarrierAdapters } from './carrier-registry';
+import { getCarrierAdapter, listCarrierAdapters } from './carrier-registry';
 import type { CarrierAdapter } from './carrier-registry';
 import { MissingCarrierEncryptionKeyError, openCredential } from './carrier-credentials';
 import type { CarrierCredential } from './carrier-credentials';
@@ -24,6 +25,7 @@ import {
   carrierEncryptionUnavailable,
   invalidCursor,
 } from './carriers.errors';
+import type { CarrierLabelRequest, CarrierLabelResult } from './carrier-label-port';
 
 // The facade is the only sibling-facing seam (AD-6, architecture test): the
 // shapes a consumer needs ride along here so nothing imports the module's
@@ -36,8 +38,29 @@ export type {
 } from './carrier.command';
 export type { CarrierAdapter, CarrierCredentialField } from './carrier-registry';
 export type { CarrierCredential } from './carrier-credentials';
+export type { CarrierLabelRequest, CarrierLabelResult } from './carrier-label-port';
 
 export const DEFAULT_CARRIER_PAGE_SIZE = 50;
+
+/**
+ * The one entry the label command (Story 4.6c) uses to reach the port: look
+ * the adapter up by code and call its `label` arm. Living here keeps the
+ * outbound module's carriers import set to exactly `carriers.facade` — the
+ * registry lookup is seam glue, not a registry internal. Unreachable through
+ * the command path (the connection's carrier code was validated against the
+ * registry at connect time) — a loud stop, not a silent guess.
+ */
+export async function labelThroughAdapter(
+  carrierCode: string,
+  credential: CarrierCredential,
+  request: CarrierLabelRequest,
+): Promise<CarrierLabelResult> {
+  const adapter = getCarrierAdapter(carrierCode);
+  if (adapter === undefined) {
+    throw new Error(`No carrier adapter registered: ${carrierCode}`);
+  }
+  return adapter.label(credential, request);
+}
 
 export interface ListCarrierConnectionsQuery {
   readonly cursor?: string | undefined;
@@ -86,9 +109,12 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
  * FACE only: the sealed blob is not even selected (`CONNECTION_COLUMNS`), so
  * there is no path by which a list row could grow a secret.
  *
- * This story makes **no network calls** — `rate()`, `label()` and `track()`
- * are deliberately not declared anywhere. The port grows those arms in the
- * story that consumes them (labels: 4-6c; rating: deferred).
+ * Story 4.6c grew the port's first real arm: `label()` (and the in-transaction
+ * passthroughs + `labelThroughAdapter` the label command uses) — the DIRECT
+ * carriers' arms are typed refusals and `sandbox` is the in-process stand-in,
+ * so there are still **no network calls** and the backend gains no HTTP
+ * client. `rate()` and `track()` remain undeclared (rating: deferred;
+ * tracking writeback: the outbox event, Epic 7).
  */
 @Injectable()
 export class CarriersFacade {
@@ -201,32 +227,110 @@ export class CarriersFacade {
     if (!UUID_RE.test(connectionId)) {
       throw carrierConnectionNotFound();
     }
-    const sealed = await withTenantTransaction(this.db, tenantId, async (tx) => {
-      const rows = await tx
-        .select({ credentialSealed: carrierConnections.credentialSealed })
-        .from(carrierConnections)
-        .where(
-          and(eq(carrierConnections.id, connectionId), eq(carrierConnections.tenantId, tenantId)),
-        )
-        .limit(1);
-      return rows[0]?.credentialSealed ?? null;
-    });
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.openCredentialForAdapterUseInTx(tx, tenantId, connectionId),
+    );
+  }
+
+  /**
+   * **Story 4.6c — the label arm.** Resolve the connection → open its
+   * credential (the adapter-use rules above apply verbatim) → call the
+   * adapter's label arm → answer the result. Nothing is persisted or logged
+   * here — the credential is request-scoped plaintext and dies with this
+   * call; the caller that must remember WHICH credential it used stores the
+   * connection id (and the shipment row stores the adapter's answer, never
+   * the material).
+   *
+   * The tenant predicate is the whole security story (the 4-6c spec pins the
+   * e2e FIRST, alongside the first caller): a foreign tenant's connection id
+   * resolves to nothing inside a transaction stamped with THIS tenant's
+   * `app.tenant_id` — it reads as a plain 404, never a cross-tenant read.
+   */
+  async label(
+    tenantId: string,
+    connectionId: string,
+    request: CarrierLabelRequest,
+  ): Promise<CarrierLabelResult> {
+    const connection = await this.resolveConnection(tenantId, connectionId);
+    if (connection === null) {
+      throw carrierConnectionNotFound();
+    }
+    const credential = await this.openCredentialForAdapterUse(tenantId, connectionId);
+    return labelThroughAdapter(connection.carrierCode, credential, request);
+  }
+
+  /**
+   * The in-transaction passthroughs (the `getPickTasksInTx` precedent):
+   * 4-6c's shipment command runs ONE `withTenantTransaction`, and calling a
+   * facade method that opens its own would queue a second pool connection
+   * inside a held one — the documented pool-nesting deadlock. So the
+   * shipment command calls THESE on the same `tx` it already holds.
+   */
+  async resolveConnectionInTx(
+    tx: TenantTx,
+    tenantId: string,
+    connectionId: string,
+  ): Promise<CarrierConnectionView | null> {
+    if (!UUID_RE.test(connectionId)) {
+      return null;
+    }
+    const rows = await tx
+      .select(CONNECTION_COLUMNS)
+      .from(carrierConnections)
+      .where(and(eq(carrierConnections.id, connectionId), eq(carrierConnections.tenantId, tenantId)))
+      .limit(1);
+    const row = rows[0];
+    return row === undefined ? null : toConnectionView(row);
+  }
+
+  /** Same contract as `openCredentialForAdapterUse`, inside the caller's tx. */
+  async openCredentialForAdapterUseInTx(
+    tx: TenantTx,
+    tenantId: string,
+    connectionId: string,
+  ): Promise<CarrierCredential> {
+    const sealed = await this.readSealedCredentialInTx(tx, tenantId, connectionId);
     if (sealed === null) {
       throw carrierConnectionNotFound();
     }
-    try {
-      return openCredential(sealed);
-    } catch (err) {
-      if (err instanceof MissingCarrierEncryptionKeyError) {
-        // Same fault, same answer as connect/rotate — never a raw 500.
-        throw carrierEncryptionUnavailable();
-      }
-      // The blob is there and the key is there, but the envelope will not
-      // open: the realistic trigger is a key that was changed after this
-      // material was sealed (AES-GCM authenticates, so it fails closed rather
-      // than handing back garbage). The operator's way out is to rotate the
-      // connection under the current key, which the detail says.
-      throw carrierCredentialUnreadable(connectionId);
+    return openSealedCredential(sealed, connectionId);
+  }
+
+  private async readSealedCredentialInTx(
+    tx: TenantTx,
+    tenantId: string,
+    connectionId: string,
+  ): Promise<string | null> {
+    if (!UUID_RE.test(connectionId)) {
+      throw carrierConnectionNotFound();
     }
+    const rows = await tx
+      .select({ credentialSealed: carrierConnections.credentialSealed })
+      .from(carrierConnections)
+      .where(and(eq(carrierConnections.id, connectionId), eq(carrierConnections.tenantId, tenantId)))
+      .limit(1);
+    return rows[0]?.credentialSealed ?? null;
+  }
+}
+
+/**
+ * The one credential-open mapping, shared by the standalone and in-tx arms:
+ * a missing key and an unopenable blob are the same 503s either way — never
+ * a raw 500.
+ */
+function openSealedCredential(sealed: string, connectionId: string): CarrierCredential {
+  try {
+    return openCredential(sealed);
+  } catch (err) {
+    if (err instanceof MissingCarrierEncryptionKeyError) {
+      // Same fault, same answer as connect/rotate — never a raw 500.
+      throw carrierEncryptionUnavailable();
+    }
+    // The blob is there and the key is there, but the envelope will not
+    // open: the realistic trigger is a key that was changed after this
+    // material was sealed (AES-GCM authenticates, so it fails closed rather
+    // than handing back garbage). The operator's way out is to rotate the
+    // connection under the current key, which the detail says.
+    throw carrierCredentialUnreadable(connectionId);
   }
 }

@@ -30,6 +30,8 @@ import { SHORT_PICK_REASON_CODES } from './pick.command';
 import { MAX_DIMENSION_MM, MAX_SCAN_LINES, MAX_WEIGHT_GRAMS } from './pack.command';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 import { MAX_CARRIER_NAME_LENGTH, MAX_TRACKING_NUMBER_LENGTH } from './dispatch.command';
+import { SHIPMENT_STATUSES } from './shipment.command';
+import { MAX_MANIFEST_SHIPMENTS } from './manifest.command';
 import {
   PICKLIST_LINE_STATUSES,
   PICKLIST_STATUSES,
@@ -1258,4 +1260,165 @@ export class DispatchDto {
 export class DispatchResponse {
   @ApiProperty({ type: DispatchDto })
   dispatch!: DispatchDto;
+}
+
+// ── Label + manifest (Story 4.6c) ───────────────────────────────────────────
+
+/**
+ * POST /tenants/{tenantId}/outbound/orders/{orderId}/label body — the 4.6c
+ * label command. The connection is REQUIRED (a label generates through one
+ * configured carrier account); the measurements are OPTIONAL and share the
+ * pack bounds (the same constants — the two gates cannot disagree).
+ */
+export class LabelOrderDto {
+  @ApiProperty({
+    format: 'uuid',
+    description:
+      'The carrier connection (this tenant’s) the label generates through. A foreign tenant’s connection id is a 404.',
+  })
+  @IsUUID()
+  carrierConnectionId!: string;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: Number,
+    minimum: 1,
+    maximum: MAX_WEIGHT_GRAMS,
+    description: 'Optional parcel weight in grams, same bounds as pack. Absence is never an error.',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(MAX_WEIGHT_GRAMS)
+  weightGrams?: number | null;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: PackDimensionsDto,
+    description: 'Optional parcel dimensions in millimetres — all three sides together, or the object omitted.',
+  })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => PackDimensionsDto)
+  dimensionsMm?: PackDimensionsDto | null;
+}
+
+/** The shipment — one label per order, the adapter-issued identity of the parcel. */
+export class ShipmentDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ enum: [...SHIPMENT_STATUSES], description: 'labelled or manifested' })
+  status!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The connection the label generated through' })
+  carrierConnectionId!: string;
+
+  @ApiProperty({ description: 'The adapter code at label time' })
+  carrierCode!: string;
+
+  @ApiProperty({ description: 'The registry display name resolved at label time' })
+  carrierName!: string;
+
+  @ApiProperty({ description: 'The adapter-issued tracking number — what dispatch auto-stamps' })
+  trackingNumber!: string;
+
+  @ApiProperty({ description: 'The adapter’s opaque handle for the label document — never the bytes' })
+  labelDocumentRef!: string;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'Parcel weight in grams; null when unmeasured' })
+  weightGrams!: number | null;
+
+  @ApiProperty({ type: PackDimensionsDto, nullable: true, description: 'Parcel dimensions; null when unmeasured' })
+  dimensionsMm!: PackDimensionsDto | null;
+
+  @ApiProperty({ format: 'uuid', description: 'The operator who labelled it' })
+  labelledBy!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC label time' })
+  labelledAt!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The manifest the shipment closed onto; null while labelled' })
+  manifestId!: string | null;
+}
+
+export class ShipmentResponse {
+  @ApiProperty({ type: ShipmentDto })
+  shipment!: ShipmentDto;
+}
+
+/**
+ * POST /tenants/{tenantId}/warehouses/{warehouseId}/outbound/manifests body —
+ * the 4.6c manifest command: a non-empty, bounded set of labelled shipments,
+ * all on ONE carrier connection, all in this warehouse. Duplicates collapse
+ * and order is irrelevant (the set is the intent).
+ */
+export class CreateManifestDto {
+  @ApiProperty({
+    type: [String],
+    format: 'uuid',
+    minItems: 1,
+    maxItems: MAX_MANIFEST_SHIPMENTS,
+    description: 'The labelled shipments to close (≥ 1, at most 500; duplicates collapse).',
+  })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_MANIFEST_SHIPMENTS)
+  @IsUUID('all', { each: true })
+  shipmentIds!: string[];
+}
+
+/** One header row of the manifest list. */
+export class ManifestDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  tenantId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The ONE connection every closed shipment labelled through' })
+  carrierConnectionId!: string;
+
+  @ApiProperty({ description: 'The adapter code at manifest time' })
+  carrierCode!: string;
+
+  @ApiProperty({ description: 'How many shipments the manifest closed' })
+  shipmentCount!: number;
+
+  @ApiProperty({ format: 'uuid', description: 'The operator who created it' })
+  createdBy!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC manifest time' })
+  createdAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC manifest time' })
+  updatedAt!: string;
+}
+
+export class ManifestResponse {
+  @ApiProperty({ type: ManifestDto })
+  manifest!: ManifestDto;
+}
+
+export class ManifestListResponse {
+  @ApiProperty({ type: [ManifestDto] })
+  items!: ManifestDto[];
+
+  @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor; null when exhausted' })
+  nextCursor!: string | null;
 }

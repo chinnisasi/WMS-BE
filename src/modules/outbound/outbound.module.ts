@@ -2,11 +2,14 @@ import { Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { CatalogModule } from '../catalog/catalog.module';
+import { CarriersModule } from '../carriers/carriers.module';
 import { OrderCommandService } from './order.command';
 import { WaveCommandService } from './wave.command';
 import { PickCommandService } from './pick.command';
 import { PackCommandService } from './pack.command';
 import { DispatchCommandService } from './dispatch.command';
+import { ShipmentCommandService } from './shipment.command';
+import { ManifestCommandService } from './manifest.command';
 import { WAVE_CLOCK, SystemWaveClock } from './wave.clock';
 import { OutboundFacade } from './outbound.facade';
 
@@ -59,15 +62,28 @@ import { OutboundFacade } from './outbound.facade';
  * units off the reserved counter and corrects ATP. It writes no new table and
  * no inventory table (AD-6); the Valkey mirror rides `restoreReservedUnits`
  * after the commit, journal-first (4.4's ordering).
+ *
+ * Story 4.6c adds the label + manifest commands and their tables
+ * (`shipments`, `manifests` — module-exclusive). The label command generates
+ * the adapter label through `CarriersFacade`'s IN-TX passthroughs
+ * (`resolveConnectionInTx`, `openCredentialForAdapterUseInTx`) inside its own
+ * transaction — the pool-nesting rule (never call a facade method that opens
+ * its own transaction from inside a held one) — and the outbound module
+ * imports NOTHING else from carriers (the facade-only import the
+ * architecture guard pins). The manifest command closes labelled shipments
+ * for one connection; the dispatch command auto-stamps a labelled
+ * shipment's carrier/tracking when the caller sends no free text.
  */
 @Module({
-  imports: [SharedModule, InventoryModule, CatalogModule],
+  imports: [SharedModule, InventoryModule, CatalogModule, CarriersModule],
   providers: [
     OrderCommandService,
     WaveCommandService,
     PickCommandService,
     PackCommandService,
     DispatchCommandService,
+    ShipmentCommandService,
+    ManifestCommandService,
     { provide: WAVE_CLOCK, useClass: SystemWaveClock },
     OutboundFacade,
   ],

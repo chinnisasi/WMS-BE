@@ -22,7 +22,11 @@ import {
   DevicePackDto,
   DispatchOrderDto,
   DispatchResponse,
+  CreateManifestDto,
   GenerateWaveDto,
+  LabelOrderDto,
+  ManifestListResponse,
+  ManifestResponse,
   OrderListQuery,
   OrderListResponse,
   OrderResponse,
@@ -30,6 +34,7 @@ import {
   PackResponse,
   PickResponse,
   RecordPickDto,
+  ShipmentResponse,
   WaveListResponse,
   WavePolicyListResponse,
   WavePolicyResponse,
@@ -276,6 +281,88 @@ export class OutboundController {
     };
   }
 
+  // ── labels + manifests (Story 4.6c) ───────────────────────────────────────
+
+  @Post(':tenantId/outbound/orders/:orderId/label')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'labels.execute — generates the order’s carrier label through one of the tenant’s carrier connections. The adapter call runs AFTER every guard and before any write: on adapter failure nothing is written and the order stays ready_to_dispatch (retry is a fresh submit). One labelled shipment per order — there is no label regeneration once labelled. The DIRECT carriers’ label arms are not yet configured: they answer the typed, retryable carrier-transport-unconfigured refusal (501) verbatim. The order status does not move.',
+  })
+  @ApiBody({ type: LabelOrderDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: ShipmentResponse,
+    description:
+      'The shipment: the adapter tracking number and label document reference with the connection it generated through and the optional parcel measurements (the idempotency snapshot — a replay re-serves it, nothing re-labels)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key or path parameter, a non-uuid connection id, or an out-of-bounds weight/dimension (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Order, or the carrier connection, does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is not packable-state (it does not read ready_to_dispatch — conflict naming the status), or it already has a labelled or manifested shipment (conflict), or a concurrent idempotent request (conflict). Nothing is written') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiResponse({ status: 501, ...problemJsonResponse('The connection’s carrier has no label transport on this deployment — the DIRECT carriers’ typed, retryable refusal (carrier-transport-unconfigured). Nothing is written') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('CARRIER_ENCRYPTION_KEY is missing (carrier-encryption-unavailable) or the stored credential does not open under it (carrier-credential-unreadable — rotate the connection). Nothing is written') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async labelOrder(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: LabelOrderDto,
+  ): Promise<ShipmentResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.createShipmentLabel(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        orderId,
+        carrierConnectionId: dto.carrierConnectionId,
+        // `@IsOptional()` lets an explicit `null` through — normalized to
+        // absent so an unmeasured label hashes identically either way.
+        weightGrams: dto.weightGrams ?? undefined,
+        dimensionsMm: dto.dimensionsMm ?? undefined,
+      },
+      key,
+    );
+    return { shipment: { ...snapshot.shipment } };
+  }
+
+  @Get(':tenantId/outbound/orders/:orderId/shipment')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "One order's shipment — the adapter-issued tracking number and label document reference its label produced, whatever arm it now reads (labelled or manifested)",
+  })
+  @ApiOkResponse({ type: ShipmentResponse, description: 'The order’s shipment record' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed orderId path parameter (validation-failed — it must be a uuid)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No order with this id — or no shipment for it — exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async getShipment(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ShipmentResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const shipment = await this.outbound.getShipmentForOrder(tenantId, orderId);
+    if (shipment === null) {
+      throw orderNotFound(orderId);
+    }
+    return { shipment: { ...shipment } };
+  }
+
   @Get(':tenantId/outbound/orders/:orderId')
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
@@ -340,6 +427,82 @@ export class OutboundController {
     };
     const page = await this.outbound.listOrders(tenantId, warehouseId, listQuery);
     return { items: page.items.map((item) => ({ ...item, destination: toAddressDto(item.destination) })), nextCursor: page.nextCursor };
+  }
+
+  @Post(':tenantId/warehouses/:warehouseId/outbound/manifests')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'labels.execute — closes a set of labelled shipments (all on ONE carrier connection, all in this warehouse) onto the carrier. All-or-nothing: a set naming a foreign shipment, a manifested shipment or two connections writes nothing and names the offender. The flip to manifested is terminal — there is no un-manifest.',
+  })
+  @ApiBody({ type: CreateManifestDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: ManifestResponse,
+    description:
+      'The manifest: the connection it closed shipments for and the count (the idempotency snapshot — a replay re-serves it)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key or path parameter, or an invalid shipmentIds array (empty, over 500, or a non-uuid member) (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks labels.execute (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The named shipments do not exist in this tenant, belong to another warehouse, are not in the labelled state, or span carrier connections — the problem names the offender(s) (conflict). Nothing is written. Also: a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async createManifest(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: CreateManifestDto,
+  ): Promise<ManifestResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.outbound.createManifest(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        warehouseId,
+        // Duplicates collapse and order is irrelevant inside the command —
+        // the set is the intent (the aggregateScan rule).
+        shipmentIds: dto.shipmentIds,
+      },
+      key,
+    );
+    // The response carries the row's public face; the idempotency snapshot
+    // also holds the closed id set (the command's `ManifestSnapshot`).
+    return { manifest: { ...snapshot.manifest } };
+  }
+
+  @Get(':tenantId/warehouses/:warehouseId/outbound/manifests')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Lists one warehouse's manifests, newest first (keyset cursor pagination)" })
+  @ApiOkResponse({ type: ManifestListResponse, description: "The warehouse's manifest page (header rows — the shipments point back through their manifestId)" })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor or out-of-range limit (invalid-cursor / validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async listManifests(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: OrderListQuery,
+  ): Promise<ManifestListResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    const page = await this.outbound.listManifests(tenantId, warehouseId, {
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
   }
 
   // ── waves and picklists (Story 4.2) ───────────────────────────────────────

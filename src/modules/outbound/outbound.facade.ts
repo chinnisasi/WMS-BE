@@ -2,7 +2,16 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { handlingUnits, orders, picks, skus, wavePolicies, waves } from '../../shared/db/schema';
+import {
+  handlingUnits,
+  manifests,
+  orders,
+  picks,
+  shipments,
+  skus,
+  wavePolicies,
+  waves,
+} from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
@@ -29,6 +38,10 @@ import { PackCommandService } from './pack.command';
 import type { PackOrderCommand, PackSnapshot } from './pack.command';
 import { DispatchCommandService } from './dispatch.command';
 import type { DispatchOrderCommand, DispatchSnapshot } from './dispatch.command';
+import { ShipmentCommandService } from './shipment.command';
+import type { CreateShipmentLabelCommand, ShipmentSnapshot, ShipmentStatus } from './shipment.command';
+import { ManifestCommandService } from './manifest.command';
+import type { CreateManifestCommand, ManifestSnapshot } from './manifest.command';
 import type {
   CreateWavePolicyCommand,
   GenerateWaveCommand,
@@ -198,6 +211,43 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
   }
 }
 
+/** One header row of the manifest-list read (Story 4.6c). */
+export interface ManifestEntry {
+  readonly id: string;
+  readonly tenantId: string;
+  readonly warehouseId: string;
+  readonly carrierConnectionId: string;
+  readonly carrierCode: string;
+  readonly shipmentCount: number;
+  readonly createdBy: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/** The row → view mapping the read-back and the snapshot share (4.6c). */
+function toShipmentView(row: typeof shipments.$inferSelect): ShipmentSnapshot['shipment'] {
+  return {
+    id: row.id,
+    orderId: row.orderId,
+    tenantId: row.tenantId,
+    warehouseId: row.warehouseId,
+    status: row.status as ShipmentStatus,
+    carrierConnectionId: row.carrierConnectionId,
+    carrierCode: row.carrierCode,
+    carrierName: row.carrierName,
+    trackingNumber: row.trackingNumber,
+    labelDocumentRef: row.labelDocumentRef,
+    weightGrams: row.weightGrams,
+    dimensionsMm:
+      row.lengthMm !== null && row.widthMm !== null && row.heightMm !== null
+        ? { lengthMm: row.lengthMm, widthMm: row.widthMm, heightMm: row.heightMm }
+        : null,
+    labelledBy: row.labelledBy,
+    labelledAt: canonicalInstant(row.labelledAt),
+    manifestId: row.manifestId,
+  };
+}
+
 /**
  * The outbound module's public surface (Story 4.1): the ONLY way any other
  * module — or the api shell — consumes order state. The `orders` /
@@ -214,7 +264,46 @@ export class OutboundFacade {
     @Inject(PickCommandService) private readonly pickCommand: PickCommandService,
     @Inject(PackCommandService) private readonly packCommand: PackCommandService,
     @Inject(DispatchCommandService) private readonly dispatchCommand: DispatchCommandService,
+    @Inject(ShipmentCommandService) private readonly shipmentCommand: ShipmentCommandService,
+    @Inject(ManifestCommandService) private readonly manifestCommand: ManifestCommandService,
   ) {}
+
+  /** `POST .../outbound/orders/{orderId}/label` — the 4.6c label command. */
+  async createShipmentLabel(
+    command: CreateShipmentLabelCommand,
+    idempotencyKey: string,
+  ): Promise<ShipmentSnapshot> {
+    return this.shipmentCommand.createShipmentLabel(command, idempotencyKey);
+  }
+
+  /** `POST .../warehouses/{wid}/outbound/manifests` — the 4.6c manifest command. */
+  async createManifest(
+    command: CreateManifestCommand,
+    idempotencyKey: string,
+  ): Promise<ManifestSnapshot> {
+    return this.manifestCommand.createManifest(command, idempotencyKey);
+  }
+
+  /**
+   * The order's shipment read-back (Story 4.6c): the one shipment record an
+   * order's label arc produced, whatever arm it now reads. Unknown or
+   * foreign order id — or an order never labelled — is null → the api layer
+   * 404s (the `getOrder` shape). A read — never capability-gated.
+   */
+  async getShipmentForOrder(tenantId: string, orderId: string): Promise<ShipmentSnapshot['shipment'] | null> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select()
+        .from(shipments)
+        .where(and(eq(shipments.tenantId, tenantId), eq(shipments.orderId, orderId)))
+        .limit(1);
+      const row = rows[0];
+      if (row === undefined) {
+        return null;
+      }
+      return toShipmentView(row);
+    });
+  }
 
   /** `POST .../outbound/orders` — manual entry and (adapter-ready) ingestion. */
   async createOrder(command: CreateOrderCommand, idempotencyKey: string): Promise<OrderSnapshot> {
@@ -423,6 +512,54 @@ export class OutboundFacade {
         status: row.status as WaveStatus,
         releasedAt: row.releasedAt === null ? null : canonicalInstant(row.releasedAt),
         cancelledAt: row.cancelledAt === null ? null : canonicalInstant(row.cancelledAt),
+        createdAt: canonicalInstant(row.createdAt),
+        updatedAt: canonicalInstant(row.updatedAt),
+      }));
+      return buildPage(items, pageSize);
+    });
+  }
+
+  /**
+   * Warehouse-scoped manifest list (Story 4.6c): keyset cursor pagination
+   * over `(created_at, id)` (offset is banned — UX-DR25), newest first,
+   * header rows only. A read — never capability-gated; the warehouse must
+   * belong to the tenant (404 otherwise).
+   */
+  async listManifests(
+    tenantId: string,
+    warehouseId: string,
+    query: ListOrdersQuery = {},
+  ): Promise<Page<ManifestEntry>> {
+    const pageSize = query.limit ?? DEFAULT_OUTBOUND_PAGE_SIZE;
+    const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      const rows = await tx
+        .select({
+          id: manifests.id,
+          tenantId: manifests.tenantId,
+          warehouseId: manifests.warehouseId,
+          carrierConnectionId: manifests.carrierConnectionId,
+          carrierCode: manifests.carrierCode,
+          shipmentCount: manifests.shipmentCount,
+          createdBy: manifests.createdBy,
+          createdAt: manifests.createdAt,
+          updatedAt: manifests.updatedAt,
+        })
+        .from(manifests)
+        .where(
+          and(
+            eq(manifests.tenantId, tenantId),
+            eq(manifests.warehouseId, warehouseId),
+            before === undefined
+              ? undefined
+              : sql`(${manifests.createdAt}, ${manifests.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
+          ),
+        )
+        .orderBy(desc(manifests.createdAt), desc(manifests.id))
+        .limit(pageSize + 1);
+      const items = rows.map((row) => ({
+        ...row,
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       }));
