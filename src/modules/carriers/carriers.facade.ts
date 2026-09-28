@@ -25,11 +25,16 @@ import {
   carrierEncryptionUnavailable,
   invalidCursor,
 } from './carriers.errors';
-import type { CarrierLabelRequest, CarrierLabelResult } from './carrier-label-port';
+import type {
+  CarrierLabelRequest,
+  CarrierLabelResult,
+  CarrierRateRequest,
+  CarrierRateResult,
+} from './carrier-label-port';
 
 // The facade is the only sibling-facing seam (AD-6, architecture test): the
 // shapes a consumer needs ride along here so nothing imports the module's
-// internals. 4-6c's labels and (deferred) rating consume THIS file.
+// internals. 4-6c's labels and 4-6d's rate shopping consume THIS file.
 export type {
   CarrierConnectionView,
   ConnectCarrierCommand,
@@ -38,7 +43,12 @@ export type {
 } from './carrier.command';
 export type { CarrierAdapter, CarrierCredentialField } from './carrier-registry';
 export type { CarrierCredential } from './carrier-credentials';
-export type { CarrierLabelRequest, CarrierLabelResult } from './carrier-label-port';
+export type {
+  CarrierLabelRequest,
+  CarrierLabelResult,
+  CarrierRateRequest,
+  CarrierRateResult,
+} from './carrier-label-port';
 
 export const DEFAULT_CARRIER_PAGE_SIZE = 50;
 
@@ -60,6 +70,25 @@ export async function labelThroughAdapter(
     throw new Error(`No carrier adapter registered: ${carrierCode}`);
   }
   return adapter.label(credential, request);
+}
+
+/**
+ * The rate glue (Story 4.6d) — `labelThroughAdapter`'s twin for the port's
+ * second arm: look the adapter up by code and call its `rate` arm. Same
+ * contract, same unreachable-through-the-command-path stop. The rate read
+ * catches the DIRECT carriers' typed 501 per connection and renders it as a
+ * refused item; every other throw is the read's own failure.
+ */
+export async function rateThroughAdapter(
+  carrierCode: string,
+  credential: CarrierCredential,
+  request: CarrierRateRequest,
+): Promise<CarrierRateResult> {
+  const adapter = getCarrierAdapter(carrierCode);
+  if (adapter === undefined) {
+    throw new Error(`No carrier adapter registered: ${carrierCode}`);
+  }
+  return adapter.rate(credential, request);
 }
 
 export interface ListCarrierConnectionsQuery {
@@ -114,9 +143,10 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
  * inside its own transaction (the standalone facade `label()` that opened a
  * second transaction had no caller and is gone) — the DIRECT carriers' arms
  * are typed refusals and `sandbox` is the in-process stand-in, so there are
- * still **no network calls** and the backend gains no HTTP client. `rate()`
- * and `track()` remain undeclared (rating: deferred; tracking writeback: the
- * outbox event, Epic 7).
+ * still **no network calls** and the backend gains no HTTP client. Story 4.6d
+ * grew the second arm the same way — `rateThroughAdapter`, the glue the rate
+ * read consumes. `track()` remains undeclared (tracking writeback: the outbox
+ * event, Epic 7).
  */
 @Injectable()
 export class CarriersFacade {

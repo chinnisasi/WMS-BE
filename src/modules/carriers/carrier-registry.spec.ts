@@ -5,7 +5,7 @@ import {
   listCarrierAdapters,
   registerCarrierAdapter,
 } from './carrier-registry';
-import { unconfiguredLabelArm } from './carrier-label-port';
+import { unconfiguredLabelArm, unconfiguredRateArm } from './carrier-label-port';
 
 /**
  * The registry's guards (Story 4.6b). They run at IMPORT time, so a violation
@@ -23,6 +23,7 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
         code: 'delhivery',
         displayName: 'Delhivery (again)',
         label: unconfiguredLabelArm('delhivery'),
+        rate: unconfiguredRateArm('delhivery'),
         credentialFields: [field],
       }),
     ).toThrow('Carrier adapter already registered: delhivery');
@@ -36,6 +37,7 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
         code: 'spec-empty',
         displayName: 'Empty',
         label: unconfiguredLabelArm('spec-empty'),
+        rate: unconfiguredRateArm('spec-empty'),
         credentialFields: [],
       }),
     ).toThrow('declares no credential fields');
@@ -48,6 +50,7 @@ describe('registerCarrierAdapter (the import-time guards)', () => {
         code: 'spec-dupe-field',
         displayName: 'Dupe',
         label: unconfiguredLabelArm('spec-dupe-field'),
+        rate: unconfiguredRateArm('spec-dupe-field'),
         credentialFields: [field, { ...field, label: 'Other' }],
       }),
     ).toThrow('duplicate field: apiToken');

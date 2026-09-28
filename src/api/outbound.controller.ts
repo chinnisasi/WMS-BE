@@ -29,6 +29,7 @@ import {
   ManifestResponse,
   OrderListQuery,
   OrderListResponse,
+  OrderRatesResponse,
   OrderResponse,
   PackOrderDto,
   PackResponse,
@@ -361,6 +362,40 @@ export class OutboundController {
       throw orderNotFound(orderId);
     }
     return { shipment: { ...shipment } };
+  }
+
+  @Get(':tenantId/outbound/orders/:orderId/rates')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'One ready_to_dispatch order’s carrier rates — one quoted-or-refused item per live carrier connection, sorted by carrierCode. A READ: recomputed per request, no idempotency key, no capability, nothing stored. An order whose lines’ SKUs lack weight_grams is refused 409 naming the SKUs; the DIRECT carriers’ rate arms answer their typed verbatim 501 as refused items',
+  })
+  @ApiOkResponse({
+    type: OrderRatesResponse,
+    description:
+      'The rate list: a deterministic sandbox quote in integer paise, a DIRECT carrier’s verbatim 501 refusal, or an empty list when the tenant has no live carrier connection',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed orderId path parameter (validation-failed — it must be a uuid)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No order with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The order is not ratable (it does not read ready_to_dispatch — conflict naming the status), or a contributing line’s SKU carries no weight_grams (missing-sku-weight naming the SKUs). Nothing is written') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('CARRIER_ENCRYPTION_KEY is missing (carrier-encryption-unavailable) or a stored credential does not open under it (carrier-credential-unreadable — rotate the connection). Nothing is written') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'orderId', format: 'uuid' })
+  async getOrderRates(
+    @Param('tenantId') tenantId: string,
+    @Param('orderId') orderId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<OrderRatesResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(orderId, 'orderId');
+    const snapshot = await this.outbound.getOrderRates(tenantId, orderId);
+    if (snapshot === null) {
+      throw orderNotFound(orderId);
+    }
+    return { rates: { orderId: snapshot.rates.orderId, items: snapshot.rates.items.map((item) => ({ ...item })) } };
   }
 
   @Get(':tenantId/outbound/orders/:orderId')

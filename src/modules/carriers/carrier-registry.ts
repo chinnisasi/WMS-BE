@@ -5,15 +5,15 @@
  * tenant ship with, and what does each one need to be configured with.**
  *
  * An adapter here is a DECLARATIVE DESCRIPTOR: carrier code, display name,
- * the credential fields that carrier requires — and, since Story 4.6c, the
- * port's first real arm, `label` (credential + request → tracking number +
- * document ref; the shape lives in `carrier-label-port.ts`, whose types this
- * file imports). `rate()` and `track()` are still deliberately NOT declared
- * (rating is deferred; tracking writeback is the outbox event, Epic 7), and
- * a method signature guessed before its first caller is a shipped interface
- * to unpick. **This story still makes no network calls** and the backend
- * gains no HTTP client — the DIRECT carriers' label arms are typed refusals,
- * and `sandbox` is the in-process stand-in.
+ * the credential fields that carrier requires — and, since Stories 4.6c/4.6d,
+ * the port's two real arms, `label` (credential + request → tracking number +
+ * document ref) and `rate` (credential + request → integer paise; the shapes
+ * live in `carrier-label-port.ts`, whose types this file imports). `track()`
+ * is still deliberately NOT declared (tracking writeback is the outbox event,
+ * Epic 7), and a method signature guessed before its first caller is a
+ * shipped interface to unpick. **This story still makes no network calls**
+ * and the backend gains no HTTP client — the DIRECT carriers' label and rate
+ * arms are typed refusals, and `sandbox` is the in-process stand-in.
  *
  * The registry follows `inventory/ledger-registry.ts`, not a DI token: every
  * existing port seam in the repo (`LEDGER_ANCHOR_STORE`, `WAVE_CLOCK`, the
@@ -27,8 +27,13 @@
 // Runtime edge into the label port: the arms the four registrations below
 // wire on. Type-only in the reverse direction (carrier-label-port.ts imports
 // only types from here), so the import graph stays cycle-free.
-import { sandboxLabelArm, unconfiguredLabelArm } from './carrier-label-port';
-import type { CarrierLabelArm } from './carrier-label-port';
+import {
+  sandboxLabelArm,
+  sandboxRateArm,
+  unconfiguredLabelArm,
+  unconfiguredRateArm,
+} from './carrier-label-port';
+import type { CarrierLabelArm, CarrierRateArm } from './carrier-label-port';
 
 
 /** One credential field a carrier declares it needs to be configured with. */
@@ -43,7 +48,7 @@ export interface CarrierCredentialField {
   readonly description: string;
 }
 
-/** The carrier port: identity + credential requirements + the label arm. */
+/** The carrier port: identity + credential requirements + the two arms. */
 export interface CarrierAdapter {
   /** Stable machine code — the `carrier_connections.carrier_code` value. */
   readonly code: string;
@@ -57,6 +62,12 @@ export interface CarrierAdapter {
    * in-process stand-in. See `carrier-label-port.ts`.
    */
   readonly label: CarrierLabelArm;
+  /**
+   * Story 4.6d — the port's second real arm, grown beside `label` in the
+   * story that consumes it. Every registered carrier answers rate requests:
+   * quoted (sandbox) or refused (the DIRECT carriers' same typed 501).
+   */
+  readonly rate: CarrierRateArm;
 }
 
 const REGISTRY = new Map<string, CarrierAdapter>();
@@ -99,6 +110,7 @@ registerCarrierAdapter({
   code: 'delhivery',
   displayName: 'Delhivery',
   label: unconfiguredLabelArm('delhivery'),
+  rate: unconfiguredRateArm('delhivery'),
   credentialFields: [
     {
       name: 'apiToken',
@@ -119,6 +131,7 @@ registerCarrierAdapter({
   code: 'blue_dart',
   displayName: 'Blue Dart',
   label: unconfiguredLabelArm('blue_dart'),
+  rate: unconfiguredRateArm('blue_dart'),
   credentialFields: [
     {
       name: 'licenceKey',
@@ -145,6 +158,7 @@ registerCarrierAdapter({
   code: 'ecom_express',
   displayName: 'Ecom Express',
   label: unconfiguredLabelArm('ecom_express'),
+  rate: unconfiguredRateArm('ecom_express'),
   credentialFields: [
     {
       name: 'username',
@@ -175,6 +189,7 @@ registerCarrierAdapter({
   code: 'sandbox',
   displayName: 'Sandbox',
   label: sandboxLabelArm(),
+  rate: sandboxRateArm(),
   credentialFields: [
     {
       name: 'accountToken',

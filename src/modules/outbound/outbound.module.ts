@@ -10,6 +10,7 @@ import { PackCommandService } from './pack.command';
 import { DispatchCommandService } from './dispatch.command';
 import { ShipmentCommandService } from './shipment.command';
 import { ManifestCommandService } from './manifest.command';
+import { RateService } from './rate.service';
 import { WAVE_CLOCK, SystemWaveClock } from './wave.clock';
 import { OutboundFacade } from './outbound.facade';
 
@@ -73,6 +74,13 @@ import { OutboundFacade } from './outbound.facade';
  * architecture guard pins). The manifest command closes labelled shipments
  * for one connection; the dispatch command auto-stamps a labelled
  * shipment's carrier/tracking when the caller sends no free text.
+ *
+ * Story 4.6d adds the rate-shopping READ (`rate.service.ts`): one quoted-or-
+ * refused item per live carrier connection, aggregated from the order's
+ * lines × the SKU catalog's weights, recomputed per request and never
+ * stored. It reuses the same facade seam (`rateThroughAdapter`,
+ * `openCredentialForAdapterUseInTx`) and enumerates the connections through
+ * `listConnections` BEFORE its own transaction opens (the same rule).
  */
 @Module({
   imports: [SharedModule, InventoryModule, CatalogModule, CarriersModule],
@@ -84,6 +92,7 @@ import { OutboundFacade } from './outbound.facade';
     DispatchCommandService,
     ShipmentCommandService,
     ManifestCommandService,
+    RateService,
     { provide: WAVE_CLOCK, useClass: SystemWaveClock },
     OutboundFacade,
   ],

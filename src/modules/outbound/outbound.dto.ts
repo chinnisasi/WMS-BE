@@ -1431,3 +1431,61 @@ export class ManifestListResponse {
   @ApiProperty({ type: String, nullable: true, description: 'Opaque keyset cursor; null when exhausted' })
   nextCursor!: string | null;
 }
+
+// ── Rate shopping (Story 4.6d) ──────────────────────────────────────────────
+
+/** One quoted item's money — integer paise (AD-9), an INR rate. */
+export class RateQuoteDto {
+  @ApiProperty({
+    type: Number,
+    description: 'The quote in integer paise — the sandbox arm’s deterministic formula',
+  })
+  amountPaise!: number;
+}
+
+/** One refused item — the carrier's typed refusal, in the problem's own words. */
+export class RateRefusalDto {
+  @ApiProperty({ description: 'The machine-readable problem code the client branches on' })
+  code!: string;
+
+  @ApiProperty({ type: Number, description: 'The problem’s HTTP status (501 for an unconfigured transport)' })
+  status!: number;
+
+  @ApiProperty({ description: 'The problem’s title' })
+  title!: string;
+
+  @ApiProperty({ description: 'The problem’s detail' })
+  detail!: string;
+}
+
+/** One live connection's answer: quoted OR refused, exactly one. */
+export class RateItemDto {
+  @ApiProperty({ format: 'uuid', description: 'The carrier connection that produced this item' })
+  connectionId!: string;
+
+  @ApiProperty({ description: 'The adapter code (items are sorted by it)' })
+  carrierCode!: string;
+
+  @ApiProperty({ description: 'The carrier’s display name' })
+  carrierName!: string;
+
+  @ApiProperty({ type: RateQuoteDto, nullable: true, description: 'The quote — null on a refused item' })
+  quote!: RateQuoteDto | null;
+
+  @ApiProperty({ type: RateRefusalDto, nullable: true, description: 'The typed refusal — null on a quoted item' })
+  refusal!: RateRefusalDto | null;
+}
+
+/** The rate-shopping read's answer — recomputed per request, never stored. */
+export class OrderRatesDto {
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ type: [RateItemDto], description: 'One item per live carrier connection, sorted by carrierCode' })
+  items!: RateItemDto[];
+}
+
+export class OrderRatesResponse {
+  @ApiProperty({ type: OrderRatesDto })
+  rates!: OrderRatesDto;
+}

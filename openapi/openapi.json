@@ -5765,6 +5765,113 @@
         ]
       }
     },
+    "/tenants/{tenantId}/outbound/orders/{orderId}/rates": {
+      "get": {
+        "operationId": "OutboundController_getOrderRates",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The rate list: a deterministic sandbox quote in integer paise, a DIRECT carrier’s verbatim 501 refusal, or an empty list when the tenant has no live carrier connection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderRatesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed orderId path parameter (validation-failed — it must be a uuid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No order with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not ratable (it does not read ready_to_dispatch — conflict naming the status), or a contributing line’s SKU carries no weight_grams (missing-sku-weight naming the SKUs). Nothing is written",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "CARRIER_ENCRYPTION_KEY is missing (carrier-encryption-unavailable) or a stored credential does not open under it (carrier-credential-unreadable — rotate the connection). Nothing is written",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One ready_to_dispatch order’s carrier rates — one quoted-or-refused item per live carrier connection, sorted by carrierCode. A READ: recomputed per request, no idempotency key, no capability, nothing stored. An order whose lines’ SKUs lack weight_grams is refused 409 naming the SKUs; the DIRECT carriers’ rate arms answer their typed verbatim 501 as refused items",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
     "/tenants/{tenantId}/outbound/orders/{orderId}": {
       "get": {
         "operationId": "OutboundController_getOrder",
@@ -13677,6 +13784,121 @@
         },
         "required": [
           "shipment"
+        ]
+      },
+      "RateQuoteDto": {
+        "type": "object",
+        "properties": {
+          "amountPaise": {
+            "type": "number",
+            "description": "The quote in integer paise — the sandbox arm’s deterministic formula"
+          }
+        },
+        "required": [
+          "amountPaise"
+        ]
+      },
+      "RateRefusalDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The machine-readable problem code the client branches on"
+          },
+          "status": {
+            "type": "number",
+            "description": "The problem’s HTTP status (501 for an unconfigured transport)"
+          },
+          "title": {
+            "type": "string",
+            "description": "The problem’s title"
+          },
+          "detail": {
+            "type": "string",
+            "description": "The problem’s detail"
+          }
+        },
+        "required": [
+          "code",
+          "status",
+          "title",
+          "detail"
+        ]
+      },
+      "RateItemDto": {
+        "type": "object",
+        "properties": {
+          "connectionId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The carrier connection that produced this item"
+          },
+          "carrierCode": {
+            "type": "string",
+            "description": "The adapter code (items are sorted by it)"
+          },
+          "carrierName": {
+            "type": "string",
+            "description": "The carrier’s display name"
+          },
+          "quote": {
+            "nullable": true,
+            "description": "The quote — null on a refused item",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RateQuoteDto"
+              }
+            ]
+          },
+          "refusal": {
+            "nullable": true,
+            "description": "The typed refusal — null on a quoted item",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RateRefusalDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "connectionId",
+          "carrierCode",
+          "carrierName",
+          "quote",
+          "refusal"
+        ]
+      },
+      "OrderRatesDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "items": {
+            "description": "One item per live carrier connection, sorted by carrierCode",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RateItemDto"
+            }
+          }
+        },
+        "required": [
+          "orderId",
+          "items"
+        ]
+      },
+      "OrderRatesResponse": {
+        "type": "object",
+        "properties": {
+          "rates": {
+            "$ref": "#/components/schemas/OrderRatesDto"
+          }
+        },
+        "required": [
+          "rates"
         ]
       },
       "OrderEntryDto": {
