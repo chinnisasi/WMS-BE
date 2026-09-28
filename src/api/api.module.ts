@@ -9,6 +9,7 @@ import { ReceivingController } from './receiving.controller';
 import { PutawayController } from './putaway.controller';
 import { CarriersController } from './carriers.controller';
 import { ComplianceController } from './compliance.controller';
+import { MovementsController } from './movements.controller';
 import { OpenApiController } from './openapi.controller';
 import { NotFoundController } from './not-found.controller';
 import { OpenApiDocumentHolder } from './openapi-document.holder';
@@ -20,6 +21,7 @@ import { PutawayModule } from '../modules/putaway/putaway.module';
 import { CarriersModule } from '../modules/carriers/carriers.module';
 import { CatalogModule } from '../modules/catalog/catalog.module';
 import { TenancyModule } from '../modules/tenancy/tenancy.module';
+import { MovementsModule } from '../modules/movements/movements.module';
 
 /**
  * api shell: the only HTTP surface of the monolith. Story 1.1 exposes
@@ -56,7 +58,7 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
  * response DTO, so the shell has nothing to redact.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule],
+  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, MovementsModule],
   controllers: [
     HealthController,
     EchoController,
@@ -71,6 +73,10 @@ import { TenancyModule } from '../modules/tenancy/tenancy.module';
     // rides the same shape: `ComplianceModule` is a spine-singleton already
     // imported by the root; every mutation goes through `ExcursionFacade`.
     ComplianceController,
+    // Story 5-1 — the movements surface (the transfer-order lifecycle) rides
+    // the same shape: `MovementsModule` is a spine-singleton already imported
+    // by the root; every mutation goes through `MovementsFacade`.
+    MovementsController,
     OpenApiController,
     NotFoundController,
   ],

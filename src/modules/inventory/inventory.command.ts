@@ -19,7 +19,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
-import { QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
+import { IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { uomPrecision } from '../catalog/uom';
 import { LedgerService } from './ledger.service';
@@ -570,8 +570,14 @@ export class StockAdjustmentCommand {
     // The system QC-hold bin is hold/release-owned (story 3.4): an adjustment
     // moving stock into or out of it would drop ATP with no hold row and no
     // release path — only the QC hold/release commands ever move stock
-    // through it.
-    if (bin.systemOwned && bin.code === QC_HOLD_BIN_CODE) {
+    // through it. The system IN-TRANSIT bin is the movements module's
+    // (story 5-1) for the same reason: only a transfer's two legs ever move
+    // stock through it — an adjustment parking units there would strand them
+    // ATP-excluded with no transfer to complete and no drain path.
+    if (
+      bin.systemOwned &&
+      (bin.code === QC_HOLD_BIN_CODE || bin.code === IN_TRANSIT_BIN_CODE)
+    ) {
       throw new ProblemException(
         'qc-bin-not-adjustable',
         400,

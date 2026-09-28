@@ -2523,3 +2523,115 @@ export const manifests = pgTable(
 );
 
 export type Manifest = typeof manifests.$inferSelect;
+
+/**
+ * Transfer orders (Story 5-1, FR-18/FR-29): the two-leg relocation state
+ * machine the movements module owns. A transfer moves stock Bin→Bin (same
+ * warehouse) or Warehouse→Warehouse as TWO confirmed legs — outbound (source
+ * bin → the source warehouse's system IN-TRANSIT bin) and inbound (the
+ * in-transit units → the destination bin) — each leg writing its own ledger
+ * events correlated by `referenceDoc {kind:'transfer', transferId, lineId?}`.
+ * In-transit stock physically parks in the system IN-TRANSIT bin (the
+ * QC-hold precedent), so the serial-in-exactly-one-bin invariant survives and
+ * the ATP exclusion is one subtraction term (`inTransitUnits`, beside
+ * `qcHeldUnits`) — structural, not a new state flag.
+ *
+ * `status` is the four-valued lifecycle `draft | in_transit | completed |
+ * cancelled`: the outbound confirm flips draft→in_transit, the inbound confirm
+ * in_transit→completed, and cancel (draft-only — reversing an in-transit
+ * transfer is deferred) draft→cancelled. Every non-draft transition is
+ * refused with 409 `transfer-wrong-state` by the command; lines and
+ * quantities are immutable after create (corrections are new compensating
+ * orders). The DB backstop is a CHECK declared ONLY in the migration SQL
+ * (0043, the 0038/0025 pattern — CHECKs live only in migration SQL).
+ *
+ * No FKs anywhere (repo convention): `source_warehouse_id` /
+ * `dest_warehouse_id` / `created_by` and the lines' `sku_id` / `from_bin_id` /
+ * `to_bin_id` are bare uuids validated in the command transaction. RLS
+ * policy + the status CHECK live **only in the migration SQL** (0043).
+ */
+export const TRANSFER_STATUSES = ['draft', 'in_transit', 'completed', 'cancelled'] as const;
+export type TransferStatus = (typeof TRANSFER_STATUSES)[number];
+
+export const transferOrders = pgTable(
+  'transfer_orders',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    /** The warehouse the stock leaves (its IN-TRANSIT bin parks the units). */
+    sourceWarehouseId: uuid('source_warehouse_id').notNull(),
+    /** The warehouse the units land in — MAY equal the source (Bin→Bin). */
+    destWarehouseId: uuid('dest_warehouse_id').notNull(),
+    status: text('status').notNull().default('draft'),
+    /** The creator's free-text context; null when none was given. */
+    note: text('note'),
+    createdBy: uuid('created_by').notNull(),
+    /** When the outbound confirm flipped the order to `in_transit`. */
+    outboundConfirmedBy: uuid('outbound_confirmed_by'),
+    outboundConfirmedAt: timestamp('outbound_confirmed_at', { withTimezone: true, mode: 'string' }),
+    /** When the inbound confirm flipped the order to `completed`. */
+    inboundConfirmedBy: uuid('inbound_confirmed_by'),
+    inboundConfirmedAt: timestamp('inbound_confirmed_at', { withTimezone: true, mode: 'string' }),
+    /** When the cancel flipped the order to `cancelled` (draft-only). */
+    cancelledBy: uuid('cancelled_by'),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The transfer list's keyset pagination (created_at + id, standard cursor).
+    index('transfer_orders_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    // The device snapshot's inbound-task feed: in-transit transfers TO this
+    // warehouse.
+    index('transfer_orders_dest_warehouse_status_idx').on(
+      table.destWarehouseId,
+      table.status,
+    ),
+  ],
+);
+
+export type TransferOrder = typeof transferOrders.$inferSelect;
+
+/**
+ * One line of a transfer order. `quantity` is milli-units (AD-9 as amended by
+ * story 10.1; base units cross the wire, milli lives here and inside the
+ * commands). `from_bin_id` is the source-side bin the units draw from;
+ * `to_bin_id` is the PLANNED destination bin — at inbound confirm the
+ * operator's scanned bin (the mobile op's `destBinId`) is authoritative when
+ * carried (the pick precedent — the bin a line names is a suggestion
+ * re-derived at confirm time), falling back to this planned bin. `batch_ref`
+ * is the catalog `batches.id` when the line moves batch-tracked stock
+ * (REQUIRED for a batch-tracked SKU — the batch fold needs the identity);
+ * serial-tracked lines carry NO stored serial identity — the serials are
+ * scanned at outbound confirm and the inbound leg derives its serial arms
+ * from the outbound leg's own events (the qc.released precedent).
+ */
+export const transferOrderLines = pgTable(
+  'transfer_order_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    transferId: uuid('transfer_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** Milli-units — base UoM × 10³ (positive; CHECK in the migration). */
+    quantity: bigint('quantity_milli', { mode: 'number' }).notNull(),
+    fromBinId: uuid('from_bin_id').notNull(),
+    toBinId: uuid('to_bin_id').notNull(),
+    /** The catalog batch identity for a batch-tracked line; null otherwise. */
+    batchRef: text('batch_ref'),
+    note: text('note'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The transfer detail's line read and the leg-event correlation
+    // (`referenceDoc.lineId` names this id).
+    index('transfer_order_lines_transfer_id_idx').on(table.transferId, table.id),
+    // The line's SKU read (the gate/guard joins).
+    index('transfer_order_lines_sku_id_idx').on(table.skuId),
+  ],
+);
+
+export type TransferOrderLine = typeof transferOrderLines.$inferSelect;

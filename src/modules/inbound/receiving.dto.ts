@@ -565,6 +565,66 @@ export class CatalogHandlingUnitDto {
   skuId!: string;
 }
 
+/**
+ * One line of the device snapshot's Transfer inbox task (story 5-1, additive)
+ * — a planned landing bin + its epoch, the confirm's scan pre-fill.
+ */
+export class CatalogTransferTaskLineDto {
+  @ApiProperty({ format: 'uuid' })
+  lineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  skuName!: string | null;
+
+  @ApiProperty({ description: `Base units to land. ${QUANTITY_FIELD_DESCRIPTION}`, minimum: 0.001 })
+  qty!: number;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The catalog batch identity on a batch-tracked line' })
+  batchRef!: string | null;
+
+  @ApiProperty({ format: 'uuid', description: 'The PLANNED destination bin — the confirm scan pre-fills from it' })
+  destBinId!: string;
+
+  @ApiProperty()
+  destBinCode!: string;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'The dest bin\'s state epoch, captured with the task' })
+  binStateEpoch!: number | null;
+}
+
+/** One in-transit transfer of the device snapshot (story 5-1, additive) — the Transfer inbox task. */
+export class CatalogTransferTaskDto {
+  @ApiProperty({ format: 'uuid', description: 'The transfer order awaiting inbound confirm' })
+  transferId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The warehouse the units came from' })
+  sourceWarehouseId!: string;
+
+  @ApiProperty()
+  sourceWarehouseCode!: string;
+
+  @ApiProperty()
+  sourceWarehouseName!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  destWarehouseId!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  note!: string | null;
+
+  @ApiProperty({ description: 'When the outbound confirm put the units in transit (ISO-8601 UTC)' })
+  outboundConfirmedAt!: string;
+
+  @ApiProperty({ type: [CatalogTransferTaskLineDto] })
+  lines!: readonly CatalogTransferTaskLineDto[];
+}
+
 export class CatalogSnapshotResponse {
   @ApiProperty({ description: 'ISO-8601 UTC capture time' })
   generatedAt!: string;
@@ -592,4 +652,7 @@ export class CatalogSnapshotResponse {
 
   @ApiProperty({ type: [CatalogHandlingUnitDto], description: 'Story 10.7 (additive): every ACTIVE handling unit of the warehouse (id + skuId) — the labels a catch-weight bench scan resolves against, offline. Active-only self-prunes (units flip to packed at pack)' })
   handlingUnits!: readonly CatalogHandlingUnitDto[];
+
+  @ApiProperty({ type: [CatalogTransferTaskDto], description: 'Story 5-1 (additive): the in-transit transfers TO this warehouse — the Transfer inbox tasks whose inbound confirm the operator executes (one confirm completes the whole order)' })
+  transferTasks!: readonly CatalogTransferTaskDto[];
 }
