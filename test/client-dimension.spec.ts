@@ -71,7 +71,7 @@ describe('story 21-1: the client dimension — one system-owned self client per 
     const warehouseIds: readonly [string, string] = [uuidv7(), uuidv7()];
     const skuIds: readonly [string, string] = [uuidv7(), uuidv7()];
 
-    let seededEventHashes: string[] = [];
+    let seededRows: Record<string, unknown[]>;
 
     beforeAll(async () => {
       baseUrl = process.env.DATABASE_URL!;
@@ -112,11 +112,12 @@ describe('story 21-1: the client dimension — one system-owned self client per 
       // Seeding and applying belong HERE, not inside test #1 — a focused `-t`
       // run must still assert against a migrated database (the 10-1 lesson).
       await seedPreMigrationRows();
-      seededEventHashes = (
-        (await sql`select event_hash from ledger_events order by tenant_id, warehouse_id, seq`) as unknown as {
-          event_hash: string;
-        }[]
-      ).map((row) => row.event_hash);
+      // Capture every seeded row (ALL pre-existing columns, the new
+      // `client_id` excluded) BEFORE the migration applies — the byte-identity
+      // assertion below compares against this full-width snapshot, so the
+      // header's "all pre-existing columns are byte-identical" claim is proven
+      // at its full width, not just on two named columns.
+      seededRows = await captureStampedRows();
 
       // The apply runs inside ONE transaction — the atomicity model the real
       // runner uses, and the model the fail-fast guard + post-assertion are
@@ -193,6 +194,26 @@ describe('story 21-1: the client dimension — one system-owned self client per 
       })();
     }
 
+    /**
+     * Every row of the four stamped tables as a JSON object, keyed by table.
+     * `to_jsonb(t) - 'client_id'` carries ALL columns the row had — pre-0040
+     * (where the key doesn't exist yet, and subtracting a missing key is a
+     * no-op) and post-0040 alike — so a byte-for-byte comparison across the
+     * migration sees any touched value on any column, including ones this
+     * test never named. The order (by the row's text form, which includes the
+     * unique id) is deterministic.
+     */
+    async function captureStampedRows(): Promise<Record<string, unknown[]>> {
+      const snapshot: Record<string, unknown[]> = {};
+      for (const table of CLIENT_STAMPED_TABLES) {
+        const rows = (await sql`
+          select to_jsonb(t) - 'client_id' as row from ${sql(table)} t order by 1
+        `) as unknown as { row: unknown }[];
+        snapshot[table] = rows.map((entry) => entry.row);
+      }
+      return snapshot;
+    }
+
     it('creates exactly one system-owned self client per existing tenant, and none anywhere else', async () => {
       const clients = (await sql`
         select tenant_id, code, name, status, system_owned from clients order by tenant_id
@@ -249,15 +270,15 @@ describe('story 21-1: the client dimension — one system-owned self client per 
       }
     });
 
-    it('changes no representation: every pre-existing column and hash is byte-identical', async () => {
-      const afterHashes = (
-        (await sql`select event_hash from ledger_events order by tenant_id, warehouse_id, seq`) as unknown as {
-          event_hash: string;
-        }[]
-      ).map((row) => row.event_hash);
-      expect(afterHashes).toEqual(seededEventHashes);
+    it('changes no representation: every pre-existing column of every seeded row is byte-identical', async () => {
+      // The FULL-width comparison the migration header claims: all four
+      // stamped tables, all pre-existing columns (`client_id` is the only
+      // value the migration is allowed to introduce), all seeded rows. A
+      // stray rewrite of any column — a second quantity scale, a re-derived
+      // timestamp, a touched hash — shows up here as a diff on that row.
+      expect(await captureStampedRows()).toEqual(seededRows);
       // Quantities are milli-units, NOT re-scaled a second time by a stray
-      // backfill expression.
+      // backfill expression — named separately so a failure says why.
       const deltas = (await sql`
         select quantity_delta from ledger_events order by tenant_id, warehouse_id, seq
       `) as unknown as { quantity_delta: string }[];
