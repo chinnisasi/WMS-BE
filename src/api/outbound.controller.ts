@@ -381,6 +381,7 @@ export class OutboundController {
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No order with this id exists in this tenant (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('The order is not ratable (it does not read ready_to_dispatch — conflict naming the status), or a contributing line’s SKU carries no weight_grams (missing-sku-weight naming the SKUs). Nothing is written') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('CARRIER_ENCRYPTION_KEY is missing (carrier-encryption-unavailable) or a stored credential does not open under it (carrier-credential-unreadable — rotate the connection). Nothing is written') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'orderId', format: 'uuid' })
   async getOrderRates(

@@ -5849,6 +5849,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "CARRIER_ENCRYPTION_KEY is missing (carrier-encryption-unavailable) or a stored credential does not open under it (carrier-credential-unreadable — rotate the connection). Nothing is written",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
           }
         },
         "security": [

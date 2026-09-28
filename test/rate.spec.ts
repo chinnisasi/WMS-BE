@@ -7,6 +7,7 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
+import { MAX_QUANTITY_MILLI } from '../src/shared/primitives/quantity';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 
@@ -213,6 +214,17 @@ describe('carrier rate shopping: the read that prices one order against every li
         'tenants',
       ]) {
         await cleaner.unsafe(`DELETE FROM ${table} WHERE tenant_id = ANY($1::uuid[])`, [createdTenantIds]);
+      }
+      // `ledger_events` is append-only (a trigger rejects every DELETE,
+      // UPDATE and TRUNCATE) — the teardown disables the guard for its own
+      // rows only and re-enables it.
+      await cleaner.unsafe('ALTER TABLE ledger_events DISABLE TRIGGER ledger_events_append_only');
+      try {
+        await cleaner.unsafe(`DELETE FROM ledger_events WHERE tenant_id = ANY($1::uuid[])`, [
+          createdTenantIds,
+        ]);
+      } finally {
+        await cleaner.unsafe('ALTER TABLE ledger_events ENABLE TRIGGER ledger_events_append_only');
       }
       for (const tenant of createdTenantIds) {
         const keys = await valkey.keys(`wms:{${tenant}}:*`);
@@ -591,6 +603,29 @@ describe('carrier rate shopping: the read that prices one order against every li
     expect(quoted.quote!.amountPaise).toBe(expected);
   });
 
+  it('refuses cleanly when the aggregate crosses the JS safe-integer boundary, quoting nothing', async () => {
+    // The pathological-but-accepted edge: a line at MAX_QUANTITY_MILLI against
+    // a SKU weight at the 1,000,000 g cap aggregates past 2^53 grams, where a
+    // JS Number silently loses precision. The aggregate is exact in SQL; the
+    // JS boundary is guarded explicitly — a clean 409, never a wrong quote.
+    const { orderId, skuId } = await packedOrder(main, 'RATE-OK', 2, 'overflow');
+    try {
+      await sql`
+        update order_lines set qty = ${MAX_QUANTITY_MILLI}
+        where tenant_id = ${main.tenantId}::uuid and order_id = ${orderId}::uuid and sku_id = ${skuId}::uuid
+      `;
+      await sql`update skus set weight_grams = 1000000 where id = ${skuId}::uuid`;
+
+      const refused = await getRates(main, orderId).expect(409);
+      expect(refused.body.code).toBe('conflict');
+      expect(refused.body.detail).toContain('aggregated shippable weight');
+      expect(refused.body.detail).toContain('ratable range');
+    } finally {
+      // Restore the SKU's fixture weight — later scenarios rate it.
+      await sql`update skus set weight_grams = 1200 where id = ${skuId}::uuid`;
+    }
+  });
+
   // ── the missing-weight refusal ─────────────────────────────────────────────
 
   it('refuses the whole quote with 409 naming the unweighted SKUs, writing nothing', async () => {
@@ -606,18 +641,43 @@ describe('carrier rate shopping: the read that prices one order against every li
     expect(await writeCounts(main.tenantId)).toEqual(before);
   });
 
-  it('names every unweighted SKU in the refusal (the namedSample rule, two offenders)', async () => {
-    // The same order gains a SECOND unweighted contributing line (SQL-seeded,
-    // a bare kit-less line): the refusal names both, code-sorted.
+  it('names every unweighted SKU up to the namedSample cap, then counts the rest (… and N more)', async () => {
+    // The order gains unweighted contributing lines past the detail cap: two
+    // fixture SKUs plus twenty SQL-seeded ones → 22 offenders. The sample
+    // shows the first 20 code-sorted and the COUNT names the rest — the 21st
+    // and 22nd codes must NOT appear (a multi-kilobyte detail is unreadable
+    // to the operator and a payload amplification).
     const { orderId } = await packedOrder(main, 'RATE-UNWGT', 1, 'sample');
     await sql`
       insert into order_lines (id, tenant_id, order_id, sku_id, qty, reserved_qty, status, parent_line_id)
       values (${uuidv7()}::uuid, ${main.tenantId}::uuid, ${orderId}::uuid, ${skuOf(main, 'RATE-KIT')}::uuid,
               1000, 0, 'open', null)
     `;
+    const clientIdRow = (await sql`
+      select client_id from skus where tenant_id = ${main.tenantId}::uuid and code = 'RATE-KIT' limit 1
+    `)[0] as { client_id: string };
+    for (let i = 1; i <= 20; i += 1) {
+      const code = `RATE-X${String(i).padStart(2, '0')}`;
+      const skuId = uuidv7();
+      await sql`
+        insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode)
+        values (${skuId}::uuid, ${main.tenantId}::uuid, ${clientIdRow.client_id}::uuid,
+                ${code}, 'Rate sample overflow SKU', 'each', 1800, ${`RATE-SAMPLE-${ulid()}`})
+      `;
+      await sql`
+        insert into order_lines (id, tenant_id, order_id, sku_id, qty, reserved_qty, status, parent_line_id)
+        values (${uuidv7()}::uuid, ${main.tenantId}::uuid, ${orderId}::uuid, ${skuId}::uuid,
+                1000, 0, 'open', null)
+      `;
+    }
     const refused = await getRates(main, orderId).expect(409);
+    expect(refused.body.code).toBe('missing-sku-weight');
     expect(refused.body.detail).toContain('RATE-KIT');
     expect(refused.body.detail).toContain('RATE-UNWGT');
+    expect(refused.body.detail).toContain('RATE-X18');
+    expect(refused.body.detail).toContain('… and 2 more. Set the weights and retry.');
+    expect(refused.body.detail).not.toContain('RATE-X19');
+    expect(refused.body.detail).not.toContain('RATE-X20');
   });
 
   // ── the state and existence guards ─────────────────────────────────────────
@@ -648,6 +708,18 @@ describe('carrier rate shopping: the read that prices one order against every li
     expect(crossed.body.code).toBe('not-found');
   });
 
+  it('answers 403 when the SESSION belongs to another tenant than the path names', async () => {
+    // The bare tenant's order id, requested on the BARE tenant's route under
+    // the MAIN tenant's session: the tenancy guard refuses before anything
+    // reads (the tenancy.spec.ts foreign-session precedent).
+    const { orderId } = await packedOrder(bare, 'BARE-OK', 2, 'session-cross');
+    const crossed = await request(app.getHttpServer())
+      .get(`${API}/${bare.tenantId}/outbound/orders/${orderId}/rates`)
+      .set('Authorization', `Bearer ${main.ownerToken}`)
+      .expect(403);
+    expect(crossed.body.code).toBe('permission-denied');
+  });
+
   // ── the no-connections arm ─────────────────────────────────────────────────
 
   it('answers 200 with an EMPTY list when the tenant has no live carrier connection', async () => {
@@ -663,6 +735,41 @@ describe('carrier rate shopping: the read that prices one order against every li
   });
 
   // ── the credential seam ────────────────────────────────────────────────────
+
+  it('fails the WHOLE read with 503 when a stored credential does not open — a deployment fault is never a quote', async () => {
+    const { orderId } = await packedOrder(main, 'RATE-OK', 1, 'corrupt');
+    // Corrupt the DELHIVERY connection's sealed blob in place: the value
+    // still passes the 0025 envelope CHECK (`v1:%`) but AES-GCM
+    // authenticates — opening it under the suite's key fails closed (the
+    // label suite's re-seal precedent). The credential open sits BEFORE the
+    // adapter call, so the `throw err` rethrow fires: the whole read fails,
+    // no item carries the broken connection.
+    const original = (await sql`
+      select credential_sealed from carrier_connections
+      where id = ${delhiveryConnectionId}::uuid and tenant_id = ${main.tenantId}::uuid
+    `)[0] as { credential_sealed: string };
+    try {
+      await sql`
+        update carrier_connections set credential_sealed = 'v1:not-an-openable-blob'
+        where id = ${delhiveryConnectionId}::uuid
+      `;
+      const failed = await getRates(main, orderId).expect(503);
+      expect(failed.body.code).toBe('carrier-credential-unreadable');
+      expect(failed.body.detail).toContain('rotate the connection');
+      // No partial answer leaked: the read is all-or-nothing.
+      expect(failed.body.rates).toBeUndefined();
+    } finally {
+      await sql`
+        update carrier_connections set credential_sealed = ${original.credential_sealed}
+        where id = ${delhiveryConnectionId}::uuid
+      `;
+    }
+    // The read recovers once the credential opens again.
+    const recovered = await getRates(main, orderId).expect(200);
+    const rates = recovered.body.rates as { items: { connectionId: string }[] };
+    expect(rates.items).toHaveLength(2);
+    expect(rates.items.map((item) => item.connectionId)).toContain(delhiveryConnectionId);
+  });
 
   it('never leaks the sealed credential through the rates response or anything it reads', async () => {
     const { orderId } = await packedOrder(main, 'RATE-OK', 1, 'seal');

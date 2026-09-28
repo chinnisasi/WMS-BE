@@ -19,6 +19,10 @@ import type {
  */
 const TRANSPORT_UNCONFIGURED = 'carrier-transport-unconfigured';
 
+/** A byte comparison — the item sort's contract is byte-stable, never
+ * ICU-locale-dependent (`localeCompare` can reorder between environments). */
+const cmp = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);
+
 // ── snapshots ────────────────────────────────────────────────────────────────
 
 /** One quoted item's money — integer paise (AD-9), an INR rate. */
@@ -95,7 +99,10 @@ export interface OrderRatesSnapshot {
  * quote without weight is a lie, and the operator fixes the catalog and
  * retries. The sum runs in SQL over `numeric` — a milli-unit quantity times
  * a gram weight overflows JS numbers and bigint long before it overflows
- * numeric, and the read must not fail on the order it is trying to price.
+ * numeric, and the read must not fail on the order it is trying to price —
+ * the aggregate is exact in SQL, and the JS boundary it is handed over is
+ * guarded explicitly: past 2^53 grams the read refuses with a clean 409, not
+ * a silently-wrong quote.
  *
  * ── the adapter calls ────────────────────────────────────────────────────────
  *
@@ -215,6 +222,18 @@ export class RateService {
         throw missingWeight([]);
       }
       const weightGrams = Number(weightRow.totalGrams);
+      // The SQL aggregate is exact in `numeric`, but handing it to JS re-opens
+      // the boundary the text cast was bought to close: a pathological
+      // (accepted-bounds) order can aggregate past 2^53 grams, and a
+      // `Number` beyond that silently loses precision — a wrong quote, the
+      // one thing a rate read must never be. The boundary is guarded
+      // explicitly: past it the read refuses cleanly instead of mispricing.
+      if (!Number.isSafeInteger(weightGrams)) {
+        throw rateConflict(
+          'Order cannot be rated',
+          'The order’s aggregated shippable weight exceeds the ratable range.',
+        );
+      }
 
       // ── per live connection: open the credential in-tx, call the glue ───
       const items: RateItem[] = [];
@@ -258,11 +277,11 @@ export class RateService {
       }
 
       // The item order is a contract (the matrix): carrierCode ascending —
-      // deterministic regardless of the connection walk's recency order.
-      items.sort(
-        (a, b) =>
-          a.carrierCode.localeCompare(b.carrierCode) || a.connectionId.localeCompare(b.connectionId),
-      );
+      // deterministic regardless of the connection walk's recency order. The
+      // comparator is a byte comparison, not `localeCompare`: the contract is
+      // byte-stable, and an ICU-locale-dependent comparator can reorder codes
+      // (case folding, collation tables) between environments.
+      items.sort((a, b) => cmp(a.carrierCode, b.carrierCode) || cmp(a.connectionId, b.connectionId));
 
       return { rates: { orderId: order.id, items } };
     });
