@@ -41,7 +41,7 @@ import {
 // reason).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
-  CountVarianceEntryResponseDto,
+  CountVarianceListResponse,
   ResolveCountVarianceDto,
   ResolveCountVarianceResponse,
   SetVariancePolicyDto,
@@ -525,7 +525,7 @@ export class MovementsController {
     summary: 'Lists count variances (keyset cursor pagination, newest first, status/warehouse-filterable; never capability-gated — the resolving mutation is variances.resolve)',
   })
   @ApiOkResponse({
-    type: CountVarianceEntryResponseDto,
+    type: CountVarianceListResponse,
     description: "The tenant's variance page (newest first, keyset cursor)",
   })
   @ApiResponse({ status: 400, ...problemJsonResponse('Malformed status/warehouseId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)') })
@@ -536,7 +536,7 @@ export class MovementsController {
     @Param('tenantId') tenantId: string,
     @CurrentSession() session: TenantSession,
     @Query() query: CountVarianceListQuery,
-  ): Promise<{ items: CountVarianceEntryResponseDto[]; nextCursor: string | null }> {
+  ): Promise<CountVarianceListResponse> {
     assertOwnTenantToken(session.tenantId, tenantId);
     const page = await this.movements.listCountVariances(tenantId, {
       status: query.status,
@@ -566,7 +566,7 @@ export class MovementsController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks variances.resolve (role-denied), or an over-threshold variance resolved by a role below owner (variance-owner-required)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The variance, its count task, or its bin does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The variance is already resolved (variance-resolved), the task\'s frozen bin epoch no longer matches (variance-basis-moved — recount is the remedy), the bin already has an open count task (count-task-open), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The variance is already resolved (variance-resolved), the task\'s frozen bin epoch no longer matches (variance-basis-moved — recount is the remedy), the bin already has an open count task on the RECOUNT arm (count-task-open — approve_adjust under an open sibling task is legal), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'varianceId', format: 'uuid' })

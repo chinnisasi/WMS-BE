@@ -1284,6 +1284,13 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
     let v3 = '';
     let vBin3bId = ''; // the basis-moved variance (resolved by recount)
     let v4 = '';
+    // The at-threshold boundary variance and its replay fixtures (minted by
+    // the at-threshold arm, read back by the replay arm right after).
+    let vAtThreshold = '';
+    let vAtSeqs: number[] = [];
+    let vAtKey = '';
+    let vAtBin = '';
+    let vAtSnapshot: Record<string, unknown> | null = null;
 
     const vseed = async (binId: string, quantityDelta: number): Promise<void> => {
       // All four bins live in W1 (the count surfaces' warehouse).
@@ -1789,6 +1796,63 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       }
     });
 
+    it('an at-threshold variance is stamped but notifies no one; the ops manager resolves it (the boundary is strictly greater)', async () => {
+      // |delta| exactly equal to the threshold: over-threshold is STRICTLY
+      // greater (`>`), so the row still carries the frozen stamp and the
+      // owner-only gate does NOT close — the ops manager resolves it like
+      // any under-threshold variance.
+      const bin = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${vzoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 1000, type: 'shelf', code: 'V-01-06' })
+          .expect(201)
+      ).body.id as string;
+      vAtBin = bin;
+      await vseed(bin, 4);
+      const task = await createCount({ warehouseId, binId: bin }).expect(201);
+      await submitCount(task.body.countTask.id as string, {
+        lines: [{ skuId: skuIds.get(PLAIN), countedQuantity: 9 }],
+      }, deviceOperatorToken).expect(200);
+      vAtThreshold = await varianceIdOf(task.body.countTask.id as string, skuIds.get(PLAIN)!);
+      // Stamped like any row under the policy…
+      expect((await varianceRow(vAtThreshold)).threshold_quantity_milli).toBe(5000);
+      // …but the boundary excluded it from the owner routing: no event.
+      const forVariance = (await outboxPayloads('count.variance.threshold_exceeded')).filter(
+        (payload) => payload.varianceId === vAtThreshold,
+      );
+      expect(forVariance).toHaveLength(0);
+      // The ops manager's resolution goes through (the manager verb; the
+      // owner-only gate is over-threshold only).
+      const seqs = await warehouseSeqs(warehouseId);
+      vAtSeqs = seqs.slice(0, 2);
+      vAtKey = ulid();
+      const res = await resolveVariance(vAtThreshold, {
+        decision: 'approve_adjust',
+        consideredEventSeqs: vAtSeqs,
+      }, opsToken, vAtKey).expect(200);
+      vAtSnapshot = res.body as Record<string, unknown>;
+      expect(res.body.variance.status).toBe('adjusted');
+      expect(res.body.variance.thresholdQuantity).toBe(5);
+      // The correction landed once: 4 + 5 = 9.
+      expect(await onHandMilli(warehouseId, skuIds.get(PLAIN)!, bin)).toBe(9000);
+    });
+
+    it('replays an approve_adjust whose retry reorders and duplicates the consulted seqs (the statement names a SET)', async () => {
+      // The same key, the same arm, the seqs reversed WITH a duplicate
+      // appended: the fingerprint hashes the normalized SET — deduped,
+      // ascending — so the retry replays the stored snapshot instead of
+      // answering 422 idempotency-key-reuse.
+      const replay = await resolveVariance(vAtThreshold, {
+        decision: 'approve_adjust',
+        consideredEventSeqs: [vAtSeqs[1]!, vAtSeqs[0]!, vAtSeqs[0]!],
+      }, opsToken, vAtKey).expect(200);
+      expect(replay.body).toEqual(vAtSnapshot);
+      // Nothing re-applied: the correction is the first arm's, still.
+      expect(await onHandMilli(warehouseId, skuIds.get(PLAIN)!, vAtBin)).toBe(9000);
+    });
+
     it('fences the roles: the floor cannot resolve or write the policy, foreign callers stay out', async () => {
       // One more open variance for the 403 arms.
       const task = await createCount({ warehouseId, binId: vbin1 }).expect(201);
@@ -1805,6 +1869,12 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       expect(opPolicy.body.code).toBe('role-denied');
       const foreign = await resolveVariance(varianceId, { decision: 'recount' }, otherTenantToken, ulid()).expect(403);
       expect(foreign.body.code).toBe('permission-denied'); // the token's tenant ≠ the path tenant
+      // The two READS are not capability-gated — their only fence is the
+      // same tenant gate, which the foreign token fails identically.
+      const foreignQueue = await listVariances('', otherTenantToken).expect(403);
+      expect(foreignQueue.body.code).toBe('permission-denied');
+      const foreignPolicy = await getVariancePolicy(otherTenantToken).expect(403);
+      expect(foreignPolicy.body.code).toBe('permission-denied');
       const unknownId = await resolveVariance(randomUUID(), { decision: 'recount' }, ownerToken, ulid()).expect(404);
       expect(unknownId.body.code).toBe('not-found');
       // …and the owner's own resolution still comes first in this describe's
@@ -1873,12 +1943,14 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       expect(retired.body.retiredAt).not.toBeNull();
       // Retirement writes no ledger event and no epoch bump — the frozen
       // basis still matches, so the resolve reaches the correction's guard
-      // set (not 409 variance-basis-moved).
+      // set (not 409 variance-basis-moved). The statement is CAPPED at the
+      // DTO's ArrayMaxSize(200) — the full ledger walk would overshoot the
+      // max-count and fail this case on the wrong error cell.
       const seqs = await warehouseSeqs(warehouseId);
       const ledgerBefore = await ledgerCount();
       const res = await resolveVariance(varianceId, {
         decision: 'approve_adjust',
-        consideredEventSeqs: seqs,
+        consideredEventSeqs: seqs.slice(0, 200),
       }, ownerToken).expect(400);
       expect(res.body.code).toBe('bin-retired');
       // The rollback: the variance is still open, no stockCorrection event
@@ -1892,6 +1964,100 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
         (payload) => payload.varianceId === varianceId,
       );
       expect(echoes).toHaveLength(0);
+    });
+
+    it('refuses consulted seqs another warehouse wrote (the probe is warehouse-scoped)', async () => {
+      // W3's ledger holds at least one event; W2 (the policy arms' warehouse,
+      // never stock-touched) stays ledger-empty. A stated seq that exists in
+      // the tenant's OTHER warehouse but not in the variance's own warehouse
+      // is refused — the probe reads ONE warehouse's ledger, so a value that
+      // exists somewhere in the tenant is not enough.
+      let w3Seqs = (await sql`
+        select seq from ledger_events
+        where tenant_id = ${tenantId}::uuid and warehouse_id = ${schedulerWarehouseId}::uuid
+        order by seq asc`).map((row) => Number((row as { seq: number }).seq));
+      if (w3Seqs.length === 0) {
+        // W3 has no ledger yet — mint one through the adjustment vocabulary.
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/inventory/adjustments`)
+          .set('Authorization', `Bearer ${opsToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({
+            warehouseId: schedulerWarehouseId,
+            skuId: skuIds.get(PLAIN),
+            binId: binSched,
+            quantityDelta: 1,
+            reasonCode: 'stock-count',
+            note: 'count-suite 5-4 probe seed',
+          })
+          .expect(201);
+        w3Seqs = [(await sql`
+          select seq from ledger_events
+          where tenant_id = ${tenantId}::uuid and warehouse_id = ${schedulerWarehouseId}::uuid
+          order by seq asc limit 1`)[0] as unknown as { seq: number }].map((row) => Number(row.seq));
+      }
+      const otherSeq = w3Seqs[0]!;
+      // The variance lives in W2 — a warehouse whose ledger is empty.
+      const zone = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${policyWarehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'P', name: 'Zone P (5-4 probe)' })
+        .expect(201);
+      const bin = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${policyWarehouseId}/zones/${zone.body.id}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 1000, type: 'shelf', code: 'P-01-01' })
+          .expect(201)
+      ).body.id as string;
+      const task = await createCount({ warehouseId: policyWarehouseId, binId: bin }).expect(201);
+      await submitCount(task.body.countTask.id as string, {
+        lines: [{ skuId: skuIds.get(PLAIN), countedQuantity: 3 }],
+      }, deviceOperatorToken).expect(200);
+      const varianceId = await varianceIdOf(task.body.countTask.id as string, skuIds.get(PLAIN)!);
+      const res = await resolveVariance(varianceId, {
+        decision: 'approve_adjust',
+        consideredEventSeqs: [otherSeq],
+      }, ownerToken, ulid()).expect(400);
+      expect(res.body.code).toBe('validation-failed');
+      expect(String(res.body.detail)).toContain(String(otherSeq)); // the refused seq echoed
+      expect((await varianceRow(varianceId)).status).toBe('open');
+    });
+
+    it('stores the statement on the recount arm: the row and the outbox echo both carry it', async () => {
+      // The recount arm's seqs are OPTIONAL — but a stated statement is part
+      // of the resolution's record: stored on the row and echoed in the
+      // outbox payload (both non-null), not dropped between row and event.
+      const bin = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${vzoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 1000, type: 'shelf', code: 'V-01-07' })
+          .expect(201)
+      ).body.id as string;
+      await vseed(bin, 6);
+      const task = await createCount({ warehouseId, binId: bin }).expect(201);
+      await submitCount(task.body.countTask.id as string, {
+        lines: [{ skuId: skuIds.get(PLAIN), countedQuantity: 2 }],
+      }, deviceOperatorToken).expect(200); // expected 6 − counted 2 → delta −4
+      const varianceId = await varianceIdOf(task.body.countTask.id as string, skuIds.get(PLAIN)!);
+      const stated = (await warehouseSeqs(warehouseId)).slice(0, 2);
+      const res = await resolveVariance(varianceId, {
+        decision: 'recount',
+        consideredEventSeqs: stated,
+      }, ownerToken, ulid()).expect(200);
+      expect(res.body.variance.status).toBe('recounted');
+      expect(res.body.variance.recountTaskId).toBeTruthy();
+      expect(res.body.variance.consideredEventSeqs).toEqual(stated);
+      expect((await varianceRow(varianceId)).considered_event_seqs).toEqual(stated);
+      const echoes = (await outboxPayloads('count.variance.resolved')).filter(
+        (payload) => payload.varianceId === varianceId,
+      );
+      expect(echoes).toHaveLength(1);
+      expect(echoes[0]!.consideredEventSeqs).toEqual(stated);
     });
   });
 });

@@ -11429,7 +11429,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/CountVarianceEntryResponseDto"
+                  "$ref": "#/components/schemas/CountVarianceListResponse"
                 }
               }
             }
@@ -11574,7 +11574,7 @@
             }
           },
           "409": {
-            "description": "The variance is already resolved (variance-resolved), the task's frozen bin epoch no longer matches (variance-basis-moved — recount is the remedy), the bin already has an open count task (count-task-open), or a concurrent idempotent request (conflict)",
+            "description": "The variance is already resolved (variance-resolved), the task's frozen bin epoch no longer matches (variance-basis-moved — recount is the remedy), the bin already has an open count task on the RECOUNT arm (count-task-open — approve_adjust under an open sibling task is legal), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -20230,6 +20230,24 @@
           "recountTaskId",
           "consideredEventSeqs",
           "createdAt"
+        ]
+      },
+      "CountVarianceListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CountVarianceEntryResponseDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
         ]
       },
       "ResolveCountVarianceDto": {

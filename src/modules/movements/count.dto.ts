@@ -274,6 +274,12 @@ export class SetVariancePolicyDto {
   @IsOptional()
   @Type(() => Number)
   @IsNumber({ allowNaN: false, allowInfinity: false })
+  // The milli-units conversion (`thresholdToMilli`) multiplies by QUANTITY_SCALE —
+  // a fractional BASE-unit threshold would invent milli-units the stored
+  // integer column cannot carry, and the command refuses non-whole input
+  // anyway (the 5-2 `AdjustmentPolicyDto` note); refusing here names the
+  // field in the 400 instead of a 500 from the overflow assert.
+  @IsInt()
   @Min(0)
   @Max(MAX_VARIANCE_THRESHOLD_BASE)
   quantityThreshold?: number | null;
@@ -392,7 +398,7 @@ export class CountVarianceEntryResponseDto {
   epochConflict!: boolean;
 
   @ApiProperty({ enum: [...COUNT_VARIANCE_STATUSES] })
-  status!: string;
+  status!: (typeof COUNT_VARIANCE_STATUSES)[number];
 
   // The explicit `type` on every nullable-optional scalar (the 5-3
   // `SubmitCountResponse.recountTaskId` idiom): jest's transpile emits no
@@ -419,6 +425,15 @@ export class CountVarianceEntryResponseDto {
 
   @ApiProperty()
   createdAt!: string;
+}
+
+/** GET …/movements/variances response (the 5-5-destined resolution queue). */
+export class CountVarianceListResponse {
+  @ApiProperty({ type: [CountVarianceEntryResponseDto] })
+  items!: readonly CountVarianceEntryResponseDto[];
+
+  @ApiProperty({ type: String, nullable: true, required: false })
+  nextCursor?: string | null;
 }
 
 /** POST …/movements/variances/:varianceId/resolve response. */

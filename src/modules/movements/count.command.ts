@@ -14,6 +14,8 @@ import {
   skus,
   type CountTask,
 } from '../../shared/db/schema';
+// Type-only: the status tuple's element type rides `typeof` — no runtime use.
+import type { COUNT_VARIANCE_STATUSES } from '../../shared/db/schema';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
 import type { SignedQuantity } from '../../shared/primitives/quantity';
 import { uuidv7 } from '../../shared/primitives/ids';
@@ -220,7 +222,9 @@ export interface ResolveCountVarianceCommand {
    * the approve arm — an explicit stock correction that consulted no
    * history is exactly the silent write-off the epic forbids; optional on
    * the recount arm (the recount task's snapshot is its new basis, made
-   * after the resolution runs). Each seq a whole number ≥ 1.
+   * after the resolution runs). The per-seq shape checks (whole numbers ≥ 1)
+   * live in the wire DTO; this command checks the set's SIZE (at most
+   * `CONSIDERED_SEQS_MAX`) and the approve arm's non-empty requirement only.
    */
   readonly consideredEventSeqs?: readonly number[] | undefined;
   readonly occurredAt?: string | undefined;
@@ -242,7 +246,8 @@ export interface CountVarianceEntry {
   readonly delta: number;
   /** A movement moved the bin between task start and submit (OQ-2). */
   readonly epochConflict: boolean;
-  readonly status: string;
+  /** The DB CHECK's vocabulary — the mirrored tuple, not a bare string. */
+  readonly status: (typeof COUNT_VARIANCE_STATUSES)[number];
   /** The submit-frozen threshold in BASE units; null = no policy (disabled). */
   readonly thresholdQuantity: number | null;
   readonly resolvedBy: string | null;
@@ -328,13 +333,13 @@ function varianceOwnerRequired(varianceId: string): ProblemException {
   );
 }
 
-/** The frozen bin epoch no longer equals the live one — approve-adjust refuses. */
-function varianceBasisMoved(varianceId: string, liveEpoch: number | null): ProblemException {
+/** The task's frozen bin epoch no longer matches the live state — approve-adjust refuses. */
+function varianceBasisMoved(varianceId: string, frozenEpoch: number | null): ProblemException {
   return new ProblemException(
     'variance-basis-moved',
     409,
     'The variance counting basis has moved',
-    `Variance "${varianceId}" was counted against the task's frozen bin state (epoch ${liveEpoch === null ? 'none' : liveEpoch} no longer matches) — a moved basis means recount, not adjust. The recount arm is the remedy.`,
+    `Variance "${varianceId}" was counted against bin state frozen at epoch ${frozenEpoch === null ? 'none' : frozenEpoch} — the bin has moved since (the live epoch no longer matches the frozen value), so the counted expectation is not the correction's basis. A moved basis means recount, not adjust; the recount arm is the remedy.`,
   );
 }
 
@@ -368,7 +373,10 @@ export function varianceEntry(row: typeof countVariances.$inferSelect): CountVar
     countedQuantity: fromMilli(row.countedQuantity),
     delta: fromMilli(row.deltaMilli),
     epochConflict: row.epochConflict,
-    status: row.status,
+    // The DB CHECK's vocabulary, mirrored (the row's column is the raw text
+    // type; the wire shape narrows to the same tuple the schema comment
+    // names — one vocabulary, two layers).
+    status: row.status as (typeof COUNT_VARIANCE_STATUSES)[number],
     thresholdQuantity: row.thresholdQuantityMilli === null ? null : fromMilli(row.thresholdQuantityMilli),
     resolvedBy: row.resolvedBy,
     resolvedAt: row.resolvedAt === null ? null : canonicalInstant(row.resolvedAt),
@@ -899,7 +907,7 @@ export class CountService {
           await tx.insert(countVariances).values(varianceRows);
           // One owner-notification event per OVER-THRESHOLD variance — the
           // 5-2 per-pend event shape (notifyRole owner; Epic 9 owns delivery).
-          if (thresholdMilli !== undefined && thresholdMilli !== null) {
+          if (thresholdMilli !== null) {
             for (const row of varianceRows) {
               if (Math.abs(row.deltaMilli) > thresholdMilli) {
                 await this.outbox.append(tx, {
@@ -1075,10 +1083,10 @@ export class CountService {
     idempotencyKey: string,
   ): Promise<{ snapshot: ResolveCountVarianceSnapshot; replayed: boolean }> {
     // Shape checks above the transaction: business time, the decision
-    // vocabulary, and the consulted seqs (whole numbers ≥ 1; the approve arm
-    // requires a non-empty statement — an explicit stock correction that
-    // consulted no history is exactly the silent write-off the epic
-    // forbids).
+    // vocabulary, and the consulted seqs' set shape (the per-seq checks live
+    // in the wire DTO; the command checks max-count + the approve arm's
+    // non-empty requirement — an explicit stock correction that consulted no
+    // history is exactly the silent write-off the epic forbids).
     let occurredAt: string;
     if (command.occurredAt === undefined) {
       occurredAt = nowIso();
@@ -1416,7 +1424,9 @@ export class CountService {
               variance.thresholdQuantityMilli === null
                 ? null
                 : fromMilli(variance.thresholdQuantityMilli),
-            consideredEventSeqs: statedSeqs,
+            // The row's contract, echoed: null when the resolution stated
+            // nothing (no-statement recount), not an empty array.
+            consideredEventSeqs: statedSeqs.length > 0 ? statedSeqs : null,
             resolvedBy: command.actorUserId,
             resolvedAt,
             recountTaskId,

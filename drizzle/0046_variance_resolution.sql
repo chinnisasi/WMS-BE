@@ -21,7 +21,9 @@
 --    outbox event. Null = disabled, the same semantics as a missing row.
 --
 -- 3. The deferred indexes from PENDING: `count_variances(task_id)` (the
---    resolve command's task read) and `skus(tenant_id, abc_class)` (the
+--    variances-by-task reads — the resolution surface's task→variance
+--    lookups; the resolve command reads count_tasks by PK, so it is NOT the
+--    epoch guard's path) and `skus(tenant_id, abc_class)` (the
 --    scheduler's classed-SKU probe), both as plain CREATE INDEX — drizzle-kit
 --    re-emits them from the schema (the snapshot carries them).
 --
@@ -65,6 +67,10 @@ ALTER TABLE "count_variances" ADD COLUMN "resolved_at" timestamp with time zone;
 ALTER TABLE "count_variances" ADD COLUMN "recount_task_id" uuid;--> statement-breakpoint
 ALTER TABLE "count_variances" ADD COLUMN "considered_event_seqs" jsonb;--> statement-breakpoint
 CREATE UNIQUE INDEX "count_variance_policies_tenant_id_unique" ON "count_variance_policies" USING btree ("tenant_id");--> statement-breakpoint
+-- Story 5-4 (the snapshot's index) — the variances-by-task reads: the
+-- resolution surface's task→variance lookups (the submit response's variance
+-- card, the replay reads) resolve through the task id. The resolve command
+-- itself reads count_tasks by PK; this index is not the epoch guard's path.
 CREATE INDEX "count_variances_task_id_idx" ON "count_variances" USING btree ("task_id");--> statement-breakpoint
 CREATE INDEX "skus_tenant_id_abc_class_idx" ON "skus" USING btree ("tenant_id","abc_class");--> statement-breakpoint
 

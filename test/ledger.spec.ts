@@ -657,6 +657,53 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
     expect(rejected.body).toMatchObject({ status: 400, code: 'invalid-cursor' });
   });
 
+  it('the binId filter narrows the timeline to events touching the bin (source or destination), and a malformed binId is 400', async () => {
+    // Two fresh bins in their own zone: the chosen one takes an intake
+    // (to_bin) AND a draw (from_bin), the neighbour one intake of its own —
+    // the filter must keep both of the chosen bin's events and exclude the
+    // unrelated one.
+    const zone = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ code: 'B', name: `Zone B ${ulid()}` })
+      .expect(201);
+    const mkBin = async (code: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zone.body.id}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 1000, type: 'shelf', code })
+          .expect(201)
+      ).body.id as string;
+    const binX = await mkBin(`B-01-${ulid().slice(10, 14).toUpperCase()}`);
+    const binY = await mkBin(`B-01-${ulid().slice(10, 14).toUpperCase()}`);
+    const intoX = await adjust(opsToken, adjustmentBody({ binId: binX, quantityDelta: 5 })).expect(201);
+    const outOfX = await adjust(opsToken, adjustmentBody({ binId: binX, quantityDelta: -2 }), ulid()).expect(201);
+    const intoY = await adjust(opsToken, adjustmentBody({ binId: binY, quantityDelta: 1 }), ulid()).expect(201);
+
+    // Exactly the two events touching binX, newest first, with their arms.
+    const page = await listEvents(opsToken, { binId: binX }).expect(200);
+    const items = page.body.items as {
+      id: string;
+      fromBinId: string | null;
+      toBinId: string | null;
+    }[];
+    expect(items.map((item) => item.id).sort()).toEqual([intoX.body.event.id, outOfX.body.event.id].sort());
+    expect(items.every((item) => item.fromBinId === binX || item.toBinId === binX)).toBe(true);
+    expect(items.some((item) => item.id === intoY.body.event.id)).toBe(false);
+
+    // The neighbour's filter sees only its own intake.
+    const yPage = await listEvents(opsToken, { binId: binY }).expect(200);
+    const yItems = yPage.body.items as { id: string }[];
+    expect(yItems.map((item) => item.id)).toEqual([intoY.body.event.id]);
+
+    // Not a uuid → the query pipe refuses before any read.
+    const malformed = await listEvents(opsToken, { binId: 'not-a-uuid' }).expect(400);
+    expect(malformed.body).toMatchObject({ status: 400, code: 'validation-failed' });
+  });
+
   it('row-level security: the three new tables are tenant-isolated and fail closed', async () => {
     const admin = postgres(process.env.DATABASE_URL!, { max: 1 });
     let scoped: ReturnType<typeof postgres> | undefined;

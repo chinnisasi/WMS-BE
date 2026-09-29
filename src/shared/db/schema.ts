@@ -3031,8 +3031,9 @@ export const countVariances = pgTable(
     ),
     // The variance list's warehouse filter.
     index('count_variances_warehouse_id_idx').on(table.warehouseId),
-    // Story 5-4 (drizzle/0046) — the resolve command's task read (the frozen
-    // epoch its guard compares) resolves through the task id.
+    // Story 5-4 (drizzle/0046) — the variances-by-task reads: the
+    // resolution surface's task→variance lookups (the submit response's
+    // variance card, the replay reads) resolve through the task id.
     index('count_variances_task_id_idx').on(table.taskId),
   ],
 );
@@ -3043,11 +3044,12 @@ export type CountVariance = typeof countVariances.$inferSelect;
  * Variance threshold policies (story 5-4): the PER-TENANT config routing a
  * count variance to resolution — `quantityThresholdMilli` (null = disabled,
  * mirroring `stockAdjustmentPolicies`; milli-units so the submit freezes it
- * straight onto every variance row that submits under it). A submit whose
- * |delta| exceeds the frozen threshold stamps the value on the variance and
- * emits the owner-notification outbox event
- * (`count.variance.threshold_exceeded`); such a variance resolves ONLY by
- * owner, every other variance by owner or ops_manager (`variances.resolve`).
+ * straight onto every variance row that submits under it). A submit under
+ * the policy stamps the value on EVERY variance row it mints; a row whose
+ * |delta| exceeds the FROZEN stamp additionally emits the
+ * owner-notification outbox event (`count.variance.threshold_exceeded`);
+ * such a variance resolves ONLY by owner, every other variance by owner or
+ * ops_manager (`variances.resolve`).
  *
  * One row per tenant (`unique(tenant_id)`); upsert is PUT (gated on
  * `variances.resolve` — the pen is the resolver set's, the `counts.manage`
