@@ -1276,6 +1276,7 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
     let vbin2: string; // PLAIN 4 — the over-threshold arm
     let vbin3: string; // PLAIN 5 — the stale-seqs and basis-moved (recount) arms
     let vbin4: string; // PLAIN 2 — the open-task-per-bin bound
+    let vzoneId = ''; // Zone V — the bins' parent (the retire arm's bin mint)
     let ownerUserId = '';
     // The suite's five terminal variances, minted in the arms below in order.
     let v1 = '';
@@ -1392,6 +1393,7 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
         .send({ code: 'V', name: 'Zone V (5-4)' })
         .expect(201);
       const zoneId = zone.body.id as string;
+      vzoneId = zoneId;
       const mkBin = async (code: string): Promise<string> =>
         (
           await request(app.getHttpServer())
@@ -1837,6 +1839,59 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
         (payload) => payload.varianceId === varianceId,
       );
       expect(forVariance).toHaveLength(0);
+    });
+
+    it('refuses the approve_adjust correction against a retired bin (the guard-set arm): 400, the variance stays open', async () => {
+      // The I/O matrix's row-1 error cell: the correction's re-execution
+      // rides assertAdjustableInTx's FULL guard set, and a bin retired
+      // between the count and the decision is refused — the resolve rolls
+      // back, the variance stays open, and a recount is the only way out.
+      // An EMPTY bin counts a variance with an expected of 0 (the beyond-task
+      // append) — no stock, which is exactly what permits the retirement.
+      const bin = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${vzoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 1000, type: 'shelf', code: 'V-01-05' })
+          .expect(201)
+      ).body.id as string;
+      const task = await createCount({ warehouseId, binId: bin }).expect(201);
+      await submitCount(task.body.countTask.id as string, {
+        lines: [{ skuId: skuIds.get(PLAIN), countedQuantity: 3 }],
+      }, deviceOperatorToken).expect(200);
+      const varianceId = await varianceIdOf(task.body.countTask.id as string, skuIds.get(PLAIN)!);
+      expect((await varianceRow(varianceId)).status).toBe('open');
+      // The bin holds nothing — the retirement gate (retirement is terminal,
+      // so the guard set the approval-time sequence must see it).
+      const retired = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${warehouseId}/bins/${bin}/retire`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({})
+        .expect(200);
+      expect(retired.body.retiredAt).not.toBeNull();
+      // Retirement writes no ledger event and no epoch bump — the frozen
+      // basis still matches, so the resolve reaches the correction's guard
+      // set (not 409 variance-basis-moved).
+      const seqs = await warehouseSeqs(warehouseId);
+      const ledgerBefore = await ledgerCount();
+      const res = await resolveVariance(varianceId, {
+        decision: 'approve_adjust',
+        consideredEventSeqs: seqs,
+      }, ownerToken).expect(400);
+      expect(res.body.code).toBe('bin-retired');
+      // The rollback: the variance is still open, no stockCorrection event
+      // landed (the ledger is untouched), nothing moved (still empty).
+      expect((await varianceRow(varianceId)).status).toBe('open');
+      expect((await varianceRow(varianceId)).considered_event_seqs).toBeNull();
+      expect(await ledgerCount()).toBe(ledgerBefore);
+      // No on-hand row: the bin was empty going in and nothing corrected in.
+      expect(await onHandMilli(warehouseId, skuIds.get(PLAIN)!, bin)).toBeNull();
+      const echoes = (await outboxPayloads('count.variance.resolved')).filter(
+        (payload) => payload.varianceId === varianceId,
+      );
+      expect(echoes).toHaveLength(0);
     });
   });
 });
