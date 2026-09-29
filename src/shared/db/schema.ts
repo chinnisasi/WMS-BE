@@ -531,6 +531,10 @@ export const skus = pgTable(
     // Story 11.3 — the product list's skuCount and the SKU list's productId
     // filter both resolve through this column (uuid + index, no FK).
     index('skus_product_id_idx').on(table.productId),
+    // Story 5-4 — the deferred 5-3 scheduler index (drizzle/0046): the
+    // scheduled-count generation's "every classed SKU of the warehouse" probe
+    // resolves through (tenant, class) instead of scanning the tenant's SKUs.
+    index('skus_tenant_id_abc_class_idx').on(table.tenantId, table.abcClass),
   ],
 );
 
@@ -2940,6 +2944,17 @@ export const countTaskLines = pgTable(
 export type CountTaskLine = typeof countTaskLines.$inferSelect;
 
 /**
+ * The count variance lifecycle vocabulary (story 5-4): the TS side of the
+ * three mirrored layers (DB CHECK in `drizzle/0046_variance_resolution.sql`;
+ * statuses filter via the queue-read DTO). 5-3 wrote exactly `open`; 5-4's
+ * resolve command transitions a variance to `adjusted` (approve-adjust — the
+ * stock correction applied) or `recounted` (the recount arm — the variance's
+ * expected basis replaced by the recount snapshot's line).
+ */
+export const COUNT_VARIANCE_STATUSES = ['open', 'adjusted', 'recounted'] as const;
+export type CountVarianceStatus = (typeof COUNT_VARIANCE_STATUSES)[number];
+
+/**
  * Count variances (story 5-3): written AT SUBMIT, one row per SKU whose
  * counted ≠ expected — never a stock write, never a ledger event (5-3
  * inserts and NEVER touches a variance row afterwards; resolution states
@@ -2954,6 +2969,19 @@ export type CountTaskLine = typeof countTaskLines.$inferSelect;
  * module doc names, CHECK-pinned so 5-4's states arrive as their own
  * migration. RLS policies + the CHECKs live **only in the migration SQL**
  * (0045).
+ *
+ * Story 5-4 additions (all written by the resolution, never by 5-3's
+ * insert except the threshold stamp): `thresholdQuantityMilli` is the
+ * tenant policy threshold frozen AT SUBMIT (the
+ * `threshold_quantity_at_request` precedent — a later policy PUT cannot
+ * re-write what the submit compared against; null = the tenant had no
+ * threshold policy, the disabled shape); `resolvedBy`/`resolvedAt` stamp
+ * the resolution; `recountTaskId` is the recount arm's minted task (bare
+ * uuid, no FK — the repo convention, validated in the command
+ * transaction); `consideredEventSeqs` is the ledger seq list the
+ * resolution states it consulted (jsonb, echoed in the audit + outbox
+ * events). Row states, RLS additions and the widened status CHECK live
+ * **only in the migration SQL** (0045/0046).
  */
 export const countVariances = pgTable(
   'count_variances',
@@ -2976,6 +3004,20 @@ export const countVariances = pgTable(
     epochConflict: boolean('epoch_conflict').notNull().default(false),
     /** Exactly `open` in 5-3 — 5-4 owns every later state. */
     status: text('status').notNull().default('open'),
+    /**
+     * Story 5-4 — the tenant threshold policy's value (milli) frozen at
+     * submit; null = no policy row (disabled). The resolve command's
+     * owner-only guard compares |delta| against THIS frozen value.
+     */
+    thresholdQuantityMilli: integer('threshold_quantity_milli'),
+    /** The resolver's user id (5-4; null while open). */
+    resolvedBy: uuid('resolved_by'),
+    /** The resolution's instant (5-4; null while open). */
+    resolvedAt: timestamp('resolved_at', { withTimezone: true, mode: 'string' }),
+    /** The recount arm's minted task id (5-4; null on the approve arm). */
+    recountTaskId: uuid('recount_task_id'),
+    /** The ledger seqs the resolution states it consulted (5-4; null = none stated). */
+    consideredEventSeqs: jsonb('considered_event_seqs').$type<number[]>(),
     ...tenantTimestamps,
   },
   (table) => [
@@ -2989,7 +3031,52 @@ export const countVariances = pgTable(
     ),
     // The variance list's warehouse filter.
     index('count_variances_warehouse_id_idx').on(table.warehouseId),
+    // Story 5-4 (drizzle/0046) — the resolve command's task read (the frozen
+    // epoch its guard compares) resolves through the task id.
+    index('count_variances_task_id_idx').on(table.taskId),
   ],
 );
 
 export type CountVariance = typeof countVariances.$inferSelect;
+
+/**
+ * Variance threshold policies (story 5-4): the PER-TENANT config routing a
+ * count variance to resolution — `quantityThresholdMilli` (null = disabled,
+ * mirroring `stockAdjustmentPolicies`; milli-units so the submit freezes it
+ * straight onto every variance row that submits under it). A submit whose
+ * |delta| exceeds the frozen threshold stamps the value on the variance and
+ * emits the owner-notification outbox event
+ * (`count.variance.threshold_exceeded`); such a variance resolves ONLY by
+ * owner, every other variance by owner or ops_manager (`variances.resolve`).
+ *
+ * One row per tenant (`unique(tenant_id)`); upsert is PUT (gated on
+ * `variances.resolve` — the pen is the resolver set's, the `counts.manage`
+ * rationale); a GET of the unset row answers 404, mirroring
+ * adjustment-policies. No delete verb (PUT is upsert). Audit:
+ * `count.variance_policy_updated`. RLS policy
+ * `count_variance_policies_tenant_isolation` + the threshold CHECK live
+ * **only in the migration SQL** (0046).
+ */
+export const countVariancePolicies = pgTable(
+  'count_variance_policies',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    /**
+     * The |delta| ceiling in MILLI-units above which a variance is
+     * owner-only (strictly greater marks over-threshold; at-threshold does
+     * not). Null disables the routing — the same semantics as a missing
+     * row.
+     */
+    quantityThresholdMilli: integer('quantity_threshold_milli'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One policy per tenant — the config row IS the tenant's opt-in.
+    uniqueIndex('count_variance_policies_tenant_id_unique').on(table.tenantId),
+  ],
+);
+
+export type CountVariancePolicy = typeof countVariancePolicies.$inferSelect;

@@ -33,6 +33,21 @@ import {
   SubmitCountResponse,
   CountPoliciesResponse,
 } from '../modules/movements/count.dto';
+// No eslint-disable... EXCEPT one below: CountVarianceListQuery is listed
+// with the response bodies for a REASON — a Query DTO's class must stay a
+// runtime value (in design:paramtypes) for the ValidationPipe's transform;
+// a type-only import erases it and the pipe silently stops shaping the
+// query (this file's other blocks carry the same disable for the same
+// reason).
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import {
+  CountVarianceEntryResponseDto,
+  ResolveCountVarianceDto,
+  ResolveCountVarianceResponse,
+  SetVariancePolicyDto,
+  VariancePolicyResponse,
+  CountVarianceListQuery,
+} from '../modules/movements/count.dto';
 const IDEMPOTENCY_HEADER = [
   {
     name: 'Idempotency-Key',
@@ -435,6 +450,160 @@ export class MovementsController {
     return { policies: snapshot.policies.map((policy) => ({ ...policy })) };
   }
 
+  // ── variance resolution (Story 5-4) ───────────────────────────────────────
+
+  @Put(':tenantId/movements/variance-policies')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Upserts the tenant\'s variance-threshold policy (variances.resolve): the |delta| ceiling (base units) above which a variance resolves by owner only — a submit freezes the threshold onto every variance row it writes; null disables the routing',
+  })
+  @ApiBody({ type: SetVariancePolicyDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.OK,
+    type: VariancePolicyResponse,
+    description: 'The policy row after the upsert (the idempotency snapshot)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body — a negative/non-whole threshold or one above the stored column bound (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks variances.resolve (role-denied)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent first write of the same policy lost the unique-index race (conflict — retry), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async setVariancePolicy(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: SetVariancePolicyDto,
+  ): Promise<VariancePolicyResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return await this.movements.setVariancePolicy(
+      { tenantId, actorUserId: session.userId, quantityThreshold: dto.quantityThreshold ?? null },
+      key,
+    );
+  }
+
+  @Get(':tenantId/movements/variance-policies')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Returns the tenant\'s variance-threshold policy, or 404 when unset (the routing is disabled; never capability-gated)',
+  })
+  @ApiOkResponse({
+    type: VariancePolicyResponse,
+    description: "The tenant's policy row",
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No policy row exists — the threshold routing is disabled (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async getVariancePolicy(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<VariancePolicyResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const snapshot = await this.movements.getVariancePolicy(tenantId);
+    if (snapshot === null) {
+      throw new ProblemException(
+        'not-found',
+        404,
+        'No variance threshold policy',
+        'This tenant has no count_variance_policies row — the threshold routing is disabled (PUT a threshold to enable).',
+      );
+    }
+    return snapshot;
+  }
+
+  @Get(':tenantId/movements/variances')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Lists count variances (keyset cursor pagination, newest first, status/warehouse-filterable; never capability-gated — the resolving mutation is variances.resolve)',
+  })
+  @ApiOkResponse({
+    type: CountVarianceEntryResponseDto,
+    description: "The tenant's variance page (newest first, keyset cursor)",
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed status/warehouseId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async listCountVariances(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: CountVarianceListQuery,
+  ): Promise<{ items: CountVarianceEntryResponseDto[]; nextCursor: string | null }> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const page = await this.movements.listCountVariances(tenantId, {
+      status: query.status,
+      warehouseId: query.warehouseId,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items.map((entry) => ({ ...entry })), nextCursor: page.nextCursor };
+  }
+
+  @Post(':tenantId/movements/variances/:varianceId/resolve')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Resolves one open count variance (variances.resolve — owner + Ops Manager): approve_adjust applies the counted−expected delta as stock.adjusted ledger events (the task\'s frozen bin epoch must still EQUAL the live one), or recount mints a recount task and re-bases the variance; an over-threshold variance resolves by owner only',
+  })
+  @ApiBody({ type: ResolveCountVarianceDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.OK,
+    type: ResolveCountVarianceResponse,
+    description: 'The resolution (the idempotency snapshot): the variance in its terminal state, plus the approve arm\'s correction',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, consulted seqs this warehouse\'s ledger never wrote, or an approve-adjust guard refusal (bin retired / kit / catch-weight / batch parity) from the correction\'s re-execution (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), the caller lacks variances.resolve (role-denied), or an over-threshold variance resolved by a role below owner (variance-owner-required)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The variance, its count task, or its bin does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The variance is already resolved (variance-resolved), the task\'s frozen bin epoch no longer matches (variance-basis-moved — recount is the remedy), the bin already has an open count task (count-task-open), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'varianceId', format: 'uuid' })
+  async resolveCountVariance(
+    @Param('tenantId') tenantId: string,
+    @Param('varianceId') varianceId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: ResolveCountVarianceDto,
+  ): Promise<ResolveCountVarianceResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(varianceId, 'varianceId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.movements.resolveCountVariance(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        varianceId,
+        decision: dto.decision,
+        consideredEventSeqs: dto.consideredEventSeqs ?? undefined,
+        occurredAt: dto.occurredAt,
+      },
+      key,
+    );
+    return {
+      variance: { ...snapshot.variance },
+      stockCorrection:
+        snapshot.stockCorrection === null
+          ? null
+          : {
+              eventId: snapshot.stockCorrection.eventId,
+              seq: snapshot.stockCorrection.seq,
+              onHand: { ...snapshot.stockCorrection.onHand },
+            },
+    };
+  }
+
   @Get(':tenantId/movements/transfers')
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
@@ -500,7 +669,7 @@ export class MovementsController {
 }
 
 /** Movements uuid path params fail 400 (not a 500 from the `::uuid` cast). */
-function assertUuidParam(value: string, name: 'transferId' | 'taskId' | 'warehouseId'): void {
+function assertUuidParam(value: string, name: 'transferId' | 'taskId' | 'warehouseId' | 'varianceId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

@@ -50,6 +50,12 @@ export type {
   GrantReservationCommand,
   ReservationSnapshot,
 } from './reservation.service';
+// Story 5-4: the variance-resolution approve arm rebuilds an adjustment
+// command from the variance row and runs it through the in-transaction seams
+// below — cross-module callers import the command/event types here, never
+// from `inventory.command` internals (the same rule as the ledger shapes
+// above).
+export type { AdjustStockCommand, StockAdjustmentSnapshot } from './inventory.command';
 import type {
   ChainAnchor,
   ChainBreakReport,
@@ -60,6 +66,7 @@ import type {
 } from './ledger.service';
 import { StockAdjustmentCommand } from './inventory.command';
 import type { AdjustStockCommand, StockAdjustmentResult, StockAdjustmentSnapshot, StockAdjustmentPendingSnapshot } from './inventory.command';
+import type { SignedQuantity } from '../../shared/primitives/quantity';
 import { AdjustmentApprovalCommand } from './adjustment-approval.command';
 import type {
   AdjustmentDecisionSnapshot,
@@ -107,6 +114,13 @@ export interface LedgerTimelineEntry {
 
 export interface LedgerTimelineQuery {
   readonly skuId?: string | undefined;
+  /**
+   * Story 5-4 — narrow the timeline to one bin: fromBin = bin OR toBin = bin
+   * (an event moved stock either through it). The approve-adjust resolver's
+   * "pull the bin's history" read (the resolution's consulted-seqs list
+   * quotes seq(s) from this timeline).
+   */
+  readonly binId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -323,6 +337,40 @@ export class InventoryFacade {
   }
 
   /**
+   * The adjustment GUARD SET, in-transaction (Story 5-4): the guard set and
+   * the conversion behind the replay lookup a cross-module command runs
+   * before its own apply — the variance-resolution approve arm executes the
+   * bin's stock correction through THIS seam (AD-6: movements reach
+   * inventory's writes only via the facade), inside the caller's transaction,
+   * after the caller's own locks. Same contract as `adjust`'s internal step:
+   * refuses 400/404 verbatim.
+   */
+  async assertAdjustableInTx(
+    tx: TenantTx,
+    command: AdjustStockCommand,
+  ): Promise<{ delta: SignedQuantity; handlingUnitIds: readonly string[] }> {
+    return this.stockAdjustment.assertAdjustableInTx(tx, command);
+  }
+
+  /**
+   * The adjustment APPLY, in-transaction (Story 5-4): the ledger append +
+   * on-hand projection fold a cross-module command writes through —
+   * approve-adjust's stock correction lands as `stock.adjusted` events via
+   * this passthrough, inside the caller's transaction. The write-side
+   * refusals (insufficient on-hand, serial-elsewhere) roll back the
+   * caller's whole transaction with their 4xx verbatim.
+   */
+  async applyAdjustmentInTx(
+    tx: TenantTx,
+    command: AdjustStockCommand,
+    delta: SignedQuantity,
+    handlingUnitIds: readonly string[],
+    occurredAt: string,
+  ): Promise<{ snapshot: StockAdjustmentSnapshot; firstEventId: string }> {
+    return this.stockAdjustment.applyAdjustmentInTx(tx, command, delta, handlingUnitIds, occurredAt);
+  }
+
+  /**
    * The replay pre-check (review loop 1 — "replay beats composition"):
    * returns the stored snapshot for (tenant, key) when the payload hash
    * matches — BEFORE the api layer runs any composition (identity ensure,
@@ -390,6 +438,12 @@ export class InventoryFacade {
             eq(ledgerEvents.tenantId, tenantId),
             eq(ledgerEvents.warehouseId, warehouseId),
             query.skuId === undefined ? undefined : eq(ledgerEvents.skuId, query.skuId),
+            // Story 5-4 — the bin filter: an event touches the bin when it is
+            // either the movement's source or its destination (the timeline's
+            // fromBin = bin OR toBin = bin arm).
+            query.binId === undefined
+              ? undefined
+              : sql`(${ledgerEvents.fromBinId} = ${query.binId}::uuid OR ${ledgerEvents.toBinId} = ${query.binId}::uuid)`,
             before === undefined
               ? undefined
               : sql`(${ledgerEvents.createdAt}, ${ledgerEvents.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -1052,6 +1106,36 @@ export class InventoryFacade {
    */
   async lockWarehouseInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<void> {
     await tx.execute(warehouseAdvisoryLock(tenantId, warehouseId));
+  }
+
+  /**
+   * The consulted-seqs probe (Story 5-4): which of the given ledger seqs
+   * exist in ONE warehouse's ledger, inside the caller's transaction — the
+   * variance-resolution command refuses a resolution whose stated
+   * `consideredEventSeqs` name ledger events this warehouse never wrote
+   * (400 `validation-failed` BEFORE any write), and the read rides the
+   * facade because the ledger table is inventory-module-owned.
+   */
+  async ledgerSeqsExistInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    seqs: readonly number[],
+  ): Promise<Set<number>> {
+    if (seqs.length === 0) {
+      return new Set();
+    }
+    const rows = await tx
+      .select({ seq: ledgerEvents.seq })
+      .from(ledgerEvents)
+      .where(
+        and(
+          eq(ledgerEvents.tenantId, tenantId),
+          eq(ledgerEvents.warehouseId, warehouseId),
+          inArray(ledgerEvents.seq, [...seqs]),
+        ),
+      );
+    return new Set(rows.map((row) => row.seq));
   }
 
   /**

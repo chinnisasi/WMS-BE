@@ -3,18 +3,21 @@ import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
+  auditEvents,
   bins,
   countPolicies,
   countTaskLines,
   countTasks,
   countVariances,
+  countVariancePolicies,
   idempotencyKeys,
   skus,
   type CountTask,
 } from '../../shared/db/schema';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
+import type { SignedQuantity } from '../../shared/primitives/quantity';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { assertUtcIso, nowIso } from '../../shared/primitives/time';
+import { assertUtcIso, canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { isUniqueViolationOn, ProblemException } from '../../shared/problem-details/problem.exception';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -25,6 +28,7 @@ import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.ser
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { uomPrecision } from '../catalog/uom';
 import { InventoryFacade } from '../inventory/inventory.facade';
+import type { AdjustStockCommand } from '../inventory/inventory.facade';
 
 /**
  * Cycle counts (Story 5-3, FR-cycle-count): the movements module's second
@@ -41,11 +45,21 @@ import { InventoryFacade } from '../inventory/inventory.facade';
  *   every task line must be counted (a line the request does not name is a
  *   400 `count-incomplete` — 0 is a valid count only when EXPLICITLY
  *   entered); counted ≠ expected appends one `open` variance row per
- *   differing SKU; the epoch compare runs UNDER the locks and is an
- *   EQUALITY against the live epoch (`null` matches) — a mismatch flags
- *   every variance `epochConflict` AND auto-creates a fresh recount task
- *   for the bin in the same transaction (OQ-2, AD-14 case-3 shape). Counts
- *   NEVER write stock: no ledger event, no on-hand change, no epoch bump.
+ *   differing SKU, stamped with the tenant's variance-threshold policy
+ *   FROZEN at submit (story 5-4); the epoch compare runs UNDER the locks
+ *   and is an EQUALITY against the live epoch (`null` matches) — a mismatch
+ *   flags every variance `epochConflict` AND auto-creates a fresh recount
+ *   task for the bin in the same transaction (OQ-2, AD-14 case-3 shape).
+ *   Counts NEVER write stock: no ledger event, no on-hand change, no epoch
+ *   bump. (The 5-4 approve-adjust resolution is the story's ONLY count-side
+ *   stock write, and it runs through the adjustment vocabulary.)
+ * - **resolve** (story 5-4, `variances.resolve` — owner + Ops Manager): one
+ *   open variance per resolution. approve_adjust moves the bin by the
+ *   counted−expected delta as `stock.adjusted` events (epoch must still
+ *   equal the task's frozen one) or recount re-plans the bin and re-bases
+ *   the variance; the resolution carries its consulted ledger seqs, is
+ *   audit-logged and outboxed (`count.variance.resolved`). An over-threshold
+ *   variance (its frozen submit stamp) resolves by owner only.
  * - **upsert policies** (`counts.manage`): one row per (tenant, warehouse,
  *   ABC class) naming the scheduled interval in days — a policy IS the
  *   schedule, so the policy write rides `counts.manage` (the `waves.manage`
@@ -163,6 +177,103 @@ export interface CountPoliciesSnapshot {
   }[];
 }
 
+/**
+ * The variance-threshold policy PUT body (story 5-4): the threshold in BASE
+ * units on the wire (the codebase's units rule — conversion sits inside the
+ * command, behind the replay lookup); stored as `quantity_threshold_milli`
+ * so the submit freezes it straight onto the variance rows. `0` is valid
+ * (every variance over-threshold); `null`/absent disables the routing — the
+ * same semantics as a missing row, and the only way back off an enabled
+ * threshold (there is no delete verb: PUT is upsert).
+ */
+export interface SetVariancePolicyCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly quantityThreshold: number | null;
+}
+
+/** GET …/movements/variance-policies response — null when unset (flow disabled). */
+export interface VariancePolicySnapshot {
+  readonly id: string;
+  readonly tenantId: string;
+  /** Base units at the edge; null when the policy is disabled. */
+  readonly quantityThreshold: number | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * The resolve command (story 5-4): the per-variance resolution. `decision`
+ * carries the ARM — not a stored state; the arm's STATUS is what the row
+ * carries (`adjusted` | `recounted`).
+ */
+export interface ResolveCountVarianceCommand {
+  readonly tenantId: string;
+  /** The resolver's session user — authority is re-read from the DB at entry. */
+  readonly actorUserId: string;
+  readonly varianceId: string;
+  /** The arm: the approve-adjust correction, or the recount re-plan. */
+  readonly decision: 'approve_adjust' | 'recount';
+  /**
+   * The ledger seqs this resolution STATES it consulted (the bin's history
+   * the approver pulled from the ledger timeline). REQUIRED, non-empty, on
+   * the approve arm — an explicit stock correction that consulted no
+   * history is exactly the silent write-off the epic forbids; optional on
+   * the recount arm (the recount task's snapshot is its new basis, made
+   * after the resolution runs). Each seq a whole number ≥ 1.
+   */
+  readonly consideredEventSeqs?: readonly number[] | undefined;
+  readonly occurredAt?: string | undefined;
+}
+
+/** One row of the variance queue read (and the resolve response's core). */
+export interface CountVarianceEntry {
+  readonly id: string;
+  readonly tenantId: string;
+  readonly taskId: string;
+  readonly warehouseId: string;
+  readonly binId: string;
+  readonly skuId: string;
+  /** Base units at the edge (story 10.1) — the frozen expectation. */
+  readonly expectedQuantity: number;
+  /** Base units — what the operator counted. */
+  readonly countedQuantity: number;
+  /** counted − expected, base units. */
+  readonly delta: number;
+  /** A movement moved the bin between task start and submit (OQ-2). */
+  readonly epochConflict: boolean;
+  readonly status: string;
+  /** The submit-frozen threshold in BASE units; null = no policy (disabled). */
+  readonly thresholdQuantity: number | null;
+  readonly resolvedBy: string | null;
+  readonly resolvedAt: string | null;
+  /** The recount arm's minted task; null on the approve arm and while open. */
+  readonly recountTaskId: string | null;
+  /** The ledger seqs the resolution stated it consulted; null when none stated. */
+  readonly consideredEventSeqs: number[] | null;
+  readonly createdAt: string;
+}
+
+/** The API response body (and the idempotent replay's stored copy), resolve. */
+export interface ResolveCountVarianceSnapshot {
+  readonly variance: CountVarianceEntry;
+  /**
+   * The approve arm's correction: the applied `stock.adjusted` event (id +
+   * seq — the single-event shape is the only reachable one here: a variance
+   * has no serial arms) and the settled on-hand. Null on the recount arm.
+   */
+  readonly stockCorrection: {
+    readonly eventId: string;
+    readonly seq: number | null;
+    readonly onHand: {
+      readonly skuId: string;
+      readonly binId: string;
+      /** Base units — the on-hand after the correction. */
+      readonly quantity: number;
+    };
+  } | null;
+}
+
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 // ── machine-code helpers (the spec's matrix fixes these) ─────────────────────
@@ -195,6 +306,78 @@ function countIncomplete(skuIds: readonly string[]): ProblemException {
     'The count leaves task lines uncounted',
     `Every line of the task must be counted before it can submit — these SKUs have no counted quantity: ${skuIds.join(', ')}. A zero count is valid, but only when explicitly entered.`,
   );
+}
+
+/** A resolve meeting a variance that is no longer `open` (story 5-4's 409). */
+function varianceResolved(status: string, varianceId: string): ProblemException {
+  return new ProblemException(
+    'variance-resolved',
+    409,
+    'Count variance already resolved',
+    `Variance "${varianceId}" is already ${status} — resolutions are terminal.`,
+  );
+}
+
+/** An over-threshold variance resolved by a role below owner — 403. */
+function varianceOwnerRequired(varianceId: string): ProblemException {
+  return new ProblemException(
+    'variance-owner-required',
+    403,
+    'Over-threshold variance resolves by owner only',
+    `Variance "${varianceId}" exceeded the tenant's threshold when it was submitted — |delta| > the frozen threshold stamps it owner-only. Owner resolves this one; the frozen threshold decides, the resolver's role is read at command entry.`,
+  );
+}
+
+/** The frozen bin epoch no longer equals the live one — approve-adjust refuses. */
+function varianceBasisMoved(varianceId: string, liveEpoch: number | null): ProblemException {
+  return new ProblemException(
+    'variance-basis-moved',
+    409,
+    'The variance counting basis has moved',
+    `Variance "${varianceId}" was counted against the task's frozen bin state (epoch ${liveEpoch === null ? 'none' : liveEpoch} no longer matches) — a moved basis means recount, not adjust. The recount arm is the remedy.`,
+  );
+}
+
+/** The consulted-seqs statement's ceiling (a timeline pull, not a bulk export). */
+const CONSIDERED_SEQS_MAX = 200;
+
+/**
+ * Normalise the consulted seqs for hashing AND storage: deduped, ascending —
+ * the statement names a SET of ledger events, so client order is not part
+ * of the resolution's identity (a retried request listing the same events
+ * in another order still replays).
+ */
+function normalizeConsideredSeqs(seqs: readonly number[]): number[] {
+  return [...new Set(seqs)].sort((a, b) => a - b);
+}
+
+/**
+ * The variance row's read-model shape (base units at the edge; the resolve
+ * snapshot and the 5-5-destined queue read share this ONE mapper — a copy
+ * drifts the moment a column moves).
+ */
+export function varianceEntry(row: typeof countVariances.$inferSelect): CountVarianceEntry {
+  return {
+    id: row.id,
+    tenantId: row.tenantId,
+    taskId: row.taskId,
+    warehouseId: row.warehouseId,
+    binId: row.binId,
+    skuId: row.skuId,
+    expectedQuantity: fromMilli(row.expectedQuantity),
+    countedQuantity: fromMilli(row.countedQuantity),
+    delta: fromMilli(row.deltaMilli),
+    epochConflict: row.epochConflict,
+    status: row.status,
+    thresholdQuantity: row.thresholdQuantityMilli === null ? null : fromMilli(row.thresholdQuantityMilli),
+    resolvedBy: row.resolvedBy,
+    resolvedAt: row.resolvedAt === null ? null : canonicalInstant(row.resolvedAt),
+    recountTaskId: row.recountTaskId,
+    consideredEventSeqs: row.consideredEventSeqs ?? null,
+    // The queue read keys its cursor on the FULL-precision instant beside
+    // this; the body keeps the canonical (ms) shape.
+    createdAt: canonicalInstant(row.createdAt),
+  };
 }
 
 @Injectable()
@@ -673,7 +856,14 @@ export class CountService {
 
         // 3. The variance rows — one `open` row per DIFFERING SKU, written
         // at submit; never a stock write, never a ledger event (5-3 inserts
-        // and never touches a variance row afterwards).
+        // and never touches a variance row afterwards). Story 5-4: the
+        // tenant's variance-threshold policy is read ONCE and the threshold
+        // is FROZEN onto every variance row the policy covers (the
+        // `threshold_quantity_at_request` precedent — a later policy PUT
+        // cannot re-write what the submit compared against), and a variance
+        // whose |delta| is strictly over the frozen threshold appends the
+        // owner-notification outbox event. No policy row (or a null
+        // threshold on one) = disabled: no stamp, no event.
         const expectedBySku = new Map(taskLines.map((line) => [line.skuId, line.expectedQuantity]));
         const varianceInputs = command.lines
           .map((line) => {
@@ -682,22 +872,55 @@ export class CountService {
             return { skuId: line.skuId, counted, expected, delta: counted - expected };
           })
           .filter((input) => input.counted !== input.expected);
-        if (varianceInputs.length > 0) {
-          await tx.insert(countVariances).values(
-            varianceInputs.map((input) => ({
-              id: uuidv7(),
-              tenantId: command.tenantId,
-              taskId: command.taskId,
-              warehouseId: task.warehouseId,
-              binId: task.binId,
-              skuId: input.skuId,
-              expectedQuantity: input.expected,
-              countedQuantity: input.counted,
-              deltaMilli: input.counted - input.expected,
-              epochConflict,
-              status: 'open',
-            })),
-          );
+        const policyRows =
+          varianceInputs.length > 0
+            ? await tx
+                .select()
+                .from(countVariancePolicies)
+                .where(eq(countVariancePolicies.tenantId, command.tenantId))
+                .limit(1)
+            : [];
+        const thresholdMilli = policyRows[0]?.quantityThresholdMilli ?? null;
+        const varianceRows = varianceInputs.map((input) => ({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          taskId: command.taskId,
+          warehouseId: task.warehouseId,
+          binId: task.binId,
+          skuId: input.skuId,
+          expectedQuantity: input.expected,
+          countedQuantity: input.counted,
+          deltaMilli: input.counted - input.expected,
+          epochConflict,
+          status: 'open',
+          thresholdQuantityMilli: thresholdMilli,
+        }));
+        if (varianceRows.length > 0) {
+          await tx.insert(countVariances).values(varianceRows);
+          // One owner-notification event per OVER-THRESHOLD variance — the
+          // 5-2 per-pend event shape (notifyRole owner; Epic 9 owns delivery).
+          if (thresholdMilli !== undefined && thresholdMilli !== null) {
+            for (const row of varianceRows) {
+              if (Math.abs(row.deltaMilli) > thresholdMilli) {
+                await this.outbox.append(tx, {
+                  messageId: uuidv7(),
+                  tenantId: command.tenantId,
+                  type: 'count.variance.threshold_exceeded',
+                  occurredAt,
+                  payload: {
+                    varianceId: row.id,
+                    taskId: command.taskId,
+                    warehouseId: task.warehouseId,
+                    binId: task.binId,
+                    skuId: row.skuId,
+                    delta: fromMilli(row.deltaMilli),
+                    thresholdQuantity: fromMilli(thresholdMilli),
+                    notifyRole: 'owner',
+                  },
+                });
+              }
+            }
+          }
         }
 
         // 4. The task settles — the row is locked, so the conditional
@@ -771,6 +994,438 @@ export class CountService {
             epochConflict,
           })),
           recountTaskId,
+        };
+
+        try {
+          await tx.insert(idempotencyKeys).values({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            key: idempotencyKey,
+            payloadHash,
+            responseSnapshot: snapshot,
+          });
+        } catch (err) {
+          if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
+            throw new ProblemException(
+              'conflict',
+              409,
+              'Concurrent idempotent request',
+              'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
+            );
+          }
+          throw err;
+        }
+        return { snapshot, replayed: false };
+      },
+    );
+
+    return { snapshot, replayed };
+  }
+
+  // ── resolveCountVariance (story 5-4, variances.resolve) ─────────────────
+
+  /**
+   * The resolve fingerprint. The consulted seqs normalise (deduped, sorted)
+   * before hashing — a retry that lists the same events in a different
+   * order replays rather than 422s (the fingerprint must not make a retry
+   * look different).
+   */
+  resolveCountVarianceFingerprint(command: ResolveCountVarianceCommand): string {
+    return hashCommandPayload({
+      varianceId: command.varianceId,
+      decision: command.decision,
+      occurredAt: command.occurredAt,
+      consideredEventSeqs: normalizeConsideredSeqs(command.consideredEventSeqs ?? []),
+    });
+  }
+
+  /**
+   * Resolve one open count variance (story 5-4, `variances.resolve` — owner
+   * + Ops Manager; over-threshold resolves owner-only via the
+   * frozen-threshold guard, not the capability).
+   *
+   * Two arms:
+   * - **approve_adjust** — the explicit stock correction: the variance's
+   *   counted−expected delta applies to the bin as `stock.adjusted` ledger
+   *   events, executed through `assertAdjustableInTx` + `applyAdjustmentInTx`
+   *   (the 5-2 approve-arm shape, riding the inventory facade). Requires the
+   *   task's FROZEN `binStateEpoch` to still EQUAL the bin's live epoch
+   *   (null matches null) — a moved basis means recount, not adjust (409
+   *   `variance-basis-moved`).
+   * - **recount** — the remedy: a fresh recount task (5-3's
+   *   `createRecountTaskInTx`) whose snapshot becomes the variance's new
+   *   expected basis; the delta is recomputed in the same terminal UPDATE
+   *   (0 when the bin's on-hand is empty and the task's line is absent).
+   *
+   * Command order (the 5-2 decide shape, order-for-order): capability →
+   * idempotency → variance lock `.for('update')` → 404 → 409
+   * `variance-resolved` → owner check → the consulted-seqs probe (a stale
+   * seq refuses BEFORE any write) → locks (bin row → warehouse advisory
+   * LAST) → the epoch-equality guard (approve arm) → the arm → conditional
+   * terminal UPDATE `.where(status = 'open')` → audit row + outbox
+   * `count.variance.resolved` → idempotency LAST.
+   *
+   * The approve arm's refusals (bin retired, insufficient on-hand inside the
+   * apply, a kit SKU) roll the whole transaction back — the variance STAYS
+   * open, the caller gets the guard's 4xx verbatim (the recount arm is the
+   * remedy for each, mirroring 5-2's "the Owner may reject instead").
+   */
+  async resolveCountVariance(
+    command: ResolveCountVarianceCommand,
+    idempotencyKey: string,
+  ): Promise<{ snapshot: ResolveCountVarianceSnapshot; replayed: boolean }> {
+    // Shape checks above the transaction: business time, the decision
+    // vocabulary, and the consulted seqs (whole numbers ≥ 1; the approve arm
+    // requires a non-empty statement — an explicit stock correction that
+    // consulted no history is exactly the silent write-off the epic
+    // forbids).
+    let occurredAt: string;
+    if (command.occurredAt === undefined) {
+      occurredAt = nowIso();
+    } else {
+      try {
+        occurredAt = assertUtcIso(command.occurredAt);
+      } catch {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'occurredAt must be a valid ISO-8601 UTC instant',
+          `occurredAt must be a Z-suffixed ISO-8601 UTC timestamp (got "${command.occurredAt}").`,
+        );
+      }
+    }
+    if (command.decision !== 'approve_adjust' && command.decision !== 'recount') {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Unknown resolution decision',
+        `decision must be "approve_adjust" or "recount" (got "${String(command.decision)}").`,
+      );
+    }
+    const statedSeqs = normalizeConsideredSeqs(command.consideredEventSeqs ?? []);
+    if (statedSeqs.length > CONSIDERED_SEQS_MAX) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Too many considered ledger seqs',
+        `consideredEventSeqs carries ${statedSeqs.length} seqs — at most ${CONSIDERED_SEQS_MAX} per resolution.`,
+      );
+    }
+    if (command.decision === 'approve_adjust' && statedSeqs.length === 0) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'The resolution must state the ledger events it consulted',
+        'An approve_adjust resolution must carry at least one consideredEventSeq — the bin ledger seq the approver considered before signing the correction. The recount arm may state none.',
+      );
+    }
+
+    const payloadHash = this.resolveCountVarianceFingerprint(command);
+
+    const { snapshot, replayed } = await withTenantTransaction(
+      this.db,
+      command.tenantId,
+      async (tx) => {
+        // Authority at command-service entry — DB role read, same tx, BEFORE
+        // the replay lookup (the deliberate fail-closed carve-out).
+        const role = await getMemberRoleIn(tx, command.tenantId, command.actorUserId);
+        assertPermission(role, 'variances.resolve');
+
+        const existing = await this.lookupIdempotencyKey(tx, command.tenantId, idempotencyKey);
+        if (existing !== undefined) {
+          if (existing.payloadHash !== payloadHash) {
+            throw idempotencyKeyReuse();
+          }
+          return {
+            snapshot: existing.responseSnapshot as ResolveCountVarianceSnapshot,
+            replayed: true,
+          };
+        }
+
+        // The variance row, LOCKED — the state machine's mutex (404 when
+        // foreign). First lock of this command; the bin row and the
+        // warehouse advisory follow.
+        const varianceRows = await tx
+          .select()
+          .from(countVariances)
+          .where(
+            and(eq(countVariances.tenantId, command.tenantId), eq(countVariances.id, command.varianceId)),
+          )
+          .limit(1)
+          .for('update');
+        const variance = varianceRows[0];
+        if (variance === undefined) {
+          throw new ProblemException(
+            'not-found',
+            404,
+            'Count variance not found',
+            `No count variance with id "${command.varianceId}" exists in this tenant.`,
+          );
+        }
+        if (variance.status !== 'open') {
+          throw varianceResolved(variance.status, variance.id);
+        }
+
+        // The frozen-threshold guard: the variance's OWN submit-time stamp
+        // decides, not today's policy — a later policy PUT cannot un-stamp
+        // (or re-threshold) the variance.
+        if (
+          variance.thresholdQuantityMilli !== null &&
+          Math.abs(variance.deltaMilli) > variance.thresholdQuantityMilli &&
+          role !== 'owner'
+        ) {
+          throw varianceOwnerRequired(variance.id);
+        }
+
+        // The consulted-seqs probe: every stated seq must be ledger events
+        // this warehouse actually wrote — refused BEFORE any write (the
+        // matrix's stale-seqs arm; warehouse-scoped because the resolution
+        // consults the bin's history, and the bin lives in this warehouse).
+        if (statedSeqs.length > 0) {
+          await assertWarehouseInTenant(tx, command.tenantId, variance.warehouseId);
+          const found = await this.inventory.ledgerSeqsExistInTx(
+            tx,
+            command.tenantId,
+            variance.warehouseId,
+            statedSeqs,
+          );
+          const missing = statedSeqs.filter((seq) => !found.has(seq));
+          if (missing.length > 0) {
+            throw new ProblemException(
+              'validation-failed',
+              400,
+              'The consulted ledger seqs are not in the warehouse ledger',
+              `consideredEventSeqs names seq(s) ${missing.join(', ')} that this warehouse's ledger never wrote — state only seqs from the (tenant, warehouse) ledger timeline.`,
+            );
+          }
+        }
+
+        // The task row — the approve arm's frozen epoch rides it. NO lock:
+        // the task is terminal (settled at submit) and immutable; the epoch
+        // compare below runs under the bin locks.
+        const taskRows = await tx
+          .select()
+          .from(countTasks)
+          .where(and(eq(countTasks.tenantId, command.tenantId), eq(countTasks.id, variance.taskId)))
+          .limit(1);
+        const task = taskRows[0];
+        if (task === undefined) {
+          throw new ProblemException(
+            'not-found',
+            404,
+            'Count task not found',
+            'The variance\'s count task no longer exists in this tenant.',
+          );
+        }
+
+        // Locks, in the codebase's canonical acyclic order: the bin row,
+        // then the warehouse advisory LAST. Both arms run under them — the
+        // approve arm's epoch compare must not race an epoch-bumping write,
+        // and the recount arm's expectation capture (inside
+        // `createRecountTaskInTx`) reads under the locks like every other
+        // onHandInBinInTx call.
+        const binRows = await tx
+          .select({ id: bins.id, code: bins.code })
+          .from(bins)
+          .where(
+            and(
+              eq(bins.tenantId, command.tenantId),
+              eq(bins.warehouseId, variance.warehouseId),
+              eq(bins.id, variance.binId),
+            ),
+          )
+          .limit(1)
+          .for('update');
+        const bin = binRows[0];
+        if (bin === undefined) {
+          throw new ProblemException(
+            'not-found',
+            404,
+            'Bin not found',
+            "The count variance's bin no longer exists in this tenant.",
+          );
+        }
+        await this.inventory.lockWarehouseInTx(tx, command.tenantId, variance.warehouseId);
+
+        const resolvedAt = nowIso();
+        let stockCorrection: ResolveCountVarianceSnapshot['stockCorrection'] = null;
+        let recountTaskId: string | null = null;
+        let finalExpected = variance.expectedQuantity;
+        let finalDelta = variance.deltaMilli;
+
+        if (command.decision === 'approve_adjust') {
+          // The epoch-equality guard: the task's FROZEN bin state must still
+          // EQUAL the live epoch read UNDER the locks — `null` matches null
+          // (movements gotcha 2: read → lock → compare; the submit's
+          // EQUALITY discipline, re-asked at resolution time). `epochConflict`
+          // variances resolve approve-adjust only after the epochs
+          // re-equalize.
+          const epochs = await this.inventory.binStateEpochsInTx(
+            tx,
+            command.tenantId,
+            variance.warehouseId,
+            [variance.binId],
+          );
+          const liveEpoch = epochs.get(variance.binId) ?? null;
+          if (liveEpoch !== task.binStateEpoch) {
+            throw varianceBasisMoved(variance.id, task.binStateEpoch);
+          }
+          // The correction: the same internals the immediate adjustment and
+          // the 5-2 approval re-execution run — the guard set first (refuses
+          // BIN 404 / kit / catch-weight / batch-parity 400s BEFORE any
+          // write), then the apply (whose write-side refusals roll the whole
+          // transaction back). A variance carries no batch/serial identity —
+          // a batch- or serial-tracked SKU's variance cannot build a legal
+          // correction and answers those refusals (recount is the remedy).
+          const rebuilt: AdjustStockCommand = {
+            tenantId: command.tenantId,
+            actorUserId: command.actorUserId,
+            warehouseId: variance.warehouseId,
+            skuId: variance.skuId,
+            binId: variance.binId,
+            // `fromMilli` of the stored delta round-trips exactly (AD-9).
+            quantityDelta: fromMilli(variance.deltaMilli),
+            reasonCode: 'stock-count',
+            note: `count variance ${variance.id} resolution — count task ${variance.taskId}`,
+            // The correction's business time is the DECISION time (the
+            // 5-2 approved-events discipline).
+            occurredAt: resolvedAt,
+          };
+          await this.inventory.assertAdjustableInTx(tx, rebuilt);
+          const applied = await this.inventory.applyAdjustmentInTx(
+            tx,
+            rebuilt,
+            variance.deltaMilli as SignedQuantity,
+            [],
+            resolvedAt,
+          );
+          stockCorrection = {
+            eventId: applied.firstEventId,
+            seq: applied.snapshot.event.seq,
+            onHand: {
+              skuId: applied.snapshot.onHand.skuId,
+              binId: applied.snapshot.onHand.binId,
+              quantity: applied.snapshot.onHand.quantity,
+            },
+          };
+        } else {
+          // The recount arm — the remedy. One open task per bin STILL
+          // bounds the re-plan: a bin whose open task exists (the
+          // epoch-mismatch's auto-recount, or any other pending count)
+          // refuses until that task settles (the create's 409 arm, under
+          // the locks).
+          const openRows = await tx
+            .select({ id: countTasks.id })
+            .from(countTasks)
+            .where(
+              and(
+                eq(countTasks.tenantId, command.tenantId),
+                eq(countTasks.warehouseId, variance.warehouseId),
+                eq(countTasks.binId, variance.binId),
+                eq(countTasks.status, 'pending'),
+              ),
+            )
+            .limit(1);
+          if (openRows[0] !== undefined) {
+            throw countTaskOpen(bin.code);
+          }
+          const mintedTaskId = await this.createRecountTaskInTx(
+            tx,
+            command.tenantId,
+            task,
+            occurredAt,
+          );
+          recountTaskId = mintedTaskId;
+          // The recounted variance's expected basis becomes the recount
+          // snapshot's line expectation — 0 when the bin's on-hand is empty
+          // and the line is absent. The delta is recomputed in the same
+          // UPDATE below (the 0045 `delta_milli` CHECK re-holds).
+          const lineRows = await tx
+            .select({ expectedQuantity: countTaskLines.expectedQuantity })
+            .from(countTaskLines)
+            .where(
+              and(
+                eq(countTaskLines.tenantId, command.tenantId),
+                eq(countTaskLines.taskId, mintedTaskId),
+                eq(countTaskLines.skuId, variance.skuId),
+              ),
+            )
+            .limit(1);
+          finalExpected = lineRows[0]?.expectedQuantity ?? 0;
+          finalDelta = variance.countedQuantity - finalExpected;
+        }
+
+        const status = command.decision === 'approve_adjust' ? 'adjusted' : 'recounted';
+        // The terminal transition is CONDITIONAL (the 5-2 decide shape's
+        // belt to the locked read's braces).
+        const resolved = await tx
+          .update(countVariances)
+          .set({
+            status,
+            // The recount arm rewrites the basis in the SAME UPDATE — the
+            // row's counted value never changes, only what it was counted
+            // against.
+            expectedQuantity: finalExpected,
+            deltaMilli: finalDelta,
+            resolvedBy: command.actorUserId,
+            resolvedAt,
+            recountTaskId,
+            consideredEventSeqs: statedSeqs.length > 0 ? statedSeqs : null,
+            updatedAt: resolvedAt,
+          })
+          .where(
+            and(
+              eq(countVariances.tenantId, command.tenantId),
+              eq(countVariances.id, variance.id),
+              eq(countVariances.status, 'open'),
+            ),
+          )
+          .returning();
+        if (resolved[0] === undefined) {
+          throw varianceResolved(status, variance.id);
+        }
+
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'count.variance.resolved',
+          targetType: 'count_variance',
+          targetId: variance.id,
+          reference: idempotencyKey,
+          occurredAt: resolvedAt,
+        });
+
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: 'count.variance.resolved',
+          occurredAt: resolvedAt,
+          payload: {
+            varianceId: variance.id,
+            taskId: variance.taskId,
+            warehouseId: variance.warehouseId,
+            binId: variance.binId,
+            skuId: variance.skuId,
+            decision: command.decision,
+            status,
+            expectedQuantity: fromMilli(finalExpected),
+            countedQuantity: fromMilli(variance.countedQuantity),
+            delta: fromMilli(finalDelta),
+            thresholdQuantity:
+              variance.thresholdQuantityMilli === null
+                ? null
+                : fromMilli(variance.thresholdQuantityMilli),
+            consideredEventSeqs: statedSeqs,
+            resolvedBy: command.actorUserId,
+            resolvedAt,
+            recountTaskId,
+          },
+        });
+
+        const snapshot: ResolveCountVarianceSnapshot = {
+          variance: varianceEntry(resolved[0]),
+          stockCorrection,
         };
 
         try {
