@@ -613,7 +613,7 @@ export class InventoryController {
     type: LedgerEventListResponse,
     description: "The warehouse's ledger event-timeline page (newest first, keyset cursor)",
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed skuId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed skuId/binId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
@@ -628,6 +628,7 @@ export class InventoryController {
     assertOwnTenant(session, tenantId);
     const timelineQuery: LedgerTimelineQuery = {
       skuId: query.skuId,
+      binId: query.binId,
       cursor: query.cursor,
       limit: query.limit,
     };

@@ -149,6 +149,21 @@ export const CAPABILITIES = [
   // The count submit is an operator task (the Count inbox tab's op; the
   // floor-verb pattern — `putaway.execute`'s rationale).
   'counts.execute',
+  // Story 5-4 — FR-cycle-count's resolution verb: resolving an open count
+  // variance by approve-adjust (the explicit stock correction, one
+  // `variances.resolve` step — no second requester) or recount (the fresh
+  // recount task as the new basis). Owner + Ops Manager (CHECKPOINT 1,
+  // ratified 2026-09-29 — the counts.execute reviewer floor, one step above
+  // the floor that counts); Accountant stays read-only; Operator counts but
+  // never resolves. Over-threshold variances stay owner-only not by the
+  // capability but by the resolve command's frozen-threshold guard (the
+  // variance row carries the submit-time threshold) — the `adjustments.approve`
+  // rationale at the command instead of the capability, because the
+  // threshold here is per-SKU delta, not the movement itself. The capability
+  // also gates the variance-threshold POLICY write (a policy IS the
+  // resolution rule — the `waves.manage` rationale). Mirrored into wms-fe
+  // `src/lib/users.ts`.
+  'variances.resolve',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -204,6 +219,10 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // everything; the execute holder set mirrors `putaway.execute`).
     'counts.manage',
     'counts.execute',
+    // Story 5-4 — the variance resolution verb (CHECKPOINT 1: owner +
+    // ops_manager; over-threshold stays owner-only at the command's
+    // frozen-threshold guard, not here).
+    'variances.resolve',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',

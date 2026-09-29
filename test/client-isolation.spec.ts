@@ -656,8 +656,9 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // transfer_orders and transfer_order_lines; 0044 (story 5-2) added two
       // more — stock_adjustment_pendings and stock_adjustment_policies;
       // 0045 (story 5-3) added four more — count_policies, count_tasks,
-      // count_task_lines and count_variances. None lost.
-      expect(policies).toHaveLength(54);
+      // count_task_lines and count_variances; 0046 (story 5-4) added one
+      // more — count_variance_policies. None lost.
+      expect(policies).toHaveLength(55);
 
       for (const expected of CLIENT_POLICIES) {
         const found = policies.find(

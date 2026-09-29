@@ -3,10 +3,13 @@ import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
+import type {
+  COUNT_VARIANCE_STATUSES} from '../../shared/db/schema';
 import {
   bins,
   countTaskLines,
   countTasks,
+  countVariances,
   skus,
   transferOrderLines,
   transferOrders,
@@ -15,8 +18,9 @@ import {
   type TransferOrderLine,
 } from '../../shared/db/schema';
 import { fromMilli } from '../../shared/primitives/quantity';
-import { canonicalInstant } from '../../shared/primitives/time';
+import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/time';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
+import type { Page } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -32,10 +36,17 @@ import {
 } from './transfer.command';
 import {
   CountService,
+  varianceEntry,
   type CountPoliciesSnapshot,
+  type CountVarianceEntry,
   type CreateCountSnapshot,
+  type ResolveCountVarianceCommand,
+  type ResolveCountVarianceSnapshot,
+  type SetVariancePolicyCommand,
   type SubmitCountSnapshot,
+  type VariancePolicySnapshot,
 } from './count.command';
+import { VariancePolicyCommand } from './variance-policy.command';
 
 /**
  * The movements module's public seam (Story 5-1): every other module (and the
@@ -57,6 +68,16 @@ export const MAX_SNAPSHOT_TRANSFER_TASKS = 500;
 export const MAX_SNAPSHOT_COUNT_TASKS = 500;
 /** The scheduler's per-warehouse-per-tick task bound (PENDING: tunable). */
 export const MAX_SCHEDULED_TASKS_PER_TICK = 200;
+
+/** The variance queue read's page default (the pendings queue's shape). */
+export const DEFAULT_VARIANCE_PAGE_SIZE = 50;
+
+export interface ListCountVariancesQuery {
+  readonly status?: (typeof COUNT_VARIANCE_STATUSES)[number] | undefined;
+  readonly warehouseId?: string | undefined;
+  readonly cursor?: string | undefined;
+  readonly limit?: number | undefined;
+}
 
 export interface ListTransfersQuery {
   readonly status?: string | undefined;
@@ -198,6 +219,7 @@ export class MovementsFacade {
     // One-way: the facade consumes the commands; the commands never see it.
     @Inject(TransferService) private readonly commands: TransferService,
     @Inject(CountService) private readonly countCommands: CountService,
+    @Inject(VariancePolicyCommand) private readonly variancePolicies: VariancePolicyCommand,
     // The epoch read for the task cards (the same-tx capture the pick
     // command's task read established) and — nothing else; every stock write
     // already went through the command's facade passthroughs.
@@ -268,6 +290,32 @@ export class MovementsFacade {
     return withTenantTransaction(this.db, tenantId, (tx) =>
       this.countCommands.generateScheduledTasksInTx(tx, tenantId, warehouseId, maxTasks),
     );
+  }
+
+  // ── variance command passthroughs (story 5-4; the api layer's only
+  //    variance mutations) ─────────────────────────────────────────────────
+
+  /** PUT …/movements/variance-policies — the tenant's threshold row. */
+  setVariancePolicy(
+    command: SetVariancePolicyCommand,
+    idempotencyKey: string,
+  ): Promise<VariancePolicySnapshot> {
+    return this.variancePolicies.setVariancePolicy(command, idempotencyKey);
+  }
+
+  /** GET …/movements/variance-policies — null when no row exists (disabled). */
+  getVariancePolicy(tenantId: string): Promise<VariancePolicySnapshot | null> {
+    return this.variancePolicies.getVariancePolicy(tenantId);
+  }
+
+  /** POST …/movements/variances/:varianceId/resolve — the arm's execution. */
+  resolveCountVariance(
+    command: ResolveCountVarianceCommand,
+    idempotencyKey: string,
+  ): Promise<ResolveCountVarianceSnapshot> {
+    return this.countCommands
+      .resolveCountVariance(command, idempotencyKey)
+      .then((result) => result.snapshot);
   }
 
   // ── reads ────────────────────────────────────────────────────────────────
@@ -601,6 +649,64 @@ export class MovementsFacade {
    * `getTransferTasksInTx` shape): the device catalog snapshot composes this
    * beside its other reads in ONE tenant transaction.
    */
+  /**
+   * GET …/movements/variances — the variance RESOLUTION queue (story 5-4;
+   * 5-5 owns the queue surface): the resolution cards' rows — delta,
+   * threshold context, who/when resolved. Newest first, keyset cursor
+   * pagination (offset pagination is banned — UX-DR25), status- and
+   * warehouse-filterable. A read — never capability-gated (the resolving
+   * mutation is); the route's tenant RLS keeps every row the tenant's own
+   * (the status/warehouse filters narrow only within it).
+   */
+  async listCountVariances(
+    tenantId: string,
+    query: ListCountVariancesQuery = {},
+  ): Promise<Page<CountVarianceEntry>> {
+    const pageSize = query.limit ?? DEFAULT_VARIANCE_PAGE_SIZE;
+    const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({
+          row: countVariances,
+          // The CURSOR needs the raw `::text` instant — the driver's parse
+          // (and `canonicalInstant`) truncates to milliseconds, and a
+          // truncated cursor's strict `<` would skip the tail of a tie
+          // group (rows sharing one transactional `now()`). See
+          // `fullPrecisionInstant`.
+          createdAtText: sql<string>`${countVariances.createdAt}::text`,
+        })
+        .from(countVariances)
+        .where(
+          and(
+            eq(countVariances.tenantId, tenantId),
+            query.status === undefined ? undefined : eq(countVariances.status, query.status),
+            query.warehouseId === undefined
+              ? undefined
+              : eq(countVariances.warehouseId, query.warehouseId),
+            before === undefined
+              ? undefined
+              : sql`(${countVariances.createdAt}, ${countVariances.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
+          ),
+        )
+        .orderBy(desc(countVariances.createdAt), desc(countVariances.id))
+        .limit(pageSize + 1);
+      // buildPage encodes the cursor from the FULL-precision instants; the
+      // surfaced entries keep the canonical (ms) body shape.
+      const page = buildPage(
+        rows.map((wrapped) => ({
+          createdAt: fullPrecisionInstant(wrapped.createdAtText),
+          id: wrapped.row.id,
+          entry: varianceEntry(wrapped.row),
+        })),
+        pageSize,
+      );
+      return {
+        items: page.items.map((wrapped) => wrapped.entry),
+        nextCursor: page.nextCursor,
+      };
+    });
+  }
+
   async getCountTasksInTx(
     tx: TenantTx,
     tenantId: string,
@@ -706,5 +812,10 @@ export type {
   SubmitCountSnapshot,
   CountPoliciesSnapshot,
   CountVarianceSnapshot,
+  CountVarianceEntry,
+  ResolveCountVarianceCommand,
+  ResolveCountVarianceSnapshot,
+  SetVariancePolicyCommand,
+  VariancePolicySnapshot,
 } from './count.command';
 export type { TransferOrder, TransferOrderLine };

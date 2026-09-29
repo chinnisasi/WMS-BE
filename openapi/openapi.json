@@ -4273,6 +4273,16 @@
             }
           },
           {
+            "name": "binId",
+            "required": false,
+            "in": "query",
+            "description": "Only events touching one bin (its source OR destination; story 5-4's bin-history read)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -4305,7 +4315,7 @@
             }
           },
           "400": {
-            "description": "Malformed skuId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "description": "Malformed skuId/binId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11174,6 +11184,422 @@
           }
         ],
         "summary": "Upserts the warehouse's cycle-count policies (counts.manage): one row per (tenant, warehouse, ABC class) naming the scheduled count interval in days — a class with no row is never scheduled",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/variance-policies": {
+      "put": {
+        "operationId": "MovementsController_setVariancePolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetVariancePolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The policy row after the upsert (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VariancePolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — a negative/non-whole threshold or one above the stored column bound (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks variances.resolve (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent first write of the same policy lost the unique-index race (conflict — retry), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Upserts the tenant's variance-threshold policy (variances.resolve): the |delta| ceiling (base units) above which a variance resolves by owner only — a submit freezes the threshold onto every variance row it writes; null disables the routing",
+        "tags": [
+          "movements"
+        ]
+      },
+      "get": {
+        "operationId": "MovementsController_getVariancePolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The tenant's policy row",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VariancePolicyResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No policy row exists — the threshold routing is disabled (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Returns the tenant's variance-threshold policy, or 404 when unset (the routing is disabled; never capability-gated)",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/variances": {
+      "get": {
+        "operationId": "MovementsController_listCountVariances",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "open",
+                "adjusted",
+                "recounted"
+              ]
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Narrow to one warehouse",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The tenant's variance page (newest first, keyset cursor)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CountVarianceListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed status/warehouseId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists count variances (keyset cursor pagination, newest first, status/warehouse-filterable; never capability-gated — the resolving mutation is variances.resolve)",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/movements/variances/{varianceId}/resolve": {
+      "post": {
+        "operationId": "MovementsController_resolveCountVariance",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "varianceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveCountVarianceDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The resolution (the idempotency snapshot): the variance in its terminal state, plus the approve arm's correction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResolveCountVarianceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid body, consulted seqs this warehouse's ledger never wrote, or an approve-adjust guard refusal (bin retired / kit / catch-weight / batch parity) from the correction's re-execution (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks variances.resolve (role-denied), or an over-threshold variance resolved by a role below owner (variance-owner-required)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The variance, its count task, or its bin does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The variance is already resolved (variance-resolved), the task's frozen bin epoch no longer matches (variance-basis-moved — recount is the remedy), the bin already has an open count task on the RECOUNT arm (count-task-open — approve_adjust under an open sibling task is legal), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Resolves one open count variance (variances.resolve — owner + Ops Manager): approve_adjust applies the counted−expected delta as stock.adjusted ledger events (the task's frozen bin epoch must still EQUAL the live one), or recount mints a recount task and re-bases the variance; an over-threshold variance resolves by owner only",
         "tags": [
           "movements"
         ]
@@ -19658,6 +20084,219 @@
         },
         "required": [
           "policies"
+        ]
+      },
+      "SetVariancePolicyDto": {
+        "type": "object",
+        "properties": {
+          "quantityThreshold": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "maximum": 2147483,
+            "description": "The |delta| ceiling in BASE units above which a variance resolves by owner only (null/absent = disable the routing). Stored as milli-units. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded."
+          }
+        }
+      },
+      "VariancePolicyResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantityThreshold": {
+            "type": "number",
+            "nullable": true,
+            "description": "Base units; null = the routing is disabled"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "quantityThreshold",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "CountVarianceEntryResponseDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "taskId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedQuantity": {
+            "type": "number",
+            "description": "Base units — the frozen expectation"
+          },
+          "countedQuantity": {
+            "type": "number",
+            "description": "Base units — what the operator counted"
+          },
+          "delta": {
+            "type": "number",
+            "description": "counted − expected (may be negative)"
+          },
+          "epochConflict": {
+            "type": "boolean",
+            "description": "A movement moved the bin between task start and submit (OQ-2)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "adjusted",
+              "recounted"
+            ]
+          },
+          "thresholdQuantity": {
+            "type": "number",
+            "nullable": true,
+            "description": "Base units — the submit-frozen threshold; null = disabled"
+          },
+          "resolvedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "recountTaskId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The recount arm’s minted task"
+          },
+          "consideredEventSeqs": {
+            "nullable": true,
+            "description": "The consulted ledger seqs",
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "createdAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "taskId",
+          "warehouseId",
+          "binId",
+          "skuId",
+          "expectedQuantity",
+          "countedQuantity",
+          "delta",
+          "epochConflict",
+          "status",
+          "thresholdQuantity",
+          "resolvedBy",
+          "resolvedAt",
+          "recountTaskId",
+          "consideredEventSeqs",
+          "createdAt"
+        ]
+      },
+      "CountVarianceListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CountVarianceEntryResponseDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "ResolveCountVarianceDto": {
+        "type": "object",
+        "properties": {
+          "decision": {
+            "type": "string",
+            "enum": [
+              "approve_adjust",
+              "recount"
+            ],
+            "description": "The resolution arm"
+          },
+          "consideredEventSeqs": {
+            "nullable": true,
+            "description": "The ledger seqs this resolution states it consulted (the bin timeline the approver pulled). Required, non-empty, on approve_adjust; optional on recount.",
+            "maxItems": 200,
+            "type": "array",
+            "items": {
+              "type": "number",
+              "minimum": 1
+            }
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock",
+            "minLength": 20,
+            "maxLength": 35
+          }
+        },
+        "required": [
+          "decision"
+        ]
+      },
+      "ResolveCountVarianceResponse": {
+        "type": "object",
+        "properties": {
+          "variance": {
+            "$ref": "#/components/schemas/CountVarianceEntryResponseDto"
+          },
+          "stockCorrection": {
+            "type": "object",
+            "nullable": true,
+            "description": "The approve arm’s applied correction (event id + seq + the settled on-hand); null on the recount arm"
+          }
+        },
+        "required": [
+          "variance",
+          "stockCorrection"
         ]
       },
       "TransferListResponse": {

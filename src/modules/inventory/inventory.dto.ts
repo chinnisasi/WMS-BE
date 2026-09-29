@@ -219,6 +219,15 @@ export class LedgerEventsQuery {
   @IsUUID()
   skuId?: string;
 
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: "Only events touching one bin (its source OR destination; story 5-4's bin-history read)",
+  })
+  @IsOptional()
+  @IsUUID()
+  binId?: string;
+
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()
