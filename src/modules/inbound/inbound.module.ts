@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { CatalogModule } from '../catalog/catalog.module';
 import { InventoryModule } from '../inventory/inventory.module';
@@ -41,8 +41,12 @@ import { QcFacade } from './qc.facade';
  * An inbound → outbound module edge buys nothing here and drags the whole
  * outbound graph into this module's initialization.
  */
+// forwardRef(catalog): story 5-6 made TenancyModule import this module (the
+// sync-report apply arm), closing a third catalog → tenancy → inbound →
+// catalog cycle; the decorator must not touch the loading binding eagerly
+// (the catalog↔tenancy pattern).
 @Module({
-  imports: [SharedModule, CatalogModule, InventoryModule, PutawayModule],
+  imports: [SharedModule, forwardRef(() => CatalogModule), InventoryModule, PutawayModule],
   providers: [
     VendorCommand,
     PurchaseOrderCommand,

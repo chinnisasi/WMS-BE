@@ -1970,4 +1970,81 @@ export class CountService {
     });
     return taskId;
   }
+
+  /**
+   * Story 5-6 — the AD-14 recount arm without a superseded task: the
+   * `createRecountTaskInTx` core against a plain bin (the human-review
+   * surface never had a prior count task; it re-plans from the bin's CURRENT
+   * on-hand and live epoch — both read UNDER the locks the caller holds, the
+   * OQ-2 capture's discipline). `createdBy` is null exactly as the OQ-2
+   * arm's.
+   *
+   * The per-bin open-task rule re-holds here (the create's 409 arm, under
+   * the caller's locks): a bin with a pending count task refuses the mint —
+   * the caller surfaces `count-task-open` verbatim and its row stays open.
+   * The caller holds the locks (bin row `.for('update')` → warehouse
+   * advisory LAST — the canonical order) and its own transaction; this
+   * method only mints.
+   */
+  async mintRecountTaskForBinInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    binId: string,
+    binCode: string,
+    occurredAt: string,
+  ): Promise<string> {
+    const openRows = await tx
+      .select({ id: countTasks.id })
+      .from(countTasks)
+      .where(
+        and(
+          eq(countTasks.tenantId, tenantId),
+          eq(countTasks.warehouseId, warehouseId),
+          eq(countTasks.binId, binId),
+          eq(countTasks.status, 'pending'),
+        ),
+      )
+      .limit(1);
+    if (openRows[0] !== undefined) {
+      throw countTaskOpen(binCode);
+    }
+
+    const expected = await this.inventory.onHandInBinInTx(tx, tenantId, warehouseId, binId);
+    const epochs = await this.inventory.binStateEpochsInTx(tx, tenantId, warehouseId, [binId]);
+    const epoch = epochs.get(binId) ?? null;
+
+    const taskId = uuidv7();
+    await tx.insert(countTasks).values({
+      id: taskId,
+      tenantId,
+      warehouseId,
+      binId,
+      status: 'pending',
+      origin: 'recount',
+      binStateEpoch: epoch,
+      createdBy: null,
+    });
+    const lineValues = expected
+      .filter((arm) => arm.quantity !== 0)
+      .map((arm) => ({
+        id: uuidv7(),
+        tenantId,
+        taskId,
+        skuId: arm.skuId,
+        expectedQuantity: arm.quantity,
+      }));
+    if (lineValues.length > 0) {
+      await tx.insert(countTaskLines).values(lineValues);
+    }
+
+    await this.outbox.append(tx, {
+      messageId: uuidv7(),
+      tenantId,
+      type: 'count.created',
+      occurredAt,
+      payload: { taskId, binId, warehouseId, origin: 'recount' },
+    });
+    return taskId;
+  }
 }

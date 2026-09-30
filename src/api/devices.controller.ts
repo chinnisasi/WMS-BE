@@ -14,6 +14,7 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/
 import { UUID_RE } from '../shared/primitives/ids';
 import { EnrollmentCommand } from '../modules/tenancy/enrollment.command';
 import type { DeviceView } from '../modules/tenancy/enrollment.command';
+import { SyncReportCommand } from '../modules/tenancy/sync-report.command';
 import {
   BadgeInDto,
   BadgeInResponse,
@@ -26,6 +27,20 @@ import {
   MintEnrollmentCodeDto,
   MintEnrollmentCodeResponse,
 } from './devices.dto';
+// The Query DTO stays a RUNTIME import (the global ValidationPipe's
+// transform reads design:paramtypes — the movements.controller note's
+// precedent).
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import {
+  RecordSyncReportDto,
+  RejectedOpListQuery,
+  RejectedOpListResponse,
+  RejectedOpResolveResponse,
+  ResolveRejectedOpDto,
+  SyncReportResponse,
+} from './rejected-ops.dto';
+import type { RejectedOpEntry } from '../modules/tenancy/sync-report.command';
+import type { RejectedOpResponse } from './rejected-ops.dto';
 
 export class DeviceListQuery {
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
@@ -64,7 +79,14 @@ const IDEMPOTENCY_HEADER = [
 @ApiExtraModels(ProblemDetailsDto)
 @Controller('tenants')
 export class DevicesController {
-  constructor(@Inject(EnrollmentCommand) private readonly enrollment: EnrollmentCommand) {}
+  constructor(
+    @Inject(EnrollmentCommand) private readonly enrollment: EnrollmentCommand,
+    // Story 5-6 — the AD-14 sync-report surface (upload + review queue +
+    // resolve) rides the same controller: the upload is the device contract's
+    // newest member, the review routes gate on the session family only (the
+    // command asserts `review.decide`).
+    @Inject(SyncReportCommand) private readonly syncReports: SyncReportCommand,
+  ) {}
 
   @Post(':tenantId/devices/enrollment-codes')
   @HttpCode(HttpStatus.CREATED)
@@ -247,10 +269,169 @@ export class DevicesController {
       key,
     );
   }
+
+  // ── story 5-6: the AD-14 sync report + the rejected-op review queue ─────
+
+  /**
+   * The replay pass's durable upload (device session; badge-in required —
+   * the self-test echo's family). The command re-resolves the device row and
+   * the operator's role per call (fail-closed); rows dedupe per
+   * (tenant, op_id), so the at-least-once re-post is a no-op.
+   */
+  @Post(':tenantId/devices/sync-reports')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(DeviceSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Records a device sync report of dropped terminal ops (rejected + quarantined fates) — badge-in session, per-row dedupe',
+  })
+  @ApiBody({ type: RecordSyncReportDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: SyncReportResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed report row (validation-failed, naming the row)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or a demoted/removed operator (role-denied)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Concurrent idempotent request for the same key') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
+  async recordSyncReport(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentDeviceSession() session: DeviceSession,
+    @Body() dto: RecordSyncReportDto,
+  ): Promise<SyncReportResponse> {
+    assertOwnTenant(session.tenantId, tenantId);
+    if (session.userId === null) {
+      // A bare enrollment credential has no operator — badge-in first.
+      throw new ProblemException(
+        'unauthenticated',
+        401,
+        'Badge-in required',
+        'This endpoint requires an operator badge-in session.',
+      );
+    }
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const { snapshot } = await this.syncReports.recordSyncReport(
+      {
+        tenantId,
+        deviceId: session.deviceId,
+        operatorUserId: session.userId,
+        rows: dto.rows,
+      },
+      key,
+    );
+    return { ...snapshot, rows: snapshot.rows.map((ack) => ({ ...ack })) };
+  }
+
+  /**
+   * The Conflicts & Reviews queue's read (story 5-6): the rejected ops,
+   * newest first, status-filtered, keyset-paged. A read — open to any
+   * tenant member (never capability-gated; the tab itself hides on the
+   * capability, never blocks).
+   */
+  @Get(':tenantId/rejected-ops')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Lists the tenant's rejected sync-report ops (keyset cursor pagination — open to any member)" })
+  @ApiOkResponse({ type: RejectedOpListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor (invalid-cursor), out-of-range limit, or unknown status filter (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async listRejectedOps(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: RejectedOpListQuery,
+  ): Promise<RejectedOpListResponse> {
+    assertOwnTenant(session.tenantId, tenantId);
+    const page = await this.syncReports.listRejectedOps(tenantId, {
+      status: query.status,
+      cursor: query.cursor,
+      limit: query.limit === undefined ? undefined : query.limit,
+    });
+    return { items: page.items.map(toRejectedOpResponse), nextCursor: page.nextCursor };
+  }
+
+  /**
+   * The resolve route (story 5-6, `review.decide` — the command executes
+   * the arm; owner + ops_manager): apply / recount / discard, one row per
+   * call. An apply arm's guard refusal surfaces verbatim (400/403/409/422
+   * — the row stays open); the already-resolved and foreign arms are 409 /
+   * 404.
+   */
+  @Post(':tenantId/rejected-ops/:rejectedOpId/resolve')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Resolves one open rejected op (review.decide): apply re-executes the payload through its own guarded command (binStateEpoch stripped), recount mints a count task on the payload bin, discard trails to audit',
+  })
+  @ApiBody({ type: ResolveRejectedOpDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: RejectedOpResolveResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, unknown decision, or the payload refusing an arm (validation-failed — including a payload recount cannot re-plan)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks review.decide (role-denied), or the apply re-execution\'s own guards refused (device-revoked, verbatim)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Rejected op does not exist in this tenant (not-found), or a recounted bin does not') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Row already resolved (rejected-op-resolved), a pending count task on the bin (count-task-open), or the re-executed command\'s own conflict (verbatim)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'rejectedOpId', format: 'uuid' })
+  async resolveRejectedOp(
+    @Param('tenantId') tenantId: string,
+    @Param('rejectedOpId') rejectedOpId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: ResolveRejectedOpDto,
+  ): Promise<RejectedOpResolveResponse> {
+    assertOwnTenant(session.tenantId, tenantId);
+    assertUuidParam(rejectedOpId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const { snapshot } = await this.syncReports.resolveRejectedOp(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        rejectedOpId,
+        decision: dto.decision,
+        occurredAt: dto.occurredAt,
+      },
+      key,
+    );
+    return {
+      rejectedOp: toRejectedOpResponse(snapshot.rejectedOp),
+      outcome: snapshot.outcome,
+    };
+  }
 }
 
 function toDeviceResponse(device: DeviceView): DeviceResponse {
   return { ...device };
+}
+
+function toRejectedOpResponse(entry: RejectedOpEntry): RejectedOpResponse {
+  return {
+    id: entry.id,
+    tenantId: entry.tenantId,
+    deviceId: entry.deviceId,
+    operatorUserId: entry.operatorUserId,
+    opId: entry.opId,
+    opType: entry.opType,
+    classification: entry.classification,
+    problemCode: entry.problemCode,
+    problemDetail: entry.problemDetail,
+    payload: entry.payload,
+    attribution: entry.attribution,
+    opEnqueuedAt: entry.opEnqueuedAt,
+    opOccurredAt: entry.opOccurredAt,
+    status: entry.status,
+    resolvedBy: entry.resolvedBy,
+    resolvedAt: entry.resolvedAt,
+    resolvedOutcome: entry.resolvedOutcome,
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
+  };
 }
 
 /** Device uuid path params fail 400 (not a 500 from the `::uuid` cast). */

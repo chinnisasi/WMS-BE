@@ -3598,6 +3598,347 @@
         ]
       }
     },
+    "/tenants/{tenantId}/devices/sync-reports": {
+      "post": {
+        "operationId": "DevicesController_recordSyncReport",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordSyncReportDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncReportResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed report row (validation-failed, naming the row)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown or revoked device (device-revoked), or a demoted/removed operator (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Concurrent idempotent request for the same key",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Records a device sync report of dropped terminal ops (rejected + quarantined fates) — badge-in session, per-row dedupe",
+        "tags": [
+          "devices"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/rejected-ops": {
+      "get": {
+        "operationId": "DevicesController_listRejectedOps",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "open",
+                "applied",
+                "recounted",
+                "discarded"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RejectedOpListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor (invalid-cursor), out-of-range limit, or unknown status filter (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's rejected sync-report ops (keyset cursor pagination — open to any member)",
+        "tags": [
+          "devices"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/rejected-ops/{rejectedOpId}/resolve": {
+      "post": {
+        "operationId": "DevicesController_resolveRejectedOp",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "rejectedOpId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveRejectedOpDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RejectedOpResolveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, unknown decision, or the payload refusing an arm (validation-failed — including a payload recount cannot re-plan)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks review.decide (role-denied), or the apply re-execution's own guards refused (device-revoked, verbatim)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Rejected op does not exist in this tenant (not-found), or a recounted bin does not",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Row already resolved (rejected-op-resolved), a pending count task on the bin (count-task-open), or the re-executed command's own conflict (verbatim)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Resolves one open rejected op (review.decide): apply re-executes the payload through its own guarded command (binStateEpoch stripped), recount mints a count task on the payload bin, discard trails to audit",
+        "tags": [
+          "devices"
+        ]
+      }
+    },
     "/tenants/{tenantId}/inventory/adjustments": {
       "post": {
         "operationId": "InventoryController_adjustStock",
@@ -13973,6 +14314,322 @@
           "operatorUserId",
           "echoed",
           "receivedAt"
+        ]
+      },
+      "SyncReportAttributionDto": {
+        "type": "object",
+        "properties": {
+          "deviceLabel": {
+            "type": "string",
+            "description": "The op's own device label (as sealed at enqueue)"
+          },
+          "operatorEmail": {
+            "type": "string",
+            "description": "The op's own operator email (as sealed at enqueue)"
+          }
+        }
+      },
+      "SyncReportRowDto": {
+        "type": "object",
+        "properties": {
+          "opId": {
+            "type": "string",
+            "description": "The mobile op's ULID (26 chars — the dedupe key)"
+          },
+          "opType": {
+            "type": "string",
+            "enum": [
+              "grn.submit",
+              "putaway.place",
+              "pick.record",
+              "pack.execute",
+              "excursion.record",
+              "transfer.confirm",
+              "count.submit"
+            ]
+          },
+          "classification": {
+            "type": "string",
+            "enum": [
+              "rejected",
+              "quarantined"
+            ],
+            "description": "The replay fate the server refused with"
+          },
+          "problemCode": {
+            "type": "string",
+            "description": "The refusal code, verbatim from the replay"
+          },
+          "problemDetail": {
+            "type": "string",
+            "nullable": true,
+            "description": "The refusal detail, verbatim (null when the server sent none)"
+          },
+          "payload": {
+            "type": "object",
+            "description": "The op's payload as enqueued (base units; the apply arm re-executes it)"
+          },
+          "attribution": {
+            "nullable": true,
+            "description": "The op's own session as the device sealed it",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SyncReportAttributionDto"
+              }
+            ]
+          },
+          "opEnqueuedAt": {
+            "type": "string",
+            "description": "When the op was enqueued on the device (ISO-8601)"
+          },
+          "opOccurredAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "The op's business time when the payload carried one"
+          }
+        },
+        "required": [
+          "opId",
+          "opType",
+          "classification",
+          "problemCode",
+          "payload",
+          "opEnqueuedAt"
+        ]
+      },
+      "RecordSyncReportDto": {
+        "type": "object",
+        "properties": {
+          "rows": {
+            "description": "The dropped terminal ops retained by the last replay pass(es). 200 rows is the per-report ceiling; the EFFECTIVE bound is the body limit (~100 kB default — 32 kB per-row payload cap × 50-row slices is the uploader's real shape), so a report that exceeds the body limit is refused 413 before any row can be named.",
+            "maxItems": 200,
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SyncReportRowDto"
+            }
+          }
+        },
+        "required": [
+          "rows"
+        ]
+      },
+      "SyncReportRowAckResponse": {
+        "type": "object",
+        "properties": {
+          "opId": {
+            "type": "string",
+            "description": "The op's ULID"
+          },
+          "recorded": {
+            "type": "boolean",
+            "description": "Whether this upload recorded the row (false = the (tenant, op_id) dedupe absorbed it)"
+          }
+        },
+        "required": [
+          "opId",
+          "recorded"
+        ]
+      },
+      "SyncReportResponse": {
+        "type": "object",
+        "properties": {
+          "received": {
+            "type": "number",
+            "description": "Rows the report carried"
+          },
+          "recorded": {
+            "type": "number",
+            "description": "Rows newly recorded (open in the queue)"
+          },
+          "duplicates": {
+            "type": "number",
+            "description": "Rows the per-row dedupe absorbed (already reported)"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SyncReportRowAckResponse"
+            }
+          }
+        },
+        "required": [
+          "received",
+          "recorded",
+          "duplicates",
+          "rows"
+        ]
+      },
+      "RejectedOpResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "deviceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "operatorUserId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "opId": {
+            "type": "string",
+            "description": "The mobile op's ULID"
+          },
+          "opType": {
+            "type": "string",
+            "enum": [
+              "grn.submit",
+              "putaway.place",
+              "pick.record",
+              "pack.execute",
+              "excursion.record",
+              "transfer.confirm",
+              "count.submit"
+            ]
+          },
+          "classification": {
+            "type": "string",
+            "enum": [
+              "rejected",
+              "quarantined"
+            ]
+          },
+          "problemCode": {
+            "type": "string"
+          },
+          "problemDetail": {
+            "type": "string",
+            "nullable": true
+          },
+          "payload": {
+            "type": "object"
+          },
+          "attribution": {
+            "type": "object",
+            "description": "Device name + operator id/email + the op's own session"
+          },
+          "opEnqueuedAt": {
+            "type": "string"
+          },
+          "opOccurredAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "applied",
+              "recounted",
+              "discarded"
+            ]
+          },
+          "resolvedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "resolvedOutcome": {
+            "type": "object",
+            "nullable": true,
+            "description": "The arm's outcome (the applied snapshot / minted count task id / the discard marker)"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "deviceId",
+          "operatorUserId",
+          "opId",
+          "opType",
+          "classification",
+          "problemCode",
+          "problemDetail",
+          "payload",
+          "attribution",
+          "opEnqueuedAt",
+          "opOccurredAt",
+          "status",
+          "resolvedBy",
+          "resolvedAt",
+          "resolvedOutcome",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "RejectedOpListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RejectedOpResponse"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "ResolveRejectedOpDto": {
+        "type": "object",
+        "properties": {
+          "decision": {
+            "type": "string",
+            "enum": [
+              "apply",
+              "recount",
+              "discard"
+            ],
+            "description": "The arm — 'recount' requires the payload to carry a bin"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "The decision instant (ISO-8601 UTC; server clock when absent)"
+          }
+        },
+        "required": [
+          "decision"
+        ]
+      },
+      "RejectedOpResolveResponse": {
+        "type": "object",
+        "properties": {
+          "rejectedOp": {
+            "$ref": "#/components/schemas/RejectedOpResponse"
+          },
+          "outcome": {
+            "type": "object",
+            "nullable": true,
+            "description": "The arm's outcome — the re-executed command's snapshot, the minted count task id, or the discard marker"
+          }
+        },
+        "required": [
+          "rejectedOp",
+          "outcome"
         ]
       },
       "BatchInputDto": {

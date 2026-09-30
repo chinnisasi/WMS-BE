@@ -330,6 +330,13 @@
       "when": 1790695650839,
       "tag": "0046_variance_resolution",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1790695650840,
+      "tag": "0047_rejected_ops",
+      "breakpoints": true
     }
   ]
 }
