@@ -598,7 +598,7 @@ export class SyncReportCommand {
           // misstamp rows 2..n — each row carries its own.
           const attribution = {
             deviceId: command.deviceId,
-            deviceLabel: device.label ?? '',
+            deviceLabel: device.label ?? null,
             operatorId: command.operatorUserId,
             operatorEmail: operator.email,
             opDeviceLabel: row.attribution?.deviceLabel ?? null,

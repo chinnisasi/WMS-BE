@@ -452,6 +452,15 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
     ]).expect(400);
     expect(stranger.body.detail).toContain('forged');
 
+    // A NULL row (review iteration 1, RB6 — pinned at its REAL layer): the
+    // DTO's @ValidateNested({each: true}) refuses null array elements itself,
+    // with a 400 — never a 500 — naming the array path, not a row (there is
+    // no op id in a null to name).
+    const nullRow = await uploadReport(tenantId, badgeSession, [null as unknown as Record<string, unknown>]).expect(400);
+    expect(nullRow.body).toMatchObject({ code: 'validation-failed' });
+    expect(nullRow.body.detail).toContain('rows');
+    expect(nullRow.body.detail).toContain('either object or array');
+
     // A one-row-over budget (the frozen 200) is a boundary validation.
     const flood = Array.from({ length: 201 }, () => packOpRow());
     await uploadReport(tenantId, badgeSession, flood).expect(400);
@@ -657,6 +666,42 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
     const unknownBin = await resolveOp(ownerToken, tenantId, ghost.id, { decision: 'recount' }, ulid()).expect(404);
     expect(unknownBin.body).toMatchObject({ code: 'not-found' });
     expect(unknownBin.body.detail).toContain('No bin with id');
+
+    // RV2 (review iteration 1): the PUTAWAY carrier — the arm's second
+    // vocabulary half. A `putaway.place` row whose payload names NO `binId`,
+    // only the placement field `toBinId` (the real mobile outbox's placement
+    // payload shape, its own warehouse + bin), counts: the arm resolves the
+    // bin from `payload.toBinId` against the payload's OWN warehouse and
+    // mints the task on THAT bin.
+    const putawayTarget = await createWarehouseAndBin(ownerToken, tenantId, 'A-01-02');
+    const putawayCountRow = reportRow('putaway.place', {
+      warehouseId: putawayTarget.warehouseId,
+      grnId: uuidv7(),
+      grnLineId: uuidv7(),
+      skuId: uuidv7(),
+      batchId: null,
+      qty: 6,
+      toBinId: putawayTarget.binId,
+      reasonCode: null,
+      occurredAt: ENQUEUED_AT,
+      serials: null,
+    });
+    await uploadReport(tenantId, badgeSession, [putawayCountRow], ulid()).expect(201);
+    ({ items } = (await listRejectedOps(ownerToken, tenantId, { status: 'open' }).expect(200)).body);
+    const putawayCount = items.find((i: { opId: string }) => i.opId === putawayCountRow.opId)!;
+    const toBinRecount = await resolveOp(ownerToken, tenantId, putawayCount.id, { decision: 'recount' }, ulid()).expect(200);
+    expect(toBinRecount.body.rejectedOp.status).toBe('recounted');
+    const toBinTaskId = toBinRecount.body.outcome.countTaskId as string;
+    expect(typeof toBinTaskId).toBe('string');
+    const sql2 = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const tasks = await sql2<{ bin_id: string; origin: string }[]>`
+        select bin_id, origin from count_tasks where tenant_id = ${tenantId} and id = ${toBinTaskId}`;
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]).toMatchObject({ bin_id: putawayTarget.binId, origin: 'recount' });
+    } finally {
+      await sql2.end();
+    }
   });
 
   /** Seeds on-hand with a stock-count adjustment (the picking suite's fixture). */

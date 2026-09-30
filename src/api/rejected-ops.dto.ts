@@ -72,7 +72,12 @@ export class SyncReportRowDto {
 }
 
 export class RecordSyncReportDto {
-  @ApiProperty({ type: [SyncReportRowDto], description: 'The dropped terminal ops retained by the last replay pass(es)', maxItems: 200 })
+  @ApiProperty({
+    type: [SyncReportRowDto],
+    description:
+      'The dropped terminal ops retained by the last replay pass(es). 200 rows is the per-report ceiling; the EFFECTIVE bound is the body limit (~100 kB default — 32 kB per-row payload cap × 50-row slices is the uploader\'s real shape), so a report that exceeds the body limit is refused 413 before any row can be named.',
+    maxItems: 200,
+  })
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(200)
