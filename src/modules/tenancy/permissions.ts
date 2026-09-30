@@ -164,6 +164,17 @@ export const CAPABILITIES = [
   // resolution rule — the `waves.manage` rationale). Mirrored into wms-fe
   // `src/lib/users.ts`.
   'variances.resolve',
+  // Story 6.1 — FR-22's replenishment verbs: the per-warehouse reorder-policy
+  // writes (upsert + delete), the breach dismissal, and the suggested-PO
+  // submit. Owner + Ops Manager (the planning set; the floor never acts on
+  // replenishment drafts). The submit arm re-executes PO creation under
+  // `po.manage` on the same transaction, so the inbound gate stays live
+  // there — a holder of `replenishment.manage` without `po.manage` could not
+  // exist by construction, and the inner assert is the proof. Deliberately
+  // NOT gating the list reads (policies / breaches / drafts): reads are
+  // never gated (the rule at the top of this file). Mirrored into wms-fe
+  // `src/lib/users.ts`.
+  'replenishment.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -223,6 +234,10 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // ops_manager; over-threshold stays owner-only at the command's
     // frozen-threshold guard, not here).
     'variances.resolve',
+    // Story 6.1 — the replenishment verbs (owner holds everything): the
+    // reorder-policy writes, breach dismissal, and suggested-PO submit — the
+    // planning set, the stock-intelligence surface's operator.
+    'replenishment.manage',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',

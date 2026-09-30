@@ -168,6 +168,20 @@ export class PurchaseOrderCommand {
     @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
   ) {}
 
+  /**
+   * The create command's HTTP entry (its own tenant transaction — story 3.1).
+   * Story 6.1: the core moved into `createInTx` so a caller that already
+   * holds the locks can mint a PO on ITS OWN transaction without ever
+   * nesting a second one — a nested transaction reserves a SECOND pooled
+   * connection while the outer one is held, and postgres.js queues
+   * connection requests with no timeout (the documented pool-deadlock shape,
+   * `putaway.facade.ts:221-224`). Every invariant — the fresh `po.manage`
+   * role read, the replay lookup, the master-data asserts, the outbox append,
+   * the idempotency key LAST — is carried by `createInTx` unchanged, so this
+   * wrapper is the same command it always was; the replenishment submit arm
+   * re-executes PO creation through it UNDER `po.manage` on the submit's own
+   * held transaction (one connection total).
+   */
   async create(command: CreatePoCommand, idempotencyKey: string): Promise<PurchaseOrderSnapshot> {
     // ── story 10.2: this fingerprint is over BASE units ────────────────────
     // Conversion moved out of the controller and into the command, behind the
@@ -186,81 +200,99 @@ export class PurchaseOrderCommand {
       lines: command.lines.map(lineFingerprint),
     });
 
-    const { snapshot } = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
-      // Authority at command-service entry — DB role read, same tx, BEFORE
-      // the replay lookup (the deliberate fail-closed carve-out).
-      assertPermission(
-        await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
-        'po.manage',
-      );
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      const snapshot = await this.createInTx(tx, command, idempotencyKey, payloadHash);
+      return snapshot;
+    });
+  }
 
-      const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
-      if (replay !== null) {
-        return { snapshot: replay as PurchaseOrderSnapshot, replayed: true };
+  /**
+   * The create command's core, on the CALLER's transaction (story 6.1 — the
+   * `mintRecountTaskForBinInTx` house shape): every invariant runs here, on
+   * the transaction the caller holds — never a second one. The payload hash
+   * is passed in (it is computed from the command before the transaction
+   * opens, so a replayed HTTP create hashes identically); the caller mints
+   * the `code` and the `lines` exactly as it would for the standalone entry.
+   */
+  async createInTx(
+    tx: TenantTx,
+    command: CreatePoCommand,
+    idempotencyKey: string,
+    payloadHash: string,
+  ): Promise<PurchaseOrderSnapshot> {
+    // Authority at command-service entry — DB role read, same tx, BEFORE
+    // the replay lookup (the deliberate fail-closed carve-out). Re-run here
+    // even for an in-tx caller: the replenishment submit arm re-executes PO
+    // creation and the inbound gate stays live on that path too.
+    assertPermission(
+      await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+      'po.manage',
+    );
+
+    const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+    if (replay !== null) {
+      return replay as PurchaseOrderSnapshot;
+    }
+
+    // Master-data integrity in the write transaction (no FK repo
+    // convention): warehouse in tenant, vendor in tenant, every line's SKU
+    // in tenant — a foreign or nonexistent scope is 404 before any write.
+    await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
+    await this.assertVendorInTenant(tx, command.tenantId, command.vendorId);
+    const uomBySku = await this.assertSkuIdsInTenant(
+      tx,
+      command.tenantId,
+      command.lines.map((line) => line.skuId),
+    );
+    // Story 10.2: conversion and the precision refusal, behind the replay
+    // lookup above and with each line's unit in hand.
+    const lines = this.scaleLines(command.lines, uomBySku);
+    const lineRows = lines.map((line) => this.lineInsert(command.tenantId, null, line));
+
+    // Story 21-1 (AD-23): an inbound document is authored for one client —
+    // the tenant's `self` client on a D2C tenant, idempotent, no branch.
+    const clientId = await ensureSelfClientInTx(tx, command.tenantId);
+
+    let po: { id: string };
+    try {
+      const rows = await tx
+        .insert(purchaseOrders)
+        .values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          clientId,
+          warehouseId: command.warehouseId,
+          vendorId: command.vendorId,
+          code: command.code,
+          status: 'open',
+        })
+        .returning({ id: purchaseOrders.id });
+      po = rows[0]!;
+    } catch (err) {
+      if (isUniqueViolationOn(err, PURCHASE_ORDERS_TENANT_CODE)) {
+        throw duplicatePoCode(command.code);
       }
+      throw err;
+    }
+    await tx
+      .insert(purchaseOrderLines)
+      .values(lineRows.map((row) => ({ ...row, poId: po.id })));
 
-      // Master-data integrity in the write transaction (no FK repo
-      // convention): warehouse in tenant, vendor in tenant, every line's SKU
-      // in tenant — a foreign or nonexistent scope is 404 before any write.
-      await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
-      await this.assertVendorInTenant(tx, command.tenantId, command.vendorId);
-      const uomBySku = await this.assertSkuIdsInTenant(
-        tx,
-        command.tenantId,
-        command.lines.map((line) => line.skuId),
-      );
-      // Story 10.2: conversion and the precision refusal, behind the replay
-      // lookup above and with each line's unit in hand.
-      const lines = this.scaleLines(command.lines, uomBySku);
-      const lineRows = lines.map((line) => this.lineInsert(command.tenantId, null, line));
+    const snapshot = await this.snapshotOf(tx, po.id);
 
-      // Story 21-1 (AD-23): an inbound document is authored for one client —
-      // the tenant's `self` client on a D2C tenant, idempotent, no branch.
-      const clientId = await ensureSelfClientInTx(tx, command.tenantId);
-
-      let po: { id: string };
-      try {
-        const rows = await tx
-          .insert(purchaseOrders)
-          .values({
-            id: uuidv7(),
-            tenantId: command.tenantId,
-            clientId,
-            warehouseId: command.warehouseId,
-            vendorId: command.vendorId,
-            code: command.code,
-            status: 'open',
-          })
-          .returning({ id: purchaseOrders.id });
-        po = rows[0]!;
-      } catch (err) {
-        if (isUniqueViolationOn(err, PURCHASE_ORDERS_TENANT_CODE)) {
-          throw duplicatePoCode(command.code);
-        }
-        throw err;
-      }
-      await tx
-        .insert(purchaseOrderLines)
-        .values(lineRows.map((row) => ({ ...row, poId: po.id })));
-
-      const snapshot = await this.snapshotOf(tx, po.id);
-
-      // In-transaction outbox append (AD-7) — the idempotent replay returned
-      // above and a concurrent duplicate's transaction rolls back whole, so
-      // a replayed create appends nothing. The payload carries the full
-      // post-mutation PO + line snapshot (no read-after-write downstream).
-      await this.outbox.append(tx, {
-        messageId: uuidv7(),
-        tenantId: command.tenantId,
-        type: 'po.created',
-        occurredAt: nowIso(),
-        payload: { purchaseOrder: snapshot.purchaseOrder },
-      });
-
-      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
-      return { snapshot, replayed: false };
+    // In-transaction outbox append (AD-7) — the idempotent replay returned
+    // above and a concurrent duplicate's transaction rolls back whole, so
+    // a replayed create appends nothing. The payload carries the full
+    // post-mutation PO + line snapshot (no read-after-write downstream).
+    await this.outbox.append(tx, {
+      messageId: uuidv7(),
+      tenantId: command.tenantId,
+      type: 'po.created',
+      occurredAt: nowIso(),
+      payload: { purchaseOrder: snapshot.purchaseOrder },
     });
 
+    await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
     return snapshot;
   }
 

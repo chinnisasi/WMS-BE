@@ -8,6 +8,8 @@ import { InventoryModule } from '../modules/inventory/inventory.module';
 import { InventoryFacade } from '../modules/inventory/inventory.facade';
 import { MovementsModule } from '../modules/movements/movements.module';
 import { MovementsFacade, MAX_SCHEDULED_TASKS_PER_TICK } from '../modules/movements/transfer.facade';
+import { ReplenishmentModule } from '../modules/replenishment/replenishment.module';
+import { ReplenishmentFacade, MAX_REPLENISHMENT_SCOPES_PER_TICK } from '../modules/replenishment/replenishment.facade';
 
 /** Per-cycle drain bound (AD-17): a cycle publishes at most this many rows. */
 export const DEFAULT_OUTBOX_DRAIN_LIMIT = 100;
@@ -87,6 +89,27 @@ export function parseCountSchedulerPollMs(raw: string | undefined): number {
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(
       `COUNT_SCHEDULER_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
+    );
+  }
+  return parsed;
+}
+
+/**
+ * The replenishment scheduler's poll interval, in milliseconds, from
+ * `REPLENISHMENT_SCHEDULER_POLL_MS` — the same env-gate conventions as the
+ * sibling workers (unset/`0` is OFF — a deployment that alerts on breaches
+ * sets e.g. `60000` for FR-22's frozen ≤5-min bound with headroom; a
+ * non-negative integer is required or the boot fails loudly; tests drive
+ * the facade's `sweepScope()` and the worker's tick directly).
+ */
+export function parseReplenishmentPollMs(raw: string | undefined): number {
+  if (raw === undefined || raw === '') {
+    return 0;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(
+      `REPLENISHMENT_SCHEDULER_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
     );
   }
   return parsed;
@@ -379,18 +402,154 @@ export class CountSchedulerWorker implements OnApplicationBootstrap, OnApplicati
 }
 
 /**
+ * The replenishment scheduler worker (story 6.1): an interval poll loop over
+ * `ReplenishmentFacade.sweepScope(tenantId, warehouseId)` — FR-22's detection
+ * loop. One tick enumerates every (tenant, warehouse) scope that OWNS a
+ * reorder state, cross-tenant, as TWO queries (the spec's "two queries, not
+ * one guess"): the per-warehouse policy scopes, UNION the warehouses of every
+ * tenant carrying any SKU default > 0 (a tenant configuring only the
+ * tenant-wide SKU columns must still be swept against each of its
+ * warehouses). The tick's scope loop carries a per-tick cap
+ * (`MAX_REPLENISHMENT_SCOPES_PER_TICK`, the count scheduler's
+ * `MAX_SCHEDULED_TASKS_PER_TICK` precedent) with a truncation log line, so
+ * the frozen ≤5-min visibility bound stays honest at scope counts larger
+ * than one tick can carry. Each scope is all-or-nothing (the sweep's own
+ * transactions); a poison scope is logged and retried next tick — a failure
+ * never starves the rest, and a Valkey-down ATP read skips its scope rather
+ * than ever reading 0. Env-gated OFF when `REPLENISHMENT_SCHEDULER_POLL_MS`
+ * is unset/`0` (tests drive the facade directly and one plumbing test drives
+ * `tick()` itself), shed via the in-process `running` flag, `unref`'d timer,
+ * and a shutdown hook.
+ */
+@Injectable()
+export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('ReplenishmentSchedulerWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+
+  constructor(
+    // The cross-tenant scope enumeration read (BYPASSRLS — the count
+    // scheduler's `authDb` precedent); every WRITE stays on the facade's
+    // tenant transactions.
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(ReplenishmentFacade) private readonly replenishment: ReplenishmentFacade,
+  ) {
+    this.pollMs = parseReplenishmentPollMs(process.env.REPLENISHMENT_SCHEDULER_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off (tests, or a deployment that sweeps elsewhere)
+    }
+    this.logger.log(`Replenishment scheduler worker started (poll every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    // Never hold the process open on the timer alone: shutdown hooks end it.
+    this.timer.unref?.();
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /**
+   * The tick, exposed for the plumbing test (the worker drives the facades;
+   * the test owns the enums). Package-private would be truer — the count
+   * scheduler's test drove the bootstrap timer instead; this keeps the tick
+   * directly callable.
+   */
+  async tick(): Promise<void> {
+    if (this.running) {
+      return; // shed: one cycle at a time in this process
+    }
+    this.running = true;
+    try {
+      // ── the two scope queries (the spec's "two queries, not one guess") ──
+      // 1. every warehouse owning a per-warehouse reorder policy;
+      const policyScopes = (await this.authDb.execute(sql`
+        select distinct on (tenant_id, warehouse_id)
+          tenant_id as "tenantId", warehouse_id as "warehouseId"
+        from reorder_policies
+        order by tenant_id asc, warehouse_id asc
+      `)) as unknown as { tenantId: string; warehouseId: string }[];
+      // 2. every warehouse of every tenant carrying at least one SKU with a
+      //    tenant-wide default > 0 (reorder point OR qty — a point of 0 with
+      //    a qty is not an alert source, but the scope's SKUs all reading an
+      //    effective point of 0 short-circuits inside the sweep anyway).
+      const defaultScopes = (await this.authDb.execute(sql`
+        select distinct w.tenant_id as "tenantId", w.id as "warehouseId"
+        from skus s
+        join warehouses w on w.tenant_id = s.tenant_id
+        where s.reorder_point > 0 or s.reorder_qty > 0
+        order by w.tenant_id asc, w.id asc
+      `)) as unknown as { tenantId: string; warehouseId: string }[];
+
+      // Deduped union, deterministic order (policy scopes first — a
+      // configured override is the sharpest alert source — then defaults).
+      const scopes = new Map<string, { tenantId: string; warehouseId: string }>();
+      for (const scope of [...policyScopes, ...defaultScopes]) {
+        scopes.set(`${scope.tenantId}|${scope.warehouseId}`, scope);
+      }
+      const ordered = [...scopes.values()];
+
+      // The per-tick scope cap: the rest waits for the next tick, LOUDLY
+      // (the frozen ≤5-min bound stays quantified, not silently overrun).
+      const carried = ordered.slice(0, MAX_REPLENISHMENT_SCOPES_PER_TICK);
+      if (ordered.length > carried.length) {
+        this.logger.warn(
+          `Replenishment scheduler carried ${carried.length} of ${ordered.length} scope(s) this tick ` +
+            `— the remaining ${ordered.length - carried.length} will be swept on the next tick`,
+        );
+      }
+
+      for (const scope of carried) {
+        // One scope = the sweep's own tenant transactions — all-or-nothing
+        // per phase. A poison scope (a repeatedly failing tx, or a Valkey
+        // down mid-read) must not starve the rest — log and retry next
+        // tick, the count scheduler's per-scope rationale.
+        try {
+          await this.replenishment.sweepScope(scope.tenantId, scope.warehouseId);
+        } catch (error) {
+          this.logger.error(
+            `Replenishment scheduler could not sweep warehouse ${scope.warehouseId} — skipped this cycle: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.error(
+        `Replenishment scheduler cycle failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
+/**
  * jobs shell — background/relay workers (outbox relay, reconciliation,
- * reservation reaper, count scheduler, import batches, notifications
- * dispatch). The event bus + outbox seams live in shared/events and are
- * provided by SharedModule. All workers are env-gated OFF unless
- * `OUTBOX_RELAY_POLL_MS` / `OUTBOX_RECONCILE_POLL_MS` /
- * `RESERVATION_REAPER_POLL_MS` / `COUNT_SCHEDULER_POLL_MS` is set (tests
- * exercise `drain()` / `reconcileNext()` / `expireDueReservations()` /
- * `generateScheduledCountTasks()` directly).
+ * reservation reaper, count scheduler, replenishment scheduler, import
+ * batches, notifications dispatch). The event bus + outbox seams live in
+ * shared/events and are provided by SharedModule. All workers are env-gated
+ * OFF unless `OUTBOX_RELAY_POLL_MS` / `OUTBOX_RECONCILE_POLL_MS` /
+ * `RESERVATION_REAPER_POLL_MS` / `COUNT_SCHEDULER_POLL_MS` /
+ * `REPLENISHMENT_SCHEDULER_POLL_MS` is set (tests exercise `drain()` /
+ * `reconcileNext()` / `expireDueReservations()` /
+ * `generateScheduledCountTasks()` / `sweepScope()` directly, plus one
+ * plumbing test driving `ReplenishmentSchedulerWorker.tick()` itself).
  */
 @Module({
-  imports: [SharedModule, InventoryModule, MovementsModule],
-  providers: [OutboxRelayWorker, ReconciliationWorker, ReservationReaper, CountSchedulerWorker],
+  imports: [SharedModule, InventoryModule, MovementsModule, ReplenishmentModule],
+  providers: [
+    OutboxRelayWorker,
+    ReconciliationWorker,
+    ReservationReaper,
+    CountSchedulerWorker,
+    ReplenishmentSchedulerWorker,
+  ],
   exports: [],
 })
 export class JobsModule {}

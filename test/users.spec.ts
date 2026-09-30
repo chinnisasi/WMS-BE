@@ -848,8 +848,11 @@ describe('users, roles, and permission gating (e2e)', () => {
     // (the Count inbox tab's op, floor holds it); story 5-4 (CHECKPOINT 1,
     // ratified 2026-09-29) grows it to 31 with `variances.resolve` — owner +
     // ops_manager (the over-threshold guard is a command check on the frozen
-    // threshold stamp, not a capability split).
-    expect([...CAPABILITIES]).toHaveLength(31);
+    // threshold stamp, not a capability split); story 6-1 grows it to 32 with
+    // `replenishment.manage` — owner + ops_manager (the planning set: the
+    // policy writes, breach dismissal, and suggested-PO submit; reads are
+    // never gated).
+    expect([...CAPABILITIES]).toHaveLength(32);
     expect(CAPABILITIES).toContain('secure.move');
     expect(secureMoveHolders).toEqual(['owner', 'ops_manager']);
     expect(CAPABILITIES).toContain('adjustments.approve');
