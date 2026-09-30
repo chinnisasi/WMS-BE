@@ -318,6 +318,31 @@ export class MovementsFacade {
       .then((result) => result.snapshot);
   }
 
+  /**
+   * Story 5-6 — the AD-14 recount arm's mint, in-transaction for the caller
+   * that holds the locks (bin row `.for('update')` → warehouse advisory
+   * LAST) and whose own resolve transaction closes the reported row. The
+   * open-task rule and the capture live INSIDE the count core
+   * (`mintRecountTaskForBinInTx`) — no ledger-write shortcut sits outside it.
+   */
+  mintRecountTaskInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    binId: string,
+    binCode: string,
+    occurredAt: string,
+  ): Promise<string> {
+    return this.countCommands.mintRecountTaskForBinInTx(
+      tx,
+      tenantId,
+      warehouseId,
+      binId,
+      binCode,
+      occurredAt,
+    );
+  }
+
   // ── reads ────────────────────────────────────────────────────────────────
 
   /** The transfer detail read: the order, its lines, and BOTH legs' events. */

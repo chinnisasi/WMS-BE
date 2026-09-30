@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { TenancyModule } from '../tenancy/tenancy.module';
@@ -20,11 +20,12 @@ import { MovementsFacade } from './transfer.facade';
  * hash chain carries the transfer legs like every other movement.
  *
  * Imports `InventoryModule` (the facade one-way — inventory imports nothing
- * back) and `TenancyModule` (the session guards the api shell composes with
- * the controller). Exports ONLY the facade.
+ * back) and `TenancyModule` (forwardRef — story 5-6's SyncReportModule rides
+ * this module's facade for the AD-14 recount arm, making the edge two-way;
+ * the catalog↔tenancy pattern). Exports ONLY the facade.
  */
 @Module({
-  imports: [SharedModule, InventoryModule, TenancyModule],
+  imports: [SharedModule, InventoryModule, forwardRef(() => TenancyModule)],
   providers: [TransferService, CountService, VariancePolicyCommand, MovementsFacade],
   exports: [MovementsFacade],
 })

@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { InboundModule } from '../inbound/inbound.module';
@@ -26,10 +26,13 @@ import { ColdChainFacade } from './cold-chain.facade';
  *
  * Imports `SharedModule` (the spine primitives — DATABASE, OUTBOX_SINK) plus
  * `InventoryModule`, `InboundModule` and `OutboundModule` (all export only
- * their facades; none imports back into compliance, so no cycles).
+ * their facades; none imports back into compliance directly — but story 5-6
+ * made TenancyModule import this module (the sync-report apply arm), closing
+ * catalog → tenancy → compliance → {inbound, outbound} → catalog cycles, so
+ * the in-cycle imports are lazy decorators (the catalog↔tenancy pattern).
  */
 @Module({
-  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule],
+  imports: [SharedModule, InventoryModule, forwardRef(() => InboundModule), forwardRef(() => OutboundModule)],
   providers: [ExcursionCommand, ExcursionFacade, ColdChainFacade],
   exports: [ExcursionFacade, ColdChainFacade],
 })

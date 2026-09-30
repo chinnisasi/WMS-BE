@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { CatalogModule } from '../catalog/catalog.module';
@@ -82,8 +82,12 @@ import { OutboundFacade } from './outbound.facade';
  * `openCredentialForAdapterUseInTx`) and enumerates the connections through
  * `listConnections` BEFORE its own transaction opens (the same rule).
  */
+// forwardRef(catalog): story 5-6 made TenancyModule import this module (the
+// sync-report apply arm), closing a catalog → tenancy → outbound → catalog
+// cycle through compliance too; the decorator must not touch the loading
+// binding eagerly (the catalog↔tenancy pattern).
 @Module({
-  imports: [SharedModule, InventoryModule, CatalogModule, CarriersModule],
+  imports: [SharedModule, InventoryModule, forwardRef(() => CatalogModule), CarriersModule],
   providers: [
     OrderCommandService,
     WaveCommandService,

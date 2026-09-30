@@ -3082,3 +3082,103 @@ export const countVariancePolicies = pgTable(
 );
 
 export type CountVariancePolicy = typeof countVariancePolicies.$inferSelect;
+
+/**
+ * The AD-14 dropped-op vocabulary (story 5-6): which replay fate a reported
+ * row came from — the two terminal fates the outbox walk deletes, retained
+ * under story 5-6 instead of vanishing. The mobile
+ * `replay-classification` fate map is the client side of this vocabulary;
+ * the server consumes refusals, it does not re-classify them (the
+ * `classification` rides each uploaded row verbatim).
+ */
+export const REJECTED_OP_CLASSIFICATIONS = ['rejected', 'quarantined'] as const;
+export type RejectedOpClassification = (typeof REJECTED_OP_CLASSIFICATIONS)[number];
+
+/**
+ * The rejected-op resolution vocabulary (story 5-6): `open` while the
+ * uploaded row awaits review; `applied` (the apply arm — the stored payload
+ * re-executed through its own guarded command), `recounted` (the recount
+ * arm — a count task minted on the payload's bin via the movement recount
+ * core) or `discarded` (the row carried only to the audit trail). The DB
+ * CHECK lives **only in the migration SQL** (0047, the 0046 pattern).
+ */
+export const REJECTED_OP_STATUSES = ['open', 'applied', 'recounted', 'discarded'] as const;
+export type RejectedOpStatus = (typeof REJECTED_OP_STATUSES)[number];
+
+/**
+ * Rejected sync-report ops (story 5-6, `rejected_ops`): one row per dropped
+ * terminal op a device's replay pass reported — the durable end of the
+ * mobile `rejected`/AD-14 case-4 `quarantined` fates. Module ownership is
+ * **tenancy deliberately** (the spec's Design Notes): the resource is a
+ * report of a device sync outcome, op-type-generic across
+ * receive/pick/putaway/pack/count/transfer, and tenancy owns the device
+ * contract the upload rides.
+ *
+ * Columns: `deviceId`/`operatorUserId` are the badge-in attribution ids (bare
+ * uuid, no FK — the repo convention, scope-validated server-side;
+ * `operatorUserId` rides the device session that reported); `opId` is the
+ * mobile op's own ULID (text, UNIQUE per tenant — the per-row dedupe key
+ * that makes at-least-once uploads safe); `opType` is the mobile OpType;
+ * `classification`/`problemCode`/`problemDetail` are the replay refusal
+ * verbatim; `payload` is the op's payload as uploaded (the apply arm
+ * re-executes it; `binStateEpoch` is stripped at APPLY time, never at store
+ * time); `attribution` is the badge-in device name + operator id/email
+ * jsonb; `opEnqueuedAt`/`opOccurredAt` are the op's own timestamps; the
+ * resolution columns stamp the arm (`resolvedOutcome` is the arm's outcome
+ * jsonb — the applied snapshot / minted count task id / the discard note).
+ *
+ * RLS policy `rejected_ops_tenant_isolation` + the classification/status
+ * CHECKs live **only in the migration SQL** (0047). Never uploaded:
+ * `self-test.echo` ops (device diagnostics, not reviewable).
+ */
+export const rejectedOps = pgTable(
+  'rejected_ops',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    /** The reporting device's id (badge-in session; bare uuid, no FK). */
+    deviceId: uuid('device_id').notNull(),
+    /** The attributed operator's user id (badge-in session; bare uuid, no FK). */
+    operatorUserId: uuid('operator_user_id').notNull(),
+    /** The mobile op's ULID — the (tenant, op_id) dedupe key. */
+    opId: text('op_id').notNull(),
+    opType: text('op_type').notNull(),
+    /** Which replay fate reported it — the upload carries it verbatim. */
+    classification: text('classification').notNull(),
+    /** The refusal code + server detail, verbatim from the replay. */
+    problemCode: text('problem_code').notNull(),
+    problemDetail: text('problem_detail'),
+    /** The op's payload as uploaded (base units; re-executed by the apply arm). */
+    payload: jsonb('payload').notNull(),
+    /** Device name + operator id/email + queued-at, the badge-in attribution. */
+    attribution: jsonb('attribution').notNull(),
+    /** The op's own timestamps from the device. */
+    opEnqueuedAt: timestamp('op_enqueued_at', { withTimezone: true, mode: 'string' }).notNull(),
+    opOccurredAt: timestamp('op_occurred_at', { withTimezone: true, mode: 'string' }),
+    /** Exactly `open` at upload — the resolution arms own every later state. */
+    status: text('status').notNull().default('open'),
+    /** The resolver's user id (null while open). */
+    resolvedBy: uuid('resolved_by'),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true, mode: 'string' }),
+    /** The arm's outcome (snapshot fragments / minted task id), jsonb. */
+    resolvedOutcome: jsonb('resolved_outcome'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The per-row dedupe that makes at-least-once uploads safe: a re-posted
+    // row updates nothing (the unique pair absorbs the retry).
+    uniqueIndex('rejected_ops_tenant_id_op_id_unique').on(table.tenantId, table.opId),
+    // The review queue's keyset read (status filter first — the pendings
+    // queue's keyset shape).
+    index('rejected_ops_tenant_status_created_at_id_idx').on(
+      table.tenantId,
+      table.status,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type RejectedOp = typeof rejectedOps.$inferSelect;
