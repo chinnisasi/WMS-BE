@@ -3213,12 +3213,13 @@ export type RejectedOp = typeof rejectedOps.$inferSelect;
  * whatever a planner had left on it). NO FK anywhere (repo convention),
  * scope-validated in the command transaction.
  *
- * The status CHECKs (both vocabularies below) and the fail-closed RLS
- * policies live **only in the migration SQL** (0048 — drizzle-kit generate
- * is blind to both, and the snapshot records `isRLSEnabled: false`, so the
- * next generate must not re-emit either). The partial uniques and the
- * positive-point CHECK companions are drizzle-declared here (the 0009-0011
- * snapshots record `where` clauses fine).
+ * The status CHECKs (both vocabularies below), the positive-point CHECKs on
+ * the milli columns, and the fail-closed RLS policies live **only in the
+ * migration SQL** (0048 — drizzle-kit generate is blind to CHECKs and RLS,
+ * and the snapshot records `isRLSEnabled: false`, so the next generate must
+ * not re-emit any of them). The partial uniques are drizzle-declared here
+ * (the 0009-0011 snapshots record `where` clauses fine); their CHECK
+ * companions read columns declared below.
  */
 export const REPLENISHMENT_BREACH_STATUSES = ['open', 'recovered', 'actioned', 'dismissed'] as const;
 export type ReplenishmentBreachStatus = (typeof REPLENISHMENT_BREACH_STATUSES)[number];

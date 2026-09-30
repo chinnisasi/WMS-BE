@@ -49,8 +49,10 @@ export type {
 /**
  * The worker tick's per-tick SCOPE cap (the count scheduler's
  * `MAX_SCHEDULED_TASKS_PER_TICK` precedent): one tick evaluates at most this
- * many (tenant, warehouse) scopes — anything beyond is left to the next tick
- * and logged at truncation, so the frozen ≤5-min visibility bound stays
+ * many (tenant, warehouse) scopes — anything beyond is logged at truncation
+ * and carried by a rotating window (the worker's offset advances each
+ * truncated tick), so scopes past the cap are delayed a few ticks, never
+ * starved, and the frozen ≤5-min visibility bound stays
  * honest (bounded and KNOWN) at scope counts larger than one tick can carry,
  * instead of a serial sweep that silently eats its own poll interval.
  */

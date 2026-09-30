@@ -653,6 +653,79 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
     expect(badStatus.body.code).toBe('validation-failed');
   });
 
+  // The three read seams are keyset-paged — walked past page ONE here (the
+  // adjustment-approval convention): pages compose without repeats, the
+  // cursor exhausts, and the small-page composition equals the big page.
+  it('keyset pagination: the policy/breach/draft lists walk their cursor chains to exhaustion', async () => {
+    // The policy list is single-row at this point in the suite — seed two
+    // throwaway overrides (then DELETE them again at the arm's end, restoring
+    // the sweep arms' fixture) so every walk is genuinely multi-row.
+    const extraPolicyIds: string[] = [];
+    for (const [code, point, qty] of [['RP-B', 111, 222], ['RP-C', 333, 444]] as const) {
+      const created = await putPolicy(tenantId, ownerToken, {
+        warehouseId: policyWarehouseId,
+        skuId: skuIds.get(code),
+        reorderPoint: point,
+        reorderQty: qty,
+      }).expect(200);
+      extraPolicyIds.push(created.body.policy.id as string);
+    }
+
+    const walk = async (
+      path: string,
+    ): Promise<{ paged: string[]; bigPage: string[] }> => {
+      const big = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}${path}&limit=200`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      const bigPage = (big.body.items as { id: string }[]).map((row) => row.id);
+      const paged: string[] = [];
+      let cursor = '';
+      for (let page = 0; page < 50; page += 1) {
+        const res = await request(app.getHttpServer())
+          .get(`${API}/${tenantId}${path}&limit=1${cursor}`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .expect(200);
+        paged.push(...(res.body.items as { id: string }[]).map((row) => row.id));
+        if (res.body.nextCursor === null) {
+          break;
+        }
+        cursor = `&cursor=${encodeURIComponent(res.body.nextCursor as string)}`;
+      }
+      return { paged, bigPage };
+    };
+
+    for (const path of [
+      '/replenishment/policies?',
+      '/replenishment/breaches?',
+      '/replenishment/suggested-pos?',
+    ]) {
+      const { paged, bigPage } = await walk(path);
+      // Fixture sanity: each list is multi-row here — the walk is real.
+      expect(bigPage.length).toBeGreaterThanOrEqual(2);
+      expect(paged).toEqual(bigPage); // order AND membership — pages compose exactly
+      expect(new Set(paged).size).toBe(paged.length); // no repeats across hops
+    }
+
+    // Restore the fixture: the throwaway overrides are gone again.
+    for (const policyId of extraPolicyIds) {
+      await request(app.getHttpServer())
+        .delete(`${API}/${tenantId}/replenishment/policies/${policyId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .expect(200);
+    }
+
+    // A one-row list exhausts on its first page with no nextCursor at all —
+    // the null-cursor-at-last-hop contract on the un-truncated shape.
+    const one = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/replenishment/policies?skuId=${skuIds.get('RP-B')}&limit=50`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    expect(one.body.items).toHaveLength(1);
+    expect(one.body.nextCursor).toBeNull();
+  });
+
   // ── the submit arm ────────────────────────────────────────────────────────
 
   it('submit a vendor-named draft: a REAL PO on the inbound path, the FLAT response carrier, draft → submitted, breach → actioned, event + audit', async () => {
@@ -780,6 +853,32 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
     expect(rpB.status).toBe('open');
   });
 
+  it('submit with a quantity that fails the mint’s UoM precision guard: 400 verbatim, the draft stays a draft', async () => {
+    // RP-B is `pcs` — whole units, zero decimal places. 1500 milli = 1.5 pcs
+    // passes the DTO's integer-milli guard but the inbound mint's precision
+    // guard refuses finer-than-unit quantities — the submit's quantity edit
+    // is not a hole around it (the comment on the mint's arm).
+    const dB = (await draftRows(tenantId, warehouseId, skuIds.get('RP-B')!))[0]!;
+    expect(dB.status).toBe('draft');
+    const refused = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/replenishment/suggested-pos/${dB.id}/submit`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ quantityMilli: 1500 })
+      .expect(400);
+    expect(refused.body.code).toBe('validation-failed');
+    expect(refused.body.title).toContain('must be a whole number');
+    expect(refused.body.title).toContain('orderedQty');
+
+    // The rolled-back mint left the draft and the breach exactly as they were.
+    const unchanged = (await draftRows(tenantId, warehouseId, skuIds.get('RP-B')!))[0]!;
+    expect(unchanged.id).toBe(dB.id);
+    expect(unchanged.status).toBe('draft');
+    expect(unchanged.quantity_milli).toBe(dB.quantity_milli);
+    const rpB = (await breachRows(tenantId, warehouseId, skuIds.get('RP-B')!))[1]!;
+    expect(rpB.status).toBe('open');
+  });
+
   it('submit 403: a member without replenishment.manage is refused; lists stay open to members', async () => {
     const dC = (await draftRows(tenantId, warehouseId, skuIds.get('RP-C')!))[0]!;
     const denied = await request(app.getHttpServer())
@@ -897,6 +996,156 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
     } finally {
       await probe.end();
     }
+  });
+
+  it('policy delete fallback: with the override gone, the next sweep evaluates the SKU’s tenant-wide default', async () => {
+    // A fresh warehouse (self-contained — no other arm has swept it) whose
+    // only source for RP-A is first the override, then the SKU columns.
+    const w4 = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `RP-${ulid().slice(10, 16).toUpperCase()}`, name: 'Fallback WH' })
+        .expect(201)
+    ).body.id as string;
+    const w4Zone = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${w4}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'A', name: 'Zone A' })
+        .expect(201)
+    ).body.id as string;
+    const w4Bin = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${w4}/zones/${w4Zone}/bins`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ capacity: 10000, type: 'shelf', code: 'A-01-01' })
+        .expect(201)
+    ).body.id as string;
+    await app.get(InventoryFacade).rebuildReservationCounters(tenantId, w4);
+    const adjust = async (delta: number): Promise<void> => {
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/inventory/adjustments`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId: w4,
+          skuId: skuIds.get('RP-A'),
+          binId: w4Bin,
+          quantityDelta: delta,
+          reasonCode: 'stock-count',
+          note: 'replenishment-suite fallback arm',
+        })
+        .expect(201);
+    };
+
+    // The override opens RP-A (ATP 3000 < 9000) frozen at the OVERRIDE's
+    // point. (RP-C is on the same fixture as its tenant-wide default —
+    // evaluated 2; the assertions below stay on RP-A's rows.)
+    await adjust(3);
+    const created = await putPolicy(tenantId, ownerToken, {
+      warehouseId: w4,
+      skuId: skuIds.get('RP-A'),
+      reorderPoint: 9000,
+      reorderQty: 5000,
+    }).expect(200);
+    const firstSweep = await replenishment.sweepScope(tenantId, w4);
+    expect(firstSweep).toMatchObject({ evaluated: 2, opened: 2, recovered: 0 });
+    const overrideBreach = (await breachRows(tenantId, w4, skuIds.get('RP-A')!))[0]!;
+    expect(Number(overrideBreach.point_milli)).toBe(9000);
+
+    // Delete the override → the effective point falls back to the SKU's
+    // tenant-wide default (2000). The next sweep evaluates 2000: ATP 3000 now
+    // exceeds it and the breach RECOVERS — it would have stayed open against
+    // the frozen 9000 (or against a 0-point "no evaluation" mistake alike).
+    // (RP-C's open breach absorbs its sweep — no change either way.)
+    await request(app.getHttpServer())
+      .delete(`${API}/${tenantId}/replenishment/policies/${created.body.policy.id as string}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .expect(200);
+    const afterDelete = await replenishment.sweepScope(tenantId, w4);
+    expect(afterDelete).toMatchObject({ evaluated: 2, opened: 0, recovered: 1 });
+    const rows = await breachRows(tenantId, w4, skuIds.get('RP-A')!);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.status).toBe('recovered');
+
+    // Direct evidence the default now DECIDES: draw ATP below it — the
+    // re-breach freezes at the SKU DEFAULT's 2000, neither the deleted
+    // override's 9000 nor "no point".
+    await adjust(-3);
+    const reBreach = await replenishment.sweepScope(tenantId, w4);
+    expect(reBreach).toMatchObject({ evaluated: 2, opened: 1, recovered: 0 });
+    const reRows = await breachRows(tenantId, w4, skuIds.get('RP-A')!);
+    expect(reRows).toHaveLength(2);
+    expect(reRows[0]!.status).toBe('recovered');
+    expect(Number(reRows[1]!.point_milli)).toBe(2000);
+    // The standing draft repointed onto the fresh breach, quantity now the
+    // default's 3000 (the override's 5000 is gone with the override).
+    const dW4 = (await draftRows(tenantId, w4, skuIds.get('RP-A')!))[0]!;
+    expect(dW4.breach_id).toBe(reRows[1]!.id);
+    expect(dW4.status).toBe('draft');
+    expect(Number(dW4.quantity_milli)).toBe(3000);
+  });
+
+  it('worker tick() against the REAL facades: a policy scope and a defaulted-SKU scope both sweep — policy scopes enumerate first', async () => {
+    // The tick enumerates scopes cross-tenant on the REAL auth db and drives
+    // the REAL facades — the plumbing block only ever stubbed these. Seed one
+    // scope of each kind: a per-warehousePOLICY scope (a fresh warehouse whose
+    // override is its only source) and a defaulted-SKU scope (W2 — the RP-A /
+    // RP-C SKU-column defaults cover every tenant-A warehouse, and W2 carries
+    // no policy rows at this point).
+    const w3 = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `RP-${ulid().slice(10, 16).toUpperCase()}`, name: 'Tick WH' })
+        .expect(201)
+    ).body.id as string;
+    await app.get(InventoryFacade).rebuildReservationCounters(tenantId, w3);
+    await app.get(InventoryFacade).rebuildReservationCounters(tenantId, policyWarehouseId);
+    await putPolicy(tenantId, ownerToken, {
+      warehouseId: w3,
+      skuId: skuIds.get('RP-A'),
+      reorderPoint: 500,
+      reorderQty: 600,
+    }).expect(200);
+
+    // The suite keeps the poll env DELETED (no background races) — the tick
+    // is driven by hand, exactly what its package-public surface exists for.
+    const worker = new ReplenishmentSchedulerWorker(app.get(AUTH_DATABASE) as never, replenishment);
+    await worker.tick();
+
+    // The policy scope swept: the override decided the frozen point.
+    const w3Rows = await breachRows(tenantId, w3, skuIds.get('RP-A')!);
+    expect(w3Rows).toHaveLength(1);
+    expect(w3Rows[0]!.status).toBe('open');
+    expect(Number(w3Rows[0]!.point_milli)).toBe(500);
+    const w3Draft = (await draftRows(tenantId, w3, skuIds.get('RP-A')!))[0]!;
+    expect(Number(w3Draft.quantity_milli)).toBe(600);
+
+    // The defaulted-SKU scope swept: no policy there — the SKU-column default
+    // (2000) decided, with the default's own qty (3000).
+    const w2Rows = await breachRows(tenantId, policyWarehouseId, skuIds.get('RP-A')!);
+    expect(w2Rows).toHaveLength(1);
+    expect(Number(w2Rows[0]!.point_milli)).toBe(2000);
+    const w2Draft = (await draftRows(tenantId, policyWarehouseId, skuIds.get('RP-A')!))[0]!;
+    expect(Number(w2Draft.quantity_milli)).toBe(3000);
+
+    // The deterministic dedupe order: every policy scope enumerates before
+    // every first-seen default scope → the w3 breach audited before the w2 one.
+    const order = await sql`
+      select target_id, created_at from audit_events
+      where tenant_id = ${tenantId}::uuid and action = 'replenishment.breach_detected'
+        and target_id in (${w3Rows[0]!.id}::uuid, ${w2Rows[0]!.id}::uuid)`;
+    const byId = new Map(
+      order.map((row) => [row.target_id as string, new Date(row.created_at as string).getTime()]),
+    );
+    expect(byId.get(w3Rows[0]!.id) as number).toBeLessThan(byId.get(w2Rows[0]!.id) as number);
   });
 });
 
@@ -1030,21 +1279,49 @@ describe('replenishment scheduler plumbing (unit, story 6-1)', () => {
     expect(authDb.calls).toBe(2);
   });
 
-  it('tick() carries at most MAX_REPLENISHMENT_SCOPES_PER_TICK scopes and logs the truncation loudly', async () => {
+  it('tick() carries at most MAX_REPLENISHMENT_SCOPES_PER_TICK scopes, logs the truncation loudly, and ROTATES the window so the tail is eventually swept', async () => {
     setEnv('20');
     const warnSpy = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-    const many = Array.from({ length: MAX_REPLENISHMENT_SCOPES_PER_TICK + 10 }, (_, i) => ({
+    const tailLength = 10;
+    const total = MAX_REPLENISHMENT_SCOPES_PER_TICK + tailLength;
+    const many = Array.from({ length: total }, (_, i) => ({
       tenantId: `t-${Math.floor(i / 100)}`,
       warehouseId: `w-${i}`,
     }));
     const facade = stubFacade();
     const worker = new ReplenishmentSchedulerWorker(stubAuthDb(many, []) as never, facade as never);
     try {
+      // Tick 1: the head window — and the truncation warn.
       await worker.tick();
       expect(facade.calls).toHaveLength(MAX_REPLENISHMENT_SCOPES_PER_TICK);
+      expect(facade.calls[facade.calls.length - 1]).toEqual({
+        tenantId: `t-${Math.floor((MAX_REPLENISHMENT_SCOPES_PER_TICK - 1) / 100)}`,
+        warehouseId: `w-${MAX_REPLENISHMENT_SCOPES_PER_TICK - 1}`,
+      });
       expect(warnSpy.mock.calls.map((call) => String(call[0])).join('\n')).toContain(
-        `carried ${MAX_REPLENISHMENT_SCOPES_PER_TICK} of ${MAX_REPLENISHMENT_SCOPES_PER_TICK + 10}`,
+        `carried ${MAX_REPLENISHMENT_SCOPES_PER_TICK} of ${total}`,
       );
+
+      // A head-only slice would sweep the same window forever — the window
+      // ROTATES one scope per truncating tick, so the tail's tail (`w-209`)
+      // is swept within the offsets it takes the window to walk the cycle
+      // (offsets 0..tailLength each still cover a fresh tail index). Bound
+      // the loop and assert FULL coverage of all `total` scopes.
+      let ticks = 1;
+      const swept = new Set(facade.calls.map((call) => call.warehouseId));
+      while (swept.size < total && ticks < 100) {
+        ticks += 1;
+        await worker.tick();
+        for (const call of facade.calls) {
+          swept.add(call.warehouseId);
+        }
+      }
+      expect(swept).toEqual(new Set(many.map((scope) => scope.warehouseId)));
+      expect(ticks).toBeLessThanOrEqual(tailLength + 1);
+
+      // …and every truncating tick kept the warn honest (never a head-only
+      // slice lying that the tail waits for "the next tick").
+      expect(warnSpy.mock.calls.length).toBe(ticks);
     } finally {
       warnSpy.mockRestore();
     }

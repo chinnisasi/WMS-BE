@@ -411,8 +411,11 @@ export class CountSchedulerWorker implements OnApplicationBootstrap, OnApplicati
  * tenant-wide SKU columns must still be swept against each of its
  * warehouses). The tick's scope loop carries a per-tick cap
  * (`MAX_REPLENISHMENT_SCOPES_PER_TICK`, the count scheduler's
- * `MAX_SCHEDULED_TASKS_PER_TICK` precedent) with a truncation log line, so
- * the frozen ≤5-min visibility bound stays honest at scope counts larger
+ * `MAX_SCHEDULED_TASKS_PER_TICK` precedent) with a truncation log line — and
+ * the truncating ticks ROTATE the window (a head-only slice would starve the
+ * enumerated tail forever, the order being deterministic), so scopes past the
+ * cap are delayed a few ticks, never forgotten, and the frozen ≤5-min
+ * visibility bound stays honest at scope counts larger
  * than one tick can carry. Each scope is all-or-nothing (the sweep's own
  * transactions); a poison scope is logged and retried next tick — a failure
  * never starves the rest, and a Valkey-down ATP read skips its scope rather
@@ -427,6 +430,8 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** The truncating ticks' rotating-window offset (advances one scope per truncated tick). */
+  private tickOffset = 0;
 
   constructor(
     // The cross-tenant scope enumeration read (BYPASSRLS — the count
@@ -495,13 +500,21 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
       }
       const ordered = [...scopes.values()];
 
-      // The per-tick scope cap: the rest waits for the next tick, LOUDLY
-      // (the frozen ≤5-min bound stays quantified, not silently overrun).
-      const carried = ordered.slice(0, MAX_REPLENISHMENT_SCOPES_PER_TICK);
+      // The per-tick scope cap with a ROTATING window: the enumeration is
+      // deterministically ordered, so a head-only slice would carry the SAME
+      // head every tick and starve everything past the cap forever. Each
+      // truncating tick instead carries a wrap-around window starting one
+      // scope further than the last — every scope is swept within
+      // ⌈ordered.length / cap⌉ ticks, and the truncation stays LOUDLY
+      // quantified (the frozen ≤5-min bound stays known, not overrun).
+      const carried =
+        ordered.length <= MAX_REPLENISHMENT_SCOPES_PER_TICK
+          ? ordered
+          : this.rotatingWindow(ordered, MAX_REPLENISHMENT_SCOPES_PER_TICK);
       if (ordered.length > carried.length) {
         this.logger.warn(
           `Replenishment scheduler carried ${carried.length} of ${ordered.length} scope(s) this tick ` +
-            `— the remaining ${ordered.length - carried.length} will be swept on the next tick`,
+            `— the rotating window advances each tick until every scope is swept`,
         );
       }
 
@@ -526,6 +539,31 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
     } finally {
       this.running = false;
     }
+  }
+
+  /**
+   * The cap's rotating window — `cap` entries of the deterministically-ordered
+   * enumeration, starting at this worker's tick offset and wrapping around the
+   * cycle, the offset advancing one scope per TRUNCATED tick. Over
+   * ⌈length / cap⌉ + length ticks every scope is swept (in fact the whole
+   * cycle is covered once the offset has advanced `length - cap + 1` times),
+   * so scopes past the cap are delayed, never starved — the head-only slice
+   * this replaced never swept them at all.
+   */
+  private rotatingWindow(
+    ordered: readonly { tenantId: string; warehouseId: string }[],
+    cap: number,
+  ): { tenantId: string; warehouseId: string }[] {
+    const start = this.tickOffset % ordered.length;
+    const window: { tenantId: string; warehouseId: string }[] = [];
+    for (let i = 0; i < cap && i < ordered.length; i += 1) {
+      const scope = ordered[(start + i) % ordered.length];
+      if (scope !== undefined) {
+        window.push(scope);
+      }
+    }
+    this.tickOffset = (this.tickOffset + 1) % ordered.length;
+    return window;
   }
 }
 

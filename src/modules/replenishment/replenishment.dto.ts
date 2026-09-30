@@ -1,7 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsIn, IsInt, IsOptional, IsString, IsUUID, Max, Min } from 'class-validator';
-import { MAX_QUANTITY_MILLI, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
+import { MAX_QUANTITY_MILLI } from '../../shared/primitives/quantity';
 import {
   REPLENISHMENT_BREACH_STATUSES,
   SUGGESTED_PO_STATUSES,
@@ -271,7 +271,9 @@ export class SubmitSuggestedPoDto {
   vendorId?: string;
 
   @ApiPropertyOptional({
-    description: `The quantity to order in MILLI-units. ${QUANTITY_FIELD_DESCRIPTION} Omitted keeps the draft's quantity.`,
+    description:
+      'The quantity to order in MILLI-units (strictly positive; positive-integer-milli bound). ' +
+      'Omitted keeps the draft\'s quantity.',
     minimum: 1,
     maximum: MAX_REPLENISHMENT_MILLI,
   })
