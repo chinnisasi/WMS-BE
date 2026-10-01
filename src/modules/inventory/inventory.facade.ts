@@ -150,6 +150,19 @@ export interface BatchBinOnHandEntry {
 }
 
 /**
+ * One per-(sku, batch) warehouse-scope on-hand SUM (Story 6.2 — the expiry
+ * scan's enumeration and the batch-alert queue's freshness stitch). The
+ * projection's stored milli, summed across bins; a scope absent from the
+ * result carries NO positive on-hand anywhere in the warehouse.
+ */
+export interface BatchScopeSumEntry {
+  readonly warehouseId: string;
+  readonly skuId: string;
+  readonly batchId: string;
+  readonly quantityMilli: number;
+}
+
+/**
  * One on-hand projection row of the Story 2.5 stock list — plain
  * `stock_on_hand` truth for any SKU (tracked or not; no batch fields — the
  * untracked passthrough is the row itself).
@@ -1205,6 +1218,92 @@ export class InventoryFacade {
           sql`${batchOnHand.quantity} > 0`,
         ),
       );
+  }
+
+  /**
+   * Story 6.2 — the expiry scan's enumeration read: per (sku, batch) SUMMED
+   * on-hand for ONE warehouse, positive rows only, in the CALLER's
+   * transaction (the `batchOnHandByBinsInTx` seam-fix shape — the projection
+   * join lives in inventory because inventory owns it). The replenishment
+   * scan composes it beside its policy row inside one tx, so a nested second
+   * transaction — the documented pool-deadlock shape — never happens. Sums
+   * come back in STORED milli; a scope with no positive row is simply
+   * absent (consuming its last unit removes the key, not zeroes it — the
+   * scan's auto-resolve reads an absent key as on-hand 0).
+   */
+  async batchScopeSumsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<readonly BatchScopeSumEntry[]> {
+    const rows = await tx
+      .select({
+        warehouseId: batchOnHand.warehouseId,
+        skuId: batchOnHand.skuId,
+        batchId: batchOnHand.batchId,
+        // The stored bigint sum crosses as a string (the repo's bigint-trap
+        // convention) — `Number()` at this boundary, the projection's own.
+        quantityMilli: sql<string>`coalesce(sum(${batchOnHand.quantity}), 0)::bigint`,
+      })
+      .from(batchOnHand)
+      .where(
+        and(
+          eq(batchOnHand.tenantId, tenantId),
+          eq(batchOnHand.warehouseId, warehouseId),
+          sql`${batchOnHand.quantity} > 0`,
+        ),
+      )
+      .groupBy(batchOnHand.warehouseId, batchOnHand.skuId, batchOnHand.batchId);
+    return rows.map((row) => ({ ...row, quantityMilli: Number(row.quantityMilli) }));
+  }
+
+  /**
+   * Story 6.2 — the batch-alert QUEUE read's freshness stitch: per-scope
+   * summed on-hand for exactly the scopes the caller names (one alert page's
+   * rows), in the caller's transaction. Same projection, positive rows only,
+   * stored milli — an alert whose last unit was consumed comes back ABSENT
+   * (the queue renders its live on-hand as 0).
+   */
+  async batchScopeSumsForScopesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    scopes: readonly { warehouseId: string; skuId: string; batchId: string }[],
+  ): Promise<readonly BatchScopeSumEntry[]> {
+    if (scopes.length === 0) {
+      return [];
+    }
+    const unique = [...new Set(scopes.map((s) => `${s.warehouseId}|${s.skuId}|${s.batchId}`))]
+      .map((key) => key.split('|'))
+      .map((parts) => ({
+        warehouseId: parts[0]!,
+        skuId: parts[1]!,
+        batchId: parts[2]!,
+      }));
+    const rows = await tx
+      .select({
+        warehouseId: batchOnHand.warehouseId,
+        skuId: batchOnHand.skuId,
+        batchId: batchOnHand.batchId,
+        quantityMilli: sql<string>`coalesce(sum(${batchOnHand.quantity}), 0)::bigint`,
+      })
+      .from(batchOnHand)
+      .where(
+        and(
+          eq(batchOnHand.tenantId, tenantId),
+          sql`${batchOnHand.quantity} > 0`,
+          or(
+            ...unique.map((scope) =>
+              and(
+                eq(batchOnHand.warehouseId, scope.warehouseId),
+                eq(batchOnHand.skuId, scope.skuId),
+                eq(batchOnHand.batchId, scope.batchId),
+              ),
+            ),
+          ),
+        ),
+      )
+      .groupBy(batchOnHand.warehouseId, batchOnHand.skuId, batchOnHand.batchId);
+    return rows.map((row) => ({ ...row, quantityMilli: Number(row.quantityMilli) }));
   }
 
   /** Real-time ATP: on-hand (quarantine-excluded) − reserved − hooks. */

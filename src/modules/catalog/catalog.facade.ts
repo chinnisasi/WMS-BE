@@ -72,6 +72,19 @@ export interface BatchIdentity {
   readonly status: string;
 }
 
+/**
+ * The scan-side batch intake facts (Story 6.2): identity + lifecycle + the
+ * anchoring instants — `expiryDate` for the expiry arm, `createdAt` for the
+ * aging arm. No `mfgDate` (the scan evaluates neither).
+ */
+export interface BatchIntake {
+  readonly id: string;
+  readonly code: string;
+  readonly expiryDate: string | null;
+  readonly status: string;
+  readonly createdAt: string;
+}
+
 /** Serial identity (catalog-owned) — location/history are ledger-derived (AD-6). */
 export interface SerialIdentity {
   readonly id: string;
@@ -390,6 +403,37 @@ export class CatalogFacade {
         mfgDate: batches.mfgDate,
         expiryDate: batches.expiryDate,
         status: batches.status,
+      })
+      .from(batches)
+      .where(and(eq(batches.tenantId, tenantId), inArray(batches.skuId, [...new Set(skuIds)])));
+  }
+
+  /**
+   * Story 6.2 — the expiry scan's identity read: the INTAKE facts of a set of
+   * SKUs' batches, inside the caller's transaction (the
+   * `getBatchesForSkusInTx` shape). Beyond the identity columns this carries
+   * `createdAt` — the batch's receipt instant, the AGING definition's anchor
+   * (ratified for 6.2: `age_days = floor((now − created_at) / 86400s)`,
+   * frozen at detection). The expiry evaluation reads `expiryDate` and the
+   * lifecycle flag `status` from the same rows — the scan never joins
+   * `batches` from an inventory-side table (AD-6).
+   */
+  async getBatchIntakesForSkusInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuIds: readonly string[],
+  ): Promise<ReadonlyArray<BatchIntake & { readonly skuId: string }>> {
+    if (skuIds.length === 0) {
+      return [];
+    }
+    return tx
+      .select({
+        id: batches.id,
+        skuId: batches.skuId,
+        code: batches.code,
+        expiryDate: batches.expiryDate,
+        status: batches.status,
+        createdAt: batches.createdAt,
       })
       .from(batches)
       .where(and(eq(batches.tenantId, tenantId), inArray(batches.skuId, [...new Set(skuIds)])));

@@ -3,6 +3,9 @@ import { Type } from 'class-transformer';
 import { IsIn, IsInt, IsOptional, IsString, IsUUID, Max, Min } from 'class-validator';
 import { MAX_QUANTITY_MILLI } from '../../shared/primitives/quantity';
 import {
+  BATCH_ALERT_KINDS,
+  BATCH_ALERT_STATUSES,
+  MAX_ALERT_CONFIG_DAYS,
   REPLENISHMENT_BREACH_STATUSES,
   SUGGESTED_PO_STATUSES,
 } from '../../shared/db/schema';
@@ -298,6 +301,165 @@ export class SubmitSuggestedPoResponse {
 
   @ApiProperty({ type: PurchaseOrderDto })
   purchaseOrder!: PurchaseOrderDto;
+}
+
+// ── expiry/aging config: upsert + get ───────────────────────────────────────
+
+/**
+ * The tenant's expiry/aging config — the PUT body (both ≥ 0 whole-day ints;
+ * the int4 storage bound is the ceiling). No DELETE exists: absence (GET 404)
+ * is the disable mechanism, and the absent-row convention means a tenant that
+ * never PUT one has expiry/aging alerting off.
+ */
+export class UpsertExpiryPolicyDto {
+  @ApiProperty({
+    description:
+      'Lead days before a batch\'s expiry an `expiry_upcoming` alert opens (already-expired ' +
+      'batches qualify at every lead). Whole-day integer ≥ 0.',
+    minimum: 0,
+    maximum: MAX_ALERT_CONFIG_DAYS,
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(MAX_ALERT_CONFIG_DAYS)
+  expiryLeadDays!: number;
+
+  @ApiProperty({
+    description:
+      'Batch age since intake (`batches.created_at`) that raises an `aged` alert. Whole-day integer ≥ 0.',
+    minimum: 0,
+    maximum: MAX_ALERT_CONFIG_DAYS,
+  })
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(MAX_ALERT_CONFIG_DAYS)
+  agingThresholdDays!: number;
+}
+
+export class ExpiryPolicyDto {
+  @ApiProperty({ description: 'Lead days before a batch\'s expiry an `expiry_upcoming` alert opens' })
+  expiryLeadDays!: number;
+
+  @ApiProperty({ description: 'Batch age since intake that raises an `aged` alert' })
+  agingThresholdDays!: number;
+
+  @ApiProperty({ description: 'ISO-8601 UTC creation time' })
+  createdAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC last-write time' })
+  updatedAt!: string;
+}
+
+export class ExpiryPolicyResponse {
+  @ApiProperty({ type: ExpiryPolicyDto })
+  expiryPolicy!: ExpiryPolicyDto;
+}
+
+// ── batch alerts: list + dismiss ────────────────────────────────────────────
+
+export class BatchAlertListQuery {
+  @ApiProperty({
+    required: false,
+    enum: [...BATCH_ALERT_KINDS],
+    description: 'Only alerts of one kind (the queue\'s kind filter — a batch can carry both)',
+  })
+  @IsOptional()
+  @IsIn([...BATCH_ALERT_KINDS])
+  kind?: (typeof BATCH_ALERT_KINDS)[number];
+
+  @ApiProperty({
+    required: false,
+    enum: [...BATCH_ALERT_STATUSES],
+    description: 'Only alerts of one status (the lifecycle tabs; the ops queue reads open)',
+  })
+  @IsOptional()
+  @IsIn([...BATCH_ALERT_STATUSES])
+  status?: (typeof BATCH_ALERT_STATUSES)[number];
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Only one warehouse\'s alerts' })
+  @IsOptional()
+  @IsUUID()
+  warehouseId?: string;
+
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
+export class BatchAlertDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The alerted batch (the click-through target)' })
+  batchId!: string;
+
+  @ApiProperty({ enum: [...BATCH_ALERT_KINDS] })
+  kind!: (typeof BATCH_ALERT_KINDS)[number];
+
+  @ApiProperty({ enum: [...BATCH_ALERT_STATUSES] })
+  status!: (typeof BATCH_ALERT_STATUSES)[number];
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description: 'Batch age in days FROZEN at detection (`aged` rows only; null on expiry rows)',
+  })
+  ageDays!: number | null;
+
+  @ApiProperty({
+    required: false,
+    description: 'The LIVE batch on-hand for this scope, milli-units — re-read at read time, never stored. Carried on LIST rows; absent on the dismissal snapshot.',
+  })
+  onHandMilli?: number;
+
+  @ApiProperty({
+    required: false,
+    description: 'The alerted batch\'s human code — the queue card renders it, never a truncated id. Carried on LIST rows; absent on the dismissal snapshot.',
+  })
+  batchCode?: string;
+
+  @ApiProperty({ description: 'The detection instant (ISO-8601 UTC) — the row\'s creation time' })
+  detectedAt!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Resolution instant, null while open' })
+  resolvedAt!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description: 'The dismisser\'s user id, null while open (and on auto-resolve — nobody acted)',
+  })
+  resolvedBy!: string | null;
+}
+
+export class BatchAlertResponse {
+  @ApiProperty({ type: BatchAlertDto })
+  batchAlert!: BatchAlertDto;
+}
+
+export class BatchAlertListResponse {
+  @ApiProperty({ type: [BatchAlertDto] })
+  items!: readonly BatchAlertDto[];
+
+  @ApiProperty({ type: String, nullable: true, required: false })
+  nextCursor?: string | null;
 }
 
 export type { PurchaseOrderDto, PurchaseOrderLineDto };

@@ -959,7 +959,7 @@ describe('architecture: the transfer aggregate is movements-module-owned (story 
   });
 });
 
-describe('architecture: the replenishment planning state is replenishment-module-owned (story 6-1)', () => {
+describe('architecture: the replenishment planning state is replenishment-module-owned (stories 6-1 and 6-2)', () => {
   /**
    * Story 6-1 populates the replenishment spine (`reorder_policies`,
    * `reorder_breaches`, `suggested_pos`) — a CONSUMER of derived state, never
@@ -967,11 +967,20 @@ describe('architecture: the replenishment planning state is replenishment-module
    * (the sweep never touches a stock table), the tenant-wide SKU defaults
    * only through `CatalogFacade`, and the real PO only through the inbound
    * facade's in-tx mint (the submit arm — inbound stays the ONLY writer of
-   * `purchase_orders`). Every other module reaches it through
+   * `purchase_orders`). Story 6-2 adds the batch-alert spine
+   * (`batch_alerts`, `expiry_alert_policies`): the scan reads on-hand only
+   * through the inventory facade's projection sums and batch identity only
+   * through the catalog facade. Every other module reaches it through
    * `ReplenishmentFacade`.
    */
-  const REPLENISHMENT_TABLES = ['reorderPolicies', 'reorderBreaches', 'suggestedPos'] as const;
-  const RAW_REPLENISHMENT_TABLES = 'reorder_policies|reorder_breaches|suggested_pos';
+  const REPLENISHMENT_TABLES = [
+    'reorderPolicies',
+    'reorderBreaches',
+    'suggestedPos',
+    'batchAlerts',
+    'expiryAlertPolicies',
+  ] as const;
+  const RAW_REPLENISHMENT_TABLES = 'reorder_policies|reorder_breaches|suggested_pos|batch_alerts|expiry_alert_policies';
   const replenishmentRoot = join(SRC_ROOT, 'modules', 'replenishment');
 
   it('no replenishment-table write happens outside the replenishment module', () => {
@@ -1032,23 +1041,36 @@ describe('architecture: the replenishment planning state is replenishment-module
 
   it('the replenishment module writes only its own tables and reads stock/state only through facades (the test is meaningful)', () => {
     // The aggregate's writes live in the command (policies, idempotency) and
-    // the sweep (breaches, drafts) — and nowhere else.
+    // the sweep (breaches, drafts) — and nowhere else. Story 6-2 splits the
+    // batch-alert writes: the command owns the CONFIG row and the dismissal,
+    // the scan owns the raise/resolve transitions.
     const command = readFileSync(join(replenishmentRoot, 'replenishment.command.ts'), 'utf8');
     expect(drizzleWriteOn('reorderPolicies').test(command)).toBe(true);
     expect(drizzleWriteOn('suggestedPos').test(command)).toBe(true);
+    expect(drizzleWriteOn('expiryAlertPolicies').test(command)).toBe(true);
+    expect(drizzleWriteOn('batchAlerts').test(command)).toBe(true);
     const sweep = readFileSync(join(replenishmentRoot, 'replenishment.sweep.ts'), 'utf8');
     expect(drizzleWriteOn('reorderBreaches').test(sweep)).toBe(true);
     expect(drizzleWriteOn('suggestedPos').test(sweep)).toBe(true);
+    const scan = readFileSync(join(replenishmentRoot, 'replenishment.expiry.scan.ts'), 'utf8');
+    expect(drizzleWriteOn('batchAlerts').test(scan)).toBe(true);
+    // The scan NEVER writes the config row (the command is its only writer).
+    expect(drizzleWriteOn('expiryAlertPolicies').test(scan)).toBe(false);
     // No second quantity-mutation path: the module writes NO stock/ledger
-    // table, and the ATP numbers come from the inventory facade only.
-    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'binStateEpochs', 'reservations', 'purchaseOrders', 'skus', 'vendors'] as const) {
+    // table, the ATP numbers come from the inventory facade only, and the
+    // scan's on-hand/batch facts from the facades' in-tx reads (never a
+    // cross-module table reach — AD-6).
+    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'binStateEpochs', 'reservations', 'purchaseOrders', 'skus', 'vendors', 'batches'] as const) {
       expect(drizzleWriteOn(table).test(command)).toBe(false);
       expect(drizzleWriteOn(table).test(sweep)).toBe(false);
+      expect(drizzleWriteOn(table).test(scan)).toBe(false);
       expect(drizzleWriteOn(table).test(replenishmentFacadeSource())).toBe(false);
     }
     expect(sweep).toContain('this.inventory.atp');
+    expect(scan).toContain('this.inventory.batchScopeSumsInTx');
+    expect(scan).toContain('this.catalog.getBatchIntakesForSkusInTx');
     // The facade is the seam: read-only over the aggregate's tables (the
-    // writes ride the command/sweep), passthroughs only.
+    // writes ride the command/sweep/scan), passthroughs only.
     for (const table of REPLENISHMENT_TABLES) {
       expect(drizzleWriteOn(table).test(replenishmentFacadeSource())).toBe(false);
     }

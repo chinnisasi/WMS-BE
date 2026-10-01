@@ -683,6 +683,12 @@ export const batches = pgTable(
   (table) => [
     uniqueIndex('batches_tenant_sku_code_unique').on(table.tenantId, table.skuId, table.code),
     index('batches_tenant_sku_idx').on(table.tenantId, table.skuId),
+    // Story 6.2 (FR-23): provisioned for the expiry-scan family's expiry-range
+    // reads on a tenant's batches. No query today consumes it — the scan's
+    // identity read rides the pre-existing tenant/sku index above, and the
+    // queue's FEFO expiry sort is done in JS — it ships so a future
+    // catalog-side expiry-range read never needs a migration of its own.
+    index('batches_tenant_expiry_idx').on(table.tenantId, table.expiryDate),
   ],
 );
 
@@ -3349,3 +3355,122 @@ export const suggestedPos = pgTable(
 );
 
 export type SuggestedPo = typeof suggestedPos.$inferSelect;
+
+/**
+ * ── Alert config + batch alerts (story 6.2, FR-23) ────────────────────────
+ *
+ * The expiry/aging half of the replenishment module: a per-TENANT config row
+ * (config-not-code — a tenant with no row has expiry/aging alerting DISABLED;
+ * no default lead/threshold days hide in code), driving the scheduler tick's
+ * second evaluation (the expiry scan, a sibling of the breach sweep), which
+ * opens per-SCOPE batch alerts.
+ *
+ * `expiry_alert_policies` — one row per tenant (unique `tenant_id`):
+ * `expiry_lead_days` — a batch whose `expiry_date` falls within this many
+ * days of now (or is already past it) raises an expiry alert while it carries
+ * on-hand; `aging_threshold_days` — a batch whose age since INTAKE
+ * (`batches.created_at`) reaches this many days raises an aging alert. Both
+ * ≥ 0 (CHECK in 0049); no DELETE command — "GET 404 when absent" is the
+ * family's existing-shape (absence IS the disable mechanism this side of the
+ * API).
+ *
+ * `batch_alerts` — one row per (tenant, warehouse, sku, batch, kind) alert
+ * EVENT-scope: the kind vocabulary `expiry_upcoming | aged` (a batch that
+ * triggers both carries TWO rows — the queue filters by kind); at most ONE
+ * OPEN row per scope+kind (partial unique, the `reorder_breaches` shape).
+ * `age_days` is FROZEN at detection (age moves; the alert records what it
+ * saw) and only on `aged` rows; expiry itself is never frozen (the catalog
+ * froze dates at intake). Lifecycle `open → resolved` (the batch's on-hand
+ * read 0 on a later scan; `resolved_by` null — nobody acted; NO event) |
+ * `open → dismissed` (human, `resolved_by/at` stamped). No batch code or
+ * expiry column: identity and dates are catalog-owned and read fresh (or
+ * joined client-side); the ONLY stock number the queue read carries is the
+ * LIVE on-hand stitched in at read time — never a stored one (AD-1).
+ *
+ * The status/kind CHECKs below, the >= 0 CHECKs on the config ints, and the
+ * fail-closed RLS policies live **only in the migration SQL** (0049 — the
+ * drizzle-blindness rule; the snapshot records `isRLSEnabled: false`). The
+ * partial open-scope unique is drizzle-declared here.
+ */
+export const BATCH_ALERT_KINDS = ['expiry_upcoming', 'aged'] as const;
+export type BatchAlertKind = (typeof BATCH_ALERT_KINDS)[number];
+
+export const BATCH_ALERT_STATUSES = ['open', 'resolved', 'dismissed'] as const;
+export type BatchAlertStatus = (typeof BATCH_ALERT_STATUSES)[number];
+
+/** The config ints' storage bound — int4 (the DTO validates against the same bound). */
+export const MAX_ALERT_CONFIG_DAYS = 2147483647;
+
+export const expiryAlertPolicies = pgTable(
+  'expiry_alert_policies',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    /** Days of lead time before `batches.expiry_date` an alert opens (≥ 0; CHECK in 0049). */
+    expiryLeadDays: integer('expiry_lead_days').notNull(),
+    /** Batch age since intake that raises an `aged` alert (≥ 0; CHECK in 0049). */
+    agingThresholdDays: integer('aging_threshold_days').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One config row per tenant — last-write-wins upsert (the variance-policy
+    // family's shape).
+    uniqueIndex('expiry_alert_policies_tenant_unique').on(table.tenantId),
+  ],
+);
+
+export type ExpiryAlertPolicy = typeof expiryAlertPolicies.$inferSelect;
+
+export const batchAlerts = pgTable(
+  'batch_alerts',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    batchId: uuid('batch_id').notNull(),
+    /** Exactly per the detection that opened it — a scope+kind row never re-kinds. */
+    kind: text('kind').notNull(),
+    /** Exactly `open` at detection — the transitions own every later state. */
+    status: text('status').notNull().default('open'),
+    /** FROZEN at detection — days since intake, `aged` rows only (null on `expiry_upcoming`). */
+    ageDays: integer('age_days'),
+    /** The dismisser's user id (null while open and on auto-resolve). */
+    resolvedBy: uuid('resolved_by'),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // At most ONE OPEN alert per (tenant, warehouse, sku, batch, kind): the
+    // partial unique absorbs a racing double-open (the loser's 23505 is
+    // swallowed as another tick's already-open verdict — the breach shape).
+    uniqueIndex('batch_alerts_open_tenant_warehouse_sku_batch_kind_unique')
+      .on(table.tenantId, table.warehouseId, table.skuId, table.batchId, table.kind)
+      .where(sql`status = 'open'`),
+    // The queue's keyset reads (status filter first — the tabs, then kind).
+    index('batch_alerts_tenant_status_created_at_id_idx').on(
+      table.tenantId,
+      table.status,
+      table.createdAt,
+      table.id,
+    ),
+    index('batch_alerts_tenant_kind_created_at_id_idx').on(
+      table.tenantId,
+      table.kind,
+      table.createdAt,
+      table.id,
+    ),
+    index('batch_alerts_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type BatchAlert = typeof batchAlerts.$inferSelect;
