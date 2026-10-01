@@ -85,6 +85,11 @@ ALTER TABLE "integrations" ADD CONSTRAINT "integrations_backorder_policy_check" 
 ALTER TABLE "integrations" ADD CONSTRAINT "integrations_breaker_state_check" CHECK (
   "breaker_state" IN ('closed', 'open', 'half-open')
 );--> statement-breakpoint
+-- The carriers precedent (0025): sealed credential material must carry the
+-- envelope prefix — raw provider material can never be stored.
+ALTER TABLE "integrations" ADD CONSTRAINT "integrations_credential_sealed_envelope" CHECK (
+  "credential_sealed" LIKE 'v1:%'
+);--> statement-breakpoint
 ALTER TABLE "integrations" ADD CONSTRAINT "integrations_consecutive_failures_nonnegative_check" CHECK (
   "consecutive_failures" >= 0
 );--> statement-breakpoint

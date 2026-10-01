@@ -119,13 +119,6 @@ export class ChannelConnectionResponse {
   updatedAt!: string;
 }
 
-export class ChannelConnectionListResponse {
-  @ApiProperty({ type: [ChannelConnectionResponse] })
-  items!: ChannelConnectionResponse[];
-  @ApiProperty({ nullable: true, type: String })
-  nextCursor!: string | null;
-}
-
 /** The per-connection sync-health row (arm 4). */
 export class ChannelConnectionListEntryDto {
   @ApiProperty({ format: 'uuid' })

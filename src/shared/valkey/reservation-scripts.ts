@@ -90,30 +90,3 @@ end
 redis.call('SET', KEYS[1], restored, 'KEEPTTL')
 return {1, tostring(restored)}
 `;
-
-/**
- * The mirror-INCREMENT arm (story 7.1, AD-13): a standing buffer's journal
- * write commits, and its net counter delta is applied AFTER the commit —
- * journal first, mirror second, exactly like a release's restore but in the
- * growing direction. This is NOT a decision script: it arbitrates nothing
- * (no ceiling, no ready marker — the decision was Postgres's headroom check
- * inside the journalling transaction). Its ONLY job is to keep the mirror
- * tracking journal truth; a missing counter fails it closed (the caller
- * logs and the next rebuild/parity pass repairs toward Postgres), never
- * grants blind.
- *
- * KEYS[1] = reserved counter
- * ARGV[1] = quantity to add, ARGV[2] = counter TTL seconds (backstop)
- *
- * Returns {1, newReserved} or {0, 'missing-counter'}.
- */
-export const RESERVATION_MIRROR_INCREMENT_SCRIPT = `
-if redis.call('EXISTS', KEYS[1]) == 0 then
-  return {0, 'missing-counter'}
-end
-local qty = tonumber(ARGV[1])
-local reserved = tonumber(redis.call('GET', KEYS[1]))
-local grown = redis.call('INCRBY', KEYS[1], qty)
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-return {1, tostring(grown)}
-`;
