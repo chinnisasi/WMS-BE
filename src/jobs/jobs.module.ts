@@ -499,21 +499,29 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
         where s.reorder_point > 0 or s.reorder_qty > 0
         order by w.tenant_id asc, w.id asc
       `)) as unknown as { tenantId: string; warehouseId: string }[];
-      // 3. every warehouse carrying batch on-hand on a BATCH-TRACKED SKU
-      //    (the expiry scan's alert sources — the projection's positive rows
-      //    are the only scopes a batch alert can detect against), UNION every
+      // 3. every warehouse carrying batch on-hand on a BATCH-TRACKED SKU of a
+      //    tenant WITH an expiry-alert config (the expiry scan's alert
+      //    sources — the projection's positive rows are the only scopes a
+      //    batch alert can detect against, and a tenant with no config row
+      //    scans to a no-op, so enumerating it is pure waste), UNION every
       //    warehouse with an OPEN batch alert — the consumed-warehouse arm:
       //    once a warehouse's LAST positive batch row is gone its on-hand
       //    query would never name it again, and the auto-resolve of its open
       //    alerts (on-hand 0) would never run. The union keeps them swept
-      //    until every alert settles. The dedupe map below absorbs any
-      //    overlap with queries 1-2.
+      //    until every alert settles. The EXISTS rides the on-hand arm ONLY —
+      //    the open-alert arm needs no config check (the table has no DELETE;
+      //    an open alert implies the config row existed). The dedupe map
+      //    below absorbs any overlap with queries 1-2.
       const batchScopes = (await this.authDb.execute(sql`
         select tenant_id as "tenantId", warehouse_id as "warehouseId" from (
           select bo.tenant_id, bo.warehouse_id
           from batch_on_hand bo
           join skus s on s.tenant_id = bo.tenant_id and s.id = bo.sku_id
           where bo.quantity > 0 and s.batch_tracked
+            and exists (
+              select 1 from expiry_alert_policies p
+              where p.tenant_id = bo.tenant_id
+            )
           union
           select a.tenant_id, a.warehouse_id
           from batch_alerts a

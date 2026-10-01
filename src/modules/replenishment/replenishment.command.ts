@@ -215,7 +215,9 @@ export function assertPositiveMilli(value: number, field: string): number {
  * The config days' one validation at the command edge: a whole-day integer,
  * ≥ 0 (0 admits a live threshold — the spec's stated grammar), inside the
  * int4 storage bound the column carries. The refusal names the field (the
- * I/O matrix's arm), and fires at the edge, behind the replay lookup.
+ * I/O matrix's arm), and fires at the edge, AHEAD of the tenant transaction —
+ * so a same-key replay whose payload fails this validation 400s
+ * `validation-failed` and never reaches the 422 `idempotency-key-reuse` arm.
  */
 export function assertNonNegativeDays(value: number, field: string): number {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
@@ -917,8 +919,10 @@ export class ReplenishmentCommand {
     command: UpsertExpiryPolicyCommand,
     idempotencyKey: string,
   ): Promise<ExpiryPolicySnapshot> {
-    // The day counts validate at the edge, behind the replay lookup below:
-    // a negative day count is the 400 naming the field.
+    // The day counts validate at the edge, AHEAD of the transaction (and of
+    // the replay lookup below): a negative day count is the 400 naming the
+    // field — even on a same-key replay with a changed payload, which 400s
+    // `validation-failed` before the 422 reuse arm can fire.
     assertNonNegativeDays(command.expiryLeadDays, 'expiryLeadDays');
     assertNonNegativeDays(command.agingThresholdDays, 'agingThresholdDays');
     const payloadHash = hashCommandPayload({

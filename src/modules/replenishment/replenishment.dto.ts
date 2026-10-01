@@ -424,9 +424,16 @@ export class BatchAlertDto {
   ageDays!: number | null;
 
   @ApiProperty({
+    required: false,
     description: 'The LIVE batch on-hand for this scope, milli-units — re-read at read time, never stored. Carried on LIST rows; absent on the dismissal snapshot.',
   })
   onHandMilli?: number;
+
+  @ApiProperty({
+    required: false,
+    description: 'The alerted batch\'s human code — the queue card renders it, never a truncated id. Carried on LIST rows; absent on the dismissal snapshot.',
+  })
+  batchCode?: string;
 
   @ApiProperty({ description: 'The detection instant (ISO-8601 UTC) — the row\'s creation time' })
   detectedAt!: string;

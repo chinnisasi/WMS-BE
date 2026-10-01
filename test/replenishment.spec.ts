@@ -1284,6 +1284,13 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       // Same key, different payload → 422 idempotency-key-reuse.
       await putExpiry({ ...body, expiryLeadDays: LEAD_DAYS + 1 }, key).expect(422);
 
+      // Same key, different INVALID payload → 400 validation-failed, NOT 422:
+      // the day counts validate at the edge, AHEAD of the transaction and its
+      // replay lookup — the validation arm decides before the reuse arm can.
+      const invalidReplay = await putExpiry({ ...body, expiryLeadDays: -1 }, key).expect(400);
+      expect(invalidReplay.body.code).toBe('validation-failed');
+      expect((invalidReplay.body.errors ?? []).join(' ')).toContain('expiryLeadDays');
+
       // Exactly ONE audit row — the replay came from idempotency, the
       // refusals never entered the transaction.
       const audits = await auditRows('replenishment.expiry_policy_upserted', tenantId);
@@ -1401,7 +1408,7 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       const e1Id = await batchIdOf('E1');
       const a1Id = await batchIdOf('A1');
       const e4Id = await batchIdOf('E4');
-      const list = async (query = ''): Promise<{ items: { id: string; kind: string; status: string; batchId: string; ageDays: number | null; onHandMilli?: number }[]; nextCursor?: string | null }> =>
+      const list = async (query = ''): Promise<{ items: { id: string; kind: string; status: string; batchId: string; ageDays: number | null; onHandMilli?: number; batchCode?: string }[]; nextCursor?: string | null }> =>
         (
           await request(app.getHttpServer())
             .get(`${API}/${tenantId}/replenishment/batch-alerts${query}`)
@@ -1418,13 +1425,18 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
         'expiry_upcoming',
       ]);
       // The freshness stitch: milli on-hand re-read at read time — E1 holds 5,
-      // A1 7, E4 1 base units; the frozen age rides the aged rows only.
+      // A1 7, E4 1 base units; the frozen age rides the aged rows only. The
+      // code stitch rides the same rows — every batch's human code, the card's
+      // render source.
       const e1Rows = open.items.filter((item) => item.batchId === e1Id);
       expect(e1Rows.map((item) => item.onHandMilli).sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([5000, 5000]);
+      expect(e1Rows.every((item) => item.batchCode === 'E1')).toBe(true);
       const a1Item = open.items.find((item) => item.batchId === a1Id)!;
       expect(a1Item.onHandMilli).toBe(7000);
+      expect(a1Item.batchCode).toBe('A1');
       expect(a1Item.ageDays).toBe(30);
       expect(open.items.find((item) => item.batchId === e4Id)!.onHandMilli).toBe(1000);
+      expect(open.items.find((item) => item.batchId === e4Id)!.batchCode).toBe('E4');
       // The expiry rows freeze nothing (the aged row on the same batch — the
       // aging arm's other half — carries the frozen age).
       expect(e1Rows.find((item) => item.kind === 'expiry_upcoming')!.ageDays).toBeNull();
@@ -1498,13 +1510,27 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
         quantityDelta: -5,
         batch: { code: 'E1', overrideReason: 'expiry alert consume arm' },
       });
+      // The READ-side absent-scope arm, observed BEFORE the resolving scan: the
+      // batch on-hand row is GONE but the alerts still stand open — the queue
+      // read's stitch finds no scope sum for them and the `?? 0` default
+      // renders. (Once the scan runs, the rows are resolved and leave nothing
+      // to observe — this open-window read is the only shape that can.)
+      const e1Id = await batchIdOf('E1');
+      const zeroWindow = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/replenishment/batch-alerts?status=open`)
+        .set('Authorization', `Bearer ${operatorToken}`)
+        .expect(200);
+      const e1OpenZero = ((zeroWindow.body.items as { batchId: string; onHandMilli?: number }[]) ?? []).filter(
+        (item) => item.batchId === e1Id,
+      );
+      expect(e1OpenZero).toHaveLength(2);
+      expect(e1OpenZero.every((item) => item.onHandMilli === 0)).toBe(true);
       const eventsBefore = (await outboxPayloads('replenishment.batch_alert_raised', tenantId)).length;
       const report = await replenishment.scanScope(tenantId, warehouseId);
       // E1's scope is gone (evaluated 7 → 6); BOTH its open alerts auto-
       // resolved — expiry_maturity never matters, only on-hand reaching 0.
       expect(report).toEqual({ tenantId, warehouseId, evaluated: 6, raised: 0, resolved: 2 });
 
-      const e1Id = await batchIdOf('E1');
       const e1Rows = (await alertRows()).filter((row) => row.batch_id === e1Id);
       expect(e1Rows).toHaveLength(2);
       expect(e1Rows.every((row) => row.status === 'resolved' && row.resolved_by === null)).toBe(true);
@@ -1529,8 +1555,10 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
         ageDays: 30,
         resolvedBy: expect.any(String),
       });
-      // The dismissal snapshot carries no on-hand (only the list rows stitch it).
+      // The dismissal snapshot carries no on-hand and no code (the list rows
+      // stitch both) — the dto contract's optional pair, both absent here.
       expect(dismissed.body.batchAlert.onHandMilli).toBeUndefined();
+      expect(dismissed.body.batchAlert.batchCode).toBeUndefined();
 
       const replayed = await request(app.getHttpServer())
         .post(`${API}/${tenantId}/replenishment/batch-alerts/${a1.id}/dismiss`)
@@ -1688,6 +1716,33 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       expect(audits).toHaveLength(7);
     });
 
+    it('two concurrent scans of one scope: both settle, exactly ONE open row per (scope, kind), exactly one raise event', async () => {
+      // A fresh trigger batch so the concurrent pair actually races the raise
+      // (every other standing scope's alert is already open or silent).
+      await adjustBatch({ warehouseId, skuId: skuIds.get('RP-EX')!, binId: binW1, quantityDelta: 3, batch: { code: 'RZE', expiryDate: daysFromNow(3) } });
+
+      const [reportA, reportB] = await Promise.all([
+        replenishment.scanScope(tenantId, warehouseId),
+        replenishment.scanScope(tenantId, warehouseId),
+      ]);
+      expect(reportA.tenantId).toBe(tenantId);
+      expect(reportB.tenantId).toBe(tenantId);
+
+      // Exactly one winner: combined raises 1 (the loser absorbed on the
+      // partial unique — no duplicate row, no duplicate event).
+      expect(reportA.raised + reportB.raised).toBe(1);
+      const rzeId = await batchIdOf('RZE');
+      const rzeRows = (await alertRows()).filter((row) => row.batch_id === rzeId);
+      expect(rzeRows).toHaveLength(1);
+      expect(rzeRows[0]!.kind).toBe('expiry_upcoming');
+      expect(rzeRows[0]!.status).toBe('open');
+      expect(
+        (await outboxPayloads('replenishment.batch_alert_raised', tenantId)).filter(
+          (payload) => payload.batchId === rzeId,
+        ),
+      ).toHaveLength(1);
+    });
+
     it('the consumed-warehouse arm: a warehouse whose ONLY enumerator is its open alert (no reorder defaults, all stock consumed) still auto-resolves via the tick', async () => {
       // Tenant D: one batch-tracked SKU with NO reorder defaults — neither the
       // policies query nor the tenant-wide defaults query ever enumerates its
@@ -1802,6 +1857,42 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       // The resolve emits no event — one raise event total for tenant D.
       const dPayloads = await outboxPayloads('replenishment.batch_alert_raised', dTenant);
       expect(dPayloads).toHaveLength(1);
+    });
+
+    it('the config MAX boundary: the storable maximum round-trips and one scan against it settles well-formed', async () => {
+      const putExpiry = (body: Record<string, unknown>): SupertestTest =>
+        request(app.getHttpServer())
+          .put(`${API}/${tenantId}/replenishment/expiry-policies`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send(body);
+      const MAX = 2147483647;
+      const saved = await putExpiry({ expiryLeadDays: MAX, agingThresholdDays: MAX }).expect(200);
+      expect(saved.body.expiryPolicy).toMatchObject({
+        expiryLeadDays: MAX,
+        agingThresholdDays: MAX,
+      });
+      // The round-trip: the boundary is storable AND readable back unchanged.
+      const got = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/replenishment/expiry-policies`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      expect(got.body.expiryPolicy).toMatchObject({
+        expiryLeadDays: MAX,
+        agingThresholdDays: MAX,
+      });
+
+      // One scan against the MAX config, settled for real. MAX lead days cover
+      // every representable expiry — the silent-but-active expiry scopes (E2,
+      // E3) now raise; everything already open stays put and nothing resolves
+      // (all open alerts' batches still carry on-hand). Aging: no real intake
+      // age can reach the MAX threshold.
+      const report = await replenishment.scanScope(tenantId, warehouseId);
+      expect(report).toEqual({ tenantId, warehouseId, evaluated: 9, raised: 2, resolved: 0 });
+
+      // Reset to the normal values — the boundary config must not leak past
+      // this arm.
+      await putExpiry({ expiryLeadDays: LEAD_DAYS, agingThresholdDays: AGING_DAYS }).expect(200);
     });
   });
 });

@@ -102,7 +102,9 @@ export class ExpiryScan {
       return idle;
     }
 
-    // ── Phase 3: transitions (one tenant transaction, EVERYTHING re-read) ──
+    // ── Phase 2: transitions (one tenant transaction, EVERYTHING re-read) ──
+    // (the sweep's fallible outside-tx phase has no counterpart here — every
+    // read this scan makes is one of these two tenant transactions' own)
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       const config = await this.readConfigInTx(tx, tenantId);
       if (config === null) {
@@ -323,6 +325,10 @@ export class ExpiryScan {
  * batch's expiry falls within the lead days (or is already past — expiry only
  * matures), `aged` when the intake-anchored age has reached the threshold. A
  * batch can hit BOTH (two rows, the queue filters by kind).
+ *
+ * The kinds come back in the lock read's kind tie-order (kind ASC — `aged`
+ * before `expiry_upcoming`), so the raise loop below never inserts in an
+ * order opposite to the one the open-alert locks were taken in.
  */
 function evaluationHits(
   config: { readonly expiryLeadDays: number; readonly agingThresholdDays: number },
@@ -331,11 +337,11 @@ function evaluationHits(
 ): { kinds: BatchAlertKind[]; ageDays: number } {
   const ageDays = ageDaysSince(batch.createdAt, nowMs);
   const kinds: BatchAlertKind[] = [];
-  if (batch.expiryDate !== null && Date.parse(batch.expiryDate) <= nowMs + config.expiryLeadDays * 86_400_000) {
-    kinds.push('expiry_upcoming');
-  }
   if (ageDays >= config.agingThresholdDays) {
     kinds.push('aged');
+  }
+  if (batch.expiryDate !== null && Date.parse(batch.expiryDate) <= nowMs + config.expiryLeadDays * 86_400_000) {
+    kinds.push('expiry_upcoming');
   }
   return { kinds, ageDays };
 }

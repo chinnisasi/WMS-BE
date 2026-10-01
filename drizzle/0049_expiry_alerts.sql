@@ -14,7 +14,12 @@
 --     identity and dates are catalog-owned and read fresh (AD-6).
 --
 -- Also one index on the EXISTING `batches` table (`batches_tenant_expiry_idx`) —
--- the scan's join input, declarable because it has no `where` clause.
+-- provisioned for the expiry-scan family's expiry-range reads on a tenant's
+-- batches (declarable because it has no `where` clause). NO query in this
+-- migration consumes it today — the scan's identity read rides the
+-- pre-existing `batches_tenant_sku_idx`, and the queue's FEFO expiry sort is
+-- done in JS. It ships anyway so the catalog-side half of a future
+-- per-warehouse expiry-range read never needs a migration of its own.
 --
 -- The snapshot carries the tables + indexes as written (partial unique
 -- included — `drizzle/meta/0009-0011` record `where` clauses, so the

@@ -49,6 +49,7 @@ import type { SweepReport } from './replenishment.sweep';
 import { ExpiryScan } from './replenishment.expiry.scan';
 import type { BatchScanReport } from './replenishment.expiry.scan';
 import { InventoryFacade } from '../inventory/inventory.facade';
+import { CatalogFacade } from '../catalog/catalog.facade';
 
 export type {
   BatchAlertEntry,
@@ -152,6 +153,8 @@ export class ReplenishmentFacade {
     @Inject(ExpiryScan) private readonly expiryScan: ExpiryScan,
     // The queue read's live on-hand stitch (inventory owns the projection).
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+    // The queue read's batch-code stitch (catalog owns batch identity).
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
   ) {}
 
   // ── command passthroughs (the api layer's only replenishment mutations) ──
@@ -355,12 +358,14 @@ export class ReplenishmentFacade {
    * spec's queue-freshness rule — the alert rows freeze their detection
    * facts, the read re-reads the projection): the page's scopes go through
    * the inventory facade's in-tx sums read on the SAME transaction, so no
-   * second connection opens while one is held.
+   * second connection opens while one is held. The page's batch codes are
+   * stitched alongside (the catalog facade's in-tx intake read — batch
+   * identity lives in catalog, AD-6) so the card renders the human code.
    */
   async listBatchAlerts(
     tenantId: string,
     query: ListBatchAlertsQuery = {},
-  ): Promise<Page<BatchAlertEntry & { readonly onHandMilli: number }>> {
+  ): Promise<Page<BatchAlertEntry & { readonly onHandMilli: number; readonly batchCode: string }>> {
     const pageSize = query.limit ?? DEFAULT_REPLENISHMENT_PAGE_SIZE;
     const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
     return withTenantTransaction(this.db, tenantId, async (tx) => {
@@ -401,11 +406,22 @@ export class ReplenishmentFacade {
       const onHandByKey = new Map(
         sums.map((sum) => [`${sum.warehouseId}|${sum.skuId}|${sum.batchId}`, sum.quantityMilli]),
       );
+      // The code stitch: the page's skuIds through the catalog facade's
+      // in-tx intake read (the scan's identity read, reused). Every alert
+      // row FKs its batch, so the lookup always hits — the non-null
+      // assertion leans on that database guarantee.
+      const intakes = await this.catalog.getBatchIntakesForSkusInTx(
+        tx,
+        tenantId,
+        rows.map((wrapped) => wrapped.row.skuId),
+      );
+      const codeByBatch = new Map(intakes.map((batch) => [batch.id, batch.code]));
       const page = this.pageOf(rows, pageSize, batchAlertEntry);
       return {
         items: page.items.map((entry) => ({
           ...entry,
           onHandMilli: onHandByKey.get(`${entry.warehouseId}|${entry.skuId}|${entry.batchId}`) ?? 0,
+          batchCode: codeByBatch.get(entry.batchId)!,
         })),
         nextCursor: page.nextCursor,
       };

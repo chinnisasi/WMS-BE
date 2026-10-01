@@ -683,9 +683,11 @@ export const batches = pgTable(
   (table) => [
     uniqueIndex('batches_tenant_sku_code_unique').on(table.tenantId, table.skuId, table.code),
     index('batches_tenant_sku_idx').on(table.tenantId, table.skuId),
-    // Story 6.2 (FR-23): the expiry scan's join input — the tenant's batches
-    // ordered by expiry so the catalog-side half of a per-warehouse
-    // expiry/aging evaluation reads candidates without a full-table scan.
+    // Story 6.2 (FR-23): provisioned for the expiry-scan family's expiry-range
+    // reads on a tenant's batches. No query today consumes it — the scan's
+    // identity read rides the pre-existing tenant/sku index above, and the
+    // queue's FEFO expiry sort is done in JS — it ships so a future
+    // catalog-side expiry-range read never needs a migration of its own.
     index('batches_tenant_expiry_idx').on(table.tenantId, table.expiryDate),
   ],
 );
