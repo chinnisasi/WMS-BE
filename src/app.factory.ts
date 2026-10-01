@@ -14,7 +14,11 @@ export const API_PREFIX = 'api/v1';
  * `withListener` is false for tests and the OpenAPI export script.
  */
 export async function createApp(withListener = false): Promise<INestApplication> {
-  const app = await NestFactory.create(AppModule, { logger: ['error', 'warn', 'log'] });
+  // Story 7.2 (RD-5): `rawBody: true` buffers every JSON request a second
+  // time (req.rawBody) so the channel webhook signatures can be verified
+  // over the EXACT bytes the provider signed — a re-serialized body would
+  // not re-hash. Deliberately accepted app-wide cost (the spec's record).
+  const app = await NestFactory.create(AppModule, { logger: ['error', 'warn', 'log'], rawBody: true });
 
   // CORS: the web client runs on its own origin (dev: localhost:3001) and
   // talks to this API cross-origin with a bearer token — an allow-list, not a

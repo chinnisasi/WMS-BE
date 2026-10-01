@@ -2,11 +2,14 @@ import { Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { CatalogModule } from '../catalog/catalog.module';
 import { InventoryModule } from '../inventory/inventory.module';
+import { OutboundModule } from '../outbound/outbound.module';
 import { TenancyModule } from '../tenancy/tenancy.module';
 import { ChannelsCommandService } from './channels.command';
 import { ChannelsFacade } from './channels.facade';
+import { ChannelsIngestCommand } from './channels.ingest.command';
 import { ChannelsPublishService } from './channels.publish';
 import { ChannelAvailabilityDelivery } from './channel-availability.delivery';
+import { ChannelWritebackDelivery } from './channel-writeback.delivery';
 
 /**
  * Channels module (Story 7-1) — the sales-channel substrate: the adapter
@@ -27,15 +30,24 @@ import { ChannelAvailabilityDelivery } from './channel-availability.delivery';
  * committed reads through `channelVisibleQuantity` (RN-6) — the sync
  * delivers, never computes.
  *
- * Imports: SharedModule (DATABASE, OUTBOX_SINK, EVENT_BUS) + the three
- * sibling facades' modules (inventory, catalog, tenancy) — one-way, no
- * back-edges. `ChannelsFacade` is exported ALONE (the architecture test
+ * Imports: SharedModule (DATABASE, OUTBOX_SINK, EVENT_BUS) + the sibling
+ * facades' modules (inventory, catalog, tenancy — one-way, no back-edges).
+ * Story 7.2 adds `OutboundModule` (the ingest command resolves its facade —
+ * the ONE order path; outbound imports nothing from channels, so the edge
+ * stays one-way). `ChannelsFacade` is exported ALONE (the architecture test
  * fails any sibling that reaches past it, AD-6): the jobs shell's sync
  * worker and the api shell's controller consume it.
  */
 @Module({
-  imports: [SharedModule, InventoryModule, CatalogModule, TenancyModule],
-  providers: [ChannelsCommandService, ChannelsPublishService, ChannelsFacade, ChannelAvailabilityDelivery],
+  imports: [SharedModule, InventoryModule, CatalogModule, OutboundModule, TenancyModule],
+  providers: [
+    ChannelsCommandService,
+    ChannelsPublishService,
+    ChannelsFacade,
+    ChannelsIngestCommand,
+    ChannelAvailabilityDelivery,
+    ChannelWritebackDelivery,
+  ],
   exports: [ChannelsFacade],
 })
 export class ChannelsModule {}

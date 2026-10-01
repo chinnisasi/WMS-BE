@@ -389,14 +389,17 @@ describe('channel connections, credentials and config (e2e, story 7-1)', () => {
         select id from integrations where tenant_id = ${tenantId}
       `) as unknown as { id: string }[];
       expect(rows).toEqual([]);
-      // The revoke attempt was metered (kind credential-revoke) — the
-      // unconfigured registry arm answers 'unconfigured' honestly, still a
-      // successful local attempt.
+      // The revoke attempt was metered (kind credential-revoke) — story 7-2
+      // (RD-6) replaced shopify's `unconfiguredRevokeArm` ('ok' honest
+      // no-op) with the REAL transport: the attempt here rides post-delete
+      // (RN-7), hits no channel and honestly meters the transport failure.
+      // The DISCONNECT itself stays non-blocking — 204, row deleted, replay
+      // 204, repeat 404 regardless of this arm's outcome.
       const calls = (await sql`
         select kind, status, integration_id, error from integration_calls where tenant_id = ${tenantId}
       `) as unknown as { kind: string; status: string; integration_id: string; error: string | null }[];
       expect(calls).toEqual([
-        expect.objectContaining({ kind: 'credential-revoke', status: 'ok', integration_id: connectionId }),
+        expect.objectContaining({ kind: 'credential-revoke', status: 'failed', integration_id: connectionId }),
       ]);
       const audits = (await sql`
         select action from audit_events where tenant_id = ${tenantId} and action = 'channels.disconnected'

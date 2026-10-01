@@ -97,6 +97,19 @@ export function bufferSkuNotFound(skuId: string): ProblemException {
 }
 
 /**
+ * 404 `not-found` — the config PUT's ingest warehouse is unknown or foreign
+ * (7.2, T1). Named for the config arm; the buffers refusal keeps its own.
+ */
+export function ingestWarehouseNotFound(warehouseId: string): ProblemException {
+  return new ProblemException(
+    'not-found',
+    404,
+    'Warehouse not found',
+    `No warehouse ${warehouseId} exists in this tenant — the ingest warehouse must be one of the connection's own.`,
+  );
+}
+
+/**
  * 503 `channel-encryption-unavailable` — the deployment has no (or a too
  * short) `CHANNEL_ENCRYPTION_KEY`. A raw throw from inside the transaction
  * would surface as a 500 and say nothing useful. Nothing is written.
@@ -145,5 +158,119 @@ export function invalidUuidParam(name: string, value: string): ProblemException 
     400,
     `${name} must be a uuid`,
     `The "${name}" path parameter must be a uuid (got "${value}").`,
+  );
+}
+
+// ── story 7.2: the ingest + writeback refusals (RD-1..RD-9) ─────────────────
+// The webhook arm's messages never name channel-side content beyond the ids
+// the tenant already owns, and never a credential value or raw payload.
+
+/**
+ * 422 `order-source-conflict` — a verified delivery whose MAPPED content
+ * diverges from the order the ref already created (RD-1; the out bound
+ * command's same-code refusal — declared here too so the webhook layer and
+ * the command agree on the code string).
+ */
+export const ORDER_SOURCE_CONFLICT_CODE = 'order-source-conflict';
+
+/**
+ * 422 `ingest-warehouse-unset` — a delivered order for a connection whose
+ * config never set `ingest_warehouse_id` (RD-4). NACK: the channel retries;
+ * remediation is the config PUT.
+ */
+export function ingestWarehouseUnset(connectionId: string): ProblemException {
+  return new ProblemException(
+    'ingest-warehouse-unset',
+    422,
+    'Ingest warehouse is not set',
+    `Connection ${connectionId} has no ingest warehouse configured — set it with the config PUT (PUT .../connections/{id}) before this channel can ingest orders.`,
+  );
+}
+
+/**
+ * 422 `ingest-config-invalid` — the ingest REFERENCES resolve to master data
+ * that left after being configured (the ingest warehouse was deleted, or a
+ * mapped SKU was). NACK: the channel retries into the same refusal; the
+ * remediation is the mapping/config PUT. Never a 404 (a 404 would tell the
+ * channel the DELIVERY is wrong — the configuration is).
+ */
+export function ingestConfigInvalid(connectionId: string, detail: string): ProblemException {
+  return new ProblemException(
+    'ingest-config-invalid',
+    422,
+    'Channel ingest configuration is invalid',
+    `Connection ${connectionId}'s ingest configuration references master data that no longer exists — ${detail}. Remediate with the config PUT / mappings PUT; the channel retries this delivery.`,
+  );
+}
+
+/**
+ * 409 `order-backorder-rejected` — RD-3's whole-order post-grant refusal
+ * under `backorder_policy: 'reject'`: any line whose grant came back short
+ * (zero-grant included) releases everything and refuses the order. No order
+ * row exists, so the detail names no order.
+ */
+export function orderBackorderRejected(connectionId: string): ProblemException {
+  return new ProblemException(
+    'order-backorder-rejected',
+    409,
+    'Order rejected under the backorder policy',
+    `Connection ${connectionId} is configured to REJECT backorders; some line could not fully reserve at grant time, so the whole order was refused and every reservation it moved was released (the fail-safe direction).`,
+  );
+}
+
+/**
+ * 403 `order-actor-unprivileged` — RD-2's fail-closed actor: the
+ * connection's `connected_by` (the ingestion's authority) has lost
+ * `orders.manage` since connecting. NACK — the channel retries; the
+ * remediation is re-connecting with an eligible account.
+ */
+export function orderActorUnprivileged(connectionId: string): ProblemException {
+  return new ProblemException(
+    'order-actor-unprivileged',
+    403,
+    'The ingest actor has lost the orders capability',
+    `Connection ${connectionId}'s connected_by no longer holds "orders.manage" — the ingest refuses closed. Remediation: reconnect the channel with an account that holds it.`,
+  );
+}
+
+/**
+ * 503 `cancellation-unresolved` — RD-8: a cancellation for an order ref the
+ * order tables have never committed (the create/cancel race, or a foreign
+ * ref). NACK: the channel retries and resolves on the retry once the create
+ * lands; a ref that never resolves is abandoned by the channel's own retry
+ * budget — an order we never created holds nothing to leak.
+ */
+export function cancellationUnresolved(connectionId: string, orderRef: string): ProblemException {
+  return new ProblemException(
+    'cancellation-unresolved',
+    503,
+    'Cancellation cannot be resolved to an order',
+    `No order for connection ${connectionId} carries external ref "${orderRef}" (yet) — retry; the cancellation settles once the order's create has committed.`,
+  );
+}
+
+/**
+ * 400 `validation-failed` — a verified, parsed delivery whose content
+ * cannot become an order because the TENANT'S configuration misses
+ * something (an unmapped external ref). Named differently from the
+ * transport's own `validationFailed` helper to keep the two 400 families
+ * greppable.
+ */
+export function validationFailedIngest(detail: string): ProblemException {
+  return new ProblemException('validation-failed', 400, 'Ingest mapping failed', detail);
+}
+
+/**
+ * 501 `channel-transport-unconfigured` — the webhook endpoint's registry
+ * gate (RD-5/RD-6): the provider declares no webhook configuration (today:
+ * `amazon-in`/`flipkart`). The typed verbatim refusal, before any
+ * credential is touched.
+ */
+export function channelWebhookUnconfigured(provider: string): ProblemException {
+  return new ProblemException(
+    'channel-transport-unconfigured',
+    501,
+    'Channel transport not configured',
+    `Channel "${provider}" has no webhook ingest transport on this deployment — its real integration has not been configured yet. Retry once it lands.`,
   );
 }

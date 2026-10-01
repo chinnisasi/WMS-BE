@@ -1,14 +1,15 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { channelMappings, integrationCalls, integrations } from '../../shared/db/schema';
-import type { Integration } from '../../shared/db/schema';
+import type { Integration, IntegrationCallStatus } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
+import { openCredential } from './channel-credentials';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
@@ -48,6 +49,13 @@ import {
 
 /** How many scopes ONE publication computes and carries (the worker's per-cycle bound). */
 export const MAX_SYNC_SCOPES_PER_PUBLISH = 200;
+
+/**
+ * The verification-refusal meter's coarse window (RD-5): at most one
+ * `verification-failed` row per connection per window — the tamper-storm
+ * amplification guard.
+ */
+export const VERIFICATION_METER_WINDOW_MS = 60_000;
 
 /** What `preparePublication` reports to the worker and the retry command. */
 export type PublicationPrep =
@@ -396,6 +404,157 @@ export class ChannelsPublishService {
       return null;
     }
     return { provider: row.provider, credentialSealed: row.credentialSealed };
+  }
+
+  /**
+   * Story 7-2's webhook face: the connection's provider + its OPENED
+   * webhook signing secret, for the HTTP surface. The sealed blob NEVER
+   * crosses into `src/api` (the carriers 4.6b pin owns that posture) — the
+   * envelope stays module-owned here; the secret rides request-scoped
+   * plaintext only, never logged, persisted or echoed. A missing or
+   * unopenable blob answers `webhookSecret: null` — the surface's fail-
+   * closed 401 arm (bl-9: the coarse meter carries the visibility there).
+   */
+  async webhookDeliveryFace(
+    tenantId: string,
+    connectionId: string,
+  ): Promise<{ provider: string; webhookSecret: string | null } | null> {
+    const row = await this.integrationForDelivery(tenantId, connectionId);
+    if (row === null) {
+      return null;
+    }
+    let webhookSecret: string | null = null;
+    try {
+      webhookSecret = openCredential(row.credentialSealed).webhookSecret ?? null;
+    } catch {
+      // ANY unopenable blob (key unavailable, corrupt envelope) fails closed
+      // the same way — the surface's verification-failure class (bl-9: the
+      // coarse meter carries the visibility there).
+      webhookSecret = null;
+    }
+    return { provider: row.provider, webhookSecret };
+  }
+
+  // ── story 7.2: the ingest + writeback meter arms ────────────────────────────
+  // Both are METER-ONLY (triage row 28 / RD-9): an outcome here never touches
+  // `last_synced_at` / `last_error` / `consecutive_failures` / the breaker —
+  // sync health is the availability sync's own story, and the writeback is
+  // not a sync. Each row goes in one tiny transaction of its own (a meter
+  // failed to write must not fail the delivery that produced it).
+
+  /**
+   * One webhook ingest's settle: an `integration_calls` row kind
+   * `order-ingest` carrying the OUTCOME status. Refused outcomes
+   * (`rejected`, `unmapped`, `verification-failed`, …) meter as statuses —
+   * they are decisions, not failures; nothing about the connection's health
+   * or breaker moves (RD-9).
+   */
+  async recordIngestOutcome(
+    tenantId: string,
+    connectionId: string,
+    args: {
+      status: IntegrationCallStatus;
+      latencyMs: number | null;
+      /** Refusal detail (the connection's OWNER knows the order ref; a webhook caller never reads this meter). */
+      error: string | null;
+    },
+  ): Promise<void> {
+    await withTenantTransaction(this.db, tenantId, async (tx) =>
+      tx.insert(integrationCalls).values({
+        id: uuidv7(),
+        tenantId,
+        integrationId: connectionId,
+        kind: 'order-ingest',
+        status: args.status,
+        latencyMs: args.latencyMs,
+        error: args.error === null ? null : args.error.slice(0, 300),
+        at: nowIso(),
+      }),
+    );
+  }
+
+  /**
+   * The verification-failure class's COARSE meter (RD-5): a tampering
+   * webhook storm must not mint a meter row per attempt, and the row must
+   * name nothing — no header value, no body byte. At most one
+   * `verification-failed` row per (connection, window). The read is the
+   * newest such row's `at` (the append-only meter's cheapest probe).
+   */
+  async recordIngestVerificationRefused(tenantId: string, connectionId: string): Promise<void> {
+    await withTenantTransaction(this.db, tenantId, async (tx) => {
+      const recent = await tx
+        .select({ at: integrationCalls.at })
+        .from(integrationCalls)
+        .where(
+          and(
+            eq(integrationCalls.tenantId, tenantId),
+            eq(integrationCalls.integrationId, connectionId),
+            eq(integrationCalls.kind, 'order-ingest'),
+            eq(integrationCalls.status, 'verification-failed'),
+          ),
+        )
+        .orderBy(desc(integrationCalls.at))
+        .limit(1);
+      const last = recent[0];
+      if (
+        last !== undefined &&
+        Date.now() - Date.parse(last.at) < VERIFICATION_METER_WINDOW_MS
+      ) {
+        return;
+      }
+      await tx.insert(integrationCalls).values({
+        id: uuidv7(),
+        tenantId,
+        integrationId: connectionId,
+        kind: 'order-ingest',
+        status: 'verification-failed',
+        latencyMs: null,
+        error: null,
+        at: nowIso(),
+      });
+    });
+  }
+
+  /**
+   * The writeback delivery's settle (RD-7): an `integration_calls` row kind
+   * `order-writeback` — and NOTHING else. Verified: `recordDelivery`
+   * hardcodes the sync stamps + breaker rungs, so reusing it would corrupt
+   * sync health with writeback outcomes. A gone connection inserts nothing
+   * (the meter row names a connection that cannot exist), silently: the
+   * delivery already ACKed a gone connection, and nothing here may revive
+   * the failure.
+   */
+  async recordWritebackDelivery(
+    tenantId: string,
+    connectionId: string,
+    args: {
+      status: IntegrationCallStatus;
+      latencyMs: number | null;
+      error: string | null;
+    },
+  ): Promise<void> {
+    await withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({ id: integrations.id })
+        .from(integrations)
+        .where(
+          and(eq(integrations.id, connectionId), eq(integrations.tenantId, tenantId)),
+        )
+        .limit(1);
+      if (rows[0] === undefined) {
+        return;
+      }
+      await tx.insert(integrationCalls).values({
+        id: uuidv7(),
+        tenantId,
+        integrationId: connectionId,
+        kind: 'order-writeback',
+        status: args.status,
+        latencyMs: args.latencyMs,
+        error: args.error === null ? null : args.error.slice(0, 300),
+        at: nowIso(),
+      });
+    });
   }
 
   /**

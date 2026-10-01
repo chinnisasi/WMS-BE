@@ -9,6 +9,7 @@ import { ReceivingController } from './receiving.controller';
 import { PutawayController } from './putaway.controller';
 import { CarriersController } from './carriers.controller';
 import { ChannelsController } from './channels.controller';
+import { WebhooksController } from './webhooks.controller';
 import { ComplianceController } from './compliance.controller';
 import { MovementsController } from './movements.controller';
 import { OpenApiController } from './openapi.controller';
@@ -91,6 +92,11 @@ import { ReplenishmentController } from './replenishment.controller';
     // imported by the root; every mutation goes through
     // `ChannelsCommandService` / `ChannelsFacade`.
     ChannelsController,
+    // Story 7-2 — the channel webhook surface (guardless by construction:
+    // the provider's AUTHORITY is its signature, not a session). The
+    // last-siblings convention keeps NotFoundController LAST (registered
+    // after webhooks so its catch-all routes cannot shadow them).
+    WebhooksController,
     OpenApiController,
     NotFoundController,
   ],

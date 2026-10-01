@@ -1140,6 +1140,9 @@ describe('architecture: channel connections are channels-module-owned (story 7-1
         'warehouses',
         'memberships',
         'carrierConnections',
+        'orders',
+        'orderLines',
+        'picks',
       ] as const) {
         if (drizzleWriteOn(table).test(file.source)) {
           offenders.push(`${file.path}: writes ${table}`);
@@ -1253,5 +1256,76 @@ describe('architecture: channel connections are channels-module-owned (story 7-1
     // jobs shell drives the facade — meaningfulness for the scan above).
     const jobs = readFileSync(join(SRC_ROOT, 'jobs', 'jobs.module.ts'), 'utf8');
     expect(jobs).toContain("from '../modules/channels/channels.facade'");
+  });
+});
+
+describe('architecture: channel ingest + writeback ride the frozen seams (story 7-2)', () => {
+  const channelsRoot = join(SRC_ROOT, 'modules', 'channels');
+  const apiRoot = join(SRC_ROOT, 'api');
+
+  it('the webhook controller reaches the channels module ONLY via its facade + the declared registry arms', () => {
+    const controller = readFileSync(join(apiRoot, 'webhooks.controller.ts'), 'utf8');
+    // No channel table, no channel command/service — the controller verifies,
+    // parses and ROUTES; the ingest decisions live in the channels module.
+    expect(controller).toContain('ChannelsFacade');
+    expect(controller).toContain('channelAdapter');
+    // The carriers 4.6b pin's posture: the sealed blob is NEVER named in
+    // `src/api` — the signing secret crosses via `webhookDeliveryFace`'s
+    // opened face, module-owned envelope.
+    expect(controller).not.toContain('credentialSealed');
+    expect(controller).not.toContain('openCredential');
+    for (const forbidden of ['ChannelsIngestCommand', 'ChannelsPublishService', 'channels.command', 'drizzle']) {
+      expect(controller).not.toContain(forbidden);
+    }
+  });
+
+  it('the ingest command creates orders ONLY through the outbound facade (the single acceptance path, 4-1)', () => {
+    const command = readFileSync(join(channelsRoot, 'channels.ingest.command.ts'), 'utf8');
+    expect(command).toContain('this.outbound.createOrder');
+    expect(command).toContain('this.outbound.cancelOrder');
+    // And it writes NO outbound table of its own — drizzle writes here are
+    // the connection/mapping reads only.
+    expect(drizzleWriteOn('orders').test(command)).toBe(false);
+    expect(drizzleWriteOn('orderLines').test(command)).toBe(false);
+  });
+
+  it('the ingest + writeback metering has exactly ONE writer per kind — the publish service', () => {
+    const publish = readFileSync(join(channelsRoot, 'channels.publish.ts'), 'utf8');
+    expect(drizzleWriteOn('integrationCalls').test(publish)).toBe(true);
+    // The ingest command meters through the publish service, never directly.
+    const ingest = readFileSync(join(channelsRoot, 'channels.ingest.command.ts'), 'utf8');
+    expect(ingest).toContain('this.publish.recordIngestOutcome');
+    expect(drizzleWriteOn('integrationCalls').test(ingest)).toBe(false);
+    // The writeback delivery settles through the publish service too.
+    const writeback = readFileSync(join(channelsRoot, 'channel-writeback.delivery.ts'), 'utf8');
+    expect(writeback).toContain('recordWritebackDelivery');
+    expect(drizzleWriteOn('integrationCalls').test(writeback)).toBe(false);
+  });
+
+  it('the writeback delivery subscribes the order events through EVENT_BUS and re-reads the order (RD-7)', () => {
+    const writeback = readFileSync(join(channelsRoot, 'channel-writeback.delivery.ts'), 'utf8');
+    expect(writeback).toContain('order.packed');
+    expect(writeback).toContain('order.dispatched');
+    expect(writeback).toContain('order.cancelled');
+    expect(writeback).toContain('this.eventBus.subscribe');
+    // The payload is never trusted for the channel arms — the order row is
+    // re-read via the outbound facade.
+    expect(writeback).toContain('orderForWriteback');
+  });
+
+  it('the webhook controller is registered in the api module ahead of the catch-alls (the last-siblings convention)', () => {
+    const apiModule = readFileSync(join(apiRoot, 'api.module.ts'), 'utf8');
+    const webhooks = apiModule.indexOf('WebhooksController');
+    const openApi = apiModule.indexOf('OpenApiController');
+    const notFound = apiModule.indexOf('NotFoundController');
+    expect(webhooks).toBeGreaterThan(-1);
+    expect(openApi).toBeGreaterThan(webhooks);
+    expect(notFound).toBeGreaterThan(openApi);
+  });
+
+  it('the registry’s webhook declarations carry the topic-binding header (the cross-endpoint replay stop)', () => {
+    const registry = readFileSync(join(channelsRoot, 'channel-registry.ts'), 'utf8');
+    expect(registry).toContain('topicHeader');
+    expect(registry).toContain("topicHeader: 'X-Shopify-Topic'");
   });
 });

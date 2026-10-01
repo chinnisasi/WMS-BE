@@ -3529,10 +3529,48 @@ export type IntegrationBreakerState = (typeof INTEGRATION_BREAKER_STATES)[number
 export const BACKORDER_POLICIES = ['accept', 'reject'] as const;
 export type BackorderPolicy = (typeof BACKORDER_POLICIES)[number];
 
-export const INTEGRATION_CALL_KINDS = ['availability-sync', 'credential-revoke'] as const;
+/**
+ * The integration-call vocabulary across the module's three delivery
+ * families (7.1: `availability-sync` outbound; `credential-revoke` the
+ * disconnect attempt). Story 7.2 adds `order-ingest` (the webhook ingest's
+ * per-delivery decision rows — see RD-9/meter contract) and
+ * `order-writeback` (RD-7), mirroring 0051's widened CHECK.
+ */
+export const INTEGRATION_CALL_KINDS = [
+  'availability-sync',
+  'credential-revoke',
+  'order-ingest',
+  'order-writeback',
+] as const;
 export type IntegrationCallKind = (typeof INTEGRATION_CALL_KINDS)[number];
 
-export const INTEGRATION_CALL_STATUSES = ['ok', 'failed'] as const;
+/**
+ * The call-row status. `ok`/`failed` are the transport verdicts (the sync
+ * delivery and the revoke attempt). The ingest/writeback families meter
+ * OUTCOME statuses — a refused ingest is a status, never a "failure" (RD-9:
+ * refused outcomes never move connection health, the breaker or the sync
+ * stamps), mirroring 0051's widened CHECK.
+ */
+export const INTEGRATION_CALL_STATUSES = [
+  'ok',
+  'failed',
+  // order-ingest outcome statuses (RD-9):
+  'accepted',
+  'backordered',
+  'replayed',
+  'rejected',
+  'conflict',
+  'unmapped',
+  'validation-failed',
+  'warehouse-unset',
+  'config-invalid',
+  'verification-failed',
+  'actor-unprivileged',
+  // cancellation-ingest outcome statuses (RD-8):
+  'released',
+  'ignored',
+  'cancellation-unresolved',
+] as const;
 export type IntegrationCallStatus = (typeof INTEGRATION_CALL_STATUSES)[number];
 
 export const integrations = pgTable(
@@ -3551,6 +3589,14 @@ export const integrations = pgTable(
     credentialVersion: integer('credential_version').notNull().default(1),
     /** Consumed by 7.2's ingestion acceptance (stored now, read then). */
     backorderPolicy: text('backorder_policy').notNull().default('accept'),
+    /**
+     * Story 7.2 (RD-4): the ONE ingest warehouse every webhook-created order
+     * for this connection lands on. Nullable — ingestion refuses its typed
+     * `422 ingest-warehouse-unset` until the config PUT sets it. No FK (the
+     * repo convention); an ingest naming a since-deleted warehouse refuses
+     * `422 ingest-config-invalid` (NACK — remediation is the config PUT).
+     */
+    ingestWarehouseId: uuid('ingest_warehouse_id'),
     connectedBy: uuid('connected_by').notNull(),
     rotatedAt: timestamp('rotated_at', { withTimezone: true, mode: 'string' }),
     rotatedBy: uuid('rotated_by'),

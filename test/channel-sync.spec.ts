@@ -12,6 +12,7 @@ import { BREAKER_FAILURE_THRESHOLD } from '../src/modules/channels/channels.view
 import { registerChannelAdapter, channelAdapter } from '../src/modules/channels/channel-registry';
 import { sealCredential } from '../src/modules/channels/channel-credentials';
 import { testAvailabilityArm, unconfiguredRevokeArm } from '../src/modules/channels/channel-availability-port';
+import { testWritebackArm } from '../src/modules/channels/channel-writeback-port';
 import { ChannelsSyncWorker, parseChannelsSyncPollMs, MAX_SYNC_CONNECTIONS_PER_TICK } from '../src/jobs/jobs.module';
 import { CHANNEL_AVAILABILITY_PUBLISHED_EVENT } from '../src/modules/channels/channels.facade';
 import { OUTBOX_RELAY } from '../src/shared/events/outbox.seam';
@@ -50,7 +51,13 @@ registerChannelAdapter({
   credentialFields: [{ name: 'apiKey', label: 'API key', required: true, description: 'test key' }],
   availabilityArm: testAvailabilityArm(),
   revokeArm: unconfiguredRevokeArm('test-echo'),
+  // story 7.2: the adapter interface now requires a writeback arm; this suite
+  // never exercises one, so an inert arm over an unused state map suffices.
+  orderWritebackArm: testWritebackArm(new Map()),
 });
+
+// The suite's writeback-state store (inert here — the writeback suite owns
+// the real one over its own registration).
 
 const SHOPIFY_CREDENTIAL = {
   shopDomain: 'sync-suite-store.myshopify.com',
