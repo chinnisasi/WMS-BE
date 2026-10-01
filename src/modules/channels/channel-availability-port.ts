@@ -35,7 +35,13 @@ export interface ChannelAvailabilityScope {
   readonly visibleMilli: number;
 }
 
-/** The publication the sync delivers — a FULL snapshot per cycle, never a delta. */
+/**
+ * The publication the sync delivers — a full snapshot per cycle (never a
+ * delta), UP TO the `MAX_SYNC_SCOPES_PER_PUBLISH = 200` cap:
+ * `computePublishedScopes` is a head-only slice past 200 (an over-cap
+ * tenant publishes the head scopes; the truncation is currently unmarked —
+ * tracked as a future PENDING row).
+ */
 export interface ChannelAvailabilityRequest {
   readonly tenantId: string;
   /** The integration (connection) the snapshot is for. */

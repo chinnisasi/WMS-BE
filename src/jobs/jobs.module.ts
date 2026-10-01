@@ -663,8 +663,10 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
  * cycle); the relay delivers, the delivery handler meters + breakers.
  *
  * A failing connection is logged and retried next tick (the scheduler's
- * per-scope rationale) — a poison connection must not starve the rest.
- * A reservation-store-down cycle (503 `reservation-store-unavailable` from
+ * per-scope rationale) — a poison connection must not starve the rest: any
+ * failure other than the store-down stall is logged (naming the connection
+ * and the reason) and the cycle moves on to the next connection. A
+ * reservation-store-down cycle (503 `reservation-store-unavailable` from
  * an ATP read) is a STALL, not a skip: the facade's `recordSyncStall`
  * stamps `last_error`/`last_attempt_at` so the connection's health DEGRADES
  * (visible in arm 4's list), nothing is appended (the sync never invents
@@ -764,7 +766,15 @@ export class ChannelsSyncWorker implements OnApplicationBootstrap, OnApplication
             }
             continue;
           }
-          throw error;
+          // Every OTHER failure is a per-connection skip, not a cycle
+          // abort: one poison connection must not abort the cycle and
+          // starve every later connection (the head rule). Log with the
+          // connection and the reason, move on, retry next tick.
+          this.logger.error(
+            `Channels sync failed for connection ${connectionId}: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+          continue;
         }
       }
       if (published > 0) {

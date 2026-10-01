@@ -569,12 +569,15 @@ export class ChannelsCommandService {
       } catch (err) {
         // A deterministic ceiling loss is a per-item refusal, NOT a
         // request-level 409: the target could not be granted against the
-        // pool, the old buffer stands, and the request continues.
+        // pool, the old buffer stands, and the request continues. The
+        // standing read here has NO catch-to-zero: the same store being
+        // down must propagate and fail the whole request fail-closed (503
+        // — nothing was written), never report a standing of 0 the store
+        // itself contradicts.
         if (err instanceof ProblemException && err.getStatus() === 409 && codeOf(err) === 'unavailable') {
           const standing = await this.inventory
             .channelVisibleQuantity(command.tenantId, item.warehouseId, item.skuId, command.connectionId)
-            .then((pool) => pool.buffer)
-            .catch(() => 0);
+            .then((pool) => pool.buffer);
           verdicts.push({
             index,
             warehouseId: item.warehouseId,
@@ -595,15 +598,58 @@ export class ChannelsCommandService {
       }
     }
 
-    // Phase 3 — the idempotency key's write, LAST (its own small tx; a
-    // concurrent duplicate of the same request 409s here instead of
-    // re-applying, which would also be safe).
+    // Phase 3 — the audit row + the idempotency key's write, LAST (one
+    // small tx; a concurrent duplicate of the same request 409s on the key
+    // insert instead of re-applying, which would also be safe). The audit
+    // rides here like every sibling command's settle tail (the buffers PUT
+    // moves real ATP, so it is audited like them).
+    const compensated: Awaited<ReturnType<InventoryFacade['standingBuffersByOwnerInTx']>> = [];
+    const result: SetConnectionBuffersResult = {
+      connectionId: command.connectionId,
+      verdicts,
+    };
     try {
-      const result: SetConnectionBuffersResult = {
-        connectionId: command.connectionId,
-        verdicts,
-      };
       await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+        // A disconnect may have committed between Phase 1 and the per-item
+        // transactions (which never re-check the connection), leaving
+        // owner-scoped `held` rows for a deleted owner no surface can ever
+        // release. This compensator exists because the per-item txs cannot
+        // be serialized against the disconnect's delete — it releases
+        // whatever the disconnect left behind, exactly the way disconnect
+        // itself does (release-in-tx here, counter mirrors after commit).
+        const stillThere = await tx
+          .select({ id: integrations.id })
+          .from(integrations)
+          .where(
+            and(
+              eq(integrations.id, command.connectionId),
+              eq(integrations.tenantId, command.tenantId),
+            ),
+          )
+          .limit(1);
+        if (stillThere[0] === undefined) {
+          const orphans = await this.inventory.standingBuffersByOwnerInTx(
+            tx,
+            command.tenantId,
+            command.connectionId,
+          );
+          for (const buffer of orphans) {
+            await this.inventory.releaseReservationInTx(tx, command.tenantId, buffer.id);
+          }
+          compensated.push(...orphans);
+        }
+
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'channels.buffers_set',
+          targetType: 'channel_connection',
+          targetId: command.connectionId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+
         await tx.insert(idempotencyKeys).values({
           id: uuidv7(),
           tenantId: command.tenantId,
@@ -612,13 +658,32 @@ export class ChannelsCommandService {
           responseSnapshot: { result },
         });
       });
-      return result;
     } catch (err) {
+      // No mirror on this path: the failed tx rolled the compensator's
+      // releases back with it, so there is nothing committed to mirror.
       if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
         throw concurrentIdempotency();
       }
       throw err;
     }
+    // Post-commit mirror for any compensator release — the same
+    // never-throws shape disconnect uses (a lost mirror fails safe: the
+    // parity pass heals; log, never rethrow).
+    for (const buffer of compensated) {
+      try {
+        await this.inventory.restoreReservedUnits(
+          command.tenantId,
+          buffer.warehouseId,
+          buffer.skuId,
+          buffer.quantity,
+        );
+      } catch (err) {
+        this.logger.error(
+          `post-commit counter restore for compensator release of buffer ${buffer.id} failed (parity pass heals): ${String(err)}`,
+        );
+      }
+    }
+    return result;
   }
 
   /**
@@ -637,7 +702,13 @@ export class ChannelsCommandService {
     command: DisconnectChannelCommand,
     idempotencyKey: string,
   ): Promise<void> {
+    // The arm discriminator keeps this hash from colliding with
+    // `retryConnection`'s (an identical `{tenantId, connectionId}` shape):
+    // one Idempotency-Key reused ACROSS the two arms must 422
+    // `idempotency-key-reuse`, never settle the second arm from the
+    // first's key row.
     const payloadHash = hashCommandPayload({
+      arm: 'disconnect',
       tenantId: command.tenantId,
       connectionId: command.connectionId,
     });
@@ -721,6 +792,21 @@ export class ChannelsCommandService {
     const released = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       const locked = await this.lockConnection(tx, command.tenantId, command.connectionId);
       if (locked === null) {
+        // The row left between the phases — but a CONCURRENT duplicate of
+        // this same request may have been the one that deleted it and
+        // settled the key. Mirror `retryConnection`'s double-replay shape:
+        // a second replay answers settled for that loser (an empty
+        // `released` — the post-commit mirror loop skips), and only a
+        // genuinely absent connection under an unsettled key is the 404.
+        const settled = await this.replayDisconnect(
+          tx,
+          command.tenantId,
+          idempotencyKey,
+          payloadHash,
+        );
+        if (settled) {
+          return [];
+        }
         throw channelConnectionNotFound();
       }
       // Every standing buffer this connection holds, released through the
@@ -816,7 +902,13 @@ export class ChannelsCommandService {
     command: RetryConnectionCommand,
     idempotencyKey: string,
   ): Promise<ChannelConnectionView> {
+    // The arm discriminator keeps this hash from colliding with
+    // `disconnect`'s (an identical `{tenantId, connectionId}` shape): one
+    // Idempotency-Key reused ACROSS the two arms must 422
+    // `idempotency-key-reuse`, never settle the second arm from the
+    // first's key row.
     const payloadHash = hashCommandPayload({
+      arm: 'retry',
       tenantId: command.tenantId,
       connectionId: command.connectionId,
     });

@@ -362,9 +362,11 @@ export class CarrierCommandService {
    * `POST .../connections/{connectionId}/disconnect` — a hard DELETE. AD-15
    * says disconnect deletes, and a status flip would leave sealed secret
    * material at rest after the operator asked for it to be gone. The verb
-   * shape follows `devices/{id}/revoke` (the repo has no `@Delete` route
-   * anywhere — every destructive verb is a POST sub-resource carrying an
-   * `Idempotency-Key`); the effect follows `po.command.ts`'s hard delete.
+   * shape follows `devices/{id}/revoke` (this command predates the repo's
+   * first true `@Delete` route — replenishment's story 6-1, then story 7-1's
+   * channels DELETE — so every destructive verb here is still a POST
+   * sub-resource carrying an `Idempotency-Key`); the effect follows
+   * `po.command.ts`'s hard delete.
    *
    * A repeat under a NEW key is a 404: the row is gone, so there is nothing
    * to disconnect. A repeat under the SAME key replays the snapshot.

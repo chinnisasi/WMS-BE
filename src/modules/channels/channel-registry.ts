@@ -10,7 +10,10 @@
  * The registry is an import-time `Map` populated by
  * `registerChannelAdapter` (throwing on a duplicate code), the
  * `ledger-registry`/`carrier-registry` convention for a fixed set of named
- * arms — and ADDITIVE: a new channel is one registration and no migration.
+ * arms — and ADDITIVE at the registry itself: a new channel is one
+ * registration here, plus the FE credential-field mirror and a migration
+ * widening the `integrations.provider` CHECK's IN-list (that migration is
+ * not optional — see `docs/design/modules/channels.md`).
  *
  * The arms (this file's runtime edge) live in `channel-availability-port.ts`
  * and are registered type-only here, so the import graph stays cycle-free

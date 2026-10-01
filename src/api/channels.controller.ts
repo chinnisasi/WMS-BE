@@ -55,7 +55,8 @@ const IDEMPOTENCY_HEADER = [
  *
  * `connect` is a POST with an Idempotency-Key; `credentials`, `config` and
  * `buffers` are PUTs; `disconnect` is the story's frozen `DELETE` arm
- * (204 — the first Delete route in the repo: the spec's I/O matrix names it,
+ * (204 — the repo's second Delete route after replenishment's story 6-1
+ * route: the spec's I/O matrix names it,
  * so the carriers module's POST-sub-resource convention yields to it — the
  * idempotency key stays required, so a crash can't double-revoke) and
  * `retry` is a POST. **No route on this controller can return credential
@@ -243,6 +244,8 @@ export class ChannelsController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks channel.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No such connection in this tenant, or it was already disconnected (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The same Idempotency-Key is being processed concurrently (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'connectionId', format: 'uuid' })
   async disconnect(

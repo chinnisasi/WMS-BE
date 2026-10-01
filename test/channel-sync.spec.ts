@@ -629,4 +629,78 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
     expect(channelAdapter('amazon-in')).toBeDefined();
     expect(channelAdapter('flipkart')).toBeDefined();
   });
+
+  it('delivery, malformed payload: the row ACK-deletes with NO meter row and NO stamp/breaker change (the ack-without-effect arm)', async () => {
+    await clearOutbox();
+    const beforeStamps = await integrationRow(echoId);
+    const beforeCalls = (await availabilityRows()).filter((r) => r.integrationId === echoId).length;
+
+    // Seed the outbox row by hand: a VALID event type riding a MALFORMED
+    // publication payload (`scopes` missing — a publisher-bug shape the
+    // relay's retry can never fix).
+    const seed = await sqlHandle();
+    try {
+      await seed`
+        insert into outbox_messages (id, tenant_id, type, payload, occurred_at)
+        values (${uuidv7()}, ${tenantId}, ${CHANNEL_AVAILABILITY_PUBLISHED_EVENT},
+                ${seed.json({
+                  connectionId: echoId,
+                  provider: 'test-echo',
+                  publishedAt: new Date().toISOString(),
+                  // `scopes` deliberately absent
+                })}, now())
+      `;
+    } finally {
+      await seed.end();
+    }
+
+    await forceDue();
+    await relay.drain(1);
+
+    // The handler acked: the row is gone (not retried, not quarantined).
+    expect(await outboxRows(echoId)).toEqual([]);
+    // The meter saw nothing, and the connection's stamps/breaker stand
+    // exactly where they were.
+    expect((await availabilityRows()).filter((r) => r.integrationId === echoId)).toHaveLength(beforeCalls);
+    expect(await integrationRow(echoId)).toEqual(beforeStamps);
+  });
+
+  it('delivery, connection left mid-retry: the row ACK-deletes with NO meter row (the deleted-connection arm)', async () => {
+    await clearOutbox();
+    const beforeCalls = (await availabilityRows()).filter((r) => r.integrationId === echoId).length;
+
+    // The echo connection is this suite's last test's spare: deleted BEFORE
+    // its publication delivers (a SECOND test-echo row is impossible — one
+    // connection per provider per tenant — so the departing row is echo's).
+    const setup = await sqlHandle();
+    try {
+      await setup`delete from integrations where tenant_id = ${tenantId} and id = ${echoId}`;
+    } finally {
+      await setup.end();
+    }
+
+    // A VALID publication (the shape decodes fine) for the now-gone row.
+    const seed = await sqlHandle();
+    try {
+      await seed`
+        insert into outbox_messages (id, tenant_id, type, payload, occurred_at)
+        values (${uuidv7()}, ${tenantId}, ${CHANNEL_AVAILABILITY_PUBLISHED_EVENT},
+                ${seed.json({
+                  connectionId: echoId,
+                  provider: 'test-echo',
+                  publishedAt: new Date().toISOString(),
+                  scopes: [],
+                })}, now())
+      `;
+    } finally {
+      await seed.end();
+    }
+
+    await forceDue();
+    await relay.drain(1);
+
+    // ACK-delete, and no meter row ever appeared for the departed owner.
+    expect(await outboxRows(echoId)).toEqual([]);
+    expect((await availabilityRows()).filter((r) => r.integrationId === echoId)).toHaveLength(beforeCalls);
+  });
 });

@@ -25,8 +25,11 @@ import { ReservationService } from './reservation.service';
  * `getMemberRoleIn`, `assertWarehouseInTenant`) are the shared
  * command-entry pattern's file-level functions.
  *
- * Outbox delivery is split to its own spec (deferred-work.md) — the
- * `LoggingEventBus` from SharedModule stays the delivery seam untouched.
+ * Outbox delivery is split to its own spec (deferred-work.md); since
+ * story 7-1's provider swap the delivery seam is SharedModule's
+ * `RoutedEventBus` (the `LoggingEventBus` provider is retired — this
+ * module binds only the EVENT_BUS symbol and does not care which
+ * implementation sits behind it).
  */
 @Module({
   imports: [SharedModule, ValkeyModule],
