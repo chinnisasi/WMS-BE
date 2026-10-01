@@ -22,6 +22,8 @@ import { CarriersModule } from '../modules/carriers/carriers.module';
 import { CatalogModule } from '../modules/catalog/catalog.module';
 import { TenancyModule } from '../modules/tenancy/tenancy.module';
 import { MovementsModule } from '../modules/movements/movements.module';
+import { ReplenishmentModule } from '../modules/replenishment/replenishment.module';
+import { ReplenishmentController } from './replenishment.controller';
 
 /**
  * api shell: the only HTTP surface of the monolith. Story 1.1 exposes
@@ -58,7 +60,7 @@ import { MovementsModule } from '../modules/movements/movements.module';
  * response DTO, so the shell has nothing to redact.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, MovementsModule],
+  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, MovementsModule, ReplenishmentModule],
   controllers: [
     HealthController,
     EchoController,
@@ -77,6 +79,11 @@ import { MovementsModule } from '../modules/movements/movements.module';
     // the same shape: `MovementsModule` is a spine-singleton already imported
     // by the root; every mutation goes through `MovementsFacade`.
     MovementsController,
+    // Story 6-1 — the replenishment surface (reorder-policy overrides, the
+    // breach queue, the suggested-PO queue + submit) rides the same shape:
+    // `ReplenishmentModule` is a spine-singleton already imported by the
+    // root; every mutation goes through `ReplenishmentFacade`.
+    ReplenishmentController,
     OpenApiController,
     NotFoundController,
   ],

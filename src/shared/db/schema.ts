@@ -3182,3 +3182,170 @@ export const rejectedOps = pgTable(
 );
 
 export type RejectedOp = typeof rejectedOps.$inferSelect;
+
+/**
+ * ── Replenishment module (story 6.1) ──────────────────────────────────────
+ *
+ * Reorder points, breach alerts, and suggested POs (FR-22). The replenishment
+ * module is a CONSUMER of derived state, never a second balance book: breach
+ * detection reads ATP through the inventory facade and mints these rows; the
+ * real PO is written only by the human-triggered submit riding the inbound
+ * PO-creation path.
+ *
+ * `reorder_policies` — the per-warehouse override on top of the SKU columns'
+ * tenant-wide defaults (`skus.reorder_point` / `reorder_qty`, editable in the
+ * SKU table; zero there disables breach evaluation unless a policy row
+ * overrides the warehouse). Effective point = policy row ?? SKU column.
+ *
+ * `reorder_breaches` — one alert row per breach EVENT: a re-breach opens a
+ * NEW row (the partial unique pins exactly one ACTIVE breach per scope);
+ * `point_milli` / `atp_milli` are frozen at detection, so the alert never
+ * re-reads stock. The breach instant lives in the shared `created_at`
+ * (the event payload and audit trail name it `breachAt`); `status` is the
+ * lifecycle `open → recovered | actioned | dismissed` — all three terminal.
+ * No event on recovery (a surface-visible state change only).
+ *
+ * `suggested_pos` — the draft PO artifact: minted exactly when a breach
+ * OPENS (`draft` → editable vendor/quantity on the surface), submitted only
+ * by the human-triggered submit command (`submitted`, `submitted_po_id`
+ * naming the real PO), or dismissed. A standing draft is system-fresh: a
+ * later re-breach REPOINTS it (the fresh breach's vendor/quantity replace
+ * whatever a planner had left on it). NO FK anywhere (repo convention),
+ * scope-validated in the command transaction.
+ *
+ * The status CHECKs (both vocabularies below), the positive-point CHECKs on
+ * the milli columns, and the fail-closed RLS policies live **only in the
+ * migration SQL** (0048 — drizzle-kit generate is blind to CHECKs and RLS,
+ * and the snapshot records `isRLSEnabled: false`, so the next generate must
+ * not re-emit any of them). The partial uniques are drizzle-declared here
+ * (the 0009-0011 snapshots record `where` clauses fine); their CHECK
+ * companions read columns declared below.
+ */
+export const REPLENISHMENT_BREACH_STATUSES = ['open', 'recovered', 'actioned', 'dismissed'] as const;
+export type ReplenishmentBreachStatus = (typeof REPLENISHMENT_BREACH_STATUSES)[number];
+
+export const SUGGESTED_PO_STATUSES = ['draft', 'submitted', 'dismissed'] as const;
+export type SuggestedPoStatus = (typeof SUGGESTED_PO_STATUSES)[number];
+
+export const reorderPolicies = pgTable(
+  'reorder_policies',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** Milli-units (AD-9 / 10.1) — strictly positive (CHECK in 0048). */
+    reorderPointMilli: bigint('reorder_point_milli', { mode: 'number' }).notNull(),
+    reorderQtyMilli: bigint('reorder_qty_milli', { mode: 'number' }).notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One override per (warehouse, sku); the SKU columns are the fallback.
+    uniqueIndex('reorder_policies_tenant_warehouse_sku_unique').on(
+      table.tenantId,
+      table.warehouseId,
+      table.skuId,
+    ),
+    // The keyset list reads (warehouse-filtered + unfiltered).
+    index('reorder_policies_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    index('reorder_policies_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type ReorderPolicy = typeof reorderPolicies.$inferSelect;
+
+export const reorderBreaches = pgTable(
+  'reorder_breaches',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** Exactly `open` at detection — the transitions own every later state. */
+    status: text('status').notNull().default('open'),
+    /** Frozen at detection — the alert never re-reads stock. */
+    pointMilli: bigint('point_milli', { mode: 'number' }).notNull(),
+    atpMilli: bigint('atp_milli', { mode: 'number' }).notNull(),
+    /** The resolver's user id (null while open and on worker recovery). */
+    resolvedBy: uuid('resolved_by'),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One ACTIVE breach per (tenant, warehouse, sku): a re-breach opens a NEW
+    // row because the unique covers only the open state (the reservations/
+    // quarantines open-scope precedent).
+    uniqueIndex('reorder_breaches_open_tenant_warehouse_sku_unique')
+      .on(table.tenantId, table.warehouseId, table.skuId)
+      .where(sql`status = 'open'`),
+    // The breach list's keyset read (status filter first — the tabs).
+    index('reorder_breaches_tenant_status_created_at_id_idx').on(
+      table.tenantId,
+      table.status,
+      table.createdAt,
+      table.id,
+    ),
+    index('reorder_breaches_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type ReorderBreach = typeof reorderBreaches.$inferSelect;
+
+export const suggestedPos = pgTable(
+  'suggested_pos',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** The breach whose opening minted the draft (bare uuid, no FK). */
+    breachId: uuid('breach_id').notNull(),
+    /** Null when the tenant carries no default vendor — submit refuses (400). */
+    vendorId: uuid('vendor_id'),
+    /** Milli-units — the fillable quantity (default qty or the recovery gap). */
+    quantityMilli: bigint('quantity_milli', { mode: 'number' }).notNull(),
+    /** Exactly `draft` at mint — submit/dismiss own every later state. */
+    status: text('status').notNull().default('draft'),
+    /** The real PO's id once submitted (the inbound path minted it). */
+    submittedPoId: uuid('submitted_po_id'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One DRAFT per (tenant, warehouse, sku) — the partial unique absorbs the
+    // re-breach repoint (the draft is re-pointed, never duplicated).
+    uniqueIndex('suggested_pos_draft_tenant_warehouse_sku_unique')
+      .on(table.tenantId, table.warehouseId, table.skuId)
+      .where(sql`status = 'draft'`),
+    // The drafts queue's keyset read (status filter first — the tabs).
+    index('suggested_pos_tenant_status_created_at_id_idx').on(
+      table.tenantId,
+      table.status,
+      table.createdAt,
+      table.id,
+    ),
+    index('suggested_pos_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type SuggestedPo = typeof suggestedPos.$inferSelect;

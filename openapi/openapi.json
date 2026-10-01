@@ -12032,6 +12032,854 @@
           "movements"
         ]
       }
+    },
+    "/tenants/{tenantId}/replenishment/policies": {
+      "put": {
+        "operationId": "ReplenishmentController_upsertReorderPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertReorderPolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The override row (created or overwritten — the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReorderPolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a non-positive / non-integer reorderPoint or reorderQty (validation-failed, naming the field)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks replenishment.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse or SKU does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent upsert of the same (warehouse, sku) (conflict), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Upserts one per-warehouse reorder-point override (replenishment.manage) — last-write-wins",
+        "tags": [
+          "replenishment"
+        ]
+      },
+      "get": {
+        "operationId": "ReplenishmentController_listReorderPolicies",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Only one warehouse's policies",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "skuId",
+            "required": false,
+            "in": "query",
+            "description": "Only one SKU's policies",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReorderPolicyListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor, a non-uuid warehouseId/skuId filter, or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A filtered warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's reorder-point overrides, warehouse/sku-filterable (keyset cursor pagination — open to any member)",
+        "tags": [
+          "replenishment"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/replenishment/policies/{policyId}": {
+      "delete": {
+        "operationId": "ReplenishmentController_deleteReorderPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "policyId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The deleted override row (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReorderPolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed policyId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks replenishment.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No override with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Deletes one per-warehouse reorder-point override (replenishment.manage) — the SKU-column default resumes",
+        "tags": [
+          "replenishment"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/replenishment/breaches": {
+      "get": {
+        "operationId": "ReplenishmentController_listBreaches",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Only breaches of one status (the queue tabs)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "open",
+                "recovered",
+                "actioned",
+                "dismissed"
+              ]
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Only one warehouse's breaches",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BreachListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed status, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A filtered warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's reorder breaches (the alert queue), status/warehouse-filterable (keyset cursor pagination — open to any member)",
+        "tags": [
+          "replenishment"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/replenishment/breaches/{breachId}/dismiss": {
+      "post": {
+        "operationId": "ReplenishmentController_dismissBreach",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "breachId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The dismissed breach row (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BreachResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed breachId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks replenishment.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No breach with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The breach is not open (breach-not-open, naming the status), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Dismisses an OPEN breach (replenishment.manage) — its suggested-PO draft stays a draft",
+        "tags": [
+          "replenishment"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/replenishment/suggested-pos": {
+      "get": {
+        "operationId": "ReplenishmentController_listSuggestedPos",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Only suggested POs of one status (the queue tabs)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "draft",
+                "submitted",
+                "dismissed"
+              ]
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Only one warehouse's drafts",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuggestedPoListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed status, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A filtered warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's suggested POs (the draft queue), status/warehouse-filterable (keyset cursor pagination — open to any member)",
+        "tags": [
+          "replenishment"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/replenishment/suggested-pos/{draftId}/submit": {
+      "post": {
+        "operationId": "ReplenishmentController_submitSuggestedPo",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "draftId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitSuggestedPoDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The draft → submitted, and the FLAT PO snapshot — body.purchaseOrder IS the minted PO ({id, code, status, vendorId, warehouseId, lines…})",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubmitSuggestedPoResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed draftId, a non-positive/non-integer quantityMilli (validation-failed), or no vendor on the draft or edits (suggested-po-vendor-required)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks replenishment.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No draft with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The draft is not a draft (suggested-po-submitted), the PO code is already in use (conflict), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Submits a DRAFT suggested PO as a REAL purchase order (replenishment.manage; the mint re-executes under po.manage) — vendor/quantity edits optional",
+        "tags": [
+          "replenishment"
+        ]
+      }
     }
   },
   "info": {
@@ -20998,6 +21846,310 @@
           "transfer",
           "lines",
           "events"
+        ]
+      },
+      "UpsertReorderPolicyDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reorderPoint": {
+            "type": "number",
+            "description": "Reorder point in MILLI-units (base UoM × 10³) — the ATP level below which a breach opens. Strictly positive; the per-warehouse override replaces the SKU-column default.",
+            "minimum": 1,
+            "maximum": 9007199254740000
+          },
+          "reorderQty": {
+            "type": "number",
+            "description": "Reorder quantity in MILLI-units (base UoM × 10³) — the draft PO's default suggested quantity. Strictly positive.",
+            "minimum": 1,
+            "maximum": 9007199254740000
+          }
+        },
+        "required": [
+          "warehouseId",
+          "skuId",
+          "reorderPoint",
+          "reorderQty"
+        ]
+      },
+      "ReorderPolicyDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reorderPoint": {
+            "type": "number",
+            "description": "Reorder point in milli-units (base UoM × 10³)"
+          },
+          "reorderQty": {
+            "type": "number",
+            "description": "Reorder quantity in milli-units (base UoM × 10³)"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last-write time"
+          }
+        },
+        "required": [
+          "id",
+          "warehouseId",
+          "skuId",
+          "reorderPoint",
+          "reorderQty",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "ReorderPolicyResponse": {
+        "type": "object",
+        "properties": {
+          "policy": {
+            "$ref": "#/components/schemas/ReorderPolicyDto"
+          }
+        },
+        "required": [
+          "policy"
+        ]
+      },
+      "ReorderPolicyListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReorderPolicyDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "BreachDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "recovered",
+              "actioned",
+              "dismissed"
+            ]
+          },
+          "pointMilli": {
+            "type": "number",
+            "description": "The reorder point FROZEN at detection, milli-units"
+          },
+          "atpMilli": {
+            "type": "number",
+            "description": "The ATP FROZEN at detection, milli-units"
+          },
+          "breachAt": {
+            "type": "string",
+            "description": "The breach instant (ISO-8601 UTC) — the row's creation time"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Resolution instant, null while open"
+          },
+          "resolvedBy": {
+            "type": "string",
+            "nullable": true,
+            "description": "The resolver's user id, null while open (and on worker recovery)"
+          }
+        },
+        "required": [
+          "id",
+          "warehouseId",
+          "skuId",
+          "status",
+          "pointMilli",
+          "atpMilli",
+          "breachAt",
+          "resolvedAt",
+          "resolvedBy"
+        ]
+      },
+      "BreachListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BreachDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "BreachResponse": {
+        "type": "object",
+        "properties": {
+          "breach": {
+            "$ref": "#/components/schemas/BreachDto"
+          }
+        },
+        "required": [
+          "breach"
+        ]
+      },
+      "SuggestedPoDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "breachId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The breach whose opening minted the draft"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "vendorId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The suggested vendor, null when the tenant carried no default"
+          },
+          "quantityMilli": {
+            "type": "number",
+            "description": "The suggested quantity in milli-units (base UoM × 10³)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "submitted",
+              "dismissed"
+            ]
+          },
+          "submittedPoId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The real PO's id once submitted, null while a draft"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last-write time"
+          }
+        },
+        "required": [
+          "id",
+          "breachId",
+          "warehouseId",
+          "skuId",
+          "vendorId",
+          "quantityMilli",
+          "status",
+          "submittedPoId",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "SuggestedPoListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SuggestedPoDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "SubmitSuggestedPoDto": {
+        "type": "object",
+        "properties": {
+          "vendorId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The vendor to purchase from — omitted keeps the draft's (a null-vendor draft refuses without it)"
+          },
+          "quantityMilli": {
+            "type": "number",
+            "description": "The quantity to order in MILLI-units (strictly positive; positive-integer-milli bound). Omitted keeps the draft's quantity.",
+            "minimum": 1,
+            "maximum": 9007199254740000
+          }
+        }
+      },
+      "SubmitSuggestedPoResponse": {
+        "type": "object",
+        "properties": {
+          "suggestedPoId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "purchaseOrder": {
+            "$ref": "#/components/schemas/PurchaseOrderDto"
+          }
+        },
+        "required": [
+          "suggestedPoId",
+          "purchaseOrder"
         ]
       }
     }

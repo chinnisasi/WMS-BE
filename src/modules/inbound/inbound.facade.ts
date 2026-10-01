@@ -4,6 +4,7 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { purchaseOrderLines, purchaseOrders, vendors } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
@@ -120,6 +121,49 @@ export class InboundFacade {
     idempotencyKey: string,
   ): Promise<PurchaseOrderSnapshot> {
     return this.poCommand.create(command, idempotencyKey);
+  }
+
+  /**
+   * Story 6.1 — the PO mint, on the CALLER's transaction (the
+   * `mintRecountTaskInTx` house shape): the replenishment submit arm holds
+   * its own transaction across draft/breach/PO/audit writes, and the mint
+   * must happen on that SAME pooled connection — a nested transaction while
+   * one is held is the documented pool-deadlock shape. The command core
+   * (`PurchaseOrderCommand.createInTx`) carries every invariant unchanged —
+   * the fresh `po.manage` role read, the replay lookup, the master-data
+   * asserts, the outbox append, its idempotency key LAST — so the mint on
+   * this path answers the same 404/409/422 arms the standalone create does.
+   * The caller passes the payload hash it computed for the mint command
+   * (fingerprinted before its own transaction opened).
+   */
+  async createPurchaseOrderInTx(
+    tx: TenantTx,
+    command: CreatePoCommand,
+    idempotencyKey: string,
+    payloadHash: string,
+  ): Promise<PurchaseOrderSnapshot> {
+    return this.poCommand.createInTx(tx, command, idempotencyKey, payloadHash);
+  }
+
+  /**
+   * Story 6.1 — the deterministic default-vendor read: the tenant's
+   * `is_default` vendor with the smallest `(created_at, id)` — the pick is
+   * stamped so two sweeps over the same vendor corpus draft identically
+   * (several defaults are possible; the `vendors` schema keeps no
+   * single-default unique). Null when the tenant carries none — the draft
+   * still mints with `vendorId: null` and the human submit names one.
+   */
+  async findDefaultVendorInTx(
+    tx: TenantTx,
+    tenantId: string,
+  ): Promise<{ id: string; code: string; name: string } | null> {
+    const rows = await tx
+      .select({ id: vendors.id, code: vendors.code, name: vendors.name })
+      .from(vendors)
+      .where(and(eq(vendors.tenantId, tenantId), eq(vendors.isDefault, true)))
+      .orderBy(asc(vendors.createdAt), asc(vendors.id))
+      .limit(1);
+    return rows[0] ?? null;
   }
 
   async amendPurchaseOrder(

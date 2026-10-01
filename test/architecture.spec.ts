@@ -958,3 +958,103 @@ describe('architecture: the transfer aggregate is movements-module-owned (story 
     }
   });
 });
+
+describe('architecture: the replenishment planning state is replenishment-module-owned (story 6-1)', () => {
+  /**
+   * Story 6-1 populates the replenishment spine (`reorder_policies`,
+   * `reorder_breaches`, `suggested_pos`) — a CONSUMER of derived state, never
+   * a second balance book: ATP is read only through `InventoryFacade.atp`
+   * (the sweep never touches a stock table), the tenant-wide SKU defaults
+   * only through `CatalogFacade`, and the real PO only through the inbound
+   * facade's in-tx mint (the submit arm — inbound stays the ONLY writer of
+   * `purchase_orders`). Every other module reaches it through
+   * `ReplenishmentFacade`.
+   */
+  const REPLENISHMENT_TABLES = ['reorderPolicies', 'reorderBreaches', 'suggestedPos'] as const;
+  const RAW_REPLENISHMENT_TABLES = 'reorder_policies|reorder_breaches|suggested_pos';
+  const replenishmentRoot = join(SRC_ROOT, 'modules', 'replenishment');
+
+  it('no replenishment-table write happens outside the replenishment module', () => {
+    // The jobs shell's scope enumeration is a raw SELECT — reads are not
+    // writes and are allowed anywhere BYPASSRLS can honestly read them.
+    const outside = files.filter((file) => !file.path.startsWith(replenishmentRoot));
+    const offenders: string[] = [];
+    for (const file of outside) {
+      for (const pattern of [
+        ...REPLENISHMENT_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_REPLENISHMENT_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) {
+          offenders.push(`${file.path}: /${pattern.source}/`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no other module reaches into the replenishment module past the facade', () => {
+    // The mirror of the movements guard (both import forms; the allowed
+    // suffixes must END the specifier). The api shell's DTO/carrier classes
+    // are `replenishment.dto` — a whitelist suffix like every sibling.
+    const replenishmentInternals = new RegExp(
+      '(?:modules/replenishment|\\.\\./replenishment)/' +
+        '(?!replenishment\\.(facade|module|dto)[\'"])',
+    );
+    const siblingModules = files.filter(
+      (file) =>
+        file.path.startsWith(join(SRC_ROOT, 'modules')) &&
+        !file.path.startsWith(replenishmentRoot) &&
+        /(?:modules\/replenishment|\.\.\/replenishment)\//.test(file.source),
+    );
+    for (const reaching of [
+      "from '../replenishment/replenishment.command'",
+      "from '../replenishment/replenishment.sweep'",
+      "from 'src/modules/replenishment/replenishment.command'",
+    ]) {
+      expect(replenishmentInternals.test(reaching)).toBe(true);
+    }
+    for (const allowed of [
+      "from '../replenishment/replenishment.facade'",
+      "from '../replenishment/replenishment.module'",
+      "from '../replenishment/replenishment.dto'",
+      "from 'src/modules/replenishment/replenishment.facade'",
+    ]) {
+      expect(replenishmentInternals.test(allowed)).toBe(false);
+    }
+    const offenders: string[] = [];
+    for (const file of siblingModules) {
+      if (replenishmentInternals.test(file.source)) {
+        offenders.push(file.path);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the replenishment module writes only its own tables and reads stock/state only through facades (the test is meaningful)', () => {
+    // The aggregate's writes live in the command (policies, idempotency) and
+    // the sweep (breaches, drafts) — and nowhere else.
+    const command = readFileSync(join(replenishmentRoot, 'replenishment.command.ts'), 'utf8');
+    expect(drizzleWriteOn('reorderPolicies').test(command)).toBe(true);
+    expect(drizzleWriteOn('suggestedPos').test(command)).toBe(true);
+    const sweep = readFileSync(join(replenishmentRoot, 'replenishment.sweep.ts'), 'utf8');
+    expect(drizzleWriteOn('reorderBreaches').test(sweep)).toBe(true);
+    expect(drizzleWriteOn('suggestedPos').test(sweep)).toBe(true);
+    // No second quantity-mutation path: the module writes NO stock/ledger
+    // table, and the ATP numbers come from the inventory facade only.
+    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'binStateEpochs', 'reservations', 'purchaseOrders', 'skus', 'vendors'] as const) {
+      expect(drizzleWriteOn(table).test(command)).toBe(false);
+      expect(drizzleWriteOn(table).test(sweep)).toBe(false);
+      expect(drizzleWriteOn(table).test(replenishmentFacadeSource())).toBe(false);
+    }
+    expect(sweep).toContain('this.inventory.atp');
+    // The facade is the seam: read-only over the aggregate's tables (the
+    // writes ride the command/sweep), passthroughs only.
+    for (const table of REPLENISHMENT_TABLES) {
+      expect(drizzleWriteOn(table).test(replenishmentFacadeSource())).toBe(false);
+    }
+  });
+
+  function replenishmentFacadeSource(): string {
+    return readFileSync(join(replenishmentRoot, 'replenishment.facade.ts'), 'utf8');
+  }
+});

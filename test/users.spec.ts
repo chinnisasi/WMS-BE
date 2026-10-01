@@ -848,8 +848,11 @@ describe('users, roles, and permission gating (e2e)', () => {
     // (the Count inbox tab's op, floor holds it); story 5-4 (CHECKPOINT 1,
     // ratified 2026-09-29) grows it to 31 with `variances.resolve` — owner +
     // ops_manager (the over-threshold guard is a command check on the frozen
-    // threshold stamp, not a capability split).
-    expect([...CAPABILITIES]).toHaveLength(31);
+    // threshold stamp, not a capability split); story 6-1 grows it to 32 with
+    // `replenishment.manage` — owner + ops_manager (the planning set: the
+    // policy writes, breach dismissal, and suggested-PO submit; reads are
+    // never gated).
+    expect([...CAPABILITIES]).toHaveLength(32);
     expect(CAPABILITIES).toContain('secure.move');
     expect(secureMoveHolders).toEqual(['owner', 'ops_manager']);
     expect(CAPABILITIES).toContain('adjustments.approve');
@@ -872,6 +875,22 @@ describe('users, roles, and permission gating (e2e)', () => {
     expect(ROLE_CAPABILITIES.ops_manager.has('variances.resolve')).toBe(true);
     expect(ROLE_CAPABILITIES.operator.has('variances.resolve')).toBe(false);
     expect(ROLE_CAPABILITIES.accountant.has('variances.resolve')).toBe(false);
+    expect(CAPABILITIES).toContain('replenishment.manage');
+    expect(ROLE_CAPABILITIES.owner.has('replenishment.manage')).toBe(true);
+    expect(ROLE_CAPABILITIES.ops_manager.has('replenishment.manage')).toBe(true);
+    expect(ROLE_CAPABILITIES.operator.has('replenishment.manage')).toBe(false);
+    expect(ROLE_CAPABILITIES.accountant.has('replenishment.manage')).toBe(false);
+    // The submit arm's inner mint re-executes PO creation under `po.manage`
+    // on the same transaction — every replenishment holder MUST hold
+    // `po.manage` too, or the mint's role assert would 403 a legitimate
+    // submit (the holder sets travel together by construction; this pin is
+    // the proof they stay together).
+    const replenishmentHolders = roles.filter((role) =>
+      ROLE_CAPABILITIES[role].has('replenishment.manage'),
+    );
+    for (const role of replenishmentHolders) {
+      expect(ROLE_CAPABILITIES[role].has('po.manage')).toBe(true);
+    }
     expect(ROLE_CAPABILITIES.operator.has('putaway.execute')).toBe(true);
     expect(ROLE_CAPABILITIES.operator.has('picks.execute')).toBe(true);
     expect(ROLE_CAPABILITIES.operator.has('excursion.record')).toBe(true);

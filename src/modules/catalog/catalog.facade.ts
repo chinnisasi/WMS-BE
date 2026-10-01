@@ -89,6 +89,20 @@ export interface EnsureBatchInput {
   readonly expiryDate?: string | undefined;
 }
 
+/**
+ * The reorder defaults one SKU carries (story 6.1) — the tenant-wide fallback
+ * the replenishment module breathes through this facade.
+ */
+export interface SkuReorderDefaults {
+  readonly id: string;
+  readonly code: string;
+  readonly name: string;
+  readonly uom: string;
+  /** Milli-units (AD-9 / 10.1) — 0 means "no tenant-wide default". */
+  readonly reorderPoint: number;
+  readonly reorderQty: number;
+}
+
 /** The hazard segregation matrix as the story 12-7 admin read carries it. */
 export interface CatalogSegregationMatrix {
   readonly classes: readonly HazardClass[];
@@ -222,6 +236,44 @@ export class CatalogFacade {
       classes: [...HAZARD_CLASSES],
       incompatible: enumerateIncompatiblePairs().map((pair) => ({ ...pair })),
     };
+  }
+
+  /**
+   * Story 6.1 — the tenant's SKUs with their reorder defaults (milli-units),
+   * inside the CALLER's transaction (the `getBatchesForSkusInTx` shape): the
+   * replenishment sweep composes these beside its own policy rows in ONE
+   * transaction, so the effective points it commits are the catalog it saw.
+   * Every tenant SKU is returned (also the 0/0 ones — the replenishment
+   * module decides what a zero point means and the read doubles as the
+   * SKU-in-tenant existence assert for the policy commands); the code + name
+   * ride along for the draft/log surfaces. A read — never capability-gated.
+   */
+  async getSkuReorderDefaultsInTx(
+    tx: TenantTx,
+    tenantId: string,
+  ): Promise<SkuReorderDefaults[]> {
+    return tx
+      .select({
+        id: skus.id,
+        code: skus.code,
+        name: skus.name,
+        uom: skus.uom,
+        reorderPoint: skus.reorderPoint,
+        reorderQty: skus.reorderQty,
+      })
+      .from(skus)
+      .where(eq(skus.tenantId, tenantId))
+      .orderBy(skus.code);
+  }
+
+  /**
+   * The same read on its own transaction (the `getSkuSummaries` wrapper
+   * shape) — the standalone entry for a caller that holds no transaction.
+   */
+  async getSkuReorderDefaults(tenantId: string): Promise<SkuReorderDefaults[]> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.getSkuReorderDefaultsInTx(tx, tenantId),
+    );
   }
 
   /** The one SKU identity read (null when the id is foreign or unknown). */
