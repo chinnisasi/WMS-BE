@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
-import { fromMilli } from '../../shared/primitives/quantity';
+import { fromMilli, MAX_QUANTITY_MILLI } from '../../shared/primitives/quantity';
 import { and, asc, eq, inArray, notExists, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
@@ -49,8 +49,13 @@ export const REAP_BATCH = 100;
  * `stock_on_hand` joined to the `QC-HOLD` system bin — no cross-module
  * hold-table read. Story 5-1 populates the in-transit hook the same way (the
  * system `IN-TRANSIT` bin, both legs of a transfer riding the ledger). The
- * `bufferUnits` placeholder stays zero-valued for Epic 7, so the formula
- * `on-hand − reserved − QC-held − in-transit − buffer` never changes.
+ * buffer hook (story 7.1, AD-13) is populated not as a formula term but as a
+ * HOLD ROW — a channel Safety Buffer IS a `held` reservation
+ * (`owner_type: 'buffer'`, `owner_id: <integration id>`, `expires_at: null`),
+ * so its subtraction lives ONCE, in the counter `reserved` the mirror keeps
+ * (a second standalone term here would double-count it — RN-1); the formula
+ * `on-hand − reserved − QC-held − in-transit − buffer` is honored, with
+ * `buffer` simply part of what `reserved` now means.
  */
 export async function qcHeldUnits(
   tx: TenantTx,
@@ -122,12 +127,45 @@ export async function inTransitUnits(
 }
 
 /**
- * The Epic 7 channel-buffer placeholder. It subtracts from ATP alongside the
- * QC-held figure, so it is denominated in the same units they are — story
- * 10.1 milli-units — the moment it stops being zero.
+ * The standing-buffer owner type (story 7.1, AD-13): the ONE owner family
+ * whose holds are standing (no TTL, `expires_at` null — the 0050 CHECK
+ * admits NULL expiry for `buffer` rows only; the reaper's
+ * `expires_at <= now()` predicate skips them naturally). A channel's Safety
+ * Buffer is this module's own `held` journal row, carved through the grant
+ * arms like any other hold.
  */
-export function bufferUnits(): number {
-  return 0;
+export const BUFFER_OWNER_TYPE = 'buffer';
+
+/**
+ * The scope's standing-buffer total (story 7.1): the journal sum over the
+ * LIVE (`held`) `owner_type = 'buffer'` rows, optionally narrowed to ONE
+ * integration's own rows (the sync's per-channel figure). The `buffer`
+ * field of every ATP snapshot reports the un-narrowed sum — transparency
+ * over the standing reservations the pool already nets out through
+ * `reserved`. `::bigint` → `Number(...)` at the boundary (the
+ * `qcHeldUnits` pattern).
+ */
+export async function bufferUnits(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  skuId: string,
+  ownerId?: string,
+): Promise<number> {
+  const rows = await tx
+    .select({ buffer: sql<string>`coalesce(sum(${reservations.quantity}), 0)::bigint` })
+    .from(reservations)
+    .where(
+      and(
+        eq(reservations.tenantId, tenantId),
+        eq(reservations.warehouseId, warehouseId),
+        eq(reservations.skuId, skuId),
+        eq(reservations.ownerType, BUFFER_OWNER_TYPE),
+        eq(reservations.state, 'held'),
+        ownerId === undefined ? undefined : eq(reservations.ownerId, ownerId),
+      ),
+    );
+  return Number(rows[0]?.buffer ?? 0);
 }
 
 /** Grant input (story 2.3): one owner hold against a (warehouse, sku) scope. */
@@ -154,7 +192,8 @@ export interface ReservationSnapshot {
   readonly ownerId: string;
   readonly quantity: number;
   readonly state: string;
-  readonly expiresAt: string;
+  /** The TTL deadline — null ONLY on story 7.1's standing `buffer` holds. */
+  readonly expiresAt: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -174,9 +213,15 @@ export interface AtpSnapshot {
    * transfer's outbound confirm — the QC-held figure's mirror.
    */
   readonly inTransit: number;
-  /** Named hook — zero in this story (Epic 7 populates it). */
+  /**
+   * Story 7.1 (AD-13): the scope's standing channel-buffer total (the journal
+   * sum over `held` `owner_type: 'buffer'` rows) — transparency only. The
+   * subtraction itself lives ONCE, in `reserved` (the mirror; RN-1): a
+   * buffer IS a held reservation, so it is already inside `reserved`, and a
+   * separate term in the `atp` arithmetic would subtract it twice.
+   */
   readonly buffer: number;
-  /** `max(0, onHand − reserved − qcHeld − inTransit − buffer)` — never oversells. */
+  /** `max(0, onHand − reserved − qcHeld − inTransit)` — never oversells (the buffer IS part of `reserved`). */
   readonly atp: number;
 }
 
@@ -216,6 +261,78 @@ function unavailable(detail: string): ProblemException {
   // The deterministic race-loser outcome (story 2.3): 409 `unavailable`
   // problem-details. Per-channel backorder/accept arrives with Epic 7.
   return new ProblemException('unavailable', 409, 'Stock unavailable', detail);
+}
+
+/**
+ * A standing buffer's refusal, raised INSIDE a journal transaction so the
+ * thrown catch rolls the write back (the old buffer standing) and converted
+ * to the 409 `unavailable` at the apply entry — the caller-facing shape.
+ */
+class StandingBufferRefusal extends Error {
+  constructor(readonly refusalDetail: string) {
+    super(refusalDetail);
+  }
+}
+
+/**
+ * The pool figure a standing-buffer refusal names (RN-2: the 409 message
+ * carries the pool the request would have overflowed).
+ */
+function bufferOverCeiling(
+  command: ChannelBufferCommand,
+  probe: StandingBufferProbe,
+): ProblemException {
+  return unavailable(
+    `SKU ${command.skuId} has ${fromMilli(probe.ceiling)} sellable unit(s) in warehouse ${command.warehouseId}` +
+      (probe.qcHeld > 0 ? ` (of which ${fromMilli(probe.qcHeld)} are QC-held)` : '') +
+      (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
+      `, holding ${fromMilli(probe.reserved)} already — the buffer of ${fromMilli(command.targetMilli)} ` +
+      `cannot be reserved.`,
+  );
+}
+
+/** The standing-buffer probe: the scope's committed read plus the open buffer row, if any. */
+interface StandingBufferProbe {
+  readonly existing: Reservation | undefined;
+  readonly reserved: number;
+  readonly ceiling: number;
+  readonly qcHeld: number;
+  readonly inTransit: number;
+}
+
+/** A standing buffer command — one integer target per (integration, warehouse, sku). */
+export interface ChannelBufferCommand {
+  readonly tenantId: string;
+  readonly warehouseId: string;
+  readonly skuId: string;
+  /** The integration (channel connection) the buffer carves stock for. */
+  readonly ownerId: string;
+  /** The standing target in milli-units; `0` clears the buffer. */
+  readonly targetMilli: number;
+}
+
+/** One standing-buffer apply. `reservation` is null only when the target was already standing unchanged. */
+export interface StandingBufferResult {
+  readonly status: 'applied';
+  readonly previousMilli: number;
+  readonly targetMilli: number;
+  readonly reservation: ReservationSnapshot | null;
+}
+
+/** The sync's per-channel visible quantity (RN-6) — the pool snapshot plus THIS channel's figure. */
+export interface ChannelVisibleSnapshot {
+  readonly warehouseId: string;
+  readonly skuId: string;
+  readonly onHand: number;
+  readonly reserved: number;
+  readonly qcHeld: number;
+  readonly inTransit: number;
+  /** The pool ATP (every holder included). */
+  readonly poolAtp: number;
+  /** THIS channel's own standing buffer (milli-units). */
+  readonly buffer: number;
+  /** `max(0, poolAtp − buffer)` — `V(c)`, the quantity this channel may list. */
+  readonly visibleMilli: number;
 }
 
 /**
@@ -347,12 +464,25 @@ export class ReservationService implements OnModuleInit {
           `(got ${fromMilli(command.quantity)}).`,
       );
     }
-    const ttlSeconds = command.ttlSeconds ?? DEFAULT_RESERVATION_TTL_SECONDS;
+    const ttlSeconds = command.ttlSeconds ?? (ownerType === BUFFER_OWNER_TYPE ? null : DEFAULT_RESERVATION_TTL_SECONDS);
     // Story 4.1 (epic-2 review F11): a zero TTL is not a valid hold — it
     // expires the instant it is journalled, a shape every caller reaches only
     // by accident. 400 like every other out-of-range input; a hold that must
-    // be short still needs at least one second.
-    if (!Number.isInteger(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > MAX_RESERVATION_TTL_SECONDS) {
+    // be short still needs at least one second. Story 7.1's exception: a
+    // standing arm (ttlSeconds UNSET) is admitted for `owner_type: 'buffer'`
+    // grants ONLY — a hold with no expiry that only a buffer change or a
+    // disconnect releases. Any other owner omitting the TTL is still the
+    // validation failure it has always been.
+    if (ttlSeconds === null && ownerType !== BUFFER_OWNER_TYPE) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'ttlSeconds is required for non-buffer holds',
+        `Only owner_type "${BUFFER_OWNER_TYPE}" (a channel's standing Safety Buffer, AD-13) grants an ` +
+          `expiry-less hold; owner_type "${ownerType}" must state its ttlSeconds.`,
+      );
+    }
+    if (ttlSeconds !== null && (!Number.isInteger(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > MAX_RESERVATION_TTL_SECONDS)) {
       throw new ProblemException(
         'validation-failed',
         400,
@@ -448,7 +578,13 @@ export class ReservationService implements OnModuleInit {
             ownerId,
             quantity: command.quantity,
             state: 'held',
-            expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+            // Story 7.1's standing arm: a `buffer` grant with no TTL journals
+            // `expires_at: null` — the reaper's predicate skips it, the 0050
+            // CHECK admits it for this owner family only.
+            expiresAt:
+              ttlSeconds === null
+                ? null
+                : new Date(Date.now() + ttlSeconds * 1000).toISOString(),
           })
           .returning();
         return toSnapshot(rows[0]!);
@@ -636,7 +772,7 @@ export class ReservationService implements OnModuleInit {
     requireUuid(tenantId, 'tenantId');
     requireUuid(warehouseId, 'warehouseId');
     requireUuid(skuId, 'skuId');
-    const { onHand, qcHeld, inTransit } = await withTenantTransaction(this.db, tenantId, async (tx) => ({
+    const { onHand, qcHeld, inTransit, buffer } = await withTenantTransaction(this.db, tenantId, async (tx) => ({
       onHand: await this.committedOnHand(tx, tenantId, warehouseId, skuId),
       // Story 3.4: the QC hook reads its real source — the stock sitting in
       // the warehouse's system QC-hold bin (same committed-read tx).
@@ -645,6 +781,9 @@ export class ReservationService implements OnModuleInit {
       // parked in the warehouse's system IN-TRANSIT bin (same committed-read
       // tx).
       inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
+      // Story 7.1: the standing-buffer figure is a journal read (AD-13) —
+      // transparency only, ALREADY inside `reserved` (see the formula note).
+      buffer: await bufferUnits(tx, tenantId, warehouseId, skuId),
     }));
     const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
     const readyKey = reservationReadyKey(tenantId, warehouseId);
@@ -682,7 +821,6 @@ export class ReservationService implements OnModuleInit {
       throw this.valkeyDown(err, 'ATP read');
     }
 
-    const buffer = bufferUnits();
     return {
       warehouseId,
       skuId,
@@ -692,8 +830,11 @@ export class ReservationService implements OnModuleInit {
       // Story 5-1 — the in-transit figure beside the QC-held one (additive to
       // the wire shape; the subtraction is what changes ATP).
       inTransit,
+      // Story 7.1 — the standing-buffer total, transparency only: a buffer IS
+      // a held reservation and is already inside `reserved`. Subtracting it
+      // again here would double-carve it (RN-1).
       buffer,
-      atp: Math.max(0, onHand - reserved - qcHeld - inTransit - buffer),
+      atp: Math.max(0, onHand - reserved - qcHeld - inTransit),
     };
   }
 
@@ -1099,7 +1240,13 @@ export class ReservationService implements OnModuleInit {
     // rides beside it; the in-transit stock is unpromisable exactly like
     // quarantined stock.)
     const inTransit = await inTransitUnits(tx, tenantId, warehouseId, skuId);
-    return Math.max(0, onHand - qcHeld - inTransit - bufferUnits());
+    // Story 7.1 (RN-1): NO standalone buffer term. A channel's Safety Buffer
+    // is a `held` reservations row since 0050 — it reaches every ceiling and
+    // ATP read inside `reserved` through the counter mirror (the journalling
+    // grant paths subtract Postgres-side, the script arbitrates counter-
+    // side); a second subtraction here would carve every buffer off the
+    // pool twice.
+    return Math.max(0, onHand - qcHeld - inTransit);
   }
 
   /** Committed on-hand, excluding every open-quarantined (sku, bin) scope. */
@@ -1321,7 +1468,7 @@ export class ReservationService implements OnModuleInit {
     tx: TenantTx,
     tenantId: string,
     reservationId: string,
-  ): Promise<{ state: string; expiresAt: string; expired: boolean } | null> {
+  ): Promise<{ state: string; expiresAt: string | null; expired: boolean } | null> {
     const rows = await tx
       .select({
         state: reservations.state,
@@ -1518,7 +1665,8 @@ export class ReservationService implements OnModuleInit {
           `(asked ${fromMilli(command.quantity)} against a ${releasedFrom.state} hold of ${fromMilli(releasedFrom.quantity)}).`,
       );
     }
-    const ttlSeconds = command.ttlSeconds ?? DEFAULT_RESERVATION_TTL_SECONDS;
+    const ttlSeconds =
+      command.ttlSeconds ?? (ownerType === BUFFER_OWNER_TYPE ? null : DEFAULT_RESERVATION_TTL_SECONDS);
     // An open hold for this owner scope means the caller did not release
     // first — `reservations_open_owner_scope_unique` would refuse the insert
     // anyway, and answering null keeps that a partial-order path rather than
@@ -1544,7 +1692,10 @@ export class ReservationService implements OnModuleInit {
         ownerId,
         quantity: command.quantity,
         state: 'held',
-        expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+        // Story 7.1: a standing `buffer` grant (ttlSeconds unset) journals
+        // no expiry; every other owner keeps the default-TTL deadline.
+        expiresAt:
+          ttlSeconds === null ? null : new Date(Date.now() + ttlSeconds * 1000).toISOString(),
       })
       .returning();
     return toSnapshot(rows[0]!);
@@ -1592,6 +1743,376 @@ export class ReservationService implements OnModuleInit {
           `${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  /**
+   * Applies a channel's STANDING SAFETY BUFFER for one scope (story 7.1,
+   * AD-13): hold `targetMilli` for `owner_id = <integration id>` with no
+   * TTL — a buffer IS a `held` reservations row — or releases the
+   * difference, or clears the buffer entirely (`0`). The channels module
+   * reaches this through `InventoryFacade.applyChannelBuffer`, never
+   * Valkey or SQL directly.
+   *
+   * ── the increase arm borrows `grant`'s machinery, not `grantInTx` ────────
+   *
+   * An increase CREATES a carve where the journal has none yet, so it
+   * arbitrates against concurrent grants exactly like `grant`: probe (read
+   * the committed scope, headroom math from the journal) → the GRANT SCRIPT
+   * (the counter checks `reserved + delta ≤ ceiling` — an in-flight order
+   * grant has already moved the counter, so the buffer's carve cannot
+   * double-promise) → journal UPDATE/INSERT with the A2 stock-row `FOR
+   * UPDATE` revalidation and the compensating decrement on journal failure.
+   * A journal-side refusal leaves the OLD buffer standing (probe wrote
+   * nothing; the compensating decrement outlives the UPDATE only when the
+   * UPDATE failed).
+   *
+   * The decrease arm is story 4.4's release-then-regrant pair verbatim
+   * (`releaseInTx` + `grantInTx`, whose "never re-grant MORE than released"
+   * precondition an `owner_type: 'buffer'` grant with a smaller target
+   * satisfies), with ONE net counter restore after the commit — the pair
+   * never opens a "the whole buffer read free" window (RN-2).
+   *
+   * Refusal (the pool cannot cover the increase) throws the deterministic
+   * 409 `unavailable` with the pool figure in the detail — nothing journalled,
+   * the old buffer standing. 503 `reservation-store-unavailable` propagates
+   * from the store arms unchanged (fail closed).
+   *
+   * Returns the standing row's post-apply snapshot plus the PREVIOUS standing
+   * quantity (`previousMilli` — the caller's audit + idempotency snapshot).
+   */
+  async applyStandingBuffer(command: ChannelBufferCommand): Promise<StandingBufferResult> {
+    const { tenantId, warehouseId, skuId, ownerId, targetMilli } = command;
+    requireUuid(tenantId, 'tenantId');
+    requireUuid(warehouseId, 'warehouseId');
+    requireUuid(skuId, 'skuId');
+    if (ownerId === '') {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'ownerId is required',
+        'A standing buffer names its integration — ownerId must be non-empty.',
+      );
+    }
+    if (
+      !Number.isInteger(targetMilli) ||
+      targetMilli < 0 ||
+      targetMilli > MAX_QUANTITY_MILLI
+    ) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'targetMilli out of range',
+        `A standing buffer target must be an integer between 0 and ${fromMilli(MAX_QUANTITY_MILLI)} (got ${String(targetMilli)}).`,
+      );
+    }
+
+    const probe = await withTenantTransaction(this.db, tenantId, async (tx) => ({
+      existing: await this.findOpenHold(tx, {
+        tenantId,
+        warehouseId,
+        skuId,
+        ownerType: BUFFER_OWNER_TYPE,
+        ownerId,
+        quantity: targetMilli,
+      }),
+      reserved: await this.journalReservedSum(tenantId, warehouseId, skuId),
+      ceiling: await this.committedCeiling(tx, tenantId, warehouseId, skuId),
+      qcHeld: await qcHeldUnits(tx, tenantId, warehouseId, skuId),
+      inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
+    }));
+    const previousMilli = probe.existing?.quantity ?? 0;
+
+    if (targetMilli === previousMilli) {
+      // Setting a buffer to what it already is is a no-op — no journal write,
+      // no counter move (a parity-shaped no-op, and the command's verdict).
+      return {
+        status: 'applied',
+        previousMilli,
+        targetMilli,
+        reservation: probe.existing === undefined ? null : toSnapshot(probe.existing),
+      };
+    }
+
+    if (targetMilli > previousMilli) {
+      return this.increaseStandingBuffer(command, probe, previousMilli);
+    }
+    return this.decreaseStandingBuffer(command, probe, previousMilli);
+  }
+
+  /**
+   * The increase arm: probe → grant script over the DELTA (Δ = target −
+   * previous) → journal (UPDATE an existing row in place / INSERT a fresh
+   * one) under the A2 stock-row revalidation, compensating on failure.
+   * Counter and journal end equal WITHOUT a post-commit mirror — the script
+   * moved the counter before the journal wrote, the `grant` order.
+   */
+  private async increaseStandingBuffer(
+    command: ChannelBufferCommand,
+    probe: StandingBufferProbe,
+    previousMilli: number,
+  ): Promise<StandingBufferResult> {
+    const { tenantId, warehouseId, skuId, ownerId, targetMilli } = command;
+    const delta = targetMilli - previousMilli;
+    const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
+    const readyKey = reservationReadyKey(tenantId, warehouseId);
+
+    const outcome = await this.runGrantScript(counterKey, readyKey, tenantId, warehouseId, skuId, {
+      quantity: delta,
+      ceiling: probe.ceiling,
+    });
+    if (outcome === 'store-down') {
+      // The A8 split, same as every grant: a store failure is retryable 503,
+      // never the deterministic 409.
+      throw reservationStoreUnavailable();
+    }
+    if (outcome !== 'granted') {
+      throw bufferOverCeiling(command, probe);
+    }
+
+    try {
+      const reservation = await withTenantTransaction(this.db, tenantId, async (tx) => {
+        // A2 verbatim: the ceiling re-read under the scope's stock-row locks
+        // serializes the journal write against adjustments (and against
+        // concurrent grant journal txs) — a stock shrink between the probe
+        // and here compensates out.
+        const lockedCeiling = await this.revalidatedCeiling(tx, tenantId, warehouseId, skuId);
+        const lockedReserved = (await this.journalReservedSums(tenantId, warehouseId, skuId, tx))[0]?.reserved ?? 0;
+        if (lockedReserved + delta > lockedCeiling) {
+          throw unavailable(
+            `SKU ${skuId} has ${fromMilli(lockedCeiling)} sellable unit(s) in warehouse ${warehouseId}` +
+              (probe.qcHeld > 0 ? ` (of which ${fromMilli(probe.qcHeld)} are QC-held)` : '') +
+              (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
+              `, holding ${fromMilli(lockedReserved)} already — the buffer of ${fromMilli(targetMilli)} ` +
+              `cannot be reserved.`,
+          );
+        }
+        if (probe.existing !== undefined) {
+          const rows = await tx
+            .update(reservations)
+            .set({ quantity: targetMilli, updatedAt: nowIso() })
+            .where(
+              and(
+                eq(reservations.id, probe.existing.id),
+                eq(reservations.tenantId, tenantId),
+                eq(reservations.ownerType, BUFFER_OWNER_TYPE),
+                eq(reservations.ownerId, ownerId),
+                // Exactly-one-writer: a concurrent release/clear of the row
+                // wins the journal and this update adjusts nothing.
+                eq(reservations.state, 'held'),
+              ),
+            )
+            .returning();
+          const row = rows[0];
+          if (row === undefined) {
+            throw new ProblemException(
+              'conflict',
+              409,
+              'Concurrent reservation for this owner',
+              'The standing buffer row changed concurrently; retry to read the settled result.',
+            );
+          }
+          return toSnapshot(row);
+        }
+        const rows = await tx
+          .insert(reservations)
+          .values({
+            id: uuidv7(),
+            tenantId,
+            warehouseId,
+            skuId,
+            ownerType: BUFFER_OWNER_TYPE,
+            ownerId,
+            quantity: targetMilli,
+            state: 'held',
+            expiresAt: null, // standing (AD-13) — only a change or disconnect releases it
+          })
+          .returning();
+        return toSnapshot(rows[0]!);
+      });
+      return {
+        status: 'applied',
+        previousMilli,
+        targetMilli,
+        reservation,
+      };
+    } catch (err) {
+      await this.compensate(counterKey, delta, err);
+      if (isUniqueViolationOn(err, 'reservations_open_owner_scope_unique')) {
+        throw new ProblemException(
+          'conflict',
+          409,
+          'Concurrent reservation for this owner',
+          'The same owner scope is being reserved concurrently; retry to read the settled result.',
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The decrease arm: one journal tx releases the standing row and re-grants
+   * the new (smaller) target — the story 4.4 pair, whose precondition
+   * (`never MORE than released`) the smaller target satisfies, with ONE net
+   * counter restore after the commit. `grantInTx` answering null (the stock
+   * underneath vanished) is a refusal, not a loss: throwing rolls the pair
+   * back and the OLD buffer stands.
+   */
+  private async decreaseStandingBuffer(
+    command: ChannelBufferCommand,
+    probe: StandingBufferProbe,
+    previousMilli: number,
+  ): Promise<StandingBufferResult> {
+    const { tenantId, warehouseId, skuId, ownerId, targetMilli } = command;
+    const existing = probe.existing;
+    if (existing === undefined) {
+      // Unreachable when previousMilli > 0 (the probe found the row) — kept
+      // explicit so the type system knows `existing` below.
+      throw unavailable(
+        `The buffer for SKU ${skuId} in warehouse ${warehouseId} is not reserved — nothing to reduce.`,
+      );
+    }
+    try {
+      const grant = await withTenantTransaction(this.db, tenantId, async (tx) => {
+        const released = await this.releaseFromStateInTx(tx, tenantId, existing.id, 'held');
+        if (targetMilli === 0) {
+          return null; // clear: the row was the buffer; nothing re-granted
+        }
+        const regranted = await this.grantInTx(
+          tx,
+          { tenantId, warehouseId, skuId, ownerType: BUFFER_OWNER_TYPE, ownerId, quantity: targetMilli },
+          released,
+        );
+        if (regranted === null) {
+          // The remainder cannot be covered (the scope's stock moved).
+          // Throwing rolls the pair back — the old buffer stands untouched.
+          throw new StandingBufferRefusal(
+            `The reduced buffer of ${fromMilli(targetMilli)} cannot be covered in warehouse ${warehouseId} ` +
+              `— the previous buffer of ${fromMilli(previousMilli)} stands.`,
+          );
+        }
+        return regranted;
+      });
+      await this.restoreReservedUnits(tenantId, warehouseId, skuId, previousMilli - targetMilli);
+      return { status: 'applied', previousMilli, targetMilli, reservation: grant };
+    } catch (err) {
+      // A refusal marker thrown inside the journal tx rolls the pair back
+      // (nothing journalled) — converted to the caller-facing 409 here.
+      if (err instanceof StandingBufferRefusal) {
+        throw unavailable(err.refusalDetail);
+      }
+      this.logger.error(
+        `Standing buffer decrease failed — counter restored nothing (journal rolled back): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      throw err;
+    }
+  }
+
+  /**
+   * ONE channel's own standing-buffer total for one scope, in the CALLER's
+   * transaction (the sync's V-formula term, RN-6): the journal sum over the
+   * `held` `buffer` rows owned by `ownerId` (an integration id).
+   */
+  async channelBufferUnitsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    ownerId: string,
+  ): Promise<number> {
+    return bufferUnits(tx, tenantId, warehouseId, skuId, ownerId);
+  }
+
+  /**
+   * EVERY standing buffer still `held` for one owner (a disconnect's
+   * release set), in the CALLER's transaction — the channels command
+   * releases them beside its credential-row delete and mirrors the net
+   * per-scope restores after the commit. At most one row per (warehouse,
+   * sku): the open-scope partial unique.
+   */
+  async standingBuffersByOwnerInTx(
+    tx: TenantTx,
+    tenantId: string,
+    ownerId: string,
+  ): Promise<ReservationSnapshot[]> {
+    return tx
+      .select()
+      .from(reservations)
+      .where(
+        and(
+          eq(reservations.tenantId, tenantId),
+          eq(reservations.ownerType, BUFFER_OWNER_TYPE),
+          eq(reservations.ownerId, ownerId),
+          eq(reservations.state, 'held'),
+        ),
+      )
+      .orderBy(asc(reservations.id));
+  }
+
+  /**
+   * EVERY standing buffer still `held` in one tenant (a facade list read's
+   * bucketed set — arm 4's buffer rows), in the CALLER's transaction.
+   */
+  async standingBuffersForTenantInTx(
+    tx: TenantTx,
+    tenantId: string,
+  ): Promise<ReservationSnapshot[]> {
+    return tx
+      .select()
+      .from(reservations)
+      .where(
+        and(
+          eq(reservations.tenantId, tenantId),
+          eq(reservations.ownerType, BUFFER_OWNER_TYPE),
+          eq(reservations.state, 'held'),
+        ),
+      )
+      .orderBy(asc(reservations.id));
+  }
+
+  /**
+   * The sync's per-channel visible quantity (story 7-1, RN-6): the POOL's
+   * ATP read (fail-closed — a store-down ATP throws the 503 the sync
+   * branches on) MINUS the channel's OWN standing buffer, clamped at zero —
+   * `V(c) = max(0, onHand − qcHeld − inTransit − Σheld − buffer(c))` = the
+   * channel's share of the shared pool minus its own staleness margin. The
+   * pool's `atp` already includes `buffer(c)` inside `reserved` (RN-1's
+   * single-subtraction layout), so the margin is subtracted once more for
+   * this channel's own listing — the exhaustion property: `V(c)` hits 0
+   * exactly when the pool drains to `buffer(c)`, i.e. while the pool still
+   * holds the buffer, and never after (buffer exhaustion reduces SYNCED
+   * quantity to 0 BEFORE the shared pool reaches 0). One consequence the
+   * acceptance side lives with (7-2): a channel may not LIST its buffer —
+   * the margin covers the sync's staleness — but its backorderACCEPTANCE
+   * may dip into it; the ledger rows, not this read, arbitrate that.
+   * The buffer MATH lives here (the inventory core; the sync never performs
+   * it), only the delivery is the channels module's.
+   */
+  async channelVisibleQuantity(
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    bufferOwnerId: string,
+  ): Promise<ChannelVisibleSnapshot> {
+    requireUuid(tenantId, 'tenantId');
+    requireUuid(warehouseId, 'warehouseId');
+    requireUuid(skuId, 'skuId');
+    const pool = await this.atp(tenantId, warehouseId, skuId);
+    const own = await withTenantTransaction(this.db, tenantId, (tx) =>
+      this.channelBufferUnitsInTx(tx, tenantId, warehouseId, skuId, bufferOwnerId),
+    );
+    return {
+      warehouseId: pool.warehouseId,
+      skuId: pool.skuId,
+      onHand: pool.onHand,
+      reserved: pool.reserved,
+      qcHeld: pool.qcHeld,
+      inTransit: pool.inTransit,
+      poolAtp: pool.atp,
+      buffer: own,
+      visibleMilli: Math.max(0, pool.atp - own),
+    };
   }
 
   /**

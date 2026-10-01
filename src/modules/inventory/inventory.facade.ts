@@ -50,6 +50,16 @@ export type {
   GrantReservationCommand,
   ReservationSnapshot,
 } from './reservation.service';
+// Story 7.1: the standing-buffer + per-channel-visible-quantity shapes are
+// part of the inventory core's public seam — the channels module consumes
+// them ONLY through this facade (never the reservation service internals).
+export type {
+  ChannelBufferCommand,
+  ChannelVisibleSnapshot,
+  StandingBufferResult,
+} from './reservation.service';
+/** Story 7.1 — the reservations owner type a channel's Safety Buffer rows carry. */
+export { BUFFER_OWNER_TYPE } from './reservation.service';
 // Story 5-4: the variance-resolution approve arm rebuilds an adjustment
 // command from the variance row and runs it through the in-transaction seams
 // below — cross-module callers import the command/event types here, never
@@ -81,9 +91,12 @@ import type { ReconcileReport } from './reconcile';
 import { ReservationService } from './reservation.service';
 import type {
   AtpSnapshot,
+  ChannelBufferCommand,
+  ChannelVisibleSnapshot,
   GrantReservationCommand,
   ReservationRebuildReport,
   ReservationSnapshot,
+  StandingBufferResult,
 } from './reservation.service';
 
 /**
@@ -752,6 +765,61 @@ export class InventoryFacade {
   }
 
   /**
+   * Applies (sets / adjusts / clears) one channel's standing Safety Buffer
+   * for one (warehouse, sku) scope — story 7.1, AD-13. THIS is the only arm
+   * by which the channels module touches the reservation core (never a
+   * Valkey counter, never a reservations SQL write; AD-6 and the epic
+   * decision "the adapter never writes stock directly"). Refusals throw the
+   * deterministic 409 `unavailable` (the old buffer standing — the caller,
+   * never this method, maps that to its per-item verdict); store failures
+   * throw 503 `reservation-store-unavailable` (fail closed).
+   */
+  async applyChannelBuffer(command: ChannelBufferCommand): Promise<StandingBufferResult> {
+    return this.reservations.applyStandingBuffer(command);
+  }
+
+  /**
+   * The sync's per-channel visible quantity (RN-6) — the pool ATP fail-closed
+   * read plus THIS channel's own standing buffer, clamped. The buffer math
+   * lives in the inventory core (the sync delivers arithmetic results it
+   * never performs itself).
+   */
+  async channelVisibleQuantity(
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    bufferOwnerId: string,
+  ): Promise<ChannelVisibleSnapshot> {
+    return this.reservations.channelVisibleQuantity(tenantId, warehouseId, skuId, bufferOwnerId);
+  }
+
+  /**
+   * Every still-held standing buffer of one owner (an integration's
+   * disconnect release set) in the CALLER's transaction — the channels
+   * command releases them beside its own writes and mirrors the net
+   * per-scope restores after the commit through `restoreReservedUnits`.
+   */
+  async standingBuffersByOwnerInTx(
+    tx: TenantTx,
+    tenantId: string,
+    ownerId: string,
+  ): Promise<ReservationSnapshot[]> {
+    return this.reservations.standingBuffersByOwnerInTx(tx, tenantId, ownerId);
+  }
+
+  /**
+   * EVERY standing buffer still `held` in one tenant (arm 4's bucketed
+   * editor rows), in the CALLER's transaction — the channels facade's list
+   * read consumes it; the channels module never reads `reservations` raw.
+   */
+  async standingBuffersForTenantInTx(
+    tx: TenantTx,
+    tenantId: string,
+  ): Promise<ReservationSnapshot[]> {
+    return this.reservations.standingBuffersForTenantInTx(tx, tenantId);
+  }
+
+  /**
    * The live journal rows for a set of reservation ids (story 4.1): the
    * outbound module's per-line reservation-state read rides this passthrough
    * — AD-6 keeps `reservations` inventory-owned, and cross-module state
@@ -774,7 +842,7 @@ export class InventoryFacade {
     tx: TenantTx,
     tenantId: string,
     reservationId: string,
-  ): Promise<{ state: string; expiresAt: string; expired: boolean } | null> {
+  ): Promise<{ state: string; expiresAt: string | null; expired: boolean } | null> {
     return this.reservations.holdLivenessInTx(tx, tenantId, reservationId);
   }
 

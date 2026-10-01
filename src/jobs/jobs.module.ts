@@ -4,12 +4,21 @@ import { SharedModule, AUTH_DATABASE } from '../shared/shared.module';
 import type { Database } from '../shared/db/db';
 import { OUTBOX_RELAY } from '../shared/events/outbox.seam';
 import type { OutboxRelay } from '../shared/events/outbox.seam';
+import { ProblemException } from '../shared/problem-details/problem.exception';
 import { InventoryModule } from '../modules/inventory/inventory.module';
 import { InventoryFacade } from '../modules/inventory/inventory.facade';
 import { MovementsModule } from '../modules/movements/movements.module';
 import { MovementsFacade, MAX_SCHEDULED_TASKS_PER_TICK } from '../modules/movements/transfer.facade';
 import { ReplenishmentModule } from '../modules/replenishment/replenishment.module';
 import { ReplenishmentFacade, MAX_REPLENISHMENT_SCOPES_PER_TICK } from '../modules/replenishment/replenishment.facade';
+import { ChannelsModule } from '../modules/channels/channels.module';
+import { ChannelsFacade } from '../modules/channels/channels.facade';
+
+/** The problem code a failed ATP read fails closed with (A8's store split). */
+function codeOf(error: ProblemException): string | null {
+  const response = error.getResponse() as { code?: unknown };
+  return typeof response.code === 'string' ? response.code : null;
+}
 
 /** Per-cycle drain bound (AD-17): a cycle publishes at most this many rows. */
 export const DEFAULT_OUTBOX_DRAIN_LIMIT = 100;
@@ -110,6 +119,30 @@ export function parseReplenishmentPollMs(raw: string | undefined): number {
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(
       `REPLENISHMENT_SCHEDULER_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
+    );
+  }
+  return parsed;
+}
+
+/** Per-cycle publish bound (story 7-1's T3): a tick syncs at most this many connections. */
+export const MAX_SYNC_CONNECTIONS_PER_TICK = 200;
+
+/**
+ * The channels sync worker's poll interval, in milliseconds, from
+ * `CHANNELS_SYNC_POLL_MS` — the same env-gate conventions as the sibling
+ * workers (unset/`0` is OFF — a deployment that publishes availability sets
+ * e.g. `60000` for the 60s sync-health SLO with headroom; a non-negative
+ * integer is required or the boot fails loudly; tests drive the facade's
+ * `publishConnectionSnapshot()` directly).
+ */
+export function parseChannelsSyncPollMs(raw: string | undefined): number {
+  if (raw === undefined || raw === '') {
+    return 0;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(
+      `CHANNELS_SYNC_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
     );
   }
   return parsed;
@@ -618,25 +651,160 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
 }
 
 /**
+ * The channels sync worker (story 7-1's T3): an interval poll loop over the
+ * tenant's connected connections — one tick enumerates every CONNECTED
+ * integration whose breaker is not open, cross-tenant (the count scheduler's
+ * `authDb` BYPASSRLS precedent; the enumeration is read-only, every WRITE
+ * stays on the facade's tenant transactions), capped at
+ * `MAX_SYNC_CONNECTIONS_PER_TICK` per cycle in deterministic order, and
+ * drives `ChannelsFacade.publishConnectionSnapshot(tenantId, connectionId)`
+ * for each: read row + mappings, compute the per-scope visible quantities
+ * (RN-6's committed reads), append ONE outbox message per (connection,
+ * cycle); the relay delivers, the delivery handler meters + breakers.
+ *
+ * A failing connection is logged and retried next tick (the scheduler's
+ * per-scope rationale) — a poison connection must not starve the rest.
+ * A reservation-store-down cycle (503 `reservation-store-unavailable` from
+ * an ATP read) is a STALL, not a skip: the facade's `recordSyncStall`
+ * stamps `last_error`/`last_attempt_at` so the connection's health DEGRADES
+ * (visible in arm 4's list), nothing is appended (the sync never invents
+ * zero — PENDING a8), and this is NOT a breaker stroke (RN-5's breaker
+ * guards runaway DELIVERY loops; the compute-side store-down is the
+ * reservation core's fail-closed mode).
+ *
+ * Env-gated OFF when `CHANNELS_SYNC_POLL_MS` is unset/`0` (tests drive the
+ * facade directly), shed via the in-process `running` flag, `unref`'d
+ * timer, and a shutdown hook.
+ */
+@Injectable()
+export class ChannelsSyncWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('ChannelsSyncWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+
+  constructor(
+    // The cross-tenant enumeration read (BYPASSRLS — the count scheduler's
+    // `authDb` precedent); every WRITE stays on the facade's tenant
+    // transactions.
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(ChannelsFacade) private readonly channels: ChannelsFacade,
+  ) {
+    this.pollMs = parseChannelsSyncPollMs(process.env.CHANNELS_SYNC_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off (tests, or a deployment that syncs elsewhere)
+    }
+    this.logger.log(`Channels sync worker started (poll every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    // Never hold the process open on the timer alone: shutdown hooks end it.
+    this.timer.unref?.();
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  async tick(): Promise<void> {
+    if (this.running) {
+      return; // shed: one cycle at a time in this process
+    }
+    this.running = true;
+    try {
+      // Cross-tenant, read-only (BYPASSRLS): every connected connection
+      // whose breaker is open is left alone — only a `retry` half-opens it
+      // (RN-5), and a `skipped` append costs nothing anyway, but skipping
+      // the whole cycle here keeps the enumeration honest about what CAN
+      // publish. Deterministic order; capped at
+      // MAX_SYNC_CONNECTIONS_PER_TICK with a truncation warn (a
+      // head-only slice here delays — one tick's lag — rather than starves,
+      // because the connection set re-enters the next cycle naturally).
+      const connections = (await this.authDb.execute(sql`
+        select tenant_id as "tenantId", id as "connectionId"
+        from integrations
+        where status = 'connected' and breaker_state <> 'open'
+        order by tenant_id asc, created_at asc, id asc
+        limit ${MAX_SYNC_CONNECTIONS_PER_TICK}
+      `)) as unknown as { tenantId: string; connectionId: string }[];
+
+      let published = 0;
+      for (const { tenantId, connectionId } of connections) {
+        try {
+          const outcome = await this.channels.publishConnectionSnapshot(tenantId, connectionId);
+          if (outcome === true) {
+            published += 1;
+          }
+          // `false` (breaker open / nothing mapped / not connected — a
+          // silent skip, no stall) and `'absent'` (the row left mid-cycle)
+          // both just continue.
+        } catch (error) {
+          const status = error instanceof ProblemException ? error.getStatus() : null;
+          const code = error instanceof ProblemException ? codeOf(error) : null;
+          if (status === 503 && code === 'reservation-store-unavailable') {
+            // The snapshot's ATP read failed closed: stamp the stall
+            // (health degrades), publish nothing, retry next tick. The
+            // stamp itself is best-effort — a recordSyncStall failure is
+            // logged by the outer catch of the NEXT cycle; here it would
+            // only hide the original reason, so it rides the local try.
+            this.logger.warn(
+              `Channels sync stalled for connection ${connectionId}: the reservation store is down — stamped, nothing published`,
+            );
+            try {
+              await this.channels.recordSyncStall(tenantId, connectionId, 'reservation store unavailable');
+            } catch (stampError) {
+              this.logger.error(
+                `Channels sync could not stamp the stall for connection ${connectionId}: ` +
+                  `${stampError instanceof Error ? stampError.message : String(stampError)}`,
+              );
+            }
+            continue;
+          }
+          throw error;
+        }
+      }
+      if (published > 0) {
+        this.logger.log(`Channels sync appended ${published} publication(s)`);
+      }
+    } catch (error) {
+      this.logger.error(
+        `Channels sync cycle failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
+/**
  * jobs shell — background/relay workers (outbox relay, reconciliation,
- * reservation reaper, count scheduler, replenishment scheduler, import
- * batches, notifications dispatch). The event bus + outbox seams live in
+ * reservation reaper, count scheduler, replenishment scheduler, channels
+ * sync, import batches, notifications dispatch). The event bus + outbox
+ * seams live in
  * shared/events and are provided by SharedModule. All workers are env-gated
  * OFF unless `OUTBOX_RELAY_POLL_MS` / `OUTBOX_RECONCILE_POLL_MS` /
  * `RESERVATION_REAPER_POLL_MS` / `COUNT_SCHEDULER_POLL_MS` /
- * `REPLENISHMENT_SCHEDULER_POLL_MS` is set (tests exercise `drain()` /
- * `reconcileNext()` / `expireDueReservations()` /
- * `generateScheduledCountTasks()` / `sweepScope()` directly, plus one
- * plumbing test driving `ReplenishmentSchedulerWorker.tick()` itself).
+ * `REPLENISHMENT_SCHEDULER_POLL_MS` / `CHANNELS_SYNC_POLL_MS` is set (tests
+ * exercise `drain()` / `reconcileNext()` / `expireDueReservations()` /
+ * `generateScheduledCountTasks()` / `sweepScope()` /
+ * `publishConnectionSnapshot()` directly, plus one plumbing test driving
+ * `ReplenishmentSchedulerWorker.tick()` itself).
  */
 @Module({
-  imports: [SharedModule, InventoryModule, MovementsModule, ReplenishmentModule],
+  imports: [SharedModule, InventoryModule, MovementsModule, ReplenishmentModule, ChannelsModule],
   providers: [
     OutboxRelayWorker,
     ReconciliationWorker,
     ReservationReaper,
     CountSchedulerWorker,
     ReplenishmentSchedulerWorker,
+    // Story 7-1's T3 — the availability publisher (env-gated OFF by
+    // default; the facade carries the cycle, the worker only times it).
+    ChannelsSyncWorker,
   ],
   exports: [],
 })

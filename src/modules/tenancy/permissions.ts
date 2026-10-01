@@ -97,6 +97,16 @@ export const CAPABILITIES = [
   // connection's public face only, never credential material, so there is
   // nothing for a gate to protect. Mirrored into wms-fe `src/lib/users.ts`.
   'carrier.manage',
+  // Story 7-1 — the channels surface's mutations (connect a sales channel,
+  // rotate its credential, set its backorder policy + standing buffers,
+  // disconnect, retry a stalled sync). A SETTINGS capability mirroring
+  // `carrier.manage`: Owner and Ops Manager only (the spec's frozen holder
+  // set — channels are not a floor verb and not an accounting verb);
+  // Operator and Accountant absent (the FE story: no Operator-visible entry).
+  // Deliberately NOT on the connection-list read (arm 4): reads are never
+  // gated (the rule at the top of this file), and the rows carry the public
+  // face only. Mirrored into wms-fe `src/lib/users.ts`.
+  'channel.manage',
   // Story 12-5 — FR-44's recording verb: an operator on the floor records a
   // temperature excursion against a bin (owner + Ops Manager + Operator,
   // mirroring `putaway.execute`'s rationale — the floor records what it
@@ -213,6 +223,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'pack.execute',
     'dispatch.execute',
     'carrier.manage',
+    // Story 7-1 — the channels verbs (owner holds everything): connect,
+    // rotate, config, buffers, disconnect, retry — the settings operator.
+    'channel.manage',
     // Story 12-5 — FR-44: the manager records excursions too (owner holds
     // everything).
     'excursion.record',

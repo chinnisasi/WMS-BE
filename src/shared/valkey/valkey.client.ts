@@ -1,15 +1,22 @@
 import { Injectable, type OnApplicationShutdown } from '@nestjs/common';
 import Redis from 'ioredis';
-import { RESERVATION_GRANT_SCRIPT, RESERVATION_RELEASE_SCRIPT } from './reservation-scripts';
+import {
+  RESERVATION_GRANT_SCRIPT,
+  RESERVATION_MIRROR_INCREMENT_SCRIPT,
+  RESERVATION_RELEASE_SCRIPT,
+} from './reservation-scripts';
 
 /** One grant-script reply: `[win(0|1), newReserved | reason]`. */
 export type GrantReply = [win: 0 | 1, rest: string];
 /** One release-script reply: `[applied(0|1), newReserved | reason]`. */
 export type ReleaseReply = [applied: 0 | 1, rest: string];
+/** One mirror-increment reply: `[applied(0|1), newReserved | reason]`. */
+export type MirrorIncrementReply = [applied: 0 | 1, rest: string];
 
 /** Script command names as registered on the client (fixed key counts). */
 const GRANT_COMMAND = 'wmsResGrant';
 const RELEASE_COMMAND = 'wmsResRelease';
+const MIRROR_INCREMENT_COMMAND = 'wmsResMirrorIncrement';
 
 /**
  * The shared Valkey client (story 2.3, AD-2): one lazy ioredis connection
@@ -57,9 +64,15 @@ export class ValkeyClient implements OnApplicationShutdown {
       enableOfflineQueue: true,
     });
     // AD-2: both decision scripts are pre-declared here with fixed key counts
-    // — there is no ad-hoc EVAL anywhere else in the codebase.
+    // — there is no ad-hoc EVAL anywhere else in the codebase. (Story 7.1
+    // adds the third, MIRROR-INCREMENT — a mirror arm, not a decision: it
+    // contains no ceiling check and no ready-marker gate.)
     client.defineCommand(GRANT_COMMAND, { numberOfKeys: 2, lua: RESERVATION_GRANT_SCRIPT });
     client.defineCommand(RELEASE_COMMAND, { numberOfKeys: 1, lua: RESERVATION_RELEASE_SCRIPT });
+    client.defineCommand(MIRROR_INCREMENT_COMMAND, {
+      numberOfKeys: 1,
+      lua: RESERVATION_MIRROR_INCREMENT_SCRIPT,
+    });
     this.client = client;
     return client;
   }
@@ -109,6 +122,26 @@ export class ValkeyClient implements OnApplicationShutdown {
       (...args: (string | number)[]) => Promise<[number, string]>
     >;
     const reply = await client[RELEASE_COMMAND]!(counterKey, quantity, counterTtlSeconds);
+    return [reply[0] === 1 ? 1 : 0, reply[1]];
+  }
+
+  /**
+   * The mirror-only increment (see `RESERVATION_MIRROR_INCREMENT_SCRIPT`):
+   * a journalled standing buffer's net counter delta applied AFTER the
+   * write's commit. Arbitrates nothing — a missing counter fails closed
+   * (the caller logs; the rebuild/parity pass repairs toward Postgres).
+   */
+  async incrementCounter(
+    counterKey: string,
+    quantity: number,
+    counterTtlSeconds: number,
+  ): Promise<MirrorIncrementReply> {
+    this.assertCounterValue('mirror-increment quantity', quantity);
+    const client = this.redis() as unknown as Record<
+      string,
+      (...args: (string | number)[]) => Promise<[number, string]>
+    >;
+    const reply = await client[MIRROR_INCREMENT_COMMAND]!(counterKey, quantity, counterTtlSeconds);
     return [reply[0] === 1 ? 1 : 0, reply[1]];
   }
 

@@ -1327,7 +1327,14 @@ export type InventoryQuarantine = typeof inventoryQuarantines.$inferSelect;
  *   counter. Valkey key TTLs are a backstop only.
  *
  * Scope is (tenant, warehouse, sku) — never bin-level (no batch/serial
- * dimensions; Story 2.4 and Epic 7 are out of scope here).
+ * dimensions; Story 2.4 is out of scope here).
+ *
+ * Story 7.1 (AD-13) — STANDING holds: a channel Safety Buffer IS a hold row
+ * (`owner_type: 'buffer'`, `owner_id: <integration id>`) with NO expiry —
+ * `expires_at` is nullable since 0050 and NULL is admitted for `buffer`
+ * rows ONLY (the CHECK lives in the migration SQL). The reaper's
+ * `expires_at IS NOT NULL` predicate (0009 SQL) skips NULL rows naturally —
+ * a standing buffer never expires.
  *
  * RLS policy + state/quantity CHECKs live **only in the migration SQL**
  * (0009, the 0006/0007/0008 pattern).
@@ -1346,7 +1353,11 @@ export const reservations = pgTable(
     /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
     quantity: bigint('quantity', { mode: 'number' }).notNull(),
     state: text('state').notNull().default('held'),
-    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
+    /**
+     * The hold's TTL deadline — null ONLY on story 7.1's standing `buffer`
+     * holds (never expires; the reaper skips nulls). CHECK in 0050.
+     */
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }),
     ...tenantTimestamps,
   },
   (table) => [
@@ -3474,3 +3485,161 @@ export const batchAlerts = pgTable(
 );
 
 export type BatchAlert = typeof batchAlerts.$inferSelect;
+
+/**
+ * ── Channels: integrations, credential vault, mappings, metering ──────────
+ * (story 7.1, AD-13/AD-15) — the channels module's spine tables.
+ *
+ * `integrations` — one connected sales channel per (tenant, provider): the
+ * identity 7.2's ingestion references (`orders.source = 'ingested'` carries
+ * this row's id), the credential vault row, and the sync-health +
+ * circuit-breaker state. No FKs (repo convention); the provider vocabulary
+ * is the three frozen channels. `credential_sealed` is the AES-256-GCM
+ * envelope blob over the canonical credential JSON, sealed under
+ * `CHANNEL_ENCRYPTION_KEY` — a key of its own, independent of
+ * `CARRIER_ENCRYPTION_KEY` (independent blast radii, the 4.6b rationale).
+ * **The blob never leaves the module** — no response DTO, no list row, no
+ * outbox payload, no audit row, no log line carries it or the plaintext.
+ * Rotation replaces the material IN PLACE (version bump); disconnect is a
+ * hard DELETE (AD-15: "disconnect deletes") and the audit row survives to
+ * record it.
+ *
+ * `channel_mappings` — the SKU binding every sync publishes through and
+ * every 7.2 webhook resolves through: one SKU per external ref per
+ * connection. Sync publishes ONLY mapped scopes; a connection with no
+ * mappings publishes nothing.
+ *
+ * `integration_calls` — the append-only meter (AD-7 companion): one row per
+ * outbound integration call (sync deliveries, revoke attempts). No update or
+ * delete command exists for it.
+ *
+ * The vocabularies' DB-side CHECKs and the fail-closed RLS policies live
+ * **only in the migration SQL** (0050, the 0048/0049 pattern — CHECKs and
+ * RLS are drizzle-blind); the uniques are drizzle-declared below.
+ */
+export const CHANNEL_PROVIDERS = ['shopify', 'amazon-in', 'flipkart'] as const;
+export type ChannelProvider = (typeof CHANNEL_PROVIDERS)[number];
+
+export const INTEGRATION_STATUSES = ['connected', 'disconnected'] as const;
+export type IntegrationStatus = (typeof INTEGRATION_STATUSES)[number];
+
+export const INTEGRATION_BREAKER_STATES = ['closed', 'open', 'half-open'] as const;
+export type IntegrationBreakerState = (typeof INTEGRATION_BREAKER_STATES)[number];
+
+export const BACKORDER_POLICIES = ['accept', 'reject'] as const;
+export type BackorderPolicy = (typeof BACKORDER_POLICIES)[number];
+
+export const INTEGRATION_CALL_KINDS = ['availability-sync', 'credential-revoke'] as const;
+export type IntegrationCallKind = (typeof INTEGRATION_CALL_KINDS)[number];
+
+export const INTEGRATION_CALL_STATUSES = ['ok', 'failed'] as const;
+export type IntegrationCallStatus = (typeof INTEGRATION_CALL_STATUSES)[number];
+
+export const integrations = pgTable(
+  'integrations',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    provider: text('provider').notNull(),
+    /** `connected` live; `disconnected` is transitional — disconnect deletes the row. */
+    status: text('status').notNull().default('connected'),
+    /** The sealed envelope blob. Never selected onto any wire shape. */
+    credentialSealed: text('credential_sealed'),
+    /** 1 at connect, +1 per rotation — the material's generation counter. */
+    credentialVersion: integer('credential_version').notNull().default(1),
+    /** Consumed by 7.2's ingestion acceptance (stored now, read then). */
+    backorderPolicy: text('backorder_policy').notNull().default('accept'),
+    connectedBy: uuid('connected_by').notNull(),
+    rotatedAt: timestamp('rotated_at', { withTimezone: true, mode: 'string' }),
+    rotatedBy: uuid('rotated_by'),
+    // ── sync health + circuit breaker (RN-5) ──
+    /** The last successfully DELIVERED availability publication (lag = now − this). */
+    lastSyncedAt: timestamp('last_synced_at', { withTimezone: true, mode: 'string' }),
+    /** The last delivery ATTEMPT, successful or not (health's "last effort"). */
+    lastAttemptAt: timestamp('last_attempt_at', { withTimezone: true, mode: 'string' }),
+    /** The last documented delivery failure's reason string (never a secret). */
+    lastError: text('last_error'),
+    /** Consecutive delivery failures — the breaker's counter (threshold const in the sync worker). */
+    consecutiveFailures: integer('consecutive_failures').notNull().default(0),
+    /** The breaker state: `open` refuses sync appends; retry half-opens. */
+    breakerState: text('breaker_state').notNull().default('closed'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One connection per provider per tenant — re-configuring is `rotate`,
+    // and a second `connect` is the 409 off THIS index (the 4.6b shape).
+    uniqueIndex('integrations_tenant_provider_unique').on(table.tenantId, table.provider),
+    // The module's list read and the sync worker's cross-tenant enumeration
+    // (created_at + id, the standard keyset shape).
+    index('integrations_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+  ],
+);
+
+export type Integration = typeof integrations.$inferSelect;
+
+export const channelMappings = pgTable(
+  'channel_mappings',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    integrationId: uuid('integration_id').notNull(),
+    /** The channel's own external identifier for the SKU (its listing id). */
+    externalRef: text('external_ref').notNull(),
+    /** The WMS SKU the ref resolves to (validated in the command transaction; the variant IS a SKU row — AD-19). */
+    skuId: uuid('sku_id').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One ref per connection (re-mapping a ref repoints the row); 7-2's
+    // webhook ingestion resolves its lines through exactly this key.
+    uniqueIndex('channel_mappings_integration_ref_unique').on(
+      table.tenantId,
+      table.integrationId,
+      table.externalRef,
+    ),
+    // The sync's mapped-scope enumeration reads by connection.
+    index('channel_mappings_tenant_integration_idx').on(table.tenantId, table.integrationId),
+  ],
+);
+
+export type ChannelMapping = typeof channelMappings.$inferSelect;
+
+export const integrationCalls = pgTable(
+  'integration_calls',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    integrationId: uuid('integration_id').notNull(),
+    kind: text('kind').notNull(),
+    status: text('status').notNull(),
+    /** Round-trip latency in milliseconds (null when the call never left). */
+    latencyMs: integer('latency_ms'),
+    /** The documented failure reason (never credential material). */
+    error: text('error'),
+    at: timestamp('at', { withTimezone: true, mode: 'string' }).notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The per-tenant integration-call meter's reads filter by integration.
+    index('integration_calls_tenant_integration_at_idx').on(
+      table.tenantId,
+      table.integrationId,
+      table.at,
+    ),
+  ],
+);
+
+export type IntegrationCall = typeof integrationCalls.$inferSelect;
+
+/** A connection's standing-buffer buckets, as the list read and the editor carry them. */
+export interface ChannelBufferBucket {
+  readonly warehouseId: string;
+  readonly skuId: string;
+  readonly bufferMilli: number;
+}

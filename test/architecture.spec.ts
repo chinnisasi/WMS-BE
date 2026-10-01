@@ -1080,3 +1080,178 @@ describe('architecture: the replenishment planning state is replenishment-module
     return readFileSync(join(replenishmentRoot, 'replenishment.facade.ts'), 'utf8');
   }
 });
+
+describe('architecture: channel connections are channels-module-owned (story 7-1)', () => {
+  /**
+   * Story 7-1 stands up the sales-channel substrate: the adapter registry,
+   * the credential vault (`integrations`), the external-reference mappings
+   * (`channel_mappings`) and the delivery metering (`integration_calls`) —
+   * module-exclusive tables exactly as the carrier vault is
+   * carriers-exclusive (AD-6): every sibling reads connection state
+   * (including sync health and the standing-buffer buckets it folds in from
+   * the reservation core) through `ChannelsFacade` alone.
+   *
+   * The mirrored guard matters just as much: the channels module NEVER
+   * writes another module's tables. Its standing buffers are the inventory
+   * core's `reservations` rows reached through `InventoryFacade`
+   * (`applyChannelBuffer` / `releaseReservationInTx` — AD-13/RN-1), and a
+   * direct drizzle or raw-SQL write of any stock/ledger/order table from
+   * this module would be a second quantity-mutation path — the exact defect
+   * class the reservation core exists to make impossible.
+   */
+  const CHANNELS_TABLES = ['integrations', 'channelMappings', 'integrationCalls'] as const;
+  const RAW_CHANNELS_TABLES = 'integrations|channel_mappings|integration_calls';
+  const channelsRoot = join(SRC_ROOT, 'modules', 'channels');
+  const CREDENTIAL_OWNER = join(channelsRoot, 'channel-credentials.ts');
+  /** Any import of a shared envelope primitive, from any depth or alias. */
+  const ENVELOPE_IMPORT = /from\s+['"][^'"]*crypto\/envelope['"]/;
+
+  it('no channel-table write happens outside the channels module', () => {
+    const outside = files.filter((file) => !file.path.startsWith(channelsRoot));
+    const offenders: string[] = [];
+    for (const file of outside) {
+      for (const pattern of [
+        ...CHANNELS_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_CHANNELS_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) {
+          offenders.push(`${file.path}: /${pattern.source}/`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the channels module writes no other module’s table — the reservation core stays single-path', () => {
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => f.path.startsWith(channelsRoot))) {
+      for (const table of [
+        'stockOnHand',
+        'batchOnHand',
+        'ledgerEvents',
+        'ledgerAnchors',
+        'binStateEpochs',
+        'reservations',
+        'reservationCounters',
+        'warehouseCounters',
+        'skus',
+        'batches',
+        'purchaseOrders',
+        'warehouses',
+        'memberships',
+        'carrierConnections',
+      ] as const) {
+        if (drizzleWriteOn(table).test(file.source)) {
+          offenders.push(`${file.path}: writes ${table}`);
+        }
+      }
+      // The one deliberately-visible raw-SQL write in the family is the
+      // channels module's own — nothing here reaches a physical
+      // reservations/stock ledger table with UPDATE/DELETE/INSERT.
+      for (const physical of [
+        'reservations',
+        'stock_on_hand',
+        'batch_on_hand',
+        'ledger_events',
+        'reservation_counters',
+        'warehouse_counters',
+      ]) {
+        if (rawWriteOn(physical).test(file.source)) {
+          offenders.push(`${file.path}: raw-SQL write of ${physical}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningfulness — the boundary is real, so pin that the buffer writes
+    // DO ride the inventory facade in the command (AD-13's single path):
+    const command = readFileSync(join(channelsRoot, 'channels.command.ts'), 'utf8');
+    expect(command).toContain('applyChannelBuffer');
+    expect(command).toContain('releaseReservationInTx');
+  });
+
+  it('the channels module itself writes its tables (the test is meaningful)', () => {
+    // The writers AFTER the publish-machinery extraction (ChannelsPublish
+    // standing beside the command and the facade): the command owns the
+    // connection-row lifecycle writes (connect / rotate / config / DELETE),
+    // the publish service owns the breaker updates + the metering rows and
+    // the mapping seed, and the FACADE only READS (it composes arm 4 from
+    // the module's tables and is the module's only exported seam).
+    const command = readFileSync(join(channelsRoot, 'channels.command.ts'), 'utf8');
+    const facade = readFileSync(join(channelsRoot, 'channels.facade.ts'), 'utf8');
+    const publish = readFileSync(join(channelsRoot, 'channels.publish.ts'), 'utf8');
+    expect(drizzleWriteOn('integrations').test(command)).toBe(true);
+    expect(drizzleWriteOn('integrations').test(publish)).toBe(true);
+    // Disconnect is a hard DELETE (AD-15) — the story's one destructive
+    // vault path, pinned so a later "soft delete" refactor argues with this.
+    expect(/\.delete\(\s*integrations\b/.test(command)).toBe(true);
+    // Metering rows and mappings have exactly one writer each.
+    expect(drizzleWriteOn('integrationCalls').test(publish)).toBe(true);
+    expect(drizzleWriteOn('channelMappings').test(publish)).toBe(true);
+    // The facade composes, never writes.
+    expect(drizzleWriteOn('integrations').test(facade)).toBe(false);
+  });
+
+  it('the channels key and envelope primitives live ONLY in channel-credentials.ts', () => {
+    const offenders: string[] = [];
+    for (const file of files) {
+      if (file.path === CREDENTIAL_OWNER) continue;
+      // The READ of the env var, not the name in prose (the carriers block's
+      // precedent: .env pointers and problem details must still name it).
+      if (/process\.env\.CHANNEL_ENCRYPTION_KEY/.test(file.source)) {
+        offenders.push(`${file.path}: reads process.env.CHANNEL_ENCRYPTION_KEY`);
+      }
+      if (file.path.startsWith(channelsRoot) && ENVELOPE_IMPORT.test(file.source)) {
+        offenders.push(`${file.path}: imports the envelope primitives`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    const owner = readFileSync(CREDENTIAL_OWNER, 'utf8');
+    expect(owner).toContain('process.env.CHANNEL_ENCRYPTION_KEY');
+    expect(ENVELOPE_IMPORT.test(owner)).toBe(true);
+  });
+
+  it('no other module reaches into the channels module past the facade', () => {
+    // Deliberately WRONG on purpose below: the reach detector must catch
+    // command/registry/errors/events/view imports, and allow only the
+    // facade/module/dto forms, so it is pinned against a detector typo the
+    // same way the carriers block is.
+    const guard = new RegExp(
+      '(?:modules/channels|\\.\\./channels)/(?!(?:channels\\.facade|channels\\.module|channels\\.dto)[\'"])',
+    );
+    for (const reaching of [
+      "from '../channels/channels.command'",
+      "from '../channels/channel-registry'",
+      "from '../channels/channel-credentials'",
+      "from '../channels/channels.events'",
+      "from '../channels/channels.view'",
+      "from '../channels/channels.errors'",
+      "from '../channels/channels.facade.internal'",
+    ]) {
+      expect(guard.test(reaching)).toBe(true);
+    }
+    for (const allowed of [
+      "from '../channels/channels.facade'",
+      "from '../channels/channels.module'",
+      "from '../channels/channels.dto'",
+    ]) {
+      expect(guard.test(allowed)).toBe(false);
+    }
+    const siblingModules = files.filter(
+      (file) =>
+        file.path.startsWith(join(SRC_ROOT, 'modules')) &&
+        !file.path.startsWith(channelsRoot) &&
+        /(?:modules\/channels|\.\.\/channels)\//.test(file.source),
+    );
+    const offenders: string[] = [];
+    for (const file of siblingModules) {
+      if (guard.test(file.source)) {
+        offenders.push(file.path);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // And the detector really scans files that import channels (the
+    // jobs shell drives the facade — meaningfulness for the scan above).
+    const jobs = readFileSync(join(SRC_ROOT, 'jobs', 'jobs.module.ts'), 'utf8');
+    expect(jobs).toContain("from '../modules/channels/channels.facade'");
+  });
+});
