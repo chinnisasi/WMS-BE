@@ -144,7 +144,9 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
 
     // SKUs: RP-A carries both tenant-wide defaults; RP-B carries NONE (the
     // override-only candidate); RP-C carries a fractional point default and
-    // NO qty (the recovery-gap arm).
+    // NO qty (the recovery-gap arm); RP-EX / RP-AG are BATCH-TRACKED with no
+    // reorder defaults at all — story 6-2's expiry/aging arms seed their
+    // batches by adjustment and never touch the sweep's candidate set.
     const csvHeader =
       'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,catch_weight_tracked,reorder_point,reorder_qty,barcode,abc_class';
     const csv = [
@@ -152,6 +154,8 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       `RP-A,Replenish A,kg,,1800,,false,false,false,2,3,,`,
       `RP-B,Replenish B,pcs,,1800,,false,false,false,,,,`,
       `RP-C,Replenish C,kg,,1800,,false,false,false,2.5,,`,
+      `RP-EX,Expiry Probe,pcs,,1800,,true,false,false,,,,`,
+      `RP-AG,Aging Probe,pcs,,1800,,true,false,false,,,,`,
     ].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
@@ -165,11 +169,11 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       .set('Authorization', `Bearer ${ownerToken}`)
       .expect(200);
     for (const item of skus.body.items as { code: string; id: string }[]) {
-      if ((['RP-A', 'RP-B', 'RP-C'] as readonly string[]).includes(item.code)) {
+      if ((['RP-A', 'RP-B', 'RP-C', 'RP-EX', 'RP-AG'] as readonly string[]).includes(item.code)) {
         skuIds.set(item.code, item.id);
       }
     }
-    expect(skuIds.size).toBe(3);
+    expect(skuIds.size).toBe(5);
 
     // Two DEFAULT vendors — several defaults are possible (no single-default
     // unique): the sweep must pick deterministically min (created_at, id).
@@ -1147,6 +1151,659 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
     );
     expect(byId.get(w3Rows[0]!.id) as number).toBeLessThan(byId.get(w2Rows[0]!.id) as number);
   });
+
+  // ══ story 6-2: expiry and aging alerts ═══════════════════════════════════
+  // A nested describe so these arms run AFTER every 6-1 arm: the batch-tracked
+  // probe SKUs (RP-EX, RP-AG) carry no reorder defaults at all, so the sweep's
+  // candidate counts above stay exact while the expiry arms ride the same
+  // tenant and warehouse fixtures.
+
+  describe('expiry and aging alerts (story 6-2)', () => {
+    const LEAD_DAYS = 7;
+    const AGING_DAYS = 30;
+    const daysFromNow = (days: number): string =>
+      new Date(Date.now() + days * 86_400_000).toISOString();
+
+    /** Raw batch-alert rows of tenant A (the RLS-scoped suite handle). */
+    async function alertRows(
+      filter: { kind?: string; status?: string } = {},
+    ): Promise<
+      { id: string; warehouse_id: string; sku_id: string; batch_id: string; kind: string; status: string; age_days: number | null; resolved_by: string | null }[]
+    > {
+      const rows = await sql`
+        select id, warehouse_id, sku_id, batch_id, kind, status, age_days, resolved_by
+        from batch_alerts
+        where tenant_id = ${tenantId}::uuid
+          ${filter.kind === undefined ? sql`` : sql`and kind = ${filter.kind}`}
+          ${filter.status === undefined ? sql`` : sql`and status = ${filter.status}`}
+        order by created_at asc, id asc`;
+      return rows.map(
+        (row) =>
+          row as unknown as {
+            id: string; warehouse_id: string; sku_id: string; batch_id: string; kind: string; status: string; age_days: number | null; resolved_by: string | null;
+          },
+      );
+    }
+
+    /** A batch's id by code (codes are tenant-unique in these arms). */
+    async function batchIdOf(code: string): Promise<string> {
+      const rows = await sql`select id from batches where tenant_id = ${tenantId}::uuid and code = ${code}`;
+      return (rows[0] as unknown as { id: string }).id;
+    }
+
+    /** A batch-aware adjustment (the batch-tracked SKUs take no blind stock). */
+    const adjustBatch = async (body: {
+      warehouseId: string;
+      skuId: string;
+      binId: string;
+      quantityDelta: number;
+      batch?: { code: string; expiryDate?: string; overrideReason?: string };
+    }): Promise<void> => {
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/inventory/adjustments`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ reasonCode: 'stock-count', note: 'replenishment 6-2 seed', ...body })
+        .expect(201);
+    };
+
+    /** The frozen-aging arithmetic's anchor: backdate the batch's intake. */
+    const backdateBatch = async (code: string, days: number): Promise<void> => {
+      await sql`update batches set created_at = now() - make_interval(days => ${days})
+        where tenant_id = ${tenantId}::uuid and code = ${code}`;
+    };
+
+    it('absent config row = disabled: the scan is a no-op on every scope and GET renders 404 (no default days hide in code)', async () => {
+      const before = await replenishment.scanScope(tenantId, warehouseId);
+      expect(before).toEqual({ tenantId, warehouseId, evaluated: 0, raised: 0, resolved: 0 });
+      // Tenant C (never configured, no batches) — the same idle verdict.
+      const tenantCScan = await replenishment.scanScope(tenantC.id, tenantC.warehouseId);
+      expect(tenantCScan).toEqual({
+        tenantId: tenantC.id,
+        warehouseId: tenantC.warehouseId,
+        evaluated: 0,
+        raised: 0,
+        resolved: 0,
+      });
+
+      const absent = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/replenishment/expiry-policies`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(404);
+      expect(absent.body.code).toBe('not-found');
+    });
+
+    it('config upsert: 200 with the snapshot; replay re-serves it; key reuse with a different payload is 422; 400s name the field; no-authority 403; wrong tenant 403', async () => {
+      const putExpiry = (body: Record<string, unknown>, key = ulid()): SupertestTest =>
+        request(app.getHttpServer())
+          .put(`${API}/${tenantId}/replenishment/expiry-policies`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, key)
+          .send(body);
+
+      const badBodies: [Record<string, unknown>, string][] = [
+        [{ expiryLeadDays: -1, agingThresholdDays: AGING_DAYS }, 'expiryLeadDays'],
+        [{ expiryLeadDays: 1.5, agingThresholdDays: AGING_DAYS }, 'expiryLeadDays'],
+        [{ expiryLeadDays: LEAD_DAYS, agingThresholdDays: -3 }, 'agingThresholdDays'],
+        [{ expiryLeadDays: LEAD_DAYS, agingThresholdDays: 2147483648 }, 'agingThresholdDays'],
+      ];
+      for (const [body, field] of badBodies) {
+        const refusal = await putExpiry(body).expect(400);
+        expect(refusal.body.code).toBe('validation-failed');
+        expect((refusal.body.errors ?? []).join(' ')).toContain(field);
+      }
+
+      // The operator holds no replenishment.manage — names the capability.
+      const denied = await request(app.getHttpServer())
+        .put(`${API}/${tenantId}/replenishment/expiry-policies`)
+        .set('Authorization', `Bearer ${operatorToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ expiryLeadDays: LEAD_DAYS, agingThresholdDays: AGING_DAYS })
+        .expect(403);
+      expect(denied.body.code).toBe('role-denied');
+      expect(denied.body.detail).toContain('replenishment.manage');
+
+      // Another tenant's session on this path → 403 from the shell's own-tenant assert.
+      await request(app.getHttpServer())
+        .put(`${API}/${tenantId}/replenishment/expiry-policies`)
+        .set('Authorization', `Bearer ${tenantC.ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ expiryLeadDays: LEAD_DAYS, agingThresholdDays: AGING_DAYS })
+        .expect(403);
+
+      const key = ulid();
+      const body = { expiryLeadDays: LEAD_DAYS, agingThresholdDays: AGING_DAYS };
+      const created = await putExpiry(body, key).expect(200);
+      expect(created.body.expiryPolicy).toMatchObject({
+        expiryLeadDays: LEAD_DAYS,
+        agingThresholdDays: AGING_DAYS,
+      });
+      // Replay: the stored snapshot, byte-for-byte.
+      const replayed = await putExpiry(body, key).expect(200);
+      expect(replayed.body.expiryPolicy).toEqual(created.body.expiryPolicy);
+      // Same key, different payload → 422 idempotency-key-reuse.
+      await putExpiry({ ...body, expiryLeadDays: LEAD_DAYS + 1 }, key).expect(422);
+
+      // Exactly ONE audit row — the replay came from idempotency, the
+      // refusals never entered the transaction.
+      const audits = await auditRows('replenishment.expiry_policy_upserted', tenantId);
+      expect(audits).toHaveLength(1);
+      expect(audits[0]!.target_type).toBe('expiry_alert_policy');
+    });
+
+    it('GET the config after the upsert: the snapshot (reads are ungated — even the operator)', async () => {
+      const got = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/replenishment/expiry-policies`)
+        .set('Authorization', `Bearer ${operatorToken}`)
+        .expect(200);
+      expect(got.body.expiryPolicy).toMatchObject({
+        expiryLeadDays: LEAD_DAYS,
+        agingThresholdDays: AGING_DAYS,
+      });
+    });
+
+    it('the scan raises: the expiry hit inside the lead, the aged hit AT the threshold boundary, BOTH kinds on one batch; the misses stay silent', async () => {
+      // Batches (batch-tracked SKUs take no blind stock — every adjustment
+      // names its batch):
+      //   E1 — expiry 4d out (inside the 7d lead) AND intake backdated 45d:
+      //        BOTH kinds on ONE batch (two rows, two events).
+      //   E2 — expiry 20d out → no hit. Fresh intake → no aging hit either.
+      //   E3 — expiry just PAST the lead boundary (+1h) → no hit.
+      //   E4 — expiry just INSIDE it (−1h) → the boundary hit.
+      //  BLK — expiry inside the lead but the batch BLOCKED → no NEW alert.
+      //   A1 — no expiry, intake backdated EXACTLY 30d → the aged boundary hit.
+      //   A2 — 29d → one day short, no hit.
+      const boundaryPlus = new Date(Date.now() + (LEAD_DAYS * 86_400 + 3_600) * 1_000)
+        .toISOString(); // just past the lead when the scan runs within the hour
+      const boundaryMinus = new Date(Date.now() + (LEAD_DAYS * 86_400 - 3_600) * 1_000)
+        .toISOString();
+      await adjustBatch({ warehouseId, skuId: skuIds.get('RP-EX')!, binId: binW1, quantityDelta: 5, batch: { code: 'E1', expiryDate: daysFromNow(4) } });
+      await adjustBatch({ warehouseId, skuId: skuIds.get('RP-EX')!, binId: binW1, quantityDelta: 3, batch: { code: 'E2', expiryDate: daysFromNow(20) } });
+      await adjustBatch({ warehouseId, skuId: skuIds.get('RP-EX')!, binId: binW1, quantityDelta: 2, batch: { code: 'E3', expiryDate: boundaryPlus } });
+      await adjustBatch({ warehouseId, skuId: skuIds.get('RP-EX')!, binId: binW1, quantityDelta: 1, batch: { code: 'E4', expiryDate: boundaryMinus } });
+      await adjustBatch({ warehouseId, skuId: skuIds.get('RP-EX')!, binId: binW1, quantityDelta: 2, batch: { code: 'BLK', expiryDate: daysFromNow(2) } });
+      await adjustBatch({ warehouseId, skuId: skuIds.get('RP-AG')!, binId: binW1, quantityDelta: 7, batch: { code: 'A1' } });
+      await adjustBatch({ warehouseId, skuId: skuIds.get('RP-AG')!, binId: binW1, quantityDelta: 4, batch: { code: 'A2' } });
+      await backdateBatch('E1', 45);
+      await backdateBatch('A1', AGING_DAYS);
+      await backdateBatch('A2', AGING_DAYS - 1);
+      await sql`update batches set status = 'blocked'
+        where tenant_id = ${tenantId}::uuid and code = 'BLK'`;
+
+      const report = await replenishment.scanScope(tenantId, warehouseId);
+      // 7 positive batch scopes (E1..BLK, A1, A2) evaluated; 4 alerts raised —
+      // E1 twice (once per kind), A1 at the boundary, E4 inside the lead.
+      expect(report).toEqual({ tenantId, warehouseId, evaluated: 7, raised: 4, resolved: 0 });
+
+      const e1Id = await batchIdOf('E1');
+      const a1Id = await batchIdOf('A1');
+      const e4Id = await batchIdOf('E4');
+      const all = await alertRows();
+      expect(all).toHaveLength(4);
+      const e1Rows = all.filter((row) => row.batch_id === e1Id);
+      expect(e1Rows.map((row) => row.kind).sort()).toEqual(['aged', 'expiry_upcoming']);
+      // The frozen facts: the expiry row freezes nothing (age_days null — the
+      // catalog froze the date at intake), the aged row freezes what it saw.
+      expect(e1Rows.find((row) => row.kind === 'expiry_upcoming')!.age_days).toBeNull();
+      expect(e1Rows.find((row) => row.kind === 'aged')!.age_days).toBe(45);
+      const a1Row = all.find((row) => row.batch_id === a1Id)!;
+      expect(a1Row.kind).toBe('aged');
+      expect(a1Row.age_days).toBe(30); // exactly AT the threshold (age ≥ threshold)
+      const e4Row = all.find((row) => row.batch_id === e4Id)!;
+      expect(e4Row.kind).toBe('expiry_upcoming');
+      expect(all.every((row) => row.status === 'open' && row.resolved_by === null)).toBe(true);
+
+      // The events: one per raise; the expiry arm names the date, the aging
+      // arm the frozen age — each payload carries exactly what its kind
+      // detected, every one addressed to the ops-manager hint.
+      const payloads = await outboxPayloads('replenishment.batch_alert_raised', tenantId);
+      expect(payloads).toHaveLength(4);
+      const e1Expiry = payloads.find((p) => p.batchId === e1Id && p.kind === 'expiry_upcoming')!;
+      expect(e1Expiry).toMatchObject({
+        kind: 'expiry_upcoming',
+        warehouseId,
+        skuId: skuIds.get('RP-EX'),
+        batchCode: 'E1',
+        expiryDate: expect.any(String),
+        notifyRole: 'ops_manager',
+      });
+      expect(e1Expiry).not.toHaveProperty('ageDays');
+      const e1Aged = payloads.find((p) => p.batchId === e1Id && p.kind === 'aged')!;
+      expect(e1Aged).toMatchObject({ kind: 'aged', ageDays: 45, notifyRole: 'ops_manager' });
+      expect(e1Aged).not.toHaveProperty('expiryDate');
+      expect(payloads.find((p) => p.batchId === a1Id)).toMatchObject({
+        kind: 'aged',
+        batchCode: 'A1',
+        ageDays: 30,
+      });
+      expect(payloads.find((p) => p.batchId === e4Id)).toMatchObject({
+        kind: 'expiry_upcoming',
+        batchCode: 'E4',
+      });
+
+      // The audit rows: under the module-reserved actor, one per alert.
+      const audits = await auditRows('replenishment.batch_alert_raised', tenantId);
+      expect(audits).toHaveLength(4);
+      expect(audits.every((row) => row.actor_user_id === REPLENISHMENT_SCHEDULER_ACTOR_ID)).toBe(true);
+      expect(audits.every((row) => row.target_type === 'batch_alert')).toBe(true);
+    });
+
+    it('already-open: a re-scan is a no-op — no duplicate row, no repeat event, no second audit row', async () => {
+      const eventsBefore = (await outboxPayloads('replenishment.batch_alert_raised', tenantId)).length;
+      const report = await replenishment.scanScope(tenantId, warehouseId);
+      expect(report).toEqual({ tenantId, warehouseId, evaluated: 7, raised: 0, resolved: 0 });
+      expect((await outboxPayloads('replenishment.batch_alert_raised', tenantId)).length).toBe(eventsBefore);
+      expect(await alertRows()).toHaveLength(4);
+      expect((await auditRows('replenishment.batch_alert_raised', tenantId)).length).toBe(4);
+    });
+
+    it('batch-alert list: kind/status/warehouse filters, the LIVE on-hand stitched in, the operator can read; the read refusals', async () => {
+      const e1Id = await batchIdOf('E1');
+      const a1Id = await batchIdOf('A1');
+      const e4Id = await batchIdOf('E4');
+      const list = async (query = ''): Promise<{ items: { id: string; kind: string; status: string; batchId: string; ageDays: number | null; onHandMilli?: number }[]; nextCursor?: string | null }> =>
+        (
+          await request(app.getHttpServer())
+            .get(`${API}/${tenantId}/replenishment/batch-alerts${query}`)
+            .set('Authorization', `Bearer ${operatorToken}`) // reads are ungated
+            .expect(200)
+        ).body;
+
+      const open = await list();
+      expect(open.items).toHaveLength(4);
+      expect(open.items.map((item) => item.kind).sort()).toEqual([
+        'aged',
+        'aged',
+        'expiry_upcoming',
+        'expiry_upcoming',
+      ]);
+      // The freshness stitch: milli on-hand re-read at read time — E1 holds 5,
+      // A1 7, E4 1 base units; the frozen age rides the aged rows only.
+      const e1Rows = open.items.filter((item) => item.batchId === e1Id);
+      expect(e1Rows.map((item) => item.onHandMilli).sort((a, b) => (a ?? 0) - (b ?? 0))).toEqual([5000, 5000]);
+      const a1Item = open.items.find((item) => item.batchId === a1Id)!;
+      expect(a1Item.onHandMilli).toBe(7000);
+      expect(a1Item.ageDays).toBe(30);
+      expect(open.items.find((item) => item.batchId === e4Id)!.onHandMilli).toBe(1000);
+      // The expiry rows freeze nothing (the aged row on the same batch — the
+      // aging arm's other half — carries the frozen age).
+      expect(e1Rows.find((item) => item.kind === 'expiry_upcoming')!.ageDays).toBeNull();
+
+      expect((await list('?kind=expiry_upcoming')).items).toHaveLength(2);
+      expect((await list('?kind=aged')).items).toHaveLength(2);
+      expect((await list('?status=open')).items).toHaveLength(4);
+      expect((await list('?status=resolved')).items).toHaveLength(0);
+      expect((await list(`?warehouseId=${warehouseId}`)).items).toHaveLength(4);
+      expect((await list(`?warehouseId=${policyWarehouseId}`)).items).toHaveLength(0);
+
+      const badLimit = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/replenishment/batch-alerts?limit=abc`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(400);
+      expect(badLimit.body.code).toBe('validation-failed');
+      expect((badLimit.body.errors ?? []).join(' ')).toContain('limit');
+      const badStatus = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/replenishment/batch-alerts?status=floating`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(400);
+      expect(badStatus.body.code).toBe('validation-failed');
+      const badKind = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/replenishment/batch-alerts?kind=stale`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(400);
+      expect(badKind.body.code).toBe('validation-failed');
+      const badCursor = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/replenishment/batch-alerts?cursor=bogus`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(400);
+      expect(badCursor.body.code).toBe('invalid-cursor');
+      await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/replenishment/batch-alerts?warehouseId=${uuidv7()}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(404);
+    });
+
+    it('batch-alert keyset pagination: the small-page walk composes to the big page', async () => {
+      const bigPage = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/replenishment/batch-alerts`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      const ids = (bigPage.body.items as { id: string }[]).map((item) => item.id);
+      expect(ids).toHaveLength(4);
+
+      const walked: string[] = [];
+      let cursor: string | undefined;
+      for (let hop = 0; hop < 10; hop += 1) {
+        const page = await request(app.getHttpServer())
+          .get(
+            `${API}/${tenantId}/replenishment/batch-alerts?limit=1${cursor === undefined ? '' : `&cursor=${encodeURIComponent(cursor)}`}`,
+          )
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .expect(200);
+        walked.push(...(page.body.items as { id: string }[]).map((item) => item.id));
+        cursor = (page.body.nextCursor as string | null) ?? undefined;
+        if (cursor === undefined) {
+          break;
+        }
+      }
+      expect(walked).toEqual(ids);
+    });
+
+    it('AUTO-resolve: consuming the batch to zero resolves its alerts (resolved_by null, NO event) — a consumed expiry alert resolves though its expiry trigger stands', async () => {
+      // Draw E1's five base units out — the whole batch leaves the projection.
+      await adjustBatch({
+        warehouseId,
+        skuId: skuIds.get('RP-EX')!,
+        binId: binW1,
+        quantityDelta: -5,
+        batch: { code: 'E1', overrideReason: 'expiry alert consume arm' },
+      });
+      const eventsBefore = (await outboxPayloads('replenishment.batch_alert_raised', tenantId)).length;
+      const report = await replenishment.scanScope(tenantId, warehouseId);
+      // E1's scope is gone (evaluated 7 → 6); BOTH its open alerts auto-
+      // resolved — expiry_maturity never matters, only on-hand reaching 0.
+      expect(report).toEqual({ tenantId, warehouseId, evaluated: 6, raised: 0, resolved: 2 });
+
+      const e1Id = await batchIdOf('E1');
+      const e1Rows = (await alertRows()).filter((row) => row.batch_id === e1Id);
+      expect(e1Rows).toHaveLength(2);
+      expect(e1Rows.every((row) => row.status === 'resolved' && row.resolved_by === null)).toBe(true);
+
+      // NO event on resolve (surface-visible state change only — the breach
+      // recovery rule).
+      expect((await outboxPayloads('replenishment.batch_alert_raised', tenantId)).length).toBe(eventsBefore);
+    });
+
+    it('dismiss an open batch alert: 200 snapshot (no onHandMilli on the snapshot); replay re-serves; re-dismiss 409 batch-alert-not-open; unknown 404; malformed 400; operator 403', async () => {
+      const a1 = (await alertRows({ kind: 'aged' })).find((row) => row.status === 'open')!;
+      const key = ulid();
+      const dismissed = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/replenishment/batch-alerts/${a1.id}/dismiss`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, key)
+        .expect(200);
+      expect(dismissed.body.batchAlert).toMatchObject({
+        id: a1.id,
+        kind: 'aged',
+        status: 'dismissed',
+        ageDays: 30,
+        resolvedBy: expect.any(String),
+      });
+      // The dismissal snapshot carries no on-hand (only the list rows stitch it).
+      expect(dismissed.body.batchAlert.onHandMilli).toBeUndefined();
+
+      const replayed = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/replenishment/batch-alerts/${a1.id}/dismiss`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, key)
+        .expect(200);
+      expect(replayed.body.batchAlert).toEqual(dismissed.body.batchAlert);
+
+      // Terminal: another dismissal (fresh key) is the 409 naming the status.
+      const refused = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/replenishment/batch-alerts/${a1.id}/dismiss`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .expect(409);
+      expect(refused.body.code).toBe('batch-alert-not-open');
+      expect(refused.body.detail).toContain('dismissed');
+
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/replenishment/batch-alerts/${uuidv7()}/dismiss`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .expect(404);
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/replenishment/batch-alerts/not-a-uuid/dismiss`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .expect(400);
+
+      // The operator holds no replenishment.manage (E4's alert is still open
+      // to refuse against).
+      const e4 = (await alertRows({ status: 'open' }))[0]!;
+      const denied = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/replenishment/batch-alerts/${e4.id}/dismiss`)
+        .set('Authorization', `Bearer ${operatorToken}`)
+        .set(KEY_HEADER, ulid())
+        .expect(403);
+      expect(denied.body.code).toBe('role-denied');
+      expect(denied.body.detail).toContain('replenishment.manage');
+
+      const audits = await auditRows('replenishment.batch_alert_dismissed', tenantId);
+      expect(audits).toHaveLength(1);
+      expect(audits[0]!.target_id).toBe(a1.id);
+      expect(audits[0]!.actor_user_id).not.toBe(REPLENISHMENT_SCHEDULER_ACTOR_ID);
+    });
+
+    it('RLS on the 6-2 tables: fail-closed; tenant-scoped reads; a foreign update touches nothing; foreign inserts refuse (42501)', async () => {
+      // The probe role (idempotent — the 6-1 arm created it).
+      await sql.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(${PROBE_LOCK})`;
+        await tx.unsafe(`
+          do $$ begin
+            if not exists (select from pg_roles where rolname = 'wms_rls_probe') then
+              create role wms_rls_probe login password 'wms_rls_probe' nosuperuser;
+            end if;
+          end $$;
+        `);
+        await tx.unsafe('grant usage on schema public to wms_rls_probe');
+        await tx.unsafe('grant select, insert, update, delete on all tables in schema public to wms_rls_probe');
+      });
+      const url = new URL(process.env.DATABASE_URL!);
+      url.username = 'wms_rls_probe';
+      url.password = 'wms_rls_probe';
+      const probe = postgres(url.toString(), { max: 1 });
+      try {
+        // Fail-closed: no tenant stamp → nothing visible.
+        for (const table of ['batch_alerts', 'expiry_alert_policies']) {
+          const unscoped = await probe.unsafe(
+            `select count(*)::int as n from ${table} where tenant_id = '${tenantId}'::uuid`,
+          );
+          expect(Number((unscoped[0] as unknown as { n: number }).n)).toBe(0);
+        }
+
+        // Tenant-stamped: batch alerts 4 (E1 ×2 resolved, A1 dismissed, E4
+        // open), config exactly 1.
+        const scopedAlerts = await probe.begin(async (tx) => {
+          await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+          return tx.unsafe(`select count(*)::int as n from batch_alerts where tenant_id = '${tenantId}'::uuid`);
+        });
+        expect(Number((scopedAlerts[0] as unknown as { n: number }).n)).toBe(4);
+        const scopedPolicies = await probe.begin(async (tx) => {
+          await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+          return tx.unsafe(`select count(*)::int as n from expiry_alert_policies where tenant_id = '${tenantId}'::uuid`);
+        });
+        expect(Number((scopedPolicies[0] as unknown as { n: number }).n)).toBe(1);
+
+        // A foreign-context UPDATE touches nothing.
+        const touched = await probe.begin(async (tx) => {
+          await tx`select set_config('app.tenant_id', ${tenantC.id}, true)`;
+          return tx.unsafe(
+            `update batch_alerts set status = 'resolved' where tenant_id = '${tenantId}'::uuid`,
+          );
+        });
+        expect(touched.count).toBe(0);
+
+        // Foreign-context INSERTs refuse at the row (WITH CHECK).
+        const foreignAlert = probe.begin(async (tx) => {
+          await tx`select set_config('app.tenant_id', ${tenantC.id}, true)`;
+          return tx.unsafe(
+            `insert into batch_alerts (id, tenant_id, warehouse_id, sku_id, batch_id, kind, status, created_at, updated_at)
+             values ('${uuidv7()}'::uuid, '${tenantId}'::uuid, '${warehouseId}'::uuid, '${skuIds.get('RP-EX')}'::uuid, '${await batchIdOf('E4')}'::uuid, 'expiry_upcoming', 'open', now(), now())`,
+          );
+        });
+        await expect(foreignAlert).rejects.toMatchObject({ code: '42501' });
+        const foreignPolicy = probe.begin(async (tx) => {
+          await tx`select set_config('app.tenant_id', ${tenantC.id}, true)`;
+          return tx.unsafe(
+            `insert into expiry_alert_policies (id, tenant_id, expiry_lead_days, aging_threshold_days, created_at, updated_at)
+             values ('${uuidv7()}'::uuid, '${tenantId}'::uuid, 1, 1, now(), now())`,
+          );
+        });
+        await expect(foreignPolicy).rejects.toMatchObject({ code: '42501' });
+      } finally {
+        await probe.end();
+      }
+    });
+
+    it('worker tick() against the REAL facades drives the scan beside the sweep: both kinds raised on the enumerated batch scope', async () => {
+      // Fresh batches on W1: E5 ages past the threshold (backdated intake, no
+      // expiry) → aged; E6 expires inside the lead with a fresh intake →
+      // expiry only. The tick's real scanScope raises both in one pass.
+      await adjustBatch({ warehouseId, skuId: skuIds.get('RP-AG')!, binId: binW1, quantityDelta: 2, batch: { code: 'E5' } });
+      await adjustBatch({ warehouseId, skuId: skuIds.get('RP-EX')!, binId: binW1, quantityDelta: 3, batch: { code: 'E6', expiryDate: daysFromNow(2) } });
+      await backdateBatch('E5', 45);
+
+      const worker = new ReplenishmentSchedulerWorker(app.get(AUTH_DATABASE) as never, replenishment);
+      await worker.tick();
+
+      const e5Id = await batchIdOf('E5');
+      const e6Id = await batchIdOf('E6');
+      const rows = await alertRows();
+      // The 4 standing rows + E5 aged + E6 expiry — AND a RE-RAISED aged row
+      // for A1: the dismissed alert does not suppress the scan (the breach
+      // precedent — the partial unique covers OPEN rows only, the sweep
+      // re-opens a fresh breach past a dismissal the same way). No dupes of
+      // the standing rows themselves.
+      expect(rows).toHaveLength(7);
+      const e5Row = rows.find((row) => row.batch_id === e5Id)!;
+      expect(e5Row.kind).toBe('aged');
+      expect(e5Row.age_days).toBe(45);
+      const e6Row = rows.find((row) => row.batch_id === e6Id)!;
+      expect(e6Row.kind).toBe('expiry_upcoming');
+      expect(rows.filter((row) => row.batch_id === e5Id)).toHaveLength(1);
+      const a1Id = await batchIdOf('A1');
+      const a1ReRaised = rows.filter(
+        (row) => row.batch_id === a1Id && row.status === 'open',
+      );
+      expect(a1ReRaised).toHaveLength(1);
+      expect(a1ReRaised[0]!.age_days).toBe(30);
+
+      const payloads = await outboxPayloads('replenishment.batch_alert_raised', tenantId);
+      expect(payloads).toHaveLength(7); // 4 raised by the hand-driven scans + 3 by the tick
+      expect(payloads.find((p) => p.batchId === e5Id)).toMatchObject({ kind: 'aged', ageDays: 45 });
+      expect(payloads.find((p) => p.batchId === e6Id)).toMatchObject({ kind: 'expiry_upcoming' });
+      const audits = await auditRows('replenishment.batch_alert_raised', tenantId);
+      expect(audits).toHaveLength(7);
+    });
+
+    it('the consumed-warehouse arm: a warehouse whose ONLY enumerator is its open alert (no reorder defaults, all stock consumed) still auto-resolves via the tick', async () => {
+      // Tenant D: one batch-tracked SKU with NO reorder defaults — neither the
+      // policies query nor the tenant-wide defaults query ever enumerates its
+      // warehouse. The batch-scope union's SECOND arm (batch_alerts where
+      // status='open') is what re-arms the auto-resolve after the last unit
+      // leaves the projection.
+      const dEmail = `owner-d-${ulid().toLowerCase()}@example.com`;
+      const dRegistered = await request(app.getHttpServer())
+        .post(API)
+        .set(KEY_HEADER, ulid())
+        .send({ name: `Expiry Only Co ${ulid()}`, ownerEmail: dEmail, password: 'correct-horse-battery' })
+        .expect(201);
+      const dTenant = dRegistered.body.tenant.id as string;
+      createdTenantIds.push(dTenant);
+      const dToken = (
+        await request(app.getHttpServer())
+          .post(`${API}/sign-in`)
+          .send({ email: dEmail, password: 'correct-horse-battery' })
+          .expect(200)
+      ).body.accessToken as string;
+      const dWh = (
+        await request(app.getHttpServer())
+          .post(`${API}/${dTenant}/warehouses`)
+          .set('Authorization', `Bearer ${dToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ origin: testAddress(), code: `RP-D-${ulid().slice(10, 16).toUpperCase()}`, name: 'Expiry WH' })
+          .expect(201)
+      ).body.id as string;
+      const dZone = (
+        await request(app.getHttpServer())
+          .post(`${API}/${dTenant}/warehouses/${dWh}/zones`)
+          .set('Authorization', `Bearer ${dToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code: 'A', name: 'Zone A' })
+          .expect(201)
+      ).body.id as string;
+      const dBin = (
+        await request(app.getHttpServer())
+          .post(`${API}/${dTenant}/warehouses/${dWh}/zones/${dZone}/bins`)
+          .set('Authorization', `Bearer ${dToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 10000, type: 'shelf', code: 'A-01-01' })
+          .expect(201)
+      ).body.id as string;
+      const dCsv = [
+        'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,catch_weight_tracked,reorder_point,reorder_qty,barcode,abc_class',
+        `RP-D1,Expiry Only,pcs,,1800,,true,false,false,,,,`,
+      ].join('\n');
+      await request(app.getHttpServer())
+        .post(`${API}/${dTenant}/catalog/imports`)
+        .set('Authorization', `Bearer ${dToken}`)
+        .set(KEY_HEADER, ulid())
+        .field('mode', 'initial')
+        .attach('file', Buffer.from(dCsv, 'utf8'), { filename: 'catalog-d.csv', contentType: 'text/csv' })
+        .expect(201);
+      const dSku = (
+        (
+          await request(app.getHttpServer())
+            .get(`${API}/${dTenant}/catalog/skus`)
+            .set('Authorization', `Bearer ${dToken}`)
+            .expect(200)
+        ).body.items as { code: string; id: string }[]
+      ).find((item) => item.code === 'RP-D1')!.id;
+      await app.get(InventoryFacade).rebuildReservationCounters(dTenant, dWh);
+      await request(app.getHttpServer())
+        .put(`${API}/${dTenant}/replenishment/expiry-policies`)
+        .set('Authorization', `Bearer ${dToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ expiryLeadDays: 3, agingThresholdDays: AGING_DAYS })
+        .expect(200);
+      const dAdjust = async (delta: number, batch: Record<string, unknown>): Promise<void> => {
+        await request(app.getHttpServer())
+          .post(`${API}/${dTenant}/inventory/adjustments`)
+          .set('Authorization', `Bearer ${dToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({
+            warehouseId: dWh,
+            skuId: dSku,
+            binId: dBin,
+            quantityDelta: delta,
+            reasonCode: 'stock-count',
+            note: 'tenant D expiry arm',
+            batch,
+          })
+          .expect(201);
+      };
+
+      // Seed a near-expiry batch (2 days out, inside the 3-day lead), then
+      // let the TICK raise it (the batch-scope half of the union enumerated
+      // the warehouse — nothing else could).
+      await dAdjust(4, { code: 'D1', expiryDate: daysFromNow(2) });
+      const worker = new ReplenishmentSchedulerWorker(app.get(AUTH_DATABASE) as never, replenishment);
+      await worker.tick();
+
+      const first = await sql`select id, status from batch_alerts where tenant_id = ${dTenant}::uuid`;
+      expect(first).toHaveLength(1);
+      const alertId = (first[0] as unknown as { id: string; status: string }).id;
+      expect((first[0] as unknown as { status: string }).status).toBe('open');
+
+      // Consume EVERYTHING — the warehouse now has no positive batch row, no
+      // reorder defaults and no policies. Only the open-alert arm of the
+      // union enumerates it; the next tick resolves the alert.
+      await dAdjust(-4, { code: 'D1', overrideReason: 'consume to zero' });
+      await worker.tick();
+
+      const second = await sql`
+        select status, resolved_by from batch_alerts
+        where tenant_id = ${dTenant}::uuid and id = ${alertId}::uuid`;
+      const resolved = second[0] as unknown as { status: string; resolved_by: string | null };
+      expect(resolved.status).toBe('resolved');
+      expect(resolved.resolved_by).toBeNull();
+      // The resolve emits no event — one raise event total for tenant D.
+      const dPayloads = await outboxPayloads('replenishment.batch_alert_raised', dTenant);
+      expect(dPayloads).toHaveLength(1);
+    });
+  });
 });
 
 // ── the worker shell (unit, the count scheduler's plumbing pattern) ─────────
@@ -1197,13 +1854,15 @@ describe('replenishment scheduler plumbing (unit, story 6-1)', () => {
   });
 
   /**
-   * An AUTH-database stub answering the tick's TWO enumeration reads: the
+   * An AUTH-database stub answering the tick's THREE enumeration reads: the
    * first call is the policies query, the second the tenant-wide defaults
-   * query (the worker alternates by call order).
+   * query, the third the batch-scope query (the worker alternates by call
+   * order; the batch scopes default to none).
    */
   function stubAuthDb(
     policyScopes: { tenantId: string; warehouseId: string }[],
     defaultScopes: { tenantId: string; warehouseId: string }[],
+    batchScopes: { tenantId: string; warehouseId: string }[] = [],
   ): { calls: number; execute(): Promise<unknown> } {
     let call = 0;
     return {
@@ -1212,23 +1871,27 @@ describe('replenishment scheduler plumbing (unit, story 6-1)', () => {
       },
       execute: async () => {
         call += 1;
-        // The tick alternates: odd calls are the policies query, even the defaults query.
-        return call % 2 === 1 ? policyScopes : defaultScopes;
+        // The tick rounds: 1 = the policies query, 2 = the defaults query, 0 = the batch scopes.
+        return call % 3 === 1 ? policyScopes : call % 3 === 2 ? defaultScopes : batchScopes;
       },
     };
   }
 
-  /** A facade stub recording sweep calls, able to hold one in flight. */
+  /** A facade stub recording sweep AND scan calls, able to hold one sweep in flight. */
   function stubFacade(): {
     calls: { tenantId: string; warehouseId: string }[];
+    scanCalls: { tenantId: string; warehouseId: string }[];
     hold: boolean;
     sweepScope(tenantId: string, warehouseId: string): Promise<unknown>;
+    scanScope(tenantId: string, warehouseId: string): Promise<unknown>;
     release(): void;
   } {
     const calls: { tenantId: string; warehouseId: string }[] = [];
+    const scanCalls: { tenantId: string; warehouseId: string }[] = [];
     let held: (() => void) | undefined;
     return {
       calls,
+      scanCalls,
       hold: false,
       async sweepScope(tenantId, warehouseId) {
         calls.push({ tenantId, warehouseId });
@@ -1238,6 +1901,10 @@ describe('replenishment scheduler plumbing (unit, story 6-1)', () => {
           });
         }
         return { tenantId, warehouseId, evaluated: 0, opened: 0, recovered: 0 };
+      },
+      async scanScope(tenantId, warehouseId) {
+        scanCalls.push({ tenantId, warehouseId });
+        return { tenantId, warehouseId, evaluated: 0, raised: 0, resolved: 0 };
       },
       release() {
         held?.();
@@ -1255,7 +1922,7 @@ describe('replenishment scheduler plumbing (unit, story 6-1)', () => {
     }
   });
 
-  it('tick() dedupes the two scope queries and sweeps every (tenant, warehouse) in deterministic order', async () => {
+  it('tick() dedupes the three scope queries and sweeps every (tenant, warehouse) in deterministic order', async () => {
     setEnv('20');
     const authDb = stubAuthDb(
       [
@@ -1266,17 +1933,25 @@ describe('replenishment scheduler plumbing (unit, story 6-1)', () => {
         { tenantId: 't-1', warehouseId: 'w-2' }, // the dedup arm
         { tenantId: 't-2', warehouseId: 'w-9' },
       ],
+      [
+        { tenantId: 't-1', warehouseId: 'w-1' }, // dupes of the batch scopes shed too
+        { tenantId: 't-3', warehouseId: 'w-7' },
+      ],
     );
     const facade = stubFacade();
     const worker = new ReplenishmentSchedulerWorker(authDb as never, facade as never);
     await worker.tick();
-    // Policy scopes first, then the defaults-only warehouses, dupes shed.
+    // Policy scopes first, then the defaults-only warehouses, then the batch
+    // scopes, dupes shed.
     expect(facade.calls).toEqual([
       { tenantId: 't-1', warehouseId: 'w-1' },
       { tenantId: 't-1', warehouseId: 'w-2' },
       { tenantId: 't-2', warehouseId: 'w-9' },
+      { tenantId: 't-3', warehouseId: 'w-7' },
     ]);
-    expect(authDb.calls).toBe(2);
+    expect(authDb.calls).toBe(3);
+    // Story 6-2: the expiry scan rode the SAME scope list, beside the sweep.
+    expect(facade.scanCalls).toEqual(facade.calls);
   });
 
   it('tick() carries at most MAX_REPLENISHMENT_SCOPES_PER_TICK scopes, logs the truncation loudly, and ROTATES the window so the tail is eventually swept', async () => {
@@ -1301,6 +1976,8 @@ describe('replenishment scheduler plumbing (unit, story 6-1)', () => {
       expect(warnSpy.mock.calls.map((call) => String(call[0])).join('\n')).toContain(
         `carried ${MAX_REPLENISHMENT_SCOPES_PER_TICK} of ${total}`,
       );
+      // The expiry scan rode the same capped window (story 6-2).
+      expect(facade.scanCalls).toEqual(facade.calls);
 
       // A head-only slice would sweep the same window forever — the window
       // ROTATES one scope per truncating tick, so the tail's tail (`w-209`)
@@ -1318,6 +1995,8 @@ describe('replenishment scheduler plumbing (unit, story 6-1)', () => {
       }
       expect(swept).toEqual(new Set(many.map((scope) => scope.warehouseId)));
       expect(ticks).toBeLessThanOrEqual(tailLength + 1);
+      // …and the scan walked the whole rotation beside the sweep.
+      expect(facade.scanCalls).toHaveLength(facade.calls.length);
 
       // …and every truncating tick kept the warn honest (never a head-only
       // slice lying that the tail waits for "the next tick").
@@ -1350,6 +2029,44 @@ describe('replenishment scheduler plumbing (unit, story 6-1)', () => {
         'Replenishment scheduler could not sweep warehouse w-1',
       );
       expect(calls).toEqual(['w-1', 'w-2']);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('the expiry scan gets its OWN failure domain: a poisoned sweep does not skip the scan and a poisoned scan does not skip the sweep', async () => {
+    setEnv('20');
+    const errorSpy = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const calls: { sweep: string[]; scan: string[] } = { sweep: [], scan: [] };
+    const flaky = {
+      async sweepScope(tenantId: string, warehouseId: string): Promise<unknown> {
+        calls.sweep.push(warehouseId);
+        if (warehouseId === 'w-1') {
+          throw new Error('valkey down');
+        }
+        return { tenantId, warehouseId, evaluated: 0, opened: 0, recovered: 0 };
+      },
+      async scanScope(tenantId: string, warehouseId: string): Promise<unknown> {
+        calls.scan.push(warehouseId);
+        if (warehouseId === 'w-2') {
+          throw new Error('catalog down');
+        }
+        return { tenantId, warehouseId, evaluated: 0, raised: 0, resolved: 0 };
+      },
+    };
+    const worker = new ReplenishmentSchedulerWorker(
+      stubAuthDb([{ tenantId: 't-1', warehouseId: 'w-1' }, { tenantId: 't-1', warehouseId: 'w-2' }], []) as never,
+      flaky as never,
+    );
+    try {
+      await worker.tick();
+      // Both evaluations ran for BOTH scopes — each in its own try/catch, so
+      // the sweep's failure never skips the scan and vice versa.
+      expect(calls.sweep).toEqual(['w-1', 'w-2']);
+      expect(calls.scan).toEqual(['w-1', 'w-2']);
+      const errors = errorSpy.mock.calls.map((call) => String(call[0])).join('\n');
+      expect(errors).toContain('Replenishment scheduler could not sweep warehouse w-1');
+      expect(errors).toContain('Replenishment scheduler could not scan warehouse w-2');
     } finally {
       errorSpy.mockRestore();
     }

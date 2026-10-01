@@ -9,6 +9,7 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/
 import { UUID_RE } from '../shared/primitives/ids';
 import { ReplenishmentFacade } from '../modules/replenishment/replenishment.facade';
 import type {
+  ListBatchAlertsQuery,
   ListBreachesQuery,
   ListReorderPoliciesQuery,
   ListSuggestedPosQuery,
@@ -17,9 +18,13 @@ import type {
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
+  BatchAlertListQuery,
+  BatchAlertListResponse,
+  BatchAlertResponse,
   BreachListQuery,
   BreachListResponse,
   BreachResponse,
+  ExpiryPolicyResponse,
   ReorderPolicyListQuery,
   ReorderPolicyListResponse,
   ReorderPolicyResponse,
@@ -27,6 +32,7 @@ import {
   SubmitSuggestedPoResponse,
   SuggestedPoListQuery,
   SuggestedPoListResponse,
+  UpsertExpiryPolicyDto,
   UpsertReorderPolicyDto,
 } from '../modules/replenishment/replenishment.dto';
 
@@ -304,10 +310,148 @@ export class ReplenishmentController {
       purchaseOrder: { ...result.purchaseOrder },
     };
   }
+
+  @Get(':tenantId/replenishment/expiry-policies')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Reads the tenant's expiry/aging config — 404 when ABSENT (the absent-row = disabled convention; open to any member)",
+  })
+  @ApiOkResponse({ type: ExpiryPolicyResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The tenant has no expiry/aging config row — the alerts are disabled — (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async getExpiryPolicy(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ExpiryPolicyResponse> {
+    assertOwnTenant(session, tenantId);
+    const snapshot = await this.replenishment.getExpiryPolicy(tenantId);
+    if (snapshot === null) {
+      // The absent-row convention: NO default days hide behind a missing row
+      // — the read states the disable, it never invents values.
+      throw new ProblemException(
+        'not-found',
+        404,
+        'No expiry/aging policy configured',
+        'This tenant has no expiry/aging policy row — expiry and aging alerting is disabled until one is upserted.',
+      );
+    }
+    return { expiryPolicy: { ...snapshot } };
+  }
+
+  @Put(':tenantId/replenishment/expiry-policies')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Upserts the tenant\'s expiry/aging config (replenishment.manage) — last-write-wins; both day counts ≥ 0' })
+  @ApiBody({ type: UpsertExpiryPolicyDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.OK,
+    type: ExpiryPolicyResponse,
+    description: 'The config row (created or overwritten — the idempotency snapshot)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a negative / non-integer expiryLeadDays or agingThresholdDays (validation-failed, naming the field)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks replenishment.manage (role-denied)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent write of the same tenant\'s config (conflict), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async upsertExpiryPolicy(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UpsertExpiryPolicyDto,
+  ): Promise<ExpiryPolicyResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.replenishment.upsertExpiryPolicy(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        expiryLeadDays: dto.expiryLeadDays,
+        agingThresholdDays: dto.agingThresholdDays,
+      },
+      key,
+    );
+    return { expiryPolicy: { ...snapshot } };
+  }
+
+  @Get(':tenantId/replenishment/batch-alerts')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Lists the tenant's batch alerts (the expiry/aging queue), kind/status/warehouse-filterable (keyset cursor pagination — open to any member); each row's on-hand is re-read live",
+  })
+  @ApiOkResponse({ type: BatchAlertListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed kind, status, cursor, or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('A filtered warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async listBatchAlerts(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: BatchAlertListQuery,
+  ): Promise<BatchAlertListResponse> {
+    assertOwnTenant(session, tenantId);
+    const listQuery: ListBatchAlertsQuery = {
+      kind: query.kind,
+      status: query.status,
+      warehouseId: query.warehouseId,
+      cursor: query.cursor,
+      limit: query.limit,
+    };
+    const page = await this.replenishment.listBatchAlerts(tenantId, listQuery);
+    return { items: page.items, nextCursor: page.nextCursor };
+  }
+
+  @Post(':tenantId/replenishment/batch-alerts/:alertId/dismiss')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Dismisses an OPEN batch alert (replenishment.manage) — no stock-side effect; the alert is evidence' })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.OK,
+    type: BatchAlertResponse,
+    description: 'The dismissed batch alert row (the idempotency snapshot)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed alertId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks replenishment.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No batch alert with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The alert is not open (batch-alert-not-open, naming the status), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'alertId', format: 'uuid' })
+  async dismissBatchAlert(
+    @Param('tenantId') tenantId: string,
+    @Param('alertId') alertId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<BatchAlertResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(alertId, 'alertId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const entry = await this.replenishment.dismissBatchAlert(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        alertId,
+      },
+      key,
+    );
+    return { batchAlert: { ...entry } };
+  }
 }
 
 /** Replenishment uuid path params fail 400 (not a 500 from the `::uuid` cast). */
-function assertUuidParam(value: string, name: 'policyId' | 'breachId' | 'draftId'): void {
+function assertUuidParam(value: string, name: 'policyId' | 'breachId' | 'draftId' | 'alertId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

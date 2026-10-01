@@ -3,11 +3,16 @@ import { and, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import type {
+  BATCH_ALERT_KINDS,
+  BATCH_ALERT_STATUSES,
   REPLENISHMENT_BREACH_STATUSES,
   SUGGESTED_PO_STATUSES} from '../../shared/db/schema';
 import {
   auditEvents,
+  batchAlerts,
+  expiryAlertPolicies,
   idempotencyKeys,
+  MAX_ALERT_CONFIG_DAYS,
   reorderBreaches,
   reorderPolicies,
   suggestedPos
@@ -52,6 +57,7 @@ export const MAX_REPLENISHMENT_MILLI = MAX_QUANTITY_MILLI;
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 const POLICY_UNIQUE = 'reorder_policies_tenant_warehouse_sku_unique';
+const EXPIRY_POLICY_UNIQUE = 'expiry_alert_policies_tenant_unique';
 
 export interface UpsertReorderPolicyCommand {
   readonly tenantId: string;
@@ -135,6 +141,49 @@ export interface SubmitSuggestedPoResult {
   readonly purchaseOrder: PurchaseOrderSnapshot['purchaseOrder'];
 }
 
+export interface UpsertExpiryPolicyCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  /** Lead days before `batches.expiry_date` an expiry alert opens — ≥ 0. */
+  readonly expiryLeadDays: number;
+  /** Batch age since intake that raises an `aged` alert — ≥ 0. */
+  readonly agingThresholdDays: number;
+}
+
+/** One tenant's expiry/aging config as every read returns it. */
+export interface ExpiryPolicySnapshot {
+  readonly expiryLeadDays: number;
+  readonly agingThresholdDays: number;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface DismissBatchAlertCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly alertId: string;
+}
+
+/**
+ * One batch-alert row as every read returns it — the alert instant is
+ * `detectedAt` (the shared `created_at`, the breach-row's `breachAt`
+ * divergence applied to 6.2's vocabulary). The queue's LIVE on-hand is
+ * stitched in by the facade read (`onHandMilli`), never a stored number.
+ */
+export interface BatchAlertEntry {
+  readonly id: string;
+  readonly warehouseId: string;
+  readonly skuId: string;
+  readonly batchId: string;
+  readonly kind: (typeof BATCH_ALERT_KINDS)[number];
+  readonly status: (typeof BATCH_ALERT_STATUSES)[number];
+  /** FROZEN at detection — `aged` rows only (null on `expiry_upcoming`). */
+  readonly ageDays: number | null;
+  readonly detectedAt: string;
+  readonly resolvedAt: string | null;
+  readonly resolvedBy: string | null;
+}
+
 /**
  * The one milli-quantity conversion at the replenishment write edge: an
  * integer of milli-units, strictly positive, inside the exact range. The
@@ -157,6 +206,32 @@ export function assertPositiveMilli(value: number, field: string): number {
       400,
       `${field} is outside the exact quantity range`,
       `${field} must be at most ${MAX_REPLENISHMENT_MILLI} milli-units (got ${value}).`,
+    );
+  }
+  return value;
+}
+
+/**
+ * The config days' one validation at the command edge: a whole-day integer,
+ * ≥ 0 (0 admits a live threshold — the spec's stated grammar), inside the
+ * int4 storage bound the column carries. The refusal names the field (the
+ * I/O matrix's arm), and fires at the edge, behind the replay lookup.
+ */
+export function assertNonNegativeDays(value: number, field: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      `${field} must be a non-negative whole-day integer`,
+      `${field} is a day count — a whole number ≥ 0 was expected (got ${String(value)}).`,
+    );
+  }
+  if (value > MAX_ALERT_CONFIG_DAYS) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      `${field} is outside the storable range`,
+      `${field} must be at most ${MAX_ALERT_CONFIG_DAYS} days (got ${value}).`,
     );
   }
   return value;
@@ -251,6 +326,8 @@ export async function loadBreachInTenant(
 type ReorderBreachRow = typeof reorderBreaches.$inferSelect;
 type ReorderPolicyRow = typeof reorderPolicies.$inferSelect;
 type SuggestedPoRow = typeof suggestedPos.$inferSelect;
+type BatchAlertRow = typeof batchAlerts.$inferSelect;
+type ExpiryAlertPolicyRow = typeof expiryAlertPolicies.$inferSelect;
 
 export function policySnapshot(row: ReorderPolicyRow): ReorderPolicySnapshot {
   return {
@@ -295,6 +372,58 @@ export function suggestedPoEntry(row: SuggestedPoRow): SuggestedPoEntry {
     submittedPoId: row.submittedPoId,
     createdAt: canonicalInstant(row.createdAt),
     updatedAt: canonicalInstant(row.updatedAt),
+  };
+}
+
+/** The batch-alert row of a mutation, locked against concurrent transitions (the loadBreachInTenant shape). */
+export async function loadBatchAlertInTenant(
+  tx: TenantTx,
+  tenantId: string,
+  alertId: string,
+): Promise<BatchAlertRow> {
+  const rows = await tx
+    .select()
+    .from(batchAlerts)
+    .where(and(eq(batchAlerts.tenantId, tenantId), eq(batchAlerts.id, alertId)))
+    .limit(1)
+    .for('update');
+  const row = rows[0];
+  if (row === undefined) {
+    throw new ProblemException(
+      'not-found',
+      404,
+      'Batch alert not found',
+      `No batch alert with id "${alertId}" exists in this tenant.`,
+    );
+  }
+  return row;
+}
+
+export function expiryPolicySnapshot(row: ExpiryAlertPolicyRow): ExpiryPolicySnapshot {
+  return {
+    expiryLeadDays: row.expiryLeadDays,
+    agingThresholdDays: row.agingThresholdDays,
+    createdAt: canonicalInstant(row.createdAt),
+    updatedAt: canonicalInstant(row.updatedAt),
+  };
+}
+
+export function batchAlertEntry(row: BatchAlertRow): BatchAlertEntry {
+  return {
+    id: row.id,
+    warehouseId: row.warehouseId,
+    skuId: row.skuId,
+    batchId: row.batchId,
+    // The columns are text; the 0049 CHECKs narrow them to the tuples — the
+    // casts lean on that database guarantee (and on the scan's inserts).
+    kind: row.kind as (typeof BATCH_ALERT_KINDS)[number],
+    status: row.status as (typeof BATCH_ALERT_STATUSES)[number],
+    ageDays: row.ageDays,
+    // The alert instant lives in the shared `created_at` (the breach naming
+    // divergence, applied to 6.2's vocabulary).
+    detectedAt: canonicalInstant(row.createdAt),
+    resolvedAt: row.resolvedAt === null ? null : canonicalInstant(row.resolvedAt),
+    resolvedBy: row.resolvedBy,
   };
 }
 
@@ -772,6 +901,168 @@ export class ReplenishmentCommand {
       };
       await writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, result);
       return result;
+    });
+  }
+
+  /**
+   * PUT …/replenishment/expiry-policies — the tenant's expiry/aging config,
+   * last-write-wins (the variance-policy precedent): the existing row locked
+   * `.for('update')`, insert-with-unique-violation-409 / update. There is no
+   * DELETE — "GET reads 404 when absent" is the absent-row family's shape,
+   * and a tenant that wants the arms effectively off writes wide values (both
+   * ≥ 0 are admitted; 0 stays a threshold, not an off switch). Audit:
+   * `replenishment.expiry_policy_upserted`.
+   */
+  async upsertExpiryPolicy(
+    command: UpsertExpiryPolicyCommand,
+    idempotencyKey: string,
+  ): Promise<ExpiryPolicySnapshot> {
+    // The day counts validate at the edge, behind the replay lookup below:
+    // a negative day count is the 400 naming the field.
+    assertNonNegativeDays(command.expiryLeadDays, 'expiryLeadDays');
+    assertNonNegativeDays(command.agingThresholdDays, 'agingThresholdDays');
+    const payloadHash = hashCommandPayload({
+      tenantId: command.tenantId,
+      expiryLeadDays: command.expiryLeadDays,
+      agingThresholdDays: command.agingThresholdDays,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(
+        await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+        'replenishment.manage',
+      );
+
+      const stored = await replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (stored !== null) {
+        return stored as ExpiryPolicySnapshot;
+      }
+
+      // The race-loser 409 shape (the reorder-policy upsert's): the unique
+      // (tenant_id) index is the backstop, the locked existing row the path.
+      const existing = await tx
+        .select()
+        .from(expiryAlertPolicies)
+        .where(eq(expiryAlertPolicies.tenantId, command.tenantId))
+        .limit(1)
+        .for('update');
+      let written: ExpiryAlertPolicyRow | undefined;
+      if (existing[0] === undefined) {
+        try {
+          const rows = await tx
+            .insert(expiryAlertPolicies)
+            .values({
+              id: uuidv7(),
+              tenantId: command.tenantId,
+              expiryLeadDays: command.expiryLeadDays,
+              agingThresholdDays: command.agingThresholdDays,
+            })
+            .returning();
+          written = rows[0];
+        } catch (err) {
+          if (isUniqueViolationOn(err, EXPIRY_POLICY_UNIQUE)) {
+            throw new ProblemException(
+              'conflict',
+              409,
+              'Concurrent expiry-policy write',
+              'The expiry/aging policy is being written concurrently; retry to read the settled result.',
+            );
+          }
+          throw err;
+        }
+      } else {
+        written = (
+          await tx
+            .update(expiryAlertPolicies)
+            .set({
+              expiryLeadDays: command.expiryLeadDays,
+              agingThresholdDays: command.agingThresholdDays,
+              updatedAt: nowIso(),
+            })
+            .where(eq(expiryAlertPolicies.id, existing[0].id))
+            .returning()
+        )[0];
+      }
+      const policy = written!;
+
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'replenishment.expiry_policy_upserted',
+        targetType: 'expiry_alert_policy',
+        targetId: policy.id,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
+
+      const snapshot = expiryPolicySnapshot(policy);
+      await writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /**
+   * POST …/replenishment/batch-alerts/:alertId/dismiss — the human's dismissal
+   * arm on a batch alert. The alert must be `open` (`batch-alert-not-open` 409
+   * otherwise — every terminal state is terminal). NO stock-side effect: the
+   * alert is evidence, and dismissal discards evidence, never stock. Audit:
+   * `replenishment.batch_alert_dismissed`.
+   */
+  async dismissBatchAlert(
+    command: DismissBatchAlertCommand,
+    idempotencyKey: string,
+  ): Promise<BatchAlertEntry> {
+    const payloadHash = hashCommandPayload({
+      tenantId: command.tenantId,
+      alertId: command.alertId,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(
+        await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+        'replenishment.manage',
+      );
+
+      const stored = await replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (stored !== null) {
+        return stored as BatchAlertEntry;
+      }
+
+      const alert = await loadBatchAlertInTenant(tx, command.tenantId, command.alertId);
+      if (alert.status !== 'open') {
+        throw new ProblemException(
+          'batch-alert-not-open',
+          409,
+          'Batch alert is not open',
+          `Batch alert "${alert.id}" is ${alert.status} — only an open batch alert can be dismissed.`,
+        );
+      }
+      const resolvedAt = nowIso();
+      await tx
+        .update(batchAlerts)
+        .set({ status: 'dismissed', resolvedAt, resolvedBy: command.actorUserId, updatedAt: resolvedAt })
+        .where(eq(batchAlerts.id, alert.id));
+
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'replenishment.batch_alert_dismissed',
+        targetType: 'batch_alert',
+        targetId: alert.id,
+        reference: idempotencyKey,
+        occurredAt: resolvedAt,
+      });
+
+      const entry: BatchAlertEntry = {
+        ...batchAlertEntry(alert),
+        status: 'dismissed',
+        resolvedAt,
+        resolvedBy: command.actorUserId,
+      };
+      await writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, entry);
+      return entry;
     });
   }
 

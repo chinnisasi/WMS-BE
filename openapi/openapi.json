@@ -12880,6 +12880,436 @@
           "replenishment"
         ]
       }
+    },
+    "/tenants/{tenantId}/replenishment/expiry-policies": {
+      "get": {
+        "operationId": "ReplenishmentController_getExpiryPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExpiryPolicyResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The tenant has no expiry/aging config row — the alerts are disabled — (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Reads the tenant's expiry/aging config — 404 when ABSENT (the absent-row = disabled convention; open to any member)",
+        "tags": [
+          "replenishment"
+        ]
+      },
+      "put": {
+        "operationId": "ReplenishmentController_upsertExpiryPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpsertExpiryPolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The config row (created or overwritten — the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExpiryPolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a negative / non-integer expiryLeadDays or agingThresholdDays (validation-failed, naming the field)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks replenishment.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent write of the same tenant's config (conflict), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Upserts the tenant's expiry/aging config (replenishment.manage) — last-write-wins; both day counts ≥ 0",
+        "tags": [
+          "replenishment"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/replenishment/batch-alerts": {
+      "get": {
+        "operationId": "ReplenishmentController_listBatchAlerts",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "kind",
+            "required": false,
+            "in": "query",
+            "description": "Only alerts of one kind (the queue's kind filter — a batch can carry both)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "expiry_upcoming",
+                "aged"
+              ]
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Only alerts of one status (the lifecycle tabs; the ops queue reads open)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "open",
+                "resolved",
+                "dismissed"
+              ]
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Only one warehouse's alerts",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchAlertListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed kind, status, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "A filtered warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's batch alerts (the expiry/aging queue), kind/status/warehouse-filterable (keyset cursor pagination — open to any member); each row's on-hand is re-read live",
+        "tags": [
+          "replenishment"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/replenishment/batch-alerts/{alertId}/dismiss": {
+      "post": {
+        "operationId": "ReplenishmentController_dismissBatchAlert",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "alertId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The dismissed batch alert row (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchAlertResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed alertId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks replenishment.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No batch alert with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The alert is not open (batch-alert-not-open, naming the status), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Dismisses an OPEN batch alert (replenishment.manage) — no stock-side effect; the alert is evidence",
+        "tags": [
+          "replenishment"
+        ]
+      }
     }
   },
   "info": {
@@ -22150,6 +22580,167 @@
         "required": [
           "suggestedPoId",
           "purchaseOrder"
+        ]
+      },
+      "ExpiryPolicyDto": {
+        "type": "object",
+        "properties": {
+          "expiryLeadDays": {
+            "type": "number",
+            "description": "Lead days before a batch's expiry an `expiry_upcoming` alert opens"
+          },
+          "agingThresholdDays": {
+            "type": "number",
+            "description": "Batch age since intake that raises an `aged` alert"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last-write time"
+          }
+        },
+        "required": [
+          "expiryLeadDays",
+          "agingThresholdDays",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "ExpiryPolicyResponse": {
+        "type": "object",
+        "properties": {
+          "expiryPolicy": {
+            "$ref": "#/components/schemas/ExpiryPolicyDto"
+          }
+        },
+        "required": [
+          "expiryPolicy"
+        ]
+      },
+      "UpsertExpiryPolicyDto": {
+        "type": "object",
+        "properties": {
+          "expiryLeadDays": {
+            "type": "number",
+            "description": "Lead days before a batch's expiry an `expiry_upcoming` alert opens (already-expired batches qualify at every lead). Whole-day integer ≥ 0.",
+            "minimum": 0,
+            "maximum": 2147483647
+          },
+          "agingThresholdDays": {
+            "type": "number",
+            "description": "Batch age since intake (`batches.created_at`) that raises an `aged` alert. Whole-day integer ≥ 0.",
+            "minimum": 0,
+            "maximum": 2147483647
+          }
+        },
+        "required": [
+          "expiryLeadDays",
+          "agingThresholdDays"
+        ]
+      },
+      "BatchAlertDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The alerted batch (the click-through target)"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "expiry_upcoming",
+              "aged"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "resolved",
+              "dismissed"
+            ]
+          },
+          "ageDays": {
+            "type": "number",
+            "nullable": true,
+            "description": "Batch age in days FROZEN at detection (`aged` rows only; null on expiry rows)"
+          },
+          "onHandMilli": {
+            "type": "number",
+            "description": "The LIVE batch on-hand for this scope, milli-units — re-read at read time, never stored. Carried on LIST rows; absent on the dismissal snapshot."
+          },
+          "detectedAt": {
+            "type": "string",
+            "description": "The detection instant (ISO-8601 UTC) — the row's creation time"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Resolution instant, null while open"
+          },
+          "resolvedBy": {
+            "type": "string",
+            "nullable": true,
+            "description": "The dismisser's user id, null while open (and on auto-resolve — nobody acted)"
+          }
+        },
+        "required": [
+          "id",
+          "warehouseId",
+          "skuId",
+          "batchId",
+          "kind",
+          "status",
+          "ageDays",
+          "onHandMilli",
+          "detectedAt",
+          "resolvedAt",
+          "resolvedBy"
+        ]
+      },
+      "BatchAlertListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchAlertDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "BatchAlertResponse": {
+        "type": "object",
+        "properties": {
+          "batchAlert": {
+            "$ref": "#/components/schemas/BatchAlertDto"
+          }
+        },
+        "required": [
+          "batchAlert"
         ]
       }
     }

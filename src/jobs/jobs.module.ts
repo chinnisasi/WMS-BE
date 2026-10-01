@@ -402,25 +402,31 @@ export class CountSchedulerWorker implements OnApplicationBootstrap, OnApplicati
 }
 
 /**
- * The replenishment scheduler worker (story 6.1): an interval poll loop over
- * `ReplenishmentFacade.sweepScope(tenantId, warehouseId)` — FR-22's detection
- * loop. One tick enumerates every (tenant, warehouse) scope that OWNS a
- * reorder state, cross-tenant, as TWO queries (the spec's "two queries, not
- * one guess"): the per-warehouse policy scopes, UNION the warehouses of every
+ * The replenishment scheduler worker (stories 6.1 + 6.2): an interval poll
+ * loop over the per-scope entries of `ReplenishmentFacade` — the breach sweep
+ * (`sweepScope`) and, beside it on the SAME tick, the expiry/aging scan
+ * (`scanScope`) — FR-22's detection loop and FR-23's, one scheduler. One tick
+ * enumerates every (tenant, warehouse) scope that OWNS a reorder state or a
+ * batch alert source, cross-tenant, as THREE queries (the spec's "queries,
+ * not one guess"): the per-warehouse policy scopes, the warehouses of every
  * tenant carrying any SKU default > 0 (a tenant configuring only the
  * tenant-wide SKU columns must still be swept against each of its
- * warehouses). The tick's scope loop carries a per-tick cap
+ * warehouses), and every warehouse carrying batch on-hand on a batch-tracked
+ * SKU UNION an open batch alert (the consumed-warehouse arm). The tick's
+ * scope loop carries a per-tick cap
  * (`MAX_REPLENISHMENT_SCOPES_PER_TICK`, the count scheduler's
  * `MAX_SCHEDULED_TASKS_PER_TICK` precedent) with a truncation log line — and
  * the truncating ticks ROTATE the window (a head-only slice would starve the
  * enumerated tail forever, the order being deterministic), so scopes past the
  * cap are delayed a few ticks, never forgotten, and the frozen ≤5-min
  * visibility bound stays honest at scope counts larger
- * than one tick can carry. Each scope is all-or-nothing (the sweep's own
- * transactions); a poison scope is logged and retried next tick — a failure
- * never starves the rest, and a Valkey-down ATP read skips its scope rather
- * than ever reading 0. Env-gated OFF when `REPLENISHMENT_SCHEDULER_POLL_MS`
- * is unset/`0` (tests drive the facade directly and one plumbing test drives
+ * than one tick can carry. Each scope is all-or-nothing per evaluation (the
+ * sweep's and the scan's own transactions; the scan has its OWN catch — a
+ * failing sweep never skips the scan); a poison scope is logged and retried
+ * next tick — a failure never starves the rest, and a Valkey-down ATP read
+ * skips its sweep rather than ever reading 0. Env-gated OFF when
+ * `REPLENISHMENT_SCHEDULER_POLL_MS` is unset/`0` (tests drive the facades
+ * directly and one plumbing test drives
  * `tick()` itself), shed via the in-process `running` flag, `unref`'d timer,
  * and a shutdown hook.
  */
@@ -472,7 +478,9 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
     }
     this.running = true;
     try {
-      // ── the two scope queries (the spec's "two queries, not one guess") ──
+      // ── the three scope queries (6.1's "two queries, not one guess", plus
+      // 6.2's third: the expiry scan rides the SAME tick — "a scope, a query,
+      // and one call") ──
       // 1. every warehouse owning a per-warehouse reorder policy;
       const policyScopes = (await this.authDb.execute(sql`
         select distinct on (tenant_id, warehouse_id)
@@ -491,11 +499,34 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
         where s.reorder_point > 0 or s.reorder_qty > 0
         order by w.tenant_id asc, w.id asc
       `)) as unknown as { tenantId: string; warehouseId: string }[];
+      // 3. every warehouse carrying batch on-hand on a BATCH-TRACKED SKU
+      //    (the expiry scan's alert sources — the projection's positive rows
+      //    are the only scopes a batch alert can detect against), UNION every
+      //    warehouse with an OPEN batch alert — the consumed-warehouse arm:
+      //    once a warehouse's LAST positive batch row is gone its on-hand
+      //    query would never name it again, and the auto-resolve of its open
+      //    alerts (on-hand 0) would never run. The union keeps them swept
+      //    until every alert settles. The dedupe map below absorbs any
+      //    overlap with queries 1-2.
+      const batchScopes = (await this.authDb.execute(sql`
+        select tenant_id as "tenantId", warehouse_id as "warehouseId" from (
+          select bo.tenant_id, bo.warehouse_id
+          from batch_on_hand bo
+          join skus s on s.tenant_id = bo.tenant_id and s.id = bo.sku_id
+          where bo.quantity > 0 and s.batch_tracked
+          union
+          select a.tenant_id, a.warehouse_id
+          from batch_alerts a
+          where a.status = 'open'
+        ) scopes
+        order by tenant_id asc, warehouse_id asc
+      `)) as unknown as { tenantId: string; warehouseId: string }[];
 
       // Deduped union, deterministic order (policy scopes first — a
-      // configured override is the sharpest alert source — then defaults).
+      // configured override is the sharpest alert source — then defaults,
+      // then batch-scope sources).
       const scopes = new Map<string, { tenantId: string; warehouseId: string }>();
-      for (const scope of [...policyScopes, ...defaultScopes]) {
+      for (const scope of [...policyScopes, ...defaultScopes, ...batchScopes]) {
         scopes.set(`${scope.tenantId}|${scope.warehouseId}`, scope);
       }
       const ordered = [...scopes.values()];
@@ -519,15 +550,26 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
       }
 
       for (const scope of carried) {
-        // One scope = the sweep's own tenant transactions — all-or-nothing
-        // per phase. A poison scope (a repeatedly failing tx, or a Valkey
-        // down mid-read) must not starve the rest — log and retry next
-        // tick, the count scheduler's per-scope rationale.
+        // One scope = each evaluation's own tenant transactions —
+        // all-or-nothing per phase. A poison scope (a repeatedly failing tx,
+        // or a Valkey down mid-ATP) must not starve the rest — log and retry
+        // next tick, the count scheduler's per-scope rationale.
         try {
           await this.replenishment.sweepScope(scope.tenantId, scope.warehouseId);
         } catch (error) {
           this.logger.error(
             `Replenishment scheduler could not sweep warehouse ${scope.warehouseId} — skipped this cycle: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        // The expiry/aging scan rides the SAME tick, its OWN catch: a sweep
+        // failure (a Valkey down) must not skip the expiry scan — the two
+        // evaluations share a scope, never a failure domain.
+        try {
+          await this.replenishment.scanScope(scope.tenantId, scope.warehouseId);
+        } catch (error) {
+          this.logger.error(
+            `Replenishment scheduler could not scan warehouse ${scope.warehouseId} for expiry/aging — skipped this cycle: ` +
               `${error instanceof Error ? error.message : String(error)}`,
           );
         }
