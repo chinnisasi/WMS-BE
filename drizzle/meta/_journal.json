@@ -351,6 +351,13 @@
       "when": 1790824175407,
       "tag": "0049_expiry_alerts",
       "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1790831973852,
+      "tag": "0050_channels_integrations",
+      "breakpoints": true
     }
   ]
 }

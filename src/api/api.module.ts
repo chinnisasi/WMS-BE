@@ -8,6 +8,7 @@ import { OutboundController } from './outbound.controller';
 import { ReceivingController } from './receiving.controller';
 import { PutawayController } from './putaway.controller';
 import { CarriersController } from './carriers.controller';
+import { ChannelsController } from './channels.controller';
 import { ComplianceController } from './compliance.controller';
 import { MovementsController } from './movements.controller';
 import { OpenApiController } from './openapi.controller';
@@ -23,6 +24,7 @@ import { CatalogModule } from '../modules/catalog/catalog.module';
 import { TenancyModule } from '../modules/tenancy/tenancy.module';
 import { MovementsModule } from '../modules/movements/movements.module';
 import { ReplenishmentModule } from '../modules/replenishment/replenishment.module';
+import { ChannelsModule } from '../modules/channels/channels.module';
 import { ReplenishmentController } from './replenishment.controller';
 
 /**
@@ -60,7 +62,7 @@ import { ReplenishmentController } from './replenishment.controller';
  * response DTO, so the shell has nothing to redact.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, MovementsModule, ReplenishmentModule],
+  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, MovementsModule, ReplenishmentModule, ChannelsModule],
   controllers: [
     HealthController,
     EchoController,
@@ -84,6 +86,11 @@ import { ReplenishmentController } from './replenishment.controller';
     // `ReplenishmentModule` is a spine-singleton already imported by the
     // root; every mutation goes through `ReplenishmentFacade`.
     ReplenishmentController,
+    // Story 7-1 — the channels surface (connections, buffers, sync health)
+    // rides the same shape: `ChannelsModule` is a spine-singleton already
+    // imported by the root; every mutation goes through
+    // `ChannelsCommandService` / `ChannelsFacade`.
+    ChannelsController,
     OpenApiController,
     NotFoundController,
   ],

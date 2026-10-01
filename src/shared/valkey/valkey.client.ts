@@ -1,6 +1,9 @@
 import { Injectable, type OnApplicationShutdown } from '@nestjs/common';
 import Redis from 'ioredis';
-import { RESERVATION_GRANT_SCRIPT, RESERVATION_RELEASE_SCRIPT } from './reservation-scripts';
+import {
+  RESERVATION_GRANT_SCRIPT,
+  RESERVATION_RELEASE_SCRIPT,
+} from './reservation-scripts';
 
 /** One grant-script reply: `[win(0|1), newReserved | reason]`. */
 export type GrantReply = [win: 0 | 1, rest: string];

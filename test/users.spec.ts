@@ -851,8 +851,11 @@ describe('users, roles, and permission gating (e2e)', () => {
     // threshold stamp, not a capability split); story 6-1 grows it to 32 with
     // `replenishment.manage` — owner + ops_manager (the planning set: the
     // policy writes, breach dismissal, and suggested-PO submit; reads are
-    // never gated).
-    expect([...CAPABILITIES]).toHaveLength(32);
+    // never gated); story 7-1 grows it to 33 with `channel.manage` — owner +
+    // ops_manager (the channels vault: connect/rotate/disconnect/buffers are
+    // credential- and margin-touching planner verbs, not floor verbs, and
+    // not accounting).
+    expect([...CAPABILITIES]).toHaveLength(33);
     expect(CAPABILITIES).toContain('secure.move');
     expect(secureMoveHolders).toEqual(['owner', 'ops_manager']);
     expect(CAPABILITIES).toContain('adjustments.approve');
@@ -891,6 +894,11 @@ describe('users, roles, and permission gating (e2e)', () => {
     for (const role of replenishmentHolders) {
       expect(ROLE_CAPABILITIES[role].has('po.manage')).toBe(true);
     }
+    expect(CAPABILITIES).toContain('channel.manage');
+    expect(ROLE_CAPABILITIES.owner.has('channel.manage')).toBe(true);
+    expect(ROLE_CAPABILITIES.ops_manager.has('channel.manage')).toBe(true);
+    expect(ROLE_CAPABILITIES.operator.has('channel.manage')).toBe(false);
+    expect(ROLE_CAPABILITIES.accountant.has('channel.manage')).toBe(false);
     expect(ROLE_CAPABILITIES.operator.has('putaway.execute')).toBe(true);
     expect(ROLE_CAPABILITIES.operator.has('picks.execute')).toBe(true);
     expect(ROLE_CAPABILITIES.operator.has('excursion.record')).toBe(true);

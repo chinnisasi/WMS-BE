@@ -2,7 +2,7 @@ import type { ModuleMetadata, Provider } from '@nestjs/common';
 import { Module } from '@nestjs/common';
 import { APP_FILTER } from '@nestjs/core';
 import { createLazyAuthDatabase, createLazyDatabase } from './db/db';
-import { EVENT_BUS, LoggingEventBus } from './events/event-bus';
+import { EVENT_BUS, RoutedEventBus } from './events/event-bus';
 import { OUTBOX_RELAY, OUTBOX_SINK } from './events/outbox.seam';
 import { PostgresOutboxRelay, PostgresOutboxSink } from './events/outbox';
 import { ProblemDetailsFilter } from './problem-details/problem-details.filter';
@@ -33,8 +33,12 @@ export { DATABASE, AUTH_DATABASE } from './db/tokens';
       useFactory: createLazyAuthDatabase,
     } satisfies Provider,
     // The event bus seam is shared infrastructure: every emitting module
-    // (tenancy since 1.2, catalog since 1.4) injects the same token.
-    { provide: EVENT_BUS, useClass: LoggingEventBus },
+    // (tenancy since 1.2, catalog since 1.4) injects the same token. Story
+    // 7-1 swaps the logged no-op for the type-routed bus — the outbox
+    // relay's publishes now FORWARD to subscribed handlers and a throwing
+    // handler propagates (the row re-drains / dead-letters, the AD-7
+    // contract); LoggingEventBus is retired as a provider.
+    { provide: EVENT_BUS, useClass: RoutedEventBus },
     // The transactional outbox (AD-7, story outbox-relay): commands append
     // in-transaction through OUTBOX_SINK; the jobs-shell relay worker drives
     // OUTBOX_RELAY, which publishes through EVENT_BUS above.

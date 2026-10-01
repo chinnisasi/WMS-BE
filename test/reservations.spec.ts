@@ -325,8 +325,8 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     expect(granted.quantity).toBe(2);
     expect(granted.ownerType).toBe('order-line');
     // TTL'd hold: expires_at is now + the default 900s (a small clock skew guard).
-    expect(Date.parse(granted.expiresAt)).toBeGreaterThan(Date.now() + 800_000);
-    expect(Date.parse(granted.expiresAt)).toBeLessThanOrEqual(Date.now() + 1_000_000);
+    expect(Date.parse(granted.expiresAt!)).toBeGreaterThan(Date.now() + 800_000);
+    expect(Date.parse(granted.expiresAt!)).toBeLessThanOrEqual(Date.now() + 1_000_000);
 
     const atp = await atpUnits(skuId);
     expect(atp).toMatchObject({ onHand: 5, reserved: 2, qcHeld: 0, buffer: 0, atp: 3 });
