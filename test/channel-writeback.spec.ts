@@ -96,6 +96,10 @@ registerChannelAdapter(WRITEBACK_ADAPTER as unknown as Parameters<typeof registe
 registerChannelAdapter(FAILING_ADAPTER as unknown as Parameters<typeof registerChannelAdapter>[0]);
 
 const SKU_CODES = ['WB-A', 'WB-B', 'WB-C'] as const;
+// The kit parent joins the IMPORT + the mapping set but holds NO stock —
+// a kit SKU is created on an empty SKU (the catalog's own guard).
+const KIT_CODE = 'WB-KIT';
+const MAPPED_CODES = [...SKU_CODES, KIT_CODE];
 
 describe('channel writeback: source filter, dedupe, convergence, echo, decoupling, DLQ (e2e, story 7-2)', () => {
   let app: INestApplication;
@@ -127,8 +131,9 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
   });
 
   afterAll(async () => {
-    // Nothing under this suite's tenants is kept — the clone DB drops on
-    // suiteDb.drop() anyway; the deletions keep the shared dev DB clean.
+    // Nothing under this suite's tenants is kept. The suite runs against its
+    // own clone DB (useSuiteDatabase above); these deletions keep THAT clone
+    // small for the suite's own queries, and suiteDb.drop() removes it whole.
     await cleanupRows();
     const db = app.get<unknown>(DATABASE) as Record<string, unknown> & { $client?: { end(): Promise<void> } };
     await (db.$client as { end(): Promise<void> }).end();
@@ -240,7 +245,7 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
 
     const csvHeader =
       'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode';
-    const csv = [csvHeader, ...SKU_CODES.map((code) => `${code},Test SKU ${code},pcs,,1800,,,,,`)].join('\n');
+    const csv = [csvHeader, ...MAPPED_CODES.map((code) => `${code},Test SKU ${code},pcs,,1800,,,,,`)].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
       .set('Authorization', `Bearer ${opsToken}`)
@@ -253,11 +258,11 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
       .set('Authorization', `Bearer ${ownerToken}`)
       .expect(200);
     for (const item of skus.body.items as { code: string; id: string }[]) {
-      if ((SKU_CODES as readonly string[]).includes(item.code)) {
+      if (MAPPED_CODES.includes(item.code)) {
         skuIds.set(item.code, item.id);
       }
     }
-    expect(skuIds.size).toBe(SKU_CODES.length);
+    expect(skuIds.size).toBe(MAPPED_CODES.length);
 
     // ── the device + badge-in operator (picking feeds every fixture) ────────
     const minted = await request(app.getHttpServer())
@@ -310,7 +315,7 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
     await channels.setChannelMappings(
       tenantId,
       connectionId,
-      (SKU_CODES as readonly string[]).map((code) => ({ externalRef: code, skuId: skuIds.get(code)! })),
+      MAPPED_CODES.map((code) => ({ externalRef: code, skuId: skuIds.get(code)! })),
     );
   }
 
@@ -719,6 +724,187 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
     expect(health.lastAttemptAt).toBeNull();
     expect(health.consecutiveFailures).toBe(0);
     expect(health.breakerState).toBe('closed');
+    await clearOutbox();
+  });
+
+  // ── the mapping-loss refusals (review patch P3: RD-7 amended) ─────────────
+
+  /** A multi-line ingest of one order (the partial-resolution fixture). */
+  async function ingestLines(
+    connectionId: string,
+    provider: 'test-writeback' | 'test-writeback-fail',
+    orderRef: number,
+    lines: { code: string; quantity: number }[],
+  ): Promise<string> {
+    const bodyText = JSON.stringify({
+      id: orderRef,
+      shipping_address: {
+        name: 'Ravi Kumar', phone: '9876543210', address1: 'Plot 12',
+        address2: 'Tech Park', city: 'Hyderabad', province: 'Telangana', zip: '500081',
+      },
+      line_items: lines.map(({ code, quantity }) => ({ sku: code, quantity })),
+    });
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/webhooks/channels/${provider}/${connectionId}/orders`)
+      .set(HMAC_HEADER, sign(bodyText))
+      .set(TOPIC_HEADER, 'orders/create')
+      .set('Content-Type', 'application/json')
+      .send(bodyText)
+      .expect(200);
+    return (await outbound.findOrderByChannelRef(tenantId, connectionId, String(orderRef)))!.id;
+  }
+
+  function cancelBodyText(orderRef: number): string {
+    return JSON.stringify({ id: orderRef });
+  }
+
+  /** The mapping PUT (arm 7) — the FULL-REPLACE seam the refusals name. */
+  function putMappings(items: { externalRef: string; skuId: string }[]): request.Test {
+    return request(app.getHttpServer())
+      .put(`${API}/${tenantId}/channels/connections/${connId}/mappings`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ items });
+  }
+
+  it('a writeback whose lines PARTIALLY unresolve refuses WHOLE — the meter names the remediation, no partial fulfillment posts', async () => {
+    const ref = 8_300_000_000_006;
+    await ingestLines(connId, 'test-writeback', ref, [
+      { code: 'WB-A', quantity: 2 },
+      { code: 'WB-B', quantity: 1 },
+    ]);
+    // Full replacement minus WB-B (the remediation the refusal names): one
+    // of the two packed lines now unresolves.
+    await putMappings([{ externalRef: 'WB-A', skuId: skuIds.get('WB-A')! }]).expect(200);
+    await flowToFulfilment((await outbound.findOrderByChannelRef(tenantId, connId, String(ref)))!.id, [
+      { code: 'WB-A', quantity: 2 },
+      { code: 'WB-B', quantity: 1 },
+    ]);
+    // The attempt meters ONE failed 'order-writeback' row naming the
+    // mapping PUT as the healer — and posts NOTHING to the channel (the
+    // half-measure of silently dropping the unmapped line is gone).
+    await relay.drain(25);
+    const rows = await writebackRows(connId);
+    expect(rows.at(-1)!.status).toBe('failed');
+    expect(rows.at(-1)!.error).toContain('1 of 2 order line(s) resolve to no channel SKU mapping');
+    expect(rows.at(-1)!.error).toContain('map the SKU(s) (mapping PUT) to heal');
+    expect(WRITEBACK_STATES.get(String(ref))?.fulfillments.size ?? 0).toBe(0);
+
+    // The refusal is RETRYABLE honestly, and the HEAL lands it: the mapping
+    // set restored, the redrained packed row posts and settles ok.
+    await putMappings(MAPPED_CODES.map((code) => ({ externalRef: code, skuId: skuIds.get(code)! }))).expect(200);
+    await forceDue('order.packed');
+    await drainAll();
+    const healed = WRITEBACK_STATES.get(String(ref))!;
+    expect(healed.fulfillments.size).toBe(1);
+    expect((await writebackRows(connId)).at(-1)!.status).toBe('ok');
+    await clearOutbox();
+  });
+
+  it('a writeback whose EVERY line unresolves refuses whole with the zero-resolved count (review patch P9)', async () => {
+    const ref = 8_300_000_000_008;
+    await ingestRef(connId, 'test-writeback', ref, 'WB-C', 1);
+    await putMappings([]).expect(200); // the total clear
+    await flowToFulfilment((await outbound.findOrderByChannelRef(tenantId, connId, String(ref)))!.id, [
+      { code: 'WB-C', quantity: 1 },
+    ]);
+    await relay.drain(25);
+    const rows = await writebackRows(connId);
+    expect(rows.at(-1)!.status).toBe('failed');
+    expect(rows.at(-1)!.error).toContain('1 of 1 order line(s) resolve to no channel SKU mapping');
+    expect(WRITEBACK_STATES.get(String(ref))?.fulfillments.size ?? 0).toBe(0);
+    await clearOutbox();
+  });
+
+  it('a KIT order’s writeback posts the CHILDREN only — the parent never posts, mapped or unmapped (review patch P3)', async () => {
+    // The kit exists only through the catalog route (kit-ness is relational):
+    // 1×WB-KIT = 1×WB-A + 1×WB-C, every member mapped — the total clear the
+    // previous test left behind is undone first.
+    await channels.setChannelMappings(
+      tenantId,
+      connId,
+      MAPPED_CODES.map((code) => ({ externalRef: code, skuId: skuIds.get(code)! })),
+    );
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/skus/${skuIds.get('WB-KIT')!}/kit`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        components: [
+          { skuId: skuIds.get('WB-A')!, quantity: 1 },
+          { skuId: skuIds.get('WB-C')!, quantity: 1 },
+        ],
+      })
+      .expect(201);
+    const ref = 8_300_000_000_009;
+    const orderId = await ingestRef(connId, 'test-writeback', ref, 'WB-KIT', 1);
+    // The picklists carry the exploded children; the bench scans components.
+    await flowToFulfilment(orderId, [
+      { code: 'WB-A', quantity: 1 },
+      { code: 'WB-C', quantity: 1 },
+    ]);
+    await drainAll();
+    const state = WRITEBACK_STATES.get(String(ref))!;
+    expect(state.fulfillments.size).toBe(1);
+    // The FIRST applied statement posted exactly the children (the later
+    // dispatched statement converges through the same read-back entry).
+    expect(state.postedLines!.slice(0, 2)).toEqual([
+      { externalRef: 'WB-A', quantity: 1 },
+      { externalRef: 'WB-C', quantity: 1 },
+    ]);
+    for (const line of state.postedLines!) {
+      expect(line.externalRef).not.toBe('WB-KIT'); // the parent NEVER posts
+    }
+    // The parent's mapping DROPPED (the components stay): the unmapped
+    // parent refuses NOTHING — the exclusion ran BEFORE the mapping
+    // resolution, and the re-drained packed row reads the fulfillment
+    // and acks.
+    await putMappings([
+      { externalRef: 'WB-A', skuId: skuIds.get('WB-A')! },
+      { externalRef: 'WB-C', skuId: skuIds.get('WB-C')! },
+    ]).expect(200);
+    await handAppendPacked(orderId);
+    await drainAll();
+    expect(WRITEBACK_STATES.get(String(ref))!.fulfillments.size).toBe(1); // no second fulfillment
+    expect((await writebackRows(connId)).at(-1)!.status).toBe('ok');
+    await clearOutbox();
+  });
+
+  it('a cancellation of a PACKED ingest order answers 200 {outcome: ignored} — meter + audit row (RD-8, review patches P9/P10)', async () => {
+    const ref = 8_300_000_000_010;
+    // Restore a set that maps this order's line (the kit test shrank it).
+    await putMappings(MAPPED_CODES.map((code) => ({ externalRef: code, skuId: skuIds.get(code)! }))).expect(200);
+    const orderId = await ingestRef(connId, 'test-writeback', ref, 'WB-B', 1);
+    await flowToFulfilment(orderId, [{ code: 'WB-B', quantity: 1 }]);
+    await drainAll();
+    const res = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/webhooks/channels/test-writeback/${connId}/cancellations`)
+      .set(HMAC_HEADER, sign(cancelBodyText(ref)))
+      .set(TOPIC_HEADER, 'orders/cancelled')
+      .set('Content-Type', 'application/json')
+      .send(cancelBodyText(ref))
+      .expect(200);
+    expect(res.body.outcome).toBe('ignored');
+    const sql = await sqlHandle();
+    try {
+      const meters = (await sql`
+        select status from integration_calls
+        where tenant_id = ${tenantId} and integration_id = ${connId}
+          and kind = 'order-ingest' and status = 'ignored'
+      `) as unknown as { status: string }[];
+      expect(meters.length).toBeGreaterThanOrEqual(1);
+      const audits = (await sql`
+        select target_id, reference from audit_events
+        where tenant_id = ${tenantId} and action = 'order.cancellation_ignored' and target_id = ${orderId}
+      `) as unknown as { target_id: string; reference: string }[];
+      expect(audits).toHaveLength(1);
+      expect(audits[0]!.reference).toBe(String(ref));
+      // The order's units already left — the status stands, the channel's
+      // truth and ours already agree (RD-8).
+      expect(await orderStatus(orderId)).toBe('dispatched');
+    } finally {
+      await sql.end();
+    }
     await clearOutbox();
   });
 });

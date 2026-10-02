@@ -3566,6 +3566,9 @@ export const INTEGRATION_CALL_STATUSES = [
   'config-invalid',
   'verification-failed',
   'actor-unprivileged',
+  // availability-sync outcome status (7-2 RD-6, amended: the variant-lookup
+  // arm could not resolve every mapped ref — a meted refusal, no breaker):
+  'item-unresolved',
   // cancellation-ingest outcome statuses (RD-8):
   'released',
   'ignored',
@@ -3637,6 +3640,14 @@ export const channelMappings = pgTable(
     externalRef: text('external_ref').notNull(),
     /** The WMS SKU the ref resolves to (validated in the command transaction; the variant IS a SKU row — AD-19). */
     skuId: uuid('sku_id').notNull(),
+    /**
+     * 7-2 RD-6 (amended): the resolved numeric Shopify inventory_item_id the
+     * availability-publish arm last looked the ref up as, cached so a publish
+     * cycle does not re-query the variant for every scope. Nullable — set
+     * only by the publish arm's resolution write-back; a mapping PUT clears
+     * it (a re-mapped ref's cached id belongs to the old ref, never reusable).
+     */
+    inventoryItemId: bigint('inventory_item_id', { mode: 'number' }),
     ...tenantTimestamps,
   },
   (table) => [

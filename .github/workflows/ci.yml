@@ -116,3 +116,52 @@ jobs:
 
       - name: Spec drift guard (committed spec matches the code)
         run: git diff --exit-code openapi/
+
+  loadtest-smoke:
+    # Frozen T8's smoke pin (review patch P4): the acceptance harness in
+    # smoke mode (minutes) against real Postgres + Valkey — the same service
+    # shape the lint-and-test job provisions. The harness boots its own app
+    # (createApp), rebuilds its template tenant via the suite-db clone, and
+    # exits nonzero when any gate (p95, oversells, ledger parity) fails.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: wms
+          POSTGRES_PASSWORD: wms
+          POSTGRES_DB: wms
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U wms"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      valkey:
+        image: valkey/valkey:9.1-alpine
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://wms:wms@localhost:55432/wms
+      VALKEY_URL: redis://localhost:56379/0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Apply migrations
+        run: bun run db:migrate
+
+      - name: Acceptance smoke (120 s, gates enforced)
+        run: bun run loadtest:smoke

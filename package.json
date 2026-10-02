@@ -18,7 +18,8 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "bun src/shared/db/migrate.ts",
     "db:verify": "bun src/shared/db/verify.ts",
-    "openapi:export": "bun src/api/export-openapi.ts"
+    "openapi:export": "bun src/api/export-openapi.ts",
+    "loadtest:smoke": "bun scripts/loadtest-acceptance.ts --mode smoke"
   },
   "dependencies": {
     "@nestjs/common": "12.0.1",

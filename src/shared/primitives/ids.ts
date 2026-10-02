@@ -75,3 +75,12 @@ export function isUuid(value: string): boolean {
  * this one only answers "can this string be a uuid at all".)
  */
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The ONE ceiling for channel-supplied external identifiers (story 7-2):
+ * the ingested order's channel ref and the ingest command's external event
+ * id both bound here — a shared const (not a private literal at each site)
+ * so the ingest-side parse arm and the order command's storage bound cannot
+ * drift apart silently.
+ */
+export const MAX_EXTERNAL_ID_LENGTH = 200;

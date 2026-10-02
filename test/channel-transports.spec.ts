@@ -1,4 +1,6 @@
 import { createHmac } from 'node:crypto';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { Socket } from 'node:net';
 import * as https from 'node:https';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -15,8 +17,13 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 import { DEFAULT_CHANNEL_HTTP_TIMEOUT_MS, parseChannelHttpTimeoutMs } from '../src/modules/channels/channel-http';
 import type { ChannelHttpResponse } from '../src/modules/channels/channel-http';
+import { channelHttpRequest } from '../src/modules/channels/channel-http';
+import {
+  ChannelItemsUnresolvedError,
+} from '../src/modules/channels/channel-availability-port';
 import {
   WRITEBACK_LOCATION_UNSET,
+  WRITEBACK_UNTRACKED_ID,
   shopifyAvailabilityArm,
   shopifyOrderWritebackArm,
   shopifyRevokeArm,
@@ -112,44 +119,132 @@ afterAll(() => {
   delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
 });
 
-describe('channel transports: the shopify arms against a local stub (story 7.2, RD-6/RD-7)', () => {
-  it('the availability arm posts ONE inventory-set request per scope, the credential header, milli converted', async () => {
-    const stub = new ShopStub([{ status: 200, body: {} }]);
+describe('channel transports: the shopify arms against a local stub (story 7.2, RD-6/RD-7 amended)', () => {
+  // The WMS-side identity of the mapped SKUs (uuid — never on the wire post-
+  // amendment) and the CHANNEL-side refs the arm must resolve (RD-6 amended,
+  // change log #7: the WMS skuId uuid is never posted as Shopify's
+  // inventory_item_id).
+  const SKU_1 = '00000000-0000-0000-0000-000000000031';
+  const SKU_2 = '00000000-0000-0000-0000-000000000032';
+  const WAREHOUSE = '00000000-0000-0000-0000-000000000003';
+  const REF_1 = 'SHOPIFY-STUB-SKU-1';
+  const REF_2 = 'SHOPIFY-STUB-SKU-2';
+
+  /** One base scope shape, filled per test. */
+  const scope = (skuId: string, ref: string, visibleMilli: number, itemId?: number) => ({
+    warehouseId: WAREHOUSE,
+    skuId,
+    externalRef: ref,
+    visibleMilli,
+    ...(itemId === undefined ? {} : { inventoryItemId: itemId }),
+  });
+
+  // The first two lookups (one per distinct ref) then the two set posts.
+  const RESOLVED_STUB_ANSWERS = [
+    { status: 200, body: { variants: [{ id: 11, inventory_item_id: 445566 }] } },
+    { status: 200, body: { variants: [{ id: 12, inventory_item_id: 556677 }] } },
+    { status: 200, body: {} },
+    { status: 200, body: {} },
+  ];
+
+  it('the availability arm resolves every mapped ref first, then posts the RESOLVED item id and the FLOORED quantity (RD-6 amended: the WMS skuId uuid is never posted)', async () => {
+    const stub = new ShopStub(RESOLVED_STUB_ANSWERS);
     const domain = await stub.start();
     try {
       const result = await shopifyAvailabilityArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
         tenantId: '00000000-0000-0000-0000-000000000001',
         integrationId: '00000000-0000-0000-0000-000000000002',
         provider: 'shopify',
-        scopes: [
-          { warehouseId: '00000000-0000-0000-0000-000000000003', skuId: 'gid-1', visibleMilli: 12_500 },
-          { warehouseId: '00000000-0000-0000-0000-000000000003', skuId: 'gid-2', visibleMilli: 0 },
-        ],
+        scopes: [scope(SKU_1, REF_1, 12_500), scope(SKU_2, REF_2, 0)],
         publishedAt: '2026-10-02T00:00:00.000Z',
       });
       expect(typeof result.acceptedAt).toBe('string');
-      expect(stub.requests).toHaveLength(2); // ONE request per scope set
-      expect(stub.requests[0]!.url).toBe('/admin/api/2026-01/inventory_levels/set.json');
-      expect(stub.requests[0]!.method).toBe('POST');
-      expect(stub.requests[0]!.headers['x-shopify-access-token']).toBe(ADMIN_TOKEN);
-      const firstBody = JSON.parse(stub.requests[0]!.body) as Record<string, unknown>;
-      expect(firstBody).toMatchObject({ location_id: 9001, inventory_item_ids: ['gid-1'], available: 12.5 });
-      const secondBody = JSON.parse(stub.requests[1]!.body) as Record<string, unknown>;
-      expect(secondBody).toMatchObject({ available: 0 });
+      // The resolutions ride the result — the delivery persists the cache.
+      expect(result.resolvedItems).toEqual({ [REF_1]: 445566, [REF_2]: 556677 });
+      // TWO variant lookups, then the two set posts (one postable scope each).
+      expect(stub.requests).toHaveLength(4);
+      expect(stub.requests[0]!.method).toBe('GET');
+      expect(stub.requests[0]!.url).toBe(`/admin/api/2026-01/variants.json?sku=${encodeURIComponent(REF_1)}`);
+      expect(stub.requests[1]!.url).toBe(`/admin/api/2026-01/variants.json?sku=${encodeURIComponent(REF_2)}`);
+      expect(stub.requests[2]!.url).toBe('/admin/api/2026-01/inventory_levels/set.json');
+      expect(stub.requests[2]!.method).toBe('POST');
+      expect(stub.requests[2]!.headers['x-shopify-access-token']).toBe(ADMIN_TOKEN);
+      // The inventory_set body carries the CHANNEL item id — the WMS uuid
+      // (SKU_1) appears NOWHERE in any request.
+      const firstBody = JSON.parse(stub.requests[2]!.body) as Record<string, unknown>;
+      expect(firstBody).toMatchObject({ location_id: 9001, inventory_item_ids: [445566], available: 12 });
+      expect(stub.requests[2]!.body).not.toContain(SKU_1);
+      const secondBody = JSON.parse(stub.requests[3]!.body) as Record<string, unknown>;
+      expect(secondBody).toMatchObject({ inventory_item_ids: [556677], available: 0 });
+      // The 12.5 milli quantity lands FLOORED (RD-6 amended's quantization
+      // policy: Shopify inventory is integer-only; floor is ATP-safe — it
+      // never advertises more than exists).
+      expect(stub.requests[2]!.body).not.toContain('12.5');
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('a cached inventoryItemId posts without a lookup; an unresolvable ref SKIPS its scopes with the skipped count (RD-6 amended)', async () => {
+    // The lookups: ref 2's answer resolves nothing (empty variants).
+    const stub = new ShopStub([
+      { status: 200, body: { variants: [] } },
+      { status: 200, body: {} },
+    ]);
+    const domain = await stub.start();
+    try {
+      const result = await shopifyAvailabilityArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
+        tenantId: '00000000-0000-0000-0000-000000000001',
+        integrationId: '00000000-0000-0000-0000-000000000002',
+        provider: 'shopify',
+        scopes: [scope(SKU_1, REF_1, 1_000, 778899), scope(SKU_2, REF_2, 2_000)],
+        publishedAt: '2026-10-02T00:00:00.000Z',
+      });
+      // Exactly ONE lookup (only the uncached ref), exactly ONE post (the
+      // skipped ref's scopes never post anything).
+      expect(stub.requests).toHaveLength(2);
+      expect(stub.requests[0]!.url).toContain('/variants.json?sku=');
+      const postBody = JSON.parse(stub.requests[1]!.body) as Record<string, unknown>;
+      expect(postBody).toMatchObject({ inventory_item_ids: [778899] });
+      expect(result.skippedRefs).toEqual([REF_2]);
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('EVERY scope unresolvable refuses the attempt with the typed ChannelItemsUnresolvedError and NO inventory_set request (RD-6 amended)', async () => {
+    const stub = new ShopStub([
+      { status: 200, body: { variants: [] } },
+      { status: 200, body: { variants: [] } },
+    ]);
+    const domain = await stub.start();
+    try {
+      await expect(shopifyAvailabilityArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
+        tenantId: '00000000-0000-0000-0000-000000000001',
+        integrationId: '00000000-0000-0000-0000-000000000002',
+        provider: 'shopify',
+        scopes: [scope(SKU_1, REF_1, 1_000), scope(SKU_2, REF_2, 1_000)],
+        publishedAt: '2026-10-02T00:00:00.000Z',
+      })).rejects.toThrow(ChannelItemsUnresolvedError);
+      // No inventory_levels request ever left with a guessed id.
+      expect(stub.requests.filter((request_) => request_.url.includes('inventory_levels'))).toEqual([]);
     } finally {
       stub.close();
     }
   });
 
   it('a 4xx answer reads as the delivery failure the breaker already understands (not-ok)', async () => {
-    const stub = new ShopStub([{ status: 422, body: { errors: 'Inventory not found' } }]);
+    const stub = new ShopStub([
+      { status: 200, body: { variants: [{ inventory_item_id: 445566 }] } },
+      { status: 422, body: { errors: 'Inventory not found' } },
+    ]);
     const domain = await stub.start();
     try {
       const attempt = shopifyAvailabilityArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
         tenantId: '00000000-0000-0000-0000-000000000001',
         integrationId: '00000000-0000-0000-0000-000000000002',
         provider: 'shopify',
-        scopes: [{ warehouseId: 'w', skuId: 'gid-1', visibleMilli: 1000 }],
+        scopes: [scope(SKU_1, REF_1, 1000)],
         publishedAt: '2026-10-02T00:00:00.000Z',
       });
       await expect(attempt).rejects.toMatchObject({ kind: 'not-ok', status: 422 });
@@ -233,6 +328,25 @@ describe('channel transports: the shopify arms against a local stub (story 7.2, 
       expect(body.fulfillment.location_id).toBe(9001);
       expect(body.fulfillment.line_items).toEqual([{ sku: 'SKU-1', quantity: 2 }, { sku: 'SKU-2', quantity: 1 }]);
       expect(body.fulfillment.notify_customer).toBe(false);
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('the writeback arm "dispatched": a read-back fulfillment WITHOUT an id is the typed un-addressable failure (review patch P8)', async () => {
+    const stub = new ShopStub([
+      { status: 200, body: { fulfillments: [{ tracking_number: null }] } }, // no id
+    ]);
+    const domain = await stub.start();
+    try {
+      const attempt = shopifyOrderWritebackArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
+        tenantId: 't', integrationId: 'i', provider: 'shopify', orderRef: '9001', state: 'dispatched',
+        carrier: 'Blue Dart', tracking: 'BD-9', lines: [{ externalRef: 'SKU-1', quantity: 2 }],
+      });
+      // The typed marker — never the malformed `fulfillments//tracking_info`
+      // request path a `String(id ?? '')` would have built.
+      await expect(attempt).rejects.toThrow(WRITEBACK_UNTRACKED_ID);
+      expect(stub.requests).toHaveLength(1); // the read-back; NO follow-up request
     } finally {
       stub.close();
     }
@@ -343,6 +457,57 @@ describe('channel transports: the shopify arms against a local stub (story 7.2, 
       const problem = (caught as { getResponse(): { code?: string } }).getResponse();
       expect(problem.code).toBe('channel-transport-unconfigured');
       expect((caught as { getStatus(): number }).getStatus()).toBe(501);
+    }
+  });
+});
+
+describe('channel-http body integrity (review patch P7)', () => {
+  /** A one-shot raw HTTPS server (beyond the JSON stub's vocabulary). */
+  async function withRawServer(
+    handler: (req: IncomingMessage, res: ServerResponse) => void,
+  ): Promise<{ run: (path: string) => Promise<unknown>; close: () => Promise<void> }> {
+    const server = https.createServer({ key: ShopStub.key, cert: ShopStub.cert }, handler);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    return {
+      run: (path: string) =>
+        channelHttpRequest({ method: 'GET', url: `https://127.0.0.1:${port}/${path}`, headers: {} }),
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  it('a multi-byte UTF-8 character split across chunk boundaries decodes INTACT', async () => {
+    const server = await withRawServer((req, res) => {
+      void req;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      // 'café' as raw bytes: the é (0xC3 0xA9) deliberately SPLIT — the
+      // 0xC3 rides one chunk, the 0xA9 the next (a per-chunk string decode
+      // would corrupt it into a replacement char).
+      res.write(Buffer.from('{"a":"caf\xC3', 'binary'));
+      setTimeout(() => res.end(Buffer.from('\xA9"}', 'binary')), 20);
+    });
+    try {
+      const response = (await server.run('split')) as { body: string };
+      expect(JSON.parse(response.body)).toEqual({ a: 'café' });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('a truncated 2xx (declared content-length never fully arrives) is the TYPED failure, never a partial body', async () => {
+    const server = await withRawServer((req, res) => {
+      void req;
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '64' });
+      res.write('part');
+      setImmediate(() => (req.socket as Socket).destroy());
+    });
+    try {
+      await expect(server.run('truncate')).rejects.toMatchObject({
+        kind: expect.stringMatching(/^(network|not-ok)$/),
+        status: null,
+      });
+    } finally {
+      await server.close();
     }
   });
 });

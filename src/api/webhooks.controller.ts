@@ -140,6 +140,10 @@ export class WebhooksController {
     const verified = await this.verifyDelivery(tenantId, provider, connectionId, 'cancellations', request);
     const parsed = verified.adapter.webhook!.parseCancellation(verified.body);
     if (parsed === null) {
+      // The orders endpoint's metered posture, mirrored (review patch P5):
+      // a verified body carrying no cancellable shape meters the same parse
+      // refusal — never metered content, just the row.
+      await this.channels.recordIngestParseRefused(tenantId, connectionId);
       throw webhookValidationFailed();
     }
     const result = await this.channels.ingestCancellationDelivery({
@@ -165,7 +169,10 @@ export class WebhooksController {
     request: Request,
   ): Promise<{ adapter: ChannelAdapter; body: Record<string, unknown> }> {
     if (!UUID_RE.test(tenantId) || !UUID_RE.test(connectionId)) {
-      throw invalidUuidParam(!UUID_RE.test(tenantId) ? 'tenantId' : 'connectionId', tenantId);
+      // The echo names the parameter that ACTUALLY failed (review patch P13)
+      // — never always-tenantId.
+      const failed = !UUID_RE.test(tenantId) ? 'tenantId' : 'connectionId';
+      throw invalidUuidParam(failed, failed === 'tenantId' ? tenantId : connectionId);
     }
     // Connection resolve first (404 names nothing): the id must exist in
     // THIS tenant AND the provider path must match its own. The FACE
@@ -191,14 +198,17 @@ export class WebhooksController {
     }
 
     // The signing secret (request-scoped plaintext — never logged, never in
-    // any response). Absent or unopenable is the SAME 401 class (bl-9: not
-    // silent — the coarse meter carries the misconfiguration's visibility).
+    // any response). Opened here — AFTER the 501 gate above, so an
+    // unconfigured provider never touches a credential (review patch P5;
+    // the lazy-open face makes the comment honest). Absent or unopenable is
+    // the SAME 401 class (bl-9: not silent — the coarse meter carries the
+    // misconfiguration's visibility).
     const rawBody = (request as Request & { rawBody?: Buffer }).rawBody;
     if (
       rawBody === undefined ||
       !verifyWebhookSignature(
         declaration.verification,
-        face.webhookSecret ?? '',
+        face.openSecret() ?? '',
         rawBody,
         request.headers[declaration.verification.header.toLowerCase()],
       )
@@ -218,14 +228,18 @@ export class WebhooksController {
     }
 
     // Parse AFTER verification: the 400 for a shaped-but-unmappable body
-    // never runs for a tampered one. A non-JSON body throws here.
+    // never runs for a tampered one. A non-JSON (or non-object) body is
+    // STILL an unmappable body — it meters the parse refusal exactly like
+    // the parse arms' own refusal does (review patch P5), then the same 400.
     let body: unknown;
     try {
       body = JSON.parse(rawBody.toString('utf8'));
     } catch {
+      await this.channels.recordIngestParseRefused(tenantId, connectionId);
       throw webhookValidationFailed();
     }
     if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      await this.channels.recordIngestParseRefused(tenantId, connectionId);
       throw webhookValidationFailed();
     }
     return { adapter, body: body as Record<string, unknown> };
@@ -256,7 +270,11 @@ function webhookValidationFailed(): ProblemException {
  * The declaration-driven signature verification (RD-5): HMAC-SHA256 over
  * the raw body in the declared encoding, constant-time compared. Today the
  * frozen scheme is `hmac-sha256`; a future scheme that is NOT hmac-sha256
- * fails CLOSED here (the registry would come with its arm).
+ * fails CLOSED here (the registry would come with its arm) — as a false
+ * (not a thrown answer): the caller's verification-failure class runs
+ * unchanged, so an unsupported scheme meters the coarse refusal like any
+ * other verification failure (review patch P5) instead of bypassing the
+ * meter with a thrown problem.
  */
 function verifyWebhookSignature(
   verification: ChannelWebhookVerification,
@@ -266,13 +284,9 @@ function verifyWebhookSignature(
 ): boolean {
   if (verification.scheme !== 'hmac-sha256') {
     // Fail closed: a scheme this build can no-op would otherwise verify
-    // nothing at all. The channel-http story adds arms WITH their code.
-    throw new ProblemException(
-      'webhook-signature-invalid',
-      401,
-      'Webhook signature scheme not supported',
-      '',
-    );
+    // nothing at all. The channel-http story adds arms WITH their code —
+    // until then the SAME 401 refusal posture (and its meter) applies.
+    return false;
   }
   if (
     secret === '' ||

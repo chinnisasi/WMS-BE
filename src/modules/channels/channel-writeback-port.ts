@@ -112,24 +112,45 @@ export interface TestChannelOrderState {
   >;
   /** Whether the channel has cancelled the order (the read-back for `cancelled`). */
   cancelled: boolean;
+  /**
+   * The lines each APPLIED statement posted (RD-7 amended — review patch P3's
+   * kit-parent exclusion pins against these): the request's `lines` exactly
+   * as the arm received it, appended per applied call. Noop calls append
+   * nothing. Optional — suites that set a state by hand leave it unset.
+   */
+  postedLines?: { readonly externalRef: string; readonly quantity: number }[];
 }
 
 export function testWritebackArm(
   states: Map<string, TestChannelOrderState>,
 ): ChannelOrderWritebackArm {
   return async (_credential, request) => {
-    const state = states.get(request.orderRef) ?? {
-      fulfillments: new Map(),
+    const state: TestChannelOrderState = states.get(request.orderRef) ?? {
+      fulfillments: new Map<
+        string,
+        { readonly withTracking: boolean; readonly carrier: string | null; readonly tracking: string | null }
+      >(),
       cancelled: false,
     };
     states.set(request.orderRef, state);
     const settledAt = new Date().toISOString();
+    // Every APPLIED statement records the lines it posted — the exclusion
+    // and under-reportance assertions read the request verbatim.
+    const record = (): void => {
+      if (state.postedLines === undefined) {
+        state.postedLines = [];
+      }
+      state.postedLines.push(
+        ...request.lines.map((line) => ({ externalRef: line.externalRef, quantity: line.quantity })),
+      );
+    };
     switch (request.state) {
       case 'packed': {
         // RD-7: packed posts ONLY when no fulfillment exists.
         if (state.fulfillments.size > 0 || state.cancelled) {
           return { settledAt, action: 'noop' };
         }
+        record();
         state.fulfillments.set('test-fulfillment', {
           withTracking: false,
           carrier: null,
@@ -143,6 +164,7 @@ export function testWritebackArm(
           return { settledAt, action: 'noop' }; // tracking already present
         }
         if (untracked !== undefined) {
+          record();
           state.fulfillments.set('test-fulfillment', {
             withTracking: true,
             carrier: request.carrier ?? null,
@@ -152,6 +174,7 @@ export function testWritebackArm(
         }
         // No fulfillment at all: the packed arm never ran (relay reordering)
         // — create ONE fulfillment carrying the tracking (convergence).
+        record();
         state.fulfillments.set('test-fulfillment', {
           withTracking: true,
           carrier: request.carrier ?? null,
@@ -163,6 +186,7 @@ export function testWritebackArm(
         if (state.cancelled) {
           return { settledAt, action: 'noop' };
         }
+        record();
         state.cancelled = true;
         return { settledAt, action: 'cancelled' };
       }

@@ -62,6 +62,9 @@ registerChannelAdapter({
 const SHOPIFY_CREDENTIAL = {
   shopDomain: 'sync-suite-store.myshopify.com',
   accessToken: 'canary-sync-shopify-5c19d8',
+  // The real arm requires the location for a WRITE (lookup-and-set needs it
+  // for its set.json posts; RD-6's optional-at-connect, required-at-write).
+  locationId: '9001',
 };
 const SKU_CODES = ['SYNC-A', 'SYNC-B'] as const;
 
@@ -332,6 +335,24 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
     }
   }
 
+  /**
+   * Seeds a cached channel inventory_item_id on a mapping row (RD-6
+   * amended): the publish arm's own write-back, seeded directly here to
+   * make a delivery fail at the SET call (a real transport failure) instead
+   * of at the variant lookup.
+   */
+  async function setCachedItemId(tenantId: string, connectionId: string, externalRef: string, itemId: number): Promise<void> {
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await sql`
+        update channel_mappings set inventory_item_id = ${itemId}
+        where tenant_id = ${tenantId} and integration_id = ${connectionId} and external_ref = ${externalRef}
+      `;
+    } finally {
+      await sql.end();
+    }
+  }
+
   /** Maps both skus onto the echo connection (the seed arm; no route). */
   async function mapEchoSkus(): Promise<void> {
     await channels.setChannelMappings(
@@ -400,7 +421,7 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
         select payload from outbox_messages
         where tenant_id = ${tenantId} and type = ${CHANNEL_AVAILABILITY_PUBLISHED_EVENT}
           and payload->>'connectionId' = ${echoId}
-      `) as unknown as { payload: { connectionId: string; provider: string; publishedAt: string; scopes: { warehouseId: string; skuId: string; visibleMilli: number }[] } }[];
+      `) as unknown as { payload: { connectionId: string; provider: string; publishedAt: string; scopes: { warehouseId: string; skuId: string; externalRef: string; visibleMilli: number }[] } }[];
       const payload = outbox[0]!.payload;
       expect(payload.connectionId).toBe(echoId);
       expect(payload.provider).toBe('test-echo');
@@ -409,6 +430,10 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
       for (const scope of payload.scopes) {
         expect(scope.warehouseId).toBe(warehouseId);
         expect(scope.visibleMilli).toBe(0);
+        // RD-6 amended: every scope carries the mapping's externalRef — the
+        // publish arm resolves the CHANNEL id from it (the WMS skuId alone
+        // never names a channel-side item).
+        expect(scope.externalRef).toMatch(/^echo-/);
       }
     } finally {
       await sql.end();
@@ -440,9 +465,10 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
         select payload from outbox_messages
         where tenant_id = ${tenantId} and type = ${CHANNEL_AVAILABILITY_PUBLISHED_EVENT}
           and payload->>'connectionId' = ${shopifyId}
-      `) as unknown as { payload: { scopes: { skuId: string; visibleMilli: number }[] } }[];
+      `) as unknown as { payload: { scopes: { skuId: string; externalRef: string; visibleMilli: number }[] } }[];
       const scope = outbox[0]!.payload.scopes[0]!;
       expect(scope.skuId).toBe(shopifySkuId);
+      expect(scope.externalRef).toBe('ext-1');
       expect(scope.visibleMilli).toBe(toMilli(2));
     } finally {
       await sql2.end();
@@ -484,14 +510,71 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
     expect(rows).toHaveLength(2); // the original + the retry's
   });
 
-  it('delivery, failing: each drain attempt meters a failed call and strokes the breaker; the row quarantines at 5; the breaker opens', async () => {
+  it('delivery, EVERY ref unresolvable (RD-6 amended): each drain attempt meters the typed item-unresolved refusal and moves NO breaker/health stamp; the row still quarantines at 5', async () => {
     await clearOutbox();
     const beforeCount = (await availabilityRows()).filter((r) => r.integrationId === shopifyId).length;
+    const beforeStamps = await integrationRow(shopifyId);
 
     expect(await channels.publishConnectionSnapshot(tenantId, shopifyId)).toBe(true);
 
-    // Attempt 1: the shopify arm is the unconfigured 501 — a retriable
-    // delivery failure; the settle still commits (meter row + stamp).
+    // Attempt 1: the real shopify arm resolves 'ext-1' through the Admin
+    // API — the suite's credential names no live store, so the variant
+    // lookup fails and EVERY scope is unresolvable: the typed, METED
+    // refusal (change log #7) — NO breaker rung, NO health stamp movement.
+    await forceDue();
+    await relay.drain(1);
+    const afterOne = (await availabilityRows()).filter((r) => r.integrationId === shopifyId);
+    expect(afterOne).toHaveLength(beforeCount + 1);
+    const metered = afterOne[afterOne.length - 1]!;
+    expect(metered).toMatchObject({ kind: 'availability-sync', status: 'item-unresolved' });
+    expect(metered.error).not.toBeNull();
+    // The breaker and the sync stamps stand EXACTLY where they were (a
+    // refused outcome is a status, never a failure — RD-9).
+    expect(await integrationRow(shopifyId)).toEqual(beforeStamps);
+
+    // The refusal RETHROWS: the row retries (it is not acked) — and the
+    // relay's own retry budget carries it to the dead-letter (the delivery
+    // failure's honest fate; the refusal's remedy is the mapping PUT or a
+    // healed lookup, neither of which the relay can invent). Attempts 2..5
+    // re-meter the SAME refusal status each drain.
+    for (let attempt = 2; attempt <= 5; attempt += 1) {
+      await forceDue();
+      await relay.drain(1);
+      const after = (await availabilityRows()).filter((r) => r.integrationId === shopifyId);
+      expect(after).toHaveLength(beforeCount + attempt);
+    }
+    for (const row of (await availabilityRows()).slice(beforeCount)) {
+      expect(row).toMatchObject({ status: 'item-unresolved' });
+    }
+    // And the breaker kept still THROUGH the whole retry ladder.
+    expect(await integrationRow(shopifyId)).toEqual(beforeStamps);
+    expect(await integrationRow(shopifyId)).toMatchObject({ breakerState: 'closed' });
+    const dead = await outboxRows(shopifyId);
+    expect(dead).toHaveLength(1);
+    expect(dead[0]).toMatchObject({ status: 'quarantined', attempts: 5 });
+
+    // Health stays DEGRADED (no error stamped — the never-synced lag only).
+    const list = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/channels/connections`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    const entry = (list.body.items as Record<string, unknown>[]).find((e) => e.id === shopifyId)!;
+    expect(entry).toMatchObject({ health: 'degraded', breakerState: 'closed', lastError: null });
+  });
+
+  it('delivery failing on a CACHED item id: the inventory-set transport failure strokes the breaker each drain; the row quarantines at 5; the breaker opens (RN-5)', async () => {
+    await clearOutbox();
+    const beforeCount = (await availabilityRows()).filter((r) => r.integrationId === shopifyId).length;
+
+    // A cached inventory_item_id skips the (unresolvable) lookup and posts
+    // straight into the suite's dead shopDomain — a real TRANSPORT failure,
+    // the breaker machinery's own input class.
+    await setCachedItemId(tenantId, shopifyId, 'ext-1', 445566);
+
+    expect(await channels.publishConnectionSnapshot(tenantId, shopifyId)).toBe(true);
+
+    // Attempt 1: the set POST fails network — the settle still commits
+    // (meter row + stamp).
     await forceDue();
     await relay.drain(1);
     const afterOne = (await availabilityRows()).filter((r) => r.integrationId === shopifyId);

@@ -26,13 +26,24 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
 /**
  * One published scope: the inventory core's computed visible quantity
  * (RN-6 — the core performed the buffer math; this port only carries the
- * result) for one mapped (warehouse, sku).
+ * result) for one mapped (warehouse, sku), plus the CHANNEL identity the
+ * publish arm must resolve and never the WMS one (RD-6 amended: the arm
+ * posts Shopify's `inventory_item_id`, the WMS `skuId` uuid is never put on
+ * the channel wire).
  */
 export interface ChannelAvailabilityScope {
   readonly warehouseId: string;
   readonly skuId: string;
+  /** The mapped ref the publish arm resolves to the channel's item id. */
+  readonly externalRef: string;
   /** `V(c)` — the quantity this channel may list, in milli-units. */
   readonly visibleMilli: number;
+  /**
+   * The previously-resolved channel item id, cached on the mapping row —
+   * when present the arm posts WITHOUT a variant lookup. Absent means the
+   * arm must resolve (and may answer `resolvedItems` for the write-back).
+   */
+  readonly inventoryItemId?: number;
 }
 
 /**
@@ -57,6 +68,40 @@ export interface ChannelAvailabilityRequest {
 export interface ChannelAvailabilityResult {
   /** The channel-side accepted-at instant (opaque; arms mint it). */
   readonly acceptedAt: string;
+  /**
+   * RD-6 amended: the item ids THIS attempt resolved (externalRef → the
+   * channel's numeric `inventory_item_id`) — the delivery persists them on
+   * the mapping rows so the next cycle skips the lookup. Present only when
+   * the arm actually looked something up.
+   */
+  readonly resolvedItems?: Readonly<Record<string, number>>;
+  /**
+   * The refs neither cached nor resolvable this attempt — the scopes the
+   * arm SKIPPED (never posted with a guessed or WMS id). Empty/absent when
+   * every scope posted; when it holds the WHOLE scope set the arm refuses
+   * (see `ChannelItemsUnresolvedError`) — partial skips stay a metered,
+   * non-refusing outcome.
+   */
+  readonly skippedRefs?: readonly string[];
+}
+
+/**
+ * The availability publish's typed refusal (RD-6 amended): EVERY scope's
+ * variant lookup failed or resolved to nothing — the arm has nothing it may
+ * honestly post, so the attempt refuses with this typed (meted, never
+ * breaker/health-moving) error. The delivery meters `item-unresolved` and
+ * rethrows; the relay's budget owns the retry, remediation is the mapping
+ * PUT (or the channel's lookup healing, since a lookup failure is one
+ * trigger).
+ */
+export class ChannelItemsUnresolvedError extends Error {
+  constructor(readonly unresolvedRefs: readonly string[]) {
+    super(
+      `channel availability publish refused: no inventory_item_id resolved for ${unresolvedRefs.length} ` +
+        `mapped ref(s) (${unresolvedRefs.slice(0, 5).join(', ')}) — nothing was posted.`,
+    );
+    this.name = 'ChannelItemsUnresolvedError';
+  }
 }
 
 /**

@@ -14,6 +14,7 @@ import type { ChannelCredential } from '../src/modules/channels/channel-credenti
 import { testAvailabilityArm, unconfiguredRevokeArm } from '../src/modules/channels/channel-availability-port';
 import { testWritebackArm } from '../src/modules/channels/channel-writeback-port';
 import { shopifyParseOrder, shopifyParseCancellation } from '../src/modules/channels/channel-shopify-port';
+import { ValkeyClient } from '../src/shared/valkey/valkey.client';
 import { ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { testAddress } from './support/shipment-address';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -68,6 +69,36 @@ registerChannelAdapter({
   },
 });
 
+/**
+ * The scheme-pinning adapter (review patch P5): a provider whose declaration
+ * carries a scheme THIS build does not implement (`hmac-sha1` — the cast is
+ * the point: a future registry could admit the code). Verification fails
+ * CLOSED — even a perfectly-computed signature answers the same 401 posture
+ * and its coarse meter, never an exception and never a bypass.
+ */
+registerChannelAdapter({
+  code: 'test-webhook-legacy',
+  displayName: 'Test Webhook Legacy',
+  credentialFields: [
+    { name: 'apiKey', label: 'API key', required: true, description: 'test key' },
+    { name: 'webhookSecret', label: 'Webhook signing secret', required: false, description: 'suite signs deliveries directly' },
+  ],
+  availabilityArm: testAvailabilityArm(),
+  revokeArm: unconfiguredRevokeArm('test-webhook-legacy'),
+  orderWritebackArm: testWritebackArm(new Map()),
+  webhook: {
+    topics: { orders: 'orders/create', cancellations: 'orders/cancelled' },
+    verification: {
+      header: 'X-Suite-Hmac',
+      encoding: 'base64',
+      scheme: 'hmac-sha1',
+      topicHeader: 'X-Suite-Topic',
+    },
+    parseOrder: shopifyParseOrder,
+    parseCancellation: shopifyParseCancellation,
+  },
+} as unknown as Parameters<typeof registerChannelAdapter>[0]);
+
 // One connection PER PROVIDER PER TENANT (`integrations_tenant_provider_
 // unique` — a connection IS a shop) — so this suite drives ONE ingest
 // connection and MUTATES its config between phases (the same mutation the
@@ -84,6 +115,9 @@ const SKU_CODES = [
   'WH-C2', // kit component 2 (starved)
 ] as const;
 
+const CSV_HEADER =
+  'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode';
+
 describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e, story 7-2)', () => {
   let app: INestApplication;
   let channels: ChannelsFacade;
@@ -98,6 +132,7 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
   let accountantUserId = '';
   let warehouseId: string;
   let connId: string;
+  let legacyConnId: string;
   let flipkartId: string;
   const skuIds = new Map<string, string>();
 
@@ -124,7 +159,7 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await sql`alter table integrations drop constraint if exists integrations_provider_check`;
-      await sql`alter table integrations add constraint integrations_provider_check check (provider in ('shopify', 'amazon-in', 'flipkart', 'test-webhook'))`;
+      await sql`alter table integrations add constraint integrations_provider_check check (provider in ('shopify', 'amazon-in', 'flipkart', 'test-webhook', 'test-webhook-legacy'))`;
     } finally {
       await sql.end();
     }
@@ -132,6 +167,7 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
 
   /** Direct connection insert — the frozen provider DTO vocabulary does not admit test codes. */
   async function insertConnection(args: {
+    provider?: 'test-webhook' | 'test-webhook-legacy';
     secret: string;
     ingestWarehouseId: string | null;
     connectedBy: string;
@@ -144,7 +180,7 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
         insert into integrations
           (id, tenant_id, provider, status, credential_sealed, credential_version,
            backorder_policy, ingest_warehouse_id, connected_by, created_at, updated_at)
-        values (${uuidv7()}, ${tenantId}, 'test-webhook', 'connected', ${sealed}, 1,
+        values (${uuidv7()}, ${tenantId}, ${args.provider ?? 'test-webhook'}, 'connected', ${sealed}, 1,
                 ${args.backorderPolicy ?? 'accept'}, ${args.ingestWarehouseId}, ${args.connectedBy}, now(), now())
         returning id
       `) as unknown as { id: string }[];
@@ -227,8 +263,7 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
       .send({ capacity: 1000000, type: 'shelf', code: 'A-01-01' })
       .expect(201);
 
-    const csvHeader =
-      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode';
+    const csvHeader = CSV_HEADER;
     const csv = [csvHeader, ...SKU_CODES.map((code) => `${code},Test SKU ${code},pcs,,1800,,,,,`)].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
@@ -261,6 +296,12 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     ).body.id as string;
 
     connId = await insertConnection({ secret: SECRET_ONE, ingestWarehouseId: warehouseId, connectedBy: ownerUserId });
+    legacyConnId = await insertConnection({
+      provider: 'test-webhook-legacy',
+      secret: SECRET_ONE,
+      ingestWarehouseId: warehouseId,
+      connectedBy: ownerUserId,
+    });
 
     // Mappings: the kit family + the stocked plain lines.
     await channels.setChannelMappings(
@@ -525,6 +566,55 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     expect(res.body.detail).not.toContain('canary');
   });
 
+  it('an EMPTY line_items body refuses at the parse arm — 400, never an accepted zero-line order (review patch P11)', async () => {
+    const res = await postOrder(connId, JSON.stringify({
+      id: 9_000_000_010_100,
+      shipping_address: { name: 'Ravi Kumar', phone: '9876543210', address1: 'Plot 12', address2: 'Tech Park', city: 'Hyderabad', province: 'Telangana', zip: '500081' },
+      line_items: [],
+    })).expect(400);
+    expect(res.body.code).toBe('validation-failed');
+    expect(await outbound.findOrderByChannelRef(tenantId, connId, '9000000010100')).toBeNull();
+    const rows = await meterRows(connId);
+    expect(rows.at(-1)!.status).toBe('validation-failed');
+  });
+
+  it('a NON-JSON body and a non-object body are METED parse refusals on both endpoints (review patch P5)', async () => {
+    // The bytes are what the signature covers — a signed non-JSON body
+    // verifies, then refuses at the parse boundary (never a 500).
+    for (const bodyText of ['this is not json', '[1, 2]', '"a bare string"']) {
+      const res = await postOrder(connId, bodyText).expect(400);
+      expect(res.body.code).toBe('validation-failed');
+      const rows = await meterRows(connId);
+      expect(rows.at(-1)!.status).toBe('validation-failed');
+    }
+    // The cancellations endpoint mirrors the posture.
+    for (const bodyText of ['this is not json', '[1, 2]']) {
+      const res = await postCancel(connId, bodyText).expect(400);
+      expect(res.body.code).toBe('validation-failed');
+      const rows = await meterRows(connId);
+      expect(rows.at(-1)!.status).toBe('validation-failed');
+    }
+  });
+
+  it('the ingested order.created audit row names its channel source (review patch P10) — never a secret', async () => {
+    await postOrder(connId, orderBody(9_000_000_010_200, [{ sku: 'WH-A', quantity: 1 }])).expect(200);
+    const orderId = (await outbound.findOrderByChannelRef(tenantId, connId, '9000000010200'))!.id;
+    const sql = await sqlHandle();
+    try {
+      const audits = (await sql`
+        select reference from audit_events
+        where tenant_id = ${tenantId} and action = 'order.created' and target_id = ${orderId}
+      `) as unknown as { reference: string }[];
+      expect(audits).toHaveLength(1);
+      const written = JSON.parse(audits[0]!.reference) as {
+        channel: { connectionId: string; externalEventId: string | null };
+      };
+      expect(written.channel).toEqual({ connectionId: connId, externalEventId: '9000000010200' });
+    } finally {
+      await sql.end();
+    }
+  });
+
   // ── phase B: the verification-failure class (RD-5) ────────────────────────
 
   it('tampered body answers 401 with an empty detail — before any parse', async () => {
@@ -578,6 +668,37 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     expect(res.body.code).toBe('channel-transport-unconfigured');
   });
 
+  it('the 501 transport gate runs BEFORE the credential opens (review patch P5): an unopenable sealed blob still 501s', async () => {
+    const sql = await sqlHandle();
+    let stored: string | null = null;
+    try {
+      const rows = (await sql`
+        select credential_sealed from integrations where tenant_id = ${tenantId} and id = ${flipkartId}
+      `) as unknown as { credential_sealed: string | null }[];
+      stored = rows[0]!.credential_sealed;
+      // Envelope-shaped but undecryptable — passes the storage CHECK, fails
+      // every openCredential attempt (the sealed format is
+      // `v1:<iv b64>:<tag b64>:<ciphertext b64>`).
+      await sql`update integrations set credential_sealed = 'v1:garbage:garbage:garbage' where tenant_id = ${tenantId} and id = ${flipkartId}`;
+    } finally {
+      await sql.end();
+    }
+    try {
+      // The lazy-open face returns a real row (the connection exists), so
+      // the unconfigured gate fires BEFORE any openCredential attempt —
+      // the 501 stands where an eager open would have answered 401.
+      const res = await postOrderTo('flipkart', flipkartId, orderBody(9_000_000_010_043, [{ sku: 'WH-A', quantity: 1 }])).expect(501);
+      expect(res.body.code).toBe('channel-transport-unconfigured');
+    } finally {
+      const restore = await sqlHandle();
+      try {
+        await restore`update integrations set credential_sealed = ${stored} where tenant_id = ${tenantId} and id = ${flipkartId}`;
+      } finally {
+        await restore.end();
+      }
+    }
+  });
+
   // ── phase D: the cancellation arms (RD-8) ─────────────────────────────────
 
   it('an unknown order ref answers 503 cancellation-unresolved (the channel retries)', async () => {
@@ -597,6 +718,24 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     expect(rows.some((row) => row.status === 'released')).toBe(true);
     const again = await postCancel(connId, cancelBody(9_000_000_020_002)).expect(200);
     expect(again.body.outcome).toBe('ignored');
+    // RD-8 (review patch P10): the ignored decision is ALSO an audit row —
+    // action `order.cancellation_ignored` beside the meter row, the ref the
+    // only content.
+    const sql = await sqlHandle();
+    try {
+      const audits = (await sql`
+        select action, target_type, target_id, reference from audit_events
+        where tenant_id = ${tenantId} and action = 'order.cancellation_ignored'
+      `) as unknown as { target_type: string; target_id: string; reference: string }[];
+      expect(audits).toHaveLength(1);
+      expect(audits[0]).toMatchObject({
+        target_type: 'order',
+        target_id: orderId,
+        reference: '9000000020002',
+      });
+    } finally {
+      await sql.end();
+    }
   });
 
   // ── phase E: the actor authority (RD-2) — re-read PER DELIVERY ────────────
@@ -681,6 +820,23 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     await mutateConnection({ backorderPolicy: 'accept' });
   });
 
+  it("the webhook ROUTE's grant-store 503: the ingest fails closed and meters failed (review patch P9)", async () => {
+    // The same closed posture the manual route pins (orders.spec): the
+    // grant store unreachable → 503, nothing written; the webhook route's
+    // rejection map meters the 503 as `failed`.
+    const valkeyClient = app.get(ValkeyClient);
+    jest.spyOn(valkeyClient, 'grantReservation').mockRejectedValue(new Error('connection refused'));
+    try {
+      const res = await postOrder(connId, orderBody(9_000_000_010_300, [{ sku: 'WH-A', quantity: 1 }])).expect(503);
+      expect(res.body.code).toBe('reservation-store-unavailable');
+      expect(await outbound.findOrderByChannelRef(tenantId, connId, '9000000010300')).toBeNull();
+      const rows = await meterRows(connId);
+      expect(rows.at(-1)!.status).toBe('failed');
+    } finally {
+      jest.restoreAllMocks();
+    }
+  });
+
   // ── phase H: rotate semantics + the mid-delivery rotate window ────────────
 
   it('a rotate POSTing every declared field keeps webhookSecret (wholesale-replace semantics)', async () => {
@@ -709,6 +865,58 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     await postOrder(connId, orderBody(9_000_000_010_001, [{ sku: 'WH-A', quantity: 3 }]), SECRET_ONE).expect(401);
     // And the current secret verifies again.
     await postOrder(connId, orderBody(9_000_000_010_001, [{ sku: 'WH-A', quantity: 3 }]), SECRET_TWO).expect(200);
+  });
+
+  // ── phase I: the two remaining verification postures (review patch P5/P9) ─
+
+  it('an UNSUPPORTED signing scheme fails closed to the SAME 401 + meter — no exception, no bypass (review patch P5)', async () => {
+    // A perfectly-computed hmac-sha256 signature changes NOTHING: the
+    // legacy provider's declared scheme is not implemented, verification
+    // answers false (never a thrown problem), and the delivery lands in
+    // the coarse verification-failed meter like any other 401.
+    const bodyText = orderBody(9_000_000_010_501, [{ sku: 'WH-A', quantity: 1 }]);
+    const res = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/webhooks/channels/test-webhook-legacy/${legacyConnId}/orders`)
+      .set('X-Suite-Hmac', sign(SECRET_ONE, bodyText))
+      .set('X-Suite-Topic', 'orders/create')
+      .set('Content-Type', 'application/json')
+      .send(bodyText)
+      .expect(401);
+    expect(res.body.code).toBe('webhook-signature-invalid');
+    expect(res.body.detail).toBe('');
+    const rows = await meterRows(legacyConnId);
+    const refused = rows.filter((row) => row.status === 'verification-failed');
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.kind).toBe('order-ingest');
+    expect(refused[0]!.error).toBeNull();
+  });
+
+  it('the EMPTY-SECRET arm: a rotation that drops webhookSecret turns every delivery into the meted 401 (bl-9, review patch P9)', async () => {
+    // Wholesale rotation WITHOUT the webhookSecret field drops it.
+    await request(app.getHttpServer())
+      .put(`${API}/${tenantId}/channels/connections/${connId}/credentials`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ credentials: { apiKey: 'canary-wh-key-nosecret', locationId: '111111' } })
+      .expect(200);
+    expect((await readStoredCredential(connId)).webhookSecret).toBeUndefined();
+    // A VALID HMAC under the remembered secret changes nothing to verify
+    // against — the absent-secret arm still 401s with its coarse meter.
+    await clearMeterRows(connId);
+    const res = await postOrder(connId, orderBody(9_000_000_010_502, [{ sku: 'WH-A', quantity: 1 }]), SECRET_TWO).expect(401);
+    expect(res.body.code).toBe('webhook-signature-invalid');
+    expect(res.body.detail).toBe('');
+    const rows = await meterRows(connId);
+    const refused = rows.filter((row) => row.status === 'verification-failed');
+    expect(refused).toHaveLength(1);
+    expect(refused[0]!.error).toBeNull();
+    // Restore the secret (the later phases re-use the connection).
+    await request(app.getHttpServer())
+      .put(`${API}/${tenantId}/channels/connections/${connId}/credentials`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ credentials: { apiKey: 'canary-wh-key-nosecret', webhookSecret: SECRET_TWO, locationId: '111111' } })
+      .expect(200);
   });
 
   // ── the mappings routes (row 4-5) ─────────────────────────────────────────
@@ -759,6 +967,80 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
       .send({ items })
       .expect(400);
     expect(res.body.code).toBe('validation-failed');
+  });
+
+  it('mappings PUT 400s a TRIMMED duplicate ref pair — `{"A", " A"}` is now a typed 400, never a 500 (review patch P6)', async () => {
+    const res = await request(app.getHttpServer())
+      .put(`${API}/${tenantId}/channels/connections/${connId}/mappings`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        items: [
+          { externalRef: 'A', skuId: skuIds.get('WH-A')! },
+          { externalRef: ' A', skuId: skuIds.get('WH-B')! },
+        ],
+      })
+      .expect(400);
+    expect(res.body.code).toBe('validation-failed');
+    expect(res.body.detail).toContain('at most once');
+    // Nothing was written — the set before this PUT stands.
+    const list = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/channels/connections/${connId}/mappings`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    expect(list.body.items).toEqual([]);
+  });
+
+  it('mappings PUT 400s at the SCOPE CEILING — SKUs × active warehouses, and passes at the cap (review patch P9)', async () => {
+    // A second active warehouse doubles every SKU's scope arithmetic.
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ origin: testAddress(), code: `WHK2-${ulid().slice(10, 16).toUpperCase()}`, name: `Webhook second WH ${ulid()}` })
+      .expect(201);
+    // 101 fresh SKUs (one import): 101 × 2 = 202 scopes, above the cap.
+    const ceilingCodes = Array.from({ length: 101 }, (_, i) => `WHX-${String(i).padStart(3, '0')}`);
+    const csv = [CSV_HEADER, ...ceilingCodes.map((code) => `${code},Ceiling SKU ${code},pcs,,1800,,,,,`)].join('\n');
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog-ceiling.csv', contentType: 'text/csv' })
+      .expect(201);
+    const sql = await sqlHandle();
+    const ceilingIds: { externalRef: string; skuId: string }[] = [];
+    try {
+      const rows = (await sql`
+        select id, code from skus where tenant_id = ${tenantId} and code like 'WHX-%'
+      `) as unknown as { id: string; code: string }[];
+      expect(rows).toHaveLength(101);
+      for (const row of rows) {
+        ceilingIds.push({ externalRef: row.code, skuId: row.id });
+      }
+    } finally {
+      await sql.end();
+    }
+    const putMappings = (items: { externalRef: string; skuId: string }[]): request.Test =>
+      request(app.getHttpServer())
+        .put(`${API}/${tenantId}/channels/connections/${connId}/mappings`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ items });
+    // 100 × 2 = 200 — AT the cap, accepted.
+    await putMappings(ceilingIds.slice(0, 100)).expect(200);
+    // 101 × 2 = 202 — above it, the 400 names the arithmetic.
+    const over = await putMappings(ceilingIds).expect(400);
+    expect(over.body.code).toBe('validation-failed');
+    expect(over.body.detail).toContain('101 mapped SKU(s) × 2 active warehouse(s) = 202');
+    expect(over.body.detail).toContain('200-scope cap');
+    // The refused PUT wrote nothing.
+    const list = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/channels/connections/${connId}/mappings`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    expect(list.body.items).toHaveLength(100);
   });
 
   it('mappings routes refuse a capability-less role 403 (AD-4)', async () => {

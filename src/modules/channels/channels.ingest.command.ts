@@ -4,7 +4,9 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { channelMappings, integrations } from '../../shared/db/schema';
 import type { Integration, IntegrationCallStatus } from '../../shared/db/schema';
-import { ulid } from '../../shared/primitives/ids';
+import { auditEvents } from '../../shared/db/schema';
+import { nowIso } from '../../shared/primitives/time';
+import { ulid, uuidv7 } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
@@ -251,6 +253,10 @@ export class ChannelsIngestCommand {
         latencyMs: Date.now() - startedAt,
         error: `the order reads "${order.status}" — the cancellation records as ignored`,
       });
+      // RD-8 (review patch P10): an `ignored` outcome is still a
+      // cancellation decision — it lands in the audit trail as well as the
+      // meter (the released path's audit rides `cancelOrder`'s own row).
+      await this.recordCancellationIgnoredAuditSafe(tenantId, connection.connectedBy, order.id, parsed.orderRef);
       return { outcome: 'ignored' };
     }
     try {
@@ -273,7 +279,15 @@ export class ChannelsIngestCommand {
         // pre-pick stock — recorded as `ignored` (RD-8; the meter row
         // carries the refusal detail); the 403 maps fail-closed as for
         // orders; everything else refuses the delivery verbatim.
-        const mapped = await this.mapCancellationRejection(tenantId, connectionId, startedAt, err);
+        const mapped = await this.mapCancellationRejection(
+          tenantId,
+          connectionId,
+          startedAt,
+          err,
+          connection.connectedBy,
+          order,
+          parsed.orderRef,
+        );
         if (mapped !== null) {
           return mapped;
         }
@@ -343,6 +357,9 @@ export class ChannelsIngestCommand {
     connectionId: string,
     startedAt: number,
     err: ProblemException,
+    actorUserId: string,
+    order: { readonly id: string },
+    orderRef: string,
   ): Promise<{ outcome: 'released' | 'ignored' } | null> {
     const latencyMs = Date.now() - startedAt;
     const code = (err.getResponse() as { code: string }).code;
@@ -363,6 +380,9 @@ export class ChannelsIngestCommand {
         latencyMs,
         error: err.message,
       }).catch(() => undefined);
+      // RD-8 (review patch P10): the 409-class `ignored` decision lands in
+      // the audit trail as well as the meter.
+      await this.recordCancellationIgnoredAuditSafe(tenantId, actorUserId, order.id, orderRef);
       return { outcome: 'ignored' };
     }
     await this.publish.recordIngestOutcome(tenantId, connectionId, {
@@ -371,6 +391,41 @@ export class ChannelsIngestCommand {
       error: err.message,
     }).catch(() => undefined);
     return null;
+  }
+
+  /**
+   * The `ignored` cancellation decision's audit row (RD-8 — "every
+   * cancellation outcome lands in the meter … and an audit row", review
+   * patch P10: both ignored branches write it). The action
+   * `order.cancellation_ignored`, the actor `connected_by`, the ref the
+   * channel named — nothing secret. Best-effort (a meter row's own
+   * posture): an audit write fault must not fail a delivery that already
+   * answered 200.
+   */
+  private async recordCancellationIgnoredAuditSafe(
+    tenantId: string,
+    actorUserId: string,
+    orderId: string,
+    orderRef: string,
+  ): Promise<void> {
+    try {
+      await withTenantTransaction(this.db, tenantId, (tx) =>
+        tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId,
+          actorUserId,
+          action: 'order.cancellation_ignored',
+          targetType: 'order',
+          targetId: orderId,
+          reference: orderRef,
+          occurredAt: nowIso(),
+        }),
+      );
+    } catch (err) {
+      this.logger.error(
+        `ignored-cancellation audit row failed to write (non-blocking): ${String(err)}`,
+      );
+    }
   }
 
   /** The connection's public face (the sealed blob rides nothing here). */

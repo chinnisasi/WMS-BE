@@ -142,13 +142,46 @@ export async function channelHttpRequest(args: {
     );
   }
 
-  const chunks: string[] = [];
+  // The body accumulates as RAW BYTES and decodes ONCE at the end (review
+  // patch P7): a multi-byte UTF-8 character split across chunk boundaries
+  // corrupts under a per-chunk string decode, and an error path must never
+  // resolve with what has been pushed so far.
+  const chunks: Buffer[] = [];
   const status = response.statusCode ?? 0;
-  const body: string = await new Promise((resolve, reject) => {
-    response.on('data', (chunk: string | Buffer) => chunks.push(String(chunk)));
-    response.on('end', () => resolve(chunks.join('')));
-    response.on('error', reject);
-  });
+  let body: string;
+  try {
+    body = await new Promise((resolve, reject) => {
+      response.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+      response.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      response.on('error', reject);
+    });
+  } catch (err) {
+    // An aborted/errored stream mid-body fails typed: the timeout lands as
+    // `timeout`, everything else as `network` — never a partial body (P7).
+    throw signal.aborted
+      ? new ChannelHttpError('timeout', null, `channel call exceeded ${CHANNEL_HTTP_TIMEOUT_MS}ms`)
+      : new ChannelHttpError('network', null, err instanceof Error ? err.message.slice(0, 200) : 'network error');
+  }
+  if (signal.aborted) {
+    // The timeout landed mid-body: a PARTIAL body is not a response — the
+    // typed `timeout` failure, never a truncated 2xx read (P7).
+    throw new ChannelHttpError('timeout', null, `channel call exceeded ${CHANNEL_HTTP_TIMEOUT_MS}ms`);
+  }
+  // A truncated 2xx (connection closed before the declared Content-Length
+  // arrived) is a transport failure, not a short answer (P7).
+  const declaredLength = response.headers['content-length'];
+  const declared = declaredLength === undefined ? null : Number(Array.isArray(declaredLength) ? declaredLength[0] : declaredLength);
+  if (
+    status >= 200 && status < 400 &&
+    declared !== null && Number.isFinite(declared) &&
+    Buffer.concat(chunks).length !== declared
+  ) {
+    throw new ChannelHttpError(
+      'not-ok',
+      null,
+      `channel response truncated: ${Buffer.concat(chunks).length} of ${declared} declared bytes arrived`,
+    );
+  }
   if (!signal.aborted && status < 200) {
     // A transport-level protocol failure (no status line).
     throw new ChannelHttpError('network', null, `no response status (connected, then closed)`);

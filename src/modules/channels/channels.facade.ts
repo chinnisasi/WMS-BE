@@ -302,15 +302,16 @@ export class ChannelsFacade {
   }
 
   /**
-   * The WEBHOOK surface's delivery face (story 7-2): provider + the OPENED
-   * signing secret — the sealed blob never crosses into `src/api` (the
-   * carriers 4.6b pin). `webhookSecret: null` = absent or unopenable — the
-   * caller's fail-closed 401 arm.
+   * The WEBHOOK surface's delivery face (story 7-2): provider + LAZY access
+   * to the signing secret — opened only when the caller's 501 gate has
+   * passed (review patch P5), the sealed blob never crosses into `src/api`
+   * (the carriers 4.6b pin). `openSecret() === null` = absent or
+   * unopenable — the caller's fail-closed 401 arm.
    */
   webhookDeliveryFace(
     tenantId: string,
     connectionId: string,
-  ): Promise<{ provider: string; webhookSecret: string | null } | null> {
+  ): Promise<{ provider: string; openSecret: () => string | null } | null> {
     return this.publish.webhookDeliveryFace(tenantId, connectionId);
   }
 
@@ -334,9 +335,9 @@ export class ChannelsFacade {
   // (kept for the arm-4 composition test + the surfaces story's reads)
   computePublishedScopes(
     tenantId: string,
-    skuIds: readonly string[],
+    skuRefs: readonly { skuId: string; externalRef: string }[],
     connectionId: string,
   ): Promise<PublishedScope[]> {
-    return this.publish.computePublishedScopes(tenantId, skuIds, connectionId);
+    return this.publish.computePublishedScopes(tenantId, skuRefs, connectionId);
   }
 }

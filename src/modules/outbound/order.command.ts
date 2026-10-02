@@ -11,7 +11,7 @@ import {
   skus,
 } from '../../shared/db/schema';
 import type { Order, OrderLine } from '../../shared/db/schema';
-import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
+import { MAX_EXTERNAL_ID_LENGTH, UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -99,9 +99,6 @@ const MAX_GRANT_ATTEMPTS = 4;
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 /** The channel-dedup partial unique index (the race backstop's name). */
 const ORDERS_SOURCE_EVENT_UNIQUE = 'orders_source_event_unique';
-
-/** Max length of an ingested order's external event id (a channel ref). */
-const MAX_EXTERNAL_EVENT_ID_LENGTH = 200;
 
 /**
  * The line-quantity ceiling, in milli-units (story 10.1). The column is
@@ -352,9 +349,9 @@ export class OrderCommandService {
         if (!UUID_RE.test(integrationId)) {
           throw validationFailed('integrationId must be a uuid.');
         }
-        if (externalEventId.length > MAX_EXTERNAL_EVENT_ID_LENGTH) {
+        if (externalEventId.length > MAX_EXTERNAL_ID_LENGTH) {
           throw validationFailed(
-            `externalEventId is at most ${MAX_EXTERNAL_EVENT_ID_LENGTH} characters.`,
+            `externalEventId is at most ${MAX_EXTERNAL_ID_LENGTH} characters.`,
           );
         }
       }
@@ -678,7 +675,19 @@ export class OrderCommandService {
           action: 'order.created',
           targetType: 'order',
           targetId: orderId,
-          reference: idempotencyKey,
+          // RD-2 (review patch P10): an INGESTED order's audit row names its
+          // channel source — the connection + the channel ref, never a
+          // secret — so "where did this order come from" answers from the
+          // audit trail alone. A manual order keeps the idempotency key.
+          reference:
+            command.source === 'ingested' && command.integrationId !== undefined
+              ? JSON.stringify({
+                  channel: {
+                    connectionId: command.integrationId,
+                    externalEventId: command.externalEventId ?? null,
+                  },
+                })
+              : idempotencyKey,
           occurredAt: nowIso(),
         });
 

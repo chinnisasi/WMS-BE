@@ -5,6 +5,7 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { openCredential } from '../src/modules/channels/channel-credentials';
+import { testAddress } from './support/shipment-address';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
 // The e2e suite talks to the real Postgres and signs sessions; the vault
@@ -470,6 +471,60 @@ describe('channel connections, credentials and config (e2e, story 7-1)', () => {
     for (const secret of [SHOPIFY_ROTATED.accessToken, ...(await sealedBlobs(tenantId))]) {
       expect([secret, text.includes(secret)]).toEqual([secret, false]);
     }
+  });
+
+  it('the 7-2 config arms (review patch P9): the ingest warehouse SET/ECHO/CLEAR and its 404 class', async () => {
+    const { tenantId, token } = await freshTenant();
+    const created = await connect(token, tenantId, shopifyBody()).expect(201);
+    const connectionId = created.body.id as string;
+    const warehouse = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/warehouses`)
+      .set('Authorization', `Bearer ${token}`)
+      .set(KEY_HEADER, ulid())
+      .send({ origin: testAddress(), code: `CHC-${ulid().slice(10, 16).toUpperCase()}`, name: `Channel WH ${ulid()}` })
+      .expect(201);
+    const warehouseId = warehouse.body.id as string;
+
+    // SET: the snapshot echoes the warehouse (RD-4's WYSIWYG).
+    const set = await setConfig(token, tenantId, connectionId, {
+      backorderPolicy: 'accept',
+      ingestWarehouseId: warehouseId,
+    }).expect(200);
+    expect(set.body).toMatchObject({ id: connectionId, ingestWarehouseId: warehouseId });
+    // ABSENT (only the policy changed here) leaves the warehouse unchanged.
+    const untouched = await setConfig(token, tenantId, connectionId, { backorderPolicy: 'reject' }).expect(200);
+    expect(untouched.body.ingestWarehouseId).toBe(warehouseId);
+    // CLEAR: the explicit null lands in the snapshot as null.
+    const cleared = await setConfig(token, tenantId, connectionId, {
+      backorderPolicy: 'accept',
+      ingestWarehouseId: null,
+    }).expect(200);
+    expect(cleared.body.ingestWarehouseId).toBeNull();
+    // UNKNOWN uuid → 404 naming the warehouse, never a bare not-found.
+    const unknown = uuidv7();
+    const notFound = await setConfig(token, tenantId, connectionId, {
+      backorderPolicy: 'accept',
+      ingestWarehouseId: unknown,
+    }).expect(404);
+    expect(notFound.body.code).toBe('not-found');
+    expect(notFound.body.detail).toContain(unknown);
+    // A FOREIGN tenant's warehouse → 404 too (the set must be THIS tenant's).
+    const other = await freshTenant();
+    const foreignWh = (
+      await request(app.getHttpServer())
+        .post(`${API}/${other.tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${other.token}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `CHF-${ulid().slice(10, 16).toUpperCase()}`, name: `Foreign WH ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    await setConfig(token, tenantId, connectionId, {
+      backorderPolicy: 'accept',
+      ingestWarehouseId: foreignWh,
+    }).expect(404);
+    // The failed writes cleared nothing — the state still reads the clear.
+    const list = await listConnections(token, tenantId).expect(200);
+    expect(list.body.items[0]).toMatchObject({ id: connectionId, ingestWarehouseId: null });
   });
 
   async function sealedBlobs(tenantId: string): Promise<string[]> {

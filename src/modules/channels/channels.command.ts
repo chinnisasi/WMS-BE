@@ -54,7 +54,7 @@ import {
   invalidUuidParam,
   unknownChannelProvider,
 } from './channels.errors';
-import { MAX_SYNC_SCOPES_PER_PUBLISH } from './channels.publish';
+import { MAX_SYNC_SCOPES_PER_PUBLISH, type MappedSkuRef } from './channels.publish';
 import type { PublishedScope } from './channels.events';
 import { CONNECTION_COLUMNS, toConnectionView } from './channels.view';
 import type {
@@ -1019,7 +1019,7 @@ export class ChannelsCommandService {
 
     type RetryPhase1 =
       | { kind: 'replayed'; snapshot: ChannelConnectionView }
-      | { kind: 'mapped'; skuIds: string[] };
+      | { kind: 'mapped'; skuRefs: MappedSkuRef[] };
     const phase1 = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       assertPermission(
         await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
@@ -1034,7 +1034,7 @@ export class ChannelsCommandService {
         throw channelConnectionNotFound();
       }
       const mapped = await tx
-        .select({ skuId: channelMappings.skuId })
+        .select({ skuId: channelMappings.skuId, externalRef: channelMappings.externalRef })
         .from(channelMappings)
         .where(
           and(
@@ -1042,7 +1042,8 @@ export class ChannelsCommandService {
             eq(channelMappings.integrationId, command.connectionId),
           ),
         );
-      return { kind: 'mapped', skuIds: [...new Set(mapped.map((row) => row.skuId))] } satisfies RetryPhase1;
+      const skuRefs = [...new Map(mapped.map((row) => [`${row.skuId}|${row.externalRef}`, row])).values()];
+      return { kind: 'mapped', skuRefs } satisfies RetryPhase1;
     });
     if (phase1.kind === 'replayed') {
       return phase1.snapshot;
@@ -1056,7 +1057,7 @@ export class ChannelsCommandService {
     const prep = await this.publish.preparePublication(
       command.tenantId,
       command.connectionId,
-      phase1.skuIds,
+      phase1.skuRefs,
     );
     const scopes: PublishedScope[] = prep.kind === 'ready' ? prep.scopes : [];
 
@@ -1130,8 +1131,14 @@ export class ChannelsCommandService {
         throw validationFailed(`Every mapping item's skuId must be a uuid (got "${item.skuId.slice(0, 12)}…").`);
       }
     }
+    // The duplicate check compares TRIMMED refs (review patch P6): the
+    // insert stores `.trim()` below, so a raw comparison would let {"A",
+    // " A"} pass this 400 and die on the unique index as an untyped 500.
     const refDuplicates = [...new Set(
-      command.items.filter((item, index) => command.items.findIndex((other) => other.externalRef === item.externalRef) !== index).map((item) => item.externalRef),
+      command.items.filter((item, index) =>
+        command.items.findIndex(
+          (other) => other.externalRef.trim() === item.externalRef.trim(),
+        ) !== index).map((item) => item.externalRef),
     )];
     if (refDuplicates.length > 0) {
       throw validationFailed(

@@ -107,17 +107,35 @@ export class ChannelWritebackDelivery implements OnModuleInit {
       throw new Error('the writeback delivery failed: credential unopenable');
     }
 
-    // The channel-facing lines: the mapping set resolves skuId → externalRef
-    // (a fresh read — the mappings PUT may have changed since ingest). A
-    // line with no live mapping is left out; when NO line resolves on an
-    // item-carrying state the attempt fails (a fulfillment of zero items
-    // would lie to the channel) and the relay retries — the mapping PUT
-    // heals the redrain. The `cancelled` state carries no items, so an
-    // unmapped cancel still settles.
+    // The channel-facing lines (RD-7 amended — change log #7): kit PARENT
+    // lines are dropped FIRST (a parent is found by inversion — any line
+    // whose id another line's `parentLineId` names — the exploded children
+    // carry the shipped quantities, so a mapped parent must never post
+    // alongside them), then the live mapping set resolves skuId →
+    // externalRef (a fresh read — the mappings PUT may have changed since
+    // ingest).
+    const parentLineIds = new Set(
+      order.lines
+        .filter((line) => line.parentLineId !== null)
+        .map((line) => line.parentLineId as string),
+    );
+    const itemLines = order.lines.filter((line) => !parentLineIds.has(line.id));
     const mappings = new Map(
       (await this.publish.listChannelMappings(event.tenantId, connectionId)).map((m) => [m.skuId, m.externalRef]),
     );
-    const lines = order.lines
+    const unresolved = itemLines.filter((line) => !mappings.has(line.skuId));
+    if (type !== 'order.cancelled' && unresolved.length > 0) {
+      // ANY fulfillment line without a live mapping fails the WHOLE attempt
+      // with the typed, metered refusal — the channel never sees a partial
+      // fulfillment that under-reports what shipped (review row 37's half
+      // measure — the silent drop — is gone). `422`-shaped: remediation is
+      // the mapping PUT; the relay retries honestly, and past its budget
+      // dead-letters. The count is the only content — never a secret.
+      const error = `${unresolved.length} of ${itemLines.length} order line(s) resolve to no channel SKU mapping — the fulfillment is refused whole; map the SKU(s) (mapping PUT) to heal`;
+      await this.settleFailure(event.tenantId, connectionId, error);
+      throw new Error(`the writeback delivery failed: ${error}`);
+    }
+    const lines = itemLines
       .map((line) => {
         const externalRef = mappings.get(line.skuId);
         return externalRef === undefined ? null : { externalRef, quantity: line.qty };

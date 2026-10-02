@@ -27,7 +27,9 @@
  */
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { fromMilli } from '../../shared/primitives/quantity';
+import { MAX_EXTERNAL_ID_LENGTH } from '../../shared/primitives/ids';
 import { ChannelHttpError, channelHttpRequest } from './channel-http';
+import { ChannelItemsUnresolvedError } from './channel-availability-port';
 import type { ParsedChannelCancellation, ParsedChannelLine, ParsedChannelOrder } from './channel-registry';
 import type { ChannelCredential } from './channel-credentials';
 import type { AddressInput } from '../../shared/primitives/address';
@@ -63,13 +65,32 @@ function adminHeaders(credential: ChannelCredential): Record<string, string> {
 /** The writeback-without-location failure's meter-facing name (RD-6). */
 export const WRITEBACK_LOCATION_UNSET = 'writeback-location-unset';
 
+/** The un-addressable read-back fulfillment's meter-facing name (RD-7). */
+export const WRITEBACK_UNTRACKED_ID = 'writeback-untracked-fulfillment';
+
+/** One Admin-API variant row from the ref lookup (the id the arm needs). */
+interface VariantLookupResponse {
+  variants?: { inventory_item_id?: number | null }[];
+}
+
 /**
- * The Shopify availability arm (RD-6): one inventory-set request PER SCOPE —
- * the payload carries the port's `ChannelAvailabilityScope` verbatim (the
- * core already computed `visibleMilli`; the arm converts to the API's unit
- * and addresses the location the credential names). A 4xx/5xx answer is the
- * delivery failure the breaker machinery already understands (the relay's
- * retry budget carries the rest).
+ * The Shopify availability arm (RD-6, amended by human negotiation — change
+ * log #7): one inventory-set request PER POSTABLE scope, every scope's
+ * mapped `externalRef` resolved to Shopify's OWN `inventory_item_id` first
+ * (a variant lookup through the Admin API) — the WMS `skuId` uuid is never
+ * put on the channel wire. A scope whose cached `inventoryItemId` arrived on
+ * the port carries no lookup; a fresh resolution rides the result back as
+ * `resolvedItems` so the delivery can persist it (the per-connection cache).
+ *
+ * An unresolvable ref (empty lookup answer, or any lookup failure) SKIPS its
+ * scopes — never guessed, never the uuid. Every scope unresolvable refuses
+ * the whole attempt with the typed `ChannelItemsUnresolvedError` (the
+ * delivery meters `item-unresolved`; no breaker/health movement — RD-9); a
+ * partial run posts what resolved and reports the skipped refs for the
+ * metered count. Posted availability is quantized
+ * `floor(visibleMilli)` — Shopify inventory is integer-only and floor is
+ * ATP-safe (never advertises more than exists). A 4xx/5xx answer on a POST
+ * itself is the delivery failure the breaker machinery already understands.
  */
 export async function shopifyAvailabilityArm(
   credential: ChannelCredential,
@@ -79,19 +100,68 @@ export async function shopifyAvailabilityArm(
     throw new ChannelHttpError('bad-arg', null, 'credential field "locationId" is absent (rotate to supply it)');
   }
   const base = adminBase(credential);
+  const headers = adminHeaders(credential);
+
+  const resolved = new Map<string, number>();
+  const fresh = new Map<string, number>();
+  const unresolved: string[] = [];
   for (const scope of request.scopes) {
+    if (scope.inventoryItemId !== undefined) {
+      resolved.set(scope.externalRef, scope.inventoryItemId);
+      continue;
+    }
+    // One scope per (ref × warehouse): the second scope of the same ref
+    // needs no second lookup.
+    if (resolved.has(scope.externalRef) || unresolved.includes(scope.externalRef)) {
+      continue;
+    }
+    try {
+      const response = await channelHttpRequest({
+        method: 'GET',
+        url: `${base}/variants.json?sku=${encodeURIComponent(scope.externalRef)}`,
+        headers,
+      });
+      const itemId = (JSON.parse(response.body) as VariantLookupResponse).variants?.[0]?.inventory_item_id;
+      if (typeof itemId === 'number' && Number.isSafeInteger(itemId)) {
+        resolved.set(scope.externalRef, itemId);
+        fresh.set(scope.externalRef, itemId);
+      } else {
+        unresolved.push(scope.externalRef);
+      }
+    } catch {
+      // A lookup failure is an unresolvable ref this attempt — the typed
+      // refusal (or the skipped count) carries it; nothing is posted with a
+      // guessed id.
+      unresolved.push(scope.externalRef);
+    }
+  }
+
+  if (resolved.size === 0) {
+    throw new ChannelItemsUnresolvedError(request.scopes.map((scope) => scope.externalRef));
+  }
+
+  for (const scope of request.scopes) {
+    const itemId = resolved.get(scope.externalRef);
+    if (itemId === undefined) {
+      continue; // unresolvable this attempt — the skipped count rides the result
+    }
     await channelHttpRequest({
       method: 'POST',
       url: `${base}/inventory_levels/set.json`,
-      headers: adminHeaders(credential),
+      headers,
       body: {
         location_id: Number(credential.locationId),
-        inventory_item_ids: [scope.skuId],
-        available: fromMilli(scope.visibleMilli),
+        inventory_item_ids: [itemId],
+        available: Math.floor(fromMilli(scope.visibleMilli)),
       },
     });
   }
-  return { acceptedAt: new Date().toISOString() };
+  const skippedRefs = unresolved.filter((ref) => !resolved.has(ref));
+  return {
+    acceptedAt: new Date().toISOString(),
+    ...(fresh.size > 0 ? { resolvedItems: Object.fromEntries(fresh) } : {}),
+    ...(skippedRefs.length > 0 ? { skippedRefs } : {}),
+  };
 }
 
 /**
@@ -202,9 +272,18 @@ export async function shopifyOrderWritebackArm(
   }
   if (fulfillments.length > 0) {
     const untracked = fulfillments[0]!;
+    // The tracking write addresses the fulfillment BY its id — a read-back
+    // row without one is un-addressable (never a malformed
+    // `fulfillments//tracking_info.json` request): the typed, metered
+    // failure arm, the relay's budget carries the retry.
+    if (typeof untracked.id !== 'number' || !Number.isSafeInteger(untracked.id)) {
+      throw new Error(
+        `${WRITEBACK_UNTRACKED_ID}: the channel's read-back fulfillment carries no id — the tracking write is un-addressable; not retried with a guessed path.`,
+      );
+    }
     await channelHttpRequest({
       method: 'POST',
-      url: `${base}/fulfillments/${String(untracked.id ?? '')}/tracking_info.json`,
+      url: `${base}/fulfillments/${untracked.id}/tracking_info.json`,
       headers,
       body: {
         tracking_info: {
@@ -270,16 +349,13 @@ export function shopifySignatureValid(
 // channel-sensitive). The channel order REF is the payload's `id` (immutable;
 // never `order_number` per RD-1's pin).
 
-/** The channel ref's ceiling — the order command's own MAX_EXTERNAL_EVENT_ID_LENGTH. */
-const MAX_ORDER_REF_LENGTH = 200;
-
 function parseOrderRef(body: Record<string, unknown>): string | null {
   const id = body['id'];
   if (typeof id !== 'string' && typeof id !== 'number') {
     return null;
   }
   const orderRef = String(id).trim();
-  if (orderRef === '' || orderRef.length > MAX_ORDER_REF_LENGTH) {
+  if (orderRef === '' || orderRef.length > MAX_EXTERNAL_ID_LENGTH) {
     return null;
   }
   return orderRef;
@@ -342,6 +418,13 @@ export function shopifyParseOrder(body: Record<string, unknown>): ParsedChannelO
       return null;
     }
     lines.push({ externalRef: sku.trim(), quantity });
+  }
+  // An order with no parseable line at all is not an empty order the ingest
+  // path creates with zero lines (review patch P11): it is an unmappable
+  // body — the parse arm refuses it exactly like any other shape it cannot
+  // capture, so the meted parse refusal (P5's posture) carries the 400.
+  if (lines.length === 0) {
+    return null;
   }
   return { orderRef, destination, lines };
 }
