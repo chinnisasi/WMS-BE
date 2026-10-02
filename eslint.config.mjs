@@ -9,7 +9,7 @@ export default tseslint.config(
     // infra-1: jest's globalSetup is loaded by jest itself (not swc), so it
     // stays CommonJS — the flat config's default ESM parse flags every
     // `require`/`module`/`process` in it.
-    files: ['test/**/*.js'],
+    files: ['test/**/*.js', 'test/**/*.cjs'],
     languageOptions: {
       sourceType: 'commonjs',
       globals: {
