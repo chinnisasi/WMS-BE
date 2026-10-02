@@ -7,7 +7,7 @@ import postgres from 'postgres';
  * idempotency rows, advisory locks and connection budget were visible to
  * every other suite — the coupling behind an intermittent failure that moved
  * between suites and hid from instrumentation. Each suite now clones the
- * template built in `global-setup.js` and drops it afterwards.
+ * template built in `global-setup.cjs` and drops it afterwards.
  *
  * `useSuiteDatabase` MUST be the first statement in a suite's `beforeAll`:
  * it rewrites `DATABASE_URL`/`DATABASE_AUTH_URL`, and everything downstream
@@ -34,7 +34,7 @@ export interface SuiteDatabase {
 
 /**
  * @param suite a short, stable slug — the database is `wms_s_<suite>`, which
- *   `global-setup.js` also uses to sweep leftovers from interrupted runs.
+ *   `global-setup.cjs` also uses to sweep leftovers from interrupted runs.
  */
 export async function useSuiteDatabase(suite: string): Promise<SuiteDatabase> {
   process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
