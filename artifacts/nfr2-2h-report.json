@@ -1,0 +1,71 @@
+{
+  "environment": "local compose Postgres (localhost:55432) + Valkey (localhost:56379); wms-be default pools; bun 1.4.0",
+  "invocation": "bun scripts/loadtest-acceptance.ts --mode full --duration-s 7200 --median-rate-rph 120 --amplify 15",
+  "harnessFlags": {
+    "mode": "full",
+    "durationS": 7200,
+    "medianRateRph": 120,
+    "amplify": 15,
+    "adjustIntervalMs": 1000,
+    "concurrency": 12,
+    "requestTimeoutMs": 5000,
+    "seedQuantity": 60,
+    "maxOrderLines": 3,
+    "port": 25101,
+    "keepDb": true,
+    "reportPath": "artifacts/nfr2-2h-report.json",
+    "outboxRelayPollMs": "250"
+  },
+  "workload": {
+    "ingestTargetPerSecond": 0.5,
+    "achievedIngestPerSecond": 0.4996,
+    "achievedVsTarget": "100% of target",
+    "adjustAttempted": 7106,
+    "cancelAttemptedSent": 2,
+    "cancelDroppedAtRunEnd": 0
+  },
+  "acceptance": {
+    "delivered": 3597,
+    "outcomes": {
+      "accepted": 13,
+      "backordered": 3584
+    },
+    "p50Ms": 69,
+    "p95Ms": 419,
+    "p99Ms": 742,
+    "maxMs": 1517,
+    "over5sCount": 0,
+    "over5sFraction": 0
+  },
+  "writeback": {
+    "echoCount": 2,
+    "medianLagMs": 293,
+    "maxLagMs": 293
+  },
+  "integrity": {
+    "ledgerStockParityViolations": [],
+    "reservationOrderParityViolations": [],
+    "oversellViolations": [],
+    "note": "oversell = per (warehouse, sku), at every grant point: Σ held ≤ on-hand replayed from the ledger at that instant; grant/release times come from the reservations rows themselves. Cross-table timestamp ordering (ledger recorded_at vs reservation created_at) is an approximation the report accepts and names."
+  },
+  "client": {
+    "timeouts": 0,
+    "maxInFlight": 2,
+    "concurrencyBound": 12,
+    "requestTimeoutMs": 5000
+  },
+  "metering": {
+    "order-ingest": {
+      "accepted": 13,
+      "backordered": 3584,
+      "released": 2
+    },
+    "order-writeback": {
+      "ok": 2
+    }
+  },
+  "gates": {
+    "pass": true,
+    "failures": []
+  }
+}
