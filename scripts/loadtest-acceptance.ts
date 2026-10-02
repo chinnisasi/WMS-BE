@@ -59,7 +59,7 @@
  *
  * Requires the local compose Postgres (:55432) and Valkey (:56379). The suite
  * database `wms_s_loadtest` is cloned from the jest template (`wms_template`;
- * rebuilt automatically via test/support/global-setup.js when absent) and
+ * rebuilt automatically via test/support/global-setup.cjs when absent) and
  * dropped at the end unless `--keep-db`.
  *
  * SECRET DISCIPLINE: the webhook signing secret is generated per run, sealed
@@ -237,8 +237,8 @@ async function ensureTemplate(): Promise<void> {
     await admin.end();
   }
   if (present) return;
-  console.log('template database missing — building via test/support/global-setup.js …');
-  const setupUrl = pathToFileURL('test/support/global-setup.js').href;
+  console.log('template database missing — building via test/support/global-setup.cjs …');
+  const setupUrl = pathToFileURL('test/support/global-setup.cjs').href;
   const setup = (await import(setupUrl)) as { default?: unknown };
   const run = (setup.default ?? setup) as () => Promise<void>;
   await run();

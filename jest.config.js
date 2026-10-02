@@ -25,6 +25,6 @@ module.exports = {
   setupFiles: ['<rootDir>/test/support/stable-ports.setup.ts', '<rootDir>/test/http-agent.setup.ts'],
   // infra-1: builds the `wms_template` database once per run; each e2e suite
   // clones it so no two suites share state. See test/support/suite-db.ts.
-  globalSetup: '<rootDir>/test/support/global-setup.js',
+  globalSetup: '<rootDir>/test/support/global-setup.cjs',
   restoreMocks: true,
 };

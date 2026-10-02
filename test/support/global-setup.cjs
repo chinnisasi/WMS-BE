@@ -6,7 +6,10 @@
  * every other suite. Suites now each get their own database cloned from this
  * template, so migrations run ONCE here rather than 20+ times.
  */
-const postgres = require('postgres');
+// Bun's dynamic-import interop hands `require('postgres')` the ESM Module
+// namespace (default holds the function) where jest/node hand the function
+// itself — `.default ?? the module` is correct under every loader.
+const postgres = require('postgres').default ?? require('postgres');
 const { execSync } = require('node:child_process');
 
 const TEMPLATE_DB = 'wms_template';
