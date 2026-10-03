@@ -55,7 +55,10 @@ import { QUANTITY_DECIMALS } from '../../shared/primitives/quantity';
  * `skus_uom_check` / `uom_conversions_uom_check` CHECK constraints in
  * `drizzle/0027_uom_vocabulary.sql` are one list**; the vocabulary e2e suite
  * fails if they drift apart. A new unit is added by a migration that drops and
- * re-adds the CHECK (the 0023/0024 precedent) and a line here.
+ * re-adds the CHECK (the 0023/0024 precedent) and a line here — and (story
+ * 8-2a) its GST UQC in `invoicing/uqc.ts` (`UOM_TO_UQC`, typed over this
+ * tuple, so a missing entry fails the build), plus the UQC's GSTN
+ * description in wms-fe `src/lib/hsn-summary.ts` if the code is new.
  */
 export const UOMS = [
   // Count and packaging — whole, indivisible things. 0 decimal places.

@@ -12,9 +12,9 @@ jest.setTimeout(120_000);
 
 const MIGRATION = '0054_invoice_regulatory_pass.sql';
 
-/** Migration 0054, split into the statements the real runner executes. */
-function migrationStatements(): string[] {
-  return readFileSync(resolve(process.cwd(), 'drizzle', MIGRATION), 'utf8')
+/** A migration (0054 by default), split into the statements the real runner executes. */
+function migrationStatements(file: string = MIGRATION): string[] {
+  return readFileSync(resolve(process.cwd(), 'drizzle', file), 'utf8')
     .split('--> statement-breakpoint')
     .map((statement) => statement.trim())
     .filter((statement) => statement.length > 0);
@@ -378,5 +378,328 @@ describe('migration 0054: the invoice regulatory pass, applied to 8-1 rows', () 
     }
     expect((error as Error).message).toContain('migration 0054 has already been applied');
     expect([...(await sql`select id, document::text from invoices order by id`)]).toEqual([...docsBefore]);
+  });
+});
+
+const MIGRATION_0055 = '0055_hsn_summary_columns.sql';
+
+/** A post-0054 (8-1b) document: lines carry `uom`, totals the 8-1b shape. */
+function regulatoryDocument(
+  invoiceNo: string | null,
+  issuedAt: string | null,
+  lines: readonly { orderLineId: string; uom: string | null }[],
+): Record<string, unknown> {
+  return {
+    header: {
+      invoiceNo,
+      fyLabel: invoiceNo === null ? null : 'FY-2627',
+      orderRef: uuidv7(),
+      issuedAt,
+      supplyType: 'intra',
+      placeOfSupply: '29',
+      originGstin: '29AAAPZ1234C1ZV',
+      consigneeGstin: null,
+      originAddress: null,
+      consigneeAddress: null,
+    },
+    seller: { name: 'HSN Co', gstin: '29AAAPZ1234C1ZV' },
+    buyer: { name: null, gstin: null },
+    lines: lines.map((line) => ({
+      orderLineId: line.orderLineId,
+      skuCode: 'SKU',
+      skuName: 'SKU',
+      hsn: '0910',
+      qtyMilli: 1000,
+      uom: line.uom,
+      ratePaise: 0,
+      rateSource: 'order_line',
+      taxablePaise: 0,
+      gstBps: 500,
+      cgstPaise: 0,
+      sgstPaise: 0,
+      igstPaise: 0,
+      hsnGap: false,
+    })),
+    totals: { subtotal: 0, gst: 0, total: 0, roundOff: 0, payable: 0 },
+    gaps: [],
+    revision: 1,
+  };
+}
+
+/**
+ * Story 8-2a — migration 0055 against a database that carries the 0054
+ * schema and 8-1 / 8-1b rows. The scratch database is built from the repo's
+ * own migrations with the journal trimmed at 0054, seeded, then 0055 is
+ * applied WHOLE inside one transaction (as the real runner applies it).
+ * Proves: `issued_at` is the document's `issuedAt` as an INSTANT on issued
+ * and voided rows only, `uom` is the document line's, and nothing else on
+ * any row moved (`to_jsonb(row)` minus the new column, `updated_at` included).
+ */
+describe('migration 0055: the HSN summary read-model columns, applied to 0054 rows', () => {
+  const PRE_DB = 'wms_s_invoice_pre0055';
+  let baseUrl: string;
+  let sql: ReturnType<typeof postgres>;
+  let folder: string;
+
+  const tenantId = uuidv7();
+  const warehouseId = uuidv7();
+
+  // [invoice id, status, invoice_no, document issuedAt, lines [orderLineId, uom]]
+  const legacy = { id: uuidv7(), status: 'issued', no: 'FY-2627-000001', issuedAt: '2026-09-30T06:00:00.000Z', lines: [{ orderLineId: uuidv7(), uom: 'each' }] };
+  const regulatory = {
+    id: uuidv7(),
+    status: 'issued',
+    no: '29/2627/000001',
+    issuedAt: '2026-08-15T10:11:12.345Z',
+    lines: [
+      { orderLineId: uuidv7(), uom: 'kg' },
+      { orderLineId: uuidv7(), uom: 'bag' },
+    ],
+  };
+  // Re-parked 8-1 row: its document still carries a STALE issuedAt — which
+  // must NOT become an issue instant.
+  const awaiting = { id: uuidv7(), status: 'awaiting-data', no: null, issuedAt: '2026-09-01T00:00:00.000Z', lines: [{ orderLineId: uuidv7(), uom: 'litre' }] };
+  // The IST month boundary to the millisecond (30 Sep 23:59:59.999 IST).
+  const boundary = { id: uuidv7(), status: 'issued', no: '29/2627/000002', issuedAt: '2026-09-30T18:29:59.999Z', lines: [{ orderLineId: uuidv7(), uom: 'jar' }] };
+  const voided = { id: uuidv7(), status: 'voided', no: null, issuedAt: '2026-07-01T00:00:00.000Z', lines: [{ orderLineId: uuidv7(), uom: 'keg' }] };
+  const seeded = [legacy, regulatory, awaiting, boundary, voided];
+
+  let beforeInvoices: Map<string, unknown>;
+  let beforeLines: Map<string, unknown>;
+  let preflightError: unknown;
+  const preflight = {
+    nullIssuedAt: uuidv7(),
+    notIsoZ: uuidv7(),
+    zeroMatchLine: uuidv7(),
+    severalMatchLine: uuidv7(),
+    blankUomLine: uuidv7(),
+    dupInvoice: uuidv7(),
+    dupOrderLine: uuidv7(),
+  };
+
+  async function insertInvoice(
+    tx: ReturnType<typeof postgres> | postgres.TransactionSql,
+    row: { id: string; status: string; no: string | null; issuedAt: string | null },
+    document: Record<string, unknown>,
+  ): Promise<void> {
+    await tx`
+      insert into invoices (id, tenant_id, order_id, warehouse_id, invoice_no, fy_label, series_seq, status, origin_gstin,
+        place_of_supply, supply_type, subtotal_paise, gst_paise, total_paise, payable_paise, round_off_paise, revision, document,
+        created_at, updated_at)
+      values (${row.id}, ${tenantId}, ${uuidv7()}, ${warehouseId}, ${row.no}, ${row.no === null ? null : 'FY-2627'},
+        ${row.no === null ? null : 1}, ${row.status}, '29AAAPZ1234C1ZV', '29', 'intra', 0, 0, 0, 0, 0, 1,
+        ${sql.json(document as never)}, '2026-07-01T00:00:00.123456Z', '2026-07-02T00:00:00.654321Z')
+    `;
+  }
+
+  async function insertLine(
+    tx: ReturnType<typeof postgres> | postgres.TransactionSql,
+    invoiceId: string,
+    orderLineId: string,
+    id: string = uuidv7(),
+  ): Promise<void> {
+    await tx`
+      insert into invoice_lines (id, tenant_id, invoice_id, order_line_id, sku_code, sku_name, hsn, qty_milli, rate_paise,
+        rate_source, taxable_paise, gst_bps, created_at, updated_at)
+      values (${id}, ${tenantId}, ${invoiceId}, ${orderLineId}, 'SKU', 'SKU', '0910', 1000, 0, 'order_line', 0, 500,
+        '2026-07-01T00:00:00.111111Z', '2026-07-03T00:00:00.222222Z')
+    `;
+  }
+
+  const applyWhole = (): Promise<unknown> =>
+    sql.begin(async (tx) => {
+      for (const statement of migrationStatements(MIGRATION_0055)) {
+        await tx.unsafe(statement);
+      }
+    });
+
+  beforeAll(async () => {
+    baseUrl = process.env.DATABASE_URL!;
+    const url = new URL(baseUrl);
+    url.pathname = `/${PRE_DB}`;
+    const preUrl = url.toString();
+    const adminUrl = new URL(baseUrl);
+    adminUrl.pathname = '/postgres';
+    const admin = postgres(adminUrl.toString(), { max: 1 });
+    try {
+      await admin.unsafe(`select pg_terminate_backend(pid) from pg_stat_activity where datname = '${PRE_DB}'`);
+      await admin.unsafe(`drop database if exists "${PRE_DB}"`);
+      await admin.unsafe(`create database "${PRE_DB}"`);
+    } finally {
+      await admin.end();
+    }
+
+    // The schema the moment before 8-2a: the repo's own migrations, journal
+    // trimmed at 0054, the file under test removed.
+    folder = mkdtempSync(join(tmpdir(), 'wms-pre-0055-'));
+    cpSync(resolve(process.cwd(), 'drizzle'), folder, { recursive: true });
+    rmSync(join(folder, MIGRATION_0055));
+    const journalPath = join(folder, 'meta/_journal.json');
+    const journal = JSON.parse(readFileSync(journalPath, 'utf8')) as { entries: { idx: number }[] };
+    journal.entries = journal.entries.filter((entry) => entry.idx <= 54);
+    writeFileSync(journalPath, JSON.stringify(journal));
+    const db = createDatabase(preUrl);
+    await migrate(db, { migrationsFolder: folder });
+    await (db as unknown as { $client: { end(): Promise<void> } }).$client.end();
+
+    sql = postgres(preUrl, { max: 2, onnotice: () => undefined });
+
+    for (const row of seeded) {
+      await insertInvoice(sql, row, regulatoryDocument(row.no, row.issuedAt, row.lines));
+      for (const line of row.lines) {
+        await insertLine(sql, row.id, line.orderLineId);
+      }
+    }
+
+    beforeInvoices = new Map(
+      ((await sql`select id, to_jsonb(i) as row from invoices i`) as unknown as { id: string; row: unknown }[]).map((r) => [r.id, r.row]),
+    );
+    beforeLines = new Map(
+      ((await sql`select id, to_jsonb(l) as row from invoice_lines l`) as unknown as { id: string; row: unknown }[]).map((r) => [r.id, r.row]),
+    );
+
+    // The pre-flight bites: every offender kind at once, named — and the
+    // whole file rolls back.
+    try {
+      await sql.begin(async (tx) => {
+        // (a) issued with a null issuedAt; voided with a non-Z timestamp.
+        await insertInvoice(tx, { id: preflight.nullIssuedAt, status: 'issued', no: '29/2627/000098', issuedAt: null }, regulatoryDocument('29/2627/000098', null, []));
+        await insertInvoice(tx, { id: preflight.notIsoZ, status: 'voided', no: null, issuedAt: null }, regulatoryDocument(null, '2026-09-30 06:00:00', []));
+        // (b) a line matching NO document line, and one matching two.
+        const host = uuidv7();
+        const twice = uuidv7();
+        await insertInvoice(tx, { id: host, status: 'issued', no: '29/2627/000099', issuedAt: null }, regulatoryDocument('29/2627/000099', '2026-09-01T00:00:00Z', [
+          { orderLineId: twice, uom: 'each' },
+          { orderLineId: twice, uom: 'box' },
+        ]));
+        await insertLine(tx, host, uuidv7(), preflight.zeroMatchLine);
+        await insertLine(tx, host, twice, preflight.severalMatchLine);
+        // (c) a matched line whose document uom is blank.
+        const blankHost = uuidv7();
+        const blankLine = uuidv7();
+        await insertInvoice(tx, { id: blankHost, status: 'awaiting-data', no: null, issuedAt: null }, regulatoryDocument(null, null, [{ orderLineId: blankLine, uom: '  ' }]));
+        await insertLine(tx, blankHost, blankLine, preflight.blankUomLine);
+        // (d) two rows for one (invoice, order line).
+        await insertInvoice(tx, { id: preflight.dupInvoice, status: 'awaiting-data', no: null, issuedAt: null }, regulatoryDocument(null, null, [{ orderLineId: preflight.dupOrderLine, uom: 'each' }]));
+        await insertLine(tx, preflight.dupInvoice, preflight.dupOrderLine);
+        await insertLine(tx, preflight.dupInvoice, preflight.dupOrderLine);
+        for (const statement of migrationStatements(MIGRATION_0055)) {
+          await tx.unsafe(statement);
+        }
+      });
+    } catch (err) {
+      preflightError = err;
+    }
+
+    await applyWhole();
+  });
+
+  afterAll(async () => {
+    await sql?.end();
+    if (folder !== undefined) rmSync(folder, { recursive: true, force: true });
+    const adminUrl = new URL(baseUrl);
+    adminUrl.pathname = '/postgres';
+    const admin = postgres(adminUrl.toString(), { max: 1 });
+    try {
+      await admin.unsafe(`select pg_terminate_backend(pid) from pg_stat_activity where datname = '${PRE_DB}'`);
+      await admin.unsafe(`drop database if exists "${PRE_DB}"`);
+    } finally {
+      await admin.end();
+    }
+  });
+
+  it('the pre-flight refused every offender kind at once, naming each, and left nothing behind', () => {
+    expect(preflightError).toBeDefined();
+    const message = (preflightError as Error).message;
+    expect(message).toContain('migration 0055 pre-flight failed');
+    expect(message).toContain(`${preflight.nullIssuedAt} (issued, issuedAt null)`);
+    expect(message).toContain(`${preflight.notIsoZ} (voided, issuedAt 2026-09-30 06:00:00)`);
+    expect(message).toContain(`${preflight.zeroMatchLine} (invoice`);
+    expect(message).toContain('0 matches');
+    expect(message).toContain(`${preflight.severalMatchLine} (invoice`);
+    expect(message).toContain('2 matches');
+    expect(message).toMatch(new RegExp(`whose document uom is null or blank: \\[${preflight.blankUomLine} `));
+    expect(message).toContain(`${preflight.dupInvoice}/${preflight.dupOrderLine} (2 rows)`);
+  });
+
+  it('backfills issued_at from the document as an INSTANT on issued and voided rows — and leaves the awaiting row NULL despite its stale issuedAt', async () => {
+    const rows = (await sql`
+      select id, to_char(issued_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as issued_at,
+        issued_at = (document->'header'->>'issuedAt')::timestamptz as same_instant
+      from invoices
+    `) as unknown as { id: string; issued_at: string | null; same_instant: boolean | null }[];
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    for (const row of [legacy, regulatory, boundary, voided]) {
+      expect(byId.get(row.id)).toEqual({ id: row.id, issued_at: row.issuedAt, same_instant: true });
+    }
+    expect(byId.get(awaiting.id)!.issued_at).toBeNull();
+    expect(rows).toHaveLength(seeded.length);
+  });
+
+  it('backfills every line’s uom from its own document line (two lines on one invoice included)', async () => {
+    const rows = (await sql`select invoice_id, order_line_id, uom from invoice_lines`) as unknown as {
+      invoice_id: string;
+      order_line_id: string;
+      uom: string;
+    }[];
+    const expected = seeded.flatMap((row) => row.lines.map((line) => ({ invoice_id: row.id, order_line_id: line.orderLineId, uom: line.uom })));
+    expect(rows.sort((a, b) => a.order_line_id.localeCompare(b.order_line_id))).toEqual(
+      expected.sort((a, b) => a.order_line_id.localeCompare(b.order_line_id)),
+    );
+  });
+
+  it('changes nothing else on any row — the whole row minus the new column is identical, updated_at included', async () => {
+    const invoicesAfter = (await sql`select id, to_jsonb(i) - 'issued_at' as row from invoices i`) as unknown as { id: string; row: unknown }[];
+    expect(new Map(invoicesAfter.map((r) => [r.id, r.row]))).toEqual(beforeInvoices);
+    const linesAfter = (await sql`select id, to_jsonb(l) - 'uom' as row from invoice_lines l`) as unknown as { id: string; row: unknown }[];
+    expect(new Map(linesAfter.map((r) => [r.id, r.row]))).toEqual(beforeLines);
+    expect(beforeInvoices.size).toBe(seeded.length);
+  });
+
+  it('enforces the two-way issued_at CHECKs, uom NOT NULL, the line UNIQUE, and creates the partial index', async () => {
+    const violation = async (run: (tx: postgres.TransactionSql) => Promise<unknown>): Promise<{ constraint_name?: string; code?: string }> => {
+      let error: unknown;
+      try {
+        await sql.begin(async (tx) => {
+          await run(tx);
+          throw new Error('rollback');
+        });
+      } catch (err) {
+        error = err;
+      }
+      return error as { constraint_name?: string; code?: string };
+    };
+    expect((await violation((tx) => tx`update invoices set issued_at = now() where id = ${awaiting.id}`)).constraint_name).toBe(
+      'invoices_awaiting_unissued_check',
+    );
+    expect((await violation((tx) => tx`update invoices set issued_at = null where id = ${legacy.id}`)).constraint_name).toBe(
+      'invoices_issued_at_stamped_check',
+    );
+    expect((await violation((tx) => tx`update invoices set issued_at = null where id = ${voided.id}`)).constraint_name).toBe(
+      'invoices_issued_at_stamped_check',
+    );
+    expect((await violation((tx) => tx`update invoice_lines set uom = null where invoice_id = ${legacy.id}`)).code).toBe('23502');
+    const dup = await violation((tx) =>
+      tx`insert into invoice_lines (id, tenant_id, invoice_id, order_line_id, sku_code, sku_name, qty_milli, rate_paise, rate_source, taxable_paise, gst_bps, uom)
+         values (${uuidv7()}, ${tenantId}, ${legacy.id}, ${legacy.lines[0]!.orderLineId}, 'SKU', 'SKU', 1, 0, 'order_line', 0, 0, 'each')`,
+    );
+    expect(dup.constraint_name).toBe('invoice_lines_invoice_order_line_unique');
+    // A legal write still lands (the baseline reaches the rollback, not a constraint).
+    expect((await violation((tx) => tx`update invoices set issued_at = now() where id = ${legacy.id}`)) as unknown as Error).toEqual(new Error('rollback'));
+    const indexes = (await sql`select indexdef from pg_indexes where indexname = 'invoices_tenant_gstin_issued_at_idx'`) as unknown as { indexdef: string }[];
+    expect(indexes[0]!.indexdef).toContain('(tenant_id, origin_gstin, issued_at) WHERE (status = \'issued\'::text)');
+  });
+
+  it('a second apply RAISEs at the guard and changes nothing', async () => {
+    const snapshot = async () => [...(await sql`select id, to_jsonb(i)::text as row from invoices i order by id`)];
+    const before = await snapshot();
+    let error: unknown;
+    try {
+      await applyWhole();
+    } catch (err) {
+      error = err;
+    }
+    expect((error as Error).message).toContain('migration 0055 has already been applied');
+    expect(await snapshot()).toEqual(before);
   });
 });

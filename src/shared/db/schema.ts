@@ -3786,6 +3786,14 @@ export const invoices = pgTable(
     revision: integer('revision').notNull().default(1),
     /** The pinned client-agnostic document snapshot (Design Notes shape). */
     document: jsonb('document').notNull(),
+    /**
+     * Story 8-2a: the issuance instant — the SAME value as
+     * `document.header.issuedAt` (one clock read writes both). NULL while
+     * `awaiting-data`; set on every issued/voided row (the two-way CHECK in
+     * migration 0055). A READ-MODEL column for the HSN summary's period
+     * filter: never on a view, a DTO or the idempotency snapshot.
+     */
+    issuedAt: timestamp('issued_at', { withTimezone: true, mode: 'string' }),
     ...tenantTimestamps,
   },
   (table) => [
@@ -3799,6 +3807,10 @@ export const invoices = pgTable(
       .where(sql`invoice_no is not null`),
     // The list read's keyset cursor.
     index('invoices_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    // Story 8-2a: the HSN summary's per-(GSTIN, period) scan over issued rows.
+    index('invoices_tenant_gstin_issued_at_idx')
+      .on(table.tenantId, table.originGstin, table.issuedAt)
+      .where(sql`status = 'issued'`),
   ],
 );
 
@@ -3834,11 +3846,21 @@ export const invoiceLines = pgTable(
     sgstPaise: bigint('sgst_paise', { mode: 'number' }).notNull().default(0),
     igstPaise: bigint('igst_paise', { mode: 'number' }).notNull().default(0),
     hsnGap: boolean('hsn_gap').notNull().default(false),
+    /**
+     * Story 8-2a: the SKU's base UoM as it stood at generation (the
+     * document line's `uom`). Deliberately NO vocabulary CHECK — a frozen
+     * snapshot must survive a later vocabulary change. Read-model only (the
+     * HSN summary's UQC grouping): never on a view, a DTO or a snapshot.
+     */
+    uom: text('uom').notNull(),
     ...tenantTimestamps,
   },
   (table) => [
     // The detail read's per-line ordering.
     index('invoice_lines_tenant_invoice_idx').on(table.tenantId, table.invoiceId),
+    // Story 8-2a: one row per order line per invoice — the key 0055's uom
+    // backfill joins the document on.
+    uniqueIndex('invoice_lines_invoice_order_line_unique').on(table.invoiceId, table.orderLineId),
   ],
 );
 

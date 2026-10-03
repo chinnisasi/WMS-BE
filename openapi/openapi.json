@@ -14554,6 +14554,153 @@
         ]
       }
     },
+    "/tenants/{tenantId}/invoices/hsn-summary": {
+      "get": {
+        "description": "Per supplier GSTIN (each GSTIN files its own return) and per accounting period by IST issue date: a month (YYYY-MM) or an FY quarter (FY-yyyy-Qn). Only issued invoices count (never awaiting-data or voided). Rows group by (HSN, UQC, GST rate); every amount is the exact paise sum of the frozen invoice lines — nothing is rounded per row and the invoice round-off is never spread. A line whose HSN is blank or malformed (not 4, 6 or 8 digits) is an hsnIssue row: inside the totals, listed in issueLines with the SKU's current catalog HSN as a hint, and left out of the Table 12 CSV by the client. The totals equal the included invoices' subtotal and GST to the paisa. A well-formed GSTIN with nothing issued in the period is an empty summary.",
+        "operationId": "InvoicingController_hsnSummary",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "gstin",
+            "required": true,
+            "in": "query",
+            "description": "The supplier GSTIN whose return this is — matched exactly (canonical uppercase), no case folding",
+            "schema": {
+              "example": "29AAAPZ1234C1ZV",
+              "type": "string"
+            }
+          },
+          {
+            "name": "period",
+            "required": true,
+            "in": "query",
+            "description": "The accounting period, by IST issue date: a month 'YYYY-MM' (e.g. '2026-09') or an FY quarter 'FY-yyyy-Qn' (Q1 Apr–Jun, Q2 Jul–Sep, Q3 Oct–Dec, Q4 Jan–Mar; e.g. 'FY-2627-Q2')",
+            "schema": {
+              "example": "2026-09",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HsnSummaryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A missing or malformed gstin, or a missing or invalid period — month 13, Q5, non-consecutive FY years (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The HSN summary of one supplier GSTIN for one period — GSTR-1 Table 12's per-HSN figures over the ISSUED invoices, B2B and B2C (open to any member)",
+        "tags": [
+          "invoicing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/invoices/hsn-summary/gstins": {
+      "get": {
+        "operationId": "InvoicingController_hsnSummaryGstins",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "GSTIN ascending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HsnSummaryGstinsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Every supplier GSTIN with issued invoices, with its first and last issue instant — the HSN summary pickers derive their periods from these (open to any member)",
+        "tags": [
+          "invoicing"
+        ]
+      }
+    },
     "/tenants/{tenantId}/invoices/{invoiceId}": {
       "get": {
         "operationId": "InvoicingController_getInvoice",
@@ -25181,6 +25328,364 @@
           "nextCursor": {
             "type": "string",
             "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "HsnSummaryPeriodDto": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string",
+            "example": "2026-09"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "month",
+              "quarter"
+            ]
+          },
+          "from": {
+            "type": "string",
+            "description": "Inclusive lower bound: the UTC instant of the first IST midnight of the period"
+          },
+          "to": {
+            "type": "string",
+            "description": "EXCLUSIVE upper bound: the UTC instant of the first IST midnight after the period"
+          },
+          "toExclusive": {
+            "type": "boolean",
+            "enum": [
+              true
+            ],
+            "description": "Always true — `to` is exclusive"
+          }
+        },
+        "required": [
+          "label",
+          "kind",
+          "from",
+          "to",
+          "toExclusive"
+        ]
+      },
+      "HsnSummaryRowDto": {
+        "type": "object",
+        "properties": {
+          "hsn": {
+            "type": "string",
+            "nullable": true,
+            "description": "The trimmed HSN as frozen on the lines; null = blank"
+          },
+          "hsnIssue": {
+            "type": "boolean",
+            "description": "Blank or malformed HSN (not 4, 6 or 8 digits). Included in the totals so they reconcile; excluded from the Table 12 CSV (the portal accepts master HSNs only)"
+          },
+          "uqc": {
+            "type": "string",
+            "enum": [
+              "NOS",
+              "BOX",
+              "CTN",
+              "PAC",
+              "BAG",
+              "DRM",
+              "ROL",
+              "BDL",
+              "PRS",
+              "DOZ",
+              "BTL",
+              "CAN",
+              "TUB",
+              "SET",
+              "GMS",
+              "KGS",
+              "TON",
+              "MLT",
+              "LTR",
+              "KLR",
+              "CMS",
+              "MTR",
+              "SQM",
+              "SQF",
+              "OTH"
+            ],
+            "description": "GST Unit Quantity Code — no quantity is ever scaled to fit one; OTH where none means the same unit"
+          },
+          "sourceUoms": {
+            "description": "The distinct catalog units merged into this row (sorted)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mixedUnits": {
+            "type": "boolean",
+            "description": "More than one catalog unit merged under one UQC (only OTH can) — the quantity mixes units"
+          },
+          "gstBps": {
+            "type": "number",
+            "description": "GST rate in basis points (1800 = 18%)"
+          },
+          "qtyMilli": {
+            "type": "number",
+            "description": "Σ dispatched quantity in milli-units — unrounded"
+          },
+          "lineCount": {
+            "type": "number",
+            "description": "Invoice lines summed into this row"
+          },
+          "taxablePaise": {
+            "type": "number",
+            "description": "Σ taxable value, paise (exact)"
+          },
+          "igstPaise": {
+            "type": "number",
+            "description": "Σ IGST, paise"
+          },
+          "cgstPaise": {
+            "type": "number",
+            "description": "Σ CGST, paise"
+          },
+          "sgstPaise": {
+            "type": "number",
+            "description": "Σ SGST/UTGST, paise"
+          },
+          "totalValuePaise": {
+            "type": "number",
+            "description": "Taxable + every tax, paise (Table 12 \"Total Value\")"
+          }
+        },
+        "required": [
+          "hsn",
+          "hsnIssue",
+          "uqc",
+          "sourceUoms",
+          "mixedUnits",
+          "gstBps",
+          "qtyMilli",
+          "lineCount",
+          "taxablePaise",
+          "igstPaise",
+          "cgstPaise",
+          "sgstPaise",
+          "totalValuePaise"
+        ]
+      },
+      "HsnSummaryTotalsDto": {
+        "type": "object",
+        "properties": {
+          "invoiceCount": {
+            "type": "number",
+            "description": "Issued invoices in scope (an invoice with no lines still counts)"
+          },
+          "taxablePaise": {
+            "type": "number"
+          },
+          "igstPaise": {
+            "type": "number"
+          },
+          "cgstPaise": {
+            "type": "number"
+          },
+          "sgstPaise": {
+            "type": "number"
+          },
+          "gstPaise": {
+            "type": "number",
+            "description": "IGST + CGST + SGST, paise"
+          },
+          "totalValuePaise": {
+            "type": "number",
+            "description": "Taxable + GST, paise"
+          }
+        },
+        "required": [
+          "invoiceCount",
+          "taxablePaise",
+          "igstPaise",
+          "cgstPaise",
+          "sgstPaise",
+          "gstPaise",
+          "totalValuePaise"
+        ]
+      },
+      "HsnSummarySectionDto": {
+        "type": "object",
+        "properties": {
+          "rows": {
+            "description": "HSN ascending (issue rows last), then UQC, then rate",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HsnSummaryRowDto"
+            }
+          },
+          "totals": {
+            "description": "Over every row, issue rows included",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HsnSummaryTotalsDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "rows",
+          "totals"
+        ]
+      },
+      "HsnIssueLineDto": {
+        "type": "object",
+        "properties": {
+          "section": {
+            "type": "string",
+            "enum": [
+              "b2b",
+              "b2c"
+            ]
+          },
+          "invoiceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceNo": {
+            "type": "string",
+            "description": "The invoice number (unique per supplier GSTIN), e.g. '29/2627/000001'"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "hsn": {
+            "type": "string",
+            "nullable": true,
+            "description": "The HSN frozen on the line (trimmed); null = blank"
+          },
+          "taxablePaise": {
+            "type": "number"
+          },
+          "gstPaise": {
+            "type": "number"
+          },
+          "valuePaise": {
+            "type": "number",
+            "description": "Taxable + GST, paise — what leaving this line out of the CSV leaves Table 12 short by"
+          },
+          "catalogHsn": {
+            "type": "string",
+            "nullable": true,
+            "description": "The SKU's CURRENT catalog HSN — a hint for the correction; the issued invoice is never rewritten from it"
+          }
+        },
+        "required": [
+          "section",
+          "invoiceId",
+          "invoiceNo",
+          "skuCode",
+          "hsn",
+          "taxablePaise",
+          "gstPaise",
+          "valuePaise",
+          "catalogHsn"
+        ]
+      },
+      "HsnSummaryDto": {
+        "type": "object",
+        "properties": {
+          "gstin": {
+            "type": "string"
+          },
+          "period": {
+            "$ref": "#/components/schemas/HsnSummaryPeriodDto"
+          },
+          "b2b": {
+            "description": "Invoices to registered recipients (a consignee GSTIN)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HsnSummarySectionDto"
+              }
+            ]
+          },
+          "b2c": {
+            "description": "Invoices to unregistered recipients (no consignee GSTIN)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HsnSummarySectionDto"
+              }
+            ]
+          },
+          "totals": {
+            "description": "B2B + B2C — equals the included invoices’ subtotal and GST to the paisa",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/HsnSummaryTotalsDto"
+              }
+            ]
+          },
+          "issueLines": {
+            "description": "Every line behind an hsnIssue row",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HsnIssueLineDto"
+            }
+          }
+        },
+        "required": [
+          "gstin",
+          "period",
+          "b2b",
+          "b2c",
+          "totals",
+          "issueLines"
+        ]
+      },
+      "HsnSummaryResponse": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "$ref": "#/components/schemas/HsnSummaryDto"
+          }
+        },
+        "required": [
+          "summary"
+        ]
+      },
+      "HsnSummaryGstinDto": {
+        "type": "object",
+        "properties": {
+          "gstin": {
+            "type": "string"
+          },
+          "firstIssuedAt": {
+            "type": "string",
+            "description": "Earliest issue instant under this GSTIN, ISO-8601 UTC"
+          },
+          "lastIssuedAt": {
+            "type": "string",
+            "description": "Latest issue instant under this GSTIN, ISO-8601 UTC"
+          },
+          "invoiceCount": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "gstin",
+          "firstIssuedAt",
+          "lastIssuedAt",
+          "invoiceCount"
+        ]
+      },
+      "HsnSummaryGstinsResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "Every supplier GSTIN with issued invoices, GSTIN ascending",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HsnSummaryGstinDto"
+            }
           }
         },
         "required": [

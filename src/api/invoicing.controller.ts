@@ -10,9 +10,14 @@ import { UUID_RE } from '../shared/primitives/ids';
 import { InvoicingCommand } from '../modules/invoicing/command';
 import { InvoicingFacade } from '../modules/invoicing/facade';
 import type { InvoiceView } from '../modules/invoicing/view';
+import type { HsnSummaryRow } from '../modules/invoicing/hsn-summary';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
   GenerateInvoiceDto,
+  HsnSummaryGstinsResponse,
+  HsnSummaryQuery,
+  HsnSummaryResponse,
+  HsnSummaryRowDto,
   InvoiceDto,
   InvoiceListQuery,
   InvoiceListResponse,
@@ -118,6 +123,66 @@ export class InvoicingController {
     };
   }
 
+  // Story 8-2a. DECLARED BEFORE `:tenantId/invoices/:invoiceId`: Express
+  // matches routes in declaration order, and `:invoiceId` would otherwise
+  // capture `hsn-summary` (and answer 400 "invoiceId must be a uuid").
+  // `invoicing-hsn.spec.ts` pins the order. `hsn-summary/gstins` has two
+  // segments and cannot collide with `:invoiceId`.
+  @Get(':tenantId/invoices/hsn-summary')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "The HSN summary of one supplier GSTIN for one period — GSTR-1 Table 12's per-HSN figures over the ISSUED invoices, B2B and B2C (open to any member)",
+    description:
+      'Per supplier GSTIN (each GSTIN files its own return) and per accounting period by IST issue date: a month (YYYY-MM) or an FY quarter (FY-yyyy-Qn). ' +
+      'Only issued invoices count (never awaiting-data or voided). Rows group by (HSN, UQC, GST rate); every amount is the exact paise sum of the frozen invoice lines — nothing is rounded per row and the invoice round-off is never spread. ' +
+      'A line whose HSN is blank or malformed (not 4, 6 or 8 digits) is an hsnIssue row: inside the totals, listed in issueLines with the SKU\'s current catalog HSN as a hint, and left out of the Table 12 CSV by the client. ' +
+      'The totals equal the included invoices\' subtotal and GST to the paisa. A well-formed GSTIN with nothing issued in the period is an empty summary.',
+  })
+  @ApiOkResponse({ type: HsnSummaryResponse, description: 'The summary' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A missing or malformed gstin, or a missing or invalid period — month 13, Q5, non-consecutive FY years (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async hsnSummary(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: HsnSummaryQuery,
+  ): Promise<HsnSummaryResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const summary = await this.invoices.hsnSummary(tenantId, query.gstin, query.period);
+    return {
+      summary: {
+        ...summary,
+        period: { ...summary.period },
+        b2b: { rows: summary.b2b.rows.map(toHsnRowDto), totals: { ...summary.b2b.totals } },
+        b2c: { rows: summary.b2c.rows.map(toHsnRowDto), totals: { ...summary.b2c.totals } },
+        totals: { ...summary.totals },
+        issueLines: summary.issueLines.map((line) => ({ ...line })),
+      },
+    };
+  }
+
+  @Get(':tenantId/invoices/hsn-summary/gstins')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Every supplier GSTIN with issued invoices, with its first and last issue instant — the HSN summary pickers derive their periods from these (open to any member)',
+  })
+  @ApiOkResponse({ type: HsnSummaryGstinsResponse, description: 'GSTIN ascending' })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async hsnSummaryGstins(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<HsnSummaryGstinsResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    return { items: (await this.invoices.hsnSummaryGstins(tenantId)).map((item) => ({ ...item })) };
+  }
+
   @Get(':tenantId/invoices/:invoiceId')
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
@@ -153,6 +218,11 @@ function toInvoiceDto(view: InvoiceView): InvoiceDto {
     document: view.document as unknown as Record<string, unknown>,
     lines: view.lines.map((line) => ({ ...line })),
   };
+}
+
+/** Readonly row → mutable response DTO. */
+function toHsnRowDto(row: HsnSummaryRow): HsnSummaryRowDto {
+  return { ...row, sourceUoms: [...row.sourceUoms] };
 }
 
 /** Path uuid params fail 400 (not a 500 from the `::uuid` cast). */

@@ -1,6 +1,7 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { OutboundModule } from '../outbound/outbound.module';
+import { CatalogModule } from '../catalog/catalog.module';
 import { InvoicingCommand } from './command';
 import { InvoiceDeliveryHandler } from './delivery';
 import { InvoicingFacade } from './facade';
@@ -22,9 +23,12 @@ import { InvoiceGenerator } from './generator';
  * relay drains it; `InvoiceDeliveryHandler` subscribes and generates. The
  * manual `invoice.generate` command is the operator's generate/regenerate,
  * exported (with the facade) for the api shell's `InvoicingController`.
+ *
+ * Story 8-2a: imports `CatalogModule` for ONE read — the HSN summary's
+ * current-catalog-HSN hint (`CatalogFacade.getSkuHsnByCodesInTx`).
  */
 @Module({
-  imports: [SharedModule, OutboundModule],
+  imports: [SharedModule, OutboundModule, forwardRef(() => CatalogModule)],
   providers: [InvoiceGenerator, InvoicingCommand, InvoiceDeliveryHandler, InvoicingFacade],
   exports: [InvoicingFacade, InvoicingCommand, InvoiceGenerator],
 })

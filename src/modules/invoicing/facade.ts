@@ -16,6 +16,15 @@ import {
   toInvoiceView,
 } from './view';
 import type { InvoiceEntry, InvoiceView } from './view';
+import { CatalogFacade } from '../catalog/catalog.facade';
+import {
+  assertGstinParam,
+  hsnSummaryGstinsInTx,
+  hsnSummaryInTx,
+  parsePeriod,
+  type HsnSummaryGstin,
+  type HsnSummaryView,
+} from './hsn-summary';
 
 /**
  * The invoicing module's read surface (story 8-1): the invoice list, an
@@ -60,7 +69,37 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
 
 @Injectable()
 export class InvoicingFacade {
-  constructor(@Inject(DATABASE) private readonly db: Database) {}
+  constructor(
+    @Inject(DATABASE) private readonly db: Database,
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
+  ) {}
+
+  /**
+   * The HSN summary (story 8-2a) of ONE supplier GSTIN over ONE period —
+   * GSTR-1 Table 12's figures over the issued invoices, B2B / B2C. A read
+   * (never capability-gated). A malformed `gstin` or `period` is `400
+   * validation-failed`; a well-formed GSTIN with nothing issued in the
+   * period is an empty summary, not a 404.
+   */
+  async hsnSummary(tenantId: string, gstin: string, period: string): Promise<HsnSummaryView> {
+    const parsedGstin = assertGstinParam(gstin);
+    const parsedPeriod = parsePeriod(period);
+    // REPEATABLE READ: the summary's three reads (grouped sums, invoice
+    // counts, issue lines) must see ONE snapshot — an invoice issued between
+    // them under READ COMMITTED would make rows, counts and issue lines disagree.
+    return withTenantTransaction(
+      this.db,
+      tenantId,
+      async (tx) =>
+        hsnSummaryInTx(tx, tenantId, parsedGstin, parsedPeriod, (codes) => this.catalog.getSkuHsnByCodesInTx(tx, tenantId, codes)),
+      { isolationLevel: 'repeatable read' },
+    );
+  }
+
+  /** Every supplier GSTIN with issued invoices, with its first/last issue instant (story 8-2a). */
+  async hsnSummaryGstins(tenantId: string): Promise<HsnSummaryGstin[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => hsnSummaryGstinsInTx(tx, tenantId));
+  }
 
   /** One invoice's detail (row + priced lines), or null. In-tx variant. */
   async getInvoiceInTx(tx: TenantTx, tenantId: string, invoiceId: string): Promise<InvoiceView | null> {
