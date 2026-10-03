@@ -11,6 +11,7 @@ import type { ChannelVisibleSnapshot } from '../src/modules/inventory/reservatio
 import { BREAKER_FAILURE_THRESHOLD } from '../src/modules/channels/channels.view';
 import { registerChannelAdapter, channelAdapter } from '../src/modules/channels/channel-registry';
 import { sealCredential } from '../src/modules/channels/channel-credentials';
+import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { testAvailabilityArm, unconfiguredRevokeArm } from '../src/modules/channels/channel-availability-port';
 import { testWritebackArm } from '../src/modules/channels/channel-writeback-port';
 import { ChannelsSyncWorker, parseChannelsSyncPollMs, MAX_SYNC_CONNECTIONS_PER_TICK } from '../src/jobs/jobs.module';
@@ -83,6 +84,8 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
   let shopifyId: string;
   let flipkartId: string;
   let echoId: string;
+  /** The worker-tick block's own echo row (the first echo is a test's victim). */
+  let echo2Id: string;
   const skuIds = new Map<string, string>();
 
   beforeAll(async () => {
@@ -755,6 +758,66 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
     expect(await integrationRow(echoId)).toEqual(beforeStamps);
   });
 
+  it('delivery, malformed SHAPE beyond structure (epic-7 retro D9): a negative visibleMilli and a non-uuid connectionId both ACK with no meter row and no stamp movement', async () => {
+    await clearOutbox();
+    const beforeStamps = await integrationRow(echoId);
+    const beforeCalls = (await availabilityRows()).filter((r) => r.integrationId === echoId).length;
+
+    const seed = await sqlHandle();
+    try {
+      // Row 1 — a NEGATIVE visibleMilli: V(c) is `max(0, …)` by RN-6, so a
+      // negative publication is a publisher invariant breach that would post
+      // negative availability — the decode refuses it (malformed payload).
+      await seed`
+        insert into outbox_messages (id, tenant_id, type, payload, occurred_at)
+        values (${uuidv7()}, ${tenantId}, ${CHANNEL_AVAILABILITY_PUBLISHED_EVENT},
+                ${seed.json({
+                  connectionId: echoId,
+                  provider: 'test-echo',
+                  publishedAt: new Date().toISOString(),
+                  scopes: [{
+                    warehouseId,
+                    skuId: skuIds.get('SYNC-A'),
+                    externalRef: 'echo-SYNC-A',
+                    visibleMilli: -1000,
+                  }],
+                })}, now())
+      `;
+      // Row 2 — a NON-UUID connectionId: the decode now refuses the shape
+      // before it reaches `integrationForDelivery` (whose Postgres cast
+      // would 22P02 the row dead through the retry budget).
+      await seed`
+        insert into outbox_messages (id, tenant_id, type, payload, occurred_at)
+        values (${uuidv7()}, ${tenantId}, ${CHANNEL_AVAILABILITY_PUBLISHED_EVENT},
+                ${seed.json({
+                  connectionId: 'not-a-uuid',
+                  provider: 'test-echo',
+                  publishedAt: new Date().toISOString(),
+                  scopes: [],
+                })}, now())
+      `;
+    } finally {
+      await seed.end();
+    }
+
+    await forceDue();
+    await relay.drain(2);
+
+    // Both rows ACK-deleted (the malformed-payload posture: logged, never
+    // retried), NO meter row, NO stamp movement anywhere.
+    const sql = await sqlHandle();
+    try {
+      const remaining = (await sql`
+        select count(*)::int as count from outbox_messages where tenant_id = ${tenantId}
+      `) as unknown as { count: number }[];
+      expect(remaining[0]!.count).toBe(0);
+    } finally {
+      await sql.end();
+    }
+    expect((await availabilityRows()).filter((r) => r.integrationId === echoId)).toHaveLength(beforeCalls);
+    expect(await integrationRow(echoId)).toEqual(beforeStamps);
+  });
+
   it('delivery, connection left mid-retry: the row ACK-deletes with NO meter row (the deleted-connection arm)', async () => {
     await clearOutbox();
     const beforeCalls = (await availabilityRows()).filter((r) => r.integrationId === echoId).length;
@@ -792,5 +855,116 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
     // ACK-delete, and no meter row ever appeared for the departed owner.
     expect(await outboxRows(echoId)).toEqual([]);
     expect((await availabilityRows()).filter((r) => r.integrationId === echoId)).toHaveLength(beforeCalls);
+  });
+
+  it('the worker tick against the REAL DB (epic-7 retro D3): the enumeration SQL executes for real — the open breaker is skipped by the WHERE, a throwing publish STAMPS its stall without crashing the tick, the healthy one publishes', async () => {
+    // A fresh echo row (the deleted-connection arm removed the first; the
+    // (tenant, provider) slot is free again).
+    const echo2Sql = await sqlHandle();
+    try {
+      const sealed = sealCredential({ apiKey: 'canary-echo2-key-31af95' });
+      const inserted = (await echo2Sql`
+        insert into integrations
+          (id, tenant_id, provider, status, credential_sealed, credential_version,
+           backorder_policy, connected_by, created_at, updated_at)
+        values (${uuidv7()}, ${tenantId}, 'test-echo', 'connected', ${sealed}, 1,
+                'accept', ${ownerUserId}, now(), now())
+        returning id
+      `) as unknown as { id: string }[];
+      echo2Id = inserted[0]!.id;
+    } finally {
+      await echo2Sql.end();
+    }
+    await channels.setChannelMappings(tenantId, echo2Id, [
+      { externalRef: 'echo2-SYNC-A', skuId: skuIds.get('SYNC-A')! },
+    ]);
+
+    // The three shapes the stub-driven plumbing test cannot reach: one
+    // healthy (echo2), one breaker OPEN (shopify), one whose publish THROWS
+    // (flipkart — intercepted at the facade with the stall class, a 503
+    // `reservation-store-unavailable`).
+    const setup = await sqlHandle();
+    try {
+      await setup`update integrations set breaker_state = 'open' where tenant_id = ${tenantId} and id = ${shopifyId}`;
+      await setup`update integrations set breaker_state = 'closed' where tenant_id = ${tenantId} and id = ${flipkartId}`;
+    } finally {
+      await setup.end();
+    }
+    await clearOutbox();
+
+    // The worker rides the REAL authDb (the BYPASSRLS enumeration executes
+    // against the real rows) and the REAL facade — only the thrower's
+    // publish arm is intercepted.
+    const publishSpy = jest
+      .spyOn(channels, 'publishConnectionSnapshot')
+      .mockImplementation(async (tenant: string, connection: string) => {
+        if (connection === flipkartId) {
+          throw new ProblemException('reservation-store-unavailable', 503, 'Reservation store unavailable');
+        }
+        return ChannelsFacade.prototype.publishConnectionSnapshot.call(channels, tenant, connection);
+      });
+    const worker = new ChannelsSyncWorker(app.get(AUTH_DATABASE), channels);
+    try {
+      await worker.tick();
+      const called = publishSpy.mock.calls.map((call) => call[1]);
+      expect(called).toContain(echo2Id);
+      expect(called).toContain(flipkartId);
+      // The OPEN breaker never reaches the facade — skipped by the WHERE.
+      expect(called).not.toContain(shopifyId);
+
+      // The healthy connection PUBLISHED: one real outbox row, real SQL.
+      expect(await outboxRows(echo2Id)).toHaveLength(1);
+
+      // The thrower: recordSyncStall executed against the real DB (the
+      // machinery the stub test could never reach) — the stall stamped, the
+      // tick moved on without crashing.
+      const stalled = await integrationRow(flipkartId);
+      expect(stalled).toMatchObject({ breakerState: 'closed', lastError: 'reservation store unavailable' });
+      expect(stalled.lastAttemptAt).not.toBeNull();
+      expect(await outboxRows(flipkartId)).toEqual([]);
+
+      // And the open one stands untouched.
+      expect(await integrationRow(shopifyId)).toMatchObject({ breakerState: 'open' });
+    } finally {
+      publishSpy.mockRestore();
+    }
+  });
+
+  it('the breaker HEALS (epic-7 retro D6): half-open → one SUCCESS delivery through the real drain → closed, streak reset, health derives ok', async () => {
+    // The half-open state exactly as the manual retry leaves it (RN-5's
+    // retry-moved shape), seeded with a STALE failure behind it — the heal
+    // must clear it, not merely write `closed` over it.
+    const seed = await sqlHandle();
+    try {
+      await seed`
+        update integrations
+          set breaker_state = 'half-open', consecutive_failures = 0,
+              last_error = 'stale failure (seeded)', last_synced_at = '2020-01-01T00:00:00.000Z'
+        where tenant_id = ${tenantId} and id = ${echo2Id}
+      `;
+    } finally {
+      await seed.end();
+    }
+    await clearOutbox();
+    expect(await channels.publishConnectionSnapshot(tenantId, echo2Id)).toBe(true);
+    await forceDue();
+    await relay.drain(1);
+
+    // The real drain path's success settle: the breaker CLOSED, the streak
+    // reset, the stale error cleared, the sync stamped fresh — and the row
+    // acked.
+    const row = await integrationRow(echo2Id);
+    expect(row).toMatchObject({ breakerState: 'closed', consecutiveFailures: 0, lastError: null });
+    expect(row.lastSyncedAt).not.toBeNull();
+    expect(await outboxRows(echo2Id)).toEqual([]);
+
+    // The health read derives OK from the healed row (the arm-4 list).
+    const list = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/channels/connections`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    const entry = (list.body.items as Record<string, unknown>[]).find((e) => e.id === echo2Id)!;
+    expect(entry).toMatchObject({ health: 'ok', breakerState: 'closed', lastError: null });
+    expect(entry.syncLagMs).not.toBeNull();
   });
 });

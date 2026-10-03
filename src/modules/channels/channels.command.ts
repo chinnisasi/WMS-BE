@@ -56,7 +56,7 @@ import {
 } from './channels.errors';
 import { MAX_SYNC_SCOPES_PER_PUBLISH, type MappedSkuRef } from './channels.publish';
 import type { PublishedScope } from './channels.events';
-import { CONNECTION_COLUMNS, toConnectionView } from './channels.view';
+import { CONNECTION_COLUMNS, CONNECTION_RELOCK_COLUMNS, toConnectionView } from './channels.view';
 import type {
   ChannelConnectionView,
   ChannelBufferVerdict,
@@ -842,8 +842,19 @@ export class ChannelsCommandService {
     // Phase 2 — the delete itself, one transaction: release buffers, drop
     // mappings + the row, audit, consume the key. (The revoke attempt moved
     // AFTER this commit — story 7.2's RN-7 fold; see below the mirror loop.)
+    // `revokeSealed` captures the re-locked row's blob under its lock — the
+    // blob the post-commit revoke opens (D4 in the block below).
+    let revokeSealed: string | null = null;
     const released = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
-      const locked = await this.lockConnection(tx, command.tenantId, command.connectionId);
+      // The re-lock carries the row's sealed blob (D4 — see the revoke block
+      // below): the blob captured under THIS lock is the one later revoked.
+      const lockedRows = (await tx
+        .select(CONNECTION_RELOCK_COLUMNS)
+        .from(integrations)
+        .where(and(eq(integrations.id, command.connectionId), eq(integrations.tenantId, command.tenantId)))
+        .limit(1)
+        .for('update')) as unknown as Integration[];
+      const locked = lockedRows[0] ?? null;
       if (locked === null) {
         // The row left between the phases — but a CONCURRENT duplicate of
         // this same request may have been the one that deleted it and
@@ -862,6 +873,12 @@ export class ChannelsCommandService {
         }
         throw channelConnectionNotFound();
       }
+      // Epic-7 retro D4: the revoke opens the RE-LOCKED row's blob — a
+      // rotate committing between the phases replaced the credential, and
+      // the NEW blob is the one live at the channel (revoking Phase 1's
+      // instead leaves it rotated-but-never-revoked). Phase 1's read stays
+      // only a fallback for the in-tx read coming back empty.
+      revokeSealed = locked.credentialSealed ?? existing.credentialSealed;
       // Every standing buffer this connection holds, released through the
       // core's release-in-tx (the journal rows to 'released'). The caller
       // mirrors once per release AFTER the commit — the counter sees one
@@ -934,14 +951,21 @@ export class ChannelsCommandService {
       }
     }
 
-    // ── story 7.2 (RN-7 / review finding 4): the re-revoke rides AFTER the
+    // ── story 7.2 (RN-7 / review finding 4): the revoke rides AFTER the
     // delete commits, OUTSIDE any transaction. The 7-1 posture revoked
     // BEFORE the delete tx; with a real HTTP revoke arm that would hold the
     // row's lock up to CHANNEL_HTTP_TIMEOUT_MS against the pool — the exact
     // lock-duration the pool-nesting gotcha forbids. Post-commit is equally
-    // correct under AD-15: the delete is a local atomic act, and the stale
-    // blob's revocation needs no transaction. Phase 1's row is the read —
-    // the delete re-locked and re-404'd below; this attempt uses ITS blob.
+    // correct under AD-15: the delete is a local atomic act, and the blob's
+    // revocation needs no transaction.
+    // Epic-7 retro D4: the attempt opens the blob the delete tx captured
+    // under the PHASE-2 re-lock (the `CONNECTION_RELOCK_COLUMNS` read
+    // above) — NOT Phase 1's. A rotate committing between the phases
+    // replaces the credential, and the re-locked blob is the one live at
+    // the channel; opening Phase 1's would leave the rotated credential
+    // deleted-but-never-revoked. Phase 1's blob is only the fallback for
+    // the in-tx capture coming back empty (a settled concurrent duplicate
+    // ran its own revoke).
 
     const adapter = requireChannelAdapterOrNull(existing.provider);
     let revokeError: string | null = null;
@@ -951,7 +975,7 @@ export class ChannelsCommandService {
       revokeError = 'adapter no longer registered';
     } else {
       try {
-        const credential = openCredential(existing.credentialSealed!);
+        const credential = openCredential((revokeSealed ?? existing.credentialSealed)!);
         await adapter.revokeArm({
           tenantId: command.tenantId,
           integrationId: existing.id,

@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger, type OnModuleInit } from '@nestjs/common';
 import { EVENT_BUS } from '../../shared/events/event-bus';
 import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
+import { UUID_RE } from '../../shared/primitives/ids';
 import { channelAdapter } from './channel-registry';
 import { MissingChannelEncryptionKeyError, openCredential } from './channel-credentials';
 import type { ChannelCredential } from './channel-credentials';
@@ -178,8 +179,13 @@ function decodePublication(payload: Record<string, unknown>): ChannelAvailabilit
     scopes?: unknown;
     publishedAt?: unknown;
   };
+  // Epic-7 retro D9: the id is uuid-shape-checked HERE — a non-uuid would
+  // only query-fail (Postgres 22P02) at `integrationForDelivery` and burn
+  // the row through the relay's retry budget; the malformed-payload posture
+  // (ack, never retried) applies instead.
   if (
     typeof record.connectionId !== 'string' ||
+    !UUID_RE.test(record.connectionId) ||
     typeof record.provider !== 'string' ||
     typeof record.publishedAt !== 'string' ||
     !Array.isArray(record.scopes)
@@ -201,13 +207,17 @@ function decodePublication(payload: Record<string, unknown>): ChannelAvailabilit
       externalRef?: unknown;
       visibleMilli?: unknown;
     };
+    // A negative `visibleMilli` is a publisher invariant breach — V(c) is
+    // `max(0, …)` by RN-6 — and posts negative availability to the channel:
+    // malformed, exactly like a non-integer one (D9).
     if (
       typeof item.warehouseId !== 'string' ||
       typeof item.skuId !== 'string' ||
       typeof item.externalRef !== 'string' ||
       item.externalRef === '' ||
       typeof item.visibleMilli !== 'number' ||
-      !Number.isInteger(item.visibleMilli)
+      !Number.isInteger(item.visibleMilli) ||
+      item.visibleMilli < 0
     ) {
       return null;
     }

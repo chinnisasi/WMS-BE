@@ -5,6 +5,10 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { openCredential } from '../src/modules/channels/channel-credentials';
+import { sealCredential } from '../src/modules/channels/channel-credentials';
+import { registerChannelAdapter } from '../src/modules/channels/channel-registry';
+import { testAvailabilityArm } from '../src/modules/channels/channel-availability-port';
+import { testWritebackArm } from '../src/modules/channels/channel-writeback-port';
 import { testAddress } from './support/shipment-address';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
@@ -39,6 +43,25 @@ const SHOPIFY_ROTATED = {
   shopDomain: 'canary-channel-store.myshopify.com',
   accessToken: 'canary-shopify-rotated-7c22e9',
 };
+
+/**
+ * The revoke RECORDER (epic-7 retro D4): the disconnect's post-commit revoke
+ * attempt opens the credential IN PROCESS — this arm captures that content,
+ * making WHICH blob the revoke received falsifiable. In-capture only
+ * (in-process, never logged/persisted); the canary strings stay here.
+ */
+const revokeReceived: Record<string, unknown>[] = [];
+registerChannelAdapter({
+  code: 'test-revoke',
+  displayName: 'Test Revoke',
+  credentialFields: [{ name: 'apiKey', label: 'API key', required: true, description: 'test key' }],
+  availabilityArm: testAvailabilityArm(),
+  revokeArm: async (args) => {
+    revokeReceived.push(args.credential as Record<string, unknown>);
+    return { status: 'revoked' };
+  },
+  orderWritebackArm: testWritebackArm(new Map()),
+});
 
 describe('channel connections, credentials and config (e2e, story 7-1)', () => {
   let app: INestApplication;
@@ -86,6 +109,22 @@ describe('channel connections, credentials and config (e2e, story 7-1)', () => {
 
   function sqlHandle(): postgres.Sql<Record<string, unknown>> {
     return postgres(process.env.DATABASE_URL!, { max: 1 });
+  }
+
+  /**
+   * Widens the integrations provider CHECK on THIS suite's throwaway DB
+   * clone so the registered test-revoke adapter can hold an integrations row
+   * (the sync suite's admitTestProviderInDb pattern — runtime-only, the
+   * prod CHECK keeps the frozen three).
+   */
+  async function admitTestProviderInDb(): Promise<void> {
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await sql`alter table integrations drop constraint if exists integrations_provider_check`;
+      await sql`alter table integrations add constraint integrations_provider_check check (provider in ('shopify', 'amazon-in', 'flipkart', 'test-revoke'))`;
+    } finally {
+      await sql.end();
+    }
   }
 
   async function signIn(email: string, password = 'correct-horse-battery'): Promise<string> {
@@ -415,6 +454,125 @@ describe('channel connections, credentials and config (e2e, story 7-1)', () => {
       expect(JSON.stringify(idem[0]!.response_snapshot)).toContain(connectionId);
     } finally {
       await sql.end();
+    }
+  });
+
+  it('disconnect revokes the RE-LOCKED row’s sealed blob: a rotate committing BETWEEN the phases revokes the ROTATED credential, never Phase 1’s (epic-7 retro D4)', async () => {
+    await admitTestProviderInDb();
+    const { tenantId, ownerId, token } = await freshTenant();
+    // The test-revoke connection rides a DIRECT sealed insert (the DTO's
+    // frozen provider vocabulary keeps the frozen three; the vault machinery
+    // is credential-shape-agnostic) — the recorder's revoke arm then makes
+    // WHICH blob the disconnect's revoke attempt received falsifiable.
+    const V1 = 'canary-revoke-v1-a1a1a1';
+    const seed = sqlHandle();
+    let connectionId: string;
+    try {
+      const sealed = sealCredential({ apiKey: V1 });
+      const inserted = (await seed`
+        insert into integrations
+          (id, tenant_id, provider, status, credential_sealed, credential_version,
+           backorder_policy, connected_by, created_at, updated_at)
+        values (${uuidv7()}, ${tenantId}, 'test-revoke', 'connected', ${sealed}, 1,
+                'accept', ${ownerId}, now(), now())
+        returning id
+      `) as unknown as { id: string }[];
+      connectionId = inserted[0]!.id;
+    } finally {
+      await seed.end();
+    }
+
+    // The RACE — D4's window, produced deterministically through the row
+    // lock's queue (a sequential rotate-then-disconnect proves nothing:
+    // Phase 1 would read the rotated row too). A third transaction holds
+    // the integrations row's lock; the disconnect is fired FIRST (it parks
+    // in its Phase-1 FOR UPDATE, queued), the rotate queues behind it, and
+    // only then does the holder commit. Postgres grants queued waiters in
+    // order, so the rotate lands BETWEEN the disconnect's two phases:
+    //
+    //   disconnect Phase 1 ← reads the V1 blob under its lock, commits
+    //   rotate             ← writes the V2 blob, commits   ← the D4 window
+    //   disconnect Phase 2 ← re-locks; the V2 row is the one it deletes
+    //
+    // The revoke must open the blob captured under the PHASE-2 lock (V2);
+    // Phase 1's capture (V1) is the stale one D4 forbids revoking. If the
+    // interleave ever misfires, the rotate's 200-vs-404 assertion fails
+    // loudly — a mistimed race can never pass silently.
+    const V2 = 'canary-revoke-v2-b2b2b2';
+    revokeReceived.length = 0;
+
+    /** Wait until `min` sessions are PARKED on the integrations row lock —
+     * a lock-wait whose query is the `... for update` select, blocked by the
+     * holder's own pid, so no other suite's session can pollute the count. */
+    const waitRowWaiters = async (holderPid: number, min: number, deadlineMs: number): Promise<void> => {
+      const probe = sqlHandle();
+      try {
+        const deadline = Date.now() + deadlineMs;
+        while (Date.now() < deadline) {
+          const waiting = (await probe`
+            select a.pid, a.wait_event_type as wevent from pg_stat_activity a
+            where a.wait_event_type = 'Lock' and a.state = 'active'
+              and a.query ilike '%integrations%' and a.query ilike '%for update%'
+              and ${holderPid} = any(pg_blocking_pids(a.pid))
+          `) as unknown as { pid: number; wevent: string }[];
+          if (waiting.length >= min) return;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        throw new Error(`only ${min - 1} waiter(s) parked on the row lock; the command never got there`);
+      } finally {
+        await probe.end();
+      }
+    };
+
+    // The two HTTP requests are fired INSIDE the holder's transaction (and
+    // awaited only after every phase has run) so their ordering on the lock
+    // queue is the one the comments above promise.
+    const holder = sqlHandle();
+    let disconnecting: Promise<unknown> | undefined;
+    let rotating: Promise<unknown> | undefined;
+    try {
+      await holder.begin(async (tx) => {
+        const locked = (await tx`
+          select pg_backend_pid() as pid from integrations
+          where tenant_id = ${tenantId} and id = ${connectionId} for update
+        `) as unknown as { pid: number }[];
+        disconnecting = (async () => disconnect(token, tenantId, connectionId, ulid()).expect(204))();
+        // The disconnect must be ON the lock (not merely in flight) before
+        // the rotate fires — otherwise the rotate could win the row first.
+        await waitRowWaiters(locked[0]!.pid, 1, 5000);
+        rotating = (async () => rotate(token, tenantId, connectionId, { apiKey: V2 }).expect(200))();
+        // Normally the rotate parks within ms and this returns immediately.
+        // The bail-out just keeps a stalled rotate from eating the test
+        // budget — everything is still re-checked loudly below.
+        await waitRowWaiters(locked[0]!.pid, 2, 1000).catch(() => undefined);
+        // Returning commits — the queue drains in fire order.
+      });
+    } finally {
+      await holder.end();
+    }
+    const [deleted, rotated] = (await Promise.all([disconnecting!, rotating!])) as [
+      { status: number },
+      { body: Record<string, unknown> },
+    ];
+    expect(deleted.status).toBe(204);
+    expect(rotated.body).toMatchObject({ id: connectionId, credentialVersion: 2 });
+
+    // The revoke attempt opened the RE-LOCKED row's blob — the ROTATED one.
+    expect(revokeReceived).toEqual([{ apiKey: V2 }]);
+    expect(JSON.stringify(revokeReceived)).not.toContain(V1);
+
+    // The attempt metered honestly (the recorder's arm worked).
+    const meter = sqlHandle();
+    try {
+      const calls = (await meter`
+        select kind, status, integration_id as "integrationId" from integration_calls
+        where tenant_id = ${tenantId}
+      `) as unknown as { kind: string; status: string; integrationId: string }[];
+      expect(calls).toEqual([
+        expect.objectContaining({ kind: 'credential-revoke', status: 'ok', integrationId: connectionId }),
+      ]);
+    } finally {
+      await meter.end();
     }
   });
 
