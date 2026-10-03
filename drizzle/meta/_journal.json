@@ -386,6 +386,13 @@
       "when": 1791026577094,
       "tag": "0054_invoice_regulatory_pass",
       "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "7",
+      "when": 1791050484657,
+      "tag": "0055_hsn_summary_columns",
+      "breakpoints": true
     }
   ]
 }

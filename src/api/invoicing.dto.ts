@@ -1,9 +1,14 @@
 import { Type } from 'class-transformer';
-import { ArrayMaxSize, IsArray, IsInt, IsOptional, IsString, IsUUID, Max, Min, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsInt, IsOptional, IsString, IsUUID, Matches, Max, Min, ValidateNested } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { GAP_KINDS, INVOICE_STATUSES, RATE_SOURCES } from '../modules/invoicing/generator';
 import type { GapKind, InvoiceStatus, RateSource } from '../modules/invoicing/generator';
 import { INVOICE_LIST_MAX_PAGE_SIZE } from '../modules/invoicing/view';
+import { HSN_PERIOD_KINDS, HSN_PERIOD_SHAPE_RE, HSN_SECTIONS } from '../modules/invoicing/hsn-summary';
+import type { HsnPeriodKind, HsnSection } from '../modules/invoicing/hsn-summary';
+import { UQCS } from '../modules/invoicing/uqc';
+import type { Uqc } from '../modules/invoicing/uqc';
+import { GSTIN_RE } from '../shared/primitives/gstin';
 
 /**
  * Upper bound on the rate overrides one generate call carries — an order's
@@ -260,4 +265,191 @@ export class InvoiceListResponse {
 
   @ApiProperty({ type: String, nullable: true, required: false })
   nextCursor?: string | null;
+}
+
+// ── HSN summary (story 8-2a) ─────────────────────────────────────────────────
+
+/** GET /tenants/{tenantId}/invoices/hsn-summary query. */
+export class HsnSummaryQuery {
+  @ApiProperty({
+    description: 'The supplier GSTIN whose return this is — matched exactly (canonical uppercase), no case folding',
+    example: '29AAAPZ1234C1ZV',
+  })
+  @IsString()
+  @Matches(GSTIN_RE, { message: 'gstin must be a GSTIN — two digits then thirteen letters or digits' })
+  gstin!: string;
+
+  @ApiProperty({
+    description:
+      "The accounting period, by IST issue date: a month 'YYYY-MM' (e.g. '2026-09') or an FY quarter 'FY-yyyy-Qn' (Q1 Apr–Jun, Q2 Jul–Sep, Q3 Oct–Dec, Q4 Jan–Mar; e.g. 'FY-2627-Q2')",
+    example: '2026-09',
+  })
+  @IsString()
+  @Matches(HSN_PERIOD_SHAPE_RE, { message: "period must be 'YYYY-MM' or 'FY-yyyy-Qn'" })
+  period!: string;
+}
+
+export class HsnSummaryPeriodDto {
+  @ApiProperty({ example: '2026-09' })
+  label!: string;
+
+  @ApiProperty({ enum: HSN_PERIOD_KINDS })
+  kind!: HsnPeriodKind;
+
+  @ApiProperty({ description: 'Inclusive lower bound: the UTC instant of the first IST midnight of the period' })
+  from!: string;
+
+  @ApiProperty({ description: 'EXCLUSIVE upper bound: the UTC instant of the first IST midnight after the period' })
+  to!: string;
+
+  @ApiProperty({ enum: [true], description: 'Always true — `to` is exclusive' })
+  toExclusive!: true;
+}
+
+export class HsnSummaryRowDto {
+  @ApiProperty({ type: String, nullable: true, description: 'The trimmed HSN as frozen on the lines; null = blank' })
+  hsn!: string | null;
+
+  @ApiProperty({
+    description:
+      'Blank or malformed HSN (not 4, 6 or 8 digits). Included in the totals so they reconcile; excluded from the Table 12 CSV (the portal accepts master HSNs only)',
+  })
+  hsnIssue!: boolean;
+
+  @ApiProperty({ enum: UQCS, description: 'GST Unit Quantity Code — no quantity is ever scaled to fit one; OTH where none means the same unit' })
+  uqc!: Uqc;
+
+  @ApiProperty({ type: [String], description: 'The distinct catalog units merged into this row (sorted)' })
+  sourceUoms!: string[];
+
+  @ApiProperty({ description: 'More than one catalog unit merged under one UQC (only OTH can) — the quantity mixes units' })
+  mixedUnits!: boolean;
+
+  @ApiProperty({ description: 'GST rate in basis points (1800 = 18%)' })
+  gstBps!: number;
+
+  @ApiProperty({ description: 'Σ dispatched quantity in milli-units — unrounded' })
+  qtyMilli!: number;
+
+  @ApiProperty({ description: 'Invoice lines summed into this row' })
+  lineCount!: number;
+
+  @ApiProperty({ description: 'Σ taxable value, paise (exact)' })
+  taxablePaise!: number;
+
+  @ApiProperty({ description: 'Σ IGST, paise' })
+  igstPaise!: number;
+
+  @ApiProperty({ description: 'Σ CGST, paise' })
+  cgstPaise!: number;
+
+  @ApiProperty({ description: 'Σ SGST/UTGST, paise' })
+  sgstPaise!: number;
+
+  @ApiProperty({ description: 'Taxable + every tax, paise (Table 12 "Total Value")' })
+  totalValuePaise!: number;
+}
+
+export class HsnSummaryTotalsDto {
+  @ApiProperty({ description: 'Issued invoices in scope (an invoice with no lines still counts)' })
+  invoiceCount!: number;
+
+  @ApiProperty()
+  taxablePaise!: number;
+
+  @ApiProperty()
+  igstPaise!: number;
+
+  @ApiProperty()
+  cgstPaise!: number;
+
+  @ApiProperty()
+  sgstPaise!: number;
+
+  @ApiProperty({ description: 'IGST + CGST + SGST, paise' })
+  gstPaise!: number;
+
+  @ApiProperty({ description: 'Taxable + GST, paise' })
+  totalValuePaise!: number;
+}
+
+export class HsnSummarySectionDto {
+  @ApiProperty({ type: [HsnSummaryRowDto], description: 'HSN ascending (issue rows last), then UQC, then rate' })
+  rows!: HsnSummaryRowDto[];
+
+  @ApiProperty({ type: HsnSummaryTotalsDto, description: 'Over every row, issue rows included' })
+  totals!: HsnSummaryTotalsDto;
+}
+
+export class HsnIssueLineDto {
+  @ApiProperty({ enum: HSN_SECTIONS })
+  section!: HsnSection;
+
+  @ApiProperty({ format: 'uuid' })
+  invoiceId!: string;
+
+  @ApiProperty({ description: "The invoice number (unique per supplier GSTIN), e.g. '29/2627/000001'" })
+  invoiceNo!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The HSN frozen on the line (trimmed); null = blank' })
+  hsn!: string | null;
+
+  @ApiProperty()
+  taxablePaise!: number;
+
+  @ApiProperty()
+  gstPaise!: number;
+
+  @ApiProperty({ description: 'Taxable + GST, paise — what leaving this line out of the CSV leaves Table 12 short by' })
+  valuePaise!: number;
+
+  @ApiProperty({ type: String, nullable: true, description: "The SKU's CURRENT catalog HSN — a hint for the correction; the issued invoice is never rewritten from it" })
+  catalogHsn!: string | null;
+}
+
+export class HsnSummaryDto {
+  @ApiProperty()
+  gstin!: string;
+
+  @ApiProperty({ type: HsnSummaryPeriodDto })
+  period!: HsnSummaryPeriodDto;
+
+  @ApiProperty({ type: HsnSummarySectionDto, description: 'Invoices to registered recipients (a consignee GSTIN)' })
+  b2b!: HsnSummarySectionDto;
+
+  @ApiProperty({ type: HsnSummarySectionDto, description: 'Invoices to unregistered recipients (no consignee GSTIN)' })
+  b2c!: HsnSummarySectionDto;
+
+  @ApiProperty({ type: HsnSummaryTotalsDto, description: 'B2B + B2C — equals the included invoices’ subtotal and GST to the paisa' })
+  totals!: HsnSummaryTotalsDto;
+
+  @ApiProperty({ type: [HsnIssueLineDto], description: 'Every line behind an hsnIssue row' })
+  issueLines!: HsnIssueLineDto[];
+}
+
+export class HsnSummaryResponse {
+  @ApiProperty({ type: HsnSummaryDto })
+  summary!: HsnSummaryDto;
+}
+
+export class HsnSummaryGstinDto {
+  @ApiProperty()
+  gstin!: string;
+
+  @ApiProperty({ description: 'Earliest issue instant under this GSTIN, ISO-8601 UTC' })
+  firstIssuedAt!: string;
+
+  @ApiProperty({ description: 'Latest issue instant under this GSTIN, ISO-8601 UTC' })
+  lastIssuedAt!: string;
+
+  @ApiProperty()
+  invoiceCount!: number;
+}
+
+export class HsnSummaryGstinsResponse {
+  @ApiProperty({ type: [HsnSummaryGstinDto], description: 'Every supplier GSTIN with issued invoices, GSTIN ascending' })
+  items!: HsnSummaryGstinDto[];
 }

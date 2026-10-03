@@ -466,6 +466,29 @@ export class CatalogFacade {
   }
 
   /**
+   * The CURRENT catalog HSN of a set of SKU codes (story 8-2a), inside the
+   * caller's transaction — the HSN summary's hint beside an issued line whose
+   * frozen HSN is blank or malformed. A hint only: an issued invoice is never
+   * rewritten from it. A code the catalog does not know is absent from the
+   * map (codes are immutable and SKUs are never deleted, so in practice
+   * every snapshot code resolves).
+   */
+  async getSkuHsnByCodesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    codes: readonly string[],
+  ): Promise<ReadonlyMap<string, string | null>> {
+    if (codes.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .select({ code: skus.code, hsn: skus.hsn })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.code, [...new Set(codes)])));
+    return new Map(rows.map((row) => [row.code, row.hsn]));
+  }
+
+  /**
    * The one batch existence read (Story 2.5): null when the id is unknown or
    * foreign — the batch detail route's catalog 404 check, before any
    * inventory read. The `skuId` rides along (a batch's SKU identity).

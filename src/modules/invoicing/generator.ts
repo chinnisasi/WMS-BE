@@ -153,7 +153,7 @@ export interface InvoiceDraft {
 // ── FY numbering ─────────────────────────────────────────────────────────────
 
 /** India is UTC+05:30 year-round (no DST) — the FY is read off the IST clock. */
-const IST_OFFSET_MS = 5.5 * 3600 * 1000;
+export const IST_OFFSET_MS = 5.5 * 3600 * 1000;
 
 /**
  * The financial-year label of an issuance instant: April 1 – March 31 in
@@ -616,6 +616,9 @@ export class InvoiceGenerator {
           roundOffPaise: draft.roundOffPaise,
           revision,
           document,
+          // Story 8-2a: the read-model twin of `document.header.issuedAt` —
+          // the SAME variable (one clock read), null while awaiting-data.
+          issuedAt,
         });
       } catch (err) {
         if (isUniqueViolationOn(err, 'invoices_tenant_order_unique')) {
@@ -681,6 +684,9 @@ export class InvoiceGenerator {
         roundOffPaise: draft.roundOffPaise,
         revision,
         document,
+        // Story 8-2a: the awaiting→issued flip stamps the issuance instant
+        // from the SAME variable the document carries; a re-park stays null.
+        issuedAt,
       })
       .where(eq(invoices.id, existing.id));
     await tx.delete(invoiceLines).where(eq(invoiceLines.invoiceId, existing.id));
@@ -904,6 +910,8 @@ export class InvoiceGenerator {
         sgstPaise: line.sgstPaise,
         igstPaise: line.igstPaise,
         hsnGap: line.hsnGap,
+        // Story 8-2a: the read-model unit snapshot (the document line's uom).
+        uom: line.uom,
       })),
     );
   }
