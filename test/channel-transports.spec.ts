@@ -139,10 +139,32 @@ describe('channel transports: the shopify arms against a local stub (story 7.2, 
     ...(itemId === undefined ? {} : { inventoryItemId: itemId }),
   });
 
-  // The first two lookups (one per distinct ref) then the two set posts.
+  // The GRAPHQL variant-lookup answers, in request order (one per uncached
+  // ref), then the two set posts. The answers pin the REAL response shape —
+  // admin GraphQL `{data}` with `productVariants.edges[].node`, and
+  // `legacyResourceId` (an UnsignedInt64) as a JSON STRING (the 2023-04+
+  // serialization; the arm converts, then validates safe-integer).
   const RESOLVED_STUB_ANSWERS = [
-    { status: 200, body: { variants: [{ id: 11, inventory_item_id: 445566 }] } },
-    { status: 200, body: { variants: [{ id: 12, inventory_item_id: 556677 }] } },
+    {
+      status: 200,
+      body: {
+        data: {
+          productVariants: {
+            edges: [{ node: { sku: REF_1, inventoryItem: { legacyResourceId: '445566' } } }],
+          },
+        },
+      },
+    },
+    {
+      status: 200,
+      body: {
+        data: {
+          productVariants: {
+            edges: [{ node: { sku: REF_2, inventoryItem: { legacyResourceId: '556677' } } }],
+          },
+        },
+      },
+    },
     { status: 200, body: {} },
     { status: 200, body: {} },
   ];
@@ -163,9 +185,17 @@ describe('channel transports: the shopify arms against a local stub (story 7.2, 
       expect(result.resolvedItems).toEqual({ [REF_1]: 445566, [REF_2]: 556677 });
       // TWO variant lookups, then the two set posts (one postable scope each).
       expect(stub.requests).toHaveLength(4);
-      expect(stub.requests[0]!.method).toBe('GET');
-      expect(stub.requests[0]!.url).toBe(`/admin/api/2026-01/variants.json?sku=${encodeURIComponent(REF_1)}`);
-      expect(stub.requests[1]!.url).toBe(`/admin/api/2026-01/variants.json?sku=${encodeURIComponent(REF_2)}`);
+      // Epic-7 retro D1: the lookup rides the REAL endpoint — one POST to
+      // the admin GRAPHQL API per ref (REST has no top-level variants
+      // resource and no sku param; the request shape is pinned against it).
+      expect(stub.requests[0]!.method).toBe('POST');
+      expect(stub.requests[0]!.url).toBe('/admin/api/2026-01/graphql.json');
+      const lookup = JSON.parse(stub.requests[0]!.body) as { query: string; variables: { query: string } };
+      expect(lookup.query).toContain('productVariants(first: 10, query: $query)');
+      expect(lookup.variables.query).toBe(`sku:"${REF_1}"`);
+      expect(stub.requests[1]!.url).toBe('/admin/api/2026-01/graphql.json');
+      expect((JSON.parse(stub.requests[1]!.body) as { variables: { query: string } }).variables.query)
+        .toBe(`sku:"${REF_2}"`);
       expect(stub.requests[2]!.url).toBe('/admin/api/2026-01/inventory_levels/set.json');
       expect(stub.requests[2]!.method).toBe('POST');
       expect(stub.requests[2]!.headers['x-shopify-access-token']).toBe(ADMIN_TOKEN);
@@ -185,10 +215,17 @@ describe('channel transports: the shopify arms against a local stub (story 7.2, 
     }
   });
 
-  it('a cached inventoryItemId posts without a lookup; an unresolvable ref SKIPS its scopes with the skipped count (RD-6 amended)', async () => {
-    // The lookups: ref 2's answer resolves nothing (empty variants).
+  it('a cached inventoryItemId posts without a lookup; an unresolvable ref SKIPS its scopes with the skipped count (RD-6 amended; epic-7 retro D1)', async () => {
+    // The lookups: ref 2's answer resolves nothing (an empty edges set).
     const stub = new ShopStub([
-      { status: 200, body: { variants: [] } },
+      {
+        status: 200,
+        body: {
+          data: {
+            productVariants: { edges: [{ node: { sku: REF_1, inventoryItem: { legacyResourceId: '778899' } } }] },
+          },
+        },
+      },
       { status: 200, body: {} },
     ]);
     const domain = await stub.start();
@@ -203,7 +240,7 @@ describe('channel transports: the shopify arms against a local stub (story 7.2, 
       // Exactly ONE lookup (only the uncached ref), exactly ONE post (the
       // skipped ref's scopes never post anything).
       expect(stub.requests).toHaveLength(2);
-      expect(stub.requests[0]!.url).toContain('/variants.json?sku=');
+      expect(stub.requests[0]!.url).toBe('/admin/api/2026-01/graphql.json');
       const postBody = JSON.parse(stub.requests[1]!.body) as Record<string, unknown>;
       expect(postBody).toMatchObject({ inventory_item_ids: [778899] });
       expect(result.skippedRefs).toEqual([REF_2]);
@@ -213,9 +250,10 @@ describe('channel transports: the shopify arms against a local stub (story 7.2, 
   });
 
   it('EVERY scope unresolvable refuses the attempt with the typed ChannelItemsUnresolvedError and NO inventory_set request (RD-6 amended)', async () => {
+    const emptyEdges = { data: { productVariants: { edges: [] } } };
     const stub = new ShopStub([
-      { status: 200, body: { variants: [] } },
-      { status: 200, body: { variants: [] } },
+      { status: 200, body: emptyEdges },
+      { status: 200, body: emptyEdges },
     ]);
     const domain = await stub.start();
     try {
@@ -233,9 +271,166 @@ describe('channel transports: the shopify arms against a local stub (story 7.2, 
     }
   });
 
+  it('the lookup decides on the EDGES: a tokenized non-exact node.sku is filtered out (epic-7 retro D1)', async () => {
+    // Shopify's sku: search matches TOKENS — the stub answers with one edge
+    // whose sku merely CONTAINS the ref and the exact edge; only the exact
+    // one may resolve.
+    const stub = new ShopStub([
+      {
+        status: 200,
+        body: {
+          data: {
+            productVariants: {
+              edges: [
+                { node: { sku: `X ${REF_1} Y`, inventoryItem: { legacyResourceId: '111111' } } },
+                { node: { sku: REF_2, inventoryItem: { legacyResourceId: '556677' } } },
+              ],
+            },
+          },
+        },
+      },
+      { status: 200, body: {} },
+    ]);
+    const domain = await stub.start();
+    try {
+      const result = await shopifyAvailabilityArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
+        tenantId: '00000000-0000-0000-0000-000000000001',
+        integrationId: '00000000-0000-0000-0000-000000000002',
+        provider: 'shopify',
+        scopes: [scope(SKU_2, REF_2, 2_000)],
+        publishedAt: '2026-10-02T00:00:00.000Z',
+      });
+      expect(result.resolvedItems).toEqual({ [REF_2]: 556677 });
+      const postBody = JSON.parse(stub.requests[1]!.body) as Record<string, unknown>;
+      expect(postBody).toMatchObject({ inventory_item_ids: [556677] });
+      expect(stub.requests[1]!.body).not.toContain('111111');
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('a tokenized answer with NO exact edge resolves nothing — and an ambiguous ref (the sku on TWO variants) is refused, never guessed (epic-7 retro D1)', async () => {
+    // Arm 1 — only a non-exact edge: unresolved.
+    const onlyTokenMatch = new ShopStub([
+      {
+        status: 200,
+        body: {
+          data: {
+            productVariants: {
+              edges: [{ node: { sku: `X ${REF_1} Y`, inventoryItem: { legacyResourceId: '111111' } } }],
+            },
+          },
+        },
+      },
+    ]);
+    const domain = await onlyTokenMatch.start();
+    try {
+      await expect(shopifyAvailabilityArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
+        tenantId: 't', integrationId: 'i', provider: 'shopify',
+        scopes: [scope(SKU_1, REF_1, 1_000)],
+        publishedAt: '2026-10-02T00:00:00.000Z',
+      })).rejects.toThrow(ChannelItemsUnresolvedError);
+      expect(onlyTokenMatch.requests.filter((r) => r.url.includes('inventory_levels'))).toEqual([]);
+    } finally {
+      onlyTokenMatch.close();
+    }
+
+    // Arm 2 — the exact sku on two DISTINCT variants (two products): the
+    // ambiguity is the RD-6 posture — refused, never guessed.
+    const ambiguous = new ShopStub([
+      {
+        status: 200,
+        body: {
+          data: {
+            productVariants: {
+              edges: [
+                { node: { sku: REF_1, inventoryItem: { legacyResourceId: '111111' } } },
+                { node: { sku: REF_1, inventoryItem: { legacyResourceId: '222222' } } },
+              ],
+            },
+          },
+        },
+      },
+    ]);
+    const ambiguousDomain = await ambiguous.start();
+    try {
+      await expect(shopifyAvailabilityArm({ ...CREDENTIAL, shopDomain: ambiguousDomain } as ChannelCredential, {
+        tenantId: 't', integrationId: 'i', provider: 'shopify',
+        scopes: [scope(SKU_1, REF_1, 1_000)],
+        publishedAt: '2026-10-02T00:00:00.000Z',
+      })).rejects.toThrow(ChannelItemsUnresolvedError);
+      expect(ambiguous.requests.filter((r) => r.url.includes('inventory_levels'))).toEqual([]);
+    } finally {
+      ambiguous.close();
+    }
+  });
+
+  it('a non-numeric legacyResourceId resolves nothing — never a guessed id (epic-7 retro D1/RD-6)', async () => {
+    const stub = new ShopStub([
+      {
+        status: 200,
+        body: {
+          data: {
+            productVariants: {
+              edges: [{ node: { sku: REF_1, inventoryItem: { legacyResourceId: 'gid-not-a-number' } } }],
+            },
+          },
+        },
+      },
+    ]);
+    const domain = await stub.start();
+    try {
+      await expect(shopifyAvailabilityArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
+        tenantId: 't', integrationId: 'i', provider: 'shopify',
+        scopes: [scope(SKU_1, REF_1, 1_000)],
+        publishedAt: '2026-10-02T00:00:00.000Z',
+      })).rejects.toThrow(ChannelItemsUnresolvedError);
+      expect(stub.requests.filter((r) => r.url.includes('inventory_levels'))).toEqual([]);
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('a 200 GraphQL body carrying top-level `errors` (throttling included) is the unresolved arm, never a read-through', async () => {
+    const stub = new ShopStub([
+      { status: 200, body: { errors: [{ message: 'Throttled' }], data: null } },
+    ]);
+    const domain = await stub.start();
+    try {
+      await expect(shopifyAvailabilityArm({ ...CREDENTIAL, shopDomain: domain } as ChannelCredential, {
+        tenantId: 't', integrationId: 'i', provider: 'shopify',
+        scopes: [scope(SKU_1, REF_1, 1_000)],
+        publishedAt: '2026-10-02T00:00:00.000Z',
+      })).rejects.toThrow(ChannelItemsUnresolvedError);
+      expect(stub.requests.filter((r) => r.url.includes('inventory_levels'))).toEqual([]);
+    } finally {
+      stub.close();
+    }
+  });
+
+  it('the availability arm refuses a NON-NUMERIC locationId as bad-arg before any wire call (epic-7 retro D9)', async () => {
+    const stub = new ShopStub([]);
+    const domain = await stub.start();
+    try {
+      const badLocation = { ...CREDENTIAL, shopDomain: domain, locationId: '9001-main' } as unknown as ChannelCredential;
+      const attempt = shopifyAvailabilityArm(badLocation, {
+        tenantId: 't', integrationId: 'i', provider: 'shopify',
+        scopes: [scope(SKU_1, REF_1, 1_000, 445566)], // cached id — no lookup either way
+        publishedAt: '2026-10-02T00:00:00.000Z',
+      });
+      await expect(attempt).rejects.toMatchObject({ kind: 'bad-arg', status: null });
+      expect(stub.requests).toEqual([]); // refused BEFORE any request left
+    } finally {
+      stub.close();
+    }
+  });
+
   it('a 4xx answer reads as the delivery failure the breaker already understands (not-ok)', async () => {
     const stub = new ShopStub([
-      { status: 200, body: { variants: [{ inventory_item_id: 445566 }] } },
+      {
+        status: 200,
+        body: { data: { productVariants: { edges: [{ node: { sku: REF_1, inventoryItem: { legacyResourceId: '445566' } } }] } } },
+      },
       { status: 422, body: { errors: 'Inventory not found' } },
     ]);
     const domain = await stub.start();

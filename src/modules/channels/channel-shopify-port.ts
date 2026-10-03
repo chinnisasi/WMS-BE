@@ -68,9 +68,50 @@ export const WRITEBACK_LOCATION_UNSET = 'writeback-location-unset';
 /** The un-addressable read-back fulfillment's meter-facing name (RD-7). */
 export const WRITEBACK_UNTRACKED_ID = 'writeback-untracked-fulfillment';
 
-/** One Admin-API variant row from the ref lookup (the id the arm needs). */
+/**
+ * The sku→item lookup (RD-6 amended; epic-7 retro D1): one Admin GRAPHQL
+ * call per uncached ref. The 7-1 patch shipped a REST variants lookup the
+ * Shopify REST Admin API does not have (no top-level variants resource, no
+ * sku param — REST variants deprecated since API 2024-04): the real
+ * transport 404d every uncached ref. GraphQL's `productVariants` search is the
+ * published surface that answers it; the arm decides on the EDGES (below)
+ * because the search is tokenized, never exact-match.
+ */
+const VARIANTS_BY_SKU_QUERY = `
+  query VariantsBySku($query: String!) {
+    productVariants(first: 10, query: $query) {
+      edges { node { sku inventoryItem { legacyResourceId } } }
+    }
+  }
+`;
+
+/** One Admin GRAPHQL variant-lookup answer (the shape above, decoded). */
 interface VariantLookupResponse {
-  variants?: { inventory_item_id?: number | null }[];
+  data?: {
+    productVariants?: {
+      edges?: readonly {
+        node?: {
+          sku?: string | null;
+          inventoryItem?: { legacyResourceId?: string | number | null } | null;
+        } | null;
+      }[] | null;
+    } | null;
+  } | null;
+  errors?: readonly { message?: string }[] | null;
+}
+
+/**
+ * The credential's location as the NUMERIC Shopify location id, or null when
+ * it cannot address an inventory/fulfillment write — the one validation both
+ * POST arms share (epic-7 retro D9: the availability arm's bare empty-string
+ * check let a non-numeric locationId reach the wire as `location_id: null`).
+ */
+function numericLocationId(credential: ChannelCredential): number | null {
+  if (credential.locationId === undefined) {
+    return null;
+  }
+  const parsed = Number(credential.locationId);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
 /**
@@ -96,8 +137,13 @@ export async function shopifyAvailabilityArm(
   credential: ChannelCredential,
   request: ChannelAvailabilityRequest,
 ): Promise<ChannelAvailabilityResult> {
-  if (credential.locationId === undefined || credential.locationId === '') {
-    throw new ChannelHttpError('bad-arg', null, 'credential field "locationId" is absent (rotate to supply it)');
+  const locationId = numericLocationId(credential);
+  if (locationId === null) {
+    throw new ChannelHttpError(
+      'bad-arg',
+      null,
+      `credential field "locationId"${credential.locationId === undefined ? ' is absent' : ' is not a Shopify numeric location id'} (rotate to supply it)`,
+    );
   }
   const base = adminBase(credential);
   const headers = adminHeaders(credential);
@@ -116,18 +162,53 @@ export async function shopifyAvailabilityArm(
       continue;
     }
     try {
+      // The ref rides QUOTED so SKUs containing spaces/colons form a valid
+      // search term; embedded double quotes are dropped before quoting (a
+      // malformed term can only yield zero edges → unresolved — the exact
+      // edge filter below is the correctness boundary, the quoting recalls).
+      const searchRef = scope.externalRef.trim().replace(/"/g, '');
       const response = await channelHttpRequest({
-        method: 'GET',
-        url: `${base}/variants.json?sku=${encodeURIComponent(scope.externalRef)}`,
+        method: 'POST',
+        url: `${base}/graphql.json`,
         headers,
+        body: { query: VARIANTS_BY_SKU_QUERY, variables: { query: `sku:"${searchRef}"` } },
       });
-      const itemId = (JSON.parse(response.body) as VariantLookupResponse).variants?.[0]?.inventory_item_id;
-      if (typeof itemId === 'number' && Number.isSafeInteger(itemId)) {
-        resolved.set(scope.externalRef, itemId);
-        fresh.set(scope.externalRef, itemId);
-      } else {
-        unresolved.push(scope.externalRef);
+      const body = JSON.parse(response.body) as VariantLookupResponse;
+      if (body.errors !== undefined && body.errors !== null && body.errors.length > 0) {
+        // Throttling included: a GraphQL errors body never reads as data.
+        throw new ChannelHttpError('not-ok', response.status, 'the admin GraphQL lookup answered with errors');
       }
+      // Shopify's sku: search is TOKENIZED, not exact-match: only an edge
+      // whose node.sku IS the ref (trimmed) may resolve it, and the resolved
+      // id comes from `inventoryItem.legacyResourceId` — Shopify's own
+      // documented bridge to the numeric REST id the set call needs (no
+      // gid-suffix parsing). Distinct ids > 1 (a SKU repeated across
+      // products — Shopify permits it) are ambiguous: refused as unresolved,
+      // never guessed (RD-6).
+      const ref = scope.externalRef.trim();
+      const ids = new Set<string>();
+      for (const edge of body.data?.productVariants?.edges ?? []) {
+        const node = edge?.node;
+        if (node === null || node === undefined || typeof node.sku !== 'string' || node.sku.trim() !== ref) {
+          continue;
+        }
+        const raw = node.inventoryItem?.legacyResourceId;
+        // `legacyResourceId` is an UnsignedInt64 — a JSON STRING on every
+        // 2023-04+ version; a number still arrives on older ones. Either
+        // shape must convert to a safe, positive integer or the edge
+        // resolves nothing.
+        const parsed = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : Number.NaN;
+        if (Number.isSafeInteger(parsed) && parsed > 0) {
+          ids.add(String(parsed));
+        }
+      }
+      if (ids.size !== 1) {
+        unresolved.push(scope.externalRef);
+        continue;
+      }
+      const itemId = Number([...ids][0]!);
+      resolved.set(scope.externalRef, itemId);
+      fresh.set(scope.externalRef, itemId);
     } catch {
       // A lookup failure is an unresolvable ref this attempt — the typed
       // refusal (or the skipped count) carries it; nothing is posted with a
@@ -150,7 +231,7 @@ export async function shopifyAvailabilityArm(
       url: `${base}/inventory_levels/set.json`,
       headers,
       body: {
-        location_id: Number(credential.locationId),
+        location_id: locationId,
         inventory_item_ids: [itemId],
         available: Math.floor(fromMilli(scope.visibleMilli)),
       },
@@ -198,16 +279,14 @@ export async function shopifyOrderWritebackArm(
   request: ChannelOrderWritebackRequest,
 ): Promise<ChannelOrderWritebackResult> {
   // RD-6: the location is REQUIRED material for a fulfillment call — the
-  // named failure, never a guessed location.
-  if (credential.locationId === undefined || credential.locationId === '') {
+  // named failure, never a guessed location. The validation expression is
+  // the shared `numericLocationId` (epic-7 retro D9 — one validation, both
+  // POST arms); the ERROR differs per arm (the availability arm's is the
+  // typed `bad-arg`).
+  const locationId = numericLocationId(credential);
+  if (locationId === null) {
     throw new Error(
-      `${WRITEBACK_LOCATION_UNSET}: the connection's credential holds no locationId — rotate to supply Shopify's location the writeback fulfills against.`,
-    );
-  }
-  const locationId = Number(credential.locationId);
-  if (!Number.isSafeInteger(locationId) || locationId <= 0) {
-    throw new Error(
-      `${WRITEBACK_LOCATION_UNSET}: the connection's credential locationId "${credential.locationId}" is not a Shopify numeric location id (rotate to supply it).`,
+      `${WRITEBACK_LOCATION_UNSET}: the connection's credential locationId ${credential.locationId === undefined ? 'is absent' : `"${credential.locationId}"`} is not a Shopify numeric location id (rotate to supply it).`,
     );
   }
   const base = adminBase(credential);
