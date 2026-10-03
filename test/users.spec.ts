@@ -854,8 +854,15 @@ describe('users, roles, and permission gating (e2e)', () => {
     // never gated); story 7-1 grows it to 33 with `channel.manage` — owner +
     // ops_manager (the channels vault: connect/rotate/disconnect/buffers are
     // credential- and margin-touching planner verbs, not floor verbs, and
-    // not accounting).
-    expect([...CAPABILITIES]).toHaveLength(33);
+    // not accounting); story 8-1 grows it to 34 with `invoice.generate` —
+    // owner + ops_manager (pricing a line on a numbered tax document is a
+    // finance act; the accountant reads invoices but does not set prices).
+    expect([...CAPABILITIES]).toHaveLength(34);
+    expect(CAPABILITIES).toContain('invoice.generate');
+    expect(ROLE_CAPABILITIES.owner.has('invoice.generate')).toBe(true);
+    expect(ROLE_CAPABILITIES.ops_manager.has('invoice.generate')).toBe(true);
+    expect(ROLE_CAPABILITIES.operator.has('invoice.generate')).toBe(false);
+    expect(ROLE_CAPABILITIES.accountant.has('invoice.generate')).toBe(false);
     expect(CAPABILITIES).toContain('secure.move');
     expect(secureMoveHolders).toEqual(['owner', 'ops_manager']);
     expect(CAPABILITIES).toContain('adjustments.approve');

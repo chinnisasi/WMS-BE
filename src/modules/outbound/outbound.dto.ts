@@ -28,6 +28,7 @@ import { SHORT_PICK_REASON_CODES } from './pick.command';
 // gate every HTTP caller actually hits. (`order.command` / `pick.command`
 // set the precedent above; `pack.command` imports no DTO, so no cycle.)
 import { MAX_DIMENSION_MM, MAX_SCAN_LINES, MAX_WEIGHT_GRAMS } from './pack.command';
+import { GSTIN_RE, gstinDtoTransform } from '../../shared/primitives/gstin';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 import { MAX_CARRIER_NAME_LENGTH, MAX_TRACKING_NUMBER_LENGTH } from './dispatch.command';
 import { SHIPMENT_STATUSES } from './shipment.command';
@@ -66,6 +67,20 @@ export class OrderLineInputDto {
   @Min(0.001)
   @Max(MAX_QUANTITY_BASE)
   quantity!: number;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'The line\'s selling rate in integer PAISE per this SKU\'s base UoM (story 8-1) — frozen at acceptance and priced from at invoicing. Optional: omit it on an unpriced (channel-ingested) line — the invoice parks awaiting-data until the operator prices it there.',
+    minimum: 0,
+    example: 12500,
+  })
+  @Type(() => Number)
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(Number.MAX_SAFE_INTEGER)
+  ratePaise?: number;
 }
 
 /** POST /tenants/{tenantId}/outbound/orders body (manual entry + ingestion). */
@@ -120,6 +135,18 @@ export class CreateOrderDto {
   @ValidateNested()
   @Type(() => AddressDto)
   destination!: AddressDto;
+
+  @ApiProperty({
+    required: false,
+    format: 'string',
+    description:
+      'The consignee\'s GSTIN (story 8-1), when the buyer is GST-registered. Place of supply resolves from its first two digits; optional — absent falls back to the destination state\'s name.',
+  })
+  @Transform(gstinDtoTransform)
+  @IsOptional()
+  @IsString()
+  @Matches(GSTIN_RE, { message: 'consigneeGstin must be a 15-character GSTIN (two digits, thirteen alphanumeric characters)' })
+  consigneeGstin?: string;
 }
 
 /** POST /tenants/{tenantId}/outbound/orders/{orderId}/cancel body — none. */

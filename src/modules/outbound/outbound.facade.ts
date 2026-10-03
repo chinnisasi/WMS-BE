@@ -5,6 +5,7 @@ import type { Database } from '../../shared/db/db';
 import {
   handlingUnits,
   manifests,
+  orderLines,
   orders,
   picks,
   shipments,
@@ -145,6 +146,44 @@ export interface PackWorkRead {
 }
 
 export const DEFAULT_OUTBOUND_PAGE_SIZE = 50;
+
+// ── invoicing's dispatch-facts read (Story 8-1) ───────────────────────────
+
+/**
+ * One order line's INVOICE FACTS (what `orderInvoiceFactsInTx` hands the
+ * invoicing module): the ordered qty, the DISPATCHED qty re-derived from
+ * `picks` (generation re-derives from persisted facts — never trusts the
+ * event payload), the SKU's GST data as it stood at the read, and the
+ * frozen-acceptance rate (null on an unpriced line — parks `awaiting-data`).
+ * Kit composition rides `parentLineId`; the invoicing generator drops
+ * zero-picked kit parents at its own boundary.
+ */
+export interface OrderInvoiceLineFact {
+  readonly orderLineId: string;
+  readonly parentLineId: string | null;
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly skuName: string;
+  readonly hsn: string | null;
+  readonly gstRateBps: number;
+  readonly uom: string;
+  readonly orderedQtyMilli: number;
+  /** Sum of this line's picks, in milli-units (zero when the line has none — a kit parent). */
+  readonly dispatchedQtyMilli: number;
+  readonly ratePaise: number | null;
+}
+
+/** One order's full invoicing fact set, read in ONE transaction. */
+export interface OrderInvoiceFacts {
+  readonly orderId: string;
+  readonly tenantId: string;
+  readonly warehouseId: string;
+  readonly status: OrderStatus;
+  readonly consigneeGstin: string | null;
+  readonly destination: AddressSnapshot | null;
+  readonly createdAt: string;
+  readonly lines: readonly OrderInvoiceLineFact[];
+}
 
 /**
  * The cap on the snapshot's pack tasks (the `MAX_SNAPSHOT_PICK_TASKS`
@@ -399,6 +438,106 @@ export class OutboundFacade {
    */
   async orderForWriteback(tenantId: string, orderId: string): Promise<OrderSnapshot['order'] | null> {
     return this.getOrder(tenantId, orderId);
+  }
+
+  // (the invoicing facts read's methods follow — story 8-1)
+
+  /**
+   * The dispatch facts invoicing's generator derives an invoice from (story
+   * 8-1): the order header (status, consignee GSTIN, destination address) and
+   * its lines with the SKU join and the per-line picks sum — the "picks
+   * re-derived by the handler" rule, never the event payload's word. In-tx
+   * ONLY (the `getPickTasksInTx` reason verbatim: the generation composes
+   * this read with tenancy party facts and its own writes in ONE tenant
+   * transaction; a pool-opening sibling would reserve a second connection
+   * while the outer one is held). A READ — sku joins are precedented
+   * (`pick.command.ts`); the architecture guard binds WRITES only.
+   *
+   * Unknown or foreign order id is null — the invoicing command maps that to
+   * its 404 arm and the delivery handler ACKs.
+   */
+  async orderInvoiceFactsInTx(tx: TenantTx, tenantId: string, orderId: string): Promise<OrderInvoiceFacts | null> {
+    const rows = await tx
+      .select({
+        id: orders.id,
+        tenantId: orders.tenantId,
+        warehouseId: orders.warehouseId,
+        status: orders.status,
+        consigneeGstin: orders.consigneeGstin,
+        destinationContactName: orders.destinationContactName,
+        destinationPhone: orders.destinationPhone,
+        destinationLine1: orders.destinationLine1,
+        destinationLine2: orders.destinationLine2,
+        destinationCity: orders.destinationCity,
+        destinationState: orders.destinationState,
+        destinationPincode: orders.destinationPincode,
+        createdAt: orders.createdAt,
+      })
+      .from(orders)
+      .where(and(eq(orders.id, orderId), eq(orders.tenantId, tenantId)))
+      .limit(1);
+    const order = rows[0];
+    if (order === undefined) {
+      return null;
+    }
+
+    // Lines + sku join + the picks sum. `::bigint` — an int4 sum overflows
+    // (the pack-read's own lesson); int8 comes back as a string and
+    // `Number(...)` is the boundary coercion. A line with no pick rows sums
+    // to NULL (left join) — a zero-picked kit parent, dropped by the
+    // generator, never a 500. Primary-key columns ride the group by so
+    // Postgres's functional dependency admits the other selected columns.
+    const lines = await tx
+      .select({
+        orderLineId: orderLines.id,
+        parentLineId: orderLines.parentLineId,
+        skuId: orderLines.skuId,
+        skuCode: skus.code,
+        skuName: skus.name,
+        hsn: skus.hsn,
+        gstRateBps: skus.gstRateBps,
+        uom: skus.uom,
+        orderedQtyMilli: orderLines.qty,
+        ratePaise: orderLines.ratePaise,
+        dispatchedQtySum: sql<string | null>`sum(${picks.qty})::bigint`,
+      })
+      .from(orderLines)
+      .innerJoin(skus, and(eq(skus.id, orderLines.skuId), eq(skus.tenantId, orderLines.tenantId)))
+      .leftJoin(picks, and(eq(picks.orderLineId, orderLines.id), eq(picks.tenantId, orderLines.tenantId)))
+      .where(and(eq(orderLines.orderId, orderId), eq(orderLines.tenantId, tenantId)))
+      .groupBy(orderLines.id, skus.id)
+      .orderBy(asc(orderLines.createdAt), asc(orderLines.id));
+
+    return {
+      orderId: order.id,
+      tenantId: order.tenantId,
+      warehouseId: order.warehouseId,
+      status: order.status as OrderStatus,
+      consigneeGstin: order.consigneeGstin,
+      destination: addressFromColumns({
+        contactName: order.destinationContactName,
+        phone: order.destinationPhone,
+        line1: order.destinationLine1,
+        line2: order.destinationLine2,
+        city: order.destinationCity,
+        state: order.destinationState,
+        pincode: order.destinationPincode,
+      }),
+      createdAt: canonicalInstant(order.createdAt),
+      lines: lines.map((line) => ({
+        orderLineId: line.orderLineId,
+        parentLineId: line.parentLineId,
+        skuId: line.skuId,
+        skuCode: line.skuCode,
+        skuName: line.skuName,
+        hsn: line.hsn,
+        gstRateBps: line.gstRateBps,
+        uom: line.uom,
+        orderedQtyMilli: line.orderedQtyMilli,
+        dispatchedQtyMilli: line.dispatchedQtySum === null ? 0 : Number(line.dispatchedQtySum),
+        ratePaise: line.ratePaise,
+      })),
+    };
   }
 
   /**

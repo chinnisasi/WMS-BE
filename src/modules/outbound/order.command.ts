@@ -18,6 +18,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
+import { normalizeGstinInput, GSTIN_RE } from '../../shared/primitives/gstin';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -122,6 +123,17 @@ export interface OrderLineInput {
    * command, not a crossing between two layers.
    */
   readonly quantity: number;
+  /**
+   * Story 8-1 — the line's selling rate in integer paise per the SKU's BASE
+   * unit, OPTIONAL (channel-ingested orders arrive without prices; those
+   * lines park `awaiting-data` at invoicing until the operator prices
+   * them). Validated + normalized behind the replay lookup; stamped onto
+   * `order_lines.rate_paise` at acceptance and NEVER touched again (no edit
+   * command; invoicing's override freezes into the invoice document).
+   * A kit line's rate is inert — the parent drops at zero picks and the
+   * components ride their per-component invoice overrides.
+   */
+  readonly ratePaise?: number | undefined;
 }
 
 export interface CreateOrderCommand {
@@ -141,6 +153,13 @@ export interface CreateOrderCommand {
    * absent address before any write.
    */
   readonly destination?: AddressInput | undefined;
+  /**
+   * Story 8-1 — the consignee's GSTIN when the buyer is GST-registered.
+   * Optional; its first two digits are the place-of-supply code the invoice
+   * resolves (Design Notes: the GSTIN outranks address text). Shape-checked
+   * against `GSTIN_RE` behind the replay lookup; stamped at create only.
+   */
+  readonly consigneeGstin?: string | undefined;
   /** Channel arms — required together when `source: 'ingested'`, else absent. */
   readonly integrationId?: string | undefined;
   readonly externalEventId?: string | undefined;
@@ -186,6 +205,21 @@ export interface OrderLineSnapshot {
   readonly createdAt: string;
 }
 
+/**
+ * A line's client-facing fields with a fixed key order (the idempotency hash is key-order dependent).
+ *
+ * ── story 8-1: `ratePaise` joins the fingerprint ───────────────────────────
+ * Pinned in the spec's Design Notes: a DELIBERATE 11-1-shaped hash break, not
+ * a silent input change — a pre-8-1 key replayed against this build hashes
+ * differently and answers 422 `idempotency-key-reuse` (or
+ * `order-source-conflict` for a channel redelivery) instead of replaying.
+ * `ratePaise` is the line's price at acceptance — invoicing prices from it —
+ * so a payload whose price differs on redelivery is a different command.
+ */
+function lineFingerprint(line: OrderLineInput): Record<string, unknown> {
+  return { skuId: line.skuId, quantity: line.quantity, ratePaise: line.ratePaise };
+}
+
 /** The API response body for an order (the idempotency snapshot). */
 export interface OrderSnapshot {
   readonly order: {
@@ -202,11 +236,6 @@ export interface OrderSnapshot {
     readonly updatedAt: string;
     readonly lines: readonly OrderLineSnapshot[];
   };
-}
-
-/** A line's client-facing fields with a fixed key order (the idempotency hash is key-order dependent). */
-function lineFingerprint(line: OrderLineInput): Record<string, unknown> {
-  return { skuId: line.skuId, quantity: line.quantity };
 }
 
 /**
@@ -292,11 +321,21 @@ export class OrderCommandService {
     // EXPECTED. No compatibility branch exists; there is nothing to be
     // compatible with. (Story 11-1 grew the destination into both hashes —
     // the same break again, pinned the same way.)
+    //
+    // ── story 8-1: `consigneeGstin` joins BOTH hashes ─────────────────────
+    // The spec's Design Notes pin this as a DELIBERATE break (the 11-1
+    // family, never silent): the hash above carries the address only when
+    // normalized; the GSTIN adds the buyer's registration identity invoicing
+    // prices place-of-supply from. Normalized (`normalizeGstinInput` — the
+    // LENIENT hash step) BEFORE hashing, absent = null; the shape refusal
+    // lives in the preflight behind the replay lookup.
+    const consigneeGstin = normalizeGstinInput(command.consigneeGstin);
     const sourcePayloadHash =
       command.source === 'ingested'
         ? hashCommandPayload({
             warehouseId: command.warehouseId,
             destination: addressFingerprint(normalizedDestination) ?? null,
+            consigneeGstin,
             lines: command.lines.map(lineFingerprint),
           })
         : null;
@@ -307,6 +346,7 @@ export class OrderCommandService {
       integrationId,
       externalEventId,
       destination: addressFingerprint(normalizedDestination) ?? null,
+      consigneeGstin,
       lines: command.lines.map(lineFingerprint),
     });
 
@@ -324,6 +364,7 @@ export class OrderCommandService {
         return {
           replayed: replay as OrderSnapshot,
           destination: undefined,
+          consigneeGstin: null,
           lines: [] as OrderLineInput[],
           explosions: new Map(),
         };
@@ -331,6 +372,13 @@ export class OrderCommandService {
 
       // ── input validation (400 before any write) ─────────────────────────
       this.assertLines(command.lines);
+      // Story 8-1: the consignee GSTIN's FULL shape validation, behind the
+      // replay lookup (the lenient normalize already ran above for the hash).
+      if (consigneeGstin !== null && !GSTIN_RE.test(consigneeGstin)) {
+        throw validationFailed(
+          `consigneeGstin must be a 15-character GSTIN (two digits, thirteen alphanumeric characters; got "${consigneeGstin}").`,
+        );
+      }
       // Story 11-1: the destination is validated HERE, behind the replay
       // lookup — the command is the boundary (the Epic 7 adapter path bypasses
       // the DTO's @ValidateNested), and a refusal must never answer 400 to an
@@ -373,6 +421,12 @@ export class OrderCommandService {
           skuId: line.skuId,
           quantity: assertRecordableQuantity(line.quantity, 'quantity', uom, uomPrecision(uom)),
         };
+      });
+      // Story 8-1: the returned lines carry each line's validated rate (or
+      // null) — the ONLY rate shape the grant and write phases below see.
+      const linesWithRates = lines.map((line, index) => {
+        const rate = command.lines[index]?.ratePaise;
+        return rate === undefined ? line : { ...line, ratePaise: this.assertRatePaise(rate) };
       });
 
       // ── story 11.4: the kit explosion plan ───────────────────────────────
@@ -451,10 +505,16 @@ export class OrderCommandService {
             payloadHash,
             snapshot,
           );
-          return { replayed: snapshot, destination: undefined, lines, explosions: new Map() };
+          return {
+            replayed: snapshot,
+            destination: undefined,
+            consigneeGstin: null,
+            lines,
+            explosions: new Map(),
+          };
         }
       }
-      return { replayed: null, destination, lines, explosions };
+      return { replayed: null, destination, consigneeGstin, lines: linesWithRates, explosions };
     });
     if (preflight.replayed !== null) {
       return preflight.replayed;
@@ -465,6 +525,8 @@ export class OrderCommandService {
     // whenever the replay did not hit, because the validation above ran.
     const lines = preflight.lines;
     const destination = preflight.destination!;
+    // (`consigneeGstin` is already in scope — the preflight's normalized,
+    // shape-validated value from the hash stage.)
     // The kit explosion plan the preflight validated (empty on a replay or a
     // dedup hit — those never reach the grant phase).
     const explosions = preflight.explosions;
@@ -587,6 +649,9 @@ export class OrderCommandService {
             destinationCity: destination.city,
             destinationState: destination.state,
             destinationPincode: destination.pincode,
+            // Story 8-1: the buyer's registration identity (optional, absent
+            // = null) — invoicing resolves place of supply from it.
+            consigneeGstin,
           });
         } catch (err) {
           if (isUniqueViolationOn(err, ORDERS_SOURCE_EVENT_UNIQUE)) {
@@ -624,6 +689,10 @@ export class OrderCommandService {
                   reservationId: hold?.id ?? null,
                   status: reservedQty < line.quantity ? 'backordered' : 'open',
                   parentLineId: null,
+                  // Story 8-1: the rate frozen at acceptance (null unpri-
+                  // ced). NEVER touched again — invoicing's override freezes
+                  // into the invoice document instead.
+                  ratePaise: line.ratePaise ?? null,
                 },
               ];
             }
@@ -637,6 +706,10 @@ export class OrderCommandService {
               reservationId: null,
               status: childHolds.has(`${index}:0`) ? 'open' : 'backordered',
               parentLineId: null,
+              // Inert at invoicing (the parent drops at zero picks), stamped
+              // anyway as what acceptance froze — the components ride their
+              // own rates (per-line overrides at invoicing).
+              ratePaise: line.ratePaise ?? null,
             };
             const childRows = bom.map((component, childIndex) => {
               const hold = childHolds.get(`${index}:${childIndex}`);
@@ -651,6 +724,10 @@ export class OrderCommandService {
                 reservationId: hold?.id ?? null,
                 status: reservedQty < component.qty ? 'backordered' : 'open',
                 parentLineId: lineIds[index]!,
+                // Story 8-1: a component's rate is its OWN (null here — the
+                // kit's price is the parent's, never decomposed at explode);
+                // per-component overrides ride the invoicing command's rates.
+                ratePaise: null,
               };
             });
             return [parentRow, ...childRows];
@@ -1269,6 +1346,23 @@ export class OrderCommandService {
   }
 
   /** Line-shape validation (400 before any write). */
+  /**
+   * Story 8-1 — the line rate's shape rule: a non-negative safe integer in
+   * paise (null/absent = unpriced). Behind the replay lookup (its caller's
+   * position); named because ONE rate rule serves manual and ingested calls
+   * alike. No upper ceiling on the WIRE beyond the safe-integer range — the
+   * invoice math asserts its own exact-range outputs in `arith.ts`, so an
+   * absurd rate is a loud typed failure at generation, never a silent round.
+   */
+  private assertRatePaise(rate: number): number {
+    if (!Number.isSafeInteger(rate) || rate < 0) {
+      throw validationFailed(
+        `ratePaise must be a non-negative integer in paise (got ${String(rate)}).`,
+      );
+    }
+    return rate;
+  }
+
   private assertLines(lines: readonly OrderLineInput[]): void {
     if (lines.length === 0) {
       throw validationFailed('An order carries at least one line.');

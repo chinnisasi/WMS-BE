@@ -9,7 +9,8 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
 import { assertPermission } from './permissions';
-import { getMemberRoleIn } from './tenancy.service';
+import { getMemberRoleIn, normalizeGstin } from './tenancy.service';
+import { normalizeGstinInput } from '../../shared/primitives/gstin';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -30,6 +31,12 @@ export interface CreateWarehouseCommand {
    * only — no update endpoint exists (story 4-6d owns that decision).
    */
   readonly origin?: AddressInput | undefined;
+  /**
+   * Story 8-1 — the warehouse's GSTIN (the invoicing supplier identity,
+   * preferred over the tenant default). Optional; set at create only like
+   * the origin itself. Shape-validated behind the replay lookup.
+   */
+  readonly gstin?: string | undefined;
 }
 
 /** The API response body for a warehouse (the idempotency snapshot). */
@@ -41,6 +48,8 @@ export interface WarehouseSnapshot {
     readonly name: string;
     /** The origin address (story 11-1); null on a pre-11.1 warehouse row. */
     readonly origin: AddressSnapshot | null;
+    /** Story 8-1 — the warehouse GSTIN (null when none was given). */
+    readonly gstin: string | null;
     readonly createdAt: string;
   };
 }
@@ -75,11 +84,18 @@ export class WarehouseCommand {
     // in test/shipment-addresses.spec.ts). Normalized before hashing —
     // deterministic, DB-independent.
     const normalizedOrigin = addressFingerprint(normalizeAddressInput(command.origin));
+    // Story 8-1: the GSTIN joins the payload hash as the normalized form (or
+    // null) — presence and absence hash differently (the 11-1 origin break's
+    // family: a pre-8-1 key replayed with a GSTIN added answers 422). The
+    // LENIENT normalize (never throws); the shape validation runs inside the
+    // transaction, behind the replay lookup, like the origin address's.
+    const gstin = normalizeGstinInput(command.gstin);
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       code: command.code,
       name: command.name,
       origin: normalizedOrigin ?? null,
+      gstin,
     });
 
     const { snapshot } = await withTenantTransaction(
@@ -117,6 +133,10 @@ export class WarehouseCommand {
         // Story 11-1: the origin's shape rules run HERE, behind the replay
         // lookup — required at create, atomic, pincode six digits as text.
         const origin = assertAddress(command.origin, 'origin');
+        // Story 8-1: the FULL shape validation, behind the replay lookup
+        // (non-HTTP callers skip the DTO's @Matches — the command is the
+        // boundary).
+        const warehouseGstin = normalizeGstin(command.gstin);
         try {
           const rows = await tx
             .insert(warehouses)
@@ -132,6 +152,7 @@ export class WarehouseCommand {
               originCity: origin.city,
               originState: origin.state,
               originPincode: origin.pincode,
+              gstin: warehouseGstin,
             })
             .returning();
           const row = rows[0]!;
@@ -149,6 +170,7 @@ export class WarehouseCommand {
               state: row.originState,
               pincode: row.originPincode,
             }),
+            gstin: row.gstin,
             createdAt: row.createdAt,
           };
         } catch (err) {

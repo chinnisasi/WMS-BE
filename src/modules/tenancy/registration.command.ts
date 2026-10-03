@@ -12,6 +12,8 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { hashPassword } from './passwords';
 import { hashCommandPayload } from './idempotency-guard';
 import { setTenantScope } from '../../shared/db/tenant-scope';
+import { normalizeGstin } from './tenancy.service';
+import { normalizeGstinInput } from '../../shared/primitives/gstin';
 import { ensureSelfClientInTx } from '../clients/ensure-self-client';
 
 /** Registration command input (AD-10: state changes enter command services). */
@@ -19,11 +21,20 @@ export interface RegisterTenantCommand {
   readonly name: string;
   readonly ownerEmail: string;
   readonly password: string;
+  /**
+   * Story 8-1 — the tenant's GSTIN, optional (a tenant may register before
+   * it has one; it is the invoicing DEFAULT the warehouse GSTIN overrides).
+   * Normalized trim + uppercase; joins the payload hash as `gstin ?? null`
+   * so presence and absence hash differently (a deliberate 8-1 break, the
+   * 11-1-origin precedent). The settings-edit route is deferred — 8-1
+   * stamps GSTINs at registration and warehouse-create only.
+   */
+  readonly gstin?: string | undefined;
 }
 
 /** The API response body — never carries the password hash. */
 export interface TenantRegistrationSnapshot {
-  readonly tenant: { readonly id: string; readonly name: string };
+  readonly tenant: { readonly id: string; readonly name: string; readonly gstin: string | null };
   readonly owner: { readonly id: string; readonly email: string };
 }
 
@@ -64,11 +75,19 @@ export class RegistrationCommand {
     idempotencyKey: string,
   ): Promise<TenantRegistrationSnapshot> {
     const email = command.ownerEmail.trim().toLowerCase();
+    // Story 8-1: the GSTIN normalizes LENIENTLY for the fingerprint
+    // (`normalizeGstinInput` — trim + uppercase, never throws) and joins it
+    // as `gstin ?? null` — presence and absence hash differently, so a key
+    // replayed with a GSTIN added answers 422 (the 11-1 origin-precedent hash
+    // break). The shape check (`normalizeGstin`) runs behind the replay
+    // lookup, as every other input's does.
+    const gstin = normalizeGstinInput(command.gstin);
     // Cheap fingerprint first, replay lookup second, scrypt hash LAST — a
     // replay must not pay the ~100 ms hashing cost just to discard it.
     const payloadHash = hashCommandPayload({
       name: command.name,
       ownerEmail: email,
+      gstin,
     });
 
     // Auth-time replay lookup (no tenant context yet) — BYPASSRLS connection.
@@ -84,6 +103,7 @@ export class RegistrationCommand {
       return existing[0].responseSnapshot as TenantRegistrationSnapshot;
     }
 
+    normalizeGstin(gstin);
     const passwordHash = await hashPassword(command.password);
 
     const snapshot = await this.db.transaction(async (tx) => {
@@ -92,7 +112,7 @@ export class RegistrationCommand {
 
       const tenantRows = await tx
         .insert(tenants)
-        .values({ id: tenantId, tenantId, name: command.name })
+        .values({ id: tenantId, tenantId, name: command.name, gstin })
         .returning();
       const tenant = tenantRows[0]!;
 
@@ -124,7 +144,7 @@ export class RegistrationCommand {
       }
 
       const body: TenantRegistrationSnapshot = {
-        tenant: { id: tenant.id, name: tenant.name },
+        tenant: { id: tenant.id, name: tenant.name, gstin: tenant.gstin },
         owner,
       };
       // In-transaction outbox append (AD-7, story outbox-relay) — replaces

@@ -118,7 +118,7 @@ export class TenancyController {
   ): Promise<TenantRegistrationResponse> {
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const snapshot = await this.registrationCommand.register(
-      { name: dto.name, ownerEmail: dto.ownerEmail, password: dto.password },
+      { name: dto.name, ownerEmail: dto.ownerEmail, password: dto.password, gstin: dto.gstin },
       key,
     );
     return { tenant: { ...snapshot.tenant }, owner: { ...snapshot.owner } };
@@ -158,7 +158,14 @@ export class TenancyController {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const snapshot = await this.warehouseCommand.create(
-      { tenantId, actorUserId: session.userId, code: dto.code, name: dto.name, origin: dto.origin },
+      {
+        tenantId,
+        actorUserId: session.userId,
+        code: dto.code,
+        name: dto.name,
+        origin: dto.origin,
+        gstin: dto.gstin,
+      },
       key,
     );
     // Story 11-1: the origin crosses the snapshot→wire edge (line2 null → absent).

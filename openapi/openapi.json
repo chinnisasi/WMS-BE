@@ -14347,6 +14347,300 @@
         ]
       }
     },
+    "/tenants/{tenantId}/invoices": {
+      "post": {
+        "description": "Creates the invoice when the dispatch event has not yet (or never — pre-8-1 dispatches have no backfill) produced one; otherwise recomputes it. An invoice issues (and takes its FY-series number, once) when every dispatched line is priced, the place of supply resolves and a supplier GSTIN exists (warehouse, else tenant); otherwise it stays 'awaiting-data' with its gaps listed in the document. Content-identical regeneration leaves the revision unchanged. Overrides never write order_lines.rate_paise. A concurrent generation (the event delivery racing this call) settles to one invoice — on losing the insert this call retries once over the winner's row, so its rates still apply.",
+        "operationId": "InvoicingController_generateInvoice",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerateInvoiceDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The order's invoice as it stands after generation (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvoiceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid body, a negative or non-integer ratePaise, or a duplicate orderLineId in rates (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks invoice.generate (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No order with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The order is not dispatched (order-not-dispatched), a rate override names a line that is not of this order (line-not-of-order) or a line already priced at order acceptance (line-already-priced), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Generates or regenerates a dispatched order's ONE invoice (invoice.generate) — re-derived from the persisted dispatch facts, with optional per-line rate overrides frozen into the document",
+        "tags": [
+          "invoicing"
+        ]
+      },
+      "get": {
+        "operationId": "InvoicingController_listInvoices",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The invoice page (newest first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvoiceListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor or out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's invoices (keyset cursor pagination, newest first — header rows, no lines or document; open to any member)",
+        "tags": [
+          "invoicing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/invoices/{invoiceId}": {
+      "get": {
+        "operationId": "InvoicingController_getInvoice",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The invoice detail",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvoiceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed invoiceId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No invoice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Reads one invoice: the row, its priced lines and the document snapshot the printable invoice renders (open to any member)",
+        "tags": [
+          "invoicing"
+        ]
+      }
+    },
     "/tenants/{tenantId}/webhooks/channels/{provider}/{connectionId}/orders": {
       "post": {
         "operationId": "WebhooksController_ingestOrder",
@@ -14687,6 +14981,11 @@
             "example": "correct-horse-battery",
             "minLength": 8,
             "maxLength": 200
+          },
+          "gstin": {
+            "type": "string",
+            "example": "27PQAPQ3345K1ZV",
+            "description": "The tenant GSTIN, optional (story 8-1) — the invoicing default the warehouse GSTIN overrides. The settings-edit route is deferred (stamped at registration only)."
           }
         },
         "required": [
@@ -14706,11 +15005,17 @@
           "name": {
             "type": "string",
             "example": "Priya Spices Pvt Ltd"
+          },
+          "gstin": {
+            "type": "string",
+            "description": "The tenant GSTIN (8-1); null when none registered.",
+            "nullable": true
           }
         },
         "required": [
           "id",
-          "name"
+          "name",
+          "gstin"
         ]
       },
       "OwnerUserResponse": {
@@ -14909,6 +15214,11 @@
                 "$ref": "#/components/schemas/AddressDto"
               }
             ]
+          },
+          "gstin": {
+            "type": "string",
+            "example": "29PQAPQ3345K1ZV",
+            "description": "The warehouse GSTIN, optional (story 8-1) — the invoicing supplier identity for dispatches leaving this warehouse, preferred over the tenant default."
           }
         },
         "required": [
@@ -14948,6 +15258,11 @@
               }
             ]
           },
+          "gstin": {
+            "type": "string",
+            "description": "The warehouse GSTIN (8-1); null when none was given",
+            "nullable": true
+          },
           "createdAt": {
             "type": "string",
             "example": "2026-09-08T00:00:00.000Z"
@@ -14959,6 +15274,7 @@
           "code",
           "name",
           "origin",
+          "gstin",
           "createdAt"
         ]
       },
@@ -18561,6 +18877,12 @@
             "minimum": 0.001,
             "maximum": 9007199254740,
             "example": 10
+          },
+          "ratePaise": {
+            "type": "number",
+            "description": "The line's selling rate in integer PAISE per this SKU's base UoM (story 8-1) — frozen at acceptance and priced from at invoicing. Optional: omit it on an unpriced (channel-ingested) line — the invoice parks awaiting-data until the operator prices it there.",
+            "minimum": 0,
+            "example": 12500
           }
         },
         "required": [
@@ -18610,6 +18932,11 @@
                 "$ref": "#/components/schemas/AddressDto"
               }
             ]
+          },
+          "consigneeGstin": {
+            "type": "string",
+            "format": "string",
+            "description": "The consignee's GSTIN (story 8-1), when the buyer is GST-registered. Place of supply resolves from its first two digits; optional — absent falls back to the destination state's name."
           }
         },
         "required": [
@@ -24457,6 +24784,376 @@
             "items": {
               "$ref": "#/components/schemas/ChannelConnectionListEntryDto"
             }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "InvoiceRateInputDto": {
+        "type": "object",
+        "properties": {
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The order line being priced (must be a line of this order)"
+          },
+          "ratePaise": {
+            "type": "number",
+            "description": "The line's rate in integer PAISE per the SKU's base UoM — frozen into the invoice document (rateSource 'manual'); order_lines.rate_paise is never written",
+            "minimum": 0,
+            "example": 12500
+          }
+        },
+        "required": [
+          "orderLineId",
+          "ratePaise"
+        ]
+      },
+      "GenerateInvoiceDto": {
+        "type": "object",
+        "properties": {
+          "orderId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The dispatched order to invoice (one invoice per order)"
+          },
+          "rates": {
+            "description": "Per-line rate overrides for UNPRICED lines only — a line priced at order acceptance keeps that frozen rate (an override naming it is refused 409 line-already-priced). Omit for a plain regenerate — manual rates already carried by the invoice hold.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InvoiceRateInputDto"
+            }
+          }
+        },
+        "required": [
+          "orderId"
+        ]
+      },
+      "InvoiceLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string",
+            "description": "SKU code snapshot at generation"
+          },
+          "skuName": {
+            "type": "string",
+            "description": "SKU name snapshot at generation"
+          },
+          "hsn": {
+            "type": "string",
+            "nullable": true,
+            "description": "HSN snapshot; null is the hsn-gap warning"
+          },
+          "qtyMilli": {
+            "type": "number",
+            "description": "Dispatched quantity in milli-units of the base UoM (re-derived from picks)"
+          },
+          "ratePaise": {
+            "type": "number",
+            "description": "Rate in paise per base unit"
+          },
+          "rateSource": {
+            "type": "string",
+            "enum": [
+              "order_line",
+              "manual"
+            ],
+            "description": "'order_line' = frozen at order acceptance; 'manual' = operator override"
+          },
+          "taxablePaise": {
+            "type": "number",
+            "description": "Taxable value, paise (half-up at the line boundary)"
+          },
+          "gstBps": {
+            "type": "number",
+            "description": "GST rate in basis points (1800 = 18%)"
+          },
+          "cgstPaise": {
+            "type": "number",
+            "description": "CGST, paise (intra-state only)"
+          },
+          "sgstPaise": {
+            "type": "number",
+            "description": "SGST/UTGST, paise (intra-state only; carries the odd remainder paise)"
+          },
+          "igstPaise": {
+            "type": "number",
+            "description": "IGST, paise (inter-state only)"
+          },
+          "hsnGap": {
+            "type": "boolean"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          }
+        },
+        "required": [
+          "id",
+          "orderLineId",
+          "skuCode",
+          "skuName",
+          "hsn",
+          "qtyMilli",
+          "ratePaise",
+          "rateSource",
+          "taxablePaise",
+          "gstBps",
+          "cgstPaise",
+          "sgstPaise",
+          "igstPaise",
+          "hsnGap",
+          "createdAt"
+        ]
+      },
+      "InvoiceDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "fyLabel": {
+            "type": "string",
+            "nullable": true
+          },
+          "seriesSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "Position in the tenant FY series; null until first issued"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "awaiting-data",
+              "issued",
+              "voided"
+            ]
+          },
+          "originGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "Supplier GSTIN snapshot (warehouse, else tenant)"
+          },
+          "consigneeGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "Consignee GSTIN snapshot; null for B2C"
+          },
+          "placeOfSupply": {
+            "type": "string",
+            "nullable": true
+          },
+          "supplyType": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "intra",
+              "inter"
+            ]
+          },
+          "subtotalPaise": {
+            "type": "number"
+          },
+          "gstPaise": {
+            "type": "number"
+          },
+          "totalPaise": {
+            "type": "number"
+          },
+          "revision": {
+            "type": "number"
+          },
+          "document": {
+            "type": "object",
+            "description": "The pinned, client-agnostic document snapshot: { header, seller, buyer, lines, totals, gaps, revision } — what the printable invoice renders"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InvoiceLineDto"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "orderId",
+          "warehouseId",
+          "invoiceNo",
+          "fyLabel",
+          "seriesSeq",
+          "status",
+          "originGstin",
+          "consigneeGstin",
+          "placeOfSupply",
+          "supplyType",
+          "subtotalPaise",
+          "gstPaise",
+          "totalPaise",
+          "revision",
+          "document",
+          "lines",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "InvoiceResponse": {
+        "type": "object",
+        "properties": {
+          "invoice": {
+            "$ref": "#/components/schemas/InvoiceDto"
+          }
+        },
+        "required": [
+          "invoice"
+        ]
+      },
+      "InvoiceEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "FY-series number; null until first issued"
+          },
+          "fyLabel": {
+            "type": "string",
+            "nullable": true,
+            "description": "e.g. 'FY-2627'; null until first issued"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "awaiting-data",
+              "issued",
+              "voided"
+            ]
+          },
+          "supplyType": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "intra",
+              "inter"
+            ],
+            "description": "null while place of supply is unresolved"
+          },
+          "placeOfSupply": {
+            "type": "string",
+            "nullable": true,
+            "description": "Two-digit GST state code; null while unresolved"
+          },
+          "subtotalPaise": {
+            "type": "number",
+            "description": "Sum of line taxable values, paise"
+          },
+          "gstPaise": {
+            "type": "number",
+            "description": "Sum of line CGST+SGST+IGST, paise"
+          },
+          "totalPaise": {
+            "type": "number",
+            "description": "subtotal + gst, paise (exact; no rupee rounding)"
+          },
+          "revision": {
+            "type": "number",
+            "description": "Bumps only when a regenerate changes the content"
+          },
+          "gapKinds": {
+            "type": "array",
+            "description": "Distinct gap kinds in the document (blocking and warning)",
+            "items": {
+              "type": "string",
+              "enum": [
+                "unpriced-line",
+                "place-of-supply",
+                "supplier-gstin",
+                "hsn-gap",
+                "pos-discrepancy"
+              ]
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "Row creation time (the keyset cursor field), ISO-8601 UTC"
+          }
+        },
+        "required": [
+          "id",
+          "orderId",
+          "warehouseId",
+          "invoiceNo",
+          "fyLabel",
+          "status",
+          "supplyType",
+          "placeOfSupply",
+          "subtotalPaise",
+          "gstPaise",
+          "totalPaise",
+          "revision",
+          "gapKinds",
+          "createdAt"
+        ]
+      },
+      "InvoiceListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InvoiceEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
           }
         },
         "required": [

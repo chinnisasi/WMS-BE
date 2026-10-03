@@ -11,6 +11,7 @@ import { CarriersController } from './carriers.controller';
 import { ChannelsController } from './channels.controller';
 import { WebhooksController } from './webhooks.controller';
 import { ComplianceController } from './compliance.controller';
+import { InvoicingController } from './invoicing.controller';
 import { MovementsController } from './movements.controller';
 import { OpenApiController } from './openapi.controller';
 import { NotFoundController } from './not-found.controller';
@@ -18,6 +19,7 @@ import { OpenApiDocumentHolder } from './openapi-document.holder';
 import { InventoryModule } from '../modules/inventory/inventory.module';
 import { InboundModule } from '../modules/inbound/inbound.module';
 import { ComplianceModule } from '../modules/compliance/compliance.module';
+import { InvoicingModule } from '../modules/invoicing/invoicing.module';
 import { OutboundModule } from '../modules/outbound/outbound.module';
 import { PutawayModule } from '../modules/putaway/putaway.module';
 import { CarriersModule } from '../modules/carriers/carriers.module';
@@ -63,7 +65,7 @@ import { ReplenishmentController } from './replenishment.controller';
  * response DTO, so the shell has nothing to redact.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, MovementsModule, ReplenishmentModule, ChannelsModule],
+  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule],
   controllers: [
     HealthController,
     EchoController,
@@ -92,6 +94,11 @@ import { ReplenishmentController } from './replenishment.controller';
     // imported by the root; every mutation goes through
     // `ChannelsCommandService` / `ChannelsFacade`.
     ChannelsController,
+    // Story 8-1 — the invoicing surface (invoice list/detail + the manual
+    // generate/regenerate) rides the same shape: `InvoicingModule` is a
+    // spine-singleton already imported by the root; the mutation goes
+    // through `InvoicingCommand`, the reads through `InvoicingFacade`.
+    InvoicingController,
     // Story 7-2 — the channel webhook surface (guardless by construction:
     // the provider's AUTHORITY is its signature, not a session). The
     // last-siblings convention keeps NotFoundController LAST (registered

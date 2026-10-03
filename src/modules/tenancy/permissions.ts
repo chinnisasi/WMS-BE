@@ -185,6 +185,16 @@ export const CAPABILITIES = [
   // never gated (the rule at the top of this file). Mirrored into wms-fe
   // `src/lib/users.ts`.
   'replenishment.manage',
+  // Story 8-1 — the invoicing module's manual generate/regenerate command
+  // (price an unpriced line, refresh an invoice from the dispatch facts).
+  // Owner + Ops Manager only, mirroring `replenishment.manage`'s planner
+  // set: invoicing is a FINANCE-side act (a tax document with a legal
+  // number), not a floor verb and not a counting verb — the Accountant's
+  // surface reads invoices but the RATE OVERRIDE that decides what a buyer
+  // is charged stays with the owner/manager pair. Operator absent (floor
+  // staff record dispatches; dispatch auto-generates nothing they can
+  // change). Mirrored into wms-fe `src/lib/users.ts` by the 8-1 FE story.
+  'invoice.generate',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -251,6 +261,10 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // reorder-policy writes, breach dismissal, and suggested-PO submit — the
     // planning set, the stock-intelligence surface's operator.
     'replenishment.manage',
+    // Story 8-1 — the invoicing verbs (owner holds everything): the manual
+    // generate/regenerate with per-line rate overrides. Mirror of
+    // `replenishment.manage`'s planner-set rationale in CAPABILITIES above.
+    'invoice.generate',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
