@@ -17,6 +17,7 @@ import {
 // `bin.command` from a DTO would pull its whole module graph in at load time.
 import { MAX_BIN_DIMENSION_MM, MAX_BIN_WEIGHT_GRAMS } from './bin-capacity';
 import { ADDRESS_FIELD_LENGTHS, PINCODE_RE } from '../../shared/primitives/address';
+import { GSTIN_RE, gstinDtoTransform } from '../../shared/primitives/gstin';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { Transform, Type } from 'class-transformer';
 import {
@@ -61,6 +62,18 @@ export class RegisterTenantDto {
   @IsString()
   @Length(8, 200)
   password!: string;
+
+  @ApiProperty({
+    example: '27PQAPQ3345K1ZV',
+    description:
+      'The tenant GSTIN, optional (story 8-1) — the invoicing default the warehouse GSTIN overrides. The settings-edit route is deferred (stamped at registration only).',
+    required: false,
+  })
+  @Transform(gstinDtoTransform)
+  @IsOptional()
+  @IsString()
+  @Matches(GSTIN_RE, { message: 'gstin must be a 15-character GSTIN (two digits, thirteen alphanumeric characters)' })
+  gstin?: string;
 }
 
 export class SignInDto {
@@ -183,6 +196,18 @@ export class CreateWarehouseDto {
   @ValidateNested()
   @Type(() => AddressDto)
   origin!: AddressDto;
+
+  @ApiProperty({
+    example: '29PQAPQ3345K1ZV',
+    description:
+      'The warehouse GSTIN, optional (story 8-1) — the invoicing supplier identity for dispatches leaving this warehouse, preferred over the tenant default.',
+    required: false,
+  })
+  @Transform(gstinDtoTransform)
+  @IsOptional()
+  @IsString()
+  @Matches(GSTIN_RE, { message: 'gstin must be a 15-character GSTIN (two digits, thirteen alphanumeric characters)' })
+  gstin?: string;
 }
 
 export class TenantResponse {
@@ -191,6 +216,9 @@ export class TenantResponse {
 
   @ApiProperty({ example: 'Priya Spices Pvt Ltd' })
   name!: string;
+
+  @ApiProperty({ type: String, description: 'The tenant GSTIN (8-1); null when none registered.', nullable: true })
+  gstin!: string | null;
 }
 
 export class OwnerUserResponse {
@@ -326,6 +354,9 @@ export class WarehouseResponse {
     description: 'The origin address (story 11-1); null on a pre-11.1 warehouse row',
   })
   origin!: AddressDto | null;
+
+  @ApiProperty({ type: String, description: 'The warehouse GSTIN (8-1); null when none was given', nullable: true })
+  gstin!: string | null;
 
   @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
   createdAt!: string;

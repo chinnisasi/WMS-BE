@@ -661,8 +661,10 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // rejected_ops; 0048 (story 6-1) added three more — reorder_policies,
       // reorder_breaches and suggested_pos; 0049 (story 6-2) added two more —
       // batch_alerts and expiry_alert_policies; 0050 (story 7-1) added three
-      // more — integrations, channel_mappings and integration_calls. None lost.
-      expect(policies).toHaveLength(64);
+      // more — integrations, channel_mappings and integration_calls; 0053
+      // (story 8-1) added three more — invoices, invoice_lines and
+      // invoice_series. None lost.
+      expect(policies).toHaveLength(67);
 
       for (const expected of CLIENT_POLICIES) {
         const found = policies.find(

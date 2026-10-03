@@ -108,12 +108,20 @@ export class OutboundController {
         // behind its replay lookup, where each line's SKU (and therefore its
         // declared precision) is already read — a precision refusal in front
         // of that lookup would answer 400 to an op that already committed.
-        lines: dto.lines.map((line) => ({ skuId: line.skuId, quantity: line.quantity })),
         // Story 11-1: the destination is forwarded VERBATIM — the command
         // owns the atomic required-together rule and the pincode shape behind
         // its replay lookup (the adapter path bypasses this DTO), so
         // stripping or normalizing here would silently diverge from it.
         destination: dto.destination,
+        // Story 8-1: the buyer's GSTIN and the per-line rates are forwarded
+        // VERBATIM (present or not) — the command owns the shape rules behind
+        // its replay lookup and freezes them at acceptance.
+        ...(dto.consigneeGstin !== undefined ? { consigneeGstin: dto.consigneeGstin } : {}),
+        lines: dto.lines.map((line) => ({
+          skuId: line.skuId,
+          quantity: line.quantity,
+          ...(line.ratePaise !== undefined ? { ratePaise: line.ratePaise } : {}),
+        })),
         // The channel arms are forwarded VERBATIM (present or not): the
         // command owns the required-together rule and 400s a manual order
         // that carries them — stripping them here would silently accept it.

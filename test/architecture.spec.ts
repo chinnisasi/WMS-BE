@@ -1329,3 +1329,51 @@ describe('architecture: channel ingest + writeback ride the frozen seams (story 
     expect(registry).toContain("topicHeader: 'X-Shopify-Topic'");
   });
 });
+
+describe('architecture: invoices are invoicing-module-owned (story 8-1)', () => {
+  /**
+   * Story 8-1's invoice records are module-exclusive to `invoicing/` (the
+   * spec's Always-rule): siblings read them through `InvoicingFacade`, and
+   * the rate/GSTIN columns invoicing consumes are written only by their
+   * owning modules — invoicing never writes an outbound or tenancy table
+   * (the rate override freezes into the invoice document, never into
+   * `order_lines`).
+   */
+  const INVOICING_TABLES = ['invoices', 'invoiceLines', 'invoiceSeries'] as const;
+  const RAW_INVOICING_TABLES = 'invoices|invoice_lines|invoice_series';
+  const invoicingRoot = join(SRC_ROOT, 'modules', 'invoicing');
+
+  it('no invoice-table write happens outside the invoicing module', () => {
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => !f.path.startsWith(invoicingRoot))) {
+      for (const pattern of [
+        ...INVOICING_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_INVOICING_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) {
+          offenders.push(`${file.path}: /${pattern.source}/`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the invoicing module writes no outbound or tenancy table (the frozen rate stays frozen)', () => {
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => f.path.startsWith(invoicingRoot))) {
+      for (const table of ['orders', 'orderLines', 'picks', 'tenants', 'warehouses', 'skus', 'gstStateCodes'] as const) {
+        if (drizzleWriteOn(table).test(file.source)) {
+          offenders.push(`${file.path}: writes ${table}`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the invoicing generator itself writes its tables (the test is meaningful)', () => {
+    const generator = readFileSync(join(invoicingRoot, 'generator.ts'), 'utf8');
+    for (const table of INVOICING_TABLES) {
+      expect(drizzleWriteOn(table).test(generator)).toBe(true);
+    }
+  });
+});

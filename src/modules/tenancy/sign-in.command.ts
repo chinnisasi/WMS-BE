@@ -48,7 +48,7 @@ export class SignInCommand {
     accessToken: string;
     tokenType: 'Bearer';
     expiresInSeconds: number;
-    tenant: { id: string; name: string };
+    tenant: { id: string; name: string; gstin: string | null };
     user: SignInUser;
   }> {
     const email = command.email.trim().toLowerCase();
@@ -85,7 +85,7 @@ export class SignInCommand {
       );
     }
     const tenantRows = await this.authDb
-      .select({ id: tenants.id, name: tenants.name })
+      .select({ id: tenants.id, name: tenants.name, gstin: tenants.gstin })
       .from(tenants)
       .where(eq(tenants.id, user.tenantId))
       .limit(1);
@@ -95,7 +95,7 @@ export class SignInCommand {
       accessToken: signTenantSession(user.tenantId, user.id, tenantSessionSecret()),
       tokenType: 'Bearer',
       expiresInSeconds: SESSION_TTL_SECONDS,
-      tenant: { id: tenant.id, name: tenant.name },
+      tenant: { id: tenant.id, name: tenant.name, gstin: tenant.gstin },
       user: {
         id: user.id,
         email: user.email,

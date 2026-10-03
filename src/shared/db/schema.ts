@@ -45,6 +45,15 @@ export const tenants = pgTable('tenants', {
     .$defaultFn(() => uuidv7()),
   tenantId: uuid('tenant_id').notNull(),
   name: text('name').notNull(),
+  /**
+   * Story 8-1 — the tenant's GSTIN, the DEFAULT supplier identity invoicing
+   * falls back to when a warehouse carries none of its own. Nullable: a
+   * tenant may register before it has one, and an invoice whose supplier
+   * GSTIN cannot resolve parks `awaiting-data` with a gap (never issues).
+   * Stamped at registration only — the settings-edit route is deferred
+   * (PENDING, 8-1). Normalized to uppercase at the write edge.
+   */
+  gstin: text('gstin'),
   ...tenantTimestamps,
 });
 
@@ -207,6 +216,13 @@ export const warehouses = pgTable(
     originCity: text('origin_city'),
     originState: text('origin_state'),
     originPincode: text('origin_pincode'),
+    /**
+     * Story 8-1 — the warehouse's GSTIN, the supplier identity invoicing
+     * prefers over the tenant default (the dispatch's origin party).
+     * Nullable (pre-8-1 rows and tenants without one); uppercase-normalized
+     * at the write edge. Set at create only, like the origin address itself.
+     */
+    gstin: text('gstin'),
     ...tenantTimestamps,
   },
   (table) => [uniqueIndex('warehouses_tenant_id_code_unique').on(table.tenantId, table.code)],
@@ -1887,6 +1903,13 @@ export const orders = pgTable(
     destinationCity: text('destination_city'),
     destinationState: text('destination_state'),
     destinationPincode: text('destination_pincode'),
+    /**
+     * Story 8-1 — the consignee's GSTIN when the buyer is registered
+     * (optional; channel/manual orders may carry none). Written by the
+     * create command ONLY (no edit command); its first two digits are the
+     * place-of-supply code invoicing resolves. Uppercase-normalized.
+     */
+    consigneeGstin: text('consignee_gstin'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -1948,6 +1971,15 @@ export const orderLines = pgTable(
      */
     parentLineId: uuid('parent_line_id'),
     status: text('status').notNull().default('open'),
+    /**
+     * Story 8-1 — the line's selling rate in integer paise per BASE unit,
+     * frozen at order acceptance. Nullable: channel-ingested orders arrive
+     * without prices (they park `awaiting-data` at invoicing). Written by
+     * the create command ONLY — there is no edit command, and invoicing's
+     * override path freezes overrides into the invoice document, never
+     * touching this column post-dispatch (Design Notes: rate freeze).
+     */
+    ratePaise: bigint('rate_paise', { mode: 'number' }),
     ...tenantTimestamps,
   },
   (table) => [
@@ -3700,3 +3732,141 @@ export interface ChannelBufferBucket {
   readonly skuId: string;
   readonly bufferMilli: number;
 }
+
+/**
+ * Invoice core (Story 8-1 — `src/modules/invoicing/`): ONE invoice per
+ * (`tenant_id`, `order_id`), derived from persisted dispatch facts over the
+ * outbox `order.dispatched` event (plus the manual generate/regenerate
+ * command). The module-exclusive writer is the invoicing module; sibling
+ * modules read through its facade. Rows start `awaiting-data` (unpriced
+ * lines, unresolvable place of supply) and flip `issued` with an FY-stamped
+ * number; `voided` exists in the vocabulary only — the void command is
+ * deferred (PENDING).
+ *
+ * `invoice_no` carries a partial unique (one number per tenant) because
+ * `awaiting-data` rows are unnumbered. `origin_gstin`/`consignee_gstin`/
+ * `place_of_supply` are SNAPSHOT columns — the parties as they stood at
+ * issuance, never re-joined on reads. Money columns are integer paise; the
+ * `subtotal + gst = total` CHECK lives in the migration SQL (hand-appended,
+ * repo convention). RLS policy also lives only in the migration SQL.
+ */
+export const invoices = pgTable(
+  'invoices',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    /** The FY-stamped number, null until first issuance. */
+    invoiceNo: text('invoice_no'),
+    fyLabel: text('fy_label'),
+    seriesSeq: bigint('series_seq', { mode: 'number' }),
+    status: text('status').notNull().default('awaiting-data'),
+    /** Party snapshots — as they stood at issuance (null while awaiting). */
+    originGstin: text('origin_gstin'),
+    consigneeGstin: text('consignee_gstin'),
+    /** The two-digit state code (or the '99' Other Country arm). */
+    placeOfSupply: text('place_of_supply'),
+    supplyType: text('supply_type'),
+    subtotalPaise: bigint('subtotal_paise', { mode: 'number' }).notNull().default(0),
+    gstPaise: bigint('gst_paise', { mode: 'number' }).notNull().default(0),
+    totalPaise: bigint('total_paise', { mode: 'number' }).notNull().default(0),
+    /** Bumped only when a regenerate changes the document content. */
+    revision: integer('revision').notNull().default(1),
+    /** The pinned client-agnostic document snapshot (Design Notes shape). */
+    document: jsonb('document').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The ONE invoice per dispatched order — the concurrent-race guarantee.
+    uniqueIndex('invoices_tenant_order_unique').on(table.tenantId, table.orderId),
+    // The FY number is unique per tenant once stamped.
+    uniqueIndex('invoices_tenant_invoice_no_unique')
+      .on(table.tenantId, table.invoiceNo)
+      .where(sql`invoice_no is not null`),
+    // The list read's keyset cursor.
+    index('invoices_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+  ],
+);
+
+export type Invoice = typeof invoices.$inferSelect;
+
+/**
+ * The priced lines of one invoice. Unpriced lines are NOT rows here — they
+ * live only in the document's `gaps` list (a line that has no rate has no
+ * tax math to store). `rate_source` says where the rate came from:
+ * `order_line` (the frozen `order_lines.rate_paise`) or `manual` (an
+ * operator override frozen into the document). `hsn_gap` marks a line that
+ * issued with a blank HSN (never blocks issuance).
+ */
+export const invoiceLines = pgTable(
+  'invoice_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    invoiceId: uuid('invoice_id').notNull(),
+    orderLineId: uuid('order_line_id').notNull(),
+    /** Per-line SKU snapshots — the catalog row as it stood at issuance. */
+    skuCode: text('sku_code').notNull(),
+    skuName: text('sku_name').notNull(),
+    hsn: text('hsn'),
+    qtyMilli: bigint('qty_milli', { mode: 'number' }).notNull(),
+    ratePaise: bigint('rate_paise', { mode: 'number' }).notNull(),
+    rateSource: text('rate_source').notNull(),
+    taxablePaise: bigint('taxable_paise', { mode: 'number' }).notNull(),
+    gstBps: integer('gst_bps').notNull(),
+    cgstPaise: bigint('cgst_paise', { mode: 'number' }).notNull().default(0),
+    sgstPaise: bigint('sgst_paise', { mode: 'number' }).notNull().default(0),
+    igstPaise: bigint('igst_paise', { mode: 'number' }).notNull().default(0),
+    hsnGap: boolean('hsn_gap').notNull().default(false),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // The detail read's per-line ordering.
+    index('invoice_lines_tenant_invoice_idx').on(table.tenantId, table.invoiceId),
+  ],
+);
+
+export type InvoiceLine = typeof invoiceLines.$inferSelect;
+
+/**
+ * The FY numbering series: one row per tenant per financial year (April 1 –
+ * March 31, Asia/Kolkata). `last_seq` allocates under the row's FOR UPDATE
+ * lock inside the issuance transaction — the concurrency guarantee behind
+ * gap-free numbering. Written by the invoicing command only.
+ */
+export const invoiceSeries = pgTable(
+  'invoice_series',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    fyLabel: text('fy_label').notNull(),
+    lastSeq: bigint('last_seq', { mode: 'number' }).notNull().default(0),
+    ...tenantTimestamps,
+  },
+  (table) => [uniqueIndex('invoice_series_tenant_fy_unique').on(table.tenantId, table.fyLabel)],
+);
+
+export type InvoiceSeries = typeof invoiceSeries.$inferSelect;
+
+/**
+ * The CBIC GST state-code list (story 8-1) — the 38 official two-digit
+ * state codes (01 Jammu & Kashmir … 37 Andhra Pradesh, 38 Ladakh, 97 Other
+ * Territory, 99 Other Country), hand-seeded in migration SQL 0053. A GLOBAL
+ * reference table like `app_metadata`: no `tenant_id`, no RLS — the codes
+ * are India-wide law, not tenant data.
+ */
+export const gstStateCodes = pgTable('gst_state_codes', {
+  /** The two-digit code itself (the table's natural key). */
+  stateCode: text('state_code').primaryKey(),
+  stateName: text('state_name').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+});
+
+export type GstStateCode = typeof gstStateCodes.$inferSelect;

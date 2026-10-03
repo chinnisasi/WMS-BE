@@ -6,6 +6,7 @@ import { CatalogModule } from './modules/catalog/catalog.module';
 import { ChannelsModule } from './modules/channels/channels.module';
 import { ComplianceModule } from './modules/compliance/compliance.module';
 import { InboundModule } from './modules/inbound/inbound.module';
+import { InvoicingModule } from './modules/invoicing/invoicing.module';
 import { InventoryModule } from './modules/inventory/inventory.module';
 import { MovementsModule } from './modules/movements/movements.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
@@ -34,6 +35,7 @@ import { JobsModule } from './jobs/jobs.module';
     InboundModule,
     PutawayModule,
     OutboundModule,
+    InvoicingModule,
     MovementsModule,
     ReplenishmentModule,
     ChannelsModule,

@@ -2,7 +2,7 @@ import { forwardRef, Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { bins, users, warehouses, zones } from '../../shared/db/schema';
+import { bins, tenants, users, warehouses, zones } from '../../shared/db/schema';
 import type { UserRole } from '../../shared/db/schema';
 // Constructor param is a type here but must stay a value import: Nest DI needs
 // the runtime class token for decorator metadata (eslint rule bends for it).
@@ -16,6 +16,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { addressFromColumns } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
+import { GSTIN_RE, normalizeGstinInput } from '../../shared/primitives/gstin';
 
 /** What other modules get from the tenancy spine (module boundary — AD-6). */
 export interface ActiveWarehouse {
@@ -140,6 +141,100 @@ export async function getMemberRoleIn(
 }
 
 /**
+ * The invoice's party facts (story 8-1, read INSIDE the caller's generate
+ * transaction so the document snapshots who stood where at issuance): the
+ * tenant (name + default GSTIN) and the dispatch's origin warehouse
+ * (name + warehouse GSTIN + origin address). A READ of tenancy tables by the
+ * invoicing module through this exported seam — the `getMemberRoleIn`
+ * precedent; the invoicing module never imports a tenancy table itself.
+ */
+export interface InvoicePartyFacts {
+  readonly tenantName: string;
+  readonly tenantGstin: string | null;
+  readonly warehouseName: string;
+  readonly warehouseGstin: string | null;
+  readonly originAddress: AddressSnapshot | null;
+}
+
+export async function invoicePartyFactsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+): Promise<InvoicePartyFacts> {
+  await assertWarehouseInTenant(tx, tenantId, warehouseId);
+  const tenantRows = await tx
+    .select({ name: tenants.name, gstin: tenants.gstin })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1);
+  const tenant = tenantRows[0];
+  if (tenant === undefined) {
+    // Fail closed: the RLS scope already guarantees membership, so this is
+    // unreachable in practice — but a missing tenant row cannot resolve a
+    // seller name, and generation must not invent one.
+    throw new ProblemException(
+      'not-found',
+      404,
+      'Tenant not found',
+      'The tenant row backing this invoice could not be read.',
+    );
+  }
+  const warehouseRows = await tx
+    .select({
+      name: warehouses.name,
+      gstin: warehouses.gstin,
+      originContactName: warehouses.originContactName,
+      originPhone: warehouses.originPhone,
+      originLine1: warehouses.originLine1,
+      originLine2: warehouses.originLine2,
+      originCity: warehouses.originCity,
+      originState: warehouses.originState,
+      originPincode: warehouses.originPincode,
+    })
+    .from(warehouses)
+    .where(and(eq(warehouses.id, warehouseId), eq(warehouses.tenantId, tenantId)))
+    .limit(1);
+  const warehouse = warehouseRows[0]!;
+  return {
+    tenantName: tenant.name,
+    tenantGstin: tenant.gstin,
+    warehouseName: warehouse.name,
+    warehouseGstin: warehouse.gstin,
+    originAddress: addressFromColumns({
+      contactName: warehouse.originContactName,
+      phone: warehouse.originPhone,
+      line1: warehouse.originLine1,
+      line2: warehouse.originLine2,
+      city: warehouse.originCity,
+      state: warehouse.originState,
+      pincode: warehouse.originPincode,
+    }),
+  };
+}
+
+/**
+ * The GSTIN's canonical storage form (story 8-1): trim + uppercase, with a
+ * whitespace-only value treated as absent (the `line2` idiom). Null stays
+ * null — optional everywhere. Shape-validated here so the non-HTTP caller
+ * paths (adapters, seeds) cannot write a 15-character-violating value either
+ * (`orders.consignee_gstin` rides the same helper from the create-order
+ * command); the migration CHECK is the storage-layer backstop.
+ */
+export function normalizeGstin(raw: string | null | undefined): string | null {
+  const value = normalizeGstinInput(raw);
+  if (value === null) return null;
+  if (!GSTIN_RE.test(value)) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      'GSTIN validation failed',
+      `gstin must be a 15-character GSTIN (two digits, thirteen alphanumeric characters; got "${value}").`,
+    );
+  }
+  return value;
+}
+
+/**
  * Tenancy facade for other spine modules and the api shell. Modules never
  * touch tenancy tables directly — they call this service (or consume its
  * domain events).
@@ -218,6 +313,8 @@ export class TenancyService {
       name: string;
       /** The origin address (story 11-1); null on a pre-11.1 warehouse row. */
       origin: AddressSnapshot | null;
+      /** Story 8-1 — the warehouse GSTIN; null when none was given. */
+      gstin: string | null;
       createdAt: string;
     }>
   > {
@@ -238,6 +335,7 @@ export class TenancyService {
           originCity: warehouses.originCity,
           originState: warehouses.originState,
           originPincode: warehouses.originPincode,
+          gstin: warehouses.gstin,
           createdAt: warehouses.createdAt,
         })
         .from(warehouses)
@@ -269,6 +367,7 @@ export class TenancyService {
           state: row.originState,
           pincode: row.originPincode,
         }),
+        gstin: row.gstin,
         createdAt: row.createdAt,
       })),
       nextCursor: page.nextCursor,

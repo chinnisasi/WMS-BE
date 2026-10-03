@@ -372,6 +372,13 @@
       "when": 1790909209920,
       "tag": "0052_channel_mapping_inventory_item",
       "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1791010657494,
+      "tag": "0053_invoicing_core",
+      "breakpoints": true
     }
   ]
 }
