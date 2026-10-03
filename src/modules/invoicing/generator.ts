@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import {
   gstStateCodes,
   invoiceLines,
@@ -15,7 +15,15 @@ import { OutboundFacade } from '../outbound/outbound.facade';
 import type { OrderInvoiceFacts } from '../outbound/outbound.facade';
 import { invoicePartyFactsInTx } from '../tenancy/tenancy.service';
 import type { InvoicePartyFacts } from '../tenancy/tenancy.service';
-import { asGstBps, asPaise, assertInvoiceTotals, computeLineTax, type SupplyType } from './arith';
+import {
+  ArithmeticOverflowError,
+  asGstBps,
+  asPaise,
+  assertInvoiceTotals,
+  computeLineTax,
+  roundToRupee,
+  type SupplyType,
+} from './arith';
 
 /**
  * The derive-from-facts generator (story 8-1): ONE computation both the
@@ -105,7 +113,18 @@ export interface InvoiceDocument {
   readonly seller: { readonly name: string; readonly gstin: string | null };
   readonly buyer: { readonly name: string | null; readonly gstin: string | null };
   readonly lines: readonly InvoiceDocumentLine[];
-  readonly totals: { readonly subtotal: number; readonly gst: number; readonly payAble: number };
+  /**
+   * Story 8-1b: `total` is the exact paise sum (8-1's `payAble`, renamed);
+   * `payable` is the rupee-rounded amount due and `roundOff = payable − total`
+   * (signed, −49…+50) — both stored, printed as the "Round off" line.
+   */
+  readonly totals: {
+    readonly subtotal: number;
+    readonly gst: number;
+    readonly total: number;
+    readonly roundOff: number;
+    readonly payable: number;
+  };
   readonly gaps: readonly InvoiceGap[];
   readonly revision: number;
 }
@@ -126,6 +145,8 @@ export interface InvoiceDraft {
   readonly subtotalPaise: number;
   readonly gstPaise: number;
   readonly totalPaise: number;
+  readonly payablePaise: number;
+  readonly roundOffPaise: number;
   readonly gaps: readonly InvoiceGap[];
 }
 
@@ -150,22 +171,69 @@ export function fyLabelFor(instant: string): string {
 }
 
 /**
- * The series-row allocation: one row per tenant per FY, `last_seq` advanced
- * under the row's FOR UPDATE lock (the concurrency guarantee behind gap-free
- * numbering). Absent row → inserted then re-locked: a concurrent first
- * issuance of a DIFFERENT order in the same FY holds the lock, the
- * ON-CONFLICT-DO-NOTHING insert loses silently, and the re-select waits for
- * the winner's commit and reads its settled value — the seq comes from the
- * lock, never from the read.
+ * GST's ceiling on a tax-invoice number (Rule 46(b), CGST Rules): at most 16
+ * characters. The format below is 14 at a 6-digit sequence; a 7- or 8-digit
+ * sequence (15 / 16 chars, up to 99,999,999) still passes, and the assertion
+ * throws from sequence 100,000,000 (17 chars) on.
  */
-async function allocateSeriesSeq(tx: TenantTx, tenantId: string, fy: string): Promise<number> {
-  const scope = and(eq(invoiceSeries.tenantId, tenantId), eq(invoiceSeries.fyLabel, fy));
+export const INVOICE_NO_MAX_LENGTH = 16;
+
+/**
+ * The invoice number (story 8-1b): the supplier GSTIN's two-digit state code,
+ * the FY digits, and the 6-digit sequence — `29/2627/000001` (14 chars). The
+ * prefix is ALWAYS the GSTIN's own first two characters, never a resolved
+ * state code (`resolveStateCode` may answer from address text). Two GSTINs
+ * in one state print identical numbers by design; consumers key on
+ * (originGstin, invoiceNo), never the number alone.
+ */
+export function formatInvoiceNo(originGstin: string, fyLabel: string, seq: number): string {
+  if (!/^FY-\d{4}$/.test(fyLabel)) {
+    throw new ArithmeticOverflowError(`invoice number: malformed FY label "${fyLabel}"`);
+  }
+  if (!/^[0-9]{2}/.test(originGstin)) {
+    throw new ArithmeticOverflowError(`invoice number: supplier GSTIN "${originGstin}" carries no state-code prefix`);
+  }
+  if (!Number.isSafeInteger(seq) || seq < 1) {
+    throw new ArithmeticOverflowError(`invoice number: sequence must be a positive integer (got ${String(seq)})`);
+  }
+  const invoiceNo = `${originGstin.slice(0, 2)}/${fyLabel.slice(3)}/${String(seq).padStart(6, '0')}`;
+  if (invoiceNo.length > INVOICE_NO_MAX_LENGTH) {
+    throw new ArithmeticOverflowError(
+      `invoice number "${invoiceNo}" exceeds GST's ${INVOICE_NO_MAX_LENGTH}-character limit — the series for ${originGstin} ${fyLabel} is exhausted`,
+    );
+  }
+  return invoiceNo;
+}
+
+/**
+ * The series-row allocation: one row per (tenant, supplier GSTIN, FY),
+ * `last_seq` advanced under the row's FOR UPDATE lock (the concurrency
+ * guarantee behind gap-free numbering). Absent row → inserted then
+ * re-locked: a concurrent first issuance of a DIFFERENT order for the same
+ * GSTIN and FY holds the lock, the ON-CONFLICT-DO-NOTHING insert loses
+ * silently, and the re-select waits for the winner's commit and reads its
+ * settled value — the seq comes from the lock, never from the read.
+ *
+ * The unique is PARTIAL (`WHERE origin_gstin IS NOT NULL` — legacy 8-1
+ * per-tenant rows carry NULL), and Postgres infers a partial unique index as
+ * the conflict arbiter only when the ON CONFLICT clause states the matching
+ * predicate: the `where` below is load-bearing, not decoration.
+ */
+async function allocateSeriesSeq(tx: TenantTx, tenantId: string, originGstin: string, fy: string): Promise<number> {
+  const scope = and(
+    eq(invoiceSeries.tenantId, tenantId),
+    eq(invoiceSeries.originGstin, originGstin),
+    eq(invoiceSeries.fyLabel, fy),
+  );
   let rows = await tx.select().from(invoiceSeries).where(scope).limit(1).for('update');
   if (rows[0] === undefined) {
     await tx
       .insert(invoiceSeries)
-      .values({ tenantId, fyLabel: fy, lastSeq: 0 })
-      .onConflictDoNothing({ target: [invoiceSeries.tenantId, invoiceSeries.fyLabel] });
+      .values({ tenantId, originGstin, fyLabel: fy, lastSeq: 0 })
+      .onConflictDoNothing({
+        target: [invoiceSeries.tenantId, invoiceSeries.originGstin, invoiceSeries.fyLabel],
+        where: sql`origin_gstin is not null`,
+      });
     rows = await tx.select().from(invoiceSeries).where(scope).limit(1).for('update');
   }
   const row = rows[0]!;
@@ -279,6 +347,23 @@ export function lineNotOfOrder(lineId: string): ProblemException {
   );
 }
 
+/**
+ * Rates sent to an issued (or voided) invoice (story 8-1b). An issued invoice
+ * is a frozen legal document: generation never recomputes or rewrites it, so
+ * an override could only be silently ignored — refused instead. It outranks
+ * the line checks (`line-not-of-order`, `line-already-priced`): whatever the
+ * lines say, nothing about a frozen invoice can change. Corrections need
+ * credit/debit notes (deferred).
+ */
+export function invoiceFrozen(status: string, invoiceNo: string | null): ProblemException {
+  return new ProblemException(
+    'invoice-frozen',
+    409,
+    'Invoice is frozen',
+    `The invoice for this order is ${status}${invoiceNo === null ? '' : ` (${invoiceNo})`} — an issued invoice is never re-priced or rewritten; corrections need a credit or debit note.`,
+  );
+}
+
 /** The loser of the ONE-invoice-per-order insert race (the unique violation). */
 export class InvoiceRaceLostError extends Error {
   constructor(
@@ -310,6 +395,11 @@ export interface InvoiceGenerationOutcome {
   readonly subtotalPaise: number;
   readonly gstPaise: number;
   readonly totalPaise: number;
+  /** The rupee-rounded payable and its signed round-off (story 8-1b). */
+  readonly payablePaise: number;
+  readonly roundOffPaise: number;
+  /** The supplier GSTIN the invoice is issued under (its series' key). */
+  readonly originGstin: string | null;
   readonly document: InvoiceDocument;
   /** This attempt's write changed content (a replay/identical pass is false). */
   readonly contentChanged: boolean;
@@ -325,23 +415,26 @@ export class InvoiceGenerator {
 
   /**
    * The generate/regenerate core, called INSIDE the caller's tenant
-   * transaction. Reads the dispatch facts through the outbound facade and
-   * the party facts through the tenancy seam, computes, and settles the ONE
-   * invoice row for the order:
+   * transaction. Locks the order's invoice row first, then reads the
+   * dispatch facts through the outbound facade and the party facts through
+   * the tenancy seam, computes, and settles the ONE invoice row:
    *
+   *   issued / voided → FROZEN (story 8-1b): returned from the stored row
+   *   before any fact is read — no recompute, no write, no revision bump, no
+   *   event, whatever the catalog now says. Non-empty overrides are refused
+   *   `409 invoice-frozen` (they could only be silently ignored);
    *   absent → INSERT (a concurrent twin's unique violation throws
    *   `InvoiceRaceLostError` — the caller adopts the winner with a fresh
    *   transaction; this one rolls back whole);
-   *   present → content-compare: identical → nothing written (a pure
+   *   awaiting-data → content-compare: identical → nothing written (a pure
    *   re-derivation pass); changed → revision bump + column update + line
    *   rewrite (the lines table is the computation's OUTPUT, rebuilt whole —
    *   it carries no identity of its own).
    *
-   * A flip to `issued` (the settled row carries no number yet) allocates the
-   * FY sequence under the series-row lock and stamps `invoice_no` /
-   * `fy_label` / `series_seq` ONLY on first issuance — an already-issued
-   * regenerate keeps its number whatever the recompute finds (the flip's
-   * number is forever; the void command is the spec's deferred item).
+   * A flip to `issued` allocates the sequence of the supplier GSTIN's own
+   * FY series under its series-row lock and stamps `invoice_no` /
+   * `fy_label` / `series_seq` — once; the freeze above is what makes the
+   * number (and everything else on the document) forever.
    */
   async generateCoreInTx(
     tx: TenantTx,
@@ -349,7 +442,49 @@ export class InvoiceGenerator {
     orderId: string,
     overrides: readonly RateOverride[],
   ): Promise<InvoiceGenerationOutcome> {
-    // 1. The dispatch facts — generation re-derives, never trusts the
+    // 1. The CURRENT invoice row, locked FIRST: it is the upsert's lock, the
+    // freeze's input, and (for an awaiting row) the carrier of the frozen
+    // manual rates. Locking before the facts read means a concurrent
+    // awaiting→issued flip is observed here, after its commit — the waiter
+    // then reads `issued` and freezes rather than recomputing over it.
+    const existingRows = await tx
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.tenantId, tenantId), eq(invoices.orderId, orderId)))
+      .limit(1)
+      .for('update');
+    const existing = existingRows[0];
+
+    // 2. The freeze (story 8-1b). An issued or voided invoice is a legal
+    // document: it short-circuits BEFORE the facts read, the override checks
+    // and the computation — a later catalog edit can never reach it.
+    if (existing !== undefined && (existing.status === 'issued' || existing.status === 'voided')) {
+      if (overrides.length > 0) {
+        throw invoiceFrozen(existing.status, existing.invoiceNo);
+      }
+      return {
+        invoiceId: existing.id,
+        orderId,
+        tenantId,
+        warehouseId: existing.warehouseId,
+        invoiceNo: existing.invoiceNo,
+        fyLabel: existing.fyLabel,
+        seriesSeq: existing.seriesSeq === null ? null : Number(existing.seriesSeq),
+        status: existing.status as InvoiceStatus,
+        revision: existing.revision,
+        subtotalPaise: Number(existing.subtotalPaise),
+        gstPaise: Number(existing.gstPaise),
+        totalPaise: Number(existing.totalPaise),
+        payablePaise: Number(existing.payablePaise),
+        roundOffPaise: Number(existing.roundOffPaise),
+        originGstin: existing.originGstin,
+        document: existing.document as InvoiceDocument,
+        contentChanged: false,
+        firstIssuance: false,
+      };
+    }
+
+    // 3. The dispatch facts — generation re-derives, never trusts the
     // payload (unknown order → 404; not dispatched → 409; the delivery
     // handler surfaces both through its own error posture).
     const facts = await this.outbound.orderInvoiceFactsInTx(tx, tenantId, orderId);
@@ -360,10 +495,10 @@ export class InvoiceGenerator {
       throw orderNotDispatched(facts.status);
     }
 
-    // 2. The parties (tenancy's seam — invoicing writes no tenancy table).
+    // 4. The parties (tenancy's seam — invoicing writes no tenancy table).
     const party = await invoicePartyFactsInTx(tx, tenantId, facts.warehouseId);
 
-    // 3. The state-code reference (global — no tenant scope, like app_metadata).
+    // 5. The state-code reference (global — no tenant scope, like app_metadata).
     const codes = await tx.select().from(gstStateCodes);
     const codeByGstinPrefix = new Map<string, StateCodeEntry>(
       codes.map((row) => [row.stateCode, { stateCode: row.stateCode, stateName: row.stateName }]),
@@ -372,16 +507,8 @@ export class InvoiceGenerator {
       codes.map((row) => [normalizeStateName(row.stateName), { stateCode: row.stateCode, stateName: row.stateName }]),
     );
 
-    // 4. The CURRENT invoice row (locked) + its lines — both a rate carrier
-    // (the document's frozen manual rates re-apply on an operator regenerate
-    // that sends no overrides) and the upsert's lock.
-    const existingRows = await tx
-      .select()
-      .from(invoices)
-      .where(and(eq(invoices.tenantId, tenantId), eq(invoices.orderId, orderId)))
-      .limit(1)
-      .for('update');
-    const existing = existingRows[0];
+    // 6. The awaiting row's lines: the document's frozen manual rates
+    // re-apply on an operator regenerate that sends no overrides.
     const existingLines: InvoiceLine[] =
       existing === undefined
         ? []
@@ -395,7 +522,7 @@ export class InvoiceGenerator {
         .map((line) => [line.orderLineId, Number(line.ratePaise)]),
     );
 
-    // 5. Every override names an UNPRICED line OF this order — the two 409
+    // 7. Every override names an UNPRICED line OF this order — the two 409
     // arms (the frozen acceptance rate is never overridden).
     const overrideByLine = new Map(overrides.map((ov) => [ov.orderLineId, ov.ratePaise]));
     for (const lineId of overrideByLine.keys()) {
@@ -417,53 +544,55 @@ export class InvoiceGenerator {
       codeByStateName,
     });
 
-    // 6. The issuance bookkeeping: number + revision + pinned stamps. The
-    // SETTLED status is computed here so the stamp decision reads the same
-    // status the write will store — an existing `issued`/`voided` row never
-    // regresses (an issued row whose recompute now finds blocking gaps stays
-    // issued with the gaps visible; issuance was a decision the document
-    // still shows), and only an issuance that SETTLES issued allocates a
-    // number (a void outcome never burns a sequence).
-    const nextStatus: InvoiceStatus =
-      existing === undefined
-        ? draft.status
-        : existing.status === 'voided'
-          ? 'voided'
-          : existing.status === 'issued'
-            ? 'issued'
-            : draft.status;
+    // 8. The issuance bookkeeping. `existing` (if any) is `awaiting-data`
+    // here — the freeze returned every other status — so the settled status
+    // is the draft's, and only a draft that settles `issued` takes a number.
     let invoiceNo: string | null = null;
     let fyLabel: string | null = null;
     let seriesSeq: number | null = null;
     let issuedAt: string | null = null;
     let firstIssuance = false;
-    if (nextStatus === 'issued' && (existing === undefined || existing.invoiceNo === null)) {
+    if (draft.status === 'issued') {
+      if (draft.originGstin === null) {
+        // Unreachable: a missing supplier GSTIN is a BLOCKING gap, so the
+        // draft cannot settle issued without one. Named, because the
+        // invoices_issued_stamped_check would otherwise refuse the write
+        // with no context.
+        throw new ArithmeticOverflowError(`order ${orderId}: an issued draft without a supplier GSTIN`);
+      }
       // ONE instant for both the FY and the printed date — two clock reads
       // straddling 31 March midnight IST would number an invoice in one FY
       // and date it in the next.
       const issuedInstant = nowIso();
       const fy = fyLabelFor(issuedInstant);
-      const seq = await allocateSeriesSeq(tx, tenantId, fy);
-      invoiceNo = `${fy}-${String(seq).padStart(6, '0')}`;
+      const seq = await allocateSeriesSeq(tx, tenantId, draft.originGstin, fy);
+      invoiceNo = formatInvoiceNo(draft.originGstin, fy, seq);
       fyLabel = fy;
       seriesSeq = seq;
       issuedAt = issuedInstant;
       firstIssuance = true;
-    } else if (existing !== undefined) {
-      // An already-stamped regenerate keeps its number and its printed
-      // issuance instant — the number is forever, the instant is the
-      // document's own (the prior document carries it). Voided rows keep
-      // whatever the void found too.
-      invoiceNo = existing.invoiceNo;
-      fyLabel = existing.fyLabel;
-      seriesSeq = existing.seriesSeq === null ? null : Number(existing.seriesSeq);
-      issuedAt = (existing.document as InvoiceDocument).header.issuedAt ?? null;
     }
 
     let revision = existing?.revision ?? 1;
     let document = this.buildDocument(draft, { invoiceNo, fyLabel, issuedAt, revision });
+    const settled = {
+      orderId,
+      tenantId,
+      warehouseId: facts.warehouseId,
+      invoiceNo,
+      fyLabel,
+      seriesSeq,
+      status: draft.status,
+      subtotalPaise: draft.subtotalPaise,
+      gstPaise: draft.gstPaise,
+      totalPaise: draft.totalPaise,
+      payablePaise: draft.payablePaise,
+      roundOffPaise: draft.roundOffPaise,
+      originGstin: draft.originGstin,
+      firstIssuance,
+    };
 
-    // 7. The write.
+    // 9. The write.
     if (existing === undefined) {
       const invoiceId = uuidv7();
       try {
@@ -483,6 +612,8 @@ export class InvoiceGenerator {
           subtotalPaise: draft.subtotalPaise,
           gstPaise: draft.gstPaise,
           totalPaise: draft.totalPaise,
+          payablePaise: draft.payablePaise,
+          roundOffPaise: draft.roundOffPaise,
           revision,
           document,
         });
@@ -497,28 +628,12 @@ export class InvoiceGenerator {
         throw err;
       }
       await this.writeLines(tx, tenantId, invoiceId, draft.lines);
-      return {
-        invoiceId,
-        orderId,
-        tenantId,
-        warehouseId: facts.warehouseId,
-        invoiceNo,
-        fyLabel,
-        seriesSeq,
-        status: draft.status,
-        revision,
-        subtotalPaise: draft.subtotalPaise,
-        gstPaise: draft.gstPaise,
-        totalPaise: draft.totalPaise,
-        document,
-        contentChanged: true,
-        firstIssuance,
-      };
+      return { ...settled, invoiceId, revision, document, contentChanged: true };
     }
 
-    // 8. Regeneration: content-compare → update or pure no-op. The revision
-    // is stripped before the compare (its only job is to NUMBER a change;
-    // it must never trigger its own bump).
+    // 10. Regeneration of an awaiting row: content-compare → update or pure
+    // no-op. The revision is stripped before the compare (its only job is to
+    // NUMBER a change; it must never trigger its own bump).
     const priorDocument = existing.document as InvoiceDocument;
     if (documentsEqual(priorDocument, document)) {
       return {
@@ -534,6 +649,9 @@ export class InvoiceGenerator {
         subtotalPaise: Number(existing.subtotalPaise),
         gstPaise: Number(existing.gstPaise),
         totalPaise: Number(existing.totalPaise),
+        payablePaise: Number(existing.payablePaise),
+        roundOffPaise: Number(existing.roundOffPaise),
+        originGstin: existing.originGstin,
         document: priorDocument,
         contentChanged: false,
         firstIssuance: false,
@@ -551,7 +669,7 @@ export class InvoiceGenerator {
         invoiceNo,
         fyLabel,
         seriesSeq,
-        status: nextStatus,
+        status: draft.status,
         originGstin: draft.originGstin,
         consigneeGstin: draft.consigneeGstin,
         placeOfSupply: draft.placeOfSupply,
@@ -559,29 +677,15 @@ export class InvoiceGenerator {
         subtotalPaise: draft.subtotalPaise,
         gstPaise: draft.gstPaise,
         totalPaise: draft.totalPaise,
+        payablePaise: draft.payablePaise,
+        roundOffPaise: draft.roundOffPaise,
         revision,
         document,
       })
       .where(eq(invoices.id, existing.id));
     await tx.delete(invoiceLines).where(eq(invoiceLines.invoiceId, existing.id));
     await this.writeLines(tx, tenantId, existing.id, draft.lines);
-    return {
-      invoiceId: existing.id,
-      orderId,
-      tenantId,
-      warehouseId: facts.warehouseId,
-      invoiceNo,
-      fyLabel,
-      seriesSeq,
-      status: nextStatus,
-      revision,
-      subtotalPaise: draft.subtotalPaise,
-      gstPaise: draft.gstPaise,
-      totalPaise: draft.totalPaise,
-      document,
-      contentChanged: true,
-      firstIssuance,
-    };
+    return { ...settled, invoiceId: existing.id, revision, document, contentChanged: true };
   }
 
   // ── the pure computation ──────────────────────────────────────────────────
@@ -712,6 +816,9 @@ export class InvoiceGenerator {
       igstPaise: lines.reduce((s, l) => s + l.igstPaise, 0),
     });
 
+    // Story 8-1b: the rupee rounding touches ONLY total → payable.
+    const { payable: payablePaise, roundOff: roundOffPaise } = roundToRupee(asPaise(totalPaise));
+
     const status: InvoiceStatus = gaps.some((gap) => BLOCKING_GAP_KINDS.has(gap.kind)) ? 'awaiting-data' : 'issued';
 
     return {
@@ -726,6 +833,8 @@ export class InvoiceGenerator {
       subtotalPaise,
       gstPaise,
       totalPaise,
+      payablePaise,
+      roundOffPaise,
       gaps,
     };
   }
@@ -761,7 +870,9 @@ export class InvoiceGenerator {
       totals: {
         subtotal: draft.subtotalPaise,
         gst: draft.gstPaise,
-        payAble: draft.totalPaise,
+        total: draft.totalPaise,
+        roundOff: draft.roundOffPaise,
+        payable: draft.payablePaise,
       },
       gaps: draft.gaps.map((gap) => ({ ...gap })),
       revision: stamps.revision,

@@ -48,6 +48,10 @@ export interface InvoiceView {
   readonly subtotalPaise: number;
   readonly gstPaise: number;
   readonly totalPaise: number;
+  /** The rupee-rounded amount due (story 8-1b): ⌊(total + 50) / 100⌋ × 100. */
+  readonly payablePaise: number;
+  /** payable − total, signed, −49…+50. */
+  readonly roundOffPaise: number;
   readonly revision: number;
   /** The pinned document snapshot (Design Notes shape) as it stands. */
   readonly document: InvoiceDocument;
@@ -63,12 +67,19 @@ export interface InvoiceEntry {
   readonly warehouseId: string;
   readonly invoiceNo: string | null;
   readonly fyLabel: string | null;
+  /**
+   * The supplier GSTIN (story 8-1b): numbering is per GSTIN, so two
+   * same-state GSTINs print identical numbers — the pair identifies one.
+   */
+  readonly originGstin: string | null;
   readonly status: InvoiceStatus;
   readonly supplyType: string | null;
   readonly placeOfSupply: string | null;
   readonly subtotalPaise: number;
   readonly gstPaise: number;
   readonly totalPaise: number;
+  readonly payablePaise: number;
+  readonly roundOffPaise: number;
   readonly revision: number;
   /** The gaps count of the pinned document (the list surfaces the blockage). */
   readonly gapKinds: readonly GapKind[];
@@ -120,6 +131,8 @@ export function toInvoiceView(row: Invoice, lines: readonly InvoiceLine[]): Invo
     subtotalPaise: row.subtotalPaise,
     gstPaise: row.gstPaise,
     totalPaise: row.totalPaise,
+    payablePaise: row.payablePaise,
+    roundOffPaise: row.roundOffPaise,
     revision: row.revision,
     document: row.document as InvoiceDocument,
     lines: lines.map(toInvoiceLineView),
@@ -137,12 +150,15 @@ export function toInvoiceEntry(row: Invoice): InvoiceEntry {
     warehouseId: row.warehouseId,
     invoiceNo: row.invoiceNo,
     fyLabel: row.fyLabel,
+    originGstin: row.originGstin,
     status: row.status as InvoiceStatus,
     supplyType: row.supplyType,
     placeOfSupply: row.placeOfSupply,
     subtotalPaise: row.subtotalPaise,
     gstPaise: row.gstPaise,
     totalPaise: row.totalPaise,
+    payablePaise: row.payablePaise,
+    roundOffPaise: row.roundOffPaise,
     revision: row.revision,
     gapKinds,
     createdAt: canonicalInstant(row.createdAt),

@@ -56,9 +56,10 @@ export class InvoicingController {
       "Generates or regenerates a dispatched order's ONE invoice (invoice.generate) — re-derived from the persisted dispatch facts, with optional per-line rate overrides frozen into the document",
     description:
       'Creates the invoice when the dispatch event has not yet (or never — pre-8-1 dispatches have no backfill) produced one; otherwise recomputes it. ' +
-      "An invoice issues (and takes its FY-series number, once) when every dispatched line is priced, the place of supply resolves and a supplier GSTIN exists (warehouse, else tenant); otherwise it stays 'awaiting-data' with its gaps listed in the document. " +
-      'Content-identical regeneration leaves the revision unchanged. Overrides never write order_lines.rate_paise. ' +
-      'A concurrent generation (the event delivery racing this call) settles to one invoice — on losing the insert this call retries once over the winner\'s row, so its rates still apply.',
+      "An invoice issues (and takes the next number of its supplier GSTIN's FY series, e.g. 29/2627/000001, once) when every dispatched line is priced, the place of supply resolves and a supplier GSTIN exists (warehouse, else tenant); otherwise it stays 'awaiting-data' with its gaps listed in the document. " +
+      'An issued invoice is FROZEN: a plain regenerate returns it unchanged (no recompute, whatever the catalog now says), and rates sent to it are refused (invoice-frozen). ' +
+      'Content-identical regeneration of an awaiting invoice leaves the revision unchanged. Overrides never write order_lines.rate_paise. ' +
+      'A concurrent generation (the event delivery racing this call) settles to one invoice — on losing the insert this call retries once over the winner\'s row: if the winner parked awaiting-data the retry\'s rates apply; if the winner already issued, the retry hits the freeze and answers 409 invoice-frozen.',
   })
   @ApiBody({ type: GenerateInvoiceDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
@@ -70,7 +71,7 @@ export class InvoicingController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks invoice.generate (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No order with this id exists in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The order is not dispatched (order-not-dispatched), a rate override names a line that is not of this order (line-not-of-order) or a line already priced at order acceptance (line-already-priced), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Rates sent to an issued or voided invoice (invoice-frozen — it outranks the line checks), the order is not dispatched (order-not-dispatched), a rate override names a line that is not of this order (line-not-of-order) or a line already priced at order acceptance (line-already-priced), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async generateInvoice(

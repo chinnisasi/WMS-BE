@@ -185,9 +185,44 @@ export function assertInvoiceTotals(input: {
   }
   if (totalPaise > PAISE_CEILING) {
     // Unreachable after the safe-integer guard above; kept named because
-    // "the payable is a paise integer" is the contract 21-5 will read.
-    throw new ArithmeticOverflowError(`payable out of safe paise range: ${String(totalPaise)}`);
+    // "the total is a paise integer" is the contract 21-5 will read.
+    throw new ArithmeticOverflowError(`total out of safe paise range: ${String(totalPaise)}`);
   }
+}
+
+/** The signed round-off bounds: half-up at 50 paise puts `payable − total` in −49…+50. */
+export const ROUND_OFF_MIN = -49;
+export const ROUND_OFF_MAX = 50;
+
+/**
+ * The rupee rounding of an invoice's payable (story 8-1b, the human decision):
+ * half-up at 50 paise — `payable = ⌊(total + 50) / 100⌋ × 100` and
+ * `roundOff = payable − total`, so 228060 → 228100 (+40), 435449 → 435400
+ * (−49), 435450 → 435500 (+50). It touches ONLY total → payable; taxable,
+ * GST and every per-tax amount stay paise-exact.
+ *
+ * `roundOff` is a plain checked integer, NOT `Paise` (`asPaise` rejects the
+ * negative arm). The arithmetic is integer-only (`%` on a safe integer is
+ * exact — no float division), and `total + 50` is guarded inside the safe
+ * range. Migration 0054's `div(total + 50, 100) * 100` is the SQL twin; the
+ * parity test in invoicing.spec.ts pins that the two agree.
+ */
+export function roundToRupee(total: Paise): { payable: Paise; roundOff: number } {
+  if (!Number.isSafeInteger(total) || total < 0) {
+    throw new ArithmeticOverflowError(`roundToRupee total must be a non-negative safe integer (got ${String(total)})`);
+  }
+  if (total > PAISE_CEILING - 50) {
+    throw new ArithmeticOverflowError(
+      `roundToRupee total + 50 leaves the exact paise range: ${String(total)} (ceiling ${PAISE_CEILING - 50})`,
+    );
+  }
+  const shifted = total + 50;
+  const payable = shifted - (shifted % 100);
+  const roundOff = payable - total;
+  if (!Number.isSafeInteger(roundOff) || roundOff < ROUND_OFF_MIN || roundOff > ROUND_OFF_MAX) {
+    throw new ArithmeticOverflowError(`round-off out of range (${ROUND_OFF_MIN}…${ROUND_OFF_MAX}): ${String(roundOff)}`);
+  }
+  return { payable: asPaise(payable), roundOff };
 }
 
 /** The BigInt half-up divide arith.ts runs everything through. */

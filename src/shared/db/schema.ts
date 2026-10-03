@@ -3773,6 +3773,15 @@ export const invoices = pgTable(
     subtotalPaise: bigint('subtotal_paise', { mode: 'number' }).notNull().default(0),
     gstPaise: bigint('gst_paise', { mode: 'number' }).notNull().default(0),
     totalPaise: bigint('total_paise', { mode: 'number' }).notNull().default(0),
+    /**
+     * Story 8-1b: the rupee-rounded payable (`⌊(total + 50) / 100⌋ × 100`,
+     * half-up at 50 paise) and its signed round-off (`payable − total`, in
+     * −49…+50). Stored, never re-derived on read — e-way and the GSTR-1
+     * invoice value read these. No DEFAULT: every write states them. The
+     * rounding CHECKs live in migration 0054.
+     */
+    payablePaise: bigint('payable_paise', { mode: 'number' }).notNull(),
+    roundOffPaise: bigint('round_off_paise', { mode: 'number' }).notNull(),
     /** Bumped only when a regenerate changes the document content. */
     revision: integer('revision').notNull().default(1),
     /** The pinned client-agnostic document snapshot (Design Notes shape). */
@@ -3782,9 +3791,11 @@ export const invoices = pgTable(
   (table) => [
     // The ONE invoice per dispatched order — the concurrent-race guarantee.
     uniqueIndex('invoices_tenant_order_unique').on(table.tenantId, table.orderId),
-    // The FY number is unique per tenant once stamped.
-    uniqueIndex('invoices_tenant_invoice_no_unique')
-      .on(table.tenantId, table.invoiceNo)
+    // Story 8-1b: the number is unique per (tenant, supplier GSTIN) once
+    // stamped — each GSTIN is its own registrant with its own series, so two
+    // same-state GSTINs legitimately print the same `29/2627/000001`.
+    uniqueIndex('invoices_tenant_gstin_invoice_no_unique')
+      .on(table.tenantId, table.originGstin, table.invoiceNo)
       .where(sql`invoice_no is not null`),
     // The list read's keyset cursor.
     index('invoices_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
@@ -3834,10 +3845,17 @@ export const invoiceLines = pgTable(
 export type InvoiceLine = typeof invoiceLines.$inferSelect;
 
 /**
- * The FY numbering series: one row per tenant per financial year (April 1 –
- * March 31, Asia/Kolkata). `last_seq` allocates under the row's FOR UPDATE
- * lock inside the issuance transaction — the concurrency guarantee behind
- * gap-free numbering. Written by the invoicing command only.
+ * The FY numbering series: one row per (tenant, supplier GSTIN, financial
+ * year) — April 1 – March 31, Asia/Kolkata (story 8-1b: each GSTIN is a
+ * separate registrant). `last_seq` allocates under the row's FOR UPDATE lock
+ * inside the issuance transaction — the concurrency guarantee behind gap-free
+ * numbering. Written by the invoicing command only.
+ *
+ * `origin_gstin` is NULL only on the legacy 8-1 per-tenant rows (the
+ * `FY-2627-000001` format): they are a frozen historical series, kept and
+ * never allocated from again (issuance always has a GSTIN — the invoices
+ * CHECK makes that structural). The unique is partial over the non-NULL
+ * rows, so `ON CONFLICT` must name its predicate to infer it.
  */
 export const invoiceSeries = pgTable(
   'invoice_series',
@@ -3847,10 +3865,16 @@ export const invoiceSeries = pgTable(
       .$defaultFn(() => uuidv7()),
     tenantId: uuid('tenant_id').notNull(),
     fyLabel: text('fy_label').notNull(),
+    /** The supplier GSTIN this series numbers for; NULL = a legacy 8-1 per-tenant series. */
+    originGstin: text('origin_gstin'),
     lastSeq: bigint('last_seq', { mode: 'number' }).notNull().default(0),
     ...tenantTimestamps,
   },
-  (table) => [uniqueIndex('invoice_series_tenant_fy_unique').on(table.tenantId, table.fyLabel)],
+  (table) => [
+    uniqueIndex('invoice_series_tenant_gstin_fy_unique')
+      .on(table.tenantId, table.originGstin, table.fyLabel)
+      .where(sql`origin_gstin is not null`),
+  ],
 );
 
 export type InvoiceSeries = typeof invoiceSeries.$inferSelect;

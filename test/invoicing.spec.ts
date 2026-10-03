@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { INestApplication } from '@nestjs/common';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
@@ -35,6 +37,8 @@ delete process.env.RESERVATION_REAPER_POLL_MS;
 
 const API = '/api/v1/tenants';
 const KEY_HEADER = 'Idempotency-Key';
+/** Story 8-1b: the supplier GSTIN's state code / FY digits / 6-digit sequence. */
+const INVOICE_NO_RE = /^\d{2}\/\d{4}\/\d{6}$/;
 
 jest.setTimeout(60_000);
 
@@ -83,8 +87,19 @@ interface InvoiceRow {
   subtotal_paise: string | number;
   gst_paise: string | number;
   total_paise: string | number;
+  payable_paise: string | number;
+  round_off_paise: string | number;
   revision: number;
+  updated_at: string;
   document: Record<string, unknown>;
+}
+
+/** Migration 0054, split into the statements the real runner executes. */
+function migration0054Statements(): string[] {
+  return readFileSync(resolve(process.cwd(), 'drizzle/0054_invoice_regulatory_pass.sql'), 'utf8')
+    .split('--> statement-breakpoint')
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
 }
 
 /**
@@ -168,6 +183,11 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     'IN-HTTP', // the controller's routes, guards and error arms
     'IN-RETRY', // AC2: a failed generation retried by the relay
     'IN-SUPP', // the supplier-GSTIN gap and the origin discrepancy
+    'IN-NUM', // 8-1b: the per-GSTIN numbering series
+    'IN-FRZ', // 8-1b: the freeze after a catalog edit
+    'IN-CONC', // 8-1b: concurrent awaiting→issued generations
+    'IN-PAR', // 8-1b: SQL/TS rounding parity on a migrated awaiting row
+    'IN-RACE2', // 8-1b: the forced race whose winner ISSUES — the loser's retry freezes
   ] as const;
 
   beforeAll(async () => {
@@ -654,7 +674,8 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
   async function invoiceRow(orderId: string): Promise<InvoiceRow | undefined> {
     const rows = await sql`
       select id, status, invoice_no, fy_label, series_seq, place_of_supply, supply_type,
-             origin_gstin, consignee_gstin, subtotal_paise, gst_paise, total_paise, revision, document
+             origin_gstin, consignee_gstin, subtotal_paise, gst_paise, total_paise,
+             payable_paise, round_off_paise, revision, updated_at::text as updated_at, document
       from invoices where tenant_id = ${tenantId} and order_id = ${orderId}
     `;
     return rows[0] as unknown as InvoiceRow | undefined;
@@ -827,7 +848,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
 
     const row = mustRow(await invoiceRow(orderId));
     expect(row.status).toBe('issued');
-    expect(row.invoice_no).toMatch(/^FY-\d{4}-\d{6}$/);
+    expect(row.invoice_no).toMatch(INVOICE_NO_RE);
     expect(row.fy_label).toMatch(/^FY-\d{4}$/);
     expect(row.supply_type).toBe('intra');
     expect(row.place_of_supply).toBe('27');
@@ -835,6 +856,11 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect(Number(row.subtotal_paise)).toBe(900);
     expect(Number(row.gst_paise)).toBe(162);
     expect(Number(row.total_paise)).toBe(1062);
+    // Story 8-1b: ₹10.62 rounds half-up to ₹11 — a stored +38 paise round-off.
+    expect(Number(row.payable_paise)).toBe(1100);
+    expect(Number(row.round_off_paise)).toBe(38);
+    expect(row.invoice_no!.startsWith('27/')).toBe(true); // the supplier GSTIN's state code
+    expect(row.invoice_no!.slice(3, 7)).toBe(row.fy_label!.slice(3));
     expect(row.revision).toBe(1);
 
     // The document's arithmetic: two-sum, split, order ref, revision stamp.
@@ -842,7 +868,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
       header: { invoiceNo: string | null; issuedAt: string | null; orderRef: string; placeOfSupply: string | null; supplyType: string | null; consigneeAddress: { state: string } | null };
       seller: { gstin: string };
       lines: { skuCode: string; qtyMilli: number; ratePaise: number; rateSource: string; taxablePaise: number; cgstPaise: number; sgstPaise: number; igstPaise: number; hsnGap: boolean }[];
-      totals: { subtotal: number; gst: number; payAble: number };
+      totals: { subtotal: number; gst: number; total: number; roundOff: number; payable: number };
       gaps: { kind: string }[];
       revision: number;
     };
@@ -853,7 +879,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect(document.seller.gstin).toBe('27AAAPZ1234C1ZV');
     expect(document.lines).toHaveLength(1);
     expect(document.lines[0]).toMatchObject({ skuCode: 'IN-OK', qtyMilli: 2000, ratePaise: 450, rateSource: 'order_line', taxablePaise: 900, gstBps: 1800, cgstPaise: 81, sgstPaise: 81, igstPaise: 0, hsnGap: false });
-    expect(document.totals).toEqual({ subtotal: 900, gst: 162, payAble: 1062 });
+    expect(document.totals).toEqual({ subtotal: 900, gst: 162, total: 1062, roundOff: 38, payable: 1100 });
     expect(document.gaps).toEqual([]);
     expect(document.revision).toBe(1);
 
@@ -875,7 +901,8 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect(payloads).toHaveLength(1);
     expect(payloads[0]).toMatchObject({
       invoiceId: row.id, orderId, invoiceNo: row.invoice_no, fyLabel: row.fy_label,
-      subtotalPaise: 900, gstPaise: 162, totalPaise: 1062, revision: 1,
+      originGstin: '27AAAPZ1234C1ZV',
+      subtotalPaise: 900, gstPaise: 162, totalPaise: 1062, payablePaise: 1100, roundOffPaise: 38, revision: 1,
     });
 
     // The delivery wrote NO audit row (actorUserId is NOT NULL, no actor
@@ -918,7 +945,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
       ulid(),
     );
     expect(priced.invoice.status).toBe('issued');
-    expect(priced.invoice.invoiceNo).toMatch(/^FY-\d{4}-\d{6}$/);
+    expect(priced.invoice.invoiceNo).toMatch(INVOICE_NO_RE);
     expect(priced.invoice.subtotalPaise).toBe(1500); // 3 × 500
     expect(priced.invoice.gstPaise).toBe(270);
     expect(priced.invoice.totalPaise).toBe(1770);
@@ -1038,13 +1065,15 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect(row.status).toBe('awaiting-data');
     expect(row.place_of_supply).toBeNull();
     expect(row.supply_type).toBeNull();
-    const doc = row.document as { gaps: { kind: string; detail: string }[]; totals: { subtotal: number; gst: number; payAble: number } };
+    const doc = row.document as { gaps: { kind: string; detail: string }[]; totals: { subtotal: number; gst: number; total: number; roundOff: number; payable: number } };
     expect(doc.gaps.map((gap) => gap.kind)).toEqual(['place-of-supply']);
     expect(doc.gaps[0]!.detail).toContain('Atlantis');
     // The taxable value still computes (reviewable); NO tax charges.
     expect(doc.totals.subtotal).toBe(300);
     expect(doc.totals.gst).toBe(0);
-    expect(doc.totals.payAble).toBe(300);
+    expect(doc.totals.total).toBe(300);
+    expect(doc.totals.roundOff).toBe(0);
+    expect(doc.totals.payable).toBe(300);
   });
 
   it('a blank-HSN line ISSUES with the hsn-gap warning (a non-blocking gap)', async () => {
@@ -1056,7 +1085,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
 
     const row = mustRow(await invoiceRow(orderId));
     expect(row.status).toBe('issued'); // the gap DOES NOT block
-    expect(row.invoice_no).toMatch(/^FY-\d{4}-\d{6}$/);
+    expect(row.invoice_no).toMatch(INVOICE_NO_RE);
     const doc = row.document as { gaps: { kind: string; detail: string; orderLineId?: string }[]; lines: { orderLineId: string; skuCode: string; hsn: string | null; hsnGap: boolean }[] };
     expect(doc.gaps.map((gap) => gap.kind)).toEqual(['hsn-gap']);
     expect(doc.gaps[0]!.orderLineId).toBe(doc.lines[0]!.orderLineId);
@@ -1277,37 +1306,164 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect(replayed).toEqual(result);
   });
 
-  it('numbering: gap-free, tenant-FY-scoped, monotonic under the series-row lock', async () => {
-    // Two fresh orders issued back-to-back; the series advances by exactly
-    // one each, in THIS tenant's own series row.
-    const before = (await sql`
-      select coalesce(max(last_seq), 0)::text as last_seq from invoice_series where tenant_id = ${tenantId}
-    `) as unknown as { last_seq: string }[];
-    const last = Number(before[0]?.last_seq ?? 0);
+  it('the generation RACE, forced, winner ISSUES (8-1b): the loser\'s retry hits the freeze — 409 invoice-frozen, no audit row, no key', async () => {
+    await clearOutbox();
+    const { orderId, lineRows } = await dispatchedOrder([{ skuId: sku('IN-RACE2'), quantity: 2 }], 'race2');
+    await clearOutbox(); // nothing drains: the two commands are the only writers
 
-    const a = await command.generate(
+    // The same barrier as the race above: the FIRST command inserts the
+    // invoice (its rates make it ISSUE) and parks before its line write,
+    // uncommitted. The second starts while it is parked, sees no row, and
+    // blocks (on the series row or the unique index); the release commits
+    // the winner, so the loser's insert loses and its retry reads `issued`.
+    const proto = InvoiceGenerator.prototype as unknown as { writeLines: (...args: unknown[]) => Promise<void> };
+    const original = proto.writeLines;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let arrived!: () => void;
+    const atGate = new Promise<void>((resolve) => {
+      arrived = resolve;
+    });
+    let first = true;
+    proto.writeLines = async function (this: unknown, ...args: unknown[]): Promise<void> {
+      if (first) {
+        first = false;
+        arrived();
+        await gate;
+      }
+      return original.apply(this, args);
+    };
+    const rates = ratesFor(lineRows, { 'IN-RACE2': 450 });
+    const winnerKey = ulid();
+    const loserKey = ulid();
+    let won: Awaited<ReturnType<InvoicingCommand['generate']>>;
+    let lostError: unknown;
+    try {
+      const winner = command.generate({ tenantId, actorUserId: ownerUserId, orderId, rates }, winnerKey);
+      await atGate;
+      const loser = command.generate({ tenantId, actorUserId: ownerUserId, orderId, rates }, loserKey).then(
+        () => undefined,
+        (err: unknown) => {
+          lostError = err;
+        },
+      );
+      await waitForLockWait();
+      release();
+      won = await winner;
+      await loser;
+    } finally {
+      release();
+      proto.writeLines = original;
+    }
+
+    expect(won.invoice.status).toBe('issued');
+    expect(won.invoice.revision).toBe(1);
+    expect(lostError).toBeInstanceOf(ProblemException);
+    expect((lostError as ProblemException).getStatus()).toBe(409);
+    expect(((lostError as ProblemException).getResponse() as { code: string }).code).toBe('invoice-frozen');
+
+    const rows = await sql`select id from invoices where tenant_id = ${tenantId} and order_id = ${orderId}`;
+    expect(rows).toHaveLength(1);
+    const issued = (await sql`
+      select count(*)::int as n from outbox_messages
+      where tenant_id = ${tenantId} and type = 'invoice.issued' and payload->>'orderId' = ${orderId}
+    `) as unknown as { n: number }[];
+    expect(Number(issued[0]!.n)).toBe(1);
+    // Only the winner audited and keyed; the refused loser left nothing.
+    const audits = (await sql`
+      select reference from audit_events
+      where tenant_id = ${tenantId} and target_id = ${orderId} and action = 'invoice.generated'
+    `) as unknown as { reference: string }[];
+    expect(audits.map((row) => row.reference)).toEqual([winnerKey]);
+    const loserKeys = (await sql`
+      select count(*)::int as n from idempotency_keys where tenant_id = ${tenantId} and key = ${loserKey}
+    `) as unknown as { n: number }[];
+    expect(Number(loserKeys[0]!.n)).toBe(0);
+  });
+
+  it('numbering (8-1b): one consecutive series per supplier GSTIN — two states, and two GSTINs SHARING a state, each from 000001; the list tells them apart', async () => {
+    // Three supplier GSTINs nothing has issued under yet, so each series
+    // starts at 000001 inside this test: A and B share state 27, C is 29.
+    // They back the NO-GSTIN warehouse through the tenant-GSTIN fallback.
+    const gstinA = '27NUMAA1111A1Z1';
+    const gstinB = '27NUMBB2222B2Z2';
+    const gstinC = '29NUMCC3333C3Z3';
+    const issueUnder = async (gstin: string): Promise<Awaited<ReturnType<InvoicingCommand['generate']>>> => {
+      await sql`update tenants set gstin = ${gstin} where id = ${tenantId}`;
+      const orderId = await dispatchedFromSecondWarehouse(sku('IN-NUM'), 1, 100);
+      const out = await command.generate({ tenantId, actorUserId: ownerUserId, orderId }, ulid());
+      expect(out.invoice.status).toBe('issued');
+      expect(out.invoice.originGstin).toBe(gstin);
+      return out;
+    };
+
+    // The main warehouse's own GSTIN series (27AAAPZ…) has history from the
+    // earlier tests; it must advance by exactly one, untouched by the others.
+    const mainBefore = (await sql`
+      select coalesce(max(last_seq), 0)::text as last_seq from invoice_series
+      where tenant_id = ${tenantId} and origin_gstin = '27AAAPZ1234C1ZV'
+    `) as unknown as { last_seq: string }[];
+    const mainLast = Number(mainBefore[0]!.last_seq);
+
+    let a1, a2, b1, b2, c1, c2;
+    try {
+      a1 = await issueUnder(gstinA);
+      b1 = await issueUnder(gstinB);
+      a2 = await issueUnder(gstinA);
+      c1 = await issueUnder(gstinC);
+      b2 = await issueUnder(gstinB);
+      c2 = await issueUnder(gstinC);
+    } finally {
+      await sql`update tenants set gstin = '27BBBPT5678M2AB' where id = ${tenantId}`;
+    }
+    const main = await command.generate(
       { tenantId, actorUserId: ownerUserId, orderId: (await newIssuanceOrder('IN-SERA', 'sera-a')).orderId },
       ulid(),
     );
-    const b = await command.generate(
-      { tenantId, actorUserId: ownerUserId, orderId: (await newIssuanceOrder('IN-SERB', 'sera-b')).orderId },
-      ulid(),
-    );
-    expect(a.invoice.status).toBe('issued');
-    expect(b.invoice.status).toBe('issued');
-    expect(a.invoice.invoiceNo).toBe(a.invoice.fyLabel! + '-' + String(last + 1).padStart(6, '0'));
-    expect(b.invoice.invoiceNo).toBe(b.invoice.fyLabel! + '-' + String(last + 2).padStart(6, '0'));
-    expect(b.invoice.fyLabel).toBe(a.invoice.fyLabel);
-    expect(b.invoice.seriesSeq).toBe(last + 2);
 
-    // The series is tenant-scoped and FY-scoped: exactly one row for this
-    // tenant's current FY, holding the last sequence (the RLS probe covers
-    // the cross-tenant arm; this row is the numbering's own proof).
+    const fy = a1.invoice.fyLabel!.slice(3);
+    expect(a1.invoice.invoiceNo).toBe(`27/${fy}/000001`);
+    expect(a2.invoice.invoiceNo).toBe(`27/${fy}/000002`);
+    expect(b1.invoice.invoiceNo).toBe(`27/${fy}/000001`); // the SAME number as a1 — a different registrant
+    expect(b2.invoice.invoiceNo).toBe(`27/${fy}/000002`);
+    expect(c1.invoice.invoiceNo).toBe(`29/${fy}/000001`);
+    expect(c2.invoice.invoiceNo).toBe(`29/${fy}/000002`);
+    expect([a2, b2, c2].map((out) => out.invoice.seriesSeq)).toEqual([2, 2, 2]);
+    expect(main.invoice.originGstin).toBe('27AAAPZ1234C1ZV');
+    expect(main.invoice.seriesSeq).toBe(mainLast + 1);
+    expect(main.invoice.invoiceNo).toBe(`27/${fy}/${String(mainLast + 1).padStart(6, '0')}`);
+
+    // One series row per (GSTIN, FY), each holding its own last sequence;
+    // nothing this build writes has a NULL GSTIN (that is the legacy arm).
     const series = (await sql`
-      select fy_label, last_seq from invoice_series where tenant_id = ${tenantId} order by fy_label
-    `) as unknown as { fy_label: string; last_seq: string }[];
-    const current = series.find((row) => row.fy_label === a.invoice.fyLabel)!;
-    expect(Number(current.last_seq)).toBe(last + 2);
+      select origin_gstin, fy_label, last_seq::text as last_seq from invoice_series
+      where tenant_id = ${tenantId} and origin_gstin in (${gstinA}, ${gstinB}, ${gstinC})
+      order by origin_gstin
+    `) as unknown as { origin_gstin: string; fy_label: string; last_seq: string }[];
+    expect(series.map((row) => [row.origin_gstin, row.last_seq])).toEqual([
+      [gstinA, '2'],
+      [gstinB, '2'],
+      [gstinC, '2'],
+    ]);
+    const nullSeries = (await sql`
+      select count(*)::int as n from invoice_series where tenant_id = ${tenantId} and origin_gstin is null
+    `) as unknown as { n: number }[];
+    expect(Number(nullSeries[0]!.n)).toBe(0);
+
+    // The list distinguishes the two `27/…/000001`s by their supplier GSTIN,
+    // and so does `invoice.issued` (consumers key on the pair).
+    const page = await facade.listInvoices(tenantId, { limit: 100 });
+    const sameNumber = page.items.filter((item) => item.invoiceNo === `27/${fy}/000001`);
+    expect(sameNumber.map((item) => item.originGstin).sort()).toEqual(
+      expect.arrayContaining([gstinA, gstinB]),
+    );
+    const issued = (await sql`
+      select payload->>'originGstin' as gstin from outbox_messages
+      where tenant_id = ${tenantId} and type = 'invoice.issued' and payload->>'invoiceNo' = ${`27/${fy}/000001`}
+    `) as unknown as { gstin: string }[];
+    expect(issued.map((row) => row.gstin)).toEqual(expect.arrayContaining([gstinA, gstinB]));
   });
 
   async function newIssuanceOrder(skuCode: string, tag: string): Promise<{ orderId: string }> {
@@ -1318,6 +1474,193 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     );
     return { orderId };
   }
+
+  // ── story 8-1b: the freeze ─────────────────────────────────────────────────
+
+  /** Everything a frozen invoice must keep byte-identical: row, lines, outbox. */
+  async function frozenState(orderId: string): Promise<{ row: InvoiceRow; lines: unknown[]; outbox: number }> {
+    const row = mustRow(await invoiceRow(orderId));
+    const lines = await sql`
+      select id, order_line_id, rate_paise::text, gst_bps, taxable_paise::text, cgst_paise::text,
+             sgst_paise::text, igst_paise::text, updated_at::text
+      from invoice_lines where tenant_id = ${tenantId} and invoice_id = ${row.id} order by id
+    `;
+    const outbox = (await sql`
+      select count(*)::int as n from outbox_messages where tenant_id = ${tenantId}
+    `) as unknown as { n: number }[];
+    return { row, lines: [...lines], outbox: Number(outbox[0]!.n) };
+  }
+
+  it('FREEZE: after a SKU gstRate edit, neither a plain regenerate nor an event redelivery touches an issued invoice — row, lines, document, revision, no outbox row', async () => {
+    await clearOutbox();
+    // 1 × ₹3.33 at 18%: taxable 333, tax 59.94 → 60, total 393 → payable 400 (+7).
+    const { orderId } = await dispatchedOrder([{ skuId: sku('IN-FRZ'), quantity: 1, ratePaise: 333 }], 'frz');
+    const event = dispatchedEvent(orderId);
+    await delivery.deliver(event);
+    const issued = mustRow(await invoiceRow(orderId));
+    expect(issued.status).toBe('issued');
+    expect(Number(issued.gst_paise)).toBe(60);
+    expect(Number(issued.payable_paise)).toBe(400);
+    expect(Number(issued.round_off_paise)).toBe(7);
+
+    // The catalog moves: 18% → 5%. A recompute would now tax 17 paise.
+    await request(app.getHttpServer())
+      .patch(`${API}/${tenantId}/catalog/skus/${sku('IN-FRZ')}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ gstRate: 500 })
+      .expect(200);
+    const before = await frozenState(orderId);
+
+    // A plain manual regenerate → the stored invoice, unchanged.
+    const regenerated = await command.generate({ tenantId, actorUserId: ownerUserId, orderId }, ulid());
+    expect(regenerated.invoice.revision).toBe(issued.revision);
+    expect(regenerated.invoice.gstPaise).toBe(60);
+    expect(regenerated.invoice.document).toEqual(issued.document);
+    // The same over HTTP: 200, the stored invoice.
+    const http = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/invoices`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ orderId })
+      .expect(200);
+    expect((http.body as { invoice: { gstPaise: number; revision: number } }).invoice).toMatchObject({ gstPaise: 60, revision: issued.revision });
+
+    // The event redelivers (at-least-once) → nothing.
+    await delivery.deliver(event);
+    await delivery.deliver(dispatchedEvent(orderId));
+
+    const after = await frozenState(orderId);
+    expect(after.row).toEqual(before.row); // updated_at included — no write at all
+    expect(after.lines).toEqual(before.lines);
+    expect(after.outbox).toBe(before.outbox); // no invoice.issued, nothing else
+  });
+
+  it('FREEZE: rates sent to an issued invoice refuse 409 invoice-frozen — outranking the line checks, on the command and over HTTP', async () => {
+    const { orderId, lineRows } = await dispatchedOrder([{ skuId: sku('IN-FRZ'), quantity: 1, ratePaise: 333 }], 'frz-409');
+    await delivery.deliver(dispatchedEvent(orderId));
+    const before = await frozenState(orderId);
+    expect(before.row.status).toBe('issued');
+
+    // A priced line would answer line-already-priced, a foreign line
+    // line-not-of-order — on a frozen invoice both answer invoice-frozen.
+    await expectProblem(
+      command.generate({ tenantId, actorUserId: ownerUserId, orderId, rates: [{ orderLineId: lineRows[0]!.id, ratePaise: 1 }] }, ulid()),
+      409,
+      'invoice-frozen',
+    );
+    await expectProblem(
+      command.generate({ tenantId, actorUserId: ownerUserId, orderId, rates: [{ orderLineId: uuidv7(), ratePaise: 1 }] }, ulid()),
+      409,
+      'invoice-frozen',
+    );
+    const refused = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/invoices`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ orderId, rates: [{ orderLineId: lineRows[0]!.id, ratePaise: 1 }] })
+      .expect(409);
+    expect(refused.body.code).toBe('invoice-frozen');
+    // An empty rates array is a plain regenerate, not an override.
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/invoices`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ orderId, rates: [] })
+      .expect(200);
+
+    const after = await frozenState(orderId);
+    expect(after.row).toEqual(before.row);
+    expect(after.lines).toEqual(before.lines);
+  });
+
+  it('FREEZE: concurrent awaiting→issued generations issue ONCE — the waiter reads the issued row and freezes (one number, one invoice.issued)', async () => {
+    await clearOutbox();
+    const { orderId, lineRows } = await dispatchedOrder([{ skuId: sku('IN-CONC'), quantity: 2 }], 'conc');
+    await clearOutbox();
+    const event = dispatchedEvent(orderId);
+    await delivery.deliver(event);
+    expect(mustRow(await invoiceRow(orderId)).status).toBe('awaiting-data');
+
+    const rates = ratesFor(lineRows, { 'IN-CONC': 450 });
+    const results = await Promise.allSettled([
+      command.generate({ tenantId, actorUserId: ownerUserId, orderId, rates }, ulid()),
+      command.generate({ tenantId, actorUserId: ownerUserId, orderId, rates }, ulid()),
+      delivery.deliver(event),
+    ]);
+    const [first, second, delivered] = results;
+    expect(delivered!.status).toBe('fulfilled');
+    const commands = [first!, second!];
+    const won = commands.filter((r) => r.status === 'fulfilled') as PromiseFulfilledResult<Awaited<ReturnType<InvoicingCommand['generate']>>>[];
+    const lost = commands.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+    expect(won).toHaveLength(1);
+    expect(lost).toHaveLength(1);
+    expect(won[0]!.value.invoice.status).toBe('issued');
+    expect(lost[0]!.reason).toBeInstanceOf(ProblemException);
+    expect(((lost[0]!.reason as ProblemException).getResponse() as { code: string }).code).toBe('invoice-frozen');
+
+    const row = mustRow(await invoiceRow(orderId));
+    expect(row.invoice_no).toBe(won[0]!.value.invoice.invoiceNo);
+    const issued = (await sql`
+      select count(*)::int as n from outbox_messages
+      where tenant_id = ${tenantId} and type = 'invoice.issued' and payload->>'orderId' = ${orderId}
+    `) as unknown as { n: number }[];
+    expect(Number(issued[0]!.n)).toBe(1);
+    // The series advanced exactly once for this issuance.
+    const series = (await sql`
+      select last_seq::text as last_seq from invoice_series
+      where tenant_id = ${tenantId} and origin_gstin = ${row.origin_gstin} and fy_label = ${row.fy_label}
+    `) as unknown as { last_seq: string }[];
+    expect(Number(series[0]!.last_seq)).toBe(Number(row.series_seq));
+  });
+
+  it('PARITY: a migrated awaiting row (0054 steps 4–5 over a legacy `payAble` document) regenerates with unchanged facts at the SAME revision', async () => {
+    // 1 × ₹3.49 to an unresolvable state: awaiting, total 349 → payable 300 (−49).
+    const { orderId } = await dispatchedOrder(
+      [{ skuId: sku('IN-PAR'), quantity: 1, ratePaise: 349 }],
+      'parity',
+      { destination: testAddress({ state: 'Atlantis', city: 'Poseidonis' }) },
+    );
+    await delivery.deliver(dispatchedEvent(orderId));
+    const original = mustRow(await invoiceRow(orderId));
+    expect(original.status).toBe('awaiting-data');
+    expect(Number(original.payable_paise)).toBe(300);
+    expect(Number(original.round_off_paise)).toBe(-49);
+
+    // Every invoice as the TS generator wrote it.
+    const snapshot = async (): Promise<{ id: string; document: string; payable: string; round_off: string; revision: number }[]> =>
+      (await sql`
+        select id, document::text as document, payable_paise::text as payable, round_off_paise::text as round_off, revision
+        from invoices where tenant_id = ${tenantId} order by id
+      `) as never;
+    const written = await snapshot();
+
+    // Put this row back into the 8-1 shape, then run 0054's own backfill and
+    // document rewrite (the file's statements, not a replica) over the table.
+    await sql`
+      update invoices set document = jsonb_set(document, '{totals}',
+        jsonb_build_object('subtotal', subtotal_paise, 'gst', gst_paise, 'payAble', total_paise))
+      where id = ${original.id}
+    `;
+    const statements = migration0054Statements();
+    const backfill = statements.find((s) => s.includes('"payable_paise" = div("total_paise" + 50, 100) * 100'));
+    const rewrite = statements.find((s) => s.includes(`UPDATE "invoices" SET "document" = jsonb_set(`));
+    expect(backfill).toBeDefined();
+    expect(rewrite).toBeDefined();
+    await sql.begin(async (tx) => {
+      await tx.unsafe(backfill!);
+      await tx.unsafe(rewrite!);
+    });
+
+    // SQL and TS agree on every row: same rounding, same document bytes.
+    expect(await snapshot()).toEqual(written);
+
+    // …so a regenerate over unchanged facts is a no-op: no revision bump.
+    await delivery.deliver(dispatchedEvent(orderId));
+    const regenerated = await command.generate({ tenantId, actorUserId: ownerUserId, orderId }, ulid());
+    expect(regenerated.invoice.revision).toBe(original.revision);
+    expect(mustRow(await invoiceRow(orderId))).toEqual(original);
+  });
 
   it('NO supplier GSTIN parks the invoice (supplier-gstin gap); a tenant GSTIN from ANOTHER state warns on the origin and decides the supply type', async () => {
     try {
@@ -1528,14 +1871,20 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
       subtotalPaise: number;
       gstPaise: number;
       totalPaise: number;
+      payablePaise: number;
+      roundOffPaise: number;
+      originGstin: string;
       lines: { rateSource: string; ratePaise: number }[];
-      document: { gaps: unknown[] };
+      document: { gaps: unknown[]; totals: Record<string, number> };
     };
     expect(invoice.status).toBe('issued');
-    expect(invoice.invoiceNo).toMatch(/^FY-\d{4}-\d{6}$/);
+    expect(invoice.invoiceNo).toMatch(INVOICE_NO_RE);
     expect(invoice.subtotalPaise).toBe(500);
     expect(invoice.gstPaise).toBe(90);
     expect(invoice.totalPaise).toBe(590);
+    expect(invoice.payablePaise).toBe(600); // ₹5.90 → ₹6, +10 paise
+    expect(invoice.roundOffPaise).toBe(10);
+    expect(invoice.document.totals).toEqual({ subtotal: 500, gst: 90, total: 590, roundOff: 10, payable: 600 });
     expect(invoice.lines[0]).toMatchObject({ ratePaise: 250, rateSource: 'manual' });
     expect(invoice.document.gaps).toEqual([]);
 
@@ -1571,6 +1920,14 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect(typeof firstPage.body.nextCursor).toBe('string');
     expect(firstPage.body.items[0]).not.toHaveProperty('document');
     expect(firstPage.body.items[0]).not.toHaveProperty('lines');
+    // The entry carries the supplier GSTIN and the rounded figures (8-1b).
+    expect(firstPage.body.items[0]).toEqual(
+      expect.objectContaining({
+        originGstin: expect.any(String),
+        payablePaise: expect.any(Number),
+        roundOffPaise: expect.any(Number),
+      }),
+    );
     const secondPage = await request(app.getHttpServer())
       .get(`${API}/${tenantId}/invoices`)
       .query({ limit: 1, cursor: firstPage.body.nextCursor as string })

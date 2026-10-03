@@ -6,11 +6,19 @@ import {
   assertInvoiceTotals,
   computeLineTax as computeLineTaxBranded,
   divRound,
+  roundToRupee,
 } from '../src/modules/invoicing/arith';
 import type { SupplyType } from '../src/modules/invoicing/arith';
 import type { Paise } from '../src/shared/primitives/money';
 import { MAX_QUANTITY_MILLI, QUANTITY_SCALE, type GstBps } from '../src/shared/primitives/quantity';
-import { documentsEqual, fyLabelFor, normalizeStateName, resolveStateCode } from '../src/modules/invoicing/generator';
+import {
+  INVOICE_NO_MAX_LENGTH,
+  documentsEqual,
+  formatInvoiceNo,
+  fyLabelFor,
+  normalizeStateName,
+  resolveStateCode,
+} from '../src/modules/invoicing/generator';
 import type { InvoiceDocument, StateCodeEntry } from '../src/modules/invoicing/generator';
 
 /**
@@ -266,7 +274,7 @@ describe('invoicing arithmetic (story 8-1, unit)', () => {
       seller: { name: 'WH', gstin: '27AAAPZ1234C1ZV' },
       buyer: { name: null, gstin: null },
       lines: [],
-      totals: { subtotal: 0, gst: 0, payAble: 0 },
+      totals: { subtotal: 0, gst: 0, total: 0, roundOff: 0, payable: 0 },
       gaps: [],
       revision: 1,
     };
@@ -277,8 +285,16 @@ describe('invoicing arithmetic (story 8-1, unit)', () => {
 
     it('calls a changed total, line list or gap list different', () => {
       expect(
-        documentsEqual(base, { ...base, totals: { subtotal: 1, gst: 0, payAble: 1 } }),
+        documentsEqual(base, { ...base, totals: { subtotal: 1, gst: 0, total: 1, roundOff: -1, payable: 0 } }),
       ).toBe(false);
+      // The rounding is content too: two documents whose stored round-off
+      // and payable differ (the figures e-way and GSTR-1 read) are different
+      // documents. Both triples respect the rounding invariants.
+      const up: InvoiceDocument = { ...base, totals: { subtotal: 450, gst: 0, total: 450, roundOff: 50, payable: 500 } };
+      const down: InvoiceDocument = { ...base, totals: { subtotal: 449, gst: 0, total: 449, roundOff: -49, payable: 400 } };
+      expect(roundToRupee(asPaise(450))).toEqual({ payable: 500, roundOff: 50 });
+      expect(roundToRupee(asPaise(449))).toEqual({ payable: 400, roundOff: -49 });
+      expect(documentsEqual(up, down)).toBe(false);
       const addedLine: InvoiceDocument = { ...base, lines: [baseLine()] };
       expect(documentsEqual(base, addedLine)).toBe(false);
       const addedGap: InvoiceDocument = {
@@ -313,6 +329,78 @@ describe('invoicing arithmetic (story 8-1, unit)', () => {
       hsnGap: false,
     };
   }
+
+  describe('roundToRupee — the stored rupee round-off (story 8-1b)', () => {
+    // [total, payable, roundOff]: remainders 00 / 40 / 49 / 50 / 99 / 01,
+    // the zero total, and the spec's own matrix rows.
+    const table: readonly (readonly [number, number, number])[] = [
+      [0, 0, 0],
+      [100, 100, 0], // remainder 00 — no rounding
+      [435400, 435400, 0],
+      [228060, 228100, 40], // remainder 60 → up
+      [228040, 228000, -40], // remainder 40 → down
+      [435449, 435400, -49], // remainder 49 → down, the negative edge
+      [435450, 435500, 50], // remainder 50 → UP (half-up), the positive edge
+      [435499, 435500, 1],
+      [435401, 435400, -1],
+      [49, 0, -49],
+      [50, 100, 50],
+    ];
+    it.each(table)('rounds %i paise to a payable of %i (round-off %i)', (total, payable, roundOff) => {
+      const out = roundToRupee(asPaise(total));
+      expect(out).toEqual({ payable, roundOff });
+      expect(out.payable % 100).toBe(0);
+      expect(out.payable).toBe(total + out.roundOff);
+    });
+
+    it('keeps the round-off inside −49…+50 for every remainder', () => {
+      const seen = new Set<number>();
+      for (let r = 0; r < 100; r += 1) {
+        const { roundOff } = roundToRupee(asPaise(1_000_000 + r));
+        expect(roundOff).toBeGreaterThanOrEqual(-49);
+        expect(roundOff).toBeLessThanOrEqual(50);
+        seen.add(roundOff);
+      }
+      expect(seen.size).toBe(100); // every remainder lands on its own round-off
+    });
+
+    it('guards total + 50 inside the safe-integer range, and refuses a negative or fractional total', () => {
+      const ceiling = Number.MAX_SAFE_INTEGER - 50;
+      expect(() => roundToRupee(asPaise(ceiling))).not.toThrow();
+      expect(roundToRupee(asPaise(ceiling)).payable % 100).toBe(0);
+      expect(() => roundToRupee(asPaise(ceiling + 1))).toThrow(ArithmeticOverflowError);
+      expect(() => roundToRupee(-1 as Paise)).toThrow(ArithmeticOverflowError);
+      expect(() => roundToRupee(1.5 as Paise)).toThrow(ArithmeticOverflowError);
+    });
+  });
+
+  describe('formatInvoiceNo — the per-GSTIN series number (story 8-1b)', () => {
+    it('is the GSTIN state code / FY digits / 6-digit sequence — 14 characters', () => {
+      const no = formatInvoiceNo('29AAACR5055K1Z5', 'FY-2627', 3);
+      expect(no).toBe('29/2627/000003');
+      expect(no).toHaveLength(14);
+      expect(formatInvoiceNo('07AAACR5055K1Z5', 'FY-2627', 1)).toBe('07/2627/000001');
+    });
+
+    it('takes the prefix from the GSTIN itself, never a resolved state', () => {
+      // A 27 GSTIN numbers in the 27 series whatever its address says.
+      expect(formatInvoiceNo('27BBBPT5678M2AB', 'FY-2728', 999999)).toBe('27/2728/999999');
+    });
+
+    it('stays within GST’s 16-character limit and fails loudly past it', () => {
+      expect(INVOICE_NO_MAX_LENGTH).toBe(16);
+      expect(formatInvoiceNo('29AAACR5055K1Z5', 'FY-2627', 1_000_000)).toHaveLength(15);
+      expect(formatInvoiceNo('29AAACR5055K1Z5', 'FY-2627', 9_999_999)).toHaveLength(15);
+      expect(formatInvoiceNo('29AAACR5055K1Z5', 'FY-2627', 99_999_999)).toHaveLength(16);
+      expect(() => formatInvoiceNo('29AAACR5055K1Z5', 'FY-2627', 100_000_000)).toThrow(ArithmeticOverflowError);
+    });
+
+    it('refuses a malformed FY label, a prefix-less GSTIN or a non-positive sequence', () => {
+      expect(() => formatInvoiceNo('29AAACR5055K1Z5', '2627', 1)).toThrow(ArithmeticOverflowError);
+      expect(() => formatInvoiceNo('XXAAACR5055K1Z5', 'FY-2627', 1)).toThrow(ArithmeticOverflowError);
+      expect(() => formatInvoiceNo('29AAACR5055K1Z5', 'FY-2627', 0)).toThrow(ArithmeticOverflowError);
+    });
+  });
 
   describe('asPaise / asGstBps — the branded boundary', () => {
     it('admits non-negative safe integers (bps up to the ceiling) and refuses the rest with the typed failure', () => {
