@@ -19,6 +19,8 @@ export interface ChannelConnectionView {
   readonly providerName: string;
   readonly status: string;
   readonly backorderPolicy: string;
+  /** RD-4 — the one ingest warehouse (null until the config PUT sets it). */
+  readonly ingestWarehouseId: string | null;
   readonly credentialVersion: number;
   readonly connectedBy: string;
   readonly rotatedAt: string | null;
@@ -43,6 +45,7 @@ export interface ChannelConnectionListEntry {
   readonly providerName: string;
   readonly status: string;
   readonly backorderPolicy: string;
+  readonly ingestWarehouseId: string | null;
   readonly credentialVersion: number;
   readonly health: 'ok' | 'degraded' | 'error';
   readonly lastSyncedAt: string | null;
@@ -85,6 +88,7 @@ export const CONNECTION_COLUMNS = {
   provider: integrations.provider,
   status: integrations.status,
   backorderPolicy: integrations.backorderPolicy,
+  ingestWarehouseId: integrations.ingestWarehouseId,
   credentialVersion: integrations.credentialVersion,
   connectedBy: integrations.connectedBy,
   rotatedAt: integrations.rotatedAt,
@@ -109,6 +113,7 @@ export function toConnectionView(row: Omit<Integration, 'credentialSealed'>): Ch
     providerName: requireChannelAdapterOrNull(row.provider)?.displayName ?? row.provider,
     status: row.status,
     backorderPolicy: row.backorderPolicy,
+    ingestWarehouseId: row.ingestWarehouseId,
     credentialVersion: row.credentialVersion,
     connectedBy: row.connectedBy,
     rotatedAt: row.rotatedAt === null ? null : canonicalInstant(row.rotatedAt),

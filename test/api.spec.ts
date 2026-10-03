@@ -45,7 +45,15 @@ describe('api shell (e2e)', () => {
     expect(res.body.openapi).toMatch(/^3\./);
     expect(res.body.info.title).toBe('WMS API');
     expect(res.body.servers).toEqual([{ url: '/api/v1' }]);
-    expect(Object.keys(res.body.paths)).toEqual(expect.arrayContaining(['/health', '/echo']));
+    expect(Object.keys(res.body.paths)).toEqual(
+      expect.arrayContaining([
+        '/health',
+        '/echo',
+        // Story 7-2 — the channel webhook surface is a REGISTERED OpenAPI path.
+        '/tenants/{tenantId}/webhooks/channels/{provider}/{connectionId}/orders',
+        '/tenants/{tenantId}/webhooks/channels/{provider}/{connectionId}/cancellations',
+      ]),
+    );
   });
 
   test('POST /api/v1/echo round-trips the payload', async () => {

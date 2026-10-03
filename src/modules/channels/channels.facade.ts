@@ -1,12 +1,17 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { channelMappings, integrations } from '../../shared/db/schema';
 import type { Integration } from '../../shared/db/schema';
 import { canonicalInstant } from '../../shared/primitives/time';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { assertPermission } from '../tenancy/permissions';
+import { getMemberRoleIn } from '../tenancy/tenancy.service';
+import { channelConnectionNotFound } from './channels.errors';
 import { ChannelsCommandService } from './channels.command';
+import { ChannelsIngestCommand } from './channels.ingest.command';
+import type { ParsedChannelCancellation, ParsedChannelOrder } from './channel-registry';
 import type {
   ConnectChannelCommand,
   RotateChannelCredentialCommand,
@@ -14,6 +19,8 @@ import type {
   DisconnectChannelCommand,
   RetryConnectionCommand,
   SetConnectionBuffersCommand,
+  SetConnectionMappingsCommand,
+  ChannelMappingItem,
 } from './channels.command';
 import { ChannelsPublishService } from './channels.publish';
 import { InventoryFacade } from '../inventory/inventory.facade';
@@ -36,6 +43,8 @@ export type {
   DisconnectChannelCommand,
   RetryConnectionCommand,
   SetConnectionBuffersCommand,
+  SetConnectionMappingsCommand,
+  ChannelMappingItem,
   ChannelBufferPlanItem,
 } from './channels.command';
 export type { PublicationPrep, SyncDeliveryOutcome } from './channels.publish';
@@ -82,6 +91,7 @@ export class ChannelsFacade {
     @Inject(DATABASE) private readonly db: Database,
     @Inject(ChannelsCommandService) private readonly commands: ChannelsCommandService,
     @Inject(ChannelsPublishService) private readonly publish: ChannelsPublishService,
+    @Inject(ChannelsIngestCommand) private readonly ingest: ChannelsIngestCommand,
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
   ) {}
 
@@ -116,6 +126,14 @@ export class ChannelsFacade {
     return this.commands.setConnectionBuffers(command, idempotencyKey);
   }
 
+  /** Arm 7 — `PUT .../connections/{id}/mappings` (story 7.2, T6). */
+  setConnectionMappings(
+    command: SetConnectionMappingsCommand,
+    idempotencyKey: string,
+  ): Promise<{ connectionId: string; items: readonly ChannelMappingItem[] }> {
+    return this.commands.setConnectionMappings(command, idempotencyKey);
+  }
+
   /** Arm 3 — `DELETE .../connections/{id}` (the hard delete). */
   disconnect(command: DisconnectChannelCommand, idempotencyKey: string): Promise<void> {
     return this.commands.disconnect(command, idempotencyKey);
@@ -127,6 +145,72 @@ export class ChannelsFacade {
     idempotencyKey: string,
   ): Promise<ChannelConnectionView> {
     return this.commands.retryConnection(command, idempotencyKey);
+  }
+
+  /**
+   * The mappings GET's guard (7.2 row 4): `channel.manage` in one tx plus
+   * the connection-existence check — the command arms carry their own; the
+   * GET has no command, so the guard IS the read arm's authority (AD-4).
+   */
+  async assertConnectionManage(
+    tenantId: string,
+    actorUserId: string,
+    connectionId: string,
+  ): Promise<void> {
+    await withTenantTransaction(this.db, tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, tenantId, actorUserId), 'channel.manage');
+      const rows = await tx
+        .select({ id: integrations.id })
+        .from(integrations)
+        .where(and(eq(integrations.id, connectionId), eq(integrations.tenantId, tenantId)))
+        .limit(1);
+      if (rows[0] === undefined) {
+        throw channelConnectionNotFound();
+      }
+    });
+  }
+
+  // ── ingest passthroughs (7.2 rows 1-2 — the webhooks controller's arms) ────
+
+  /**
+   * One verified + parsed `orders` delivery through the connection's config
+   * (the ingest command's own doc). The webhook caller never sees a
+   * credential; the outcome is the row-1 vocabulary.
+   */
+  ingestOrderDelivery(args: {
+    tenantId: string;
+    connectionId: string;
+    parsed: ParsedChannelOrder;
+  }): Promise<{ outcome: 'accepted' | 'backordered' | 'replayed'; orderId: string }> {
+    return this.ingest.ingestOrderDelivery(args);
+  }
+
+  /** One verified + parsed `cancellations` delivery (RD-8). */
+  ingestCancellationDelivery(args: {
+    tenantId: string;
+    connectionId: string;
+    parsed: ParsedChannelCancellation;
+  }): Promise<{ outcome: 'released' | 'ignored' }> {
+    return this.ingest.ingestCancellationDelivery(args);
+  }
+
+  /**
+   * The verification-failure class's coarse meter (RD-5/bl-5): named
+   * `verification-failed`, content-free, rate-limited to one row per
+   * connection per 60s window — the controller's only meter before the
+   * ingest command runs.
+   */
+  recordIngestVerificationRefused(tenantId: string, connectionId: string): Promise<void> {
+    return this.publish.recordIngestVerificationRefused(tenantId, connectionId);
+  }
+
+  /** The parse-arm refusal's meter (a VERIFIED body with no mappable shape). */
+  recordIngestParseRefused(tenantId: string, connectionId: string): Promise<void> {
+    return this.publish.recordIngestOutcome(tenantId, connectionId, {
+      status: 'validation-failed',
+      latencyMs: 0,
+      error: 'the payload carries no mappable shape for the endpoint',
+    });
   }
 
   // ── read arms (this file's own) ────────────────────────────────────────────
@@ -168,6 +252,7 @@ export class ChannelsFacade {
           providerName: view.providerName,
           status: view.status,
           backorderPolicy: view.backorderPolicy,
+          ingestWarehouseId: view.ingestWarehouseId,
           credentialVersion: view.credentialVersion,
           health,
           lastSyncedAt: view.lastSyncedAt,
@@ -216,6 +301,20 @@ export class ChannelsFacade {
     return this.publish.integrationForDelivery(tenantId, connectionId);
   }
 
+  /**
+   * The WEBHOOK surface's delivery face (story 7-2): provider + LAZY access
+   * to the signing secret — opened only when the caller's 501 gate has
+   * passed (review patch P5), the sealed blob never crosses into `src/api`
+   * (the carriers 4.6b pin). `openSecret() === null` = absent or
+   * unopenable — the caller's fail-closed 401 arm.
+   */
+  webhookDeliveryFace(
+    tenantId: string,
+    connectionId: string,
+  ): Promise<{ provider: string; openSecret: () => string | null } | null> {
+    return this.publish.webhookDeliveryFace(tenantId, connectionId);
+  }
+
   // ── mapping seed arms (no route; 7-2's config path + the e2e seeder) ───────
 
   setChannelMappings(
@@ -236,9 +335,9 @@ export class ChannelsFacade {
   // (kept for the arm-4 composition test + the surfaces story's reads)
   computePublishedScopes(
     tenantId: string,
-    skuIds: readonly string[],
+    skuRefs: readonly { skuId: string; externalRef: string }[],
     connectionId: string,
   ): Promise<PublishedScope[]> {
-    return this.publish.computePublishedScopes(tenantId, skuIds, connectionId);
+    return this.publish.computePublishedScopes(tenantId, skuRefs, connectionId);
   }
 }

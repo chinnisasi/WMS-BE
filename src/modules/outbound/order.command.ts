@@ -11,7 +11,7 @@ import {
   skus,
 } from '../../shared/db/schema';
 import type { Order, OrderLine } from '../../shared/db/schema';
-import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
+import { MAX_EXTERNAL_ID_LENGTH, UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -100,9 +100,6 @@ const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 /** The channel-dedup partial unique index (the race backstop's name). */
 const ORDERS_SOURCE_EVENT_UNIQUE = 'orders_source_event_unique';
 
-/** Max length of an ingested order's external event id (a channel ref). */
-const MAX_EXTERNAL_EVENT_ID_LENGTH = 200;
-
 /**
  * The line-quantity ceiling, in milli-units (story 10.1). The column is
  * `bigint` now, so the binding limit is the 2⁵³ exact-integer ceiling every
@@ -147,6 +144,14 @@ export interface CreateOrderCommand {
   /** Channel arms — required together when `source: 'ingested'`, else absent. */
   readonly integrationId?: string | undefined;
   readonly externalEventId?: string | undefined;
+  /**
+   * Story 7.2 (RD-3) — the CONNECTION's backorder policy rides the ingest
+   * call: `'reject'` turns ANY post-grant shortfall (`granted < demanded`,
+   * zero-grant lines included) into a whole-order refusal AFTER the grants
+   * and BEFORE the write tx — every hold released, no `orders` row. Default
+   * `'accept'` today's semantics bit-for-bit (every manual caller unchanged).
+   */
+  readonly backorderPolicy?: 'accept' | 'reject' | undefined;
 }
 
 export interface CancelOrderCommand {
@@ -344,9 +349,9 @@ export class OrderCommandService {
         if (!UUID_RE.test(integrationId)) {
           throw validationFailed('integrationId must be a uuid.');
         }
-        if (externalEventId.length > MAX_EXTERNAL_EVENT_ID_LENGTH) {
+        if (externalEventId.length > MAX_EXTERNAL_ID_LENGTH) {
           throw validationFailed(
-            `externalEventId is at most ${MAX_EXTERNAL_EVENT_ID_LENGTH} characters.`,
+            `externalEventId is at most ${MAX_EXTERNAL_ID_LENGTH} characters.`,
           );
         }
       }
@@ -538,6 +543,22 @@ export class OrderCommandService {
       throw err;
     }
 
+    // ── phase 2.5 (story 7.2, RD-3): the connection's reject policy ────────
+    // A whole-order post-grant refusal. AFTER the grants (never a pre-probe —
+    // no TOCTOU window can refuse what would actually have granted) and
+    // BEFORE the write tx opens. The check reads PHASE-2's grant map, never
+    // order rows: any line where granted < demanded — a ZERO-grant (fully
+    // backordered) line included — refuses the WHOLE order; kit PARENTS are
+    // excluded from the map (they reserve 0 by construction; a row-based
+    // check would refuse every kit order regardless of grant success) and
+    // the kit CHILDREN are the entries. The release is the exact machinery
+    // the 503 path already runs — fail-safe toward understated ATP, never
+    // oversold.
+    if (command.backorderPolicy === 'reject' && this.policyRejects(lines, explosions, plainHolds, childHolds)) {
+      await this.releaseAll(command.tenantId, granted, 'backorder-policy-reject');
+      throw new BackorderRejectedError();
+    }
+
     // ── phase 3 (write tx): the order + lines + outbox + audit + key ──────
     try {
       return await withTenantTransaction(this.db, command.tenantId, async (tx) => {
@@ -654,7 +675,19 @@ export class OrderCommandService {
           action: 'order.created',
           targetType: 'order',
           targetId: orderId,
-          reference: idempotencyKey,
+          // RD-2 (review patch P10): an INGESTED order's audit row names its
+          // channel source — the connection + the channel ref, never a
+          // secret — so "where did this order come from" answers from the
+          // audit trail alone. A manual order keeps the idempotency key.
+          reference:
+            command.source === 'ingested' && command.integrationId !== undefined
+              ? JSON.stringify({
+                  channel: {
+                    connectionId: command.integrationId,
+                    externalEventId: command.externalEventId ?? null,
+                  },
+                })
+              : idempotencyKey,
           occurredAt: nowIso(),
         });
 
@@ -1023,6 +1056,35 @@ export class OrderCommandService {
     }
   }
 
+  /**
+   * RD-3's phase-2.5 predicate over the grant phase's maps: does any line
+   * demand more than it was granted? Plain lines and kit CHILDREN are the
+   * entries (a zero grant counts — `?? 0`); kit parents are excluded (they
+   * reserve 0 by construction — the map, never the rows, is the truth).
+   */
+  private policyRejects(
+    lines: readonly OrderLineInput[],
+    explosions: Map<number, readonly KitCompositionLine[]>,
+    plainHolds: Map<number, ReservationSnapshot>,
+    childHolds: Map<string, ReservationSnapshot>,
+  ): boolean {
+    for (const [index, line] of lines.entries()) {
+      const bom = explosions.get(index);
+      if (bom === undefined) {
+        if ((plainHolds.get(index)?.quantity ?? 0) < line.quantity) {
+          return true;
+        }
+        continue;
+      }
+      for (let childIndex = 0; childIndex < bom.length; childIndex += 1) {
+        if ((childHolds.get(`${index}:${childIndex}`)?.quantity ?? 0) < bom[childIndex]!.qty) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   /** The concurrent-dedup-loser outcome: re-read the winner, resolve the contract. */
   private async resolveDedupLoser(
     err: DedupLostError,
@@ -1346,5 +1408,23 @@ class DedupLostError extends Error {
     readonly sourcePayloadHash: string | null,
   ) {
     super('a concurrent delivery of the same channel payload won the dedup index');
+  }
+}
+
+/**
+ * Story 7.2 (RD-3): the whole-order refusal under `backorder_policy:
+ * 'reject'` — thrown between the grant phase and the write tx, so NO
+ * `orders` row exists behind it. The ingest arm maps this (by its code
+ * string) onto the connection-naming refusal; a manual caller would see it
+ * verbatim, and no existing caller passes `'reject'` today.
+ */
+export class BackorderRejectedError extends ProblemException {
+  constructor() {
+    super(
+      'order-backorder-rejected',
+      409,
+      'Order rejected under the backorder policy',
+      "The order's backorder policy is REJECT and some line could not fully reserve at grant time — the whole order was refused and every reservation it moved was released.",
+    );
   }
 }

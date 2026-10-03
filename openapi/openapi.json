@@ -13684,7 +13684,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, malformed connectionId, or an unknown backorderPolicy (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, malformed connectionId, an unknown backorderPolicy, or a non-uuid ingestWarehouseId (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -13714,7 +13714,7 @@
             }
           },
           "404": {
-            "description": "No such connection in this tenant (not-found)",
+            "description": "No such connection, or an unknown/foreign ingest warehouse (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -13749,7 +13749,7 @@
             "bearer": []
           }
         ],
-        "summary": "Sets the connection's backorder policy (channel.manage) — consumed by 7-2's ingestion acceptance",
+        "summary": "Sets the connection's backorder policy and the ONE warehouse orders ingest onto (channel.manage) — the ingest warehouse is consumed by 7-2's order ingestion (RD-4)",
         "tags": [
           "channels"
         ]
@@ -14004,6 +14004,220 @@
         ]
       }
     },
+    "/tenants/{tenantId}/channels/connections/{connectionId}/mappings": {
+      "get": {
+        "operationId": "ChannelsController_listConnectionMappings",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "connectionId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelConnectionMappingsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed connectionId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks channel.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such connection in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Reads the connection's SKU mappings, externalRef → skuId (channel.manage — channel settings are NOT available to operators; the epic's parity rule, pinned bl-21)",
+        "tags": [
+          "channels"
+        ]
+      },
+      "put": {
+        "operationId": "ChannelsController_setConnectionMappings",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "connectionId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetChannelMappingsDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelConnectionMappingsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, malformed connectionId, an over-cap items list, a duplicate externalRef, or a scope count above the publish ceiling — the 400 names the sku × warehouse arithmetic (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks channel.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such connection or a mapped SKU outside this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The same Idempotency-Key is being processed concurrently (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Replaces the connection's SKU mappings FULLY — rows absent from the list are removed (channel.manage); the publish scope ceiling (skuCount × activeWarehouses) is validated and names its arithmetic on refusal",
+        "tags": [
+          "channels"
+        ]
+      }
+    },
     "/tenants/{tenantId}/channels/connections/{connectionId}/retry": {
       "post": {
         "operationId": "ChannelsController_retryConnection",
@@ -14130,6 +14344,248 @@
         "summary": "Retries a stalled connection (channel.manage) — re-appends the availability snapshot through the outbox and half-opens the breaker",
         "tags": [
           "channels"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/webhooks/channels/{provider}/{connectionId}/orders": {
+      "post": {
+        "operationId": "WebhooksController_ingestOrder",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "The owning tenant path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "provider",
+            "required": true,
+            "in": "path",
+            "description": "The channel provider code",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connectionId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelWebhookOrderResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A verified body that carries no mappable order shape (validation-failed — ordered AFTER verification)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Signature invalid, the signing secret absent/unopenable, or the topic does not bind this endpoint (webhook-signature-invalid, empty detail)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The connection’s ingest actor has lost orders.manage (order-actor-unprivileged) — NACK; retry heals after a reconnect",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign connection (not-found), or an unregistered provider",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "backorder_policy reject and some line could not fully reserve (order-backorder-rejected) — nothing written, every hold released",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A divergent payload on a known order ref (order-source-conflict), no ingest warehouse set (ingest-warehouse-unset), or config referencing deleted master data (ingest-config-invalid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "The provider declares no webhook transport on this deployment (channel-transport-unconfigured)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The grant store failed closed (reservation-store-unavailable) — nothing written, the channel retries",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "summary": "A sales channel's order event (signature-verified, no session) — normalizes, maps and accepts through THE order path; the same payload twice resolves to the same order",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/webhooks/channels/{provider}/{connectionId}/cancellations": {
+      "post": {
+        "operationId": "WebhooksController_ingestCancellation",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "The owning tenant path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "provider",
+            "required": true,
+            "in": "path",
+            "description": "The channel provider code",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "connectionId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelWebhookCancellationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A verified body that carries no cancellable shape (validation-failed — ordered AFTER verification)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Signature invalid, the signing secret absent/unopenable, or the topic does not bind this endpoint (webhook-signature-invalid, empty detail)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The connection’s ingest actor has lost orders.manage (order-actor-unprivileged)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown or foreign connection (not-found), or an unregistered provider",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "The provider declares no webhook transport on this deployment (channel-transport-unconfigured)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "No order for this connection carries the ref yet (cancellation-unresolved — NACK; the retry lands after the create commits), or the grant store failed closed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "summary": "A sales channel's cancellation event (signature-verified, no session) — releases an accepted order's holds; past-accepted or already-cancelled orders ignore it",
+        "tags": [
+          "webhooks"
         ]
       }
     }
@@ -23630,6 +24086,11 @@
             "type": "string",
             "format": "uuid"
           },
+          "ingestWarehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
           "rotatedAt": {
             "type": "string",
             "nullable": true,
@@ -23680,6 +24141,7 @@
           "backorderPolicy",
           "credentialVersion",
           "connectedBy",
+          "ingestWarehouseId",
           "rotatedAt",
           "rotatedBy",
           "lastAttemptAt",
@@ -23715,6 +24177,12 @@
               "reject"
             ],
             "description": "The channel's backorder policy (consumed by 7-2's ingestion acceptance)"
+          },
+          "ingestWarehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The ONE warehouse the channel ingests orders onto — absent leaves it, null clears it"
           }
         },
         "required": [
@@ -23826,6 +24294,57 @@
           "verdicts"
         ]
       },
+      "ChannelMappingItemDto": {
+        "type": "object",
+        "properties": {
+          "externalRef": {
+            "type": "string",
+            "description": "The channel-side SKU code (the externalRef an ingest / writeback line carries)"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "externalRef",
+          "skuId"
+        ]
+      },
+      "ChannelConnectionMappingsResponse": {
+        "type": "object",
+        "properties": {
+          "connectionId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChannelMappingItemDto"
+            }
+          }
+        },
+        "required": [
+          "connectionId",
+          "items"
+        ]
+      },
+      "SetChannelMappingsDto": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "The FULL replacement mapping set (≤ 200 SKUs; an empty list clears the set)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChannelMappingItemDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
       "ChannelConnectionListEntryDto": {
         "type": "object",
         "properties": {
@@ -23848,6 +24367,11 @@
               "accept",
               "reject"
             ]
+          },
+          "ingestWarehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
           },
           "credentialVersion": {
             "type": "number"
@@ -23911,6 +24435,7 @@
           "providerName",
           "status",
           "backorderPolicy",
+          "ingestWarehouseId",
           "credentialVersion",
           "health",
           "lastSyncedAt",
@@ -23936,6 +24461,43 @@
         },
         "required": [
           "items"
+        ]
+      },
+      "ChannelWebhookOrderResponse": {
+        "type": "object",
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "backordered",
+              "replayed"
+            ]
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The order this delivery resolved to (accepted, backordered and replayed alike)"
+          }
+        },
+        "required": [
+          "outcome",
+          "orderId"
+        ]
+      },
+      "ChannelWebhookCancellationResponse": {
+        "type": "object",
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "released",
+              "ignored"
+            ]
+          }
+        },
+        "required": [
+          "outcome"
         ]
       }
     }

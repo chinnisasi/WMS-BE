@@ -4,6 +4,7 @@ import type { DomainEvent, EventBus } from '../../shared/events/event-bus.seam';
 import { channelAdapter } from './channel-registry';
 import { MissingChannelEncryptionKeyError, openCredential } from './channel-credentials';
 import type { ChannelCredential } from './channel-credentials';
+import { ChannelItemsUnresolvedError } from './channel-availability-port';
 import type { ChannelAvailabilityRequest } from './channel-availability-port';
 import { ChannelsPublishService, type SyncDeliveryOutcome } from './channels.publish';
 import {
@@ -96,17 +97,57 @@ export class ChannelAvailabilityDelivery implements OnModuleInit {
         await this.channels.recordDelivery(event.tenantId, publication.connectionId, outcome);
         throw err;
       }
+      // RD-6 amended: the mapping rows' cached item ids (per externalRef) —
+      // one read for the whole scope set, before any channel wire.
+      const cache = await this.channels.cachedInventoryItemIds(
+        event.tenantId,
+        publication.connectionId,
+        [...new Set(publication.scopes.map((scope) => scope.externalRef))],
+      );
       const request: ChannelAvailabilityRequest = {
         tenantId: event.tenantId,
         integrationId: publication.connectionId,
         provider: row.provider,
-        scopes: publication.scopes,
+        // RD-6 amended: the mapping rows' cached inventory_item_ids ride the
+        // scopes (a cached ref skips its lookup); the arm reports fresh
+        // resolutions back for the cache write.
+        scopes: publication.scopes.map((scope) => {
+          const cached = cache[scope.externalRef];
+          return cached === undefined ? scope : { ...scope, inventoryItemId: cached };
+        }),
         publishedAt: publication.publishedAt,
       };
       try {
-        await adapter.availabilityArm(credential, request);
+        const result = await adapter.availabilityArm(credential, request);
+        if (result.resolvedItems !== undefined && Object.keys(result.resolvedItems).length > 0) {
+          await this.channels.saveResolvedInventoryItems(
+            event.tenantId,
+            publication.connectionId,
+            result.resolvedItems,
+          );
+        }
         outcome = { ok: true, latencyMs: Date.now() - startedAt };
+        if (result.skippedRefs !== undefined && result.skippedRefs.length > 0) {
+          // A partial attempt refused the unresolved scopes (RD-6 amended):
+          // the meted refusal row carries the count (a status, never a
+          // failure — RD-9); the scopes that posted still settle ok.
+          await this.channels.recordItemUnresolved(
+            event.tenantId,
+            publication.connectionId,
+            `${result.skippedRefs.length} mapped ref(s) resolved to no channel inventory_item_id — their scope(s) were skipped: ${result.skippedRefs.slice(0, 10).join(', ')}${result.skippedRefs.length > 10 ? ', …' : ''}`,
+          );
+        }
       } catch (err) {
+        if (err instanceof ChannelItemsUnresolvedError) {
+          // EVERY scope unresolvable: the typed, METED refusal (RD-6
+          // amended) — one `item-unresolved` row and NOTHING else (no
+          // breaker rung, no health stamp movement — a refused outcome is a
+          // status, never a failure, RD-9); then rethrow (the relay's
+          // budget carries the retry; the mapping PUT or a healed lookup is
+          // the remediation).
+          await this.channels.recordItemUnresolved(event.tenantId, publication.connectionId, err.message);
+          throw err;
+        }
         transportError = err;
         outcome = {
           ok: false,
@@ -150,10 +191,21 @@ function decodePublication(payload: Record<string, unknown>): ChannelAvailabilit
     if (typeof scope !== 'object' || scope === null) {
       return null;
     }
-    const item = scope as { warehouseId?: unknown; skuId?: unknown; visibleMilli?: unknown };
+    // RD-6 amended: every scope carries the mapping's externalRef — the
+    // publish arm resolves the CHANNEL id from it, never the skuId uuid. A
+    // payload without it is a malformed publication (acking, as for any
+    // shape the arm cannot carry).
+    const item = scope as {
+      warehouseId?: unknown;
+      skuId?: unknown;
+      externalRef?: unknown;
+      visibleMilli?: unknown;
+    };
     if (
       typeof item.warehouseId !== 'string' ||
       typeof item.skuId !== 'string' ||
+      typeof item.externalRef !== 'string' ||
+      item.externalRef === '' ||
       typeof item.visibleMilli !== 'number' ||
       !Number.isInteger(item.visibleMilli)
     ) {
@@ -162,6 +214,7 @@ function decodePublication(payload: Record<string, unknown>): ChannelAvailabilit
     scopes.push({
       warehouseId: item.warehouseId,
       skuId: item.skuId,
+      externalRef: item.externalRef,
       visibleMilli: item.visibleMilli,
     });
   }

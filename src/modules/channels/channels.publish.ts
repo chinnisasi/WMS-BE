@@ -1,14 +1,15 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, eq } from 'drizzle-orm';
+import { and, desc, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { channelMappings, integrationCalls, integrations } from '../../shared/db/schema';
-import type { Integration } from '../../shared/db/schema';
+import type { Integration, IntegrationCallStatus } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
+import { openCredential } from './channel-credentials';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
@@ -49,7 +50,21 @@ import {
 /** How many scopes ONE publication computes and carries (the worker's per-cycle bound). */
 export const MAX_SYNC_SCOPES_PER_PUBLISH = 200;
 
-/** What `preparePublication` reports to the worker and the retry command. */
+/**
+ * The verification-refusal meter's coarse window (RD-5): at most one
+ * `verification-failed` row per connection per window — the tamper-storm
+ * amplification guard.
+ */
+export const VERIFICATION_METER_WINDOW_MS = 60_000;
+
+/** One mapped scope's identity: the WMS sku AND the ref that names it. */
+export interface MappedSkuRef {
+  readonly skuId: string;
+  readonly externalRef: string;
+}
+
+/**
+ * What `preparePublication` reports to the worker and the retry command. */
 export type PublicationPrep =
   | { kind: 'absent' }
   | { kind: 'blocked-open' }
@@ -75,9 +90,13 @@ export class ChannelsPublishService {
 
   /**
    * The publish scope computation shared by the worker and the retry
-   * command: mapped sku set × tenant warehouses, one committed read per
-   * scope through the core (RN-6 — the buffer math lives in the inventory
-   * module; the count is bounded so a cycle stays bounded).
+   * command: the mapped (sku, ref) pairs × tenant warehouses, one committed
+   * read per scope through the core (RN-6 — the buffer math lives in the
+   * inventory module; the count is bounded so a cycle stays bounded).
+   *
+   * RD-6 amended: each scope carries the mapping's `externalRef` — the
+   * publish arm resolves it to the channel's `inventory_item_id`; the WMS
+   * skuId alone never names a channel-side item.
    *
    * A store-down ATP read THROWS the 503 `reservation-store-unavailable`
    * — the worker catches it (the degraded-on-503 arm: stamp + publish
@@ -85,7 +104,7 @@ export class ChannelsPublishService {
    */
   async computePublishedScopes(
     tenantId: string,
-    skuIds: readonly string[],
+    skuRefs: readonly MappedSkuRef[],
     connectionId: string,
   ): Promise<PublishedScope[]> {
     const warehouseIds: string[] = [];
@@ -99,7 +118,7 @@ export class ChannelsPublishService {
       cursor = page.nextCursor;
     }
     const scopes: PublishedScope[] = [];
-    for (const skuId of skuIds) {
+    for (const { skuId, externalRef } of skuRefs) {
       for (const warehouseId of warehouseIds) {
         if (scopes.length >= MAX_SYNC_SCOPES_PER_PUBLISH) {
           return scopes;
@@ -113,6 +132,7 @@ export class ChannelsPublishService {
         scopes.push({
           warehouseId: pool.warehouseId,
           skuId: pool.skuId,
+          externalRef,
           visibleMilli: pool.visibleMilli,
         });
       }
@@ -130,7 +150,7 @@ export class ChannelsPublishService {
   async preparePublication(
     tenantId: string,
     connectionId: string,
-    skuIds: readonly string[],
+    skuRefs: readonly MappedSkuRef[],
   ): Promise<
     | { kind: 'absent' }
     | { kind: 'ready'; provider: string; scopes: PublishedScope[] }
@@ -146,7 +166,7 @@ export class ChannelsPublishService {
     if (row === undefined) {
       return { kind: 'absent' };
     }
-    const scopes = await this.computePublishedScopes(tenantId, skuIds, connectionId);
+    const scopes = await this.computePublishedScopes(tenantId, skuRefs, connectionId);
     return { kind: 'ready', provider: row.provider, scopes };
   }
 
@@ -177,7 +197,7 @@ export class ChannelsPublishService {
         return { kind: 'blocked-open' } as const;
       }
       const mapped = await tx
-        .select({ skuId: channelMappings.skuId })
+        .select({ skuId: channelMappings.skuId, externalRef: channelMappings.externalRef })
         .from(channelMappings)
         .where(
           and(
@@ -185,8 +205,8 @@ export class ChannelsPublishService {
             eq(channelMappings.integrationId, connectionId),
           ),
         );
-      const skuIds = [...new Set(mapped.map((row) => row.skuId))];
-      return { kind: 'ready' as const, provider: row.provider, skuIds };
+      const skuRefs = [...new Map(mapped.map((row) => [`${row.skuId}|${row.externalRef}`, row])).values()];
+      return { kind: 'ready' as const, provider: row.provider, skuRefs };
     });
     if (prep.kind === 'absent') {
       return 'absent';
@@ -194,7 +214,7 @@ export class ChannelsPublishService {
     if (prep.kind !== 'ready') {
       return false;
     }
-    const scopes = await this.computePublishedScopes(tenantId, prep.skuIds, connectionId);
+    const scopes = await this.computePublishedScopes(tenantId, prep.skuRefs, connectionId);
     if (scopes.length === 0) {
       // A connection with no (mapped × warehouse) scopes — no mappings is
       // the only way — publishes nothing (RN-6's rule).
@@ -399,6 +419,260 @@ export class ChannelsPublishService {
   }
 
   /**
+   * Story 7-2's webhook face: the connection's provider + LAZY access to its
+   * webhook signing secret, for the HTTP surface. The secret opens when the
+   * caller asks — AFTER the 501 transport gate (review patch P5, row 40:
+   * "BEFORE any credential is touched" is now true of `openCredential`
+   * itself); the sealed blob NEVER crosses into `src/api` (the carriers 4.6b
+   * pin owns that posture) and the plaintext rides request-scoped only,
+   * never logged, persisted or echoed. A missing or unopenable blob answers
+   * `null` — the surface's fail-closed 401 arm (bl-9: the coarse meter
+   * carries the visibility there).
+   */
+  async webhookDeliveryFace(
+    tenantId: string,
+    connectionId: string,
+  ): Promise<{ provider: string; openSecret: () => string | null } | null> {
+    const row = await this.integrationForDelivery(tenantId, connectionId);
+    if (row === null) {
+      return null;
+    }
+    return {
+      provider: row.provider,
+      openSecret: (): string | null => {
+        try {
+          return openCredential(row.credentialSealed).webhookSecret ?? null;
+        } catch {
+          // ANY unopenable blob (key unavailable, corrupt envelope) fails
+          // closed the same way — the surface's verification-failure class.
+          return null;
+        }
+      },
+    };
+  }
+
+  /**
+   * The availability publish's REFUSAL meter (RD-6 amended): the variant
+   * lookup could not resolve (partially, with skips; or entirely, the
+   * refusing attempt) — an `integration_calls` row kind `availability-sync`
+   * status `item-unresolved`, and NOTHING else (never the breaker, never
+   * the health stamps, never `last_synced_at`: a meted refusal is a status,
+   * never a failure — RD-9). A gone connection inserts nothing, silently
+   * (the delivery already acked/gone).
+   */
+  async recordItemUnresolved(
+    tenantId: string,
+    connectionId: string,
+    error: string,
+  ): Promise<void> {
+    await withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({ id: integrations.id })
+        .from(integrations)
+        .where(
+          and(eq(integrations.id, connectionId), eq(integrations.tenantId, tenantId)),
+        )
+        .limit(1);
+      if (rows[0] === undefined) {
+        return;
+      }
+      await tx.insert(integrationCalls).values({
+        id: uuidv7(),
+        tenantId,
+        integrationId: connectionId,
+        kind: 'availability-sync',
+        status: 'item-unresolved',
+        latencyMs: null,
+        error: error.slice(0, 300),
+        at: nowIso(),
+      });
+    });
+  }
+
+  /**
+   * RD-6 amended: the mapping rows' cached `inventory_item_id` for the given
+   * refs (the publish delivery's read side — the arm skips the lookup for
+   * whatever resolves here). Only cached non-null entries are returned.
+   */
+  async cachedInventoryItemIds(
+    tenantId: string,
+    connectionId: string,
+    refs: readonly string[],
+  ): Promise<Record<string, number>> {
+    if (refs.length === 0) return {};
+    const rows = await withTenantTransaction(this.db, tenantId, (tx) =>
+      tx
+        .select({ externalRef: channelMappings.externalRef, itemId: channelMappings.inventoryItemId })
+        .from(channelMappings)
+        .where(
+          and(
+            eq(channelMappings.tenantId, tenantId),
+            eq(channelMappings.integrationId, connectionId),
+          ),
+        ),
+    );
+    const wanted = new Set(refs);
+    const cached: Record<string, number> = {};
+    for (const row of rows) {
+      if (wanted.has(row.externalRef) && row.itemId !== null) {
+        cached[row.externalRef] = row.itemId;
+      }
+    }
+    return cached;
+  }
+
+  /**
+   * RD-6 amended: the arm's fresh resolutions persisted on the mapping rows
+   * (per (tenant, connection, ref)) — the NEXT publish cycle skips the
+   * lookup for them. Never logged, never echoed; the numeric id is the
+   * channel's own identifier, not a secret.
+   */
+  async saveResolvedInventoryItems(
+    tenantId: string,
+    connectionId: string,
+    resolved: Readonly<Record<string, number>>,
+  ): Promise<void> {
+    const entries = Object.entries(resolved);
+    if (entries.length === 0) return;
+    await withTenantTransaction(this.db, tenantId, async (tx) => {
+      for (const [externalRef, itemId] of entries) {
+        await tx
+          .update(channelMappings)
+          .set({ inventoryItemId: itemId, updatedAt: nowIso() })
+          .where(
+            and(
+              eq(channelMappings.tenantId, tenantId),
+              eq(channelMappings.integrationId, connectionId),
+              eq(channelMappings.externalRef, externalRef),
+            ),
+          );
+      }
+    });
+  }
+
+  // ── story 7.2: the ingest + writeback meter arms ────────────────────────────
+  // Both are METER-ONLY (triage row 28 / RD-9): an outcome here never touches
+  // `last_synced_at` / `last_error` / `consecutive_failures` / the breaker —
+  // sync health is the availability sync's own story, and the writeback is
+  // not a sync. Each row goes in one tiny transaction of its own (a meter
+  // failed to write must not fail the delivery that produced it).
+
+  /**
+   * One webhook ingest's settle: an `integration_calls` row kind
+   * `order-ingest` carrying the OUTCOME status. Refused outcomes
+   * (`rejected`, `unmapped`, `verification-failed`, …) meter as statuses —
+   * they are decisions, not failures; nothing about the connection's health
+   * or breaker moves (RD-9).
+   */
+  async recordIngestOutcome(
+    tenantId: string,
+    connectionId: string,
+    args: {
+      status: IntegrationCallStatus;
+      latencyMs: number | null;
+      /** Refusal detail (the connection's OWNER knows the order ref; a webhook caller never reads this meter). */
+      error: string | null;
+    },
+  ): Promise<void> {
+    await withTenantTransaction(this.db, tenantId, async (tx) =>
+      tx.insert(integrationCalls).values({
+        id: uuidv7(),
+        tenantId,
+        integrationId: connectionId,
+        kind: 'order-ingest',
+        status: args.status,
+        latencyMs: args.latencyMs,
+        error: args.error === null ? null : args.error.slice(0, 300),
+        at: nowIso(),
+      }),
+    );
+  }
+
+  /**
+   * The verification-failure class's COARSE meter (RD-5): a tampering
+   * webhook storm must not mint a meter row per attempt, and the row must
+   * name nothing — no header value, no body byte. At most one
+   * `verification-failed` row per (connection, window). The read is the
+   * newest such row's `at` (the append-only meter's cheapest probe).
+   */
+  async recordIngestVerificationRefused(tenantId: string, connectionId: string): Promise<void> {
+    await withTenantTransaction(this.db, tenantId, async (tx) => {
+      const recent = await tx
+        .select({ at: integrationCalls.at })
+        .from(integrationCalls)
+        .where(
+          and(
+            eq(integrationCalls.tenantId, tenantId),
+            eq(integrationCalls.integrationId, connectionId),
+            eq(integrationCalls.kind, 'order-ingest'),
+            eq(integrationCalls.status, 'verification-failed'),
+          ),
+        )
+        .orderBy(desc(integrationCalls.at))
+        .limit(1);
+      const last = recent[0];
+      if (
+        last !== undefined &&
+        Date.now() - Date.parse(last.at) < VERIFICATION_METER_WINDOW_MS
+      ) {
+        return;
+      }
+      await tx.insert(integrationCalls).values({
+        id: uuidv7(),
+        tenantId,
+        integrationId: connectionId,
+        kind: 'order-ingest',
+        status: 'verification-failed',
+        latencyMs: null,
+        error: null,
+        at: nowIso(),
+      });
+    });
+  }
+
+  /**
+   * The writeback delivery's settle (RD-7): an `integration_calls` row kind
+   * `order-writeback` — and NOTHING else. Verified: `recordDelivery`
+   * hardcodes the sync stamps + breaker rungs, so reusing it would corrupt
+   * sync health with writeback outcomes. A gone connection inserts nothing
+   * (the meter row names a connection that cannot exist), silently: the
+   * delivery already ACKed a gone connection, and nothing here may revive
+   * the failure.
+   */
+  async recordWritebackDelivery(
+    tenantId: string,
+    connectionId: string,
+    args: {
+      status: IntegrationCallStatus;
+      latencyMs: number | null;
+      error: string | null;
+    },
+  ): Promise<void> {
+    await withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({ id: integrations.id })
+        .from(integrations)
+        .where(
+          and(eq(integrations.id, connectionId), eq(integrations.tenantId, tenantId)),
+        )
+        .limit(1);
+      if (rows[0] === undefined) {
+        return;
+      }
+      await tx.insert(integrationCalls).values({
+        id: uuidv7(),
+        tenantId,
+        integrationId: connectionId,
+        kind: 'order-writeback',
+        status: args.status,
+        latencyMs: args.latencyMs,
+        error: args.error === null ? null : args.error.slice(0, 300),
+        at: nowIso(),
+      });
+    });
+  }
+
+  /**
    * The mapping write arm (the 7-1 deliverable's seed path; the facade's
    * seed arm delegates here). The story's I/O matrix exposes no mapping
    * ROUTE — 7-2's ingestion configures and resolves through it — so this
@@ -455,7 +729,10 @@ export class ChannelsPublishService {
               channelMappings.integrationId,
               channelMappings.externalRef,
             ],
-            set: { skuId: item.skuId, updatedAt: nowIso() },
+            // A re-mapped ref's cached inventory_item_id belongs to the OLD
+            // mapping (RD-6 amended) — the upsert clears it so the next
+            // publish re-resolves the ref freshly.
+            set: { skuId: item.skuId, inventoryItemId: null, updatedAt: nowIso() },
           })
           .returning({ id: channelMappings.id });
         written += inserted.length;

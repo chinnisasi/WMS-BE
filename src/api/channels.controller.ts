@@ -26,10 +26,12 @@ import {
   ChannelBuffersSetResponse,
   ChannelConnectionsResponse,
   ChannelConnectionResponse,
+  ChannelConnectionMappingsResponse,
   type ChannelConnectionListEntryDto,
   ConnectChannelDto,
   RotateChannelCredentialDto,
   SetChannelBuffersDto,
+  SetChannelMappingsDto,
   UpdateConnectionConfigDto,
   toConnectionResponse,
   toListEntryResponse,
@@ -149,15 +151,15 @@ export class ChannelsController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      "Sets the connection's backorder policy (channel.manage) — consumed by 7-2's ingestion acceptance",
+      "Sets the connection's backorder policy and the ONE warehouse orders ingest onto (channel.manage) — the ingest warehouse is consumed by 7-2's order ingestion (RD-4)",
   })
   @ApiBody({ type: UpdateConnectionConfigDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: ChannelConnectionResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, malformed connectionId, or an unknown backorderPolicy (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, malformed connectionId, an unknown backorderPolicy, or a non-uuid ingestWarehouseId (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks channel.manage (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('No such connection in this tenant (not-found)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such connection, or an unknown/foreign ingest warehouse (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('The same Idempotency-Key is being processed concurrently (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
@@ -178,6 +180,7 @@ export class ChannelsController {
         actorUserId: session.userId,
         connectionId,
         backorderPolicy: dto.backorderPolicy as 'accept' | 'reject',
+        ...(dto.ingestWarehouseId === undefined ? {} : { ingestWarehouseId: dto.ingestWarehouseId }),
       },
       key,
     );
@@ -228,6 +231,80 @@ export class ChannelsController {
       key,
     );
     return { connectionId: result.connectionId, verdicts: toVerdictResponses(result.verdicts) };
+  }
+
+  @Get(':tenantId/channels/connections/:connectionId/mappings')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Reads the connection's SKU mappings, externalRef → skuId (channel.manage — channel settings are NOT available to operators; the epic's parity rule, pinned bl-21)",
+  })
+  @ApiOkResponse({ type: ChannelConnectionMappingsResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed connectionId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks channel.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such connection in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'connectionId', format: 'uuid' })
+  async listConnectionMappings(
+    @Param('tenantId') tenantId: string,
+    @Param('connectionId') connectionId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ChannelConnectionMappingsResponse> {
+    assertOwnTenant(session.tenantId, tenantId);
+    assertUuidParam(connectionId, 'connectionId');
+    // The GET is channel.manage-guarded in the command service, inside its
+    // own tenant tx (every route's authority is the DB re-read, AD-4).
+    await this.channels.assertConnectionManage(tenantId, session.userId, connectionId);
+    const items = await this.channels.listChannelMappings(tenantId, connectionId);
+    return { connectionId, items };
+  }
+
+  /**
+   * Row 5 (7-2): the FULL-replacement mappings PUT. The GET's guard rides
+   * the command's own `assertPermission(channel.manage)` in-tx — identical
+   * to every sibling PUT here.
+   */
+  @Put(':tenantId/channels/connections/:connectionId/mappings')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Replaces the connection's SKU mappings FULLY — rows absent from the list are removed (channel.manage); the publish scope ceiling (skuCount × activeWarehouses) is validated and names its arithmetic on refusal",
+  })
+  @ApiBody({ type: SetChannelMappingsDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ChannelConnectionMappingsResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, malformed connectionId, an over-cap items list, a duplicate externalRef, or a scope count above the publish ceiling — the 400 names the sku × warehouse arithmetic (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks channel.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such connection or a mapped SKU outside this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The same Idempotency-Key is being processed concurrently (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'connectionId', format: 'uuid' })
+  async setConnectionMappings(
+    @Param('tenantId') tenantId: string,
+    @Param('connectionId') connectionId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: SetChannelMappingsDto,
+  ): Promise<ChannelConnectionMappingsResponse> {
+    assertOwnTenant(session.tenantId, tenantId);
+    assertUuidParam(connectionId, 'connectionId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const result = await this.channels.setConnectionMappings(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        connectionId,
+        items: dto.items.map((item) => ({ externalRef: item.externalRef, skuId: item.skuId })),
+      },
+      key,
+    );
+    return { connectionId: result.connectionId, items: [...result.items] };
   }
 
   @Delete(':tenantId/channels/connections/:connectionId')

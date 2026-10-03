@@ -1,16 +1,18 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { ArrayMaxSize, ArrayMinSize, IsIn, IsInt, IsObject, IsUUID, Max, Min, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsIn, IsInt, IsObject, IsOptional, IsString, IsUUID, Max, MaxLength, Min, ValidateNested } from 'class-validator';
 import { MAX_QUANTITY_MILLI } from '../shared/primitives/quantity';
 import { BACKORDER_POLICIES, CHANNEL_PROVIDERS } from '../shared/db/schema';
+import { MAX_BUFFER_ITEMS } from '../modules/channels/channels.command';
 import type {
   ChannelConnectionView,
   ChannelConnectionListEntry,
   ChannelBufferVerdict,
-} from '../modules/channels/channels.view';
+  ChannelMappingItem,
+} from '../modules/channels/channels.facade';
 
 /**
- * The channels HTTP surface's bodies (story 7.1). The connect/rotate
+ * The channels HTTP surface's bodies (stories 7.1 + 7.2). The connect/rotate
  * bodies are WRITE-ONLY: `credentials` validates as an object and is
  * sealed by the command — the response DTOs never carry it.
  */
@@ -45,6 +47,14 @@ export class UpdateConnectionConfigDto {
   @ApiProperty({ enum: BACKORDER_POLICIES, description: "The channel's backorder policy (consumed by 7-2's ingestion acceptance)" })
   @IsIn(BACKORDER_POLICIES)
   backorderPolicy!: string;
+
+  // 7.2 (RD-4): absent = unchanged; explicit null = clear; a uuid = set.
+  // The nullable `type: String` pin is the house rule (union reflection).
+  @ApiProperty({ type: String, nullable: true, required: false, format: 'uuid', description: 'The ONE warehouse the channel ingests orders onto — absent leaves it, null clears it' })
+  @IsOptional()
+  @IsString()
+  @IsUUID()
+  ingestWarehouseId?: string | null;
 }
 
 export class ChannelBufferItemDto {
@@ -77,6 +87,27 @@ export class SetChannelBuffersDto {
   items!: ChannelBufferItemDto[];
 }
 
+// ── 7.2 mapping bodies (row 5) ──────────────────────────────────────────────
+
+export class ChannelMappingItemDto {
+  @ApiProperty({ description: 'The channel-side SKU code (the externalRef an ingest / writeback line carries)' })
+  @IsString()
+  @MaxLength(512)
+  externalRef!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  @IsUUID()
+  skuId!: string;
+}
+
+export class SetChannelMappingsDto {
+  @ApiProperty({ type: [ChannelMappingItemDto], description: `The FULL replacement mapping set (≤ ${MAX_BUFFER_ITEMS} SKUs; an empty list clears the set)` })
+  @ArrayMaxSize(MAX_BUFFER_ITEMS)
+  @ValidateNested({ each: true })
+  @Type(() => ChannelMappingItemDto)
+  items!: ChannelMappingItemDto[];
+}
+
 // ── responses ───────────────────────────────────────────────────────────────
 
 /** One connection's public face — NEVER credential material. */
@@ -97,6 +128,9 @@ export class ChannelConnectionResponse {
   credentialVersion!: number;
   @ApiProperty({ format: 'uuid' })
   connectedBy!: string;
+  // 7.2 (RD-4): the ingest warehouse, null until the config PUT sets it.
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  ingestWarehouseId!: string | null;
   // `type` is load-bearing on the nullable fields (the carriers precedent):
   // tsc's decorator metadata for a `string | null` union is `String` under
   // jest but `Object` under swc — pinning the type keeps the served document
@@ -131,6 +165,9 @@ export class ChannelConnectionListEntryDto {
   status!: string;
   @ApiProperty({ enum: BACKORDER_POLICIES })
   backorderPolicy!: string;
+  // 7.2 (RD-4).
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  ingestWarehouseId!: string | null;
   @ApiProperty()
   credentialVersion!: number;
   @ApiProperty({ enum: ['ok', 'degraded', 'error'] })
@@ -186,6 +223,17 @@ export class ChannelBuffersSetResponse {
   @ApiProperty({ type: [ChannelBufferVerdictDto] })
   verdicts!: ChannelBufferVerdictDto[];
 }
+
+/** The mapping arm's body (7.2 row 4/5) — the GET and the PUT's 200. */
+export class ChannelConnectionMappingsResponse {
+  @ApiProperty({ format: 'uuid' })
+  connectionId!: string;
+  @ApiProperty({ type: [ChannelMappingItemDto] })
+  items!: ChannelMappingItemDto[];
+}
+
+/** The `externalRef → skuId` row shape (the module's own type, surfaced). */
+export type { ChannelMappingItem };
 
 /** Channel uuid path params / views ride these shims. */
 export function toConnectionResponse(connection: ChannelConnectionView): ChannelConnectionResponse {

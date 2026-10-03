@@ -10,17 +10,20 @@ import {
   integrations,
 } from '../../shared/db/schema';
 import type { Integration } from '../../shared/db/schema';
-import { uuidv7 } from '../../shared/primitives/ids';
+import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { MAX_QUANTITY_MILLI } from '../../shared/primitives/quantity';
-import {
-  isUniqueViolationOn,
-  ProblemException,
-} from '../../shared/problem-details/problem.exception';
+import { ProblemException } from '../../shared/problem-details/problem.exception';
+import { isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
-import { getMemberRoleIn, assertWarehouseInTenant } from '../tenancy/tenancy.service';
+import {
+  getMemberRoleIn,
+  assertWarehouseInTenant,
+  TenancyService,
+  MAX_WAREHOUSE_PAGE_SIZE,
+} from '../tenancy/tenancy.service';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
@@ -47,8 +50,11 @@ import {
   channelCredentialRejected,
   channelEncryptionUnavailable,
   concurrentIdempotency,
+  ingestWarehouseNotFound,
+  invalidUuidParam,
   unknownChannelProvider,
 } from './channels.errors';
+import { MAX_SYNC_SCOPES_PER_PUBLISH, type MappedSkuRef } from './channels.publish';
 import type { PublishedScope } from './channels.events';
 import { CONNECTION_COLUMNS, toConnectionView } from './channels.view';
 import type {
@@ -91,11 +97,13 @@ import type {
  * connection holds releases THROUGH the core's release (a buffer IS a
  * reservations row, AD-13) with its counter mirror after commit, and the
  * mapped external references go with it (no orphan mapping survives its
- * connection). The revoke port attempt happens BEFORE the delete
- * transaction — metered, logged, never blocking (an unreachable channel
- * keeps no say in the disconnect; AD-15 makes deletion a local atomic act).
- * The read + attempt happen in an unlocking first transaction, and the
- * delete re-locks and re-404s (same Idempotency-Key replays are carried by
+ * connection). Story 7.2 (RN-7): the revoke port attempt happens AFTER the
+ * delete commits — outside any transaction (a real HTTP arm inside the tx
+ * would hold the row lock up to CHANNEL_HTTP_TIMEOUT_MS), metered, logged,
+ * never blocking (an unreachable channel keeps no say in the disconnect;
+ * AD-15 makes deletion a local atomic act). The read happens in the
+ * unlocking first transaction, and the delete re-locks and re-404s (same
+ * Idempotency-Key replays are carried by
  * the response being 204 — there is no snapshot to serve).
  *
  * All secrets ride the AD-15 paths of `channel-credentials.ts`: sealed
@@ -127,6 +135,14 @@ export interface UpdateConnectionConfigCommand {
   readonly actorUserId: string;
   readonly connectionId: string;
   readonly backorderPolicy: 'accept' | 'reject';
+  /**
+   * Story 7.2 (RD-4): the one ingest warehouse, WYSIWYG — ABSENT means
+   * "unchanged", an explicit `null` means "clear", a uuid sets it. The
+   * command-side boundary validates the uuid shape (the DTO carries
+   * @IsUUID, but the command is the boundary for non-HTTP callers) and the
+   * tenant membership (404).
+   */
+  readonly ingestWarehouseId?: string | null | undefined;
 }
 
 export interface DisconnectChannelCommand {
@@ -152,6 +168,23 @@ export interface SetConnectionBuffersCommand {
   readonly actorUserId: string;
   readonly connectionId: string;
   readonly items: readonly ChannelBufferPlanItem[];
+}
+
+/**
+ * The mappings PUT's item (story 7.2, T6 — the 7-1 facade-only seed arm's
+ * first ROUTE caller). FULL replacement: the connection's mapping set
+ * becomes exactly `items` — rows removed from the list are gone.
+ */
+export interface ChannelMappingItem {
+  readonly externalRef: string;
+  readonly skuId: string;
+}
+
+export interface SetConnectionMappingsCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly connectionId: string;
+  readonly items: readonly ChannelMappingItem[];
 }
 
 
@@ -210,6 +243,21 @@ function codeOf(error: ProblemException): string {
   return (error.getResponse() as { code: string }).code;
 }
 
+/** 400 `validation-failed` — the mappings PUT's generic shape refusal. */
+function validationFailed(detail: string): ProblemException {
+  return new ProblemException('validation-failed', 400, 'Mapping set rejected', detail);
+}
+
+/** 400 `validation-failed` — the item count of the mappings PUT is over the cap. */
+function mappingSetTooLarge(count: number, max: number): ProblemException {
+  return new ProblemException(
+    'validation-failed',
+    400,
+    'Mapping set too large',
+    `The mapping list carries ${count} entries; at most ${max} SKUs per connection. (The full scope arithmetic rides the ceiling check inside the transaction.)`,
+  );
+}
+
 @Injectable()
 export class ChannelsCommandService {
   private readonly logger = new Logger('ChannelsCommand');
@@ -220,6 +268,9 @@ export class ChannelsCommandService {
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(ChannelsPublishService) private readonly publish: ChannelsPublishService,
+    // Story 7.2 (T6) — the scope-ceiling arithmetic counts the tenant's
+    // ACTIVE warehouses (the publish's scope enumeration dimension).
+    @Inject(TenancyService) private readonly tenancy: TenancyService,
   ) {}
 
   /**
@@ -405,18 +456,29 @@ export class ChannelsCommandService {
   }
 
   /**
-   * Arm 2b — `PUT .../connections/{id}`: the connection's backorder policy
-   * (stored now; consumed by 7-2's ingestion acceptance). A config write
-   * only — no credential material is involved.
+   * Arm 2b — `PUT .../connections/{id}`: the connection's config — the
+   * backorder policy (consumed by the ingest's acceptance, RD-3) and, story
+   * 7.2, the ingest warehouse (RD-4: WYSIWYG — absent = unchanged, null =
+   * clear, uuid = set with a 404 on a foreign/unknown warehouse). A config
+   * write only — no credential material is involved.
    */
   async updateConnectionConfig(
     command: UpdateConnectionConfigCommand,
     idempotencyKey: string,
   ): Promise<ChannelConnectionView> {
+    // RD-4's uuid-shape boundary (22P02-free): the DTO validates too, but
+    // the command is the boundary for the adapter path.
+    if (typeof command.ingestWarehouseId === 'string' && !UUID_RE.test(command.ingestWarehouseId)) {
+      throw invalidUuidParam('ingestWarehouseId', command.ingestWarehouseId);
+    }
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       connectionId: command.connectionId,
       backorderPolicy: command.backorderPolicy,
+      // `undefined` drops (absent = unchanged); `null` stays (clear). The
+      // two hash differently — replay distinguishes them.
+      ingestWarehouseId: command.ingestWarehouseId ?? undefined,
+      ingestWarehouseCleared: command.ingestWarehouseId === null ? true : undefined,
     });
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
@@ -440,10 +502,30 @@ export class ChannelsCommandService {
         throw channelConnectionNotFound();
       }
 
+      // The warehouse write's own guards, in THIS transaction (404 before
+      // any write): a set that is a uuid must belong to the tenant.
+      if (typeof command.ingestWarehouseId === 'string') {
+        await assertWarehouseInTenant(tx, command.tenantId, command.ingestWarehouseId).catch(
+          (err) => {
+            if (err instanceof ProblemException && err.getStatus() === 404) {
+              throw ingestWarehouseNotFound(command.ingestWarehouseId!);
+            }
+            throw err;
+          },
+        );
+      }
+
       const updatedAt = nowIso();
       const updated = await tx
         .update(integrations)
-        .set({ backorderPolicy: command.backorderPolicy, updatedAt })
+        .set({
+          backorderPolicy: command.backorderPolicy,
+          // Absent = unchanged (the field is skipped); explicit null = clear.
+          ...(command.ingestWarehouseId === undefined
+            ? {}
+            : { ingestWarehouseId: command.ingestWarehouseId }),
+          updatedAt,
+        })
         .where(eq(integrations.id, existing.id))
         .returning(CONNECTION_COLUMNS);
       const connection = toConnectionView(updated[0]!);
@@ -461,6 +543,9 @@ export class ChannelsCommandService {
             connectionId: connection.id,
             provider: connection.provider,
             backorderPolicy: command.backorderPolicy,
+            ...(command.ingestWarehouseId === undefined
+              ? {}
+              : { ingestWarehouseId: command.ingestWarehouseId }),
           },
         },
       });
@@ -689,14 +774,15 @@ export class ChannelsCommandService {
   /**
    * Arm 3 — `DELETE .../connections/{id}`: a hard DELETE (the carriers
    * disconnect shape — a status flip would leave sealed secret material at
-   * rest after the operator asked for it to be gone). The revoke attempt
-   * precedes the delete transaction (metered, never blocking); the delete
-   * releases the connection's standing buffers and drops its mappings;
-   * mirrors happen after the commit. The route returns 204 — there is no
-   * snapshot to replay, and a repeat under a NEW key is a 404 (the
-   * carriers rule). The Idempotency-Key is still consumed (its key row
-   * records the disconnect happened), so a same-key retry after a crash
-   * between phases cannot silently skip the revoke attempt.
+   * rest after the operator asked for it to be gone). Story 7.2 (RN-7): the
+   * revoke attempt rides AFTER the delete commits — outside any transaction
+   * (a port call inside the tx would hold the row lock up to
+   * `CHANNEL_HTTP_TIMEOUT_MS`); the delete releases the connection's
+   * standing buffers and drops its mappings; mirrors happen after the
+   * commit. The route returns 204 — there is no snapshot to replay, and a
+   * repeat under a NEW key is a 404 (the carriers rule). The Idempotency-Key
+   * is still consumed (its key row records the disconnect happened), so a
+   * same-key retry after a crash before the revoke cannot silently skip it.
    */
   async disconnect(
     command: DisconnectChannelCommand,
@@ -753,42 +839,9 @@ export class ChannelsCommandService {
     }
     const existing = phase1.row;
 
-    // The revocation attempt — metered and logged, NEVER blocking (AD-15:
-    // credential deletion is a local, atomic act; an unopenable blob — a
-    // lost master key — MUST NOT block the delete). The attempt reads the
-    // credential from this phase's row; the delete phase re-locks and
-    // re-404s if the row left between the phases.
-    let revokeError: string | null = null;
-    let revokeStatus: 'ok' | 'failed' = 'ok';
-    const adapter = requireChannelAdapterOrNull(existing.provider);
-    if (adapter === null || adapter === undefined) {
-      revokeStatus = 'failed';
-      revokeError = 'adapter no longer registered';
-    } else {
-      try {
-        const credential = openCredential(existing.credentialSealed!);
-        await adapter.revokeArm({
-          tenantId: command.tenantId,
-          integrationId: existing.id,
-          provider: existing.provider,
-          credential,
-        });
-        revokeStatus = 'ok';
-      } catch (err) {
-        revokeStatus = 'failed';
-        revokeError = err instanceof MissingChannelEncryptionKeyError
-          ? 'credential unopenable (encryption key unavailable)'
-          : err instanceof Error
-            ? err.message.slice(0, 300)
-            : 'revoke attempt failed';
-        this.logger.warn(
-          `revoke attempt for provider ${existing.provider} connection ${existing.id} failed: ${revokeError}`,
-        );
-      }
-    }
-
     // Phase 2 — the delete itself, one transaction: release buffers, drop
-    // mappings + the row, meter the revoke attempt, audit, consume the key.
+    // mappings + the row, audit, consume the key. (The revoke attempt moved
+    // AFTER this commit — story 7.2's RN-7 fold; see below the mirror loop.)
     const released = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       const locked = await this.lockConnection(tx, command.tenantId, command.connectionId);
       if (locked === null) {
@@ -831,18 +884,9 @@ export class ChannelsCommandService {
         );
       await tx.delete(integrations).where(eq(integrations.id, existing.id));
 
-      // The revoke attempt's meter row (kind `credential-revoke`), the
-      // audit row, then the key row — the landmark tail's order, adapted.
-      await tx.insert(integrationCalls).values({
-        id: uuidv7(),
-        tenantId: command.tenantId,
-        integrationId: existing.id,
-        kind: 'credential-revoke',
-        status: revokeStatus,
-        latencyMs: null,
-        error: revokeError,
-        at: nowIso(),
-      });
+      // The revoke attempt's METER row moved after the commit with the
+      // attempt itself (RN-7). The audit row + the key row — the landmark
+      // tail's order, adapted.
       await tx.insert(auditEvents).values({
         id: uuidv7(),
         tenantId: command.tenantId,
@@ -889,6 +933,66 @@ export class ChannelsCommandService {
         );
       }
     }
+
+    // ── story 7.2 (RN-7 / review finding 4): the re-revoke rides AFTER the
+    // delete commits, OUTSIDE any transaction. The 7-1 posture revoked
+    // BEFORE the delete tx; with a real HTTP revoke arm that would hold the
+    // row's lock up to CHANNEL_HTTP_TIMEOUT_MS against the pool — the exact
+    // lock-duration the pool-nesting gotcha forbids. Post-commit is equally
+    // correct under AD-15: the delete is a local atomic act, and the stale
+    // blob's revocation needs no transaction. Phase 1's row is the read —
+    // the delete re-locked and re-404'd below; this attempt uses ITS blob.
+
+    const adapter = requireChannelAdapterOrNull(existing.provider);
+    let revokeError: string | null = null;
+    let revokeStatus: 'ok' | 'failed' = 'ok';
+    if (adapter === null || adapter === undefined) {
+      revokeStatus = 'failed';
+      revokeError = 'adapter no longer registered';
+    } else {
+      try {
+        const credential = openCredential(existing.credentialSealed!);
+        await adapter.revokeArm({
+          tenantId: command.tenantId,
+          integrationId: existing.id,
+          provider: existing.provider,
+          credential,
+        });
+        revokeStatus = 'ok';
+      } catch (err) {
+        revokeStatus = 'failed';
+        revokeError = err instanceof MissingChannelEncryptionKeyError
+          ? 'credential unopenable (encryption key unavailable)'
+          : err instanceof Error
+            ? err.message.slice(0, 300)
+            : 'revoke attempt failed';
+        this.logger.warn(
+          `revoke attempt for provider ${existing.provider} connection ${existing.id} failed: ${revokeError}`,
+        );
+      }
+    }
+
+    // The revoke attempt's meter row — its own tiny transaction, best-effort
+    // (a lost meter row must not wedge anything; the delete already
+    // committed and the caller's answer stands).
+    try {
+      await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+        await tx.insert(integrationCalls).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          integrationId: existing.id,
+          kind: 'credential-revoke',
+          status: revokeStatus,
+          latencyMs: null,
+          error: revokeError,
+          at: nowIso(),
+        });
+      });
+    } catch (err) {
+      this.logger.error(
+        `meter row for the revoke attempt of connection ${existing.id} failed to write (non-blocking): ${String(err)}`,
+      );
+    }
   }
 
   /**
@@ -915,7 +1019,7 @@ export class ChannelsCommandService {
 
     type RetryPhase1 =
       | { kind: 'replayed'; snapshot: ChannelConnectionView }
-      | { kind: 'mapped'; skuIds: string[] };
+      | { kind: 'mapped'; skuRefs: MappedSkuRef[] };
     const phase1 = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       assertPermission(
         await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
@@ -930,7 +1034,7 @@ export class ChannelsCommandService {
         throw channelConnectionNotFound();
       }
       const mapped = await tx
-        .select({ skuId: channelMappings.skuId })
+        .select({ skuId: channelMappings.skuId, externalRef: channelMappings.externalRef })
         .from(channelMappings)
         .where(
           and(
@@ -938,7 +1042,8 @@ export class ChannelsCommandService {
             eq(channelMappings.integrationId, command.connectionId),
           ),
         );
-      return { kind: 'mapped', skuIds: [...new Set(mapped.map((row) => row.skuId))] } satisfies RetryPhase1;
+      const skuRefs = [...new Map(mapped.map((row) => [`${row.skuId}|${row.externalRef}`, row])).values()];
+      return { kind: 'mapped', skuRefs } satisfies RetryPhase1;
     });
     if (phase1.kind === 'replayed') {
       return phase1.snapshot;
@@ -952,7 +1057,7 @@ export class ChannelsCommandService {
     const prep = await this.publish.preparePublication(
       command.tenantId,
       command.connectionId,
-      phase1.skuIds,
+      phase1.skuRefs,
     );
     const scopes: PublishedScope[] = prep.kind === 'ready' ? prep.scopes : [];
 
@@ -993,6 +1098,159 @@ export class ChannelsCommandService {
       });
       return toConnectionView(appended.row);
     });
+  }
+
+  /**
+   * Arm 7 — `PUT .../connections/{id}/mappings` (story 7.2, T6): FULL
+   * replacement of the connection's `externalRef → skuId` mapping set in
+   * ONE transaction — `channel.manage` on both mapping routes (the epic's
+   * channel-settings rule; the manage⇒orders.manage parity pin rides T8).
+   *
+   * The cap is the publish's scope arithmetic, not SKU count alone
+   * (review finding 14): beyond `skuCount × activeWarehouseCount ≤
+   * MAX_SYNC_SCOPES_PER_PUBLISH` the publish head-truncates its per-cycle
+   * scope slice and the tail SKUs would never publish — the stale-for-
+   * forever wedge the 400 names the arithmetic to prevent.
+   */
+  async setConnectionMappings(
+    command: SetConnectionMappingsCommand,
+    idempotencyKey: string,
+  ): Promise<{ connectionId: string; items: readonly ChannelMappingItem[] }> {
+    // ── shape at command entry (400 before any transaction) ──────────────
+    if (command.items.length > MAX_BUFFER_ITEMS) {
+      throw mappingSetTooLarge(command.items.length, MAX_BUFFER_ITEMS);
+    }
+    for (const item of command.items) {
+      if (typeof item.externalRef !== 'string' || item.externalRef.trim() === '') {
+        throw validationFailed('Every mapping item carries a non-empty externalRef.');
+      }
+      if (item.externalRef.length > 512) {
+        throw validationFailed(`externalRef "${item.externalRef.slice(0, 24)}…" exceeds 512 characters.`);
+      }
+      if (!UUID_RE.test(item.skuId)) {
+        throw validationFailed(`Every mapping item's skuId must be a uuid (got "${item.skuId.slice(0, 12)}…").`);
+      }
+    }
+    // The duplicate check compares TRIMMED refs (review patch P6): the
+    // insert stores `.trim()` below, so a raw comparison would let {"A",
+    // " A"} pass this 400 and die on the unique index as an untyped 500.
+    const refDuplicates = [...new Set(
+      command.items.filter((item, index) =>
+        command.items.findIndex(
+          (other) => other.externalRef.trim() === item.externalRef.trim(),
+        ) !== index).map((item) => item.externalRef),
+    )];
+    if (refDuplicates.length > 0) {
+      throw validationFailed(
+        `externalRef must appear at most once per connection — duplicates: ${refDuplicates.slice(0, 5).join(', ')}.`,
+      );
+    }
+
+    const payloadHash = hashCommandPayload({
+      arm: 'mappings',
+      tenantId: command.tenantId,
+      connectionId: command.connectionId,
+      items: command.items,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(
+        await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+        'channel.manage',
+      );
+      const replayed = await this.replayMappings(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
+      }
+      const existing = await this.lockConnection(tx, command.tenantId, command.connectionId);
+      if (existing === null) {
+        throw channelConnectionNotFound();
+      }
+
+      // Every mapped sku must be this tenant's (404 naming it — the catalog
+      // facade read, the buffers arm's shape).
+      for (const skuId of [...new Set(command.items.map((item) => item.skuId))]) {
+        const sku = await this.catalog.findSku(command.tenantId, skuId);
+        if (sku === null) {
+          throw bufferSkuNotFound(skuId);
+        }
+      }
+
+      // The scope-ceiling arithmetic (row 5's 400): distinct SKUs × ACTIVE
+      // tenant warehouses against the publish's per-cycle cap.
+      const skuCount = new Set(command.items.map((item) => item.skuId)).size;
+      const warehouseCount = await this.countActiveWarehouses(command.tenantId);
+      const scopes = skuCount * warehouseCount;
+      if (scopes > MAX_SYNC_SCOPES_PER_PUBLISH) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'Mapping set exceeds the publish scope ceiling',
+          `${skuCount} mapped SKU(s) × ${warehouseCount} active warehouse(s) = ${scopes} publication scopes, above the ${MAX_SYNC_SCOPES_PER_PUBLISH}-scope cap one publish cycle carries — the tail would be silently truncated and those SKUs would never publish. Shrink the mapping set (or the warehouse set) below ${MAX_SYNC_SCOPES_PER_PUBLISH} scopes.`,
+        );
+      }
+
+      // ── FULL replacement, in this one tx: rows removed from the list are
+      // gone (the stale-scope wedge the upsert-only seed arm cannot fix).
+      await tx
+        .delete(channelMappings)
+        .where(
+          and(
+            eq(channelMappings.tenantId, command.tenantId),
+            eq(channelMappings.integrationId, command.connectionId),
+          ),
+        );
+      if (command.items.length > 0) {
+        await tx.insert(channelMappings).values(
+          command.items.map((item) => ({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            integrationId: command.connectionId,
+            externalRef: item.externalRef.trim(),
+            skuId: item.skuId,
+          })),
+        );
+      }
+
+      const result = { connectionId: command.connectionId, items: command.items };
+      await this.settle(tx, {
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'channels.mappings_set',
+        connection: toConnectionView(existing),
+        idempotencyKey,
+        payloadHash,
+        outbox: {
+          type: 'channels.mappings_set',
+          payload: {
+            connectionId: command.connectionId,
+            itemCount: command.items.length,
+            skuCount,
+            warehouseCount,
+          },
+        },
+        result,
+      });
+      return result;
+    });
+  }
+
+  /**
+   * The tenant's active warehouse count, paged (the publish enumeration's
+   * same source — the scope arithmetic counts THESE).
+   */
+  private async countActiveWarehouses(tenantId: string): Promise<number> {
+    let count = 0;
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.tenancy.listWarehouses(tenantId, cursor, MAX_WAREHOUSE_PAGE_SIZE);
+      count += page.items.length;
+      if (page.nextCursor === null) {
+        break;
+      }
+      cursor = page.nextCursor;
+    }
+    return count;
   }
 
   /** The row, locked — the 404 check rides the caller (the guards-first order). */
@@ -1060,6 +1318,28 @@ export class ChannelsCommandService {
     return ((row.responseSnapshot as { result?: SetConnectionBuffersResult }).result ?? null);
   }
 
+  /** The mappings command's replay: the stored `{connectionId, items}` snapshot, or null. */
+  private async replayMappings(
+    tx: TenantTx,
+    tenantId: string,
+    idempotencyKey: string,
+    payloadHash: string,
+  ): Promise<{ connectionId: string; items: readonly ChannelMappingItem[] } | null> {
+    const rows = await tx
+      .select()
+      .from(idempotencyKeys)
+      .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+      .limit(1);
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
+    if (row.payloadHash !== payloadHash) {
+      throw idempotencyKeyReuse();
+    }
+    return ((row.responseSnapshot as { result?: { connectionId: string; items: readonly ChannelMappingItem[] } }).result ?? null);
+  }
+
   /** The disconnect command's replay: true when the key already settled a delete. */
   private async replayDisconnect(
     tx: TenantTx,
@@ -1099,11 +1379,18 @@ export class ChannelsCommandService {
         | 'channels.connected'
         | 'channels.credentials_rotated'
         | 'channels.backorder_policy_set'
+        | 'channels.mappings_set'
         | 'channels.sync_retried';
       connection: ChannelConnectionView;
       idempotencyKey: string;
       payloadHash: string;
       outbox: { type: string; payload: Record<string, unknown> };
+      /**
+       * The command's own return value, snapshotted alongside the
+       * connection view when the command returns more than it (the
+       * mappings PUT's `{connectionId, items}`). Public-face only.
+       */
+      result?: unknown;
     },
   ): Promise<void> {
     await this.outbox.append(tx, {
@@ -1131,7 +1418,10 @@ export class ChannelsCommandService {
         tenantId: args.tenantId,
         key: args.idempotencyKey,
         payloadHash: args.payloadHash,
-        responseSnapshot: { connection: args.connection },
+        responseSnapshot: {
+          connection: args.connection,
+          ...(args.result === undefined ? {} : { result: args.result }),
+        },
       });
     } catch (err) {
       if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {

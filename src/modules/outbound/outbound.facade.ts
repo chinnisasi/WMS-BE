@@ -31,6 +31,17 @@ import type {
   OrderSource,
   OrderStatus,
 } from './order.command';
+
+// The command/snapshot vocabulary rides the facade seam for sibling modules
+// (the architecture guard allows only facade/module/dto specifiers); these
+// are type-only re-exports — the command service stays outbound-owned.
+export type {
+  CancelOrderCommand,
+  CreateOrderCommand,
+  OrderSnapshot,
+  OrderSource,
+  OrderStatus,
+};
 import { WaveCommandService, policySnapshot } from './wave.command';
 import { PickCommandService } from './pick.command';
 import type { PickSnapshot, PickTask, RecordPickCommand } from './pick.command';
@@ -326,6 +337,68 @@ export class OutboundFacade {
   /** `POST .../outbound/orders/{id}/cancel` — releases every open hold. */
   async cancelOrder(command: CancelOrderCommand, idempotencyKey: string): Promise<OrderSnapshot> {
     return this.orderCommand.cancelOrder(command, idempotencyKey);
+  }
+
+  /**
+   * Story 7.2 (RD-1/RD-8): the order a channel ref resolves to, or null —
+   * the cancellation ingest's lookup and the ingest command's `replayed`
+   * redelivery determination. Scoped to (tenant, integration, external
+   * event id) — the same identity the dedup index is partial over.
+   */
+  async findOrderByChannelRef(
+    tenantId: string,
+    integrationId: string,
+    externalEventId: string,
+  ): Promise<OrderEntry | null> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({
+          id: orders.id,
+          tenantId: orders.tenantId,
+          warehouseId: orders.warehouseId,
+          status: orders.status,
+          source: orders.source,
+          integrationId: orders.integrationId,
+          externalEventId: orders.externalEventId,
+          createdAt: orders.createdAt,
+          updatedAt: orders.updatedAt,
+        })
+        .from(orders)
+        .where(
+          and(
+            eq(orders.tenantId, tenantId),
+            eq(orders.integrationId, integrationId),
+            eq(orders.externalEventId, externalEventId),
+          ),
+        )
+        .limit(1);
+      const row = rows[0];
+      if (row === undefined) {
+        return null;
+      }
+      return {
+        id: row.id,
+        tenantId: row.tenantId,
+        warehouseId: row.warehouseId,
+        status: row.status as OrderStatus,
+        source: row.source as OrderSource,
+        integrationId: row.integrationId,
+        externalEventId: row.externalEventId,
+        destination: null,
+        createdAt: canonicalInstant(row.createdAt),
+        updatedAt: canonicalInstant(row.updatedAt),
+      };
+    });
+  }
+
+  /**
+   * Story 7.2 (RD-7): ONE consistent re-read of an order and its lines for
+   * the writeback delivery — the source of truth the delivery derives its
+   * arm request from (never the event payload's word). Unknown or foreign
+   * id is null (the delivery ACKs — the order cannot have moved anywhere).
+   */
+  async orderForWriteback(tenantId: string, orderId: string): Promise<OrderSnapshot['order'] | null> {
+    return this.getOrder(tenantId, orderId);
   }
 
   /**
