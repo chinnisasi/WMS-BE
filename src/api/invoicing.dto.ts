@@ -215,7 +215,7 @@ export class InvoiceDto {
   @ApiProperty({
     type: Object,
     description:
-      'The pinned, client-agnostic document snapshot: { header, seller, buyer, lines, totals, gaps, revision } — what the printable invoice renders',
+      'The pinned, client-agnostic document snapshot: { header, seller, buyer, lines, totals, gaps, revision } — what the printable invoice renders. Each gap is { kind, detail, orderLineId? }; orderLineId is set on the line-scoped kinds (unpriced-line, hsn-gap) so a client can price exactly the unpriced lines without parsing detail prose',
   })
   document!: Record<string, unknown>;
 

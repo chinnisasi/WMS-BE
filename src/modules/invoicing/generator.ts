@@ -61,6 +61,13 @@ const BLOCKING_GAP_KINDS: ReadonlySet<GapKind> = new Set<GapKind>(['unpriced-lin
 export interface InvoiceGap {
   readonly kind: GapKind;
   readonly detail: string;
+  /**
+   * The order line a LINE-scoped gap (`unpriced-line`, `hsn-gap`) is about —
+   * structured so a client can act on it (the pricing dialog lists exactly
+   * these lines) without parsing `detail` prose. Absent on the
+   * invoice-scoped kinds. Additive to the pinned snapshot shape (8-1 FE).
+   */
+  readonly orderLineId?: string;
 }
 
 /** One priced line of the pinned document snapshot (Design Notes shape). */
@@ -652,6 +659,7 @@ export class InvoiceGenerator {
       if (ratePaise === null) {
         gaps.push({
           kind: 'unpriced-line',
+          orderLineId: fact.orderLineId,
           detail: `line ${fact.skuCode} (${fact.orderLineId}) has no rate — parked awaiting-data until the operator prices it`,
         });
         continue;
@@ -667,6 +675,7 @@ export class InvoiceGenerator {
         // A warning, not a blocker (the HSN row of the spec's matrix).
         gaps.push({
           kind: 'hsn-gap',
+          orderLineId: fact.orderLineId,
           detail: `line ${fact.skuCode} issued with a blank HSN — the SKU carries none in the catalog`,
         });
       }

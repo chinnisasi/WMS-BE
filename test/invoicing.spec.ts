@@ -901,7 +901,11 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect(parked!.invoice_no).toBeNull();
     expect(parked!.fy_label).toBeNull();
     expect(Number(parked!.total_paise)).toBe(0);
-    expect((parked!.document as { gaps: { kind: string }[] }).gaps.map((g) => g.kind)).toEqual(['unpriced-line']);
+    // The gap names its line STRUCTURALLY — the pricing dialog's input,
+    // never parsed out of the detail prose.
+    expect((parked!.document as { gaps: { kind: string; orderLineId?: string }[] }).gaps).toEqual([
+      expect.objectContaining({ kind: 'unpriced-line', orderLineId: okLine.id }),
+    ]);
 
     // Command path: price the line → the SAME invoice flips to issued.
     const priced = await command.generate(
@@ -1053,8 +1057,9 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     const row = mustRow(await invoiceRow(orderId));
     expect(row.status).toBe('issued'); // the gap DOES NOT block
     expect(row.invoice_no).toMatch(/^FY-\d{4}-\d{6}$/);
-    const doc = row.document as { gaps: { kind: string; detail: string }[]; lines: { skuCode: string; hsn: string | null; hsnGap: boolean }[] };
+    const doc = row.document as { gaps: { kind: string; detail: string; orderLineId?: string }[]; lines: { orderLineId: string; skuCode: string; hsn: string | null; hsnGap: boolean }[] };
     expect(doc.gaps.map((gap) => gap.kind)).toEqual(['hsn-gap']);
+    expect(doc.gaps[0]!.orderLineId).toBe(doc.lines[0]!.orderLineId);
     expect(doc.lines[0]!.hsn).toBeNull();
     expect(doc.lines[0]!.hsnGap).toBe(true);
     const lines = await invoiceLineRows(row.id as string);
