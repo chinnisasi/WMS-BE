@@ -102,6 +102,20 @@ export const CONNECTION_COLUMNS = {
   updatedAt: integrations.updatedAt,
 } as const;
 
+/**
+ * The re-lock read the DISCONNECT's delete tx uses (epic-7 retro D4): the
+ * connection columns PLUS the sealed blob, selected on the row lock the
+ * re-lock already holds — no extra round trip. Its blob is the one the
+ * post-commit revoke opens: a rotate committing between the disconnect's
+ * two phases replaces the credential, and Phase 1's read carries the STALE
+ * one, so revoking that would strand the rotated credential live at the
+ * channel. In-process only — the blob still appears in NO wire shape here.
+ */
+export const CONNECTION_RELOCK_COLUMNS = {
+  ...CONNECTION_COLUMNS,
+  credentialSealed: integrations.credentialSealed,
+} as const;
+
 /** The stored row's public projection (the carriers `toConnectionView` shape). */
 export function toConnectionView(row: Omit<Integration, 'credentialSealed'>): ChannelConnectionView {
   return {
