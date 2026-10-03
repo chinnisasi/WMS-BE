@@ -379,6 +379,13 @@
       "when": 1791010657494,
       "tag": "0053_invoicing_core",
       "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1791026577094,
+      "tag": "0054_invoice_regulatory_pass",
+      "breakpoints": true
     }
   ]
 }

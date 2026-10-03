@@ -11,8 +11,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { ArithmeticOverflowError } from './arith';
 import { InvoiceGenerator, InvoiceRaceLostError } from './generator';
-import { INVOICE_ISSUED_EVENT, ORDER_DISPATCHED_EVENT } from './events';
-import type { InvoiceIssuedPayload } from './events';
+import { INVOICE_ISSUED_EVENT, ORDER_DISPATCHED_EVENT, invoiceIssuedPayload } from './events';
 
 /**
  * The dispatch event's delivery handler (story 8-1). The outbox relay drains
@@ -72,23 +71,12 @@ export class InvoiceDeliveryHandler implements OnModuleInit {
         const outcome = await this.generator.generateCoreInTx(tx, event.tenantId, orderId, []);
 
         if (outcome.firstIssuance) {
-          const payload: InvoiceIssuedPayload = {
-            invoiceId: outcome.invoiceId,
-            orderId: outcome.orderId,
-            warehouseId: outcome.warehouseId,
-            invoiceNo: outcome.invoiceNo!,
-            fyLabel: outcome.fyLabel!,
-            revision: outcome.revision,
-            subtotalPaise: outcome.subtotalPaise,
-            gstPaise: outcome.gstPaise,
-            totalPaise: outcome.totalPaise,
-          };
           await this.outbox.append(tx, {
             messageId: uuidv7(),
             tenantId: event.tenantId,
             type: INVOICE_ISSUED_EVENT,
             occurredAt: canonicalInstant(nowIso()),
-            payload: { ...payload },
+            payload: { ...invoiceIssuedPayload(outcome) },
           });
         }
         this.logger.log(

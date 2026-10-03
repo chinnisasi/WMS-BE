@@ -128,11 +128,19 @@ export class InvoiceEntryDto {
   @ApiProperty({ format: 'uuid' })
   warehouseId!: string;
 
-  @ApiProperty({ type: String, nullable: true, description: 'FY-series number; null until first issued' })
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description:
+      "The supplier GSTIN's own FY-series number, e.g. '29/2627/000001' (state code / FY digits / sequence; 8-1 invoices keep their 'FY-2627-000001' form); null until first issued. Unique per (tenant, originGstin) — never key on it alone",
+  })
   invoiceNo!: string | null;
 
   @ApiProperty({ type: String, nullable: true, description: "e.g. 'FY-2627'; null until first issued" })
   fyLabel!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Supplier GSTIN the invoice is issued under (its numbering series); null while unresolved' })
+  originGstin!: string | null;
 
   @ApiProperty({ enum: INVOICE_STATUSES })
   status!: InvoiceStatus;
@@ -149,8 +157,14 @@ export class InvoiceEntryDto {
   @ApiProperty({ description: 'Sum of line CGST+SGST+IGST, paise' })
   gstPaise!: number;
 
-  @ApiProperty({ description: 'subtotal + gst, paise (exact; no rupee rounding)' })
+  @ApiProperty({ description: 'subtotal + gst, paise (exact)' })
   totalPaise!: number;
+
+  @ApiProperty({ description: 'The amount due, rounded half-up to the whole rupee (paise, a multiple of 100)' })
+  payablePaise!: number;
+
+  @ApiProperty({ description: 'payablePaise − totalPaise: the signed round-off, −49…+50 paise' })
+  roundOffPaise!: number;
 
   @ApiProperty({ description: 'Bumps only when a regenerate changes the content' })
   revision!: number;
@@ -182,7 +196,7 @@ export class InvoiceDto {
   @ApiProperty({ type: String, nullable: true })
   fyLabel!: string | null;
 
-  @ApiProperty({ type: Number, nullable: true, description: 'Position in the tenant FY series; null until first issued' })
+  @ApiProperty({ type: Number, nullable: true, description: "Position in the supplier GSTIN's FY series; null until first issued" })
   seriesSeq!: number | null;
 
   @ApiProperty({ enum: INVOICE_STATUSES })
@@ -206,8 +220,14 @@ export class InvoiceDto {
   @ApiProperty()
   gstPaise!: number;
 
-  @ApiProperty()
+  @ApiProperty({ description: 'subtotal + gst, paise (exact)' })
   totalPaise!: number;
+
+  @ApiProperty({ description: 'The amount due, rounded half-up to the whole rupee (paise, a multiple of 100)' })
+  payablePaise!: number;
+
+  @ApiProperty({ description: 'payablePaise − totalPaise: the signed round-off, −49…+50 paise' })
+  roundOffPaise!: number;
 
   @ApiProperty()
   revision!: number;
@@ -215,7 +235,7 @@ export class InvoiceDto {
   @ApiProperty({
     type: Object,
     description:
-      'The pinned, client-agnostic document snapshot: { header, seller, buyer, lines, totals, gaps, revision } — what the printable invoice renders. Each gap is { kind, detail, orderLineId? }; orderLineId is set on the line-scoped kinds (unpriced-line, hsn-gap) so a client can price exactly the unpriced lines without parsing detail prose',
+      'The pinned, client-agnostic document snapshot: { header, seller, buyer, lines, totals, gaps, revision } — what the printable invoice renders. totals is { subtotal, gst, total, roundOff, payable } in paise (total exact; payable rupee-rounded). Frozen once issued. Each gap is { kind, detail, orderLineId? }; orderLineId is set on the line-scoped kinds (unpriced-line, hsn-gap) so a client can price exactly the unpriced lines without parsing detail prose',
   })
   document!: Record<string, unknown>;
 

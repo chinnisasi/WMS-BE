@@ -15,8 +15,7 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InvoiceGenerator, InvoiceRaceLostError } from './generator';
 import type { RateOverride } from './generator';
-import { INVOICE_ISSUED_EVENT } from './events';
-import type { InvoiceIssuedPayload } from './events';
+import { INVOICE_ISSUED_EVENT, invoiceIssuedPayload } from './events';
 import { InvoicingFacade } from './facade';
 import type { InvoiceSnapshot } from './view';
 
@@ -66,7 +65,10 @@ export interface GenerateInvoiceCommand {
  *
  * A `line-not-of-order` / `order-not-dispatched` / `not-found` refusal is
  * thrown here from the generator (the HTTP error arms); the idempotency key
- * is NOT written on a refused attempt (the attempt carried no state).
+ * is NOT written on a refused attempt (the attempt carried no state). Story
+ * 8-1b: an issued (or voided) invoice is frozen — non-empty `rates` refuse
+ * `409 invoice-frozen` (outranking the line checks), and a plain regenerate
+ * returns the stored invoice unchanged with 200.
  */
 @Injectable()
 export class InvoicingCommand {
@@ -100,9 +102,12 @@ export class InvoicingCommand {
       // A concurrent generation (the event delivery, or a twin command)
       // committed the ONE invoice first and this attempt rolled back whole.
       // Run it ONCE more: the row now exists, so the retry takes the
-      // regenerate path — the caller's rates apply, and the audit row and
-      // idempotency key land as on any success. A second loss is impossible
-      // (the unique row cannot be inserted twice), so a retry error is real.
+      // regenerate path. Two arms: the winner parked `awaiting-data` → the
+      // caller's rates apply, and the audit row and idempotency key land as
+      // on any success; the winner settled `issued` → the retry hits the
+      // freeze and, carrying rates, refuses `409 invoice-frozen` (no audit
+      // row, no key). A second loss is impossible (the unique row cannot be
+      // inserted twice), so a retry error is real.
       return this.attempt(command, idempotencyKey, rates, payloadHash);
     }
   }
@@ -152,23 +157,12 @@ export class InvoicingCommand {
         // `issued`; a regenerate that keeps the invoice issued emits
         // nothing (the number is the document's, not the event's).
         if (outcome.firstIssuance) {
-          const payload: InvoiceIssuedPayload = {
-            invoiceId: outcome.invoiceId,
-            orderId: outcome.orderId,
-            warehouseId: outcome.warehouseId,
-            invoiceNo: outcome.invoiceNo!,
-            fyLabel: outcome.fyLabel!,
-            revision: outcome.revision,
-            subtotalPaise: outcome.subtotalPaise,
-            gstPaise: outcome.gstPaise,
-            totalPaise: outcome.totalPaise,
-          };
           await this.outbox.append(tx, {
             messageId: uuidv7(),
             tenantId: command.tenantId,
             type: INVOICE_ISSUED_EVENT,
             occurredAt: canonicalInstant(nowIso()),
-            payload: { ...payload },
+            payload: { ...invoiceIssuedPayload(outcome) },
           });
         }
 
