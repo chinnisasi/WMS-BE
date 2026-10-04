@@ -12,6 +12,7 @@ import { ChannelsController } from './channels.controller';
 import { WebhooksController } from './webhooks.controller';
 import { ComplianceController } from './compliance.controller';
 import { InvoicingController } from './invoicing.controller';
+import { EwayController } from './eway.controller';
 import { MovementsController } from './movements.controller';
 import { OpenApiController } from './openapi.controller';
 import { NotFoundController } from './not-found.controller';
@@ -99,6 +100,7 @@ import { ReplenishmentController } from './replenishment.controller';
     // spine-singleton already imported by the root; the mutation goes
     // through `InvoicingCommand`, the reads through `InvoicingFacade`.
     InvoicingController,
+    EwayController,
     // Story 7-2 — the channel webhook surface (guardless by construction:
     // the provider's AUTHORITY is its signature, not a session). The
     // last-siblings convention keeps NotFoundController LAST (registered

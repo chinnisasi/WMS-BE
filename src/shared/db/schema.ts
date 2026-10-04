@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { bigint, boolean, index, integer, jsonb, numeric, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, date, index, integer, jsonb, numeric, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
 /**
@@ -3916,3 +3916,131 @@ export const gstStateCodes = pgTable('gst_state_codes', {
 });
 
 export type GstStateCode = typeof gstStateCodes.$inferSelect;
+
+// ── E-way bills (story 8-2b) ─────────────────────────────────────────────────
+
+/**
+ * The national e-way threshold (story 8-2b) — CGST Rule 138(1)'s ₹50,000,
+ * versioned by `effective_from`. GLOBAL reference data like `gst_state_codes`:
+ * no `tenant_id`, no RLS, seeded and guarded read-only in migration 0056.
+ * Thresholds are never code literals (AD-9): the one in force on an
+ * invoice's IST issue date is read from here.
+ */
+export const ewayNationalThresholds = pgTable('eway_national_thresholds', {
+  effectiveFrom: date('effective_from', { mode: 'string' }).primaryKey(),
+  thresholdPaise: bigint('threshold_paise', { mode: 'number' }).notNull(),
+  /** The legal source of the figure (e.g. `CGST Rule 138(1)`). */
+  source: text('source').notNull(),
+});
+
+export type EwayNationalThreshold = typeof ewayNationalThresholds.$inferSelect;
+
+/**
+ * A tenant's intra-state threshold override for one state (story 8-2b),
+ * APPEND-ONLY: a BEFORE UPDATE trigger raises (0056), and no command
+ * deletes. The newest `effective_from` on or before the issue date wins;
+ * among same-date rows the newest `created_at` (a correction). A NULL
+ * `threshold_paise` means "no e-way bill required" for intra-state supply
+ * in that state. CHECKs and RLS live in migration 0056.
+ */
+export const ewayStateThresholds = pgTable(
+  'eway_state_thresholds',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    stateCode: text('state_code').notNull(),
+    thresholdPaise: bigint('threshold_paise', { mode: 'number' }),
+    effectiveFrom: date('effective_from', { mode: 'string' }).notNull(),
+    createdBy: uuid('created_by').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('eway_state_thresholds_lookup_idx').on(
+      table.tenantId,
+      table.stateCode,
+      table.effectiveFrom.desc(),
+      table.createdAt.desc(),
+    ),
+  ],
+);
+
+export type EwayStateThreshold = typeof ewayStateThresholds.$inferSelect;
+
+/**
+ * Per supplier GSTIN e-way settings (story 8-2b): today only the
+ * "e-invoicing applies" flag, which holds that GSTIN's B2B bills as the
+ * computed `needs-irn` blocker (NIC refuses them without an IRN).
+ */
+export const ewayGstinSettings = pgTable(
+  'eway_gstin_settings',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    gstin: text('gstin').notNull(),
+    eInvoiceApplies: boolean('e_invoice_applies').notNull().default(false),
+    updatedBy: uuid('updated_by').notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('eway_gstin_settings_tenant_gstin_unique').on(table.tenantId, table.gstin)],
+);
+
+export type EwayGstinSetting = typeof ewayGstinSettings.$inferSelect;
+
+/**
+ * One e-way bill per issued invoice whose consignment value exceeds the
+ * threshold in force (story 8-2b). Queued `pending` by the `invoice.issued`
+ * delivery; `generated` once an EWB number is recorded (manually, after the
+ * NIC bulk upload) or returned by the gateway; `dismissed` with a reason.
+ * Part B columns are the transport details finance enters at e-way time.
+ * The two-way status CHECKs, the vocabulary CHECKs, the value > threshold
+ * CHECK and RLS live in migration 0056. No FKs (house rule).
+ */
+export const ewayBills = pgTable(
+  'eway_bills',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    invoiceId: uuid('invoice_id').notNull(),
+    originGstin: text('origin_gstin').notNull(),
+    status: text('status').notNull().default('pending'),
+    consignmentValuePaise: bigint('consignment_value_paise', { mode: 'number' }).notNull(),
+    thresholdPaise: bigint('threshold_paise', { mode: 'number' }).notNull(),
+    thresholdRule: text('threshold_rule').notNull(),
+    // Part B (transport) — null until entered.
+    transMode: integer('trans_mode'),
+    vehicleNo: text('vehicle_no'),
+    vehicleType: text('vehicle_type'),
+    transporterId: text('transporter_id'),
+    transporterName: text('transporter_name'),
+    transDocNo: text('trans_doc_no'),
+    transDocDate: date('trans_doc_date', { mode: 'string' }),
+    distanceKm: integer('distance_km'),
+    // The result — set together on `generated`.
+    ewbNo: text('ewb_no'),
+    ewbGeneratedAt: timestamp('ewb_generated_at', { withTimezone: true, mode: 'string' }),
+    ewbValidUntil: timestamp('ewb_valid_until', { withTimezone: true, mode: 'string' }),
+    source: text('source'),
+    // Tracking.
+    gatewayClaimedAt: timestamp('gateway_claimed_at', { withTimezone: true, mode: 'string' }),
+    lastExportedAt: timestamp('last_exported_at', { withTimezone: true, mode: 'string' }),
+    lastExportedBy: uuid('last_exported_by'),
+    dismissedReason: text('dismissed_reason'),
+    lastError: text('last_error'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('eway_bills_invoice_unique').on(table.invoiceId),
+    uniqueIndex('eway_bills_tenant_ewb_no_unique')
+      .on(table.tenantId, table.ewbNo)
+      .where(sql`ewb_no is not null`),
+    index('eway_bills_tenant_status_created_at_id_idx').on(table.tenantId, table.status, table.createdAt, table.id),
+  ],
+);
+
+export type EwayBill = typeof ewayBills.$inferSelect;

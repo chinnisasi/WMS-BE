@@ -1339,8 +1339,17 @@ describe('architecture: invoices are invoicing-module-owned (story 8-1)', () => 
    * (the rate override freezes into the invoice document, never into
    * `order_lines`).
    */
-  const INVOICING_TABLES = ['invoices', 'invoiceLines', 'invoiceSeries'] as const;
-  const RAW_INVOICING_TABLES = 'invoices|invoice_lines|invoice_series';
+  // Story 8-2b: the e-way tables are invoicing-owned too.
+  const INVOICING_TABLES = [
+    'invoices',
+    'invoiceLines',
+    'invoiceSeries',
+    'ewayBills',
+    'ewayStateThresholds',
+    'ewayGstinSettings',
+    'ewayNationalThresholds',
+  ] as const;
+  const RAW_INVOICING_TABLES = 'invoices|invoice_lines|invoice_series|eway_bills|eway_state_thresholds|eway_gstin_settings|eway_national_thresholds';
   const invoicingRoot = join(SRC_ROOT, 'modules', 'invoicing');
 
   it('no invoice-table write happens outside the invoicing module', () => {
@@ -1372,8 +1381,13 @@ describe('architecture: invoices are invoicing-module-owned (story 8-1)', () => 
 
   it('the invoicing generator itself writes its tables (the test is meaningful)', () => {
     const generator = readFileSync(join(invoicingRoot, 'generator.ts'), 'utf8');
-    for (const table of INVOICING_TABLES) {
+    for (const table of ['invoices', 'invoiceLines', 'invoiceSeries'] as const) {
       expect(drizzleWriteOn(table).test(generator)).toBe(true);
+    }
+    // Story 8-2b: the e-way command and delivery write theirs.
+    const eway = readFileSync(join(invoicingRoot, 'eway.command.ts'), 'utf8') + readFileSync(join(invoicingRoot, 'eway.delivery.ts'), 'utf8');
+    for (const table of ['ewayBills', 'ewayStateThresholds', 'ewayGstinSettings'] as const) {
+      expect(drizzleWriteOn(table).test(eway)).toBe(true);
     }
   });
 });

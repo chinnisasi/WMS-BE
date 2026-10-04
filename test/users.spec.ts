@@ -856,8 +856,16 @@ describe('users, roles, and permission gating (e2e)', () => {
     // credential- and margin-touching planner verbs, not floor verbs, and
     // not accounting); story 8-1 grows it to 34 with `invoice.generate` —
     // owner + ops_manager (pricing a line on a numbered tax document is a
-    // finance act; the accountant reads invoices but does not set prices).
-    expect([...CAPABILITIES]).toHaveLength(34);
+    // finance act; the accountant reads invoices but does not set prices);
+    // story 8-2b grows it to 36 with `eway.manage` — owner + ops_manager +
+    // ACCOUNTANT (the accountant's first write: e-way paperwork is finance
+    // work, decided 2026-10-04) — and `eway.configure`, owner-only.
+    expect([...CAPABILITIES]).toHaveLength(36);
+    expect(CAPABILITIES).toContain('eway.manage');
+    expect(CAPABILITIES).toContain('eway.configure');
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('eway.manage'))).toEqual(['owner', 'ops_manager', 'accountant']);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('eway.configure'))).toEqual(['owner']);
+    expect([...ROLE_CAPABILITIES.accountant]).toEqual(['eway.manage']);
     expect(CAPABILITIES).toContain('invoice.generate');
     expect(ROLE_CAPABILITIES.owner.has('invoice.generate')).toBe(true);
     expect(ROLE_CAPABILITIES.ops_manager.has('invoice.generate')).toBe(true);

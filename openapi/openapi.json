@@ -14788,6 +14788,1116 @@
         ]
       }
     },
+    "/tenants/{tenantId}/eway/bills": {
+      "get": {
+        "description": "A bill is queued automatically shortly after an invoice issues whose consignment value (taxable + GST over taxable lines) exceeds the threshold in force on its IST issue date. Blockers are computed at read time: terminal ones (the invoice is frozen) mean the bill must be generated on the portal by hand and its number recorded here; needs-irn and transport-incomplete are fixable.",
+        "operationId": "EwayController_listBills",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Only bills in this status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "generated",
+                "dismissed"
+              ]
+            }
+          },
+          {
+            "name": "gstin",
+            "required": false,
+            "in": "query",
+            "description": "Only bills of this supplier GSTIN (exact)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 50,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EwayBillListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed status, gstin, cursor or limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists e-way bills (newest first, at most 50 per page; open to any member) — each with its computed blockers and whether a gateway can generate it",
+        "tags": [
+          "eway"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/eway/bills/export": {
+      "post": {
+        "description": "All or nothing: if any id is missing, not pending, being generated, blocked, or of a different GSTIN than the rest, nothing is exported and the 409 lists each refused bill as { id, reasons } in its `bills` member. Upload the file on the e-way portal, then record each returned EWB number.",
+        "operationId": "EwayController_exportBills",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExportEwayDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EwayExportResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing Idempotency-Key, or ids empty, over 100, repeated or not uuids (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Another tenant (permission-denied), or the caller lacks eway.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A bill cannot be exported (eway-not-exportable — `bills: [{id, reasons}]`, reasons among not-found, not-pending, claimed, mixed-gstin and the blocker codes), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Exports ready pending bills of ONE supplier GSTIN as the NIC bulk-upload JSON (eway.manage); stamps lastExportedAt",
+        "tags": [
+          "eway"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/eway/bills/{billId}/transport": {
+      "patch": {
+        "description": "Rules (NIC): mode is required when any field is set; Road takes a vehicle (4–15 letters or digits) with a vehicle type R/O; Rail, Air and Ship need a transport document number (≤ 15) and date, and no vehicle; the transporter id is a 15-character GSTIN/TRANSIN; the document date is on or after the invoice date; distance 0–4000 km, at most 100 when both pincodes are equal.",
+        "operationId": "EwayController_updateTransport",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "billId",
+            "required": true,
+            "in": "path",
+            "description": "The e-way bill",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateEwayTransportDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EwayBillResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing Idempotency-Key, a malformed billId, or a Part B rule broken — each named (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Another tenant (permission-denied), or the caller lacks eway.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such bill in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The bill is not pending (eway-not-pending), a gateway generation is in flight (eway-claimed), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Replaces a pending bill's Part B (transport details) — the whole set; null or absent clears a field (eway.manage)",
+        "tags": [
+          "eway"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/eway/bills/{billId}/record": {
+      "post": {
+        "description": "Blockers are ignored (a terminal bill is generated on the portal by hand). The number is 12 digits and unused in the tenant.",
+        "operationId": "EwayController_record",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "billId",
+            "required": true,
+            "in": "path",
+            "description": "The e-way bill",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecordEwayDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EwayBillResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing Idempotency-Key, a malformed billId, ewbNo not 12 digits, generatedAt not an instant between the invoice issue and now (+5 min), or validUntil before generatedAt (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Another tenant (permission-denied), or the caller lacks eway.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such bill in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not pending (eway-not-pending), a gateway generation in flight (eway-claimed), the number already recorded (ewb-no-taken), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Records the EWB number the portal returned for a pending bill — final (eway.manage)",
+        "tags": [
+          "eway"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/eway/bills/{billId}/dismiss": {
+      "post": {
+        "operationId": "EwayController_dismiss",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "billId",
+            "required": true,
+            "in": "path",
+            "description": "The e-way bill",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DismissEwayDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EwayBillResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing Idempotency-Key, a malformed billId, or a reason not 1–200 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Another tenant (permission-denied), or the caller lacks eway.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such bill in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not pending (eway-not-pending), a gateway generation in flight (eway-claimed), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Dismisses a pending bill with a reason (eway.manage) — blockers are ignored",
+        "tags": [
+          "eway"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/eway/bills/{billId}/generate": {
+      "post": {
+        "description": "Offered only when the bill reads gatewayAvailable. The bill is claimed for two minutes while the gateway is called; a refusal is recorded as lastError.",
+        "operationId": "EwayController_generate",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "billId",
+            "required": true,
+            "in": "path",
+            "description": "The e-way bill",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EwayBillResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing Idempotency-Key or a malformed billId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Another tenant (permission-denied), or the caller lacks eway.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such bill in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Not pending (eway-not-pending), blocked (eway-not-exportable, with `bills`), already being generated (eway-claimed), the returned number already recorded (ewb-no-taken), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The gateway refused the bill (eway-gateway-refused — also stored as lastError), or the key was reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "No gateway is configured on this deployment (gateway-unconfigured)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The gateway is unreachable (eway-gateway-unavailable) — the claim expires in two minutes",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Generates a ready pending bill through the configured e-way gateway (eway.manage) — audited",
+        "tags": [
+          "eway"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/eway/state-thresholds": {
+      "get": {
+        "operationId": "EwayController_listStateThresholds",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EwayStateThresholdListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The tenant's intra-state threshold overrides — the full append-only history (open to any member)",
+        "tags": [
+          "eway"
+        ]
+      },
+      "post": {
+        "description": "Applies to intra-state invoices issued (IST) on or after effectiveFrom; null means none required. Append-only: a same-date row supersedes the earlier one. Bills already queued (and invoices not queued) are never re-evaluated.",
+        "operationId": "EwayController_appendStateThreshold",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppendEwayStateThresholdDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The appended override",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EwayStateThresholdResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing Idempotency-Key, a state not on the CBIC list or 97/99, a malformed date or a negative amount (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Another tenant (permission-denied), or the caller lacks eway.configure (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Appends an intra-state threshold override for one state (eway.configure, owner)",
+        "tags": [
+          "eway"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/eway/gstin-settings": {
+      "get": {
+        "operationId": "EwayController_listGstinSettings",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EwayGstinSettingListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The e-way settings of every GSTIN the tenant holds (its own and its warehouses'); open to any member",
+        "tags": [
+          "eway"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/eway/gstin-settings/{gstin}": {
+      "put": {
+        "operationId": "EwayController_putGstinSetting",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "gstin",
+            "required": true,
+            "in": "path",
+            "description": "One of the tenant's GSTINs (exact, uppercase)",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutEwayGstinSettingDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EwayGstinSettingResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing Idempotency-Key, or a malformed gstin (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Another tenant (permission-denied), or the caller lacks eway.configure (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The GSTIN is neither the tenant's nor a warehouse's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Sets whether e-invoicing applies to one of the tenant's GSTINs (eway.configure, owner) — its B2B bills are then held as needs-irn",
+        "tags": [
+          "eway"
+        ]
+      }
+    },
     "/tenants/{tenantId}/webhooks/channels/{provider}/{connectionId}/orders": {
       "post": {
         "operationId": "WebhooksController_ingestOrder",
@@ -25690,6 +26800,538 @@
         },
         "required": [
           "items"
+        ]
+      },
+      "EwayTransportDto": {
+        "type": "object",
+        "properties": {
+          "transMode": {
+            "type": "number",
+            "nullable": true,
+            "enum": [
+              1,
+              2,
+              3,
+              4,
+              null
+            ]
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "vehicleType": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterId": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true
+          },
+          "transDocNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "transDocDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "YYYY-MM-DD"
+          },
+          "distanceKm": {
+            "type": "number",
+            "nullable": true
+          }
+        },
+        "required": [
+          "transMode",
+          "vehicleNo",
+          "vehicleType",
+          "transporterId",
+          "transporterName",
+          "transDocNo",
+          "transDocDate",
+          "distanceKm"
+        ]
+      },
+      "EwayBlockerDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "invoice-unavailable",
+              "hsn-issue",
+              "doc-too-old",
+              "too-many-lines",
+              "address-incomplete",
+              "state-unresolved",
+              "ship-to-differs",
+              "unsupported-supply",
+              "rate-not-standard",
+              "needs-irn",
+              "transport-incomplete"
+            ]
+          },
+          "terminal": {
+            "type": "boolean",
+            "description": "Terminal: the invoice is frozen — generate on the portal and record the number here. Otherwise fixable."
+          }
+        },
+        "required": [
+          "code",
+          "terminal"
+        ]
+      },
+      "EwayBillDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "invoiceIssuedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Invoice issue instant, ISO-8601 UTC"
+          },
+          "originGstin": {
+            "type": "string",
+            "description": "Supplier GSTIN (bill-from)"
+          },
+          "consigneeGstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "b2b": {
+            "type": "boolean",
+            "description": "The consignee is registered (a GSTIN on the invoice)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "generated",
+              "dismissed"
+            ]
+          },
+          "consignmentValuePaise": {
+            "type": "number",
+            "description": "Σ (taxable + CGST + SGST + IGST) over taxable lines, paise"
+          },
+          "thresholdPaise": {
+            "type": "number",
+            "description": "The threshold the value exceeded, paise"
+          },
+          "thresholdRule": {
+            "type": "string",
+            "description": "'national' or 'state:<code>'"
+          },
+          "transport": {
+            "$ref": "#/components/schemas/EwayTransportDto"
+          },
+          "ewbNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "ewbGeneratedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "ewbValidUntil": {
+            "type": "string",
+            "nullable": true
+          },
+          "source": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "manual",
+              "gateway",
+              null
+            ]
+          },
+          "dismissedReason": {
+            "type": "string",
+            "nullable": true
+          },
+          "lastError": {
+            "type": "string",
+            "nullable": true,
+            "description": "The gateway's last refusal"
+          },
+          "gatewayClaimedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "lastExportedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Last NIC JSON download that included this bill"
+          },
+          "lastExportedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "blockers": {
+            "description": "Computed at read time (pending bills only)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EwayBlockerDto"
+            }
+          },
+          "gatewayAvailable": {
+            "type": "boolean",
+            "description": "A gateway is configured for this GSTIN and the bill is pending (offer Generate)"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "invoiceId",
+          "invoiceNo",
+          "invoiceIssuedAt",
+          "originGstin",
+          "consigneeGstin",
+          "b2b",
+          "status",
+          "consignmentValuePaise",
+          "thresholdPaise",
+          "thresholdRule",
+          "transport",
+          "ewbNo",
+          "ewbGeneratedAt",
+          "ewbValidUntil",
+          "source",
+          "dismissedReason",
+          "lastError",
+          "gatewayClaimedAt",
+          "lastExportedAt",
+          "lastExportedBy",
+          "blockers",
+          "gatewayAvailable",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "EwayBillListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EwayBillDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "ExportEwayDto": {
+        "type": "object",
+        "properties": {
+          "ids": {
+            "minItems": 1,
+            "maxItems": 100,
+            "description": "Ready bills of ONE supplier GSTIN, no repeats",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        },
+        "required": [
+          "ids"
+        ]
+      },
+      "EwayExportResponse": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "object",
+            "description": "The NIC bulk-upload file: { version, billLists: [bill objects] } — upload it as-is on the e-way portal's bulk generation"
+          }
+        },
+        "required": [
+          "file"
+        ]
+      },
+      "UpdateEwayTransportDto": {
+        "type": "object",
+        "properties": {
+          "transMode": {
+            "type": "number",
+            "nullable": true,
+            "enum": [
+              1,
+              2,
+              3,
+              4,
+              null
+            ],
+            "description": "1 Road, 2 Rail, 3 Air, 4 Ship — required when any field is set"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "Road only: 4–15 letters or digits (uppercased, spaces removed)"
+          },
+          "vehicleType": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "R",
+              "O",
+              null
+            ],
+            "description": "R regular / O over-dimensional — required with a vehicle"
+          },
+          "transporterId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The transporter's GSTIN or TRANSIN (15 characters) — enough on its own for a Part-A-only bill"
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true,
+            "description": "At most 25 characters"
+          },
+          "transDocNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "Rail/Air/Ship: required, at most 15 characters"
+          },
+          "transDocDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "YYYY-MM-DD, on or after the invoice date; Rail/Air/Ship: required"
+          },
+          "distanceKm": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "maximum": 4000,
+            "description": "Approximate distance in km (0 lets NIC compute it; at most 100 when both pincodes are equal)"
+          }
+        }
+      },
+      "EwayBillResponse": {
+        "type": "object",
+        "properties": {
+          "bill": {
+            "$ref": "#/components/schemas/EwayBillDto"
+          }
+        },
+        "required": [
+          "bill"
+        ]
+      },
+      "RecordEwayDto": {
+        "type": "object",
+        "properties": {
+          "ewbNo": {
+            "type": "string",
+            "description": "The 12-digit EWB number the portal returned",
+            "example": "141234567890"
+          },
+          "generatedAt": {
+            "type": "string",
+            "description": "When the portal generated it — ISO-8601 UTC, between the invoice issue and now (+5 min)"
+          },
+          "validUntil": {
+            "type": "string",
+            "nullable": true,
+            "description": "Validity end, ISO-8601 UTC, ≥ generatedAt (absent for a Part-A-only bill)"
+          }
+        },
+        "required": [
+          "ewbNo",
+          "generatedAt"
+        ]
+      },
+      "DismissEwayDto": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Why no e-way bill is needed (1–200 characters)"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "EwayStateThresholdDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "stateCode": {
+            "type": "string"
+          },
+          "thresholdPaise": {
+            "type": "number",
+            "nullable": true,
+            "description": "null = no e-way bill required"
+          },
+          "effectiveFrom": {
+            "type": "string",
+            "description": "YYYY-MM-DD"
+          },
+          "createdBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "createdAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "stateCode",
+          "thresholdPaise",
+          "effectiveFrom",
+          "createdBy",
+          "createdAt"
+        ]
+      },
+      "EwayStateThresholdListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EwayStateThresholdDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "AppendEwayStateThresholdDto": {
+        "type": "object",
+        "properties": {
+          "stateCode": {
+            "type": "string",
+            "description": "Two-digit GST state code (not 97 or 99)",
+            "example": "27"
+          },
+          "thresholdPaise": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "description": "Intra-state threshold in paise; null = no e-way bill required for intra-state supply"
+          },
+          "effectiveFrom": {
+            "type": "string",
+            "description": "YYYY-MM-DD — applies to invoices issued (IST) on or after this date",
+            "example": "2026-04-01"
+          }
+        },
+        "required": [
+          "stateCode",
+          "thresholdPaise",
+          "effectiveFrom"
+        ]
+      },
+      "EwayStateThresholdResponse": {
+        "type": "object",
+        "properties": {
+          "threshold": {
+            "$ref": "#/components/schemas/EwayStateThresholdDto"
+          }
+        },
+        "required": [
+          "threshold"
+        ]
+      },
+      "EwayGstinSettingDto": {
+        "type": "object",
+        "properties": {
+          "gstin": {
+            "type": "string"
+          },
+          "eInvoiceApplies": {
+            "type": "boolean"
+          },
+          "updatedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "updatedAt": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "gstin",
+          "eInvoiceApplies",
+          "updatedBy",
+          "updatedAt"
+        ]
+      },
+      "EwayGstinSettingListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EwayGstinSettingDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "PutEwayGstinSettingDto": {
+        "type": "object",
+        "properties": {
+          "eInvoiceApplies": {
+            "type": "boolean",
+            "description": "E-invoicing applies to this GSTIN: its B2B bills are held as needs-irn"
+          }
+        },
+        "required": [
+          "eInvoiceApplies"
+        ]
+      },
+      "EwayGstinSettingResponse": {
+        "type": "object",
+        "properties": {
+          "setting": {
+            "$ref": "#/components/schemas/EwayGstinSettingDto"
+          }
+        },
+        "required": [
+          "setting"
         ]
       },
       "ChannelWebhookOrderResponse": {

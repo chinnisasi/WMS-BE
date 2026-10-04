@@ -703,3 +703,123 @@ describe('migration 0055: the HSN summary read-model columns, applied to 0054 ro
     expect(await snapshot()).toEqual(before);
   });
 });
+
+const MIGRATION_0056 = '0056_eway_bills.sql';
+
+/**
+ * Story 8-2b — migration 0056 (the e-way tables) applied to a database at
+ * 0055 with an issued invoice in it. 0056 is additive (no backfill — the
+ * story's Never list), so the proof is: the tables, CHECKs, triggers, RLS and
+ * the ONE national seed row land; no existing row moves; a re-run RAISEs.
+ */
+describe('migration 0056: the e-way tables, applied to 0055 rows', () => {
+  const PRE_DB = 'wms_s_invoice_pre0056';
+  let baseUrl: string;
+  let sql: ReturnType<typeof postgres>;
+  let folder: string;
+  const tenantId = uuidv7();
+  const invoiceId = uuidv7();
+  let invoiceBefore: string;
+
+  const applyWhole = (): Promise<unknown> =>
+    sql.begin(async (tx) => {
+      for (const statement of migrationStatements(MIGRATION_0056)) {
+        await tx.unsafe(statement);
+      }
+    });
+
+  beforeAll(async () => {
+    baseUrl = process.env.DATABASE_URL!;
+    const url = new URL(baseUrl);
+    url.pathname = `/${PRE_DB}`;
+    const preUrl = url.toString();
+    const adminUrl = new URL(baseUrl);
+    adminUrl.pathname = '/postgres';
+    const admin = postgres(adminUrl.toString(), { max: 1 });
+    try {
+      await admin.unsafe(`select pg_terminate_backend(pid) from pg_stat_activity where datname = '${PRE_DB}'`);
+      await admin.unsafe(`drop database if exists "${PRE_DB}"`);
+      await admin.unsafe(`create database "${PRE_DB}"`);
+    } finally {
+      await admin.end();
+    }
+    // The schema the moment before 8-2b: journal trimmed at 0055.
+    folder = mkdtempSync(join(tmpdir(), 'wms-pre-0056-'));
+    cpSync(resolve(process.cwd(), 'drizzle'), folder, { recursive: true });
+    rmSync(join(folder, MIGRATION_0056));
+    const journalPath = join(folder, 'meta/_journal.json');
+    const journal = JSON.parse(readFileSync(journalPath, 'utf8')) as { entries: { idx: number }[] };
+    journal.entries = journal.entries.filter((entry) => entry.idx <= 55);
+    writeFileSync(journalPath, JSON.stringify(journal));
+    const db = createDatabase(preUrl);
+    await migrate(db, { migrationsFolder: folder });
+    await (db as unknown as { $client: { end(): Promise<void> } }).$client.end();
+    sql = postgres(preUrl, { max: 2, onnotice: () => undefined });
+
+    await sql`
+      insert into invoices (id, tenant_id, order_id, warehouse_id, invoice_no, fy_label, series_seq, status, origin_gstin,
+        place_of_supply, supply_type, subtotal_paise, gst_paise, total_paise, payable_paise, round_off_paise, revision, document, issued_at)
+      values (${invoiceId}, ${tenantId}, ${uuidv7()}, ${uuidv7()}, '29/2627/000001', 'FY-2627', 1, 'issued', '29AAAPZ1234C1ZV',
+        '27', 'inter', 6000000, 1080000, 7080000, 7080000, 0, 1, ${sql.json({ header: { issuedAt: '2026-10-01T00:00:00.000Z' } } as never)},
+        '2026-10-01T00:00:00.000Z')
+    `;
+    invoiceBefore = (await sql`select to_jsonb(i)::text as row from invoices i where id = ${invoiceId}`)[0]!.row as string;
+    await applyWhole();
+  });
+
+  afterAll(async () => {
+    await sql?.end();
+    if (folder !== undefined) rmSync(folder, { recursive: true, force: true });
+    const adminUrl = new URL(baseUrl);
+    adminUrl.pathname = '/postgres';
+    const admin = postgres(adminUrl.toString(), { max: 1 });
+    try {
+      await admin.unsafe(`select pg_terminate_backend(pid) from pg_stat_activity where datname = '${PRE_DB}'`);
+      await admin.unsafe(`drop database if exists "${PRE_DB}"`);
+    } finally {
+      await admin.end();
+    }
+  });
+
+  it('seeds exactly the one verified national rule, and backfills nothing', async () => {
+    expect([...(await sql`select effective_from::text as d, threshold_paise::text as p, source from eway_national_thresholds`)]).toEqual([
+      { d: '2018-04-01', p: '5000000', source: 'CGST Rule 138(1)' },
+    ]);
+    expect((await sql`select count(*)::int as n from eway_bills`)[0]!.n).toBe(0);
+    expect((await sql`select to_jsonb(i)::text as row from invoices i where id = ${invoiceId}`)[0]!.row).toBe(invoiceBefore);
+  });
+
+  it('the national table refuses UPDATE and DELETE; the state overrides refuse UPDATE but allow teardown DELETE', async () => {
+    await expect(sql`update eway_national_thresholds set threshold_paise = 1`).rejects.toThrow(/append-only/);
+    await expect(sql`delete from eway_national_thresholds`).rejects.toThrow(/append-only/);
+    const id = uuidv7();
+    await sql`insert into eway_state_thresholds (id, tenant_id, state_code, threshold_paise, effective_from, created_by)
+      values (${id}, ${tenantId}, '27', 10000000, '2025-04-01', ${uuidv7()})`;
+    await expect(sql`update eway_state_thresholds set threshold_paise = 1 where id = ${id}`).rejects.toThrow(/append-only/);
+    await sql`delete from eway_state_thresholds where id = ${id}`;
+    expect((await sql`select count(*)::int as n from eway_state_thresholds`)[0]!.n).toBe(0);
+  });
+
+  it('enables RLS with the uniform policy on the three tenant tables (not the global one)', async () => {
+    const rows = await sql`select relname, relrowsecurity from pg_class where relname like 'eway_%' and relkind = 'r' order by relname`;
+    expect([...rows].map((r) => [r.relname, r.relrowsecurity])).toEqual([
+      ['eway_bills', true],
+      ['eway_gstin_settings', true],
+      ['eway_national_thresholds', false],
+      ['eway_state_thresholds', true],
+    ]);
+    const policies = await sql`select tablename from pg_policies where tablename like 'eway_%' order by tablename`;
+    expect([...policies].map((p) => p.tablename)).toEqual(['eway_bills', 'eway_gstin_settings', 'eway_state_thresholds']);
+  });
+
+  it('a second apply RAISEs at the guard and changes nothing', async () => {
+    let error: unknown;
+    try {
+      await applyWhole();
+    } catch (err) {
+      error = err;
+    }
+    expect((error as Error).message).toContain('migration 0056 has already been applied');
+    expect((await sql`select count(*)::int as n from eway_national_thresholds`)[0]!.n).toBe(1);
+  });
+});

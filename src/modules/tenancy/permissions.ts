@@ -195,6 +195,17 @@ export const CAPABILITIES = [
   // staff record dispatches; dispatch auto-generates nothing they can
   // change). Mirrored into wms-fe `src/lib/users.ts` by the 8-1 FE story.
   'invoice.generate',
+  // Story 8-2b — the e-way bill verbs: enter Part B (transport), export the
+  // NIC bulk JSON, record a returned EWB number, dismiss, and generate
+  // through the gateway. Owner + Ops Manager + ACCOUNTANT — the accountant's
+  // FIRST write capability, a deliberate exception (decided, human,
+  // 2026-10-04): e-way paperwork is finance work. Operator absent.
+  'eway.manage',
+  // Story 8-2b — the e-way configuration: the per-state threshold overrides
+  // and the per-GSTIN "e-invoicing applies" flag. OWNER-ONLY (a threshold
+  // decides which consignments need a bill — the `adjustments.approve`
+  // rationale: the person who sets the bar).
+  'eway.configure',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -207,7 +218,8 @@ export type Capability = (typeof CAPABILITIES)[number];
  * needs (`putaway.execute`, Story 3.5 — the first non-empty operator
  * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6; `labels.execute`, Story 4.6c; `excursion.record`, Story 12-5; `transfers.execute`, Story 5-1; `counts.execute`, Story 5-3 — the floor
  * records what it observes) and NOT `secure.move` (Story 12-3 — the
- * cage is off-limits to floor staff); Accountant is read-only. Reads stay
+ * cage is off-limits to floor staff); Accountant is read-only except
+ * `eway.manage` (Story 8-2b — e-way paperwork is finance work). Reads stay
  * open to any tenant member.
  */
 export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability>>> = {
@@ -265,6 +277,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // generate/regenerate with per-line rate overrides. Mirror of
     // `replenishment.manage`'s planner-set rationale in CAPABILITIES above.
     'invoice.generate',
+    // Story 8-2b — the e-way paperwork (not its configuration, owner-only).
+    'eway.manage',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
@@ -288,7 +302,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // mirroring `transfers.execute`).
     'counts.execute',
   ]),
-  accountant: new Set<Capability>([]),
+  // Story 8-2b: the accountant's first (and only) write — the e-way
+  // paperwork (finance work). Everything else stays read-only.
+  accountant: new Set<Capability>(['eway.manage']),
 };
 
 /**

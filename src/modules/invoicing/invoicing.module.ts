@@ -6,6 +6,9 @@ import { InvoicingCommand } from './command';
 import { InvoiceDeliveryHandler } from './delivery';
 import { InvoicingFacade } from './facade';
 import { InvoiceGenerator } from './generator';
+import { EwayCommand } from './eway.command';
+import { EwayDeliveryHandler } from './eway.delivery';
+import { EWAY_GATEWAY, ewayGatewayFromEnv } from './eway-gateway';
 
 /**
  * The invoicing module (story 8-1): owns `invoices`, `invoice_lines`,
@@ -26,10 +29,23 @@ import { InvoiceGenerator } from './generator';
  *
  * Story 8-2a: imports `CatalogModule` for ONE read — the HSN summary's
  * current-catalog-HSN hint (`CatalogFacade.getSkuHsnByCodesInTx`).
+ *
+ * Story 8-2b: the e-way bills — `EwayDeliveryHandler` queues a bill on
+ * `invoice.issued`, `EwayCommand` carries the finance verbs, and the
+ * `EWAY_GATEWAY` port is selected by the `EWAY_GATEWAY` env MODE
+ * (`unconfigured` by default, `sandbox` for dev/test — never a credential).
  */
 @Module({
   imports: [SharedModule, OutboundModule, forwardRef(() => CatalogModule)],
-  providers: [InvoiceGenerator, InvoicingCommand, InvoiceDeliveryHandler, InvoicingFacade],
-  exports: [InvoicingFacade, InvoicingCommand, InvoiceGenerator],
+  providers: [
+    InvoiceGenerator,
+    InvoicingCommand,
+    InvoiceDeliveryHandler,
+    InvoicingFacade,
+    EwayCommand,
+    EwayDeliveryHandler,
+    { provide: EWAY_GATEWAY, useFactory: () => ewayGatewayFromEnv() },
+  ],
+  exports: [InvoicingFacade, InvoicingCommand, InvoiceGenerator, EwayCommand],
 })
 export class InvoicingModule {}

@@ -2,7 +2,31 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import type { Database } from '../../shared/db/db';
 import { DATABASE } from '../../shared/shared.module';
-import { invoiceLines, invoices, type Invoice, type InvoiceLine } from '../../shared/db/schema';
+import {
+  ewayBills,
+  ewayGstinSettings,
+  ewayStateThresholds,
+  invoiceLines,
+  invoices,
+  type Invoice,
+  type InvoiceLine,
+} from '../../shared/db/schema';
+import { tenantGstinsInTx } from '../tenancy/tenancy.service';
+import { EWAY_GATEWAY, type EwayGateway } from './eway-gateway';
+import {
+  EWAY_LIST_DEFAULT_PAGE_SIZE,
+  EWAY_LIST_MAX_PAGE_SIZE,
+  toEwayBillView,
+  viewContextInTx,
+  type EwayBillStatus,
+  type EwayBillView,
+} from './eway-view';
+import {
+  toGstinSettingView,
+  toStateThresholdView,
+  type EwayGstinSettingView,
+  type EwayStateThresholdView,
+} from './eway.command';
 import { decodeCursor, encodeCursor } from '../../shared/primitives/pagination';
 import { fullPrecisionInstant } from '../../shared/primitives/time';
 import type { Page } from '../../shared/primitives/pagination';
@@ -32,6 +56,13 @@ import {
  * delivery handler resolve. Reads are never capability-gated (the
  * `permissions.ts` rule) — any tenant member may read the tenant's invoices.
  */
+
+export interface ListEwayBillsQuery {
+  readonly status?: EwayBillStatus | undefined;
+  readonly gstin?: string | undefined;
+  readonly limit?: number | undefined;
+  readonly cursor?: string | undefined;
+}
 
 export interface ListInvoicesQuery {
   readonly limit?: number | undefined;
@@ -72,7 +103,81 @@ export class InvoicingFacade {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
+    @Inject(EWAY_GATEWAY) private readonly ewayGateway: EwayGateway,
   ) {}
+
+  /**
+   * The e-way bills (story 8-2b), newest first over `(created_at, id)`, at
+   * most 50 per page, optionally filtered by status and supplier GSTIN. Each
+   * row carries its computed blockers and whether a gateway can generate it.
+   * A read — never capability-gated.
+   */
+  async listEwayBills(tenantId: string, query: ListEwayBillsQuery = {}): Promise<Page<EwayBillView>> {
+    const limit = Math.min(query.limit ?? EWAY_LIST_DEFAULT_PAGE_SIZE, EWAY_LIST_MAX_PAGE_SIZE);
+    const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
+    // GSTINs are stored uppercase (the canonical form): a lowercase filter matches too.
+    const gstin = query.gstin === undefined ? undefined : assertGstinParam(query.gstin.trim().toUpperCase());
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({ bill: ewayBills, createdAtText: sql<string>`${ewayBills.createdAt}::text` })
+        .from(ewayBills)
+        .where(
+          and(
+            eq(ewayBills.tenantId, tenantId),
+            query.status === undefined ? undefined : eq(ewayBills.status, query.status),
+            gstin === undefined ? undefined : eq(ewayBills.originGstin, gstin),
+            before === undefined
+              ? undefined
+              : sql`(${ewayBills.createdAt}, ${ewayBills.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
+          ),
+        )
+        .orderBy(desc(ewayBills.createdAt), desc(ewayBills.id))
+        .limit(limit + 1);
+      const pageRows = rows.slice(0, limit);
+      const ctx = await viewContextInTx(tx, tenantId, pageRows.map((row) => row.bill), this.ewayGateway);
+      const last = pageRows.at(-1);
+      return {
+        items: pageRows.map((row) => toEwayBillView(row.bill, ctx)),
+        nextCursor:
+          rows.length > limit && last
+            ? encodeCursor({ createdAt: fullPrecisionInstant(last.createdAtText), id: last.bill.id })
+            : null,
+      };
+    });
+  }
+
+  /** Every state-threshold override row (append-only history), state then newest first. */
+  async listEwayStateThresholds(tenantId: string): Promise<EwayStateThresholdView[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select()
+        .from(ewayStateThresholds)
+        .where(eq(ewayStateThresholds.tenantId, tenantId))
+        .orderBy(
+          asc(ewayStateThresholds.stateCode),
+          desc(ewayStateThresholds.effectiveFrom),
+          desc(ewayStateThresholds.createdAt),
+          desc(ewayStateThresholds.id),
+        );
+      return rows.map(toStateThresholdView);
+    });
+  }
+
+  /**
+   * The e-way settings of every GSTIN the tenant holds (its own and its
+   * warehouses'), GSTIN ascending; a GSTIN never set reads `false`.
+   */
+  async listEwayGstinSettings(tenantId: string): Promise<EwayGstinSettingView[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const owned = await tenantGstinsInTx(tx, tenantId);
+      const rows = await tx.select().from(ewayGstinSettings).where(eq(ewayGstinSettings.tenantId, tenantId));
+      const byGstin = new Map(rows.map((row) => [row.gstin, toGstinSettingView(row)]));
+      const gstins = [...new Set([...owned, ...byGstin.keys()])].sort();
+      return gstins.map(
+        (gstin) => byGstin.get(gstin) ?? { gstin, eInvoiceApplies: false, updatedBy: null, updatedAt: null },
+      );
+    });
+  }
 
   /**
    * The HSN summary (story 8-2a) of ONE supplier GSTIN over ONE period —

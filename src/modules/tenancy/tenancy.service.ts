@@ -213,6 +213,23 @@ export async function invoicePartyFactsInTx(
 }
 
 /**
+ * Every GSTIN the tenant is registered under (story 8-2b): the tenant's own
+ * and each warehouse's, distinct and sorted. The e-way GSTIN settings accept
+ * only these. A read — invoicing writes no tenancy table.
+ */
+export async function tenantGstinsInTx(tx: TenantTx, tenantId: string): Promise<string[]> {
+  const tenantRows = await tx.select({ gstin: tenants.gstin }).from(tenants).where(eq(tenants.id, tenantId));
+  const warehouseRows = await tx
+    .select({ gstin: warehouses.gstin })
+    .from(warehouses)
+    .where(eq(warehouses.tenantId, tenantId));
+  const all = [...tenantRows, ...warehouseRows]
+    .map((row) => row.gstin)
+    .filter((gstin): gstin is string => gstin !== null);
+  return [...new Set(all)].sort();
+}
+
+/**
  * The GSTIN's canonical storage form (story 8-1): trim + uppercase, with a
  * whitespace-only value treated as absent (the `line2` idiom). Null stays
  * null — optional everywhere. Shape-validated here so the non-HTTP caller
