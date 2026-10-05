@@ -8,10 +8,16 @@ import { problem } from './problem-details';
  * an idempotency key with a different payload, …).
  */
 export class ProblemException extends HttpException {
-  constructor(code: string, status: number, title: string, detail?: string) {
+  constructor(code: string, status: number, title: string, detail?: string, extensions?: Record<string, unknown>) {
     // `message` mirrors the human detail so the filter's rendered `title` and
-    // `detail` stay consistent with this intent.
-    super({ ...problem(code, status, title, detail), message: detail ?? title }, status);
+    // `detail` stay consistent with this intent. `extensions` (story 8-2b)
+    // carries structured RFC 9457 extension members — e.g. the per-bill
+    // reasons of an e-way export refusal — which the filter renders beside
+    // the standard members; absent, the document is byte-identical.
+    super(
+      { ...problem(code, status, title, detail), message: detail ?? title, ...(extensions === undefined ? {} : { extensions }) },
+      status,
+    );
   }
 }
 

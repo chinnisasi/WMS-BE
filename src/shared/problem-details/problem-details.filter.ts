@@ -42,7 +42,18 @@ export class ProblemDetailsFilter implements ExceptionFilter {
         : typeof rawMessage === 'string'
           ? [rawMessage]
           : undefined;
+      // Structured extension members a ProblemException carries (story
+      // 8-2b) — rendered beside the standard members, never over them.
+      const extensions =
+        typeof body === 'object' && body !== null && 'extensions' in body
+          ? (body as { extensions: unknown }).extensions
+          : undefined;
+      const extensionMembers =
+        typeof extensions === 'object' && extensions !== null && !Array.isArray(extensions)
+          ? (extensions as Record<string, unknown>)
+          : {};
       details = {
+        ...extensionMembers,
         ...problem(
           code,
           status,
