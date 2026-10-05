@@ -250,6 +250,29 @@ describe('invoicing arithmetic (story 8-1, unit)', () => {
       expect(resolveStateCode(byGstin, byName, null, 'Uttaranchal')).toBeNull();
     });
 
+    it('8-1d: the additive signals — gstinKnown (the GSTIN prefix resolved) and textUnresolved (non-blank text off the list)', () => {
+      // The generator builds the prefix map from registration codes only, so 99 is absent there.
+      const byRegistrationPrefix = new Map(rows.filter((r) => r.stateCode !== '99').map((r) => [r.stateCode, r]));
+      expect(resolveStateCode(byRegistrationPrefix, byName, '27AAAPZ1234C1ZV', 'Karnataka')).toEqual({
+        code: '27', name: 'Maharashtra', textCode: '29', gstinKnown: true, textUnresolved: false,
+      });
+      // A legacy 92/99 GSTIN falls back to the text — the gstin-prefix-unknown case.
+      expect(resolveStateCode(byRegistrationPrefix, byName, '99AAAPZ1234C1ZV', 'Karnataka')).toEqual({
+        code: '29', name: 'Karnataka', textCode: '29', gstinKnown: false, textUnresolved: false,
+      });
+      expect(resolveStateCode(byRegistrationPrefix, byName, '92AAAPZ1234C1ZV', 'Karnataka')!.gstinKnown).toBe(false);
+      // Text off the list, the GSTIN resolves — the state-text-unknown case.
+      expect(resolveStateCode(byRegistrationPrefix, byName, '29AAAPZ1234C1ZV', 'Karnatka')).toEqual({
+        code: '29', name: 'Karnataka', textCode: null, gstinKnown: true, textUnresolved: true,
+      });
+      // Blank text is not "unknown text".
+      expect(resolveStateCode(byRegistrationPrefix, byName, '29AAAPZ1234C1ZV', '  ')!.textUnresolved).toBe(false);
+      // B2C: no GSTIN is not an unknown GSTIN.
+      expect(resolveStateCode(byRegistrationPrefix, byName, null, 'Gujarat')).toMatchObject({ code: '24', gstinKnown: false, textUnresolved: false });
+      // Both off → null, unchanged.
+      expect(resolveStateCode(byRegistrationPrefix, byName, '92AAAPZ1234C1ZV', 'Atlantis')).toBeNull();
+    });
+
     it('an ampersand in the address text reads as "and" (the seeded names spell it out)', () => {
       expect(resolveStateCode(byGstin, byName, null, 'Jammu & Kashmir')!.code).toBe('01');
       expect(resolveStateCode(byGstin, byName, null, 'Jammu&Kashmir')!.code).toBe('01');

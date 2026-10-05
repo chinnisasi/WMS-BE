@@ -188,7 +188,29 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     'IN-CONC', // 8-1b: concurrent awaiting→issued generations
     'IN-PAR', // 8-1b: SQL/TS rounding parity on a migrated awaiting row
     'IN-RACE2', // 8-1b: the forced race whose winner ISSUES — the loser's retry freezes
+    'IN-HBAD', // 8-1d: HSN 'HSN 0910' → hsn-invalid
+    'IN-HWS', // 8-1d: a whitespace-only HSN → hsn-invalid, not hsn-gap
+    'IN-HPAD', // 8-1d: a padded valid HSN ' 0910 ' → no warning
+    'IN-STX', // 8-1d: destination state text off the list → state-text-unknown
+    'IN-LEG', // 8-1d: legacy GSTIN prefixes (92 origin, 99 destination) → gstin-prefix-unknown
+    'IN-LEG2', // 8-1d: the cross-side order (gstin-prefix-unknown before state-text-unknown)
+    'IN-REDER', // 8-1d: an awaiting invoice saved before 8-1d re-derives ONCE
+    'IN-LEGAL', // 8-1d: the buyer legal name prints as the buyer
+    'IN-NOADDR', // 8-1d: a GSTIN-resolved side with NO address → state-text-unknown (missing)
+    'IN-BLST', // 8-1d: a GSTIN-resolved side with a blank state → state-text-unknown (missing)
+    'IN-NAME', // 8-1d: buyer / seller names NIC prints blank → party-name-unprintable
+    'IN-POSG', // 8-1d: unknown consignee GSTIN prefix + off-list text → place-of-supply names the GSTIN
+    'IN-POSO', // 8-1d: the origin twin (a 92 warehouse GSTIN + off-list origin text)
   ] as const;
+
+  /** Story 8-1d: the free-text HSNs the catalog may hold, set raw after the import. */
+  const RAW_HSN: Readonly<Record<string, string>> = {
+    'IN-HBAD': 'HSN 0910',
+    'IN-HWS': '   ',
+    'IN-HPAD': ' 0910 ',
+    'IN-LEG': 'HSN 0910',
+    'IN-REDER': 'HSN 0910',
+  };
 
   beforeAll(async () => {
     suiteDb = await useSuiteDatabase('invoicing');
@@ -297,6 +319,9 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
       skuIds.set(item.code, item.id);
     }
     expect(skuIds.size).toBeGreaterThanOrEqual(SKU_CODES.length);
+    for (const [code, hsn] of Object.entries(RAW_HSN)) {
+      await sql`update skus set hsn = ${hsn} where id = ${sku(code)}`;
+    }
 
     // The kit: 1×IN-KTC1 + 2×IN-KTC2 (the parent never holds stock).
     await request(app.getHttpServer())
@@ -485,7 +510,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
    */
   async function createOrder(
     lines: { skuId: string; quantity: number; ratePaise?: number }[],
-    opts: { destination?: Record<string, unknown>; consigneeGstin?: string | null; warehouse?: string } = {},
+    opts: { destination?: Record<string, unknown>; consigneeGstin?: string | null; consigneeLegalName?: string; warehouse?: string } = {},
   ): Promise<{ orderId: string; lineRows: OrderLineRow[] }> {
     const res = await request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/orders`)
@@ -500,6 +525,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
         ),
         destination: opts.destination ?? testAddress({ state: 'Maharashtra', city: 'Pune', line1: '24, Chakan MIDC', pincode: '411042' }),
         ...(opts.consigneeGstin ? { consigneeGstin: opts.consigneeGstin } : {}),
+        ...(opts.consigneeLegalName !== undefined ? { consigneeLegalName: opts.consigneeLegalName } : {}),
       })
       .expect(201);
     const orderId = res.body.order.id as string;
@@ -530,7 +556,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
   async function releasedWave(
     lines: { skuId: string; quantity: number; ratePaise?: number }[],
     tag: string,
-    opts: { destination?: Record<string, unknown>; consigneeGstin?: string | null } = {},
+    opts: { destination?: Record<string, unknown>; consigneeGstin?: string | null; consigneeLegalName?: string } = {},
   ): Promise<{ orderId: string; lineRows: OrderLineRow[]; picklist: Picklist }> {
     const { orderId, lineRows } = await createOrder(lines, opts);
     const policy = await policyId(`${tag}-${ulid().slice(10, 18)}`);
@@ -606,6 +632,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     opts: {
       destination?: Record<string, unknown>;
       consigneeGstin?: string | null;
+      consigneeLegalName?: string;
       /**
        * The seed override: a KIT line's parent must never be seeded
        * (story 11.4 — a kit SKU cannot hold stock, the adjustment is a
@@ -1115,6 +1142,236 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect(doc.gaps.map((gap) => gap.kind)).toEqual(['pos-discrepancy']);
     expect(doc.gaps[0]!.detail).toContain('27COSGP8394M1ZB');
     expect(doc.gaps[0]!.detail).toContain('24'); // the address code, reported
+    // 8-1d: the detail names the side and its e-way consequence.
+    expect(doc.gaps[0]!.detail).toMatch(/^ship-to discrepancy: /);
+    expect(doc.gaps[0]!.detail).toContain('if an e-way bill is required it will be blocked (ship-to-differs); generate it on the portal');
+  });
+
+  // ── story 8-1d: issuance-gate parity — the issue-time warnings ─────────────
+
+  it('8-1d: a malformed HSN ("HSN 0910") ISSUES with hsn-invalid on that line — not hsn-gap; the line keeps its raw HSN', async () => {
+    const { orderId } = await dispatchedOrder([{ skuId: sku('IN-HBAD'), quantity: 1, ratePaise: 300 }], 'hbad');
+    await delivery.deliver(dispatchedEvent(orderId));
+    const row = mustRow(await invoiceRow(orderId));
+    expect(row.status).toBe('issued');
+    const doc = row.document as { gaps: { kind: string; detail: string; orderLineId?: string }[]; lines: { orderLineId: string; hsn: string | null; hsnGap: boolean }[] };
+    expect(doc.gaps.map((gap) => gap.kind)).toEqual(['hsn-invalid']);
+    expect(doc.gaps[0]!.orderLineId).toBe(doc.lines[0]!.orderLineId);
+    expect(doc.gaps[0]!.detail).toContain('"HSN 0910"');
+    expect(doc.gaps[0]!.detail).toContain('(hsn-issue)');
+    expect(doc.lines[0]!.hsn).toBe('HSN 0910');
+    expect(doc.lines[0]!.hsnGap).toBe(false);
+    expect((await invoiceLineRows(row.id))[0]!.hsn_gap).toBe(false);
+  });
+
+  it('8-1d: a whitespace-only HSN is hsn-invalid (never hsn-gap); a padded valid HSN (" 0910 ") warns nothing', async () => {
+    const ws = await dispatchedOrder([{ skuId: sku('IN-HWS'), quantity: 1, ratePaise: 300 }], 'hws');
+    await delivery.deliver(dispatchedEvent(ws.orderId));
+    const wsRow = mustRow(await invoiceRow(ws.orderId));
+    expect(wsRow.status).toBe('issued');
+    const wsDoc = wsRow.document as { gaps: { kind: string }[]; lines: { hsnGap: boolean }[] };
+    expect(wsDoc.gaps.map((gap) => gap.kind)).toEqual(['hsn-invalid']);
+    expect(wsDoc.lines[0]!.hsnGap).toBe(false);
+
+    const pad = await dispatchedOrder([{ skuId: sku('IN-HPAD'), quantity: 1, ratePaise: 300 }], 'hpad');
+    await delivery.deliver(dispatchedEvent(pad.orderId));
+    const padRow = mustRow(await invoiceRow(pad.orderId));
+    expect(padRow.status).toBe('issued');
+    expect((padRow.document as { gaps: unknown[] }).gaps).toEqual([]);
+  });
+
+  it('8-1d: a destination state text off the list, with a resolving GSTIN, ISSUES with state-text-unknown naming the e-way block', async () => {
+    const { orderId } = await dispatchedOrder(
+      [{ skuId: sku('IN-STX'), quantity: 1, ratePaise: 300 }],
+      'stx',
+      { consigneeGstin: '29AAACR5055K1Z5', destination: testAddress({ state: 'Tamilnadu', city: 'Hosur', pincode: '635109' }) },
+    );
+    await delivery.deliver(dispatchedEvent(orderId));
+    const row = mustRow(await invoiceRow(orderId));
+    expect(row.status).toBe('issued');
+    expect(row.place_of_supply).toBe('29'); // the GSTIN's code — the text could not stand in
+    expect(row.supply_type).toBe('inter');
+    const doc = row.document as { gaps: { kind: string; detail: string; orderLineId?: string }[] };
+    expect(doc.gaps.map((gap) => gap.kind)).toEqual(['state-text-unknown']);
+    expect(doc.gaps[0]!.detail).toContain('"Tamilnadu"');
+    expect(doc.gaps[0]!.detail).toContain('(state-unresolved)');
+    expect(doc.gaps[0]!.orderLineId).toBeUndefined();
+  });
+
+  it('8-1d: legacy GSTINs whose prefix is not a registration code (92 supplier, 99 consignee) resolve from the address text and ISSUE with gstin-prefix-unknown — origin first, then the line gap', async () => {
+    try {
+      // Entry refuses these now; a pre-8-1d row can still carry them.
+      await sql`update warehouses set gstin = '92AAAPZ1234C1ZV' where id = ${noGstinWarehouseId}`;
+      const orderId = await dispatchedFromSecondWarehouse(sku('IN-LEG'), 1, 300);
+      await sql`update orders set consignee_gstin = '99AAACM4321K1Z8' where id = ${orderId}`;
+      const out = await command.generate({ tenantId, actorUserId: ownerUserId, orderId }, ulid());
+      expect(out.invoice.status).toBe('issued');
+      expect(out.invoice.originGstin).toBe('92AAAPZ1234C1ZV');
+      expect(out.invoice.placeOfSupply).toBe('27'); // the destination TEXT — 99 no longer resolves
+      expect(out.invoice.supplyType).toBe('intra'); // origin text 27 → 27
+      const gaps = out.invoice.document.gaps;
+      expect(gaps.map((gap) => gap.kind)).toEqual(['gstin-prefix-unknown', 'gstin-prefix-unknown', 'hsn-invalid']);
+      expect(gaps[0]!.detail).toContain('supplier GSTIN 92AAAPZ1234C1ZV begins "92"');
+      expect(gaps[0]!.detail).toContain('(ship-to-differs)');
+      expect(gaps[1]!.detail).toContain('consignee GSTIN 99AAACM4321K1Z8 begins "99"');
+      expect(gaps[1]!.detail).toContain('NIC may refuse this buyer GSTIN on the e-way bill');
+    } finally {
+      await sql`update warehouses set gstin = null where id = ${noGstinWarehouseId}`;
+    }
+  });
+
+  it('8-1d: the party warnings order gstin-prefix-unknown before state-text-unknown, across sides', async () => {
+    try {
+      // Origin: the tenant GSTIN (27) backs the second warehouse, whose origin
+      // text is now off the list → state-text-unknown on the ORIGIN. Destination:
+      // a legacy 92 consignee GSTIN → gstin-prefix-unknown on the DESTINATION.
+      await sql`update warehouses set origin_state = 'Maharashtra State' where id = ${noGstinWarehouseId}`;
+      const orderId = await dispatchedFromSecondWarehouse(sku('IN-LEG2'), 1, 300);
+      await sql`update orders set consignee_gstin = '92AAACM4321K1Z8' where id = ${orderId}`;
+      const out = await command.generate({ tenantId, actorUserId: ownerUserId, orderId }, ulid());
+      expect(out.invoice.status).toBe('issued');
+      const gaps = out.invoice.document.gaps;
+      expect(gaps.map((gap) => gap.kind)).toEqual(['gstin-prefix-unknown', 'state-text-unknown']);
+      expect(gaps[0]!.detail).toContain('consignee GSTIN 92AAACM4321K1Z8');
+      expect(gaps[1]!.detail).toContain(`the warehouse's origin state "Maharashtra State"`);
+    } finally {
+      await sql`update warehouses set origin_state = 'Maharashtra' where id = ${noGstinWarehouseId}`;
+    }
+  });
+
+  it('8-1d: an awaiting invoice saved before 8-1d re-derives ONCE — the first re-derive bumps the revision with the new warning, the second is a no-op', async () => {
+    // A destination off the list (no GSTIN) parks it awaiting-data; the line
+    // is priced, so its malformed HSN warns. Then strip the hsn-invalid gap,
+    // as a pre-8-1d generator would have written the document.
+    const { orderId } = await dispatchedOrder([{ skuId: sku('IN-REDER'), quantity: 1, ratePaise: 300 }], 'reder', {
+      destination: testAddress({ state: 'Atlantis', city: 'Poseidonis' }),
+    });
+    await delivery.deliver(dispatchedEvent(orderId));
+    const first = mustRow(await invoiceRow(orderId));
+    expect(first.status).toBe('awaiting-data');
+    expect((first.document as { gaps: { kind: string }[] }).gaps.map((gap) => gap.kind)).toEqual(['place-of-supply', 'hsn-invalid']);
+    await sql`
+      update invoices set document = jsonb_set(document, '{gaps}', (
+        select coalesce(jsonb_agg(g), '[]'::jsonb) from jsonb_array_elements(document->'gaps') g where g->>'kind' <> 'hsn-invalid'
+      )) where id = ${first.id}
+    `;
+    const legacy = mustRow(await invoiceRow(orderId));
+    expect((legacy.document as { gaps: { kind: string }[] }).gaps.map((gap) => gap.kind)).toEqual(['place-of-supply']);
+
+    await delivery.deliver(dispatchedEvent(orderId));
+    const bumped = mustRow(await invoiceRow(orderId));
+    expect(bumped.status).toBe('awaiting-data');
+    expect(bumped.revision).toBe(legacy.revision + 1);
+    expect((bumped.document as { gaps: { kind: string }[] }).gaps.map((gap) => gap.kind)).toEqual(['place-of-supply', 'hsn-invalid']);
+
+    await delivery.deliver(dispatchedEvent(orderId));
+    expect(mustRow(await invoiceRow(orderId))).toEqual(bumped);
+  });
+
+  it('8-1d: a side resolved from its GSTIN with NO address warns state-text-unknown (missing → address-incomplete); the missing buyer name warns too', async () => {
+    const { orderId } = await dispatchedOrder(
+      [{ skuId: sku('IN-NOADDR'), quantity: 1, ratePaise: 300 }],
+      'noaddr',
+      { consigneeGstin: '29AAACR5055K1Z5', destination: testAddress() },
+    );
+    // A pre-11.1 row: no destination columns at all.
+    await sql`
+      update orders set destination_contact_name = null, destination_phone = null, destination_line1 = null,
+        destination_line2 = null, destination_city = null, destination_state = null, destination_pincode = null
+      where id = ${orderId}
+    `;
+    await delivery.deliver(dispatchedEvent(orderId));
+    const row = mustRow(await invoiceRow(orderId));
+    expect(row.status).toBe('issued');
+    expect(row.place_of_supply).toBe('29');
+    const gaps = (row.document as { gaps: { kind: string; detail: string }[] }).gaps;
+    expect(gaps.map((gap) => gap.kind)).toEqual(['state-text-unknown', 'party-name-unprintable']);
+    expect(gaps[0]!.detail).toContain('the destination address state is missing');
+    expect(gaps[0]!.detail).toContain('(address-incomplete)');
+    expect(gaps[1]!.detail).toContain('buyer name (none)');
+  });
+
+  it('8-1d: a side resolved from its GSTIN with a BLANK state text warns state-text-unknown (missing → state-unresolved)', async () => {
+    const { orderId } = await dispatchedOrder(
+      [{ skuId: sku('IN-BLST'), quantity: 1, ratePaise: 300 }],
+      'blst',
+      { consigneeGstin: '29AAACR5055K1Z5', destination: testAddress() },
+    );
+    await sql`update orders set destination_state = '  ' where id = ${orderId}`;
+    await delivery.deliver(dispatchedEvent(orderId));
+    const row = mustRow(await invoiceRow(orderId));
+    expect(row.status).toBe('issued');
+    const gaps = (row.document as { gaps: { kind: string; detail: string }[] }).gaps;
+    expect(gaps.map((gap) => gap.kind)).toEqual(['state-text-unknown']);
+    expect(gaps[0]!.detail).toContain('the destination address state is missing');
+    expect(gaps[0]!.detail).toContain('(state-unresolved)');
+  });
+
+  it('8-1d: a seller or buyer name NIC prints blank warns party-name-unprintable (seller first) — never blocking', async () => {
+    const original = (await sql`select name from tenants where id = ${tenantId}`)[0]!.name as string;
+    try {
+      await sql`update tenants set name = 'मसाला कंपनी' where id = ${tenantId}`;
+      const { orderId } = await dispatchedOrder(
+        [{ skuId: sku('IN-NAME'), quantity: 1, ratePaise: 300 }],
+        'name',
+        { destination: testAddress({ state: 'Maharashtra', contactName: 'प्रिया शर्मा' }) },
+      );
+      await delivery.deliver(dispatchedEvent(orderId));
+      const row = mustRow(await invoiceRow(orderId));
+      expect(row.status).toBe('issued');
+      const gaps = (row.document as { gaps: { kind: string; detail: string }[] }).gaps;
+      expect(gaps.map((gap) => gap.kind)).toEqual(['party-name-unprintable', 'party-name-unprintable']);
+      expect(gaps[0]!.detail).toMatch(/^seller name "मसाला कंपनी" has no characters the e-way portal accepts/);
+      expect(gaps[0]!.detail).toContain('(address-incomplete)');
+      expect(gaps[1]!.detail).toMatch(/^buyer name "प्रिया शर्मा"/);
+    } finally {
+      await sql`update tenants set name = ${original} where id = ${tenantId}`;
+    }
+  });
+
+  it('8-1d: an unknown consignee GSTIN prefix AND an off-list state text park place-of-supply, the detail naming the GSTIN cause', async () => {
+    const { orderId } = await dispatchedOrder(
+      [{ skuId: sku('IN-POSG'), quantity: 1, ratePaise: 300 }],
+      'posg',
+      { consigneeGstin: '29AAACR5055K1Z5', destination: testAddress({ state: 'Atlantis' }) },
+    );
+    await sql`update orders set consignee_gstin = '92AAACM4321K1Z8' where id = ${orderId}`;
+    await delivery.deliver(dispatchedEvent(orderId));
+    const row = mustRow(await invoiceRow(orderId));
+    expect(row.status).toBe('awaiting-data');
+    const gaps = (row.document as { gaps: { kind: string; detail: string }[] }).gaps;
+    expect(gaps.map((gap) => gap.kind)).toEqual(['place-of-supply']);
+    expect(gaps[0]!.detail).toContain('the consignee GSTIN 92AAACM4321K1Z8 begins "92", which is not a GST state code');
+    expect(gaps[0]!.detail).toContain('(Atlantis)');
+  });
+
+  it('8-1d: the origin twin — a 92 warehouse GSTIN and an off-list origin text park place-of-supply naming the supplier GSTIN', async () => {
+    try {
+      await sql`update warehouses set gstin = '92AAAPZ1234C1ZV', origin_state = 'Atlantis' where id = ${noGstinWarehouseId}`;
+      const orderId = await dispatchedFromSecondWarehouse(sku('IN-POSO'), 1, 300);
+      const out = await command.generate({ tenantId, actorUserId: ownerUserId, orderId }, ulid());
+      expect(out.invoice.status).toBe('awaiting-data');
+      const gaps = out.invoice.document.gaps;
+      expect(gaps.map((gap) => gap.kind)).toEqual(['place-of-supply']);
+      expect(gaps[0]!.detail).toContain('supply origin unresolvable — the supplier GSTIN 92AAAPZ1234C1ZV begins "92", which is not a GST state code');
+      expect(gaps[0]!.detail).toContain('(Atlantis)');
+    } finally {
+      await sql`update warehouses set gstin = null, origin_state = 'Maharashtra' where id = ${noGstinWarehouseId}`;
+    }
+  });
+
+  it('8-1d: the buyer legal name prints as the invoice buyer (B2B); without one the buyer stays the contact name', async () => {
+    const { orderId } = await dispatchedOrder(
+      [{ skuId: sku('IN-LEGAL'), quantity: 1, ratePaise: 300 }],
+      'legal',
+      { consigneeGstin: '29AAACR5055K1Z5', consigneeLegalName: 'Mysore Spices Pvt Ltd', destination: testAddress() },
+    );
+    await delivery.deliver(dispatchedEvent(orderId));
+    const row = mustRow(await invoiceRow(orderId));
+    expect(row.status).toBe('issued');
+    const doc = row.document as { buyer: { name: string | null; gstin: string | null }; header: { consigneeAddress: { contactName: string } } };
+    expect(doc.buyer).toEqual({ name: 'Mysore Spices Pvt Ltd', gstin: '29AAACR5055K1Z5' });
+    expect(doc.header.consigneeAddress.contactName).toBe('Priya Sharma'); // the delivery contact stays on the address
   });
 
   it('an INTER-state supply charges IGST only', async () => {
@@ -1129,6 +1386,8 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect(row.status).toBe('issued');
     expect(row.supply_type).toBe('inter');
     expect(row.place_of_supply).toBe('29');
+    // 8-1d: no legal name on the order → the buyer is the contact, as before.
+    expect((row.document as { buyer: { name: string | null } }).buyer.name).toBe('Priya Sharma');
     // taxable 1000 paise; 18% = 180 → ALL of it IGST.
     expect(Number(row.gst_paise)).toBe(180);
     const lines = await invoiceLineRows(row.id);
@@ -1686,7 +1945,11 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
       expect(regenerated.invoice.supplyType).toBe('inter');
       const gaps = regenerated.invoice.document.gaps;
       expect(gaps.map((gap) => gap.kind)).toEqual(['pos-discrepancy']);
-      expect(gaps[0]!.detail).toContain('supply-origin discrepancy');
+      // 8-1d: the origin side is named "dispatch-from" (8-1 said
+      // "supply-origin"), and the detail names the e-way consequence — NIC
+      // compares the origin text state with the GSTIN's prefix.
+      expect(gaps[0]!.detail).toMatch(/^dispatch-from discrepancy: /);
+      expect(gaps[0]!.detail).toContain('if an e-way bill is required it will be blocked (ship-to-differs); generate it on the portal');
       // The seller of record is the TENANT, never the warehouse label.
       const seller = regenerated.invoice.document.seller;
       expect(seller.name).toMatch(/^GST Co /);

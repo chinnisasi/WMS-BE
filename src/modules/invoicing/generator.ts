@@ -9,6 +9,8 @@ import {
 } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { uuidv7 } from '../../shared/primitives/ids';
+import { isGstinStateCode } from '../../shared/primitives/gstin';
+import { nicText } from '../../shared/primitives/nic-text';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { OutboundFacade } from '../outbound/outbound.facade';
@@ -24,6 +26,7 @@ import {
   roundToRupee,
   type SupplyType,
 } from './arith';
+import { isValidHsn, normalizeHsn } from './hsn';
 
 /**
  * The derive-from-facts generator (story 8-1): ONE computation both the
@@ -52,15 +55,45 @@ export interface RateOverride {
 
 /**
  * The gap kinds. `unpriced-line` / `place-of-supply` / `supplier-gstin` are
- * BLOCKING (they park the invoice `awaiting-data`); `hsn-gap` /
- * `pos-discrepancy` are WARNINGS (the invoice issues with the gap visible in
- * the document). Deliberately a single `place-of-supply` kind for both
- * unresolvable sides — the detail names which. `supplier-gstin` (8-1 code
- * review): neither the warehouse nor the tenant carries a GSTIN, so no tax
- * invoice can be issued in the supplier's name — the origin may still
- * resolve from address text, which is why it is its own kind.
+ * BLOCKING (they park the invoice `awaiting-data`); every other kind is a
+ * WARNING (the invoice issues with the gap visible in the document).
+ * Deliberately a single `place-of-supply` kind for both unresolvable sides —
+ * the detail names which side and why. `supplier-gstin` (8-1 code review):
+ * neither the warehouse nor the tenant carries a GSTIN, so no tax invoice
+ * can be issued in the supplier's name — the origin may still resolve from
+ * address text, which is why it is its own kind.
+ *
+ * The warnings:
+ * - `hsn-gap` — the line's HSN is null (blank in the catalog);
+ * - `hsn-invalid` (8-1d) — the line's HSN is non-null but, after the shared
+ *   normaliser, blank or not 4/6/8 digits (`hsn.ts`). Exclusive with
+ *   `hsn-gap`; the HSN summary flags it and an e-way bill blocks on it;
+ * - `pos-discrepancy` — a side's GSTIN and address text name different
+ *   states (the GSTIN wins); the detail names the e-way consequence;
+ * - `gstin-prefix-unknown` (8-1d) — a side's stored GSTIN prefix is not a
+ *   registration state code (a legacy row; entry now refuses it), so the
+ *   side resolved from its address text;
+ * - `state-text-unknown` (8-1d) — a side's address state is not on the
+ *   official list, or is missing (no address, or a blank state), so the side
+ *   resolved from its GSTIN (an e-way bill blocks on `state-unresolved`, or
+ *   `address-incomplete` when there is no address);
+ * - `party-name-unprintable` (8-1d) — the seller or buyer name has no
+ *   character NIC's text rule keeps (`nicText`), so the e-way bill would
+ *   print it blank and block on `address-incomplete`.
+ *
+ * New kinds append at the end: the order of this tuple is the OpenAPI enum's.
  */
-export const GAP_KINDS = ['unpriced-line', 'place-of-supply', 'supplier-gstin', 'hsn-gap', 'pos-discrepancy'] as const;
+export const GAP_KINDS = [
+  'unpriced-line',
+  'place-of-supply',
+  'supplier-gstin',
+  'hsn-gap',
+  'pos-discrepancy',
+  'hsn-invalid',
+  'state-text-unknown',
+  'gstin-prefix-unknown',
+  'party-name-unprintable',
+] as const;
 export type GapKind = (typeof GAP_KINDS)[number];
 
 /** The gap kinds that park an invoice `awaiting-data`. */
@@ -70,7 +103,8 @@ export interface InvoiceGap {
   readonly kind: GapKind;
   readonly detail: string;
   /**
-   * The order line a LINE-scoped gap (`unpriced-line`, `hsn-gap`) is about —
+   * The order line a LINE-scoped gap (`unpriced-line`, `hsn-gap`,
+   * `hsn-invalid`) is about —
    * structured so a client can act on it (the pricing dialog lists exactly
    * these lines) without parsing `detail` prose. Absent on the
    * invoice-scoped kinds. Additive to the pinned snapshot shape (8-1 FE).
@@ -279,17 +313,28 @@ export function normalizeStateName(state: string | null | undefined): string {
  * MISMATCH is reported (a `pos-discrepancy` warning) and the GSTIN wins.
  * Unresolvable → null (a blocking `place-of-supply` gap — the invoice parks
  * `awaiting-data`).
+ *
+ * Story 8-1d, two ADDITIVE signals for the issue-time warnings (the existing
+ * fields are unchanged):
+ * - `gstinKnown` — a GSTIN was given AND its prefix is in
+ *   `codeByGstinPrefix` (the generator builds that map from registration
+ *   state codes only, so a legacy `92…`/`99…` GSTIN is not known and the
+ *   side falls back to its address text);
+ * - `textUnresolved` — the address state text is non-blank but not on the
+ *   list (aliases applied), so the side resolved from its GSTIN.
  */
 export function resolveStateCode(
   codeByGstinPrefix: ReadonlyMap<string, StateCodeEntry>,
   codeByStateName: ReadonlyMap<string, StateCodeEntry>,
   gstin: string | null,
   stateText: string | null,
-): { code: string; name: string; textCode: string | null } | null {
+): { code: string; name: string; textCode: string | null; gstinKnown: boolean; textUnresolved: boolean } | null {
   const gstinCode = gstin !== null ? codeByGstinPrefix.get(gstin.slice(0, 2)) ?? null : null;
   const normalized = normalizeStateName(stateText);
   if (normalized === '') {
-    return gstinCode === null ? null : { code: gstinCode.stateCode, name: gstinCode.stateName, textCode: null };
+    return gstinCode === null
+      ? null
+      : { code: gstinCode.stateCode, name: gstinCode.stateName, textCode: null, gstinKnown: true, textUnresolved: false };
   }
   const aliased = STATE_NAME_ALIASES[normalized] ?? normalized;
   const fromText = codeByStateName.get(aliased) ?? null;
@@ -301,7 +346,14 @@ export function resolveStateCode(
     code: resolved.stateCode,
     name: resolved.stateName,
     textCode: fromText === null ? null : fromText.stateCode,
+    gstinKnown: gstinCode !== null,
+    textUnresolved: fromText === null,
   };
+}
+
+/** The e-way consequence the issue-time warnings name (8-1d) — the blocker is terminal on a frozen invoice. */
+function ewayWillBlock(blocker: 'ship-to-differs' | 'state-unresolved' | 'hsn-issue' | 'address-incomplete'): string {
+  return `if an e-way bill is required it will be blocked (${blocker}); generate it on the portal`;
 }
 
 // ── refusals (the generator throws them; the HTTP arms live on the command) ─
@@ -499,9 +551,15 @@ export class InvoiceGenerator {
     const party = await invoicePartyFactsInTx(tx, tenantId, facts.warehouseId);
 
     // 5. The state-code reference (global — no tenant scope, like app_metadata).
+    // Story 8-1d: a GSTIN prefix resolves only through a REGISTRATION state
+    // code (`isGstinStateCode` — the predicate entry refuses on), so a legacy
+    // `99…` GSTIN falls back to its address text and warns, exactly like a
+    // `92…` one. Address TEXT still resolves against every row.
     const codes = await tx.select().from(gstStateCodes);
     const codeByGstinPrefix = new Map<string, StateCodeEntry>(
-      codes.map((row) => [row.stateCode, { stateCode: row.stateCode, stateName: row.stateName }]),
+      codes
+        .filter((row) => isGstinStateCode(row.stateCode))
+        .map((row) => [row.stateCode, { stateCode: row.stateCode, stateName: row.stateName }]),
     );
     const codeByStateName = new Map<string, StateCodeEntry>(
       codes.map((row) => [normalizeStateName(row.stateName), { stateCode: row.stateCode, stateName: row.stateName }]),
@@ -720,16 +778,27 @@ export class InvoiceGenerator {
     const placeOfSupply = destination?.code ?? null;
 
     const gaps: InvoiceGap[] = [];
+    // The `place-of-supply` detail names the CASE (8-1d): no GSTIN at all, or
+    // a stored GSTIN whose prefix is not a registration state code — either
+    // way the address text could not stand in.
     if (destination === null) {
+      const why =
+        facts.consigneeGstin === null
+          ? 'the consignee carries no GSTIN'
+          : `the consignee GSTIN ${facts.consigneeGstin} begins "${facts.consigneeGstin.slice(0, 2)}", which is not a GST state code,`;
       gaps.push({
         kind: 'place-of-supply',
-        detail: `place of supply unresolvable — the consignee carries no GSTIN and its destination state is not on the CBIC code list (${facts.destination?.state ?? 'no destination address'})`,
+        detail: `place of supply unresolvable — ${why} and its destination state is not on the CBIC code list (${facts.destination?.state ?? 'no destination address'})`,
       });
     }
     if (origin === null) {
+      const why =
+        originGstin === null
+          ? `neither the warehouse (${party.warehouseName}) nor the tenant carries a GSTIN`
+          : `the supplier GSTIN ${originGstin} begins "${originGstin.slice(0, 2)}", which is not a GST state code,`;
       gaps.push({
         kind: 'place-of-supply',
-        detail: `supply origin unresolvable — the warehouse (${party.warehouseName}) has no GSTIN-derived state and its origin state is not on the CBIC code list (${party.originAddress?.state ?? 'no origin address'})`,
+        detail: `supply origin unresolvable — ${why} and the warehouse's origin state is not on the CBIC code list (${party.originAddress?.state ?? 'no origin address'})`,
       });
     }
     if (originGstin === null) {
@@ -742,15 +811,75 @@ export class InvoiceGenerator {
     // (never blocking) and the code stays the GSTIN's. Checked on BOTH sides
     // and independently — the origin arm matters most when the tenant's
     // GSTIN (another state's registration) backs a warehouse that has none.
+    // Story 8-1d: each side's detail names its e-way consequence — NIC's
+    // actual-from/actual-to states come from the address text, so the
+    // mismatch is the e-way `ship-to-differs` block on a frozen invoice.
     if (origin !== null && origin.textCode !== null && origin.textCode !== origin.code) {
-      const detail = `supply-origin discrepancy: supplier GSTIN ${originGstin} resolves to code ${origin.code} (${origin.name}) but the warehouse's origin state resolves to code ${origin.textCode} — the GSTIN wins`;
+      const detail = `dispatch-from discrepancy: supplier GSTIN ${originGstin} resolves to code ${origin.code} (${origin.name}) but the warehouse's origin state resolves to code ${origin.textCode} — the GSTIN wins; ${ewayWillBlock('ship-to-differs')}`;
       gaps.push({ kind: 'pos-discrepancy', detail });
       this.logger.warn(`pos-discrepancy on order ${facts.orderId}: ${detail}`);
     }
     if (destination !== null && destination.textCode !== null && destination.textCode !== destination.code) {
-      const detail = `place-of-supply discrepancy: consignee GSTIN ${facts.consigneeGstin} resolves to code ${destination.code} (${destination.name}) but its address state resolves to code ${destination.textCode} — the GSTIN wins`;
+      const detail = `ship-to discrepancy: consignee GSTIN ${facts.consigneeGstin} resolves to code ${destination.code} (${destination.name}) but its address state resolves to code ${destination.textCode} — the GSTIN wins; ${ewayWillBlock('ship-to-differs')}`;
       gaps.push({ kind: 'pos-discrepancy', detail });
       this.logger.warn(`pos-discrepancy on order ${facts.orderId}: ${detail}`);
+    }
+    // Story 8-1d: a stored GSTIN whose prefix is not a registration state
+    // code (legacy — entry refuses it now). The side resolved from its
+    // address text; on the ORIGIN side NIC compares the text state with the
+    // GSTIN's prefix, so the e-way bill blocks on `ship-to-differs` as well.
+    if (origin !== null && originGstin !== null && !origin.gstinKnown) {
+      gaps.push({
+        kind: 'gstin-prefix-unknown',
+        detail: `supplier GSTIN ${originGstin} begins "${originGstin.slice(0, 2)}", which is not a GST state code — the supply origin resolved from the warehouse's origin state, code ${origin.code} (${origin.name}); ${ewayWillBlock('ship-to-differs')}`,
+      });
+    }
+    if (destination !== null && facts.consigneeGstin !== null && !destination.gstinKnown) {
+      gaps.push({
+        kind: 'gstin-prefix-unknown',
+        detail: `consignee GSTIN ${facts.consigneeGstin} begins "${facts.consigneeGstin.slice(0, 2)}", which is not a GST state code — the place of supply resolved from its address state, code ${destination.code} (${destination.name}); NIC may refuse this buyer GSTIN on the e-way bill`,
+      });
+    }
+    // Story 8-1d: an address state off the official list, the side resolved
+    // from its GSTIN. NIC resolves the actual states from the text alone.
+    // A MISSING state (no address, or a blank state) is the same silent
+    // e-way block: NIC needs the text state (address-incomplete without an
+    // address, state-unresolved with a blank state).
+    const originStateMissing = normalizeStateName(party.originAddress?.state) === '';
+    if (origin !== null && (origin.textUnresolved || originStateMissing)) {
+      const what = originStateMissing
+        ? `the warehouse's origin address state is missing`
+        : `the warehouse's origin state "${party.originAddress?.state ?? ''}" is not on the CBIC code list`;
+      gaps.push({
+        kind: 'state-text-unknown',
+        detail: `${what} — the supply origin resolved from the supplier GSTIN, code ${origin.code} (${origin.name}); ${ewayWillBlock(party.originAddress === null ? 'address-incomplete' : 'state-unresolved')}`,
+      });
+    }
+    const destinationStateMissing = normalizeStateName(facts.destination?.state) === '';
+    if (destination !== null && (destination.textUnresolved || destinationStateMissing)) {
+      const what = destinationStateMissing
+        ? 'the destination address state is missing'
+        : `the destination state "${facts.destination?.state ?? ''}" is not on the CBIC code list`;
+      gaps.push({
+        kind: 'state-text-unknown',
+        detail: `${what} — the place of supply resolved from the consignee GSTIN, code ${destination.code} (${destination.name}); ${ewayWillBlock(facts.destination === null ? 'address-incomplete' : 'state-unresolved')}`,
+      });
+    }
+    // Story 8-1d: the printed party names must survive NIC's text rule, or
+    // the e-way bill prints them blank (seller first, then buyer — the same
+    // names `buildDocument` prints).
+    const sellerName = party.tenantName;
+    const buyerName = facts.consigneeLegalName ?? facts.destination?.contactName ?? null;
+    for (const [role, name] of [
+      ['seller', sellerName],
+      ['buyer', buyerName],
+    ] as const) {
+      if (nicText(name, 100) === '') {
+        gaps.push({
+          kind: 'party-name-unprintable',
+          detail: `${role} name ${name === null ? '(none)' : `"${name}"`} has no characters the e-way portal accepts — ${ewayWillBlock('address-incomplete')}`,
+        });
+      }
     }
 
     // ── the lines ─────────────────────────────────────────────────────────
@@ -787,6 +916,15 @@ export class InvoiceGenerator {
           kind: 'hsn-gap',
           orderLineId: fact.orderLineId,
           detail: `line ${fact.skuCode} issued with a blank HSN — the SKU carries none in the catalog`,
+        });
+      } else if (!isValidHsn(normalizeHsn(fact.hsn))) {
+        // Story 8-1d: the ONE HSN rule the HSN summary and e-way apply
+        // (`hsn.ts`) — a non-null HSN that is whitespace-only or malformed.
+        // A warning, never a blocker; exclusive with `hsn-gap` (null only).
+        gaps.push({
+          kind: 'hsn-invalid',
+          orderLineId: fact.orderLineId,
+          detail: `line ${fact.skuCode} issued with a malformed HSN "${fact.hsn}" — not 4, 6 or 8 digits; the HSN summary flags it and, ${ewayWillBlock('hsn-issue')}`,
         });
       }
       lines.push({
@@ -869,7 +1007,11 @@ export class InvoiceGenerator {
         gstin: draft.originGstin,
       },
       buyer: {
-        name: draft.facts.destination?.contactName ?? null,
+        // Story 8-1d: the registered buyer's legal / trade name when the
+        // order carries one (so NIC's toTrdName is the legal entity), else
+        // the delivery contact — the pre-8-1d value, unchanged for every
+        // order without it.
+        name: draft.facts.consigneeLegalName ?? draft.facts.destination?.contactName ?? null,
         gstin: draft.facts.consigneeGstin,
       },
       lines: draft.lines.map((line) => ({ ...line })),

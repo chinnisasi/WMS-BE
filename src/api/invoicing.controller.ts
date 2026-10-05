@@ -138,6 +138,7 @@ export class InvoicingController {
       'Per supplier GSTIN (each GSTIN files its own return) and per accounting period by IST issue date: a month (YYYY-MM) or an FY quarter (FY-yyyy-Qn). ' +
       'Only issued invoices count (never awaiting-data or voided). Rows group by (HSN, UQC, GST rate); every amount is the exact paise sum of the frozen invoice lines — nothing is rounded per row and the invoice round-off is never spread. ' +
       'A line whose HSN is blank or malformed (not 4, 6 or 8 digits) is an hsnIssue row: inside the totals, listed in issueLines with the SKU\'s current catalog HSN as a hint, and left out of the Table 12 CSV by the client. ' +
+      'A row whose GST rate is not on the GST rate master (0, 0.1, 0.25, 1, 1.5, 3, 5, 6, 7.5, 12, 18, 28, 40 %) is a rateIssue row: inside the totals and left out of the Table 12 CSV by the client. ' +
       'The totals equal the included invoices\' subtotal and GST to the paisa. A well-formed GSTIN with nothing issued in the period is an empty summary.',
   })
   @ApiOkResponse({ type: HsnSummaryResponse, description: 'The summary' })

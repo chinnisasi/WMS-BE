@@ -12,7 +12,7 @@ import { InvoicingCommand } from '../src/modules/invoicing/command';
 import { InvoicingController } from '../src/api/invoicing.controller';
 import { UOMS } from '../src/modules/catalog/uom';
 import { UOM_TO_UQC, UQCS, uqcFor } from '../src/modules/invoicing/uqc';
-import { isValidHsn, parsePeriod } from '../src/modules/invoicing/hsn-summary';
+import { GST_RATE_MASTER_BPS, isValidHsn, normalizeHsn, parsePeriod } from '../src/modules/invoicing/hsn-summary';
 import type { HsnSummaryRow, HsnSummaryView } from '../src/modules/invoicing/hsn-summary';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
@@ -495,6 +495,11 @@ describe('invoicing: the HSN summary (e2e, story 8-2a)', () => {
     );
   });
 
+  it('8-1d: the ONE normaliser trims SPACES only (SQL btrim) and reads blank as null — shared by the generator, this summary and e-way', () => {
+    expect([null, '', '   ', ' 0910 ', '0910', '\t0910', 'HSN 0910'].map(normalizeHsn)).toEqual([null, null, null, '0910', '0910', '\t0910', 'HSN 0910']);
+    expect(['   ', ' 0910 ', '\t0910', 'HSN 0910'].map((raw) => isValidHsn(normalizeHsn(raw)))).toEqual([false, true, false, false]);
+  });
+
   // ── periods ────────────────────────────────────────────────────────────────
 
   it('parses months and FY quarters into [from, to) at IST midnights — Q4 crosses the calendar year', () => {
@@ -538,8 +543,8 @@ describe('invoicing: the HSN summary (e2e, story 8-2a)', () => {
 
     // B2B — 0910 at 5% and at 12%: two rows.
     expect(s.b2b.rows).toEqual([
-      { hsn: '0910', hsnIssue: false, uqc: 'KGS', sourceUoms: ['kg'], mixedUnits: false, gstBps: 500, qtyMilli: 2_500, lineCount: 1, taxablePaise: 100_000, igstPaise: 0, cgstPaise: 2_500, sgstPaise: 2_500, totalValuePaise: 105_000 },
-      { hsn: '0910', hsnIssue: false, uqc: 'KGS', sourceUoms: ['kg'], mixedUnits: false, gstBps: 1200, qtyMilli: 1_000, lineCount: 1, taxablePaise: 50_000, igstPaise: 0, cgstPaise: 3_000, sgstPaise: 3_000, totalValuePaise: 56_000 },
+      { hsn: '0910', hsnIssue: false, rateIssue: false, uqc: 'KGS', sourceUoms: ['kg'], mixedUnits: false, gstBps: 500, qtyMilli: 2_500, lineCount: 1, taxablePaise: 100_000, igstPaise: 0, cgstPaise: 2_500, sgstPaise: 2_500, totalValuePaise: 105_000 },
+      { hsn: '0910', hsnIssue: false, rateIssue: false, uqc: 'KGS', sourceUoms: ['kg'], mixedUnits: false, gstBps: 1200, qtyMilli: 1_000, lineCount: 1, taxablePaise: 50_000, igstPaise: 0, cgstPaise: 3_000, sgstPaise: 3_000, totalValuePaise: 56_000 },
     ]);
     expect(s.b2b.totals).toEqual({ invoiceCount: 1, taxablePaise: 150_000, igstPaise: 0, cgstPaise: 5_500, sgstPaise: 5_500, gstPaise: 11_000, totalValuePaise: 161_000 });
 
@@ -564,6 +569,34 @@ describe('invoicing: the HSN summary (e2e, story 8-2a)', () => {
     }
     expect(s.issueLines).toHaveLength(2);
     expect(s.totals.invoiceCount).toBe(4);
+  });
+
+  it('8-1d: a row whose rate is off the GST rate master (12.5 %) is a rateIssue — in the totals; 0.1 / 1.5 / 7.5 % are on the master', async () => {
+    const G07 = '07AAAPZ1234C1ZV';
+    await seedInvoice(uuidv7(), {
+      gstin: G07,
+      issuedAt: '2026-11-05T05:00:00.000Z',
+      lines: [
+        { sku: 'RATE-125', hsn: '0910', uom: 'kg', gstBps: 1250, qtyMilli: 1_000, taxable: 10_000, igst: 1_250 },
+        { sku: 'RATE-01', hsn: '0910', uom: 'kg', gstBps: 10, qtyMilli: 1_000, taxable: 10_000, igst: 10 },
+        { sku: 'RATE-15', hsn: '0910', uom: 'kg', gstBps: 150, qtyMilli: 1_000, taxable: 10_000, igst: 150 },
+        { sku: 'RATE-75', hsn: '0910', uom: 'kg', gstBps: 750, qtyMilli: 1_000, taxable: 10_000, igst: 750 },
+        // A malformed HSN at an off-master rate carries BOTH flags (the web counts it once).
+        { sku: 'RATE-BOTH', hsn: 'HSN 0910', uom: 'kg', gstBps: 1250, qtyMilli: 1_000, taxable: 1_000, igst: 125 },
+      ],
+    });
+    const s = await okSummary(G07, '2026-11');
+    expect(s.b2c.rows.map((row) => [row.hsn, row.gstBps, row.hsnIssue, row.rateIssue])).toEqual([
+      ['0910', 10, false, false],
+      ['0910', 150, false, false],
+      ['0910', 750, false, false],
+      ['0910', 1250, false, true],
+      ['HSN 0910', 1250, true, true],
+    ]);
+    // Flagged rows stay in the totals, which still reconcile to the invoice.
+    expect(s.totals.taxablePaise).toBe(41_000);
+    expect(s.totals.gstPaise).toBe(1_250 + 10 + 150 + 750 + 125);
+    expect(GST_RATE_MASTER_BPS).toEqual([0, 10, 25, 100, 150, 300, 500, 600, 750, 1200, 1800, 2800, 4000]);
   });
 
   it('reconciles to the paisa: B2B + B2C (issue rows included) equal Σ subtotal_paise and Σ gst_paise of the included invoices', async () => {

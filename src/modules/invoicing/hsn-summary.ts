@@ -6,6 +6,7 @@ import { canonicalInstant } from '../../shared/primitives/time';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { ArithmeticOverflowError } from './arith';
 import { IST_OFFSET_MS } from './generator';
+import { HSN_PATTERN, isValidHsn } from './hsn';
 import { uqcFor, type Uqc } from './uqc';
 
 /**
@@ -20,6 +21,8 @@ import { uqcFor, type Uqc } from './uqc';
  * flagged rows inside the totals (so the totals reconcile to the invoices),
  * and are listed line by line with the SKU's current catalog HSN as a hint.
  * The web leaves them out of the CSV (the portal accepts only master HSNs).
+ * Story 8-1d: a row whose rate is off the GST rate master is flagged the
+ * same way (`rateIssue`) — in the totals, out of the CSV.
  */
 
 // ── periods ─────────────────────────────────────────────────────────────────
@@ -113,22 +116,36 @@ export function assertGstinParam(raw: string): string {
 // ── HSN validity ────────────────────────────────────────────────────────────
 
 /**
- * A usable HSN: 4, 6 or 8 digits after trimming. The catalog's HSN is free
- * text, so anything else (a blank, `'HSN 0910'`, a 5-digit code) is an HSN
- * ISSUE. ONE pattern, used by both the SQL classifier and the TS check (the
- * POSIX class, not `\d`, so the two engines agree on what a digit is).
+ * Story 8-1d moved the ONE HSN rule into `hsn.ts` (shared with the generator
+ * and the e-way builder); re-exported here for the 8-2a importers. The SQL
+ * below normalises with `nullif(btrim(hsn), '')` — the same spaces-only trim
+ * `normalizeHsn` applies — and `isValidHsn` runs on that value, untrimmed.
  */
-export const HSN_PATTERN = '^[0-9]{4}([0-9]{2}){0,2}$';
-const HSN_RE = new RegExp(HSN_PATTERN);
+export { HSN_PATTERN, isValidHsn, normalizeHsn } from './hsn';
+
+// ── the GST rate master ─────────────────────────────────────────────────────
 
 /**
- * Validity of an HSN ALREADY normalized by SQL (`nullif(btrim(hsn), '')`,
- * `HSN_TRIMMED_SQL`) — no second trim here: JS `trim()` strips more
- * whitespace than `btrim`, and the two must never disagree on a row. The
- * same rule as the SQL issue-line filter: null or not matching → an issue.
+ * The GST rates a Table 12 row may carry, in basis points (story 8-1d): 0,
+ * 0.1, 0.25, 1, 1.5, 3, 5, 6, 7.5, 12, 18, 28 and 40 %.
+ *
+ * SOURCE: India Compliance's `GST_TAX_RATES` (`const_init.py`), which it
+ * checks against the e-invoice (IRP) master codes
+ * (`transaction_data.py` `validate_gst_tax_rate`). ASSUMED equal to the GSTN
+ * offline tool's Table 12 rate dropdown — that equality is NOT verified.
+ *
+ * Deliberately a different list from the e-way builder's `NIC_RATE_BPS`
+ * (NIC's e-way table lacks e.g. 1.5 % and 7.5 %). A row outside this list is
+ * a `rateIssue`: kept in the totals (they still reconcile to the invoices),
+ * left out of the CSV by the web.
  */
-export function isValidHsn(hsn: string | null): boolean {
-  return hsn !== null && HSN_RE.test(hsn);
+export const GST_RATE_MASTER_BPS: readonly number[] = Object.freeze([
+  0, 10, 25, 100, 150, 300, 500, 600, 750, 1200, 1800, 2800, 4000,
+]);
+
+/** Whether a rate (bps) is on the GST rate master. */
+export function isMasterGstRate(gstBps: number): boolean {
+  return GST_RATE_MASTER_BPS.includes(gstBps);
 }
 
 // ── shapes ──────────────────────────────────────────────────────────────────
@@ -141,6 +158,8 @@ export interface HsnSummaryRow {
   readonly hsn: string | null;
   /** Blank or malformed HSN — in the totals, never in the CSV. */
   readonly hsnIssue: boolean;
+  /** Story 8-1d: the rate is not on the GST rate master — in the totals, never in the CSV. */
+  readonly rateIssue: boolean;
   readonly uqc: Uqc;
   /** The distinct catalog units merged into this row, sorted. */
   readonly sourceUoms: readonly string[];
@@ -369,6 +388,7 @@ export async function hsnSummaryInTx(
     rowsBySection[group.section].push({
       hsn: group.hsn,
       hsnIssue: group.hsnIssue,
+      rateIssue: !isMasterGstRate(group.gstBps),
       uqc: group.uqc,
       sourceUoms,
       mixedUnits: sourceUoms.length > 1,

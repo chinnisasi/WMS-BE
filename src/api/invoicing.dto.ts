@@ -240,7 +240,7 @@ export class InvoiceDto {
   @ApiProperty({
     type: Object,
     description:
-      'The pinned, client-agnostic document snapshot: { header, seller, buyer, lines, totals, gaps, revision } — what the printable invoice renders. totals is { subtotal, gst, total, roundOff, payable } in paise (total exact; payable rupee-rounded). Frozen once issued. Each gap is { kind, detail, orderLineId? }; orderLineId is set on the line-scoped kinds (unpriced-line, hsn-gap) so a client can price exactly the unpriced lines without parsing detail prose',
+      'The pinned, client-agnostic document snapshot: { header, seller, buyer, lines, totals, gaps, revision } — what the printable invoice renders. totals is { subtotal, gst, total, roundOff, payable } in paise (total exact; payable rupee-rounded). Frozen once issued. Each gap is { kind, detail, orderLineId? }; orderLineId is set on the line-scoped kinds (unpriced-line, hsn-gap, hsn-invalid) so a client can price exactly the unpriced lines without parsing detail prose. Blocking kinds: unpriced-line, place-of-supply, supplier-gstin; every other kind is a warning the invoice issues with. buyer.name is the consignee legal name given on the order, else the destination contact name',
   })
   document!: Record<string, unknown>;
 
@@ -315,6 +315,12 @@ export class HsnSummaryRowDto {
       'Blank or malformed HSN (not 4, 6 or 8 digits). Included in the totals so they reconcile; excluded from the Table 12 CSV (the portal accepts master HSNs only)',
   })
   hsnIssue!: boolean;
+
+  @ApiProperty({
+    description:
+      'Story 8-1d: the GST rate is not on the GST rate master (0, 0.1, 0.25, 1, 1.5, 3, 5, 6, 7.5, 12, 18, 28, 40 % — the e-invoice master; its equality with the Table 12 rate list is assumed, not verified). Included in the totals so they reconcile; excluded from the Table 12 CSV',
+  })
+  rateIssue!: boolean;
 
   @ApiProperty({ enum: UQCS, description: 'GST Unit Quantity Code — no quantity is ever scaled to fit one; OTH where none means the same unit' })
   uqc!: Uqc;

@@ -180,6 +180,8 @@ export interface OrderInvoiceFacts {
   readonly warehouseId: string;
   readonly status: OrderStatus;
   readonly consigneeGstin: string | null;
+  /** Story 8-1d — the buyer's legal / trade name; null = print the contact name. */
+  readonly consigneeLegalName: string | null;
   readonly destination: AddressSnapshot | null;
   readonly createdAt: string;
   readonly lines: readonly OrderInvoiceLineFact[];
@@ -464,6 +466,7 @@ export class OutboundFacade {
         warehouseId: orders.warehouseId,
         status: orders.status,
         consigneeGstin: orders.consigneeGstin,
+        consigneeLegalName: orders.consigneeLegalName,
         destinationContactName: orders.destinationContactName,
         destinationPhone: orders.destinationPhone,
         destinationLine1: orders.destinationLine1,
@@ -514,6 +517,7 @@ export class OutboundFacade {
       warehouseId: order.warehouseId,
       status: order.status as OrderStatus,
       consigneeGstin: order.consigneeGstin,
+      consigneeLegalName: order.consigneeLegalName,
       destination: addressFromColumns({
         contactName: order.destinationContactName,
         phone: order.destinationPhone,
