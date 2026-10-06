@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
+import { assertSingleClientInTx } from '../clients/clients.facade';
 import {
   auditEvents,
   channelMappings,
@@ -1193,11 +1194,20 @@ export class ChannelsCommandService {
 
       // Every mapped sku must be this tenant's (404 naming it — the catalog
       // facade read, the buffers arm's shape).
+      const mappedClientIds: string[] = [];
       for (const skuId of [...new Set(command.items.map((item) => item.skuId))]) {
         const sku = await this.catalog.findSku(command.tenantId, skuId);
         if (sku === null) {
           throw bufferSkuNotFound(skuId);
         }
+        mappedClientIds.push(sku.clientId);
+      }
+      // Story 21-2b: a connection's orders are each for ONE client (derived
+      // from their SKUs), so a mapping set spanning clients would only fail
+      // later, delivery by delivery. Refused here, 409 `mixed-client` naming
+      // the clients.
+      if (mappedClientIds.length > 0) {
+        await assertSingleClientInTx(tx, command.tenantId, mappedClientIds, 'The mapping set');
       }
 
       // The scope-ceiling arithmetic (row 5's 400): distinct SKUs × ACTIVE

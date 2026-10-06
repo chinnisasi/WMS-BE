@@ -48,6 +48,7 @@ import {
   normalizeVariantValues,
   productNotFound,
 } from './product.command';
+import { assertSingleClientInTx } from '../clients/clients.facade';
 
 export const DEFAULT_SKU_PAGE_SIZE = 50;
 export const MAX_SKU_PAGE_SIZE = 200;
@@ -60,6 +61,12 @@ export interface SkuSnapshot {
   readonly tenantId: string;
   readonly code: string;
   readonly name: string;
+  /**
+   * Story 21-2b — the client this SKU belongs to. Optional and nullable on
+   * the interface because a stored edit snapshot written before 21-2b (a
+   * replay) lacks it; `toSnapshot` always sets it.
+   */
+  readonly clientId?: string | null;
   readonly uom: string;
   /**
    * Story 10.5: the decimal places `uom` declares, on the web-facing read
@@ -705,6 +712,26 @@ export class SkuCommand {
             // axis (the I/O matrix's `Variant values mismatch` arm).
             assertVariantValues(product.axes, fields.variantValues);
             const values = normalizeVariantValues(fields.variantValues as Record<string, string>);
+            // Story 21-2b — a product's variants never span clients: the
+            // product's OTHER attached SKUs (read under the product lock
+            // above) must all belong to this SKU's client, or the attach is
+            // refused 409 `mixed-client` naming the codes.
+            const siblingClients = await tx
+              .selectDistinct({ clientId: skus.clientId })
+              .from(skus)
+              .where(
+                and(
+                  eq(skus.tenantId, command.tenantId),
+                  eq(skus.productId, product.id),
+                  ne(skus.id, command.skuId),
+                ),
+              );
+            await assertSingleClientInTx(
+              tx,
+              command.tenantId,
+              [current.clientId, ...siblingClients.map((row) => row.clientId)],
+              `Product "${product.name}"`,
+            );
             // Duplicate variants are refused: two SKUs in one product
             // carrying identical values is the 409 the I/O matrix names,
             // checked in-transaction (the repo's no-FK convention — a
@@ -964,6 +991,7 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     tenantId: row.tenantId,
     code: row.code,
     name: row.name,
+    clientId: row.clientId,
     uom: row.uom,
     uomPrecision: uomPrecision(row.uom),
     gstRateBps: row.gstRateBps,
@@ -1004,7 +1032,7 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
   };
 }
 
-async function withConversions(
+export async function withConversions(
   tx: TenantTx,
   tenantId: string,
   row: typeof skus.$inferSelect,
@@ -1041,7 +1069,7 @@ export function duplicateVariantValues(
   );
 }
 
-function skuNotFound(): ProblemException {
+export function skuNotFound(): ProblemException {
   return new ProblemException(
     'not-found',
     404,

@@ -281,7 +281,7 @@ export class ChannelsController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks channel.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No such connection or a mapped SKU outside this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The same Idempotency-Key is being processed concurrently (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The same Idempotency-Key is being processed concurrently (conflict), or the mapped SKUs belong to more than one client (mixed-client, story 21-2b — names the clients)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'connectionId', format: 'uuid' })

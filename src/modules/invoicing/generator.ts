@@ -420,6 +420,36 @@ export function invoiceFrozen(status: string, invoiceNo: string | null): Problem
   );
 }
 
+/**
+ * Story 21-2b (decision 5) — a client brand's order is NOT GST-invoiced by
+ * the 3PL: the brand sells its own goods and invoices its own customer,
+ * while the 3PL bills the brand for services (21-5, SAC codes). Only an
+ * order whose client is the tenant's own (`system_owned`) gets a tax invoice
+ * — and therefore an e-way bill, which queues off `invoice.issued`.
+ * Invoicing on a client's behalf is PENDING. A 409: the manual generate
+ * answers it; the dispatch delivery handler acks it with a log line.
+ */
+export class ClientOrderNotInvoicedError extends ProblemException {
+  constructor(readonly orderId: string) {
+    super(
+      'client-order-not-invoiced',
+      409,
+      'Client orders are not invoiced by the warehouse',
+      `Order ${orderId} is for a client brand, not the tenant's own goods — the brand invoices its own customer, so no tax invoice or e-way bill is issued here.`,
+    );
+  }
+}
+
+/** Story 21-2b — the order's client row does not exist (a data fault). */
+export function orderClientMissing(orderId: string): ProblemException {
+  return new ProblemException(
+    'order-client-missing',
+    409,
+    "The order's client does not exist",
+    `Order ${orderId} names a client that does not exist in this tenant — no invoice can be attributed. Fix the data, then regenerate.`,
+  );
+}
+
 /** The loser of the ONE-invoice-per-order insert race (the unique violation). */
 export class InvoiceRaceLostError extends Error {
   constructor(
@@ -549,6 +579,17 @@ export class InvoiceGenerator {
     }
     if (facts.status !== 'dispatched') {
       throw orderNotDispatched(facts.status);
+    }
+    // Story 21-2b (decision 5): no tax invoice for a client brand's order —
+    // refused before anything is computed or written.
+    if (facts.clientSystemOwned === null) {
+      // A missing client row is a DATA FAULT (an order no client owns), not
+      // the client-brand skip: its own 409, which the delivery handler logs
+      // at error on its data-fault arm.
+      throw orderClientMissing(orderId);
+    }
+    if (!facts.clientSystemOwned) {
+      throw new ClientOrderNotInvoicedError(orderId);
     }
 
     // 4. The parties (tenancy's seam — invoicing writes no tenancy table).

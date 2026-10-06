@@ -859,9 +859,13 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
 
   it('the clients module owns the write, and tenancy + inventory reach it through the module (the test is meaningful)', () => {
     // A guard whose subject stopped being written would pass vacuously
-    // forever — the ensure really does write the table.
+    // forever — the ensure really does write the table, and (story 21-2b)
+    // so does the admin command (create + rename).
     const ensure = readFileSync(join(clientsRoot, 'ensure-self-client.ts'), 'utf8');
     expect(drizzleWriteOn('clients').test(ensure)).toBe(true);
+    const admin = readFileSync(join(clientsRoot, 'clients.command.ts'), 'utf8');
+    expect(/\.insert\(\s*clients\b/.test(admin)).toBe(true);
+    expect(/\.update\(\s*clients\b/.test(admin)).toBe(true);
     // Registration creates the self client in ITS OWN transaction — through
     // the module's ensure function, never a direct `clients` write.
     const registration = readFileSync(
@@ -870,10 +874,52 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
     );
     expect(registration).toContain('ensureSelfClientInTx');
     expect(drizzleWriteOn('clients').test(registration)).toBe(false);
-    // The ledger stamps every event's client through the same helper — the
-    // one write path into `ledger_events` carries the dimension.
+    // Story 21-2b re-pin: the ledger stamps every event's client FROM ITS
+    // SKU (read in the append transaction) — no longer the tenant's `self`
+    // client. A ledger that went back to `ensureSelfClientInTx` would
+    // silently attribute a client's movements to the tenant.
     const ledger = readFileSync(join(SRC_ROOT, 'modules', 'inventory', 'ledger.service.ts'), 'utf8');
-    expect(ledger).toContain('ensureSelfClientInTx');
+    expect(ledger).not.toContain('ensureSelfClientInTx');
+    expect(ledger).toMatch(/select\(\{\s*clientId:\s*skus\.clientId\s*\}\)/);
+    expect(ledger).toMatch(/clientId,\s*\n\s*warehouseId: movement\.warehouseId/);
+  });
+
+  /**
+   * Story 21-2b (decision 3): a SKU's client is set ONCE, at creation (the
+   * import's INSERT), and moved only by the owner's correction command —
+   * which refuses once the SKU has history. Any other UPDATE of
+   * `skus.client_id` would re-attribute a client's stock behind the ledger's
+   * back. Patterns: a Drizzle `.update(skus).set({ … clientId … })`, a
+   * patch-object assignment (`updates.clientId = …`), and raw SQL.
+   */
+  const CORRECTION_FILE = join(SRC_ROOT, 'modules', 'catalog', 'sku-client.command.ts');
+  const SKU_CLIENT_UPDATE = /\.update\(\s*skus\s*\)\s*\.set\(\s*\{[^}]*\bclientId\b/;
+  const SKU_CLIENT_ASSIGN = /\b\w+\.clientId\s*=(?!=)/;
+  const RAW_SKU_CLIENT_UPDATE = /\bupdate\s+"?skus"?\s+set\b[^;`]*\bclient_id\b/i;
+
+  it('only the correction command updates skus.client_id', () => {
+    const offenders: string[] = [];
+    for (const file of files) {
+      if (file.path === CORRECTION_FILE) continue;
+      for (const pattern of [SKU_CLIENT_UPDATE, RAW_SKU_CLIENT_UPDATE]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+      // The patch-object form only matters where a SKU update happens.
+      if (/\.update\(\s*skus\b/.test(file.source) && SKU_CLIENT_ASSIGN.test(file.source)) {
+        offenders.push(`${file.path}: /${SKU_CLIENT_ASSIGN.source}/`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the correction command really is the writer (the guard is meaningful)', () => {
+    const correction = readFileSync(CORRECTION_FILE, 'utf8');
+    expect(SKU_CLIENT_UPDATE.test(correction)).toBe(true);
+    // The guard's patterns bite on the shapes they name.
+    expect(SKU_CLIENT_UPDATE.test('tx.update(skus).set({ name, clientId: x })')).toBe(true);
+    expect(RAW_SKU_CLIENT_UPDATE.test('UPDATE skus SET client_id = $1')).toBe(true);
+    expect(SKU_CLIENT_ASSIGN.test('updates.clientId = other;')).toBe(true);
+    expect(SKU_CLIENT_ASSIGN.test('if (row.clientId === other)')).toBe(false);
   });
 });
 

@@ -44,7 +44,7 @@ import {
 } from '../../shared/primitives/address';
 import type { AddressInput, AddressSnapshot } from '../../shared/primitives/address';
 import { uomPrecision } from '../catalog/uom';
-import { ensureSelfClientInTx } from '../clients/ensure-self-client';
+import { assertSingleClientInTx } from '../clients/clients.facade';
 
 // ── state machine + policy constants (the outbound module exclusively owns
 // the order state machine, AD-6 — no other module may add or transition
@@ -258,6 +258,13 @@ export interface OrderSnapshot {
     readonly externalEventId: string | null;
     /** Where the shipment goes (story 11-1); null on a pre-11.1 order row. */
     readonly destination: AddressSnapshot | null;
+    /**
+     * Story 21-2b — the client the order is for, derived from its lines' and
+     * kit components' SKUs. Optional and nullable on the interface because a
+     * stored snapshot written before 21-2b (an idempotent replay) does not
+     * carry it; every snapshot built now sets it.
+     */
+    readonly clientId?: string | null;
     readonly createdAt: string;
     readonly updatedAt: string;
     readonly lines: readonly OrderLineSnapshot[];
@@ -407,6 +414,7 @@ export class OrderCommandService {
           consigneeGstin: null,
           lines: [] as OrderLineInput[],
           explosions: new Map(),
+          clientId: null,
         };
       }
 
@@ -485,11 +493,12 @@ export class OrderCommandService {
 
       // ── master-data integrity in a write transaction (404 before writes) ─
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
-      const uomBySku = await this.assertSkuIdsInTenant(
+      const lineSkus = await this.assertSkuIdsInTenant(
         tx,
         command.tenantId,
         command.lines.map((line) => line.skuId),
       );
+      const uomBySku = uomsOf(lineSkus);
 
       // ── story 10.2: conversion and the precision refusal, HERE ───────────
       // Behind the replay lookup above and with each line's unit in hand.
@@ -533,10 +542,11 @@ export class OrderCommandService {
       const componentSkuIds = [...bomBySku.values()].flatMap((bom) =>
         bom.map((line) => line.componentSkuId),
       );
-      const componentUomBySku =
+      const componentSkus =
         componentSkuIds.length === 0
-          ? new Map<string, string>()
+          ? new Map<string, SkuFacts>()
           : await this.assertSkuIdsInTenant(tx, command.tenantId, componentSkuIds);
+      const componentUomBySku = uomsOf(componentSkus);
       const explosions = new Map<number, readonly KitCompositionLine[]>();
       for (let index = 0; index < lines.length; index += 1) {
         const bom = bomBySku.get(lines[index]!.skuId);
@@ -590,10 +600,24 @@ export class OrderCommandService {
             consigneeGstin: null,
             lines,
             explosions: new Map(),
+            clientId: null,
           };
         }
       }
-      return { replayed: null, destination, consigneeGstin, lines: linesWithRates, explosions };
+
+      // ── story 21-2b: the order's client, DERIVED from its SKUs ──────────
+      // After the kit-component assertion (the components' clients are in
+      // hand) and after the dedup pre-check (a redelivery re-serves its
+      // first order's snapshot whatever its SKUs say today). Every line SKU
+      // and every kit component must belong to ONE client, or the order is
+      // refused 409 `mixed-client` naming the codes — before any grant moves.
+      const clientId = await assertSingleClientInTx(
+        tx,
+        command.tenantId,
+        [...lineSkus.values(), ...componentSkus.values()].map((sku) => sku.clientId),
+        'The order',
+      );
+      return { replayed: null, destination, consigneeGstin, lines: linesWithRates, explosions, clientId };
     });
     if (preflight.replayed !== null) {
       return preflight.replayed;
@@ -710,9 +734,10 @@ export class OrderCommandService {
     try {
       return await withTenantTransaction(this.db, command.tenantId, async (tx) => {
         const orderId = uuidv7();
-        // Story 21-1 (AD-23): an order is for one client by definition — the
-        // tenant's `self` client on a D2C tenant, idempotent, no branch.
-        const clientId = await ensureSelfClientInTx(tx, command.tenantId);
+        // Story 21-2b (AD-23): an order is for one client by definition —
+        // the client the preflight DERIVED from its lines' and components'
+        // SKUs (the tenant's `self` client on a D2C tenant; no branch).
+        const clientId = preflight.clientId!;
         try {
           await tx.insert(orders).values({
             id: orderId,
@@ -1449,6 +1474,7 @@ export class OrderCommandService {
           state: order.destinationState,
           pincode: order.destinationPincode,
         }),
+        clientId: order.clientId,
         createdAt: canonicalInstant(order.createdAt),
         updatedAt: canonicalInstant(order.updatedAt),
         lines: lines.map((line) => lineSnapshot(line, reservations, kitParentIds)),
@@ -1466,13 +1492,15 @@ export class OrderCommandService {
     tx: TenantTx,
     tenantId: string,
     skuIds: readonly string[],
-  ): Promise<Map<string, string>> {
+  ): Promise<Map<string, SkuFacts>> {
     const distinct = [...new Set(skuIds)];
+    // Story 21-2b: the same read hands back each SKU's client — the order
+    // derives its own from them.
     const rows = await tx
-      .select({ id: skus.id, uom: skus.uom })
+      .select({ id: skus.id, uom: skus.uom, clientId: skus.clientId })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)));
-    const byId = new Map(rows.map((row) => [row.id, row.uom]));
+    const byId = new Map(rows.map((row) => [row.id, { uom: row.uom, clientId: row.clientId }]));
     for (const skuId of distinct) {
       if (!byId.has(skuId)) {
         throw new ProblemException(
@@ -1524,6 +1552,16 @@ export class OrderCommandService {
       }
     }
   }
+}
+
+/** Story 21-2b — one SKU's existence facts: its base UoM and its client. */
+interface SkuFacts {
+  readonly uom: string;
+  readonly clientId: string;
+}
+
+function uomsOf(facts: ReadonlyMap<string, SkuFacts>): Map<string, string> {
+  return new Map([...facts].map(([id, sku]) => [id, sku.uom]));
 }
 
 /** One stored line as every read of this module returns it. */

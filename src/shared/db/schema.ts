@@ -835,6 +835,14 @@ export const catalogImports = pgTable(
       .primaryKey()
       .$defaultFn(() => uuidv7()),
     tenantId: uuid('tenant_id').notNull(),
+    /**
+     * Story 21-2b — the client this run imported FOR (one client per
+     * import, decision 4). Every SKU the run created carries it; a fix-mode
+     * re-run inherits it from the run it retries, so a correction can never
+     * land the retried rows under a different client. Backfilled to each
+     * tenant's `self` client by migration 0059.
+     */
+    clientId: uuid('client_id').notNull(),
     mode: text('mode').notNull(),
     committedRows: integer('committed_rows').notNull(),
     failedRows: integer('failed_rows').notNull(),

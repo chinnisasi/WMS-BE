@@ -77,7 +77,7 @@ export class InvoicingController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks invoice.generate (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No order with this id exists in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Rates sent to an issued or voided invoice (invoice-frozen — it outranks the line checks), the order is not dispatched (order-not-dispatched), a rate override names a line that is not of this order (line-not-of-order) or a line already priced at order acceptance (line-already-priced), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Rates sent to an issued or voided invoice (invoice-frozen — it outranks the line checks), the order is not dispatched (order-not-dispatched), the order is for a client brand — client orders are not invoiced by the tenant (client-order-not-invoiced, story 21-2b), a rate override names a line that is not of this order (line-not-of-order) or a line already priced at order acceptance (line-already-priced), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async generateInvoice(

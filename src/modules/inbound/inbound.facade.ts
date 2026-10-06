@@ -42,6 +42,8 @@ export interface PurchaseOrderEntry {
   readonly code: string;
   readonly status: PoStatus;
   readonly carriedFromPoId: string | null;
+  /** Story 21-2b — the client the PO is for (derived from its lines' SKUs). */
+  readonly clientId: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -244,6 +246,7 @@ export class InboundFacade {
           code: purchaseOrders.code,
           status: purchaseOrders.status,
           carriedFromPoId: purchaseOrders.carriedFromPoId,
+          clientId: purchaseOrders.clientId,
           createdAt: purchaseOrders.createdAt,
           updatedAt: purchaseOrders.updatedAt,
         })
@@ -305,6 +308,7 @@ export class InboundFacade {
         code: po.code,
         status: po.status as PoStatus,
         carriedFromPoId: po.carriedFromPoId,
+        clientId: po.clientId,
         createdAt: canonicalInstant(po.createdAt),
         updatedAt: canonicalInstant(po.updatedAt),
         lines: lines.map(lineSnapshot),

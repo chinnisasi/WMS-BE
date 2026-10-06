@@ -204,6 +204,20 @@ export function ingestConfigInvalid(connectionId: string, detail: string): Probl
 }
 
 /**
+ * Story 21-2b — 422 `ingest-config-invalid`: the delivery's mapped SKUs
+ * belong to more than one client. An order is for one client (derived from
+ * its SKUs), so the mapping set — not the delivery — is what needs fixing.
+ */
+export function ingestMixedClient(connectionId: string, what: string): ProblemException {
+  return new ProblemException(
+    'ingest-config-invalid',
+    422,
+    'Channel ingest configuration is invalid',
+    `Connection ${connectionId}'s mappings send one order to ${what} — an order is for one client. Remediate with the mappings PUT (or the catalog); the channel retries this delivery.`,
+  );
+}
+
+/**
  * 409 `order-backorder-rejected` — RD-3's whole-order post-grant refusal
  * under `backorder_policy: 'reject'`: any line whose grant came back short
  * (zero-grant included) releases everything and refuses the order. No order

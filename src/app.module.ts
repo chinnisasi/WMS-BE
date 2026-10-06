@@ -3,6 +3,7 @@ import { ApiModule } from './api/api.module';
 import { SharedModule } from './shared/shared.module';
 import { CarriersModule } from './modules/carriers/carriers.module';
 import { CatalogModule } from './modules/catalog/catalog.module';
+import { ClientsModule } from './modules/clients/clients.module';
 import { ChannelsModule } from './modules/channels/channels.module';
 import { ComplianceModule } from './modules/compliance/compliance.module';
 import { InboundModule } from './modules/inbound/inbound.module';
@@ -30,6 +31,7 @@ import { JobsModule } from './jobs/jobs.module';
   imports: [
     SharedModule,
     TenancyModule,
+    ClientsModule,
     CatalogModule,
     InventoryModule,
     InboundModule,

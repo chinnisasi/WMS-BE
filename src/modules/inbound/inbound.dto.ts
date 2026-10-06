@@ -318,6 +318,16 @@ export class PurchaseOrderDto {
   })
   carriedFromPoId!: string | null;
 
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description:
+      'Story 21-2b — the client the PO is for, derived from its lines\' SKUs. Absent or null only on a replayed response stored before 21-2b',
+  })
+  clientId?: string | null;
+
   @ApiProperty({ type: [PurchaseOrderLineDto], description: 'Per-line ordered / received / open (detail and mutations; headers only on the list)' })
   lines?: readonly PurchaseOrderLineDto[];
 

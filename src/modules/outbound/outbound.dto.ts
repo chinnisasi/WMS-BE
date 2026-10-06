@@ -241,6 +241,16 @@ export class OrderDto {
   })
   destination!: AddressDto | null;
 
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description:
+      "Story 21-2b — the client the order is for, derived from its lines' and kit components' SKUs. Absent or null only on a replayed response stored before 21-2b",
+  })
+  clientId?: string | null;
+
   @ApiProperty({ description: 'ISO-8601 UTC creation time' })
   createdAt!: string;
 
@@ -344,6 +354,15 @@ export class OrderEntryDto {
     description: 'Where the shipment goes (story 11-1); null on a pre-11.1 order row',
   })
   destination!: AddressDto | null;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description: "Story 21-2b — the client the order is for, derived from its SKUs",
+  })
+  clientId?: string | null;
 
   @ApiProperty({ description: 'ISO-8601 UTC creation time' })
   createdAt!: string;
