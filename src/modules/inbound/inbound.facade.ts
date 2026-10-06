@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, sql, type SQL } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { purchaseOrderLines, purchaseOrders, vendors } from '../../shared/db/schema';
@@ -315,6 +315,48 @@ export class InboundFacade {
       };
     });
   }
+
+  /**
+   * Story 21-4 — the `per_receipt_line` count: every GRN line of the
+   * client's SKUs whose GRN was recorded in `[from, to)`, across warehouses
+   * (`receiptLinesPredicate`). In the caller's transaction (billing's
+   * metering read).
+   */
+  async countReceiptLinesInTx(
+    tx: TenantTx,
+    scope: { readonly tenantId: string; readonly clientId: string },
+    from: string,
+    to: string,
+  ): Promise<number> {
+    const rows = (await tx.execute(sql`
+      select count(*)::bigint as "n"
+      from goods_receipt_lines grl
+      join goods_receipt_notes grn on grn.tenant_id = grl.tenant_id and grn.id = grl.grn_id
+      join skus s on s.tenant_id = grl.tenant_id and s.id = grl.sku_id
+      where ${receiptLinesPredicate(scope, from, to)}
+    `)) as unknown as { n: string | number }[];
+    return Number(rows[0]?.n ?? 0);
+  }
+}
+
+/**
+ * Story 21-4 — THE receipt-line billing predicate, the one definition behind
+ * the `per_receipt_line` count and (21-5) its dispute drill-down: a GRN line
+ * (`grl`) of a SKU (`s`) owned by the client, on a GRN (`grn`) recorded — the
+ * server stamp — in `[from, to)`. Every stored line counts, INCLUDING one
+ * whose excess was later rejected as an over-receipt (the unloading
+ * happened); the over-receipt approval's re-emitted `grn.received` writes no
+ * second line, so it is never counted twice.
+ */
+export function receiptLinesPredicate(
+  scope: { readonly tenantId: string; readonly clientId: string },
+  from: string,
+  to: string,
+): SQL {
+  return sql`grl.tenant_id = ${scope.tenantId}::uuid
+    and s.client_id = ${scope.clientId}::uuid
+    and grn.recorded_at >= ${from}::timestamptz
+    and grn.recorded_at < ${to}::timestamptz`;
 }
 
 /**

@@ -118,6 +118,20 @@ function warehouseNotFound(): ProblemException {
  * A missing member row fails closed: the caller has no role and no
  * capabilities (`role-denied` names it).
  */
+/**
+ * Story 21-4 — the member's client (AD-23 persona arm): null for the
+ * tenant's own staff, set for a client-portal user. Null for an unknown
+ * user too (the caller's role read refuses those).
+ */
+export async function getMemberClientIdIn(tx: TenantTx, tenantId: string, userId: string): Promise<string | null> {
+  const rows = await tx
+    .select({ clientId: users.clientId })
+    .from(users)
+    .where(and(eq(users.id, userId), eq(users.tenantId, tenantId)))
+    .limit(1);
+  return rows[0]?.clientId ?? null;
+}
+
 export async function getMemberRoleIn(
   tx: TenantTx,
   tenantId: string,

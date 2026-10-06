@@ -35,6 +35,7 @@ import { ReportingModule } from '../modules/reporting/reporting.module';
 import { ClientsController } from './clients.controller';
 import { ClientsModule } from '../modules/clients/clients.module';
 import { RateCardsController } from './rate-cards.controller';
+import { BillingUsageController } from './billing-usage.controller';
 import { BillingModule } from '../modules/billing/billing.module';
 
 /**
@@ -121,6 +122,8 @@ import { BillingModule } from '../modules/billing/billing.module';
     // spine-singleton already imported by the root; the mutations go through
     // `RateCardCommand`, the reads through `BillingFacade`.
     RateCardsController,
+    // Story 21-4 — the metered-usage read (member-open; never the portal's).
+    BillingUsageController,
     // Story 7-2 — the channel webhook surface (guardless by construction:
     // the provider's AUTHORITY is its signature, not a session). The
     // last-siblings convention keeps NotFoundController LAST (registered

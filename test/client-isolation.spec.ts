@@ -32,6 +32,10 @@ const STAMPED_TABLES: readonly string[] = [
   // card and each of its lines carry the client they price.
   'rate_cards',
   'rate_card_lines',
+  // Story 21-4 — the storage snapshots and their per-scope watermark, born
+  // stamped: a client's daily stock is its own commercial fact.
+  'storage_snapshots',
+  'storage_snapshot_progress',
 ];
 
 /** The five policies migration 0041 recreated with the client clause. */
@@ -49,7 +53,14 @@ const CLIENT_POLICIES: readonly { table: string; policy: string; column: string 
  * operator-only (`app.client_id` must be unset), so a portal session reads
  * its own price list and can never edit it.
  */
-const READ_ONLY_CLIENT_TABLES: readonly string[] = ['rate_cards', 'rate_card_lines'];
+const READ_ONLY_CLIENT_TABLES: readonly string[] = [
+  'rate_cards',
+  'rate_card_lines',
+  // Story 21-4 (0061) — the same shape: a portal session reads its own
+  // client's snapshots and can never write one.
+  'storage_snapshots',
+  'storage_snapshot_progress',
+];
 
 describe('story 21-2: client isolation RLS — app.client_id, the stamping primitive, the DB probe', () => {
   // ──────────────────────────────────────────────────────────────────────────
@@ -149,6 +160,15 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
         values (${cardId}, ${tenantId}, ${clientId}, 'draft', ${actorId})`;
       await sql`insert into rate_card_lines (id, tenant_id, client_id, rate_card_id, charge_code, basis, amount_paise)
         values (${uuidv7()}, ${tenantId}, ${clientId}, ${cardId}, 'storage', 'per_thousand_units_per_day', 330)`;
+    }
+
+    // Story 21-4 — one snapshot row and one watermark per client (seeded
+    // below the API: the probe is about who can SEE them).
+    for (const clientId of [clientA, clientB]) {
+      await sql`insert into storage_snapshots (id, tenant_id, client_id, warehouse_id, snapshot_date, uom, on_hand_milli)
+        values (${uuidv7()}, ${tenantId}, ${clientId}, ${warehouseId}, '2026-09-01', 'each', 5000)`;
+      await sql`insert into storage_snapshot_progress (tenant_id, client_id, warehouse_id, last_day, running)
+        values (${tenantId}, ${clientId}, ${warehouseId}, '2026-09-01', ${sql.json({ each: '5000' })})`;
     }
 
     // The INHERITED rows: stock and batch rows carry no client_id — their
@@ -513,6 +533,16 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
           // (The 42501 WITH CHECK arm itself is pinned on rate_cards above —
           // a line can only be written under a card the session can see.)
           continue;
+        } else if (table === 'storage_snapshots') {
+          rejected = portal((tx) =>
+            tx`insert into storage_snapshots (id, tenant_id, client_id, warehouse_id, snapshot_date, uom, on_hand_milli)
+              values (${uuidv7()}, ${tenantId}, ${clientB}, ${warehouseId}, '2026-09-02', 'each', 1000)`,
+          );
+        } else if (table === 'storage_snapshot_progress') {
+          rejected = portal((tx) =>
+            tx`insert into storage_snapshot_progress (tenant_id, client_id, warehouse_id, last_day, running)
+              values (${tenantId}, ${clientB}, ${uuidv7()}, '2026-09-02', '{}'::jsonb)`,
+          );
         } else {
           rejected = portal((tx) =>
             tx`insert into ledger_events (
@@ -610,6 +640,34 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       expect(deletedCards).toHaveLength(0);
       await expectCount((t) => t`select count(*)::int as n from ${t('rate_card_lines')} where rate_card_id = ${rateCardAId} and amount_paise = 330`, 1);
       await expectCount((t) => t`select count(*)::int as n from ${t('rate_cards')} where tenant_id = ${tenantId}`, 2);
+    });
+
+    it('storage snapshots are READ-ONLY to a portal session: it reads its own, and cannot insert, update or delete even its own (21-4)', async () => {
+      const own = await portal((tx) => tx`select client_id from storage_snapshots where tenant_id = ${tenantId}`);
+      expect((own as unknown as { client_id: string }[]).map((row) => row.client_id)).toEqual([clientA]);
+      const ownProgress = await portal((tx) => tx`select client_id from storage_snapshot_progress where tenant_id = ${tenantId}`);
+      expect((ownProgress as unknown as { client_id: string }[]).map((row) => row.client_id)).toEqual([clientA]);
+
+      // INSERT of its OWN client's rows: the operator-only WITH CHECK refuses.
+      await expect(
+        portal((tx) =>
+          tx`insert into storage_snapshots (id, tenant_id, client_id, warehouse_id, snapshot_date, uom, on_hand_milli)
+            values (${uuidv7()}, ${tenantId}, ${clientA}, ${warehouseId}, '2026-09-03', 'each', 1000)`,
+        ),
+      ).rejects.toMatchObject({ code: '42501' });
+      await expect(
+        portal((tx) =>
+          tx`insert into storage_snapshot_progress (tenant_id, client_id, warehouse_id, last_day, running)
+            values (${tenantId}, ${clientA}, ${uuidv7()}, '2026-09-03', '{}'::jsonb)`,
+        ),
+      ).rejects.toMatchObject({ code: '42501' });
+      // UPDATE and DELETE of its own rows bind nothing.
+      expect(await portal((tx) => tx`update storage_snapshots set on_hand_milli = 1 where client_id = ${clientA} returning id`)).toHaveLength(0);
+      expect(await portal((tx) => tx`update storage_snapshot_progress set last_day = '2030-01-01' where client_id = ${clientA} returning client_id`)).toHaveLength(0);
+      expect(await portal((tx) => tx`delete from storage_snapshots where client_id = ${clientA} returning id`)).toHaveLength(0);
+      expect(await portal((tx) => tx`delete from storage_snapshot_progress where client_id = ${clientA} returning client_id`)).toHaveLength(0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('storage_snapshots')} where tenant_id = ${tenantId} and on_hand_milli = 5000`, 2);
+      await expectCount((t) => t`select count(*)::int as n from ${t('storage_snapshot_progress')} where tenant_id = ${tenantId} and last_day = '2026-09-01'`, 2);
     });
 
     it('the UPDATE and DELETE arms bind too: a portal session cannot re-stamp its row to the sibling, and deletes ZERO of the sibling’s rows', async () => {
@@ -728,7 +786,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       await expectCount((t) => t`select count(*)::int as n from ${t('clients')} where id = ${freshId}`, 0);
     });
 
-    it('the migration recreated the FIVE policies with the client clause (0060 added the rate-card tables read-scoped, write operator-only), and lost none of the others', async () => {
+    it('the migration recreated the FIVE policies with the client clause (0060 and 0061 added the rate-card and storage-snapshot tables read-scoped, write operator-only), and lost none of the others', async () => {
       const policies = (await sql`
         select tablename, policyname, qual, with_check from pg_policies
         where schemaname = 'public' order by tablename, policyname
@@ -755,8 +813,9 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // two more — pack_verification_failures and ingest_backorder_refusals;
       // 0060 (story 21-3) added eight more — rate_cards and rate_card_lines,
       // each a client-scoped SELECT policy plus operator-only INSERT, UPDATE
-      // and DELETE policies. None lost.
-      expect(policies).toHaveLength(80);
+      // and DELETE policies; 0061 (story 21-4) added eight more in the same
+      // shape — storage_snapshots and storage_snapshot_progress. None lost.
+      expect(policies).toHaveLength(88);
 
       for (const table of READ_ONLY_CLIENT_TABLES) {
         const own = policies.filter((row) => row.tablename === table);

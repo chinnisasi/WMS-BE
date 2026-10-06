@@ -33,6 +33,20 @@ import {
   warehouseAdvisoryLock,
 } from './ledger.service';
 import type { LedgerMovement } from './ledger.service';
+import {
+  clientOnHandAtInTx as clientOnHandAtInTxImpl,
+  clientOnHandFoldByDayInTx as clientOnHandFoldByDayInTxImpl,
+  clientWarehousesWithEventsInTx as clientWarehousesWithEventsInTxImpl,
+  countDispatchedOrdersInTx as countDispatchedOrdersInTxImpl,
+  firstEventInstantInTx as firstEventInstantInTxImpl,
+  type ClientDayDelta,
+  type ClientScope,
+  type ClientWarehouseScope,
+} from './client-metering';
+// Story 21-4 — the metering scope shapes and the shared dispatched-order
+// predicate (21-5's dispute drill-down reuses it) cross the seam here.
+export type { ClientDayDelta, ClientScope, ClientWarehouseScope } from './client-metering';
+export { dispatchedOrderEventsPredicate } from './client-metering';
 import type { LedgerReferenceDoc } from './ledger-registry';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 
@@ -1167,6 +1181,53 @@ export class InventoryFacade {
         ),
       )
       .orderBy(asc(ledgerEvents.seq));
+  }
+
+  // ── Story 21-4 — the client metering reads (billing's only view of the
+  // ledger, AD-25 + AD-6). The SQL and the fold rule live in
+  // `client-metering.ts`; these are the seam.
+
+  /**
+   * The storage fold for one (client, warehouse), bucketed per (IST day, base
+   * UoM) over `[fromInstant, toInstant)` (`fromInstant` null = genesis): the
+   * net on-hand movement under the ledger's own replay rule — `+|δ|` for a
+   * destination-only event, `−|δ|` for a source-only one, 0 otherwise.
+   */
+  async clientOnHandFoldByDayInTx(
+    tx: TenantTx,
+    scope: ClientWarehouseScope,
+    fromInstant: string | null,
+    toInstant: string,
+  ): Promise<ClientDayDelta[]> {
+    return clientOnHandFoldByDayInTxImpl(tx, scope, fromInstant, toInstant);
+  }
+
+  /** One client's on-hand per base UoM in one warehouse at an instant — the fold from genesis (the drift check's genesis-sum). */
+  async clientOnHandAtInTx(tx: TenantTx, scope: ClientWarehouseScope, toInstant: string): Promise<Map<string, bigint>> {
+    return clientOnHandAtInTxImpl(tx, scope, toInstant);
+  }
+
+  /** Which warehouses each client has any ledger event in (an EXISTS probe per pair). */
+  async clientWarehousesWithEventsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    clientIds: readonly string[],
+  ): Promise<{ clientId: string; warehouseId: string }[]> {
+    return clientWarehousesWithEventsInTxImpl(tx, tenantId, clientIds);
+  }
+
+  /** The earliest `recorded_at` of one client's events in one warehouse, or null. */
+  async firstEventInstantInTx(tx: TenantTx, scope: ClientWarehouseScope): Promise<string | null> {
+    return firstEventInstantInTxImpl(tx, scope);
+  }
+
+  /**
+   * Distinct orders FIRST dispatched for a client in `[from, to)` across its
+   * warehouses (an order counts once, in the window of its first dispatch
+   * event) — on this facade because outbound reads no ledger.
+   */
+  async countDispatchedOrdersInTx(tx: TenantTx, scope: ClientScope, from: string, to: string): Promise<number> {
+    return countDispatchedOrdersInTxImpl(tx, scope, from, to);
   }
 
   /**

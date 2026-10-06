@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, sql, type SQL } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { getClientsInTx } from '../clients/clients.facade';
@@ -1170,4 +1170,45 @@ export class OutboundFacade {
   ): Promise<OrderSnapshot> {
     return this.orderCommand.snapshotOf(tx, order);
   }
+
+  /**
+   * Story 21-4 — the `per_pick` count: `picks` rows (one per picklist line —
+   * `picks_line_unique`) of the client's SKUs created in `[from, to)`, across
+   * warehouses (`picksPredicate`). In the caller's transaction (billing's
+   * metering read).
+   */
+  async countPicksInTx(
+    tx: TenantTx,
+    scope: { readonly tenantId: string; readonly clientId: string },
+    from: string,
+    to: string,
+  ): Promise<number> {
+    const rows = (await tx.execute(sql`
+      select count(*)::bigint as "n"
+      from picks p
+      join skus s on s.tenant_id = p.tenant_id and s.id = p.sku_id
+      where ${picksPredicate(scope, from, to)}
+    `)) as unknown as { n: string | number }[];
+    return Number(rows[0]?.n ?? 0);
+  }
+}
+
+/**
+ * Story 21-4 — THE pick billing predicate, the one definition behind the
+ * `per_pick` count and (21-5) its dispute drill-down: a `picks` row (`p`) of
+ * a SKU (`s`) owned by the client, created in `[from, to)`. One row per
+ * picklist line (`pick.picked` events are per batch arm or serial — never
+ * counted); `created_at` is the pick transaction's start, the server's clock.
+ * A zero-unit short pick writes no row, and transfers create no picks — so
+ * neither is billed as a pick.
+ */
+export function picksPredicate(
+  scope: { readonly tenantId: string; readonly clientId: string },
+  from: string,
+  to: string,
+): SQL {
+  return sql`p.tenant_id = ${scope.tenantId}::uuid
+    and s.client_id = ${scope.clientId}::uuid
+    and p.created_at >= ${from}::timestamptz
+    and p.created_at < ${to}::timestamptz`;
 }

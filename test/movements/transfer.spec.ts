@@ -642,6 +642,16 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       });
 
       expect(await onHandMilli(destWarehouseId, skuId, binCrossWh)).toBe(5000);
+      // Story 21-4 — ONE `recorded_at` for both legs of the transaction: the
+      // storage fold buckets by it, so a drain and an intake stamped
+      // separately could straddle an IST midnight and put the units in
+      // neither warehouse (or both) for a day.
+      const stamps = (await sql`
+        select distinct recorded_at::text as recorded_at from ledger_events
+        where tenant_id = ${tenantId} and reference_doc->>'transferId' = ${transferId} and type = 'transfer.inbound'`) as unknown as {
+        recorded_at: string;
+      }[];
+      expect(stamps).toHaveLength(1);
       const parkedSource = await onHandMilli(sourceWarehouseId, skuId, inTransitBinSource);
       expect(parkedSource === null || parkedSource === 0).toBe(true);
       const atpSourceAfter = await reservations.atp(tenantId, sourceWarehouseId, skuId);

@@ -1368,6 +1368,13 @@ export class TransferService {
           command.tenantId,
           order.sourceWarehouseId,
         );
+        // Story 21-4 — ONE `recorded_at` for every event of this transaction.
+        // A cross-warehouse leg is a draw on the source chain beside an intake
+        // on the destination chain; stamped separately, the two could fall on
+        // either side of an IST midnight, and storage metering (which folds by
+        // `recorded_at`) would see the units in NEITHER warehouse — or in
+        // both — for that day. One stamp keeps the units in exactly one place.
+        const recordedAt = nowIso();
         const events: TransferLegEventSnapshot[] = [];
         for (const line of lines) {
           const landingBinId = landingBinByLine.get(line.id)!;
@@ -1400,7 +1407,7 @@ export class TransferService {
                 serialRef: arm.serialRef,
                 actorUserId: command.actorUserId,
                 occurredAt,
-                recordedAt: nowIso(),
+                recordedAt,
                 referenceDoc,
               });
               events.push({
@@ -1442,7 +1449,7 @@ export class TransferService {
                 serialRef: arm.serialRef,
                 actorUserId: command.actorUserId,
                 occurredAt,
-                recordedAt: nowIso(),
+                recordedAt,
                 referenceDoc,
               });
               events.push({
@@ -1478,7 +1485,7 @@ export class TransferService {
                 serialRef: arm.serialRef,
                 actorUserId: command.actorUserId,
                 occurredAt,
-                recordedAt: nowIso(),
+                recordedAt,
                 referenceDoc,
               });
               events.push({

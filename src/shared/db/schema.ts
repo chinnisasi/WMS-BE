@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { bigint, boolean, date, index, integer, jsonb, numeric, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, date, index, integer, jsonb, numeric, pgEnum, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
 /**
@@ -1006,6 +1006,25 @@ export const ledgerEvents = pgTable(
     index('ledger_events_tenant_warehouse_type_recorded_at_idx').on(
       table.tenantId,
       table.warehouseId,
+      table.type,
+      table.recordedAt,
+    ),
+    // Story 21-4 — billing folds one client's events in one warehouse over a
+    // `recorded_at` window (the storage snapshot job) and probes which
+    // warehouses a client has events in. Plain builds, like 0058's
+    // (drizzle's migrator runs in one transaction — no CONCURRENTLY); see
+    // 0061's header.
+    index('ledger_events_tenant_client_warehouse_recorded_at_idx').on(
+      table.tenantId,
+      table.clientId,
+      table.warehouseId,
+      table.recordedAt,
+    ),
+    // Story 21-4 — the metering read's dispatched-order count: one client's
+    // `dispatch.dispatched` events across warehouses, by `recorded_at`.
+    index('ledger_events_tenant_client_type_recorded_at_idx').on(
+      table.tenantId,
+      table.clientId,
       table.type,
       table.recordedAt,
     ),
@@ -4230,3 +4249,75 @@ export const rateCardLines = pgTable(
 );
 
 export type RateCardLine = typeof rateCardLines.$inferSelect;
+
+/**
+ * Story 21-4 — daily storage snapshots (AD-25: a rebuildable projection, not a
+ * book). One row per (client, warehouse, IST day, SKU base UoM): the client's
+ * on-hand in base milli-units at the END of that IST day — the ledger fold
+ * over every event with `recorded_at` before the IST midnight that ends the
+ * day. Only positive values are stored (a zero day has no row; the
+ * progress watermark says it was measured). Written once by the snapshot job
+ * under the commit guarantee (`billing/storage-snapshot.ts`) and never
+ * rewritten by it; the rebuild script is the only other writer. Only client
+ * brands are snapshotted, never `self` (decision 4). The CHECK and the RLS
+ * policies (the AD-24 read clause, operator-only writes) live ONLY in
+ * `drizzle/0061_storage_snapshots.sql`. No FKs (house rule).
+ */
+export const storageSnapshots = pgTable(
+  'storage_snapshots',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    /** The IST calendar day this is the closing stock of. */
+    snapshotDate: date('snapshot_date', { mode: 'string' }).notNull(),
+    /** The SKU base UoM — storage is counted separately per unit (decision 1). */
+    uom: text('uom').notNull(),
+    /** Base milli-units on hand at the end of the day (> 0). Read raw as text — can pass 2⁵³ summed. */
+    onHandMilli: bigint('on_hand_milli', { mode: 'number' }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('storage_snapshots_scope_day_uom_unique').on(
+      table.tenantId,
+      table.clientId,
+      table.warehouseId,
+      table.snapshotDate,
+      table.uom,
+    ),
+    // The metering read sums one client's days across warehouses.
+    index('storage_snapshots_tenant_client_date_idx').on(table.tenantId, table.clientId, table.snapshotDate),
+  ],
+);
+
+export type StorageSnapshot = typeof storageSnapshots.$inferSelect;
+
+/**
+ * Story 21-4 — the snapshot job's per-scope watermark: the last IST day
+ * written for (client, warehouse) and the running per-uom on-hand at the end
+ * of that day (so a tick folds only the new days, never from genesis). Born
+ * only when the scope's first day is written under the commit guarantee
+ * (`billing/storage-snapshot.ts`). `last_day` only ever moves forward
+ * (`GREATEST`). `drift_checked_on` is the IST day the drift check last ran
+ * (it runs once per IST day, or when the watermark advances).
+ */
+export const storageSnapshotProgress = pgTable(
+  'storage_snapshot_progress',
+  {
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    lastDay: date('last_day', { mode: 'string' }).notNull(),
+    /** uom → on-hand milli-units (decimal strings) at the end of `last_day`. */
+    running: jsonb('running').notNull(),
+    driftCheckedOn: date('drift_checked_on', { mode: 'string' }),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [primaryKey({ columns: [table.tenantId, table.clientId, table.warehouseId] })],
+);
+
+export type StorageSnapshotProgress = typeof storageSnapshotProgress.$inferSelect;
+

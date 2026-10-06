@@ -1519,8 +1519,10 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
    * billing itself writes no other module's table — it reads the client
    * entity (and locks its row) through `clients.facade.ts`.
    */
-  const BILLING_TABLES = ['rateCards', 'rateCardLines'] as const;
-  const RAW_BILLING_TABLES = 'rate_cards|rate_card_lines';
+  // Story 21-4 adds the storage snapshots and their per-scope watermark —
+  // billing-owned the same way (a projection over the ledger, AD-25).
+  const BILLING_TABLES = ['rateCards', 'rateCardLines', 'storageSnapshots', 'storageSnapshotProgress'] as const;
+  const RAW_BILLING_TABLES = 'rate_cards|rate_card_lines|storage_snapshots|storage_snapshot_progress';
   const billingRoot = join(SRC_ROOT, 'modules', 'billing');
   const billingFiles = files.filter((file) => file.path.startsWith(billingRoot));
 
@@ -1571,23 +1573,61 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
     const schemaFile = join(SRC_ROOT, 'shared', 'db', 'schema.ts');
     const offenders = files
       .filter((file) => !file.path.startsWith(billingRoot) && file.path !== schemaFile)
-      .filter((file) => /\b(rateCards|rateCardLines)\b/.test(file.source))
+      .filter((file) => /\b(rateCards|rateCardLines|storageSnapshots|storageSnapshotProgress)\b/.test(file.source))
       .map((file) => file.path);
     expect(offenders).toEqual([]);
     const publicVocabulary = readFileSync(join(billingRoot, 'rate-cards.ts'), 'utf8');
-    expect(/export\s*\{[^}]*\b(rateCards|rateCardLines)\b/.test(publicVocabulary)).toBe(false);
+    expect(/export\s*\{[^}]*\b(rateCards|rateCardLines|storageSnapshots|storageSnapshotProgress)\b/.test(publicVocabulary)).toBe(false);
     // Meaningful: the facade really does read them.
     expect(/\bfrom\(\s*rateCards\b/.test(readFileSync(join(billingRoot, 'billing.facade.ts'), 'utf8'))).toBe(true);
   });
 
   it('the billing command really writes both tables (the test is meaningful)', () => {
     const command = readFileSync(join(billingRoot, 'rate-card.command.ts'), 'utf8');
-    for (const table of BILLING_TABLES) {
+    for (const table of ['rateCards', 'rateCardLines'] as const) {
       expect(drizzleWriteOn(table).test(command)).toBe(true);
     }
     expect(/\.update\(\s*rateCards\b/.test(command)).toBe(true);
     // The detectors bite on the shapes they name.
     expect(drizzleWriteOn('rateCardLines').test('tx.insert(rateCardLines).values({})')).toBe(true);
     expect(new RegExp(`\\b(insert into|update|delete from)\\s+"?(${RAW_BILLING_TABLES})\\b`, 'i').test('UPDATE rate_cards SET status')).toBe(true);
+  });
+
+  it('the snapshot service really writes both 21-4 tables, and the metering read reads the snapshots (the test is meaningful)', () => {
+    const snapshots = readFileSync(join(billingRoot, 'storage-snapshot.ts'), 'utf8');
+    expect(/insert into storage_snapshots\b/i.test(snapshots)).toBe(true);
+    expect(/insert into storage_snapshot_progress\b/i.test(snapshots)).toBe(true);
+    expect(/update storage_snapshot_progress\b/i.test(snapshots)).toBe(true);
+    expect(/\.delete\(\s*storageSnapshots\b/.test(snapshots)).toBe(true);
+    expect(/\bfrom\(\s*storageSnapshots\b/.test(readFileSync(join(billingRoot, 'metering.ts'), 'utf8'))).toBe(true);
+  });
+
+  it('billing reads the ledger, the GRN lines and the picks ONLY through the inventory, inbound and outbound facades (story 21-4)', () => {
+    // AD-6 + AD-25: metering is aggregation over other modules' records, and
+    // every such read has ONE definition on the owning module's facade (the
+    // shared predicates 21-5's drill-down reuses). Billing never names the
+    // tables — not the Drizzle objects, not the physical names in raw SQL.
+    const FORBIDDEN_IDENTIFIER = /\b(ledgerEvents|picks|goodsReceipt[A-Za-z]*)\b/;
+    const FORBIDDEN_RAW = /\b(from|join)\s+"?(ledger_events|picks|goods_receipt_[a-z_]+)\b/i;
+    // Code only — the doc comments name what the counts MEAN ("picks rows").
+    const code = (source: string): string => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    const offenders: string[] = [];
+    for (const file of billingFiles) {
+      const identifier = FORBIDDEN_IDENTIFIER.exec(code(file.source));
+      if (identifier !== null) offenders.push(`${file.path}: names ${identifier[0]}`);
+      const raw = FORBIDDEN_RAW.exec(code(file.source));
+      if (raw !== null) offenders.push(`${file.path}: raw read ${raw[0]}`);
+    }
+    expect(offenders).toEqual([]);
+    // The detectors bite on the shapes they name…
+    expect(FORBIDDEN_IDENTIFIER.test('tx.select().from(ledgerEvents)')).toBe(true);
+    expect(FORBIDDEN_IDENTIFIER.test('import { goodsReceiptLines } from')).toBe(true);
+    expect(FORBIDDEN_RAW.test('select count(*) from picks p')).toBe(true);
+    expect(FORBIDDEN_RAW.test('join goods_receipt_notes grn on')).toBe(true);
+    // …and the metering read really goes through the three facades.
+    const metering = readFileSync(join(billingRoot, 'metering.ts'), 'utf8');
+    expect(metering).toContain("from '../inventory/inventory.facade'");
+    expect(metering).toContain("from '../inbound/inbound.facade'");
+    expect(metering).toContain("from '../outbound/outbound.facade'");
   });
 });

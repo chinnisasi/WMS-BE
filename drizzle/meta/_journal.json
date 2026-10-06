@@ -428,6 +428,13 @@
       "when": 1791308811486,
       "tag": "0060_rate_cards",
       "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1791314909322,
+      "tag": "0061_storage_snapshots",
+      "breakpoints": true
     }
   ]
 }
