@@ -3,7 +3,7 @@ import { ewayNationalThresholds, ewayStateThresholds } from '../../shared/db/sch
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { ArithmeticOverflowError, type SupplyType } from './arith';
-import { IST_OFFSET_MS } from './generator';
+import { istDateOf as sharedIstDateOf } from '../../shared/primitives/time';
 
 /**
  * The e-way bill threshold (story 8-2b): which consignments need an EWB.
@@ -41,13 +41,19 @@ export function consignmentValuePaise(lines: readonly EwayValueLine[]): number {
   return total;
 }
 
-/** The IST calendar date (`YYYY-MM-DD`) an instant falls on. */
+/**
+ * The IST calendar date (`YYYY-MM-DD`) an instant falls on — the shared
+ * primitive (`shared/primitives/time.ts`, moved there by story 21-3),
+ * re-exported with this module's typed failure: an unparseable instant is
+ * an `ArithmeticOverflowError`, which `eway.delivery.ts` acks as a data
+ * fault rather than retrying.
+ */
 export function istDateOf(instant: string): string {
-  const ms = Date.parse(instant);
-  if (Number.isNaN(ms)) {
+  try {
+    return sharedIstDateOf(instant);
+  } catch {
     throw new ArithmeticOverflowError(`e-way: unparseable instant "${instant}"`);
   }
-  return new Date(ms + IST_OFFSET_MS).toISOString().slice(0, 10);
 }
 
 export const THRESHOLD_RULE_RE = /^(national|state:[0-9]{2})$/;

@@ -10,6 +10,47 @@
  */
 export const IST_OFFSET_MS = 5.5 * 3600 * 1000;
 
+/**
+ * The IST calendar date (`YYYY-MM-DD`) an instant falls on. Moved here from
+ * `invoicing/eway-threshold.ts` (story 21-3) — the e-way threshold lookup and
+ * the rate-card effective dates both ask it. Throws a `RangeError` on an
+ * unparseable instant; the invoicing module re-exports it wrapped in its own
+ * typed `ArithmeticOverflowError` (its delivery handler acks that type as a
+ * data fault).
+ */
+export function istDateOf(instant: string): string {
+  const ms = Date.parse(instant);
+  if (Number.isNaN(ms)) {
+    throw new RangeError(`unparseable instant "${instant}"`);
+  }
+  return new Date(ms + IST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/**
+ * A real calendar date in `YYYY-MM-DD` (shape AND existence — `2026-02-31`
+ * is refused). Moved here from `invoicing/eway-json.ts` (story 21-3).
+ */
+export function isIsoDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const ms = Date.parse(`${value}T00:00:00Z`);
+  return !Number.isNaN(ms) && new Date(ms).toISOString().slice(0, 10) === value;
+}
+
+/**
+ * The instant IST midnight of a `YYYY-MM-DD` date begins, as ISO-8601 UTC
+ * (`2026-11-01` → `2026-10-31T18:30:00.000Z`). Story 21-3: a rate card's
+ * effective boundary is stored as the instant it starts, because lookups are
+ * by instant (an event's time). The caller has already checked `isIsoDate`.
+ */
+export function istMidnightOf(date: string): string {
+  return new Date(Date.parse(`${date}T00:00:00Z`) - IST_OFFSET_MS).toISOString();
+}
+
+/** `YYYY-MM-DD` plus `days` calendar days (UTC arithmetic on a date — no zone). */
+export function addIsoDays(date: string, days: number): string {
+  return new Date(Date.parse(`${date}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+}
+
 export function nowIso(): string {
   return new Date().toISOString();
 }

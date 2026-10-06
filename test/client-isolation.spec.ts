@@ -28,6 +28,10 @@ const STAMPED_TABLES: readonly string[] = [
   'orders',
   'purchase_orders',
   'ledger_events',
+  // Story 21-3 — the billing module's rate cards, born stamped (AD-24): a
+  // card and each of its lines carry the client they price.
+  'rate_cards',
+  'rate_card_lines',
 ];
 
 /** The five policies migration 0041 recreated with the client clause. */
@@ -38,6 +42,14 @@ const CLIENT_POLICIES: readonly { table: string; policy: string; column: string 
   { table: 'orders', policy: 'orders_tenant_isolation', column: 'client_id' },
   { table: 'clients', policy: 'clients_tenant_isolation', column: 'id' },
 ];
+
+/**
+ * Story 21-3 (0060) — the rate-card tables are born with the client clause
+ * on READS only (`*_tenant_isolation`, FOR SELECT); every write policy is
+ * operator-only (`app.client_id` must be unset), so a portal session reads
+ * its own price list and can never edit it.
+ */
+const READ_ONLY_CLIENT_TABLES: readonly string[] = ['rate_cards', 'rate_card_lines'];
 
 describe('story 21-2: client isolation RLS — app.client_id, the stamping primitive, the DB probe', () => {
   // ──────────────────────────────────────────────────────────────────────────
@@ -59,6 +71,8 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
   let clientB: string;
   let skuAId: string;
   let skuBId: string;
+  /** Client A's draft rate card (story 21-3) — the own-client line insert targets it. */
+  let rateCardAId: string;
 
   beforeAll(async () => {
     suiteDb = await useSuiteDatabase('clientisol');
@@ -123,6 +137,18 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
           ${binId}, ${actorId}, ${at}, ${at}, ${sql.json({ kind: 'manual-adjustment', reasonCode: 'seed' })}, ${GENESIS}, ${'seed-hash-' + clientId}
         )
       `;
+    }
+
+    // Story 21-3 — one DRAFT rate card per client, each with a line (a
+    // draft, so the freeze triggers admit the line; the probe is about who
+    // can SEE them — and that a portal session can write none of them).
+    for (const clientId of [clientA, clientB]) {
+      const cardId = uuidv7();
+      if (clientId === clientA) rateCardAId = cardId;
+      await sql`insert into rate_cards (id, tenant_id, client_id, status, created_by)
+        values (${cardId}, ${tenantId}, ${clientId}, 'draft', ${actorId})`;
+      await sql`insert into rate_card_lines (id, tenant_id, client_id, rate_card_id, charge_code, basis, amount_paise)
+        values (${uuidv7()}, ${tenantId}, ${clientId}, ${cardId}, 'storage', 'per_thousand_units_per_day', 330)`;
     }
 
     // The INHERITED rows: stock and batch rows carry no client_id — their
@@ -351,7 +377,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       return Number((rows[0] as unknown as { n: number }).n);
     }
 
-    it('a PORTAL-shaped session sees its own rows and ZERO of the sibling client’s, on all four stamped tables', async () => {
+    it('a PORTAL-shaped session sees its own rows and ZERO of the sibling client’s, on every stamped table', async () => {
       for (const table of STAMPED_TABLES) {
         // The sibling's rows exist in the table (seeded; the operator probe
         // below counts them) — they are invisible here.
@@ -441,7 +467,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       expect(byClient.get(clientB)).toBeGreaterThan(0);
     });
 
-    it('the WITH CHECK arm rejects a foreign-client INSERT with 42501, on all four stamped tables', async () => {
+    it('the WITH CHECK arm rejects a foreign-client INSERT with 42501, on every stamped table (rate-card lines: the freeze trigger fails closed first)', async () => {
       for (const table of STAMPED_TABLES) {
         let rejected: Promise<unknown>;
         if (table === 'skus') {
@@ -463,6 +489,30 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
                 'CI-PO-FOREIGN', 'open'
               )`,
           );
+        } else if (table === 'rate_cards') {
+          rejected = portal((tx) =>
+            tx`insert into rate_cards (id, tenant_id, client_id, status, created_by)
+              values (${uuidv7()}, ${tenantId}, ${clientB}, 'draft', ${uuidv7()})`,
+          );
+        } else if (table === 'rate_card_lines') {
+          // A foreign-client line is refused BEFORE the WITH CHECK arm runs:
+          // the freeze trigger reads the parent card through the same RLS
+          // session, and client B's card is invisible to a client-A portal
+          // session — the parent reads as missing and the trigger fails
+          // closed (P0001). Refused at the database either way.
+          await expect(
+            portal((tx) =>
+              tx`insert into rate_card_lines (id, tenant_id, client_id, rate_card_id, charge_code, basis, amount_paise)
+                values (
+                  ${uuidv7()}, ${tenantId}, ${clientB},
+                  (select id from rate_cards where tenant_id = ${tenantId} and client_id = ${clientB} limit 1),
+                  'pick', 'per_pick', 100
+                )`,
+            ),
+          ).rejects.toMatchObject({ code: 'P0001' });
+          // (The 42501 WITH CHECK arm itself is pinned on rate_cards above —
+          // a line can only be written under a card the session can see.)
+          continue;
         } else {
           rejected = portal((tx) =>
             tx`insert into ledger_events (
@@ -526,6 +576,40 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
         (t) => t`select count(*)::int as n from ${t('ledger_events')} where tenant_id = ${tenantId} and seq = 9101`,
         1,
       );
+    });
+
+    it('rate cards are READ-ONLY to a portal session: it reads its own, and cannot insert, update or delete even its own (21-3)', async () => {
+      // Reads: its own card and line, none of the sibling's (the read clause).
+      const own = await portal((tx) => tx`select id from rate_cards where tenant_id = ${tenantId}`);
+      expect((own as unknown as { id: string }[]).map((row) => row.id)).toEqual([rateCardAId]);
+      const ownLines = await portal((tx) => tx`select count(*)::int as n from rate_card_lines where tenant_id = ${tenantId}`);
+      expect(countOf(ownLines)).toBe(1);
+
+      // INSERT of its OWN client's card: the operator-only WITH CHECK refuses.
+      await expect(
+        portal((tx) =>
+          tx`insert into rate_cards (id, tenant_id, client_id, status, created_by)
+            values (${uuidv7()}, ${tenantId}, ${clientA}, 'draft', ${uuidv7()})`,
+        ),
+      ).rejects.toMatchObject({ code: '42501' });
+      // A line on its OWN draft: the freeze trigger's parent lookup (FOR
+      // SHARE, which needs the operator-only UPDATE policy) sees no parent
+      // and fails closed before the WITH CHECK arm (P0001).
+      await expect(
+        portal((tx) =>
+          tx`insert into rate_card_lines (id, tenant_id, client_id, rate_card_id, charge_code, basis, amount_paise)
+            values (${uuidv7()}, ${tenantId}, ${clientA}, ${rateCardAId}, 'pick', 'per_pick', 300)`,
+        ),
+      ).rejects.toMatchObject({ code: 'P0001' });
+      // UPDATE and DELETE of its own rows bind nothing.
+      const updated = await portal((tx) => tx`update rate_card_lines set amount_paise = 1 where rate_card_id = ${rateCardAId} returning id`);
+      expect(updated).toHaveLength(0);
+      const deletedLines = await portal((tx) => tx`delete from rate_card_lines where rate_card_id = ${rateCardAId} returning id`);
+      expect(deletedLines).toHaveLength(0);
+      const deletedCards = await portal((tx) => tx`delete from rate_cards where id = ${rateCardAId} returning id`);
+      expect(deletedCards).toHaveLength(0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('rate_card_lines')} where rate_card_id = ${rateCardAId} and amount_paise = 330`, 1);
+      await expectCount((t) => t`select count(*)::int as n from ${t('rate_cards')} where tenant_id = ${tenantId}`, 2);
     });
 
     it('the UPDATE and DELETE arms bind too: a portal session cannot re-stamp its row to the sibling, and deletes ZERO of the sibling’s rows', async () => {
@@ -644,15 +728,15 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       await expectCount((t) => t`select count(*)::int as n from ${t('clients')} where id = ${freshId}`, 0);
     });
 
-    it('the migration recreated the FIVE policies with the client clause, and lost none of the other 39', async () => {
+    it('the migration recreated the FIVE policies with the client clause (0060 added the rate-card tables read-scoped, write operator-only), and lost none of the others', async () => {
       const policies = (await sql`
         select tablename, policyname, qual, with_check from pg_policies
         where schemaname = 'public' order by tablename, policyname
       `) as unknown as {
         tablename: string;
         policyname: string;
-        qual: string;
-        with_check: string;
+        qual: string | null;
+        with_check: string | null;
       }[];
       // 0040 left 44 policies; 0041 recreated five; 0042 (story 4.6c) added
       // two — shipments and manifests; 0043 (story 5-1) added two more —
@@ -668,9 +752,27 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // (story 8-1) added three more — invoices, invoice_lines and
       // invoice_series; 0056 (story 8-2b) added three more — eway_bills,
       // eway_state_thresholds and eway_gstin_settings; 0058 (story 9-1) added
-      // two more — pack_verification_failures and ingest_backorder_refusals.
-      // None lost.
-      expect(policies).toHaveLength(72);
+      // two more — pack_verification_failures and ingest_backorder_refusals;
+      // 0060 (story 21-3) added eight more — rate_cards and rate_card_lines,
+      // each a client-scoped SELECT policy plus operator-only INSERT, UPDATE
+      // and DELETE policies. None lost.
+      expect(policies).toHaveLength(80);
+
+      for (const table of READ_ONLY_CLIENT_TABLES) {
+        const own = policies.filter((row) => row.tablename === table);
+        expect(own.map((row) => row.policyname).sort()).toEqual(
+          [`${table}_operator_delete`, `${table}_operator_insert`, `${table}_operator_update`, `${table}_tenant_isolation`].sort(),
+        );
+        const read = own.find((row) => row.policyname === `${table}_tenant_isolation`)!;
+        expect(read.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+        expect(read.with_check).toBeNull();
+        for (const write of own.filter((row) => row.policyname !== `${table}_tenant_isolation`)) {
+          const arms = `${write.qual ?? ''} ${write.with_check ?? ''}`;
+          // Operator-only: the client variable must be UNSET, and no arm binds a client.
+          expect(arms).toContain("(NULLIF(current_setting('app.client_id'::text, true), ''::text) IS NULL)");
+          expect(arms).not.toContain('(client_id =');
+        }
+      }
 
       for (const expected of CLIENT_POLICIES) {
         const found = policies.find(

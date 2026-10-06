@@ -17301,6 +17301,891 @@
         ]
       }
     },
+    "/tenants/{tenantId}/clients/{clientId}/rate-cards/in-force": {
+      "get": {
+        "operationId": "RateCardsController_inForce",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "at",
+            "required": false,
+            "in": "query",
+            "description": "The instant to resolve, ISO-8601 UTC with a Z designator. Default: now",
+            "schema": {
+              "example": "2026-10-31T17:30:00Z",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateCardInForceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId, or `at` is not a UTC instant ending in Z (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The client's rate card in force at an instant (default now): the active or superseded card with effectiveFrom ≤ at < effectiveTo — or null, when the client is not billed then",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/rate-cards": {
+      "get": {
+        "operationId": "RateCardsController_list",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateCardListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists a client's rate cards — the newest 100 drafts first, then every dated card by effectiveFrom descending (unpaginated; dated cards are never dropped)",
+        "tags": [
+          "billing"
+        ]
+      },
+      "post": {
+        "operationId": "RateCardsController_create",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRateCardDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The draft (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateCardResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, a line outside the vocabularies or the amount range, a charge on the wrong basis or priced twice, or the tenant's own client (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks rates.manage — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The client is suspended or departed (client-not-active), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Drafts a rate card for a client (rates.manage). A draft has no date and stays editable until activated",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/rate-cards/{rateCardId}": {
+      "get": {
+        "operationId": "RateCardsController_get",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "rateCardId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateCardResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed rateCardId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No rate card with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One rate card with its lines",
+        "tags": [
+          "billing"
+        ]
+      },
+      "delete": {
+        "operationId": "RateCardsController_discard",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "rateCardId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The draft and its lines were deleted"
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed rateCardId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks rates.manage — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No rate card with this id exists in this tenant, or it was already discarded (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The card is not a draft (rate-card-not-draft), or a concurrent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Discards a draft (rates.manage) — only a draft is ever deleted; a repeat under a new key is 404, a replay under the same key 204",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/rate-cards/{rateCardId}/lines": {
+      "put": {
+        "operationId": "RateCardsController_replaceLines",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "rateCardId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RateCardLinesDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateCardResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed rateCardId, or invalid lines (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks rates.manage — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No rate card with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The card is not a draft (rate-card-not-draft), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Replaces a draft's lines (rates.manage). An activated card never changes",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/rate-cards/{rateCardId}/activate": {
+      "post": {
+        "operationId": "RateCardsController_activate",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "rateCardId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivateRateCardDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateCardResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed rateCardId or effectiveFrom (validation-failed); the tenant's own client (validation-failed); a date before today (IST) for a first card or before tomorrow (IST) for a replacement (rate-card-effective-date)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks rates.manage — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No rate card with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The card is not a draft (rate-card-not-draft), the date is not after every existing card (rate-card-effective-overlap), the card has no lines (rate-card-no-lines), the client is not active (client-not-active), or a concurrent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Activates a draft from an IST date (rates.manage). The previous open card is superseded from that date; the card is frozen from now on",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/rate-cards/{rateCardId}/cancel": {
+      "post": {
+        "operationId": "RateCardsController_cancel",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "rateCardId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateCardResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed rateCardId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks rates.manage — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No rate card with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The card is a draft or cancelled, or its date has already arrived (rate-card-not-cancellable), or a concurrent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Cancels a scheduled card — any dated card (active, or superseded by a later one) whose date has not arrived (rates.manage). It is never in force; its predecessor inherits its end (reopens open-ended, or runs to the next card’s date)",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
     "/tenants/{tenantId}/webhooks/channels/{provider}/{connectionId}/orders": {
       "post": {
         "operationId": "WebhooksController_ingestOrder",
@@ -29856,6 +30741,263 @@
         },
         "required": [
           "name"
+        ]
+      },
+      "RateCardLineResponseDto": {
+        "type": "object",
+        "properties": {
+          "chargeCode": {
+            "type": "string",
+            "enum": [
+              "storage",
+              "inbound_handling",
+              "pick",
+              "outbound_handling"
+            ]
+          },
+          "basis": {
+            "type": "string",
+            "enum": [
+              "per_thousand_units_per_day",
+              "per_receipt_line",
+              "per_pick",
+              "per_order"
+            ]
+          },
+          "amountPaise": {
+            "type": "number",
+            "description": "Integer paise per unit of the basis, GST-exclusive"
+          }
+        },
+        "required": [
+          "chargeCode",
+          "basis",
+          "amountPaise"
+        ]
+      },
+      "RateCardDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "active",
+              "superseded",
+              "cancelled"
+            ],
+            "description": "draft (editable, undated) · active (dated, frozen; scheduled when its date is ahead) · superseded (a later card took over from its date) · cancelled (withdrawn before its date; never in force)"
+          },
+          "effectiveFrom": {
+            "type": "string",
+            "nullable": true,
+            "example": "2026-11-01",
+            "description": "IST date the card takes effect (from IST midnight); null for a draft"
+          },
+          "effectiveTo": {
+            "type": "string",
+            "nullable": true,
+            "example": "2026-12-01",
+            "description": "IST date a successor took over (exclusive); null unless superseded"
+          },
+          "lines": {
+            "description": "The priced charges, in charge order",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RateCardLineResponseDto"
+            }
+          },
+          "createdBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "activatedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "activatedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC"
+          },
+          "cancelledBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "cancelledAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "clientId",
+          "status",
+          "effectiveFrom",
+          "effectiveTo",
+          "lines",
+          "createdBy",
+          "createdAt",
+          "updatedAt",
+          "activatedBy",
+          "activatedAt",
+          "cancelledBy",
+          "cancelledAt"
+        ]
+      },
+      "RateCardInForceResponse": {
+        "type": "object",
+        "properties": {
+          "rateCard": {
+            "nullable": true,
+            "description": "The card in force at asOf, or null — the client is not billed then",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RateCardDto"
+              }
+            ]
+          },
+          "asOf": {
+            "type": "string",
+            "description": "The instant resolved (ISO-8601 UTC) — the request `at`, or the server clock"
+          }
+        },
+        "required": [
+          "rateCard",
+          "asOf"
+        ]
+      },
+      "RateCardListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "The client's cards — the newest 100 drafts first, then EVERY dated card by effectiveFrom descending (never dropped by a bound). Unpaginated",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RateCardDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "RateCardLineDto": {
+        "type": "object",
+        "properties": {
+          "chargeCode": {
+            "type": "string",
+            "enum": [
+              "storage",
+              "inbound_handling",
+              "pick",
+              "outbound_handling"
+            ],
+            "description": "The charge this line prices — each at most once per card"
+          },
+          "basis": {
+            "type": "string",
+            "enum": [
+              "per_thousand_units_per_day",
+              "per_receipt_line",
+              "per_pick",
+              "per_order"
+            ],
+            "description": "The basis — fixed per charge: storage ↔ per_thousand_units_per_day (₹ per 1,000 SKU base units per day), inbound_handling ↔ per_receipt_line, pick ↔ per_pick, outbound_handling ↔ per_order"
+          },
+          "amountPaise": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10000000,
+            "example": 330,
+            "description": "Integer paise per unit of the basis, GST-exclusive (₹0 is billed at zero; ₹1 lakh cap)"
+          }
+        },
+        "required": [
+          "chargeCode",
+          "basis",
+          "amountPaise"
+        ]
+      },
+      "CreateRateCardDto": {
+        "type": "object",
+        "properties": {
+          "lines": {
+            "maxItems": 4,
+            "description": "The charges this card prices — any subset of the four. A charge with no line is not billed. A draft may have none; activation needs at least one",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RateCardLineDto"
+            }
+          }
+        },
+        "required": [
+          "lines"
+        ]
+      },
+      "RateCardResponse": {
+        "type": "object",
+        "properties": {
+          "rateCard": {
+            "$ref": "#/components/schemas/RateCardDto"
+          }
+        },
+        "required": [
+          "rateCard"
+        ]
+      },
+      "RateCardLinesDto": {
+        "type": "object",
+        "properties": {
+          "lines": {
+            "maxItems": 4,
+            "description": "The charges this card prices — any subset of the four. A charge with no line is not billed. A draft may have none; activation needs at least one",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RateCardLineDto"
+            }
+          }
+        },
+        "required": [
+          "lines"
+        ]
+      },
+      "ActivateRateCardDto": {
+        "type": "object",
+        "properties": {
+          "effectiveFrom": {
+            "type": "string",
+            "example": "2026-11-01",
+            "description": "The IST date the card takes effect, at IST midnight. A client's first card: today (IST) or later; a replacement: tomorrow (IST) or later, and after every existing card's date"
+          }
+        },
+        "required": [
+          "effectiveFrom"
         ]
       },
       "ChannelWebhookOrderResponse": {

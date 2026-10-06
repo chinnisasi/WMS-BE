@@ -34,6 +34,8 @@ import { ReportingController } from './reporting.controller';
 import { ReportingModule } from '../modules/reporting/reporting.module';
 import { ClientsController } from './clients.controller';
 import { ClientsModule } from '../modules/clients/clients.module';
+import { RateCardsController } from './rate-cards.controller';
+import { BillingModule } from '../modules/billing/billing.module';
 
 /**
  * api shell: the only HTTP surface of the monolith. Story 1.1 exposes
@@ -70,7 +72,7 @@ import { ClientsModule } from '../modules/clients/clients.module';
  * response DTO, so the shell has nothing to redact.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule],
+  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule],
   controllers: [
     HealthController,
     EchoController,
@@ -114,6 +116,11 @@ import { ClientsModule } from '../modules/clients/clients.module';
     // by the root; the mutations go through `ClientsCommand`, the list
     // through `ClientsFacade`.
     ClientsController,
+    // Story 21-3 — the rate-card surface (list, in-force, draft, edit,
+    // activate, cancel, discard) rides the same shape: `BillingModule` is a
+    // spine-singleton already imported by the root; the mutations go through
+    // `RateCardCommand`, the reads through `BillingFacade`.
+    RateCardsController,
     // Story 7-2 — the channel webhook surface (guardless by construction:
     // the provider's AUTHORITY is its signature, not a session). The
     // last-siblings convention keeps NotFoundController LAST (registered

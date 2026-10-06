@@ -214,6 +214,18 @@ export const CAPABILITIES = [
   // any member (reads are never gated). Mirrored into wms-fe
   // `src/lib/users.ts` (CAPABILITIES + OWNER_ONLY_CAPABILITIES).
   'clients.manage',
+  // Story 21-3 — rate cards: draft a client's card, edit or discard the
+  // draft, activate it from an effective date, cancel a card whose date has
+  // not arrived. OWNER + ACCOUNTANT (decided, human, 2026-10-06, decision 2):
+  // a rate card is the commercial price list the 3PL bills its client by —
+  // finance work, the `eway.manage` rationale. This deliberately REVERSES
+  // story 8-1's "the accountant does not set prices" for THIS surface: 8-1's
+  // rationale was about overriding the rate on a numbered GST tax document
+  // (still `invoice.generate`, owner + ops_manager); a client's service
+  // price list is the accountant's to keep. Ops Manager absent — it runs the
+  // floor, it does not negotiate contracts. Every member READS cards (reads
+  // are never gated). Mirrored into wms-fe `src/lib/users.ts`.
+  'rates.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -227,7 +239,8 @@ export type Capability = (typeof CAPABILITIES)[number];
  * capability, deliberate; `picks.execute`, Story 4.3; `pack.execute`, Story 4.5; `dispatch.execute`, Story 4.6; `labels.execute`, Story 4.6c; `excursion.record`, Story 12-5; `transfers.execute`, Story 5-1; `counts.execute`, Story 5-3 — the floor
  * records what it observes) and NOT `secure.move` (Story 12-3 — the
  * cage is off-limits to floor staff); Accountant is read-only except
- * `eway.manage` (Story 8-2b — e-way paperwork is finance work). Reads stay
+ * `eway.manage` (Story 8-2b — e-way paperwork is finance work) and
+ * `rates.manage` (Story 21-3 — a client's rate card is finance work). Reads stay
  * open to any tenant member.
  */
 export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability>>> = {
@@ -310,9 +323,12 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // mirroring `transfers.execute`).
     'counts.execute',
   ]),
-  // Story 8-2b: the accountant's first (and only) write — the e-way
-  // paperwork (finance work). Everything else stays read-only.
-  accountant: new Set<Capability>(['eway.manage']),
+  // Story 8-2b: the accountant's first write — the e-way paperwork (finance
+  // work). Story 21-3: the client rate cards (finance work — decision 2,
+  // which reverses 8-1's "the accountant does not set prices" for a client's
+  // service price list; a tax document's rate override stays
+  // `invoice.generate`). Everything else stays read-only.
+  accountant: new Set<Capability>(['eway.manage', 'rates.manage']),
 };
 
 /**
