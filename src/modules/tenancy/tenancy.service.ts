@@ -16,7 +16,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { addressFromColumns } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
-import { GSTIN_RE, normalizeGstinInput } from '../../shared/primitives/gstin';
+import { GSTIN_RE, gstinPrefixProblem, normalizeGstinInput } from '../../shared/primitives/gstin';
 
 /** What other modules get from the tenancy spine (module boundary — AD-6). */
 export interface ActiveWarehouse {
@@ -236,6 +236,12 @@ export async function tenantGstinsInTx(tx: TenantTx, tenantId: string): Promise<
  * paths (adapters, seeds) cannot write a 15-character-violating value either
  * (`orders.consignee_gstin` rides the same helper from the create-order
  * command); the migration CHECK is the storage-layer backstop.
+ *
+ * Story 8-1d: the two-digit prefix must also be a GST REGISTRATION state
+ * code (`isGstinStateCode` — the pure constant, so this stays synchronous
+ * and DB-free for registration, which runs outside any transaction). Every
+ * caller invokes it BEHIND its replay lookup, so a key committed before
+ * this rule still replays.
  */
 export function normalizeGstin(raw: string | null | undefined): string | null {
   const value = normalizeGstinInput(raw);
@@ -246,6 +252,15 @@ export function normalizeGstin(raw: string | null | undefined): string | null {
       400,
       'GSTIN validation failed',
       `gstin must be a 15-character GSTIN (two digits, thirteen alphanumeric characters; got "${value}").`,
+    );
+  }
+  const prefixProblem = gstinPrefixProblem(value);
+  if (prefixProblem !== null) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      'GSTIN validation failed',
+      `gstin ${prefixProblem} (got "${value}") — a GSTIN begins with the two-digit code of the state it is registered in.`,
     );
   }
   return value;

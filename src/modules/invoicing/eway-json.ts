@@ -1,9 +1,10 @@
 import { PINCODE_RE } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
+import { nicText } from '../../shared/primitives/nic-text';
 import type { SupplyType } from './arith';
 import { resolveStateCode } from './generator';
 import type { InvoiceDocument, StateCodeEntry } from './generator';
-import { isValidHsn } from './hsn-summary';
+import { isValidHsn, normalizeHsn } from './hsn';
 import { uqcFor } from './uqc';
 import { istDateOf } from './eway-threshold';
 
@@ -204,11 +205,8 @@ export interface EwbBulkFile {
 
 // ── text, amounts, dates ────────────────────────────────────────────────────
 
-/** NIC's text rule: drop every character outside `A-Za-z0-9 @#-/,&.`, then truncate. */
-export function nicText(value: string | null | undefined, max: number): string {
-  if (value === null || value === undefined) return '';
-  return value.replace(/[^A-Za-z0-9 @#\-/,&.]/g, '').slice(0, max).trim();
-}
+/** NIC's text rule — the shared primitive (8-1d moved it so outbound can apply it at entry). */
+export { nicText };
 
 /** Integer paise → a number rounded to 0.01 (the integer division is exact to the cent). */
 export function paiseToAmount(paise: number): number {
@@ -224,13 +222,6 @@ export function nicDate(isoDate: string): string {
 /** Whole IST calendar days from `fromDate` to `toDate` (both `YYYY-MM-DD`). */
 export function istDaysBetween(fromDate: string, toDate: string): number {
   return Math.round((Date.parse(`${toDate}T00:00:00Z`) - Date.parse(`${fromDate}T00:00:00Z`)) / 86_400_000);
-}
-
-/** HSN as SQL's `nullif(btrim(hsn), '')` reads it (spaces only — the 8-2a rule). */
-function trimmedHsn(hsn: string | null): string | null {
-  if (hsn === null) return null;
-  const trimmed = hsn.replace(/^ +| +$/g, '');
-  return trimmed === '' ? null : trimmed;
 }
 
 /** An address state resolved from its TEXT alone (`gstin = null` — the actual state). */
@@ -389,7 +380,7 @@ export function ewbBlockers(facts: EwayInvoiceFacts, partB: EwayPartB, ctx: Bloc
   const lines = facts.document.lines;
   const header = facts.document.header;
 
-  if (lines.some((line) => !isValidHsn(trimmedHsn(line.hsn)))) codes.add('hsn-issue');
+  if (lines.some((line) => !isValidHsn(normalizeHsn(line.hsn)))) codes.add('hsn-issue');
   if (istDaysBetween(istDateOf(facts.issuedAt), ctx.todayIst) > MAX_DOC_AGE_DAYS) codes.add('doc-too-old');
   if (lines.length > MAX_EWB_ITEMS) codes.add('too-many-lines');
 
@@ -472,7 +463,7 @@ export function ewbBillObject(facts: EwayInvoiceFacts, partB: EwayPartB, maps: S
       itemNo: index + 1,
       productName: nicText(line.skuName, 100),
       productDesc: '',
-      hsnCode: trimmedHsn(line.hsn) ?? '',
+      hsnCode: normalizeHsn(line.hsn) ?? '',
       quantity: line.qtyMilli / 1000,
       qtyUnit: uqcFor(line.uom).uqc,
       taxableAmount: paiseToAmount(line.taxablePaise),

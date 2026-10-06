@@ -14556,7 +14556,7 @@
     },
     "/tenants/{tenantId}/invoices/hsn-summary": {
       "get": {
-        "description": "Per supplier GSTIN (each GSTIN files its own return) and per accounting period by IST issue date: a month (YYYY-MM) or an FY quarter (FY-yyyy-Qn). Only issued invoices count (never awaiting-data or voided). Rows group by (HSN, UQC, GST rate); every amount is the exact paise sum of the frozen invoice lines — nothing is rounded per row and the invoice round-off is never spread. A line whose HSN is blank or malformed (not 4, 6 or 8 digits) is an hsnIssue row: inside the totals, listed in issueLines with the SKU's current catalog HSN as a hint, and left out of the Table 12 CSV by the client. The totals equal the included invoices' subtotal and GST to the paisa. A well-formed GSTIN with nothing issued in the period is an empty summary.",
+        "description": "Per supplier GSTIN (each GSTIN files its own return) and per accounting period by IST issue date: a month (YYYY-MM) or an FY quarter (FY-yyyy-Qn). Only issued invoices count (never awaiting-data or voided). Rows group by (HSN, UQC, GST rate); every amount is the exact paise sum of the frozen invoice lines — nothing is rounded per row and the invoice round-off is never spread. A line whose HSN is blank or malformed (not 4, 6 or 8 digits) is an hsnIssue row: inside the totals, listed in issueLines with the SKU's current catalog HSN as a hint, and left out of the Table 12 CSV by the client. A row whose GST rate is not on the GST rate master (0, 0.1, 0.25, 1, 1.5, 3, 5, 6, 7.5, 12, 18, 28, 40 %) is a rateIssue row: inside the totals and left out of the Table 12 CSV by the client. The totals equal the included invoices' subtotal and GST to the paisa. A well-formed GSTIN with nothing issued in the period is an empty summary.",
         "operationId": "InvoicingController_hsnSummary",
         "parameters": [
           {
@@ -20194,6 +20194,10 @@
             "type": "string",
             "format": "string",
             "description": "The consignee's GSTIN (story 8-1), when the buyer is GST-registered. Place of supply resolves from its first two digits; optional — absent falls back to the destination state's name."
+          },
+          "consigneeLegalName": {
+            "type": "string",
+            "description": "The GST-registered buyer's legal or trade name (story 8-1d), printed as the invoice's buyer and so the e-way bill's toTrdName; absent falls back to the destination contact name. Trimmed; blank reads as absent. Only alongside consigneeGstin and at most 100 characters (Unicode code points) — both refused by the command (400 validation-failed) behind its replay lookup."
           }
         },
         "required": [
@@ -26258,7 +26262,7 @@
           },
           "document": {
             "type": "object",
-            "description": "The pinned, client-agnostic document snapshot: { header, seller, buyer, lines, totals, gaps, revision } — what the printable invoice renders. totals is { subtotal, gst, total, roundOff, payable } in paise (total exact; payable rupee-rounded). Frozen once issued. Each gap is { kind, detail, orderLineId? }; orderLineId is set on the line-scoped kinds (unpriced-line, hsn-gap) so a client can price exactly the unpriced lines without parsing detail prose"
+            "description": "The pinned, client-agnostic document snapshot: { header, seller, buyer, lines, totals, gaps, revision } — what the printable invoice renders. totals is { subtotal, gst, total, roundOff, payable } in paise (total exact; payable rupee-rounded). Frozen once issued. Each gap is { kind, detail, orderLineId? }; orderLineId is set on the line-scoped kinds (unpriced-line, hsn-gap, hsn-invalid) so a client can price exactly the unpriced lines without parsing detail prose. Blocking kinds: unpriced-line, place-of-supply, supplier-gstin; every other kind is a warning the invoice issues with. buyer.name is the consignee legal name given on the order, else the destination contact name"
           },
           "lines": {
             "type": "array",
@@ -26397,7 +26401,11 @@
                 "place-of-supply",
                 "supplier-gstin",
                 "hsn-gap",
-                "pos-discrepancy"
+                "pos-discrepancy",
+                "hsn-invalid",
+                "state-text-unknown",
+                "gstin-prefix-unknown",
+                "party-name-unprintable"
               ]
             }
           },
@@ -26494,6 +26502,10 @@
             "type": "boolean",
             "description": "Blank or malformed HSN (not 4, 6 or 8 digits). Included in the totals so they reconcile; excluded from the Table 12 CSV (the portal accepts master HSNs only)"
           },
+          "rateIssue": {
+            "type": "boolean",
+            "description": "Story 8-1d: the GST rate is not on the GST rate master (0, 0.1, 0.25, 1, 1.5, 3, 5, 6, 7.5, 12, 18, 28, 40 % — the e-invoice master; its equality with the Table 12 rate list is assumed, not verified). Included in the totals so they reconcile; excluded from the Table 12 CSV"
+          },
           "uqc": {
             "type": "string",
             "enum": [
@@ -26572,6 +26584,7 @@
         "required": [
           "hsn",
           "hsnIssue",
+          "rateIssue",
           "uqc",
           "sourceUoms",
           "mixedUnits",

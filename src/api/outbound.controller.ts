@@ -117,6 +117,9 @@ export class OutboundController {
         // VERBATIM (present or not) — the command owns the shape rules behind
         // its replay lookup and freezes them at acceptance.
         ...(dto.consigneeGstin !== undefined ? { consigneeGstin: dto.consigneeGstin } : {}),
+        // Story 8-1d: the buyer legal name, VERBATIM — the command
+        // normalizes it and owns its refusals behind the replay lookup.
+        ...(dto.consigneeLegalName !== undefined ? { consigneeLegalName: dto.consigneeLegalName } : {}),
         lines: dto.lines.map((line) => ({
           skuId: line.skuId,
           quantity: line.quantity,

@@ -147,6 +147,15 @@ export class CreateOrderDto {
   @IsString()
   @Matches(GSTIN_RE, { message: 'consigneeGstin must be a 15-character GSTIN (two digits, thirteen alphanumeric characters)' })
   consigneeGstin?: string;
+
+  @ApiProperty({
+    required: false,
+    description:
+      "The GST-registered buyer's legal or trade name (story 8-1d), printed as the invoice's buyer and so the e-way bill's toTrdName; absent falls back to the destination contact name. Trimmed; blank reads as absent. Only alongside consigneeGstin and at most 100 characters (Unicode code points) — both refused by the command (400 validation-failed) behind its replay lookup.",
+  })
+  @IsOptional()
+  @IsString()
+  consigneeLegalName?: string;
 }
 
 /** POST /tenants/{tenantId}/outbound/orders/{orderId}/cancel body — none. */

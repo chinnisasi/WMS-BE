@@ -21,6 +21,12 @@ import {
   sandboxEwayGateway,
   type EwayGateway,
 } from '../src/modules/invoicing/eway-gateway';
+import { eq } from 'drizzle-orm';
+import type { Database } from '../src/shared/db/db';
+import { invoices } from '../src/shared/db/schema';
+import { withTenantTransaction } from '../src/shared/db/tenant-scope';
+import { EMPTY_PART_B, ewbBillObject } from '../src/modules/invoicing/eway-json';
+import { invoiceFacts, stateCodeMapsInTx } from '../src/modules/invoicing/eway-view';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 
@@ -163,6 +169,7 @@ describe('invoicing: e-way bills (e2e, story 8-2b)', () => {
     const csv = [
       'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
       'EW-PEP,Black pepper 1kg,pcs,,1800,0904,false,false,,,',
+      'EW-MAL,Turmeric 1kg,pcs,,500,0910,false,false,,,',
     ].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
@@ -176,6 +183,8 @@ describe('invoicing: e-way bills (e2e, story 8-2b)', () => {
       .set('Authorization', `Bearer ${ownerToken}`)
       .expect(200);
     for (const item of catalogList.body.items as { code: string; id: string }[]) skuIds.set(item.code, item.id);
+    // Story 8-1d: the catalog's HSN is free text — a malformed one, set raw.
+    await sql`update skus set hsn = 'HSN 0910' where id = ${skuIds.get('EW-MAL')!}`;
 
     const minted = await request(app.getHttpServer())
       .post(`${API}/${tenantId}/devices/enrollment-codes`)
@@ -308,8 +317,14 @@ describe('invoicing: e-way bills (e2e, story 8-2b)', () => {
   }
 
   /** The whole floor flow for one order, ending DISPATCHED (the outbox carries order.dispatched). */
-  async function dispatchedOrder(quantity: number, ratePaise: number, destination: Record<string, unknown>, consigneeGstin: string | null): Promise<string> {
-    const skuId = skuIds.get('EW-PEP')!;
+  async function dispatchedOrder(
+    quantity: number,
+    ratePaise: number,
+    destination: Record<string, unknown>,
+    consigneeGstin: string | null,
+    opts: { skuCode?: string; consigneeLegalName?: string } = {},
+  ): Promise<string> {
+    const skuId = skuIds.get(opts.skuCode ?? 'EW-PEP')!;
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/inventory/adjustments`)
       .set('Authorization', `Bearer ${opsToken}`)
@@ -320,7 +335,13 @@ describe('invoicing: e-way bills (e2e, story 8-2b)', () => {
       .post(`${API}/${tenantId}/outbound/orders`)
       .set('Authorization', `Bearer ${opsToken}`)
       .set(KEY_HEADER, ulid())
-      .send({ warehouseId, lines: [{ skuId, quantity, ratePaise }], destination, ...(consigneeGstin === null ? {} : { consigneeGstin }) })
+      .send({
+        warehouseId,
+        lines: [{ skuId, quantity, ratePaise }],
+        destination,
+        ...(consigneeGstin === null ? {} : { consigneeGstin }),
+        ...(opts.consigneeLegalName === undefined ? {} : { consigneeLegalName: opts.consigneeLegalName }),
+      })
       .expect(201);
     const orderId = created.body.order.id as string;
     const policy = await request(app.getHttpServer())
@@ -653,6 +674,52 @@ describe('invoicing: e-way bills (e2e, story 8-2b)', () => {
       expect(after.last_exported_at).not.toBeNull();
       expect(await auditCount('eway.exported', billId)).toBe(1);
       expect((await listed(billId)).lastExportedAt).not.toBeNull();
+    });
+  });
+
+  // ── story 8-1d: the buyer legal name and the malformed HSN ─────────────────
+
+  describe('issuance-gate parity (8-1d)', () => {
+    const DEST = testAddress({ contactName: 'Asha Traders', line1: '4/7 MG Road', city: 'Pune', state: 'Maharashtra', pincode: '411001' });
+
+    async function issuedInvoiceOf(orderId: string): Promise<{ id: string; document: { gaps: { kind: string }[]; buyer: { name: string | null } } }> {
+      await drainAll();
+      const rows = await sql`select id, status, document from invoices where tenant_id = ${tenantId} and order_id = ${orderId}`;
+      expect(rows[0]?.status).toBe('issued');
+      await drainAll();
+      return rows[0] as never;
+    }
+
+    it('AC: a B2B order with a legal name and HSN "HSN 0910" dispatches and ISSUES with hsn-invalid; its e-way toTrdName is the legal name', async () => {
+      // 10 × ₹6,000 at 5%, inter-state: above the national threshold, so a bill queues.
+      const orderId = await dispatchedOrder(10, 600_000, DEST, BUYER27, { skuCode: 'EW-MAL', consigneeLegalName: 'Mysore Spices Pvt Ltd' });
+      const invoice = await issuedInvoiceOf(orderId);
+      expect(invoice.document.gaps.map((gap) => gap.kind)).toContain('hsn-invalid');
+      expect(invoice.document.buyer.name).toBe('Mysore Spices Pvt Ltd');
+      // The bill queues; the frozen malformed HSN is its terminal hsn-issue block (unchanged by 8-1d)…
+      const bill = await billFor(invoice.id);
+      expect(bill?.status).toBe('pending');
+      const entry = await listed(bill!.id);
+      expect((entry.blockers as { code: string }[]).map((b) => b.code)).toContain('hsn-issue');
+      // …so the export refuses it; the ONE bill builder (export and gateway) names the legal entity as toTrdName.
+      const built = await withTenantTransaction(app.get<Database>(DATABASE), tenantId, async (tx) => {
+        const rows = await tx.select().from(invoices).where(eq(invoices.id, invoice.id));
+        return ewbBillObject(invoiceFacts(rows[0]!)!, EMPTY_PART_B, await stateCodeMapsInTx(tx));
+      });
+      expect(built.toTrdName).toBe('Mysore Spices Pvt Ltd');
+      expect(built.toGstin).toBe(BUYER27);
+    });
+
+    it('the exported bill of a legal-name order carries it as toTrdName (the export path itself)', async () => {
+      const orderId = await dispatchedOrder(10, 600_000, DEST, BUYER27, { consigneeLegalName: 'Asha Traders Pvt Ltd' });
+      const invoice = await issuedInvoiceOf(orderId);
+      expect(invoice.document.gaps).toEqual([]);
+      const bill = await billFor(invoice.id);
+      await patchTransport(bill!.id, ROAD).expect(200);
+      const res = await exportBills([bill!.id]).expect(200);
+      const exported = (res.body.file as { billLists: Record<string, unknown>[] }).billLists[0]!;
+      expect(exported.toTrdName).toBe('Asha Traders Pvt Ltd');
+      expect(exported.toGstin).toBe(BUYER27);
     });
   });
 

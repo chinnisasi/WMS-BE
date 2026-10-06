@@ -18,7 +18,8 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
-import { normalizeGstinInput, GSTIN_RE } from '../../shared/primitives/gstin';
+import { normalizeGstinInput, GSTIN_RE, gstinPrefixProblem } from '../../shared/primitives/gstin';
+import { nicText } from '../../shared/primitives/nic-text';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -110,6 +111,23 @@ const ORDERS_SOURCE_EVENT_UNIQUE = 'orders_source_event_unique';
  */
 const MAX_LINE_QUANTITY = MAX_QUANTITY_MILLI;
 
+/**
+ * Story 8-1d: the buyer legal / trade name's ceiling, in CODE POINTS
+ * (`[...s].length`, after the JS trim) — NIC's `toTrdName` is 100 wide.
+ */
+export const MAX_CONSIGNEE_LEGAL_NAME_LENGTH = 100;
+
+/**
+ * Story 8-1d: the buyer legal name's normal form — JS `trim()`, and a blank
+ * value reads as ABSENT (null). Lenient: never throws, because it runs
+ * before the hash; the refusals live behind the replay lookup.
+ */
+export function normalizeConsigneeLegalName(raw: string | null | undefined): string | null {
+  if (raw === undefined || raw === null) return null;
+  const value = raw.trim();
+  return value === '' ? null : value;
+}
+
 // ── command inputs ───────────────────────────────────────────────────────────
 
 /** One line as the client supplies it (manual entry and ingestion alike). */
@@ -160,6 +178,13 @@ export interface CreateOrderCommand {
    * against `GSTIN_RE` behind the replay lookup; stamped at create only.
    */
   readonly consigneeGstin?: string | undefined;
+  /**
+   * Story 8-1d — the GST-registered buyer's legal / trade name. Optional;
+   * only alongside `consigneeGstin`; at most 100 code points after trimming
+   * (both refused behind the replay lookup). Printed as the invoice's buyer
+   * (and so NIC's `toTrdName`), falling back to the destination contact.
+   */
+  readonly consigneeLegalName?: string | undefined;
   /** Channel arms — required together when `source: 'ingested'`, else absent. */
   readonly integrationId?: string | undefined;
   readonly externalEventId?: string | undefined;
@@ -330,12 +355,25 @@ export class OrderCommandService {
     // LENIENT hash step) BEFORE hashing, absent = null; the shape refusal
     // lives in the preflight behind the replay lookup.
     const consigneeGstin = normalizeGstinInput(command.consigneeGstin);
+    //
+    // ── story 8-1d: `consigneeLegalName` joins BOTH hashes ONLY WHEN PRESENT
+    // A deliberate exception to the always-present-key convention above
+    // (IMPLEMENTATION-GUIDE §4): an always-present key would change EVERY
+    // order's fingerprint, so every in-flight key would answer 422 and every
+    // channel redelivery `order-source-conflict` — for a field almost no
+    // request carries. Normalized first (JS trim, blank = absent), then
+    // spread in after `consigneeGstin` only when non-null, so a request
+    // without it hashes byte-identically to the pre-8-1d build (pinned by
+    // golden hashes in `test/issuance-gate-parity.spec.ts`).
+    const consigneeLegalName = normalizeConsigneeLegalName(command.consigneeLegalName);
+    const legalNameFingerprint = consigneeLegalName === null ? {} : { consigneeLegalName };
     const sourcePayloadHash =
       command.source === 'ingested'
         ? hashCommandPayload({
             warehouseId: command.warehouseId,
             destination: addressFingerprint(normalizedDestination) ?? null,
             consigneeGstin,
+            ...legalNameFingerprint,
             lines: command.lines.map(lineFingerprint),
           })
         : null;
@@ -347,6 +385,7 @@ export class OrderCommandService {
       externalEventId,
       destination: addressFingerprint(normalizedDestination) ?? null,
       consigneeGstin,
+      ...legalNameFingerprint,
       lines: command.lines.map(lineFingerprint),
     });
 
@@ -378,6 +417,45 @@ export class OrderCommandService {
         throw validationFailed(
           `consigneeGstin must be a 15-character GSTIN (two digits, thirteen alphanumeric characters; got "${consigneeGstin}").`,
         );
+      }
+      // Story 8-1d: the prefix must be a GST registration state code — the
+      // same predicate registration and warehouse create apply (the tenancy
+      // `normalizeGstin`), behind the replay lookup like the shape check.
+      const prefixProblem = consigneeGstin === null ? null : gstinPrefixProblem(consigneeGstin);
+      if (prefixProblem !== null) {
+        throw validationFailed(
+          `consigneeGstin ${prefixProblem} (got "${consigneeGstin}") — a GSTIN begins with the two-digit code of the state it is registered in.`,
+        );
+      }
+      // Story 8-1d: the buyer legal name — only alongside a GSTIN (a B2C
+      // buyer has no registered name to print), at most 100 code points
+      // (NIC's toTrdName width). Behind the replay lookup, never in the DTO.
+      if (consigneeLegalName !== null) {
+        if (consigneeGstin === null) {
+          throw validationFailed(
+            'consigneeLegalName is the GST-registered buyer\'s legal or trade name — it needs a consigneeGstin; send neither for an unregistered buyer.',
+          );
+        }
+        const codePoints = [...consigneeLegalName].length;
+        if (codePoints > MAX_CONSIGNEE_LEGAL_NAME_LENGTH) {
+          throw validationFailed(
+            `consigneeLegalName is at most ${MAX_CONSIGNEE_LEGAL_NAME_LENGTH} characters (got ${codePoints}).`,
+          );
+        }
+        // A control character (NUL included) can never be printed — and NUL
+        // would fail the insert with a 500, never an answer.
+        // eslint-disable-next-line no-control-regex -- matching control characters is the point
+        if (/[\u0000-\u001F\u007F]/.test(consigneeLegalName)) {
+          throw validationFailed('consigneeLegalName must not contain control characters (tabs, line breaks, NUL).');
+        }
+        // The name becomes the e-way bill's toTrdName, which keeps only NIC's
+        // character set: a name with none of it prints blank, and the frozen
+        // invoice's bill would be blocked (address-incomplete) for good.
+        if (nicText(consigneeLegalName, MAX_CONSIGNEE_LEGAL_NAME_LENGTH) === '') {
+          throw validationFailed(
+            'consigneeLegalName must contain Latin letters or digits — the e-way portal accepts only A–Z, a–z, 0–9, spaces and @ # - / , & . so this name would print blank on the e-way bill.',
+          );
+        }
       }
       // Story 11-1: the destination is validated HERE, behind the replay
       // lookup — the command is the boundary (the Epic 7 adapter path bypasses
@@ -652,6 +730,9 @@ export class OrderCommandService {
             // Story 8-1: the buyer's registration identity (optional, absent
             // = null) — invoicing resolves place of supply from it.
             consigneeGstin,
+            // Story 8-1d: the buyer's legal / trade name (normalized, only
+            // alongside a GSTIN — the preflight refused anything else).
+            consigneeLegalName,
           });
         } catch (err) {
           if (isUniqueViolationOn(err, ORDERS_SOURCE_EVENT_UNIQUE)) {

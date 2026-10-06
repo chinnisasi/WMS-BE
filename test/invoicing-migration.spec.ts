@@ -823,3 +823,130 @@ describe('migration 0056: the e-way tables, applied to 0055 rows', () => {
     expect((await sql`select count(*)::int as n from eway_national_thresholds`)[0]!.n).toBe(1);
   });
 });
+
+const MIGRATION_0057 = '0057_order_consignee_legal_name.sql';
+
+/**
+ * Story 8-1d — migration 0057 (`orders.consignee_legal_name` + its CHECK)
+ * applied to a database at 0056 with existing orders in it. Additive, no
+ * backfill: the proof is that the column lands NULL on every existing row,
+ * nothing else on any row moves, the CHECK enforces its three rules, and a
+ * re-run RAISEs at the guard.
+ */
+describe('migration 0057: the buyer legal name, applied to 0056 rows', () => {
+  const PRE_DB = 'wms_s_invoice_pre0057';
+  let baseUrl: string;
+  let sql: ReturnType<typeof postgres>;
+  let folder: string;
+  const tenantId = uuidv7();
+  const b2bOrderId = uuidv7();
+  const b2cOrderId = uuidv7();
+  let ordersBefore: Map<string, unknown>;
+
+  const applyWhole = (): Promise<unknown> =>
+    sql.begin(async (tx) => {
+      for (const statement of migrationStatements(MIGRATION_0057)) {
+        await tx.unsafe(statement);
+      }
+    });
+
+  beforeAll(async () => {
+    baseUrl = process.env.DATABASE_URL!;
+    const url = new URL(baseUrl);
+    url.pathname = `/${PRE_DB}`;
+    const preUrl = url.toString();
+    const adminUrl = new URL(baseUrl);
+    adminUrl.pathname = '/postgres';
+    const admin = postgres(adminUrl.toString(), { max: 1 });
+    try {
+      await admin.unsafe(`select pg_terminate_backend(pid) from pg_stat_activity where datname = '${PRE_DB}'`);
+      await admin.unsafe(`drop database if exists "${PRE_DB}"`);
+      await admin.unsafe(`create database "${PRE_DB}"`);
+    } finally {
+      await admin.end();
+    }
+    // The schema the moment before 8-1d: journal trimmed at 0056.
+    folder = mkdtempSync(join(tmpdir(), 'wms-pre-0057-'));
+    cpSync(resolve(process.cwd(), 'drizzle'), folder, { recursive: true });
+    rmSync(join(folder, MIGRATION_0057));
+    const journalPath = join(folder, 'meta/_journal.json');
+    const journal = JSON.parse(readFileSync(journalPath, 'utf8')) as { entries: { idx: number }[] };
+    journal.entries = journal.entries.filter((entry) => entry.idx <= 56);
+    writeFileSync(journalPath, JSON.stringify(journal));
+    const db = createDatabase(preUrl);
+    await migrate(db, { migrationsFolder: folder });
+    await (db as unknown as { $client: { end(): Promise<void> } }).$client.end();
+    sql = postgres(preUrl, { max: 2, onnotice: () => undefined });
+
+    // One B2B and one B2C order, as 8-1 wrote them.
+    for (const [id, gstin] of [
+      [b2bOrderId, '29AAACM4321K1Z8'],
+      [b2cOrderId, null],
+    ] as const) {
+      await sql`
+        insert into orders (id, tenant_id, client_id, warehouse_id, status, source, destination_contact_name, destination_state, consignee_gstin)
+        values (${id}, ${tenantId}, ${uuidv7()}, ${uuidv7()}, 'dispatched', 'manual', 'Ravi', 'Karnataka', ${gstin})
+      `;
+    }
+    const rows = (await sql`select id, to_jsonb(o) as row from orders o`) as unknown as { id: string; row: unknown }[];
+    ordersBefore = new Map(rows.map((r) => [r.id, r.row]));
+    await applyWhole();
+  });
+
+  afterAll(async () => {
+    await sql?.end();
+    if (folder !== undefined) rmSync(folder, { recursive: true, force: true });
+    const adminUrl = new URL(baseUrl);
+    adminUrl.pathname = '/postgres';
+    const admin = postgres(adminUrl.toString(), { max: 1 });
+    try {
+      await admin.unsafe(`select pg_terminate_backend(pid) from pg_stat_activity where datname = '${PRE_DB}'`);
+      await admin.unsafe(`drop database if exists "${PRE_DB}"`);
+    } finally {
+      await admin.end();
+    }
+  });
+
+  it('adds the column NULL on every existing order and changes nothing else on any row', async () => {
+    const rows = (await sql`
+      select id, consignee_legal_name, to_jsonb(o) - 'consignee_legal_name' as row from orders o
+    `) as unknown as { id: string; consignee_legal_name: string | null; row: unknown }[];
+    expect(rows).toHaveLength(2);
+    expect(rows.every((r) => r.consignee_legal_name === null)).toBe(true);
+    expect(new Map(rows.map((r) => [r.id, r.row]))).toEqual(ordersBefore);
+  });
+
+  it('the CHECK: a name needs a GSTIN beside it and is 1–100 characters (code points) once trimmed', async () => {
+    const attempt = async (id: string, name: string): Promise<string | undefined> => {
+      try {
+        await sql.begin(async (tx) => {
+          await tx`update orders set consignee_legal_name = ${name} where id = ${id}`;
+          throw new Error('rollback');
+        });
+      } catch (err) {
+        return (err as { constraint_name?: string }).constraint_name ?? (err as Error).message;
+      }
+      return undefined;
+    };
+    const CHECK = 'orders_consignee_legal_name_check';
+    expect(await attempt(b2cOrderId, 'Mysore Spices Pvt Ltd')).toBe(CHECK); // no GSTIN beside it
+    expect(await attempt(b2bOrderId, '')).toBe(CHECK); // blank is absent, never stored
+    expect(await attempt(b2bOrderId, '   ')).toBe(CHECK); // whitespace-only is blank too (btrim)
+    expect(await attempt(b2bOrderId, 'x'.repeat(101))).toBe(CHECK);
+    // 100 code points of a multi-byte script fit — char_length counts characters, not bytes.
+    expect(await attempt(b2bOrderId, 'क'.repeat(100))).toBe('rollback');
+    expect(await attempt(b2bOrderId, 'Mysore Spices Pvt Ltd')).toBe('rollback');
+  });
+
+  it('a second apply RAISEs at the guard and changes nothing', async () => {
+    let error: unknown;
+    try {
+      await applyWhole();
+    } catch (err) {
+      error = err;
+    }
+    expect((error as Error).message).toContain('migration 0057 has already been applied');
+    const cols = await sql`select count(*)::int as n from information_schema.columns where table_name = 'orders' and column_name = 'consignee_legal_name'`;
+    expect(cols[0]!.n).toBe(1);
+  });
+});

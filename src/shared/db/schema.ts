@@ -1910,6 +1910,13 @@ export const orders = pgTable(
      * place-of-supply code invoicing resolves. Uppercase-normalized.
      */
     consigneeGstin: text('consignee_gstin'),
+    /**
+     * Story 8-1d — the GST-registered buyer's legal / trade name (optional).
+     * Only alongside `consignee_gstin`, 1–100 characters once trimmed — the CHECK
+     * `orders_consignee_legal_name_check` (migration 0057, hand-written).
+     * Written by the create command only; read by invoicing as the buyer.
+     */
+    consigneeLegalName: text('consignee_legal_name'),
     ...tenantTimestamps,
   },
   (table) => [
