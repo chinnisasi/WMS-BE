@@ -40,6 +40,7 @@ import {
   StockListQuery,
   StockListResponse,
 } from '../modules/inventory/inventory.dto';
+import { assertInstantRange } from '../shared/primitives/instant-range';
 
 const IDEMPOTENCY_HEADER = [
   {
@@ -613,7 +614,7 @@ export class InventoryController {
     type: LedgerEventListResponse,
     description: "The warehouse's ledger event-timeline page (newest first, keyset cursor)",
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed skuId/binId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed skuId/binId/orderId query, an unregistered type, a from/to that is not an ISO-8601 instant, from not before to, a shortPick other than true/false, a malformed cursor, or an out-of-range limit (validation-failed / invalid-cursor)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
@@ -626,9 +627,15 @@ export class InventoryController {
     @Query() query: LedgerEventsQuery,
   ): Promise<LedgerEventListResponse> {
     assertOwnTenant(session, tenantId);
+    assertInstantRange(query.from, query.to);
     const timelineQuery: LedgerTimelineQuery = {
       skuId: query.skuId,
       binId: query.binId,
+      types: query.type,
+      from: query.from,
+      to: query.to,
+      orderId: query.orderId,
+      shortPick: query.shortPick,
       cursor: query.cursor,
       limit: query.limit,
     };

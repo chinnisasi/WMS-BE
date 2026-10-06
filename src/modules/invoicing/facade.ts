@@ -11,7 +11,7 @@ import {
   type Invoice,
   type InvoiceLine,
 } from '../../shared/db/schema';
-import { tenantGstinsInTx } from '../tenancy/tenancy.service';
+import { assertWarehouseInTenant, tenantGstinsInTx } from '../tenancy/tenancy.service';
 import { EWAY_GATEWAY, type EwayGateway } from './eway-gateway';
 import {
   EWAY_LIST_DEFAULT_PAGE_SIZE,
@@ -19,6 +19,7 @@ import {
   toEwayBillView,
   viewContextInTx,
   type EwayBillStatus,
+  type EwaySource,
   type EwayBillView,
 } from './eway-view';
 import {
@@ -60,11 +61,23 @@ import {
 export interface ListEwayBillsQuery {
   readonly status?: EwayBillStatus | undefined;
   readonly gstin?: string | undefined;
+  /** Story 9-1 — bills of this warehouse's invoices (asserted in-tenant first). */
+  readonly warehouseId?: string | undefined;
+  /** Story 9-1 — `generated` bills of this source. */
+  readonly source?: EwaySource | undefined;
+  /** Story 9-1 — `[from, to)` on `created_at` (when the bill was queued). */
+  readonly from?: string | undefined;
+  readonly to?: string | undefined;
   readonly limit?: number | undefined;
   readonly cursor?: string | undefined;
 }
 
 export interface ListInvoicesQuery {
+  /** Story 9-1 — one warehouse (asserted in-tenant first). */
+  readonly warehouseId?: string | undefined;
+  /** Story 9-1 — `[from, to)` on `issued_at` (an awaiting invoice has none, so it never matches a window). */
+  readonly from?: string | undefined;
+  readonly to?: string | undefined;
   readonly limit?: number | undefined;
   readonly cursor?: string | undefined;
 }
@@ -118,6 +131,9 @@ export class InvoicingFacade {
     // GSTINs are stored uppercase (the canonical form): a lowercase filter matches too.
     const gstin = query.gstin === undefined ? undefined : assertGstinParam(query.gstin.trim().toUpperCase());
     return withTenantTransaction(this.db, tenantId, async (tx) => {
+      if (query.warehouseId !== undefined) {
+        await assertWarehouseInTenant(tx, tenantId, query.warehouseId);
+      }
       const rows = await tx
         .select({ bill: ewayBills, createdAtText: sql<string>`${ewayBills.createdAt}::text` })
         .from(ewayBills)
@@ -126,6 +142,15 @@ export class InvoicingFacade {
             eq(ewayBills.tenantId, tenantId),
             query.status === undefined ? undefined : eq(ewayBills.status, query.status),
             gstin === undefined ? undefined : eq(ewayBills.originGstin, gstin),
+            // Story 9-1 — a bill has no warehouse column; it belongs to the
+            // warehouse of its invoice (table-qualified by hand inside the
+            // correlated subquery — outbound Gotcha 9).
+            query.warehouseId === undefined
+              ? undefined
+              : sql`exists (select 1 from invoices inv where inv.tenant_id = ${ewayBills.tenantId} and inv.id = ${ewayBills.invoiceId} and inv.warehouse_id = ${query.warehouseId}::uuid)`,
+            query.source === undefined ? undefined : eq(ewayBills.source, query.source),
+            query.from === undefined ? undefined : sql`${ewayBills.createdAt} >= ${query.from}::timestamptz`,
+            query.to === undefined ? undefined : sql`${ewayBills.createdAt} < ${query.to}::timestamptz`,
             before === undefined
               ? undefined
               : sql`(${ewayBills.createdAt}, ${ewayBills.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -252,6 +277,9 @@ export class InvoicingFacade {
     const limit = Math.min(query.limit ?? INVOICE_LIST_DEFAULT_PAGE_SIZE, INVOICE_LIST_MAX_PAGE_SIZE);
     const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
     return withTenantTransaction(this.db, tenantId, async (tx) => {
+      if (query.warehouseId !== undefined) {
+        await assertWarehouseInTenant(tx, tenantId, query.warehouseId);
+      }
       // The cursor carries the row's FULL-precision instant (`::text` —
       // the driver's own parse truncates to milliseconds, and a truncated
       // cursor makes the strict keyset `<` skip same-millisecond rows).
@@ -261,6 +289,9 @@ export class InvoicingFacade {
         .where(
           and(
             eq(invoices.tenantId, tenantId),
+            query.warehouseId === undefined ? undefined : eq(invoices.warehouseId, query.warehouseId),
+            query.from === undefined ? undefined : sql`${invoices.issuedAt} >= ${query.from}::timestamptz`,
+            query.to === undefined ? undefined : sql`${invoices.issuedAt} < ${query.to}::timestamptz`,
             before === undefined
               ? undefined
               : sql`(${invoices.createdAt}, ${invoices.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,

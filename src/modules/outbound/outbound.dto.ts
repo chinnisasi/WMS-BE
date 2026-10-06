@@ -2,7 +2,7 @@ import { Transform, Type } from 'class-transformer';
 import {
   MAX_QUANTITY_BASE,
   QUANTITY_FIELD_DESCRIPTION,
-} from '../../shared/primitives/quantity';
+  } from '../../shared/primitives/quantity';
 import {
   ArrayMaxSize,
   ArrayMinSize,
@@ -18,8 +18,11 @@ import {
   Min,
   IsNumber,
   ValidateNested,
+  IsBoolean,
 } from 'class-validator';
 import { ApiProperty, OmitType } from '@nestjs/swagger';
+import { BooleanFlag, IsInstant } from '../../shared/primitives/instant-range';
+import { PACK_FAILURE_ENTRIES } from '../../shared/db/schema';
 import { ORDER_SOURCES, ORDER_STATUSES } from './order.command';
 import { AddressDto } from '../tenancy/tenancy.dto';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
@@ -253,8 +256,44 @@ export class OrderResponse {
   order!: OrderDto;
 }
 
+const FROM_DESCRIPTION = (column: string): string =>
+  `Story 9-1 — only rows whose \`${column}\` is at or after this instant (inclusive). ISO-8601 with a zone designator`;
+const TO_DESCRIPTION = (column: string): string =>
+  `Story 9-1 — only rows whose \`${column}\` is strictly before this instant (exclusive). Must be after \`from\``;
+
 /** Query of the warehouse-scoped order list (keyset cursor pagination). */
 export class OrderListQuery {
+  @ApiProperty({ required: false, enum: [...ORDER_STATUSES], description: 'Story 9-1 — only orders in this status' })
+  @IsOptional()
+  @IsIn(ORDER_STATUSES)
+  status?: (typeof ORDER_STATUSES)[number];
+
+  @ApiProperty({ required: false, enum: [...ORDER_SOURCES], description: 'Story 9-1 — only orders of this source' })
+  @IsOptional()
+  @IsIn(ORDER_SOURCES)
+  source?: (typeof ORDER_SOURCES)[number];
+
+  @ApiProperty({
+    required: false,
+    type: Boolean,
+    description:
+      "Story 9-1 — `true`: only orders with at least one line created backordered (counted per order, so a kit never counts twice); `false`: only orders with none. Exactly 'true' or 'false'",
+  })
+  @IsOptional()
+  @BooleanFlag()
+  @IsBoolean()
+  backordered?: boolean;
+
+  @ApiProperty({ required: false, format: 'date-time', description: FROM_DESCRIPTION('created_at') })
+  @IsOptional()
+  @IsInstant()
+  from?: string;
+
+  @ApiProperty({ required: false, format: 'date-time', description: TO_DESCRIPTION('created_at') })
+  @IsOptional()
+  @IsInstant()
+  to?: string;
+
   @ApiProperty({
     required: false,
     description: 'Opaque keyset cursor from the previous page',
@@ -1524,4 +1563,201 @@ export class OrderRatesDto {
 export class OrderRatesResponse {
   @ApiProperty({ type: OrderRatesDto })
   rates!: OrderRatesDto;
+}
+
+// ── story 9-1: the dashboard's outbound fact lists ─────────────────────────
+
+/** Query of a windowed fact list (pack failures, backorder refusals): `[from, to)` on `created_at`. */
+export class OutboundWindowListQuery {
+  @ApiProperty({ required: false, format: 'date-time', description: FROM_DESCRIPTION('created_at') })
+  @IsOptional()
+  @IsInstant()
+  from?: string;
+
+  @ApiProperty({ required: false, format: 'date-time', description: TO_DESCRIPTION('created_at') })
+  @IsOptional()
+  @IsInstant()
+  to?: string;
+
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page', maxLength: 200 })
+  @IsOptional()
+  @IsString()
+  @Length(1, 200)
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
+/** Query of the picklist-line list: optional status, `[from, to)` on `updated_at` (the flip time of a terminal status). */
+export class PicklistLineListQuery {
+  @ApiProperty({ required: false, enum: [...PICKLIST_LINE_STATUSES], description: 'Only lines in this status' })
+  @IsOptional()
+  @IsIn(PICKLIST_LINE_STATUSES)
+  status?: (typeof PICKLIST_LINE_STATUSES)[number];
+
+  @ApiProperty({ required: false, format: 'date-time', description: FROM_DESCRIPTION('updated_at') })
+  @IsOptional()
+  @IsInstant()
+  from?: string;
+
+  @ApiProperty({ required: false, format: 'date-time', description: TO_DESCRIPTION('updated_at') })
+  @IsOptional()
+  @IsInstant()
+  to?: string;
+
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page', maxLength: 200 })
+  @IsOptional()
+  @IsString()
+  @Length(1, 200)
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
+export class PackFailureMismatchDto {
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ description: `What the order had picked. ${QUANTITY_FIELD_DESCRIPTION}` })
+  pickedQty!: number;
+
+  @ApiProperty({ description: `What the bench scanned. ${QUANTITY_FIELD_DESCRIPTION}` })
+  scannedQty!: number;
+}
+
+export class PackFailureEntryDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ enum: [...PACK_FAILURE_ENTRIES], description: 'The entry path: the tenant route, the device bench route, or a device sync-report apply' })
+  entry!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  actorUserId!: string;
+
+  @ApiProperty({ type: [PackFailureMismatchDto], description: 'Every SKU whose scan differed from the pick' })
+  mismatch!: readonly PackFailureMismatchDto[];
+
+  @ApiProperty({ description: 'ISO-8601 UTC — when the refused attempt was recorded (server time)' })
+  createdAt!: string;
+}
+
+export class PackFailureListResponse {
+  @ApiProperty({ type: [PackFailureEntryDto] })
+  items!: readonly PackFailureEntryDto[];
+
+  @ApiProperty({ type: String, nullable: true })
+  nextCursor!: string | null;
+}
+
+export class BackorderRefusalLineDto {
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ description: `What the channel order asked for. ${QUANTITY_FIELD_DESCRIPTION}` })
+  requestedQty!: number;
+
+  @ApiProperty({ description: `What could be reserved at grant time. ${QUANTITY_FIELD_DESCRIPTION}` })
+  availableQty!: number;
+}
+
+export class BackorderRefusalEntryDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  integrationId!: string;
+
+  @ApiProperty({ description: "The channel's own order event id" })
+  externalEventId!: string;
+
+  @ApiProperty({ type: [BackorderRefusalLineDto], description: 'The lines that could not fully reserve' })
+  lines!: readonly BackorderRefusalLineDto[];
+
+  @ApiProperty({ description: 'ISO-8601 UTC — when the first delivery was refused (redeliveries add no row)' })
+  createdAt!: string;
+}
+
+export class BackorderRefusalListResponse {
+  @ApiProperty({ type: [BackorderRefusalEntryDto] })
+  items!: readonly BackorderRefusalEntryDto[];
+
+  @ApiProperty({ type: String, nullable: true })
+  nextCursor!: string | null;
+}
+
+export class PicklistLineEntryDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  picklistId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  waveId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  orderLineId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  binId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  binCode!: string | null;
+
+  @ApiProperty({ description: `Planned quantity. ${QUANTITY_FIELD_DESCRIPTION}` })
+  qty!: number;
+
+  @ApiProperty({ description: `Never drawn. ${QUANTITY_FIELD_DESCRIPTION}` })
+  shortfallQty!: number;
+
+  @ApiProperty({ type: String, nullable: true, enum: [...SHORT_PICK_REASON_CODES, null] })
+  reasonCode!: string | null;
+
+  @ApiProperty({ enum: [...PICKLIST_LINE_STATUSES] })
+  status!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC' })
+  createdAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC — the last transition (a terminal status: its flip time)' })
+  updatedAt!: string;
+}
+
+export class PicklistLineListResponse {
+  @ApiProperty({ type: [PicklistLineEntryDto] })
+  items!: readonly PicklistLineEntryDto[];
+
+  @ApiProperty({ type: String, nullable: true })
+  nextCursor!: string | null;
 }

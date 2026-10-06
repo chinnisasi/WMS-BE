@@ -30,6 +30,8 @@ import { MovementsModule } from '../modules/movements/movements.module';
 import { ReplenishmentModule } from '../modules/replenishment/replenishment.module';
 import { ChannelsModule } from '../modules/channels/channels.module';
 import { ReplenishmentController } from './replenishment.controller';
+import { ReportingController } from './reporting.controller';
+import { ReportingModule } from '../modules/reporting/reporting.module';
 
 /**
  * api shell: the only HTTP surface of the monolith. Story 1.1 exposes
@@ -66,7 +68,7 @@ import { ReplenishmentController } from './replenishment.controller';
  * response DTO, so the shell has nothing to redact.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule],
+  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule],
   controllers: [
     HealthController,
     EchoController,
@@ -101,6 +103,10 @@ import { ReplenishmentController } from './replenishment.controller';
     // through `InvoicingCommand`, the reads through `InvoicingFacade`.
     InvoicingController,
     EwayController,
+    // Story 9-1 — the reporting surface (the per-warehouse Overview) rides
+    // the same shape: `ReportingModule` exports `ReportingFacade` only, and
+    // the api shell is the ONLY importer of the module (decision 6's guard).
+    ReportingController,
     // Story 7-2 — the channel webhook surface (guardless by construction:
     // the provider's AUTHORITY is its signature, not a session). The
     // last-siblings convention keeps NotFoundController LAST (registered

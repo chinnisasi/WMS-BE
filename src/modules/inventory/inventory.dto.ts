@@ -2,7 +2,7 @@ import { Transform, Type } from 'class-transformer';
 import {
   MAX_QUANTITY_BASE,
   QUANTITY_FIELD_DESCRIPTION,
-} from '../../shared/primitives/quantity';
+  } from '../../shared/primitives/quantity';
 import {
   ArrayMaxSize,
   IsArray,
@@ -16,11 +16,36 @@ import {
   Max,
   Min,
   ValidateNested,
+  ArrayMinSize,
+  IsBoolean,
+  ValidateBy,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 import { ADJUSTMENT_PENDING_STATUSES } from '../../shared/db/schema';
 import { ADJUSTMENT_REASON_CODES } from './adjustment-reason';
+import { IsInstant, BooleanFlag, RepeatableParam } from '../../shared/primitives/instant-range';
+import { isRegisteredLedgerEventType, registeredLedgerEventTypes } from './ledger-registry';
+
+/** Story 9-1 — the most `type` values one timeline read may name. */
+export const MAX_TIMELINE_TYPES = 20;
+
+/** Each element is a registered ledger event type (read at validation time). */
+function IsRegisteredLedgerType(): PropertyDecorator {
+  return ValidateBy({
+    name: 'isRegisteredLedgerType',
+    validator: {
+      validate: (value: unknown) => typeof value === 'string' && isRegisteredLedgerEventType(value),
+      defaultMessage: (args) => {
+        const given: unknown[] = Array.isArray(args?.value) ? (args.value as unknown[]) : [args?.value];
+        const unknown = given.filter((value) => typeof value !== 'string' || !isRegisteredLedgerEventType(value));
+        return `each type must be a registered ledger event type — got ${unknown
+          .map((value) => JSON.stringify(value))
+          .join(', ')}; known: ${registeredLedgerEventTypes().join(', ')}`;
+      },
+    },
+  }, { each: true });
+}
 
 /** Trim at the validation boundary (the tenancy DTO pattern). */
 function Trim() {
@@ -227,6 +252,61 @@ export class LedgerEventsQuery {
   @IsOptional()
   @IsUUID()
   binId?: string;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    enum: registeredLedgerEventTypes(),
+    maxItems: MAX_TIMELINE_TYPES,
+    description:
+      'Story 9-1 — only events of these types (repeatable: `?type=a&type=b`; one value is a one-element list). An unknown type is refused (400 validation-failed naming the known set)',
+  })
+  @IsOptional()
+  @RepeatableParam()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_TIMELINE_TYPES)
+  @IsRegisteredLedgerType()
+  type?: string[];
+
+  @ApiProperty({
+    required: false,
+    format: 'date-time',
+    description:
+      'Story 9-1 — only events RECORDED at or after this instant (`recorded_at` — the server stamp, never the device `occurred_at`). ISO-8601 with a zone designator',
+  })
+  @IsOptional()
+  @IsInstant()
+  from?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'date-time',
+    description: 'Story 9-1 — only events RECORDED strictly before this instant (exclusive). Must be after `from`',
+  })
+  @IsOptional()
+  @IsInstant()
+  to?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: "Story 9-1 — only events whose reference document names this order (`referenceDoc.orderId` — the pick, pack and dispatch arms)",
+  })
+  @IsOptional()
+  @IsUUID()
+  orderId?: string;
+
+  @ApiProperty({
+    required: false,
+    type: Boolean,
+    description:
+      "Story 9-1 — `true`: only short-pick draws (`referenceDoc.shortPick`); `false`: only events that are not. Exactly 'true' or 'false'",
+  })
+  @IsOptional()
+  @BooleanFlag()
+  @IsBoolean()
+  shortPick?: boolean;
 
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()

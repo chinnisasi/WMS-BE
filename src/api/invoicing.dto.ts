@@ -9,6 +9,7 @@ import type { HsnPeriodKind, HsnSection } from '../modules/invoicing/hsn-summary
 import { UQCS } from '../modules/invoicing/uqc';
 import type { Uqc } from '../modules/invoicing/uqc';
 import { GSTIN_RE } from '../shared/primitives/gstin';
+import { IsInstant } from '../shared/primitives/instant-range';
 
 /**
  * Upper bound on the rate overrides one generate call carries — an order's
@@ -59,6 +60,21 @@ export class GenerateInvoiceDto {
 }
 
 export class InvoiceListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 9-1 — only this warehouse's invoices. 404 when the warehouse is not this tenant's" })
+  @IsOptional()
+  @IsUUID()
+  warehouseId?: string;
+
+  @ApiProperty({ required: false, format: 'date-time', description: 'Story 9-1 — only invoices ISSUED (`issued_at`) at or after this instant; an awaiting-data invoice has no issue instant, so a windowed read never lists one. ISO-8601 with a zone designator' })
+  @IsOptional()
+  @IsInstant()
+  from?: string;
+
+  @ApiProperty({ required: false, format: 'date-time', description: 'Story 9-1 — only invoices issued strictly before this instant (exclusive). Must be after `from`' })
+  @IsOptional()
+  @IsInstant()
+  to?: string;
+
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()

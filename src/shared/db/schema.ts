@@ -990,6 +990,17 @@ export const ledgerEvents = pgTable(
       table.batchRef,
       table.seq,
     ),
+    // Story 9-1 — the reporting read model counts one warehouse's events of
+    // one type over a server-stamped window (`recorded_at`, never the device
+    // `occurred_at`), and the timeline's `type`/`from`/`to` filters walk the
+    // same prefix. A plain build (drizzle's migrator runs in one
+    // transaction — no CONCURRENTLY); see 0058's header.
+    index('ledger_events_tenant_warehouse_type_recorded_at_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.type,
+      table.recordedAt,
+    ),
   ],
 );
 
@@ -4051,3 +4062,96 @@ export const ewayBills = pgTable(
 );
 
 export type EwayBill = typeof ewayBills.$inferSelect;
+
+/**
+ * Story 9-1 — the two facts the reporting read model needs that nothing
+ * stored before (SM-3 order accuracy, SM-4 oversell). Both are OUTBOUND-owned
+ * (`test/architecture.spec.ts`), recorded best-effort from now on (no
+ * backfill — `app_metadata.reporting_facts_since` names when counting began),
+ * and deliberately NOT ledger events: a refused command moved no stock, and
+ * the ledger is stock movements under a hash chain.
+ *
+ * RLS lives only in `drizzle/0058_reporting_facts.sql` (the established
+ * pattern); so does the `entry` CHECK. No FKs — uuid columns plus indexes.
+ */
+export const PACK_FAILURE_ENTRIES = ['tenant', 'device', 'sync'] as const;
+export type PackFailureEntry = (typeof PACK_FAILURE_ENTRIES)[number];
+
+/**
+ * One row per failed pack verification (`pack-mismatch` from the scan-vs-
+ * picked check), written AFTER the pack transaction rolled back, in a fresh
+ * tenant transaction. `mismatch` carries the divergent SKUs in milli-units.
+ */
+export const packVerificationFailures = pgTable(
+  'pack_verification_failures',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    /** Which entry path reached the command — `tenant` route, `device` route, or the `sync` report apply. */
+    entry: text('entry').notNull(),
+    actorUserId: uuid('actor_user_id').notNull(),
+    mismatch: jsonb('mismatch').notNull(),
+    /**
+     * The refused attempt's idempotency key (the route's `Idempotency-Key`;
+     * the sync-report apply's op ULID). A retry of the SAME failed pack —
+     * same key — records no second row (partial unique below), so SM-3
+     * counts attempts, not retries. Nullable for a keyless caller.
+     */
+    idempotencyKey: text('idempotency_key'),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('pack_verification_failures_tenant_key_unique')
+      .on(table.tenantId, table.idempotencyKey)
+      .where(sql`idempotency_key is not null`),
+    index('pack_verification_failures_tenant_warehouse_created_at_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+    ),
+  ],
+);
+
+export type PackVerificationFailure = typeof packVerificationFailures.$inferSelect;
+
+/**
+ * One row per channel order refused under `backorder_policy = reject`,
+ * written after the grants were released, outside any transaction. A
+ * redelivered webhook mints a fresh idempotency key per delivery, so the
+ * dedupe is the channel identity `(tenant, integration, external event)` —
+ * `orders_source_event_unique`'s own identity — and the insert is
+ * `ON CONFLICT DO NOTHING`. `lines` carries `{skuId, requestedMilli,
+ * availableMilli}` per short line.
+ */
+export const ingestBackorderRefusals = pgTable(
+  'ingest_backorder_refusals',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    integrationId: uuid('integration_id').notNull(),
+    externalEventId: text('external_event_id').notNull(),
+    lines: jsonb('lines').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('ingest_backorder_refusals_tenant_integration_event_unique').on(
+      table.tenantId,
+      table.integrationId,
+      table.externalEventId,
+    ),
+    index('ingest_backorder_refusals_tenant_warehouse_created_at_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+    ),
+  ],
+);
+
+export type IngestBackorderRefusal = typeof ingestBackorderRefusals.$inferSelect;

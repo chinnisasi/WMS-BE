@@ -27,6 +27,7 @@ import {
   RecordEwayDto,
   UpdateEwayTransportDto,
 } from './eway.dto';
+import { assertInstantRange } from '../shared/primitives/instant-range';
 
 const IDEMPOTENCY_HEADER = [
   {
@@ -70,9 +71,10 @@ export class EwayController {
       'Blockers are computed at read time: terminal ones (the invoice is frozen) mean the bill must be generated on the portal by hand and its number recorded here; needs-irn and transport-incomplete are fixable.',
   })
   @ApiOkResponse({ type: EwayBillListResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed status, gstin, cursor or limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed status, gstin, warehouseId, source, cursor or limit, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed / invalid-cursor)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouseId filter names a warehouse outside this tenant (not-found)') })
   @ApiParam(TENANT_PARAM)
   async listBills(
     @Param('tenantId') tenantId: string,
@@ -80,6 +82,7 @@ export class EwayController {
     @Query() query: EwayBillListQuery,
   ): Promise<EwayBillListResponse> {
     assertOwnTenantToken(session.tenantId, tenantId);
+    assertInstantRange(query.from, query.to);
     const page = await this.facade.listEwayBills(tenantId, query);
     return { items: page.items.map(toBillDto), nextCursor: page.nextCursor };
   }

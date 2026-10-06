@@ -1186,6 +1186,8 @@ export class SyncReportCommand {
             // revoked after the op queued (or after the report's upload) is
             // refused `device-revoked` by the command's own re-authorization.
             deviceId,
+            // Story 9-1: a failed verification's fact row names this path.
+            entry: 'sync',
             orderId: payload.orderId as string,
             scanned: payload.scanned as unknown as PackCommand['scanned'],
             weightGrams: (payload.weightGrams ?? null) as number | null | undefined,

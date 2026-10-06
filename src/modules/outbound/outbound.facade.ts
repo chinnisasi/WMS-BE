@@ -21,7 +21,20 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { addressFromColumns } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
-import { canonicalInstant } from '../../shared/primitives/time';
+import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/time';
+import {
+  listBackorderRefusalsInTx,
+  listPackFailuresInTx,
+  listPicklistLinesInTx,
+} from './fact-lists';
+import type {
+  BackorderRefusalEntry,
+  PackFailureEntry,
+  PicklistLineEntry,
+  WindowFilter,
+} from './fact-lists';
+import type { PicklistLineStatus } from './wave.command';
+
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { OrderCommandService } from './order.command';
@@ -67,6 +80,9 @@ import type {
   WaveTransitionCommand,
 } from './wave.command';
 
+// Story 9-1 — the dashboard fact-list row types ride the facade seam.
+export type { BackorderRefusalEntry, PackFailureEntry, PicklistLineEntry };
+
 /** One header row of the order-list read (no lines — detail carries them). */
 export interface OrderEntry {
   readonly id: string;
@@ -83,6 +99,29 @@ export interface OrderEntry {
 }
 
 export interface ListOrdersQuery {
+  readonly cursor?: string | undefined;
+  readonly limit?: number | undefined;
+}
+
+/**
+ * Story 9-1 — the order list's dashboard drill filters (all optional,
+ * additive). The window is on `created_at` (server-stamped), `[from, to)`.
+ * `backordered` asks whether ANY line of the order was created `backordered`
+ * (the status is set only at acceptance) — counted per ORDER, so a kit's
+ * backordered parent and children never count it twice.
+ */
+export interface ListOrdersFilter extends ListOrdersQuery {
+  readonly status?: OrderStatus | undefined;
+  readonly source?: OrderSource | undefined;
+  readonly backordered?: boolean | undefined;
+  readonly from?: string | undefined;
+  readonly to?: string | undefined;
+}
+
+/** Story 9-1 — the windowed fact-list reads (pack failures, refusals, picklist lines). */
+export interface ListWindowQuery {
+  readonly from?: string | undefined;
+  readonly to?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -577,12 +616,16 @@ export class OutboundFacade {
   async listOrders(
     tenantId: string,
     warehouseId: string,
-    query: ListOrdersQuery = {},
+    query: ListOrdersFilter = {},
   ): Promise<Page<OrderEntry>> {
     const pageSize = query.limit ?? DEFAULT_OUTBOUND_PAGE_SIZE;
     const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      // Story 9-1 — "any line created backordered" (table-qualified by hand:
+      // an unqualified column in a correlated subquery resolves against the
+      // INNER from-list — Gotcha 9).
+      const anyBackordered = sql`exists (select 1 from order_lines ol where ol.tenant_id = ${orders.tenantId} and ol.order_id = ${orders.id} and ol.status = 'backordered')`;
       const rows = await tx
         .select({
           id: orders.id,
@@ -603,12 +646,25 @@ export class OutboundFacade {
           destinationPincode: orders.destinationPincode,
           createdAt: orders.createdAt,
           updatedAt: orders.updatedAt,
+          // Story 9-1: the cursor carries the FULL-precision instant (a
+          // millisecond-truncated one skips same-millisecond rows, and a
+          // drill paged to exhaustion must see every row).
+          createdAtText: sql<string>`${orders.createdAt}::text`,
         })
         .from(orders)
         .where(
           and(
             eq(orders.tenantId, tenantId),
             eq(orders.warehouseId, warehouseId),
+            query.status === undefined ? undefined : eq(orders.status, query.status),
+            query.source === undefined ? undefined : eq(orders.source, query.source),
+            query.backordered === undefined
+              ? undefined
+              : query.backordered
+                ? anyBackordered
+                : sql`not ${anyBackordered}`,
+            query.from === undefined ? undefined : sql`${orders.createdAt} >= ${query.from}::timestamptz`,
+            query.to === undefined ? undefined : sql`${orders.createdAt} < ${query.to}::timestamptz`,
             before === undefined
               ? undefined
               : sql`(${orders.createdAt}, ${orders.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -636,8 +692,66 @@ export class OutboundFacade {
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       }));
-      return buildPage(items, pageSize);
+      const page = buildPage(
+        rows.map((row, index) => ({
+          createdAt: fullPrecisionInstant(row.createdAtText),
+          id: row.id,
+          entry: items[index]!,
+        })),
+        pageSize,
+      );
+      return { items: page.items.map((wrapped) => wrapped.entry), nextCursor: page.nextCursor };
     });
+  }
+
+  // ── story 9-1: the dashboard's outbound fact lists ────────────────────────
+
+  /** `GET …/outbound/pack-failures` — failed pack verifications, newest first. */
+  async listPackFailures(
+    tenantId: string,
+    warehouseId: string,
+    query: ListWindowQuery = {},
+  ): Promise<Page<PackFailureEntry>> {
+    const filter = this.windowFilter(query);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      return listPackFailuresInTx(tx, tenantId, warehouseId, filter);
+    });
+  }
+
+  /** `GET …/outbound/backorder-refusals` — channel orders refused under the reject policy. */
+  async listBackorderRefusals(
+    tenantId: string,
+    warehouseId: string,
+    query: ListWindowQuery = {},
+  ): Promise<Page<BackorderRefusalEntry>> {
+    const filter = this.windowFilter(query);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      return listBackorderRefusalsInTx(tx, tenantId, warehouseId, filter);
+    });
+  }
+
+  /** `GET …/outbound/picklist-lines` — picklist lines by status, windowed on `updated_at`. */
+  async listPicklistLines(
+    tenantId: string,
+    warehouseId: string,
+    query: ListWindowQuery & { readonly status?: PicklistLineStatus | undefined } = {},
+  ): Promise<Page<PicklistLineEntry>> {
+    const filter = { ...this.windowFilter(query), status: query.status };
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      return listPicklistLinesInTx(tx, tenantId, warehouseId, filter);
+    });
+  }
+
+  private windowFilter(query: ListWindowQuery): WindowFilter {
+    return {
+      from: query.from,
+      to: query.to,
+      cursor: query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor),
+      limit: query.limit ?? DEFAULT_OUTBOUND_PAGE_SIZE,
+    };
   }
 
   // ── waves and picklists (Story 4.2) ───────────────────────────────────────

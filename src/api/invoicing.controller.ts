@@ -23,6 +23,7 @@ import {
   InvoiceListResponse,
   InvoiceResponse,
 } from './invoicing.dto';
+import { assertInstantRange } from '../shared/primitives/instant-range';
 
 const IDEMPOTENCY_HEADER = [
   {
@@ -106,9 +107,10 @@ export class InvoicingController {
     summary: "Lists the tenant's invoices (keyset cursor pagination, newest first — header rows, no lines or document; open to any member)",
   })
   @ApiOkResponse({ type: InvoiceListResponse, description: 'The invoice page (newest first)' })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor, warehouseId or out-of-range limit, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed / invalid-cursor)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouseId filter names a warehouse outside this tenant (not-found)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async listInvoices(
     @Param('tenantId') tenantId: string,
@@ -116,7 +118,14 @@ export class InvoicingController {
     @Query() query: InvoiceListQuery,
   ): Promise<InvoiceListResponse> {
     assertOwnTenantToken(session.tenantId, tenantId);
-    const page = await this.invoices.listInvoices(tenantId, { cursor: query.cursor, limit: query.limit });
+    assertInstantRange(query.from, query.to);
+    const page = await this.invoices.listInvoices(tenantId, {
+      warehouseId: query.warehouseId,
+      from: query.from,
+      to: query.to,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
     return {
       items: page.items.map((item) => ({ ...item, gapKinds: [...item.gapKinds] })),
       nextCursor: page.nextCursor,

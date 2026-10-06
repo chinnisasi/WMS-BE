@@ -101,6 +101,9 @@ export interface ListBatchAlertsQuery {
   readonly kind?: (typeof BATCH_ALERT_KINDS)[number] | undefined;
   readonly status?: (typeof BATCH_ALERT_STATUSES)[number] | undefined;
   readonly warehouseId?: string | undefined;
+  /** Story 9-1 — `[from, to)` on `created_at` (when the scan raised the alert). */
+  readonly from?: string | undefined;
+  readonly to?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -384,6 +387,8 @@ export class ReplenishmentFacade {
             query.warehouseId === undefined
               ? undefined
               : eq(batchAlerts.warehouseId, query.warehouseId),
+            query.from === undefined ? undefined : sql`${batchAlerts.createdAt} >= ${query.from}::timestamptz`,
+            query.to === undefined ? undefined : sql`${batchAlerts.createdAt} < ${query.to}::timestamptz`,
             before === undefined
               ? undefined
               : sql`(${batchAlerts.createdAt}, ${batchAlerts.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,

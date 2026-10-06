@@ -3,6 +3,13 @@
  * Never store local time; never format with locale on the backend.
  */
 
+/**
+ * India Standard Time is UTC+05:30 year-round (no DST). The one copy: the
+ * invoicing FY/period math and the reporting module's IST calendar-day
+ * windows (story 9-1) both read it from here.
+ */
+export const IST_OFFSET_MS = 5.5 * 3600 * 1000;
+
 export function nowIso(): string {
   return new Date().toISOString();
 }
