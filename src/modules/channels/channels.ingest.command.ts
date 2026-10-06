@@ -11,6 +11,7 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { CatalogFacade } from '../catalog/catalog.facade';
+import { getClientLabelsInTx } from '../clients/clients.facade';
 import { OutboundFacade } from '../outbound/outbound.facade';
 import type { CreateOrderCommand } from '../outbound/outbound.facade';
 import { CONNECTION_COLUMNS } from './channels.view';
@@ -18,6 +19,7 @@ import { ChannelsPublishService } from './channels.publish';
 import {
   channelConnectionNotFound,
   ingestConfigInvalid,
+  ingestMixedClient,
   ingestWarehouseUnset,
   orderActorUnprivileged,
   orderBackorderRejected,
@@ -136,8 +138,12 @@ export class ChannelsIngestCommand {
     }
     // A mapped SKU deleted after the mapping set: the typed 422 (remediation
     // is the mappings PUT) — never a bare 404.
+    const skuClientIds = new Set<string>();
     for (const skuId of skuIds) {
       const sku = await this.catalog.findSku(tenantId, skuId);
+      if (sku !== null) {
+        skuClientIds.add(sku.clientId);
+      }
       if (sku === null) {
         await this.publish.recordIngestOutcome(tenantId, connectionId, {
           status: 'config-invalid',
@@ -149,6 +155,35 @@ export class ChannelsIngestCommand {
           'a mapped SKU no longer exists — fix the mapping set with the mappings PUT',
         );
       }
+    }
+    // The replay label: was the order already on the books before THIS
+    // delivery? The dedup machinery answers idempotency; this read answers
+    // the outcome's honesty (a redelivery is `replayed`, a first delivery is
+    // `accepted`/`backordered`). Read BEFORE the mixed-client pre-check:
+    // story 21-2b — a redelivery of an accepted order must replay through
+    // the order command even if the mappings have changed since.
+    const prior = await this.outbound.findOrderByChannelRef(
+      tenantId,
+      connectionId,
+      parsed.orderRef,
+    );
+
+    // Story 21-2b: an order is for ONE client, derived from its SKUs. A
+    // FIRST delivery whose mapped SKUs span clients is a mapping problem the
+    // channel's retry cannot fix — refused HERE as the typed 422 (remediate
+    // with the mappings PUT), metered `validation-failed`, never the
+    // transient `failed` a 409 from the order command would meter as.
+    if (prior === null && skuClientIds.size > 1) {
+      const labels = await withTenantTransaction(this.db, tenantId, (tx) =>
+        getClientLabelsInTx(tx, tenantId, [...skuClientIds]),
+      );
+      const named = [...skuClientIds].map((id) => labels.get(id) ?? id).sort().join(', ');
+      await this.publish.recordIngestOutcome(tenantId, connectionId, {
+        status: 'validation-failed',
+        latencyMs: Date.now() - startedAt,
+        error: `the order's mapped SKUs belong to more than one client (${named})`,
+      });
+      throw ingestMixedClient(connectionId, `SKUs of more than one client (${named})`);
     }
 
     // ── the order command (the ONE acceptance path, 4-1's) ────────────────
@@ -169,16 +204,6 @@ export class ChannelsIngestCommand {
     // RD-9: the ingest mints its own per-delivery key — Idempotency-Key is
     // NOT a webhook input; replay safety is RD-1's dedup on the order ref.
     const idempotencyKey = ulid();
-
-    // The replay label: was the order already on the books before THIS
-    // delivery? The dedup machinery answers idempotency; this read answers
-    // the outcome's honesty (a redelivery is `replayed`, a first delivery is
-    // `accepted`/`backordered`).
-    const prior = await this.outbound.findOrderByChannelRef(
-      tenantId,
-      connectionId,
-      parsed.orderRef,
-    );
 
     try {
       const snapshot = await this.outbound.createOrder(command, idempotencyKey);
@@ -330,6 +355,14 @@ export class ChannelsIngestCommand {
       status = 'warehouse-unset';
     } else if (code === 'ingest-config-invalid') {
       status = 'config-invalid';
+    } else if (code === 'mixed-client') {
+      // Story 21-2b: the order command's mixed-client refusal (a kit whose
+      // components belong to another client — the mapping pre-check catches
+      // plain lines) is the same mapping/catalog problem: the same typed 422
+      // as the pre-check, metered `validation-failed`, never a transient
+      // `failed`.
+      status = 'validation-failed';
+      mapped = ingestMixedClient(connectionId, 'SKUs (or kit components) of more than one client');
     } else if (code === 'validation-failed') {
       status = 'validation-failed';
     } else if (err.getStatus() === 503) {

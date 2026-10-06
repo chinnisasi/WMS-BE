@@ -414,6 +414,13 @@
       "when": 1791257598986,
       "tag": "0058_reporting_facts",
       "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1791260401935,
+      "tag": "0059_client_admin",
+      "breakpoints": true
     }
   ]
 }

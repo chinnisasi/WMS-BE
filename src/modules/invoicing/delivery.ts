@@ -10,7 +10,7 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { ArithmeticOverflowError } from './arith';
-import { InvoiceGenerator, InvoiceRaceLostError } from './generator';
+import { ClientOrderNotInvoicedError, InvoiceGenerator, InvoiceRaceLostError } from './generator';
 import { INVOICE_ISSUED_EVENT, ORDER_DISPATCHED_EVENT, invoiceIssuedPayload } from './events';
 
 /**
@@ -85,6 +85,14 @@ export class InvoiceDeliveryHandler implements OnModuleInit {
         );
       });
     } catch (err) {
+      if (err instanceof ClientOrderNotInvoicedError) {
+        // Story 21-2b (decision 5): a client brand's order is not invoiced
+        // by the 3PL — the skip is the DESIGNED outcome, not a fault: ack,
+        // write nothing (no invoice, no `invoice.issued`, so no e-way bill),
+        // and let the channel writeback run after this handler.
+        this.logger.log(`dispatch ${event.eventId}: order ${orderId} is a client order — not invoiced, acking`);
+        return;
+      }
       if (err instanceof InvoiceRaceLostError) {
         // The manual command committed the invoice first; the winner's row
         // needs nothing from the event — ack.

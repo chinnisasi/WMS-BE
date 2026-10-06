@@ -18,7 +18,7 @@ import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
-import { ensureSelfClientInTx } from '../clients/ensure-self-client';
+import { assertSingleClientInTx, getClientLabelsInTx, mixedClient } from '../clients/clients.facade';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
@@ -93,6 +93,13 @@ export interface PurchaseOrderSnapshot {
     readonly code: string;
     readonly status: 'open' | 'closed';
     readonly carriedFromPoId: string | null;
+    /**
+     * Story 21-2b — the client the PO is for, derived from its lines' SKUs.
+     * Optional and nullable on the interface because a stored snapshot
+     * written before 21-2b (an idempotent replay) does not carry it; every
+     * snapshot built now sets it.
+     */
+    readonly clientId?: string | null;
     readonly createdAt: string;
     readonly updatedAt: string;
     readonly lines: readonly PurchaseOrderLineSnapshot[];
@@ -239,19 +246,27 @@ export class PurchaseOrderCommand {
     // in tenant — a foreign or nonexistent scope is 404 before any write.
     await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
     await this.assertVendorInTenant(tx, command.tenantId, command.vendorId);
-    const uomBySku = await this.assertSkuIdsInTenant(
+    const skuFacts = await this.assertSkuIdsInTenant(
       tx,
       command.tenantId,
       command.lines.map((line) => line.skuId),
     );
+    // Story 21-2b (AD-23): an inbound document is authored for one client,
+    // and that client is DERIVED from its lines' SKUs — never chosen — so
+    // the document can never disagree with its goods. Lines spanning
+    // clients are refused 409 `mixed-client` naming the codes, before any
+    // write.
+    const clientId = await assertSingleClientInTx(
+      tx,
+      command.tenantId,
+      [...skuFacts.values()].map((sku) => sku.clientId),
+      `Purchase order "${command.code}"`,
+    );
+    const uomBySku = new Map([...skuFacts].map(([id, sku]) => [id, sku.uom]));
     // Story 10.2: conversion and the precision refusal, behind the replay
     // lookup above and with each line's unit in hand.
     const lines = this.scaleLines(command.lines, uomBySku);
     const lineRows = lines.map((line) => this.lineInsert(command.tenantId, null, line));
-
-    // Story 21-1 (AD-23): an inbound document is authored for one client —
-    // the tenant's `self` client on a D2C tenant, idempotent, no branch.
-    const clientId = await ensureSelfClientInTx(tx, command.tenantId);
 
     let po: { id: string };
     try {
@@ -348,11 +363,26 @@ export class PurchaseOrderCommand {
           );
         }
       }
-      const uomBySku = await this.assertSkuIdsInTenant(
+      const skuFacts = await this.assertSkuIdsInTenant(
         tx,
         command.tenantId,
         command.lines.map((line) => line.skuId),
       );
+      // Story 21-2b: the PO's client was derived at create and never moves
+      // — an amend whose line set names another client's SKU is refused
+      // 409 `mixed-client` naming the codes (the PO's own first), before
+      // any write.
+      const foreign = [...new Set([...skuFacts.values()].map((sku) => sku.clientId))].filter(
+        (clientId) => clientId !== po.clientId,
+      );
+      if (foreign.length > 0) {
+        const codes = await getClientLabelsInTx(tx, command.tenantId, [po.clientId, ...foreign]);
+        throw mixedClient(
+          `Purchase order "${po.code}"`,
+          [po.clientId, ...foreign].map((clientId) => codes.get(clientId) ?? clientId),
+        );
+      }
+      const uomBySku = new Map([...skuFacts].map(([id, sku]) => [id, sku.uom]));
       // Story 10.2: same position, same reason — behind the replay lookup.
       const lines = this.scaleLines(command.lines, uomBySku);
 
@@ -655,14 +685,18 @@ export class PurchaseOrderCommand {
     }
   }
 
-  /** Every line's SKU must exist in the tenant (integrity-only read, 404 naming the unknown id). */
+  /**
+   * Every line's SKU must exist in the tenant (integrity-only read, 404
+   * naming the unknown id). Story 21-2b: the read also hands back each SKU's
+   * client — the PO derives its own from them.
+   */
   private async assertSkuIdsInTenant(
     tx: TenantTx,
     tenantId: string,
     skuIds: readonly string[],
-  ): Promise<Map<string, string>> {
+  ): Promise<Map<string, { uom: string; clientId: string }>> {
     const distinct = [...new Set(skuIds)];
-    const byId = new Map<string, string>();
+    const byId = new Map<string, { uom: string; clientId: string }>();
     if (distinct.length === 0) {
       return byId;
     }
@@ -670,11 +704,11 @@ export class PurchaseOrderCommand {
       // Story 10.2: the existence check also carries each SKU's base UoM
       // back — the unit is what says how precise an ordered quantity may be,
       // and one query answers both questions.
-      .select({ id: skus.id, uom: skus.uom })
+      .select({ id: skus.id, uom: skus.uom, clientId: skus.clientId })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)));
     for (const row of rows) {
-      byId.set(row.id, row.uom);
+      byId.set(row.id, { uom: row.uom, clientId: row.clientId });
     }
     for (const skuId of distinct) {
       if (!byId.has(skuId)) {
@@ -759,6 +793,7 @@ export class PurchaseOrderCommand {
         code: po.code,
         status: po.status as PoStatus,
         carriedFromPoId: po.carriedFromPoId,
+        clientId: po.clientId,
         createdAt: canonicalInstant(po.createdAt),
         updatedAt: canonicalInstant(po.updatedAt),
         lines,

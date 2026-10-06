@@ -21,6 +21,7 @@ import {
 import { ProblemDetailsDto } from '../../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
+import { UUID_RE } from '../../shared/primitives/ids';
 import { CurrentSession } from '../tenancy/tenant-session.guard';
 import { TenantSessionGuard } from '../tenancy/tenant-session.guard';
 import type { TenantSession } from '../tenancy/jwt-session';
@@ -39,10 +40,14 @@ import { KitCommand } from './kit.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { CatalogFacade } from './catalog.facade';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { SkuClientCommand } from './sku-client.command';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ImportCatalogDto } from './catalog.dto';
 import {
   CatalogImportResponse,
+  CorrectSkuClientDto,
   CreateProductDto,
+  SkuClientCorrectionResponse,
   KitListResponse,
   KitResponse,
   PatchProductDto,
@@ -156,6 +161,7 @@ export class CatalogController {
     private readonly productCommand: ProductCommand,
     private readonly kitCommand: KitCommand,
     private readonly catalogFacade: CatalogFacade,
+    private readonly skuClientCommand: SkuClientCommand,
   ) {}
 
   @Post(':tenantId/catalog/imports')
@@ -174,13 +180,15 @@ export class CatalogController {
       properties: {
         file: { type: 'string', format: 'binary', description: 'CSV or XLSX with the documented header (sku_code,name,uom,gst_rate required)' },
         mode: { type: 'string', enum: ['initial', 'fix'], description: '`initial` (default) or `fix` — fix processes only the latest run\'s failed SKU codes' },
+        clientId: { type: 'string', format: 'uuid', description: 'Story 21-2b — the client the new SKUs belong to. Required (client-required) once the tenant holds more than one client; a fix-mode re-run inherits its original run\'s client' },
       },
       required: ['file'],
     },
   })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.CREATED, type: CatalogImportResponse, description: 'Partial commit: counts + row-level errors (a 201 can carry failures)' })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a file that cannot be parsed (file-unreadable)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a file that cannot be parsed (file-unreadable), a non-uuid clientId or a fix-mode re-run naming a different client than its original run (validation-failed), or no clientId while the tenant holds more than one client (client-required)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('clientId names no client of this tenant (not-found)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks catalog.import (role-denied)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('Concurrent import with the same Idempotency-Key (conflict), or the SKU/barcode this file introduces was committed by a concurrent import and a row-level check raced it (duplicate-sku-code / duplicate-barcode) — regenerate the key or retry') })
@@ -210,6 +218,9 @@ export class CatalogController {
         actorUserId: session.userId,
         file: { name: file.originalname, mimetype: file.mimetype, buffer: file.buffer, size: file.size },
         mode: parseMode(dto.mode),
+        // Story 21-2b — uuid-checked by the DTO (400); existence is the
+        // command's 404, behind the replay lookup.
+        clientId: dto.clientId,
       },
       key,
     );
@@ -459,6 +470,46 @@ export class CatalogController {
       key,
     );
     return { ...sku, uomConversions: sku.uomConversions.map((c) => ({ ...c })) };
+  }
+
+  // ── Story 21-2b — the owner's client correction (decision 3) ──────────────
+
+  @Post(':tenantId/catalog/skus/:skuId/client')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Corrects a SKU's client (owner-only) — allowed only while the SKU has no ledger event, order line or PO line; after that its client never changes",
+  })
+  @ApiBody({ type: CorrectSkuClientDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: SkuClientCorrectionResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed skuId path parameter, or a non-uuid clientId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The SKU or the client does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The SKU, or a kit partner / product sibling that must move with it, already has history — ledger events, order/PO/transfer lines, pending adjustments, count tasks, batches, serials, reservations or channel mappings (sku-has-history, naming the SKU); or a concurrent kit/product change or same-key request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'skuId', format: 'uuid' })
+  async correctSkuClient(
+    @Param('tenantId') tenantId: string,
+    @Param('skuId') skuId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: CorrectSkuClientDto,
+  ): Promise<SkuClientCorrectionResponse> {
+    assertOwnTenant(session, tenantId);
+    if (!UUID_RE.test(skuId)) {
+      throw new ProblemException('validation-failed', 400, 'Malformed skuId', `skuId must be a uuid (got "${skuId}").`);
+    }
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const corrected = await this.skuClientCommand.correct(
+      { tenantId, actorUserId: session.userId, skuId, clientId: dto.clientId },
+      key,
+    );
+    return { skus: corrected.skus.map((sku) => ({ ...sku, uomConversions: sku.uomConversions.map((c) => ({ ...c })) })) };
   }
 
   // ── Story 11.4 — kits and bundles (FR-38, AD-19): a kit IS a SKU ──────────

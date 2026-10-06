@@ -1905,6 +1905,11 @@
                       "fix"
                     ],
                     "description": "`initial` (default) or `fix` — fix processes only the latest run's failed SKU codes"
+                  },
+                  "clientId": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "Story 21-2b — the client the new SKUs belong to. Required (client-required) once the tenant holds more than one client; a fix-mode re-run inherits its original run's client"
                   }
                 },
                 "required": [
@@ -1926,7 +1931,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or a file that cannot be parsed (file-unreadable)",
+            "description": "Missing or malformed Idempotency-Key, a file that cannot be parsed (file-unreadable), a non-uuid clientId or a fix-mode re-run naming a different client than its original run (validation-failed), or no clientId while the tenant holds more than one client (client-required)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1947,6 +1952,16 @@
           },
           "403": {
             "description": "Session belongs to another tenant (permission-denied), or the caller lacks catalog.import (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "clientId names no client of this tenant (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2602,6 +2617,135 @@
           }
         ],
         "summary": "Edits a SKU (name, GST, HSN, flags, physical attributes, reorder defaults, barcode, product attach/detach — the SKU code is immutable)",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/catalog/skus/{skuId}/client": {
+      "post": {
+        "operationId": "CatalogController_correctSkuClient",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "skuId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CorrectSkuClientDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkuClientCorrectionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed skuId path parameter, or a non-uuid clientId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The SKU or the client does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The SKU, or a kit partner / product sibling that must move with it, already has history — ledger events, order/PO/transfer lines, pending adjustments, count tasks, batches, serials, reservations or channel mappings (sku-has-history, naming the SKU); or a concurrent kit/product change or same-key request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Corrects a SKU's client (owner-only) — allowed only while the SKU has no ledger event, order line or PO line; after that its client never changes",
         "tags": [
           "catalog"
         ]
@@ -14970,7 +15114,7 @@
             }
           },
           "409": {
-            "description": "The same Idempotency-Key is being processed concurrently (conflict)",
+            "description": "The same Idempotency-Key is being processed concurrently (conflict), or the mapped SKUs belong to more than one client (mixed-client, story 21-2b — names the clients)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -15220,7 +15364,7 @@
             }
           },
           "409": {
-            "description": "Rates sent to an issued or voided invoice (invoice-frozen — it outranks the line checks), the order is not dispatched (order-not-dispatched), a rate override names a line that is not of this order (line-not-of-order) or a line already priced at order acceptance (line-already-priced), or a concurrent idempotent request (conflict)",
+            "description": "Rates sent to an issued or voided invoice (invoice-frozen — it outranks the line checks), the order is not dispatched (order-not-dispatched), the order is for a client brand — client orders are not invoiced by the tenant (client-order-not-invoiced, story 21-2b), a rate override names a line that is not of this order (line-not-of-order) or a line already priced at order acceptance (line-already-priced), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -16862,6 +17006,301 @@
         ]
       }
     },
+    "/tenants/{tenantId}/clients": {
+      "get": {
+        "operationId": "ClientsController_listClients",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's clients — every status, the system-owned `self` client first, then by code (unpaginated, bounded at 500)",
+        "tags": [
+          "clients"
+        ]
+      },
+      "post": {
+        "operationId": "ClientsController_createClient",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateClientDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The created client (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a code/name that breaks the shape rules — including the reserved code SELF (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The code is already used by another client of this tenant, including by a concurrent create (duplicate-client-code), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Registers a client brand (owner-only). The code is stored uppercase; the client starts active",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}": {
+      "patch": {
+        "operationId": "ClientsController_renameClient",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameClientDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, a name outside 1-200 characters, or a rename of the self client (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Renames a client (owner-only). The tenant's own `self` client mirrors the tenant name and cannot be renamed",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
     "/tenants/{tenantId}/webhooks/channels/{provider}/{connectionId}/orders": {
       "post": {
         "operationId": "WebhooksController_ingestOrder",
@@ -18305,6 +18744,12 @@
             "items": {
               "$ref": "#/components/schemas/CatalogImportErrorResponse"
             }
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 21-2b — the client this run imported for (a fix-mode re-run inherits it). Absent only on a replayed response stored before 21-2b"
           }
         },
         "required": [
@@ -18389,6 +18834,12 @@
           "name": {
             "type": "string",
             "example": "Chili powder 100g"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 21-2b — the client this SKU belongs to (set at import; correctable by an owner only while the SKU has no history). Absent only on a replayed edit response stored before 21-2b"
           },
           "uom": {
             "type": "string",
@@ -18946,6 +19397,34 @@
             "description": "The SKU's ABC classification (FR-cycle-count): a, b or c. Omit to leave unchanged; null clears the class (excludes the SKU from scheduled count generation, on-demand still covers it)."
           }
         }
+      },
+      "CorrectSkuClientDto": {
+        "type": "object",
+        "properties": {
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The client the SKU belongs to instead (any client of this tenant, including its own `self` client)"
+          }
+        },
+        "required": [
+          "clientId"
+        ]
+      },
+      "SkuClientCorrectionResponse": {
+        "type": "object",
+        "properties": {
+          "skus": {
+            "description": "Every SKU the correction moved — the named SKU first, then its kit partners and product siblings (a kit and a product never span clients, so they move as one group). On a no-op (already on that client) just the named SKU",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SkuResponse"
+            }
+          }
+        },
+        "required": [
+          "skus"
+        ]
       },
       "KitComponentDto": {
         "type": "object",
@@ -20949,6 +21428,12 @@
             "nullable": true,
             "description": "The closed PO whose open quantities this successor carries (null on an original PO)"
           },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 21-2b — the client the PO is for, derived from its lines' SKUs. Absent or null only on a replayed response stored before 21-2b"
+          },
           "lines": {
             "description": "Per-line ordered / received / open (detail and mutations; headers only on the list)",
             "type": "array",
@@ -21291,6 +21776,12 @@
                 "$ref": "#/components/schemas/AddressDto"
               }
             ]
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 21-2b — the client the order is for, derived from its lines' and kit components' SKUs. Absent or null only on a replayed response stored before 21-2b"
           },
           "createdAt": {
             "type": "string",
@@ -22043,6 +22534,12 @@
                 "$ref": "#/components/schemas/AddressDto"
               }
             ]
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 21-2b — the client the order is for, derived from its SKUs"
           },
           "createdAt": {
             "type": "string",
@@ -29243,6 +29740,122 @@
           "stale",
           "window",
           "tiles"
+        ]
+      },
+      "ClientDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "ACME",
+            "description": "The client's code. The tenant's own client carries the fixed code `self` (lowercase)"
+          },
+          "name": {
+            "type": "string",
+            "example": "Acme Foods",
+            "description": "The client's name. The tenant's own client mirrors the tenant name"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "suspended",
+              "departed"
+            ]
+          },
+          "systemOwned": {
+            "type": "boolean",
+            "description": "True only for the tenant's own `self` client — its goods are the tenant's own, and only its orders are GST-invoiced by the tenant"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last update"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "code",
+          "name",
+          "status",
+          "systemOwned",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "ClientListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "Every client of the tenant, any status — the system-owned client first, then by code. Unpaginated, bounded at 500",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "CreateClientDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "example": "ACME",
+            "minLength": 2,
+            "maxLength": 32,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{1,31}$",
+            "description": "Operator-facing short code, unique per tenant. Trimmed and stored UPPERCASE: 2-32 characters of A-Z, 0-9 and \"-\", starting with a letter or digit. \"SELF\" is reserved for the tenant's own client"
+          },
+          "name": {
+            "type": "string",
+            "example": "Acme Foods",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "code",
+          "name"
+        ]
+      },
+      "ClientResponse": {
+        "type": "object",
+        "properties": {
+          "client": {
+            "$ref": "#/components/schemas/ClientDto"
+          }
+        },
+        "required": [
+          "client"
+        ]
+      },
+      "RenameClientDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "example": "Acme Foods Pvt Ltd",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "name"
         ]
       },
       "ChannelWebhookOrderResponse": {

@@ -2,6 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
+import { getClientsInTx } from '../clients/clients.facade';
 import {
   handlingUnits,
   manifests,
@@ -94,6 +95,8 @@ export interface OrderEntry {
   readonly externalEventId: string | null;
   /** Where the shipment goes (story 11-1); null on a pre-11.1 order row. */
   readonly destination: AddressSnapshot | null;
+  /** Story 21-2b — the client the order is for (derived from its SKUs). */
+  readonly clientId: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -223,6 +226,14 @@ export interface OrderInvoiceFacts {
   readonly consigneeLegalName: string | null;
   readonly destination: AddressSnapshot | null;
   readonly createdAt: string;
+  /**
+   * Story 21-2b (decision 5) — whether the order's client is the tenant's
+   * OWN (`system_owned`). A client brand's order is NOT GST-invoiced by the
+   * 3PL: the brand sells its goods and invoices its own customer; invoicing
+   * on a client's behalf is PENDING. `null` when the order's client row is
+   * MISSING — a data fault, never read as "a client brand".
+   */
+  readonly clientSystemOwned: boolean | null;
   readonly lines: readonly OrderInvoiceLineFact[];
 }
 
@@ -440,6 +451,7 @@ export class OutboundFacade {
           source: orders.source,
           integrationId: orders.integrationId,
           externalEventId: orders.externalEventId,
+          clientId: orders.clientId,
           createdAt: orders.createdAt,
           updatedAt: orders.updatedAt,
         })
@@ -465,6 +477,7 @@ export class OutboundFacade {
         integrationId: row.integrationId,
         externalEventId: row.externalEventId,
         destination: null,
+        clientId: row.clientId,
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       };
@@ -514,6 +527,7 @@ export class OutboundFacade {
         destinationState: orders.destinationState,
         destinationPincode: orders.destinationPincode,
         createdAt: orders.createdAt,
+        clientId: orders.clientId,
       })
       .from(orders)
       .where(and(eq(orders.id, orderId), eq(orders.tenantId, tenantId)))
@@ -567,6 +581,11 @@ export class OutboundFacade {
         pincode: order.destinationPincode,
       }),
       createdAt: canonicalInstant(order.createdAt),
+      // Story 21-2b: the client's ownership flag, through the clients
+      // module's read seam (one primary-key probe). A missing client row is
+      // `null` — the generator reports it as a data fault, distinct from the
+      // designed client-brand skip.
+      clientSystemOwned: (await getClientsInTx(tx, tenantId, [order.clientId])).get(order.clientId)?.systemOwned ?? null,
       lines: lines.map((line) => ({
         orderLineId: line.orderLineId,
         parentLineId: line.parentLineId,
@@ -644,6 +663,7 @@ export class OutboundFacade {
           destinationCity: orders.destinationCity,
           destinationState: orders.destinationState,
           destinationPincode: orders.destinationPincode,
+          clientId: orders.clientId,
           createdAt: orders.createdAt,
           updatedAt: orders.updatedAt,
           // Story 9-1: the cursor carries the FULL-precision instant (a
@@ -689,6 +709,7 @@ export class OutboundFacade {
           state: row.destinationState,
           pincode: row.destinationPincode,
         }),
+        clientId: row.clientId,
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       }));

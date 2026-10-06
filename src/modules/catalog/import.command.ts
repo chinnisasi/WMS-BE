@@ -56,6 +56,7 @@ import {
 import { MAX_KIT_COMPONENTS, kitEventPayload } from './kit.command';
 import { getKitSkuIdsInTx } from './kit.store';
 import { ensureSelfClientInTx } from '../clients/ensure-self-client';
+import { assertClientInTenantInTx, clientLabel, listClientsInTx } from '../clients/clients.facade';
 
 export const IMPORT_MODES = ['initial', 'fix'] as const;
 export type ImportMode = (typeof IMPORT_MODES)[number];
@@ -91,6 +92,12 @@ export interface CatalogImportResponse {
   readonly failedRows: number;
   readonly skippedRows: number;
   readonly errors: readonly CatalogImportErrorDto[];
+  /**
+   * Story 21-2b — the client this run imported for (every SKU it created
+   * carries it; a fix-mode re-run inherits it). Optional on the interface
+   * because a stored snapshot written before 21-2b (a replay) lacks it.
+   */
+  readonly clientId?: string | null;
 }
 
 export interface ImportCatalogCommand {
@@ -104,6 +111,15 @@ export interface ImportCatalogCommand {
     readonly size: number;
   };
   readonly mode: ImportMode;
+  /**
+   * Story 21-2b (decision 4) — the ONE client this run's new SKUs belong to.
+   * Optional: absent means "the tenant's only client" (its `self` client),
+   * which is refused 400 `client-required` once more than one client exists
+   * (no default to mis-attribute to), and means "inherit" in fix mode. The
+   * controller refuses a non-uuid 400; an unknown id is a 404 behind the
+   * replay lookup. The CSV format is unchanged.
+   */
+  readonly clientId?: string | undefined;
 }
 
 const REQUIRED_COLUMNS = ['sku_code', 'name', 'uom', 'gst_rate'] as const;
@@ -255,9 +271,16 @@ export class ImportCommand {
 
     // Cheap fingerprint first (same discipline as registration): the payload
     // hash covers the file digest + mode — never the parsed row objects.
+    //
+    // Story 21-2b: `clientId` joins the fingerprint ONLY WHEN PRESENT (the
+    // 8-1d conditional-key exception, IMPLEMENTATION-GUIDE §4), spread in at
+    // a fixed position after `mode`: an import without it hashes
+    // byte-for-byte as before, so no in-flight key breaks. Pinned by a
+    // golden test in `test/clients.spec.ts`.
     const payloadHash = hashCommandPayload({
       fileSha256: createHash('sha256').update(command.file.buffer).digest('hex'),
       mode: command.mode,
+      ...(command.clientId === undefined ? {} : { clientId: command.clientId }),
     });
 
     const { snapshot } = await withTenantTransaction(
@@ -295,13 +318,60 @@ export class ImportCommand {
         // created_at, uuidv7 id tiebreaker) — no import picker, and repeated
         // fix rounds compose because each run's failures form the next set.
         let fixSet: ReadonlySet<string> = new Set();
+        const latest =
+          command.mode === 'fix'
+            ? await tx
+                .select({ id: catalogImports.id, clientId: catalogImports.clientId })
+                .from(catalogImports)
+                .where(eq(catalogImports.tenantId, command.tenantId))
+                .orderBy(desc(catalogImports.createdAt), desc(catalogImports.id))
+                .limit(1)
+            : [];
+
+        // ── Story 21-2b: the run's client, behind the replay lookup ─────────
+        // Decision 3's up-front guards against a mis-attributed SKU (whose
+        // client is fixed once it has history): a named client must exist
+        // in this tenant (404); a fix-mode re-run INHERITS its original
+        // run's client, and naming a different one is a 400; with more
+        // than one client and none named, there is no default to fall back
+        // to — 400 `client-required`. The `self` client is the default only
+        // while it is the tenant's only client.
+        if (command.clientId !== undefined) {
+          await assertClientInTenantInTx(tx, command.tenantId, command.clientId);
+        }
+        // The tenant's clients, read ONCE per run: the count rule below and
+        // every refusal label (the tenant's own client prints as "<tenant
+        // name> (your company)", never `self`) — no per-row query.
+        const tenantClients = await listClientsInTx(tx, command.tenantId);
+        const labels = new Map(tenantClients.map((client) => [client.id, clientLabel(client)]));
+        const label = (id: string): string => labels.get(id) ?? id;
+        let clientId: string;
+        if (latest[0] !== undefined) {
+          if (command.clientId !== undefined && command.clientId !== latest[0].clientId) {
+            throw new ProblemException(
+              'validation-failed',
+              400,
+              'A fix-mode re-run keeps its original client',
+              `The run being fixed imported for client ${label(latest[0].clientId)}; ` +
+                `a fix-mode re-run inherits it and cannot import for ${label(command.clientId)}. ` +
+                'Omit clientId (or name the same client), or start an initial import for the other client.',
+            );
+          }
+          clientId = latest[0].clientId;
+        } else if (command.clientId !== undefined) {
+          clientId = command.clientId;
+        } else if (tenantClients.length > 1) {
+          throw new ProblemException(
+            'client-required',
+            400,
+            'Choose the client this import is for',
+            'This tenant holds more than one client, so a catalog import must name the client its new SKUs belong to (clientId) — there is no default.',
+          );
+        } else {
+          clientId = await ensureSelfClientInTx(tx, command.tenantId);
+        }
+
         if (command.mode === 'fix') {
-          const latest = await tx
-            .select({ id: catalogImports.id })
-            .from(catalogImports)
-            .where(eq(catalogImports.tenantId, command.tenantId))
-            .orderBy(desc(catalogImports.createdAt), desc(catalogImports.id))
-            .limit(1);
           if (latest[0]) {
             const failed = await tx
               .select({ skuCode: catalogImportErrors.skuCode })
@@ -358,12 +428,27 @@ export class ImportCommand {
         // stable fingerprint (key-order independent) — one query for the
         // whole file.
         const tenantVariants = new Map<string, string>();
+        // Story 21-2b — the clients a referenced product's EXISTING variants
+        // belong to: a product's variants never span clients, so a row
+        // attaching this run's client to a product already holding another
+        // client's SKUs is refused per row (`mixed-client`).
+        const productClients = new Map<string, Set<string>>();
         if (referencedIds.length > 0) {
           const attached = await tx
-            .select({ productId: skus.productId, variantValues: skus.variantValues, code: skus.code })
+            .select({
+              productId: skus.productId,
+              variantValues: skus.variantValues,
+              code: skus.code,
+              clientId: skus.clientId,
+            })
             .from(skus)
             .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.productId, referencedIds)));
           for (const row of attached) {
+            if (row.productId !== null) {
+              const set = productClients.get(row.productId) ?? new Set<string>();
+              set.add(row.clientId);
+              productClients.set(row.productId, set);
+            }
             if (row.productId !== null && row.variantValues !== null) {
               tenantVariants.set(
                 `${row.productId}|${variantValuesFingerprint(row.variantValues)}`,
@@ -386,6 +471,19 @@ export class ImportCommand {
                 row.code,
                 'validation-failed',
                 `product "${row.productName}" does not exist in this tenant — import references products, it never creates them. Create the product first.`,
+              ),
+            );
+            continue;
+          }
+          const foreignClients = [...(productClients.get(product.id) ?? [])].filter((id) => id !== clientId);
+          if (foreignClients.length > 0) {
+            errors.push(
+              rowError(
+                row.rowNumber,
+                row.code,
+                'mixed-client',
+                `product "${row.productName}" already holds SKUs of client ${foreignClients.map(label).sort().join(', ')} — ` +
+                  `this import is for client ${label(clientId)}, and a product's variants never span clients.`,
               ),
             );
             continue;
@@ -421,7 +519,12 @@ export class ImportCommand {
             continue;
           }
           if (conflicts.codes.has(row.code)) {
-            errors.push(rowError(row.rowNumber, row.code, 'duplicate-sku-code', `SKU code "${row.code}" already exists in this tenant's catalog — duplicates are rejected, never merged.`));
+            // Story 21-2b: codes stay unique across the TENANT (decision 2),
+            // so the existing SKU may belong to any client — the detail names
+            // its owner so the operator can tell a re-import from a clash.
+            const ownerClientId = conflicts.codes.get(row.code)!;
+            const ownerCode = label(ownerClientId);
+            errors.push(rowError(row.rowNumber, row.code, 'duplicate-sku-code', `SKU code "${row.code}" already exists in this tenant's catalog (client ${ownerCode}) — duplicates are rejected, never merged.`));
             continue;
           }
           if (row.barcode !== null && (seenBarcodes.has(row.barcode) || conflicts.barcodes.has(row.barcode))) {
@@ -463,9 +566,9 @@ export class ImportCommand {
 
         if (committedRows > 0) {
           // Story 21-1 (AD-23): every SKU belongs to a client — the source
-          // of truth every SKU-referencing row inherits. D2C tenants stamp
-          // their `self` client; no mode branch.
-          const clientId = await ensureSelfClientInTx(tx, command.tenantId);
+          // of truth every SKU-referencing row inherits. Story 21-2b: the
+          // run's client resolved above (the tenant's `self` client while it
+          // is the only one; no mode branch).
           const skuRows = insertable.map((row) => ({
             id: uuidv7(),
             tenantId: command.tenantId,
@@ -550,7 +653,7 @@ export class ImportCommand {
             // component rows, ordered by id, so a concurrent KitCommand or
             // GRN on the same SKUs serializes behind this pass.
             const referencedSkuRows = await tx
-              .select({ id: skus.id, code: skus.code, uom: skus.uom })
+              .select({ id: skus.id, code: skus.code, uom: skus.uom, clientId: skus.clientId })
               .from(skus)
               .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.code, referencedCodes)))
               .orderBy(skus.id)
@@ -623,6 +726,14 @@ export class ImportCommand {
                 }
                 if (componentRow.id === kitSkuId) {
                   errors.push(rowError(row.rowNumber, row.code, 'kit-self-reference', `kit_components names the row's own SKU "${row.code}" as a component — a kit's BOM cannot name the kit as its own component.`));
+                  rowFailed = true;
+                  break;
+                }
+                // Story 21-2b — a kit and its components share one client
+                // (the kit's is this run's): an existing component of
+                // another client is refused per row.
+                if (componentRow.clientId !== clientId) {
+                  errors.push(rowError(row.rowNumber, row.code, 'mixed-client', `kit_components names component "${component.code}" of client ${label(componentRow.clientId)} — this kit is for client ${label(clientId)}, and a kit's components share its client.`));
                   rowFailed = true;
                   break;
                 }
@@ -701,6 +812,9 @@ export class ImportCommand {
         await tx.insert(catalogImports).values({
           id: importId,
           tenantId: command.tenantId,
+          // Story 21-2b — the run records its client, so a fix-mode re-run
+          // inherits it.
+          clientId,
           mode: command.mode,
           committedRows,
           failedRows,
@@ -729,6 +843,7 @@ export class ImportCommand {
           failedRows,
           skippedRows,
           errors,
+          clientId,
         };
         // In-transaction outbox append (AD-7, story outbox-relay) — replaces
         // the old post-commit publish. The `!replayed` gate of the old
@@ -842,17 +957,19 @@ async function findTenantConflicts(
   tx: TenantTx,
   tenantId: string,
   rows: readonly ValidRow[],
-): Promise<{ codes: ReadonlySet<string>; barcodes: ReadonlyMap<string, string> }> {
+): Promise<{ codes: ReadonlyMap<string, string>; barcodes: ReadonlyMap<string, string> }> {
   const codes = [...new Set(rows.map((row) => row.code))];
   const barcodes = [...new Set(rows.map((row) => row.barcode).filter((b): b is string => b !== null))];
-  const codesSet = new Set<string>();
+  // Story 21-2b: code → the existing SKU's client (the duplicate's detail
+  // names the owner).
+  const codesSet = new Map<string, string>();
   const barcodesMap = new Map<string, string>();
   if (codes.length > 0) {
     const rowsOut = await tx
-      .select({ code: skus.code })
+      .select({ code: skus.code, clientId: skus.clientId })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.code, codes)));
-    for (const row of rowsOut) codesSet.add(row.code);
+    for (const row of rowsOut) codesSet.set(row.code, row.clientId);
   }
   if (barcodes.length > 0) {
     const rowsOut = await tx

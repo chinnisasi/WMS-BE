@@ -859,8 +859,12 @@ describe('users, roles, and permission gating (e2e)', () => {
     // finance act; the accountant reads invoices but does not set prices);
     // story 8-2b grows it to 36 with `eway.manage` — owner + ops_manager +
     // ACCOUNTANT (the accountant's first write: e-way paperwork is finance
-    // work, decided 2026-10-04) — and `eway.configure`, owner-only.
-    expect([...CAPABILITIES]).toHaveLength(36);
+    // work, decided 2026-10-04) — and `eway.configure`, owner-only; story
+    // 21-2b grows it to 37 with `clients.manage`, owner-only (a client is a
+    // commercial relationship — the person who signs the contract).
+    expect([...CAPABILITIES]).toHaveLength(37);
+    expect(CAPABILITIES).toContain('clients.manage');
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('clients.manage'))).toEqual(['owner']);
     expect(CAPABILITIES).toContain('eway.manage');
     expect(CAPABILITIES).toContain('eway.configure');
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('eway.manage'))).toEqual(['owner', 'ops_manager', 'accountant']);

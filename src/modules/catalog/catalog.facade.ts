@@ -61,6 +61,8 @@ export interface CatalogSkuIdentity {
   readonly serialTracked: boolean;
   /** Story 10.3 — handled by unit, priced by weight (`handling_units`). */
   readonly catchWeightTracked: boolean;
+  /** Story 21-2b — the client the SKU belongs to (the channel ingest's mixed-client check). */
+  readonly clientId: string;
 }
 
 /** Batch identity (catalog-owned) — location/quantity live in inventory (AD-6). */
@@ -299,6 +301,7 @@ export class CatalogFacade {
           batchTracked: skus.batchTracked,
           serialTracked: skus.serialTracked,
           catchWeightTracked: skus.catchWeightTracked,
+          clientId: skus.clientId,
         })
         .from(skus)
         .where(and(eq(skus.tenantId, tenantId), eq(skus.id, skuId)))

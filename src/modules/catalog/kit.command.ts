@@ -25,6 +25,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { DEFAULT_SKU_PAGE_SIZE, MAX_SKU_PAGE_SIZE } from './sku.command';
+import { assertSingleClientInTx } from '../clients/clients.facade';
 import { getKitSkuIdsInTx } from './kit.store';
 import { uomPrecision } from './uom';
 
@@ -156,6 +157,7 @@ export class KitCommand {
       await assertKitSkuHoldsNoStock(tx, command.tenantId, kit);
       assertSelfReference(command.skuId, componentIds);
       await assertComponentsAreNotKits(tx, command.tenantId, componentIds, componentById);
+      await assertKitSharesOneClient(tx, command.tenantId, kit, componentIds, componentById);
       const qtyBySku = await assertComponentQuantities(command.components, componentById);
 
       // 3. The write + snapshot + outbox, one transaction (AD-7).
@@ -224,6 +226,7 @@ export class KitCommand {
 
       assertSelfReference(command.skuId, componentIds);
       await assertComponentsAreNotKits(tx, command.tenantId, componentIds, componentById);
+      await assertKitSharesOneClient(tx, command.tenantId, kit, componentIds, componentById);
       const qtyBySku = await assertComponentQuantities(command.components, componentById);
 
       const snapshot = await this.replaceComposition(tx, command.tenantId, kit, qtyBySku);
@@ -696,5 +699,25 @@ function invalidCursor(): ProblemException {
     400,
     'Malformed pagination cursor',
     'The cursor parameter is not a valid opaque page cursor.',
+  );
+}
+/**
+ * Story 21-2b — a kit and its components belong to ONE client (the kit is
+ * sold as a unit; an order exploding it must stay single-client). Checked
+ * against the LOCKED rows, so a concurrent client correction cannot slip in
+ * between; refused 409 `mixed-client` naming the codes.
+ */
+async function assertKitSharesOneClient(
+  tx: TenantTx,
+  tenantId: string,
+  kit: typeof skus.$inferSelect,
+  componentIds: readonly string[],
+  componentById: ReadonlyMap<string, typeof skus.$inferSelect>,
+): Promise<void> {
+  await assertSingleClientInTx(
+    tx,
+    tenantId,
+    [kit.clientId, ...componentIds.map((id) => componentById.get(id)!.clientId)],
+    `Kit "${kit.code}"`,
   );
 }

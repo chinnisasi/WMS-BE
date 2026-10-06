@@ -206,6 +206,14 @@ export const CAPABILITIES = [
   // decides which consignments need a bill — the `adjustments.approve`
   // rationale: the person who sets the bar).
   'eway.configure',
+  // Story 21-2b — client admin: register a client brand, rename it, and
+  // correct a SKU's client while the SKU has no history. OWNER-ONLY: a client
+  // is a commercial relationship (who the 3PL holds goods for and, from 21-5,
+  // whom it bills), the `adjustments.approve` / `eway.configure` rationale —
+  // the person who signs the contract. The client LIST read stays open to
+  // any member (reads are never gated). Mirrored into wms-fe
+  // `src/lib/users.ts` (CAPABILITIES + OWNER_ONLY_CAPABILITIES).
+  'clients.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];

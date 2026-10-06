@@ -53,6 +53,28 @@ export class ImportCatalogDto {
   @Trimmed()
   @IsIn(IMPORT_MODES)
   mode?: 'initial' | 'fix';
+
+  // Story 21-2b (decision 4) — the ONE client this run's new SKUs belong to.
+  // A request-SHAPE check only (uuid → 400 here, above the transaction); an
+  // unknown client is the command's 404, behind the replay lookup. A blank
+  // multipart field reads as absent.
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      "Story 21-2b — the client the new SKUs belong to. Required (400 client-required) once the tenant holds more than one client; absent = the tenant's own client while it is the only one. A fix-mode re-run inherits its original run's client — naming a different one is a 400",
+  })
+  @IsOptional()
+  @Transform(({ value }) => (typeof value === 'string' && value.trim() === '' ? undefined : typeof value === 'string' ? value.trim() : value))
+  @IsUUID()
+  clientId?: string;
+}
+
+/** Story 21-2b — `POST …/catalog/skus/{skuId}/client`: the owner's correction. */
+export class CorrectSkuClientDto {
+  @ApiProperty({ format: 'uuid', description: 'The client the SKU belongs to instead (any client of this tenant, including its own `self` client)' })
+  @IsUUID()
+  clientId!: string;
 }
 
 export class CatalogImportErrorResponse {
@@ -87,6 +109,15 @@ export class CatalogImportResponse {
 
   @ApiProperty({ type: [CatalogImportErrorResponse] })
   errors!: CatalogImportErrorResponse[];
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description: 'Story 21-2b — the client this run imported for (a fix-mode re-run inherits it). Absent only on a replayed response stored before 21-2b',
+  })
+  clientId?: string | null;
 }
 
 export class SkuUomConversionResponse {
@@ -112,6 +143,16 @@ export class SkuResponse {
 
   @ApiProperty({ example: 'Chili powder 100g' })
   name!: string;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    required: false,
+    description:
+      "Story 21-2b — the client this SKU belongs to (set at import; correctable by an owner only while the SKU has no history). Absent only on a replayed edit response stored before 21-2b",
+  })
+  clientId?: string | null;
 
   // Story 10.2: `uom` is a CLOSED vocabulary, published as the OpenAPI enum
   // over the same tuple the DB CHECK is written from, so a generated client
@@ -255,6 +296,15 @@ export class SkuResponse {
 
   @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
   createdAt!: string;
+}
+
+/** Story 21-2b — the client correction's response: every SKU it moved (the named one first). */
+export class SkuClientCorrectionResponse {
+  @ApiProperty({
+    type: [SkuResponse],
+    description: 'Every SKU the correction moved — the named SKU first, then its kit partners and product siblings (a kit and a product never span clients, so they move as one group). On a no-op (already on that client) just the named SKU',
+  })
+  skus!: SkuResponse[];
 }
 
 export class SkuListResponse {

@@ -42,8 +42,10 @@ const CLIENT_POLICIES: readonly { table: string; policy: string; column: string 
 describe('story 21-2: client isolation RLS — app.client_id, the stamping primitive, the DB probe', () => {
   // ──────────────────────────────────────────────────────────────────────────
   // The fixtures: ONE tenant, TWO clients (the system-owned `self` client and
-  // a second non-self client seeded by direct SQL — no client CRUD API
-  // exists), and rows for BOTH clients in every probed table. A single-client
+  // a second non-self client seeded by direct SQL — this suite probes the
+  // database itself, so it seeds below the API on purpose; the client admin
+  // API (story 21-2b) is exercised in `test/clients.spec.ts`), and rows for
+  // BOTH clients in every probed table. A single-client
   // fixture could pass with a policy that hid everything.
   // ──────────────────────────────────────────────────────────────────────────
   let suiteDb: SuiteDatabase;
@@ -86,8 +88,9 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
     // not see.
     await sql`insert into clients (id, tenant_id, code, name, status, system_owned)
       values (${clientA}, ${tenantId}, 'self', 'Isolation Co', 'active', true)`;
+    // (Codes uppercase since story 21-2b's 0059 CHECK `clients_code_format`.)
     await sql`insert into clients (id, tenant_id, code, name, status, system_owned)
-      values (${clientB}, ${tenantId}, 'brand-b', 'Brand B', 'active', false)`;
+      values (${clientB}, ${tenantId}, 'BRAND-B', 'Brand B', 'active', false)`;
 
     await sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode)
       values (${skuAId}, ${tenantId}, ${clientA}, 'CI-SKU-A', 'Isolation SKU A', 'each', 1800, ${ulid()})`;
@@ -611,7 +614,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Portal A inserting a row whose id is NOT its own client id → refused.
       const foreignInsert = portal((tx) =>
         tx`insert into clients (id, tenant_id, code, name, status, system_owned)
-          values (${uuidv7()}, ${tenantId}, 'probe-foreign', 'Foreign Client', 'active', false)`,
+          values (${uuidv7()}, ${tenantId}, 'PROBE-FOREIGN', 'Foreign Client', 'active', false)`,
       );
       await expect(foreignInsert).rejects.toMatchObject({ code: '42501' });
 
@@ -623,7 +626,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       await portal(
         (tx) =>
           tx`insert into clients (id, tenant_id, code, name, status, system_owned)
-            values (${freshId}, ${tenantId}, 'probe-own', 'Probe Own', 'active', false)`,
+            values (${freshId}, ${tenantId}, 'PROBE-OWN', 'Probe Own', 'active', false)`,
         freshId,
       );
       await expectCount((t) => t`select count(*)::int as n from ${t('clients')} where id = ${freshId}`, 1);
@@ -632,7 +635,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       const wrongInsert = portal(
         (tx) =>
           tx`insert into clients (id, tenant_id, code, name, status, system_owned)
-            values (${uuidv7()}, ${tenantId}, 'probe-wrong', 'Probe Wrong', 'active', false)`,
+            values (${uuidv7()}, ${tenantId}, 'PROBE-WRONG', 'Probe Wrong', 'active', false)`,
         freshId,
       );
       await expect(wrongInsert).rejects.toMatchObject({ code: '42501' });
