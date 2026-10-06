@@ -7,6 +7,7 @@ import type { InvoiceDocument, StateCodeEntry } from './generator';
 import { isValidHsn, normalizeHsn } from './hsn';
 import { uqcFor } from './uqc';
 import { istDateOf } from './eway-threshold';
+import { isIsoDate } from '../../shared/primitives/time';
 
 /**
  * The NIC e-way bill object (story 8-2b) — PURE functions only. ONE builder
@@ -345,12 +346,8 @@ export function partBProblems(partB: EwayPartB, ctx: PartBContext): string[] {
   return problems;
 }
 
-/** A real calendar date in `YYYY-MM-DD`. */
-export function isIsoDate(value: string): boolean {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
-  const ms = Date.parse(`${value}T00:00:00Z`);
-  return !Number.isNaN(ms) && new Date(ms).toISOString().slice(0, 10) === value;
-}
+/** A real calendar date in `YYYY-MM-DD` — moved to `shared/primitives/time.ts` (story 21-3), re-exported. */
+export { isIsoDate };
 
 /** The pincode pair a Part B is checked against (null when an address is missing). */
 export function partBContext(facts: EwayInvoiceFacts): PartBContext {

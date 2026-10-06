@@ -421,6 +421,13 @@
       "when": 1791260401935,
       "tag": "0059_client_admin",
       "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1791308811486,
+      "tag": "0060_rate_cards",
+      "breakpoints": true
     }
   ]
 }

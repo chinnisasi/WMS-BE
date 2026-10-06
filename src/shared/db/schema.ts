@@ -4163,3 +4163,70 @@ export const ingestBackorderRefusals = pgTable(
 );
 
 export type IngestBackorderRefusal = typeof ingestBackorderRefusals.$inferSelect;
+
+/**
+ * Story 21-3 — rate cards (the billing module's first tables, AD-25): a
+ * client's versioned prices. A card is drafted (no date), activated from an
+ * IST-midnight `effective_from`, and frozen after activation — the only
+ * changes a non-draft card ever sees are the three transitions (supersede,
+ * cancel, reopen-on-cancel). The vocabularies (`RATE_CARD_STATUSES`,
+ * `CHARGE_CODES`, `RATE_BASES`, the pair map) live in
+ * `src/modules/billing/rate-cards.ts`; the CHECKs, the freeze triggers, the
+ * TRUNCATE guards and the RLS policies (with the AD-24 client clause) live
+ * ONLY in `drizzle/0060_rate_cards.sql`. No FKs (house rule).
+ */
+export const rateCards = pgTable(
+  'rate_cards',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    status: text('status').notNull().default('draft'),
+    /** The IST midnight the card takes effect; null exactly for drafts. */
+    effectiveFrom: timestamp('effective_from', { withTimezone: true, mode: 'string' }),
+    /** The IST midnight a successor took over; set exactly when superseded. */
+    effectiveTo: timestamp('effective_to', { withTimezone: true, mode: 'string' }),
+    createdBy: uuid('created_by').notNull(),
+    ...tenantTimestamps,
+    activatedBy: uuid('activated_by'),
+    activatedAt: timestamp('activated_at', { withTimezone: true, mode: 'string' }),
+    cancelledBy: uuid('cancelled_by'),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
+  },
+  (table) => [
+    // One OPEN card (active, no successor) per client — the backstop behind
+    // the activation command's client-row lock.
+    uniqueIndex('rate_cards_one_open_per_client')
+      .on(table.tenantId, table.clientId)
+      .where(sql`status = 'active' AND effective_to IS NULL`),
+    index('rate_cards_tenant_client_effective_from_idx').on(table.tenantId, table.clientId, table.effectiveFrom),
+  ],
+);
+
+export type RateCard = typeof rateCards.$inferSelect;
+
+/**
+ * One priced charge of a rate card (story 21-3): integer paise per unit of
+ * the basis, GST-exclusive, 0..10,000,000. Stamped with the card's
+ * `client_id` so the AD-24 client clause binds lines directly. Each charge at
+ * most once per card.
+ */
+export const rateCardLines = pgTable(
+  'rate_card_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    rateCardId: uuid('rate_card_id').notNull(),
+    chargeCode: text('charge_code').notNull(),
+    basis: text('basis').notNull(),
+    amountPaise: bigint('amount_paise', { mode: 'number' }).notNull(),
+  },
+  (table) => [uniqueIndex('rate_card_lines_card_charge_unique').on(table.rateCardId, table.chargeCode)],
+);
+
+export type RateCardLine = typeof rateCardLines.$inferSelect;

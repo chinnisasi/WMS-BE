@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ApiModule } from './api/api.module';
 import { SharedModule } from './shared/shared.module';
+import { BillingModule } from './modules/billing/billing.module';
 import { CarriersModule } from './modules/carriers/carriers.module';
 import { CatalogModule } from './modules/catalog/catalog.module';
 import { ClientsModule } from './modules/clients/clients.module';
@@ -32,6 +33,7 @@ import { JobsModule } from './jobs/jobs.module';
     SharedModule,
     TenancyModule,
     ClientsModule,
+    BillingModule,
     CatalogModule,
     InventoryModule,
     InboundModule,

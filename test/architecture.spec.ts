@@ -1509,3 +1509,85 @@ describe('architecture: reporting is a read-only exception, imported only by the
     expect(schemaSource).toContain("pgTable(\n  'ingest_backorder_refusals'");
   });
 });
+
+describe('architecture: rate cards are billing-module-owned (story 21-3)', () => {
+  /**
+   * Story 21-3 stands up the billing module (AD-6, `spec-3pl/architecture.md`
+   * "billing … owns its own tables; writes no stock"). `rate_cards` and
+   * `rate_card_lines` are written ONLY by `src/modules/billing`; siblings
+   * (21-4 metering, 21-5 invoices) read them through `billing.facade.ts`;
+   * billing itself writes no other module's table — it reads the client
+   * entity (and locks its row) through `clients.facade.ts`.
+   */
+  const BILLING_TABLES = ['rateCards', 'rateCardLines'] as const;
+  const RAW_BILLING_TABLES = 'rate_cards|rate_card_lines';
+  const billingRoot = join(SRC_ROOT, 'modules', 'billing');
+  const billingFiles = files.filter((file) => file.path.startsWith(billingRoot));
+
+  it('no rate-card write happens outside the billing module', () => {
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => !f.path.startsWith(billingRoot))) {
+      for (const pattern of [
+        ...BILLING_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+"?(${RAW_BILLING_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the billing module writes no stock, ledger, client or order table', () => {
+    const offenders: string[] = [];
+    for (const file of billingFiles) {
+      for (const table of [...STOCK_TABLES, 'clients', 'skus', 'orders', 'orderLines', 'purchaseOrders'] as const) {
+        if (drizzleWriteOn(table).test(file.source)) offenders.push(`${file.path}: writes ${table}`);
+      }
+      if (new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_STOCK_TABLES}|clients)\\b`, 'i').test(file.source)) {
+        offenders.push(`${file.path}: raw write`);
+      }
+      // The client entity is reached only through its facade (plus the
+      // schema-face re-export the module never needs).
+      if (/from '\.\.\/clients\/(?!clients\.facade')/.test(file.source)) {
+        offenders.push(`${file.path}: reaches past the clients facade`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no other module reaches into the billing module past the facade', () => {
+    const offenders: string[] = [];
+    const reach = /from '[^']*modules\/billing\/(?!billing\.facade'|billing\.module'|rate-cards')[^']*'|from '\.\.\/billing\/(?!billing\.facade'|billing\.module'|rate-cards')[^']*'/;
+    for (const file of files.filter((f) => !f.path.startsWith(billingRoot) && !f.path.startsWith(join(SRC_ROOT, 'api')))) {
+      if (reach.test(file.source)) offenders.push(file.path);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no module outside billing even READS the rate-card tables — siblings go through billing.facade.ts', () => {
+    // `rate-cards.ts` is a public file (the vocabularies), so it must not
+    // re-export the tables either; the only other place the identifiers may
+    // appear is their definition in the shared schema.
+    const schemaFile = join(SRC_ROOT, 'shared', 'db', 'schema.ts');
+    const offenders = files
+      .filter((file) => !file.path.startsWith(billingRoot) && file.path !== schemaFile)
+      .filter((file) => /\b(rateCards|rateCardLines)\b/.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+    const publicVocabulary = readFileSync(join(billingRoot, 'rate-cards.ts'), 'utf8');
+    expect(/export\s*\{[^}]*\b(rateCards|rateCardLines)\b/.test(publicVocabulary)).toBe(false);
+    // Meaningful: the facade really does read them.
+    expect(/\bfrom\(\s*rateCards\b/.test(readFileSync(join(billingRoot, 'billing.facade.ts'), 'utf8'))).toBe(true);
+  });
+
+  it('the billing command really writes both tables (the test is meaningful)', () => {
+    const command = readFileSync(join(billingRoot, 'rate-card.command.ts'), 'utf8');
+    for (const table of BILLING_TABLES) {
+      expect(drizzleWriteOn(table).test(command)).toBe(true);
+    }
+    expect(/\.update\(\s*rateCards\b/.test(command)).toBe(true);
+    // The detectors bite on the shapes they name.
+    expect(drizzleWriteOn('rateCardLines').test('tx.insert(rateCardLines).values({})')).toBe(true);
+    expect(new RegExp(`\\b(insert into|update|delete from)\\s+"?(${RAW_BILLING_TABLES})\\b`, 'i').test('UPDATE rate_cards SET status')).toBe(true);
+  });
+});
