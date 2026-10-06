@@ -6,6 +6,7 @@ import {
   auditEvents,
   idempotencyKeys,
   orderLines,
+  ingestBackorderRefusals,
   orders,
   picklistLines,
   skus,
@@ -694,8 +695,14 @@ export class OrderCommandService {
     // the kit CHILDREN are the entries. The release is the exact machinery
     // the 503 path already runs — fail-safe toward understated ATP, never
     // oversold.
-    if (command.backorderPolicy === 'reject' && this.policyRejects(lines, explosions, plainHolds, childHolds)) {
+    const shortLines =
+      command.backorderPolicy === 'reject' ? this.policyShortLines(lines, explosions, plainHolds, childHolds) : [];
+    if (shortLines.length > 0) {
       await this.releaseAll(command.tenantId, granted, 'backorder-policy-reject');
+      // Story 9-1 — the SM-4 "prevented" fact, written AFTER the grants were
+      // released and outside any transaction, best-effort: the caller gets
+      // exactly today's refusal whatever happens here.
+      await this.recordBackorderRefusal(command, integrationId, externalEventId, shortLines);
       throw new BackorderRejectedError();
     }
 
@@ -1215,32 +1222,85 @@ export class OrderCommandService {
   }
 
   /**
-   * RD-3's phase-2.5 predicate over the grant phase's maps: does any line
-   * demand more than it was granted? Plain lines and kit CHILDREN are the
+   * RD-3's phase-2.5 predicate over the grant phase's maps: which lines
+   * demand more than they were granted? Plain lines and kit CHILDREN are the
    * entries (a zero grant counts — `?? 0`); kit parents are excluded (they
-   * reserve 0 by construction — the map, never the rows, is the truth).
+   * reserve 0 by construction — the map, never the rows, is the truth). A
+   * non-empty result refuses the whole order (story 9-1 returns the lines
+   * rather than a boolean so the refusal fact can name them; the predicate
+   * itself — "any short entry" — is unchanged).
    */
-  private policyRejects(
+  private policyShortLines(
     lines: readonly OrderLineInput[],
     explosions: Map<number, readonly KitCompositionLine[]>,
     plainHolds: Map<number, ReservationSnapshot>,
     childHolds: Map<string, ReservationSnapshot>,
-  ): boolean {
+  ): BackorderRefusalLine[] {
+    const short: BackorderRefusalLine[] = [];
     for (const [index, line] of lines.entries()) {
       const bom = explosions.get(index);
       if (bom === undefined) {
-        if ((plainHolds.get(index)?.quantity ?? 0) < line.quantity) {
-          return true;
+        const available = plainHolds.get(index)?.quantity ?? 0;
+        if (available < line.quantity) {
+          short.push({ skuId: line.skuId, requestedMilli: line.quantity, availableMilli: available });
         }
         continue;
       }
       for (let childIndex = 0; childIndex < bom.length; childIndex += 1) {
-        if ((childHolds.get(`${index}:${childIndex}`)?.quantity ?? 0) < bom[childIndex]!.qty) {
-          return true;
+        const component = bom[childIndex]!;
+        const available = childHolds.get(`${index}:${childIndex}`)?.quantity ?? 0;
+        if (available < component.qty) {
+          short.push({ skuId: component.componentSkuId, requestedMilli: component.qty, availableMilli: available });
         }
       }
     }
-    return false;
+    return short;
+  }
+
+  /**
+   * Story 9-1 — the ingest refusal fact (SM-4's "prevented"). Only a channel
+   * delivery carries both identity arms; the reject policy is reached only
+   * from channel ingest today, so a refusal without them records nothing.
+   * `ON CONFLICT DO NOTHING` on `(tenant, integration, external event)`:
+   * a redelivered webhook mints a fresh idempotency key per delivery, so the
+   * channel identity is the only dedupe that holds. Best-effort — logged,
+   * never thrown.
+   */
+  private async recordBackorderRefusal(
+    command: CreateOrderCommand,
+    integrationId: string | null,
+    externalEventId: string | null,
+    shortLines: readonly BackorderRefusalLine[],
+  ): Promise<void> {
+    if (integrationId === null || externalEventId === null) {
+      return;
+    }
+    try {
+      await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+        await tx
+          .insert(ingestBackorderRefusals)
+          .values({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            warehouseId: command.warehouseId,
+            integrationId,
+            externalEventId,
+            lines: shortLines,
+          })
+          .onConflictDoNothing({
+            target: [
+              ingestBackorderRefusals.tenantId,
+              ingestBackorderRefusals.integrationId,
+              ingestBackorderRefusals.externalEventId,
+            ],
+          });
+      });
+    } catch (err) {
+      this.logger.error(
+        `Order refused under the backorder policy (integration ${integrationId}, event ${externalEventId}) but its refusal fact could not be written — ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   /** The concurrent-dedup-loser outcome: re-read the winner, resolve the contract. */
@@ -1584,6 +1644,13 @@ class DedupLostError extends Error {
   ) {
     super('a concurrent delivery of the same channel payload won the dedup index');
   }
+}
+
+/** Story 9-1 — one short line of a refused channel order, in milli-units (the fact row's shape). */
+export interface BackorderRefusalLine {
+  readonly skuId: string;
+  readonly requestedMilli: number;
+  readonly availableMilli: number;
 }
 
 /**

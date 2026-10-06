@@ -11,6 +11,7 @@ import {
 } from '../../shared/db/schema';
 import type { PurchaseOrderLineDto } from '../inbound/inbound.dto';
 import { PurchaseOrderDto } from '../inbound/inbound.dto';
+import { IsInstant } from '../../shared/primitives/instant-range';
 
 /** The milli-unit wire bound — the stored `bigint` column's exact range (the variance-threshold ceiling's derivation). */
 const MAX_REPLENISHMENT_MILLI = MAX_QUANTITY_MILLI;
@@ -382,6 +383,16 @@ export class BatchAlertListQuery {
   @IsOptional()
   @IsUUID()
   warehouseId?: string;
+
+  @ApiProperty({ required: false, format: 'date-time', description: 'Story 9-1 — only alerts raised (`created_at`, server time) at or after this instant. ISO-8601 with a zone designator' })
+  @IsOptional()
+  @IsInstant()
+  from?: string;
+
+  @ApiProperty({ required: false, format: 'date-time', description: 'Story 9-1 — only alerts raised strictly before this instant (exclusive). Must be after `from`' })
+  @IsOptional()
+  @IsInstant()
+  to?: string;
 
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()

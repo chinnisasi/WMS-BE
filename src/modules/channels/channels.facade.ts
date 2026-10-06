@@ -64,6 +64,10 @@ export type {
   PublishedScope,
 } from './channels.events';
 export { CHANNEL_AVAILABILITY_PUBLISHED_EVENT } from './channels.events';
+// Story 9-1 — the ONE health rule, re-exported so the reporting dashboard's
+// sync tile classifies a connection exactly as `/channels` does (a pure
+// function; reporting reaches it through the facade specifier only).
+export { connectionHealth } from './channels.view';
 
 /**
  * The channels module's read side + the one seam every consumer rides

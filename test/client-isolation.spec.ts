@@ -664,8 +664,10 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // more — integrations, channel_mappings and integration_calls; 0053
       // (story 8-1) added three more — invoices, invoice_lines and
       // invoice_series; 0056 (story 8-2b) added three more — eway_bills,
-      // eway_state_thresholds and eway_gstin_settings. None lost.
-      expect(policies).toHaveLength(70);
+      // eway_state_thresholds and eway_gstin_settings; 0058 (story 9-1) added
+      // two more — pack_verification_failures and ingest_backorder_refusals.
+      // None lost.
+      expect(policies).toHaveLength(72);
 
       for (const expected of CLIENT_POLICIES) {
         const found = policies.find(

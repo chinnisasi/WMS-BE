@@ -9,7 +9,8 @@ import type { DeviceSession, TenantSession } from '../modules/tenancy/jwt-sessio
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { OutboundFacade } from '../modules/outbound/outbound.facade';
-import type { ListOrdersQuery } from '../modules/outbound/outbound.facade';
+import type { ListOrdersFilter } from '../modules/outbound/outbound.facade';
+import { assertInstantRange } from '../shared/primitives/instant-range';
 import type { OrderLineDto } from '../modules/outbound/outbound.dto';
 import { toAddressDto } from '../modules/tenancy/tenancy.dto';
 // Constructor params are types here but must stay value imports: Nest
@@ -29,6 +30,11 @@ import {
   ManifestResponse,
   OrderListQuery,
   OrderListResponse,
+  OutboundWindowListQuery,
+  BackorderRefusalListResponse,
+  PackFailureListResponse,
+  PicklistLineListQuery,
+  PicklistLineListResponse,
   OrderRatesResponse,
   OrderResponse,
   PackOrderDto,
@@ -451,7 +457,7 @@ export class OutboundController {
     type: OrderListResponse,
     description: "The warehouse's order page (headers only — the detail read carries the lines; keyset cursor)",
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor or out-of-range limit (invalid-cursor / validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor, out-of-range limit, an unknown status/source, a from/to that is not an ISO-8601 instant, from not before to, or a backordered flag other than true/false (invalid-cursor / validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
@@ -467,12 +473,123 @@ export class OutboundController {
     // A malformed (non-uuid) warehouseId is a 400 (the inbound uuid-guard
     // rule) — before any facade call.
     assertUuidParam(warehouseId, 'warehouseId');
-    const listQuery: ListOrdersQuery = {
+    assertInstantRange(query.from, query.to);
+    const listQuery: ListOrdersFilter = {
+      status: query.status,
+      source: query.source,
+      backordered: query.backordered,
+      from: query.from,
+      to: query.to,
       cursor: query.cursor,
       limit: query.limit,
     };
     const page = await this.outbound.listOrders(tenantId, warehouseId, listQuery);
     return { items: page.items.map((item) => ({ ...item, destination: toAddressDto(item.destination) })), nextCursor: page.nextCursor };
+  }
+
+  // ── story 9-1: the dashboard's outbound fact lists (reads, member-open) ──
+
+  @Get(':tenantId/warehouses/:warehouseId/outbound/picklist-lines')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Lists one warehouse's picklist lines, status-filterable and windowed on updated_at (the flip time), newest first by creation (keyset cursor on created_at, id) — the short-pick drill: a zero-unit short pick exists ONLY here (no picks row, no ledger event)",
+  })
+  @ApiOkResponse({ type: PicklistLineListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor, out-of-range limit, an unknown status, a from/to that is not an ISO-8601 instant, or from not before to (invalid-cursor / validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async listPicklistLines(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: PicklistLineListQuery,
+  ): Promise<PicklistLineListResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    assertInstantRange(query.from, query.to);
+    const page = await this.outbound.listPicklistLines(tenantId, warehouseId, {
+      status: query.status,
+      from: query.from,
+      to: query.to,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/warehouses/:warehouseId/outbound/pack-failures')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Lists one warehouse's failed pack verifications (pack-mismatch refusals, every entry path), windowed on created_at, newest first (keyset cursor) — recorded since story 9-1, no backfill",
+  })
+  @ApiOkResponse({ type: PackFailureListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor, out-of-range limit, a from/to that is not an ISO-8601 instant, or from not before to (invalid-cursor / validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async listPackFailures(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: OutboundWindowListQuery,
+  ): Promise<PackFailureListResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    assertInstantRange(query.from, query.to);
+    const page = await this.outbound.listPackFailures(tenantId, warehouseId, {
+      from: query.from,
+      to: query.to,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return {
+      items: page.items.map((item) => ({ ...item, mismatch: item.mismatch.map((line) => ({ ...line })) })),
+      nextCursor: page.nextCursor,
+    };
+  }
+
+  @Get(':tenantId/warehouses/:warehouseId/outbound/backorder-refusals')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Lists one warehouse's channel orders refused under the reject backorder policy (one row per channel event — redeliveries add none), windowed on created_at, newest first (keyset cursor) — recorded since story 9-1, no backfill",
+  })
+  @ApiOkResponse({ type: BackorderRefusalListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor, out-of-range limit, a from/to that is not an ISO-8601 instant, or from not before to (invalid-cursor / validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async listBackorderRefusals(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: OutboundWindowListQuery,
+  ): Promise<BackorderRefusalListResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    assertInstantRange(query.from, query.to);
+    const page = await this.outbound.listBackorderRefusals(tenantId, warehouseId, {
+      from: query.from,
+      to: query.to,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return {
+      items: page.items.map((item) => ({ ...item, lines: item.lines.map((line) => ({ ...line })) })),
+      nextCursor: page.nextCursor,
+    };
   }
 
   @Post(':tenantId/warehouses/:warehouseId/outbound/manifests')

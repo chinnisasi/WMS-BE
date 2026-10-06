@@ -4624,6 +4624,72 @@
             }
           },
           {
+            "name": "type",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only events of these types (repeatable: `?type=a&type=b`; one value is a one-element list). An unknown type is refused (400 validation-failed naming the known set)",
+            "schema": {
+              "maxItems": 20,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "stock.adjusted",
+                  "grn.received",
+                  "qc.held",
+                  "qc.released",
+                  "putaway.placed",
+                  "bin.merged",
+                  "pick.picked",
+                  "pack.packed",
+                  "dispatch.dispatched",
+                  "excursion.recorded",
+                  "transfer.outbound",
+                  "transfer.inbound"
+                ]
+              }
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only events RECORDED at or after this instant (`recorded_at` — the server stamp, never the device `occurred_at`). ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only events RECORDED strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only events whose reference document names this order (`referenceDoc.orderId` — the pick, pack and dispatch arms)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "shortPick",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — `true`: only short-pick draws (`referenceDoc.shortPick`); `false`: only events that are not. Exactly 'true' or 'false'",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -4656,7 +4722,7 @@
             }
           },
           "400": {
-            "description": "Malformed skuId/binId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "description": "Malformed skuId/binId/orderId query, an unregistered type, a from/to that is not an ISO-8601 instant, from not before to, a shortPick other than true/false, a malformed cursor, or an out-of-range limit (validation-failed / invalid-cursor)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6855,6 +6921,63 @@
             }
           },
           {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only orders in this status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "accepted",
+                "ready_to_dispatch",
+                "dispatched",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "source",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only orders of this source",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "manual",
+                "ingested"
+              ]
+            }
+          },
+          {
+            "name": "backordered",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — `true`: only orders with at least one line created backordered (counted per order, so a kit never counts twice); `false`: only orders with none. Exactly 'true' or 'false'",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is at or after this instant (inclusive). ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -6888,7 +7011,7 @@
             }
           },
           "400": {
-            "description": "Malformed cursor or out-of-range limit (invalid-cursor / validation-failed)",
+            "description": "Malformed cursor, out-of-range limit, an unknown status/source, a from/to that is not an ISO-8601 instant, from not before to, or a backordered flag other than true/false (invalid-cursor / validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6934,6 +7057,406 @@
           }
         ],
         "summary": "Lists one warehouse's orders, newest first (keyset cursor pagination)",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/outbound/picklist-lines": {
+      "get": {
+        "operationId": "OutboundController_listPicklistLines",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Only lines in this status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "planned",
+                "unfulfillable",
+                "picked",
+                "short",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `updated_at` is at or after this instant (inclusive). ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `updated_at` is strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "maxLength": 200,
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PicklistLineListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor, out-of-range limit, an unknown status, a from/to that is not an ISO-8601 instant, or from not before to (invalid-cursor / validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists one warehouse's picklist lines, status-filterable and windowed on updated_at (the flip time), newest first by creation (keyset cursor on created_at, id) — the short-pick drill: a zero-unit short pick exists ONLY here (no picks row, no ledger event)",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/outbound/pack-failures": {
+      "get": {
+        "operationId": "OutboundController_listPackFailures",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is at or after this instant (inclusive). ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "maxLength": 200,
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PackFailureListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor, out-of-range limit, a from/to that is not an ISO-8601 instant, or from not before to (invalid-cursor / validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists one warehouse's failed pack verifications (pack-mismatch refusals, every entry path), windowed on created_at, newest first (keyset cursor) — recorded since story 9-1, no backfill",
+        "tags": [
+          "outbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/outbound/backorder-refusals": {
+      "get": {
+        "operationId": "OutboundController_listBackorderRefusals",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is at or after this instant (inclusive). ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "maxLength": 200,
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackorderRefusalListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor, out-of-range limit, a from/to that is not an ISO-8601 instant, or from not before to (invalid-cursor / validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists one warehouse's channel orders refused under the reject backorder policy (one row per channel event — redeliveries add none), windowed on created_at, newest first (keyset cursor) — recorded since story 9-1, no backfill",
         "tags": [
           "outbound"
         ]
@@ -7086,6 +7609,63 @@
             "in": "path",
             "schema": {
               "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only orders in this status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "accepted",
+                "ready_to_dispatch",
+                "dispatched",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "source",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only orders of this source",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "manual",
+                "ingested"
+              ]
+            }
+          },
+          {
+            "name": "backordered",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — `true`: only orders with at least one line created backordered (counted per order, so a kit never counts twice); `false`: only orders with none. Exactly 'true' or 'false'",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is at or after this instant (inclusive). ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
               "type": "string"
             }
           },
@@ -7314,6 +7894,63 @@
             "in": "path",
             "schema": {
               "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only orders in this status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "accepted",
+                "ready_to_dispatch",
+                "dispatched",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "source",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only orders of this source",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "manual",
+                "ingested"
+              ]
+            }
+          },
+          {
+            "name": "backordered",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — `true`: only orders with at least one line created backordered (counted per order, so a kit never counts twice); `false`: only orders with none. Exactly 'true' or 'false'",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is at or after this instant (inclusive). ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
               "type": "string"
             }
           },
@@ -8111,6 +8748,63 @@
             }
           },
           {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only orders in this status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "accepted",
+                "ready_to_dispatch",
+                "dispatched",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "source",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only orders of this source",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "manual",
+                "ingested"
+              ]
+            }
+          },
+          {
+            "name": "backordered",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — `true`: only orders with at least one line created backordered (counted per order, so a kit never counts twice); `false`: only orders with none. Exactly 'true' or 'false'",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is at or after this instant (inclusive). ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only rows whose `created_at` is strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -8338,6 +9032,35 @@
             }
           },
           {
+            "name": "poless",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — `true`: only BLIND receipts (no purchase order — flagged for PO matching); `false`: only PO-backed ones. Exactly 'true' or 'false'",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only receipts whose `created_at` (server time) is at or after this instant. ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only receipts whose `created_at` is strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -8370,7 +9093,7 @@
             }
           },
           "400": {
-            "description": "Malformed cursor (invalid-cursor), malformed warehouseId, or out-of-range limit (validation-failed)",
+            "description": "Malformed cursor (invalid-cursor), malformed warehouseId, out-of-range limit, a poless flag other than true/false, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8537,6 +9260,36 @@
             }
           },
           {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — narrow to one warehouse (404 when it is not this tenant's)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only over-receipts requested (`requested_at`, server time) at or after this instant. ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only over-receipts requested strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -8569,7 +9322,7 @@
             }
           },
           "400": {
-            "description": "Malformed status, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "description": "Malformed status, warehouseId, cursor, out-of-range limit, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed / invalid-cursor)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8590,6 +9343,16 @@
           },
           "403": {
             "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouseId filter names a warehouse outside this tenant (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -13109,6 +13872,26 @@
             }
           },
           {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only alerts raised (`created_at`, server time) at or after this instant. ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only alerts raised strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -13141,7 +13924,7 @@
             }
           },
           "400": {
-            "description": "Malformed kind, status, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "description": "Malformed kind, status, cursor, out-of-range limit, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed / invalid-cursor)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -14481,6 +15264,36 @@
             }
           },
           {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only this warehouse's invoices. 404 when the warehouse is not this tenant's",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only invoices ISSUED (`issued_at`) at or after this instant; an awaiting-data invoice has no issue instant, so a windowed read never lists one. ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only invoices issued strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -14513,7 +15326,7 @@
             }
           },
           "400": {
-            "description": "Malformed cursor or out-of-range limit (validation-failed / invalid-cursor)",
+            "description": "Malformed cursor, warehouseId or out-of-range limit, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed / invalid-cursor)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -14534,6 +15347,16 @@
           },
           "403": {
             "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouseId filter names a warehouse outside this tenant (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -14827,6 +15650,49 @@
             }
           },
           {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only bills of this warehouse's invoices (a bill carries no warehouse; it is read through its invoice). 404 when the warehouse is not this tenant's",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "source",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only bills generated by this source (`gateway` or `manual`); a bill not yet generated has none",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "manual",
+                "gateway"
+              ]
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only bills queued (`created_at`, server time) at or after this instant. ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-1 — only bills queued strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -14859,7 +15725,7 @@
             }
           },
           "400": {
-            "description": "Malformed status, gstin, cursor or limit (validation-failed / invalid-cursor)",
+            "description": "Malformed status, gstin, warehouseId, source, cursor or limit, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed / invalid-cursor)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -14880,6 +15746,16 @@
           },
           "403": {
             "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouseId filter names a warehouse outside this tenant (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -15895,6 +16771,94 @@
         "summary": "Sets whether e-invoicing applies to one of the tenant's GSTINs (eway.configure, owner) — its B2B bills are then held as needs-irn",
         "tags": [
           "eway"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/reporting/overview": {
+      "get": {
+        "description": "Best-effort: at most 3 tile transactions run at once across the whole process, each statement under min(1.5 s, time left), inside a 1.8 s overall budget. A tile that times out, misses the budget or fails reads `unavailable` (every value null) and the response is `stale: true` — it never fails the page. Every figure carries a `drill` {apiPath, query, reconciles}: for `reconciles: true`, paging that list with that query to exhaustion yields exactly the figure. No polling — read it again to refresh.",
+        "operationId": "ReportingController_overview",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportingOverviewResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed warehouseId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found) — checked before any tile runs",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The operational dashboard for one warehouse: ten KPI tiles, each a projection over its owning module's records, with today's (IST) and the 7-day figure, and the list behind every number",
+        "tags": [
+          "reporting"
         ]
       }
     },
@@ -21118,6 +22082,293 @@
         },
         "required": [
           "items"
+        ]
+      },
+      "PicklistLineEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "picklistId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "waveId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "binCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "description": "Planned quantity. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded."
+          },
+          "shortfallQty": {
+            "type": "number",
+            "description": "Never drawn. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded."
+          },
+          "reasonCode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "bin-empty",
+              "fewer-units-than-planned",
+              "damaged-units",
+              "stock-not-found",
+              "other",
+              null
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "unfulfillable",
+              "picked",
+              "short",
+              "cancelled"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — the last transition (a terminal status: its flip time)"
+          }
+        },
+        "required": [
+          "id",
+          "picklistId",
+          "waveId",
+          "orderId",
+          "orderLineId",
+          "skuId",
+          "binId",
+          "binCode",
+          "qty",
+          "shortfallQty",
+          "reasonCode",
+          "status",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "PicklistLineListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PicklistLineEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PackFailureMismatchDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "pickedQty": {
+            "type": "number",
+            "description": "What the order had picked. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded."
+          },
+          "scannedQty": {
+            "type": "number",
+            "description": "What the bench scanned. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded."
+          }
+        },
+        "required": [
+          "skuId",
+          "skuCode",
+          "pickedQty",
+          "scannedQty"
+        ]
+      },
+      "PackFailureEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "orderId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "entry": {
+            "type": "string",
+            "enum": [
+              "tenant",
+              "device",
+              "sync"
+            ],
+            "description": "The entry path: the tenant route, the device bench route, or a device sync-report apply"
+          },
+          "actorUserId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "mismatch": {
+            "description": "Every SKU whose scan differed from the pick",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackFailureMismatchDto"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — when the refused attempt was recorded (server time)"
+          }
+        },
+        "required": [
+          "id",
+          "warehouseId",
+          "orderId",
+          "entry",
+          "actorUserId",
+          "mismatch",
+          "createdAt"
+        ]
+      },
+      "PackFailureListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackFailureEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "BackorderRefusalLineDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "requestedQty": {
+            "type": "number",
+            "description": "What the channel order asked for. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded."
+          },
+          "availableQty": {
+            "type": "number",
+            "description": "What could be reserved at grant time. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded."
+          }
+        },
+        "required": [
+          "skuId",
+          "requestedQty",
+          "availableQty"
+        ]
+      },
+      "BackorderRefusalEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "integrationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "externalEventId": {
+            "type": "string",
+            "description": "The channel's own order event id"
+          },
+          "lines": {
+            "description": "The lines that could not fully reserve",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BackorderRefusalLineDto"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — when the first delivery was refused (redeliveries add no row)"
+          }
+        },
+        "required": [
+          "id",
+          "warehouseId",
+          "integrationId",
+          "externalEventId",
+          "lines",
+          "createdAt"
+        ]
+      },
+      "BackorderRefusalListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BackorderRefusalEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
         ]
       },
       "CreateManifestDto": {
@@ -27345,6 +28596,653 @@
         },
         "required": [
           "setting"
+        ]
+      },
+      "ReportingWindowDto": {
+        "type": "object",
+        "properties": {
+          "todayFrom": {
+            "type": "string",
+            "description": "ISO-8601 UTC — IST midnight of asOf's IST date (the start of today)"
+          },
+          "d7From": {
+            "type": "string",
+            "description": "ISO-8601 UTC — IST midnight six days before todayFrom"
+          },
+          "to": {
+            "type": "string",
+            "description": "ISO-8601 UTC — the exclusive end of every window (= asOf)"
+          },
+          "lastHourFrom": {
+            "type": "string",
+            "description": "ISO-8601 UTC — asOf − 1 h: the pick rate's lastHour window start (its drill's from)"
+          },
+          "last24hFrom": {
+            "type": "string",
+            "description": "ISO-8601 UTC — asOf − 24 h: the sync tile's ingest-failure window start"
+          }
+        },
+        "required": [
+          "todayFrom",
+          "d7From",
+          "to",
+          "lastHourFrom",
+          "last24hFrom"
+        ]
+      },
+      "ReportingDrillDto": {
+        "type": "object",
+        "properties": {
+          "apiPath": {
+            "type": "string",
+            "description": "The API route (relative to /api/v1, ids filled in) whose rows are behind the figure — e.g. /tenants/{t}/warehouses/{w}/outbound/picklist-lines"
+          },
+          "query": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "The exact query to send it. Windowed figures carry from and to (to = asOf, exclusive)"
+          },
+          "reconciles": {
+            "type": "boolean",
+            "description": "True: paging apiPath?query to exhaustion yields exactly the figure. False for rates, medians and ratios — and for figures whose list cannot express the exact filter"
+          }
+        },
+        "required": [
+          "apiPath",
+          "query",
+          "reconciles"
+        ]
+      },
+      "ReportingFigureDto": {
+        "type": "object",
+        "properties": {
+          "value": {
+            "type": "number",
+            "nullable": true,
+            "description": "Null when the tile is unavailable or the figure has no data"
+          },
+          "drill": {
+            "$ref": "#/components/schemas/ReportingDrillDto"
+          }
+        },
+        "required": [
+          "value",
+          "drill"
+        ]
+      },
+      "ReportingWindowedFigureDto": {
+        "type": "object",
+        "properties": {
+          "today": {
+            "description": "Today so far — the IST calendar day of asOf",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingFigureDto"
+              }
+            ]
+          },
+          "d7": {
+            "description": "Today plus the previous six IST days",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingFigureDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "today",
+          "d7"
+        ]
+      },
+      "DockToStockTileDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "description": "`ok`: every figure was computed. `unavailable`: the tile timed out, missed the overall deadline, or failed — every value is null (there is no 'estimated' state)"
+          },
+          "medianMinutes": {
+            "description": "Median minutes from GRN creation to bin placement, over placements in the window (negative intervals excluded); null with no placement",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "awaitingPutaway": {
+            "description": "Live: GRN lines whose applied stock still sits in Receiving — the putaway task list",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingFigureDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "medianMinutes",
+          "awaitingPutaway"
+        ]
+      },
+      "PickRateTileDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "description": "`ok`: every figure was computed. `unavailable`: the tile timed out, missed the overall deadline, or failed — every value is null (there is no 'estimated' state)"
+          },
+          "pickLines": {
+            "description": "Pick lines recorded (one per line — a serial draw is one line)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "lastHour": {
+            "description": "Pick lines recorded in the hour before asOf",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingFigureDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "pickLines",
+          "lastHour"
+        ]
+      },
+      "ShortPicksTileDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "description": "`ok`: every figure was computed. `unavailable`: the tile timed out, missed the overall deadline, or failed — every value is null (there is no 'estimated' state)"
+          },
+          "shortLines": {
+            "description": "Picklist lines flipped to short in the window — zero-unit (empty-bin) shorts included",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "shortLines"
+        ]
+      },
+      "GrnVariancesTileDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "description": "`ok`: every figure was computed. `unavailable`: the tile timed out, missed the overall deadline, or failed — every value is null (there is no 'estimated' state)"
+          },
+          "overReceipts": {
+            "description": "Over-receipts requested in the window",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "pendingOverReceipts": {
+            "description": "Live: over-receipts awaiting a decision",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingFigureDto"
+              }
+            ]
+          },
+          "blindGrns": {
+            "description": "Blind GRNs (no purchase order — flagged for PO matching) recorded in the window",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "overReceipts",
+          "pendingOverReceipts",
+          "blindGrns"
+        ]
+      },
+      "OrderAccuracyTileDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "description": "`ok`: every figure was computed. `unavailable`: the tile timed out, missed the overall deadline, or failed — every value is null (there is no 'estimated' state)"
+          },
+          "defectsPer1000": {
+            "description": "SM-3: (short-picked lines + failed pack verifications) per 1,000 dispatched lines; null with no dispatched line",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "shortLines": {
+            "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+          },
+          "packFailures": {
+            "description": "Failed pack verifications (recorded since countingSince)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "dispatchedLines": {
+            "description": "Order lines dispatched in the window",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "countingSince": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC — when failed pack verifications began to be recorded (no backfill)"
+          }
+        },
+        "required": [
+          "state",
+          "defectsPer1000",
+          "shortLines",
+          "packFailures",
+          "dispatchedLines",
+          "countingSince"
+        ]
+      },
+      "OversellTileDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "description": "`ok`: every figure was computed. `unavailable`: the tile timed out, missed the overall deadline, or failed — every value is null (there is no 'estimated' state)"
+          },
+          "backorderedOrders": {
+            "description": "SM-4: channel orders accepted in the window with at least one backordered line (per order)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "prevented": {
+            "description": "Channel orders refused under the reject backorder policy — oversell prevented (recorded since countingSince)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "countingSince": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC — when refusals began to be recorded (no backfill)"
+          }
+        },
+        "required": [
+          "state",
+          "backorderedOrders",
+          "prevented",
+          "countingSince"
+        ]
+      },
+      "ExpiryAlertsTileDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "description": "`ok`: every figure was computed. `unavailable`: the tile timed out, missed the overall deadline, or failed — every value is null (there is no 'estimated' state)"
+          },
+          "openExpiryUpcoming": {
+            "description": "Live: open expiry-upcoming alerts",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingFigureDto"
+              }
+            ]
+          },
+          "openAged": {
+            "description": "Live: open aged-stock alerts",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingFigureDto"
+              }
+            ]
+          },
+          "raised": {
+            "description": "Alerts of either kind raised in the window",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "openExpiryUpcoming",
+          "openAged",
+          "raised"
+        ]
+      },
+      "SyncConnectionHealthDto": {
+        "type": "object",
+        "properties": {
+          "integrationId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "connected",
+              "disconnected"
+            ],
+            "description": "A disconnected connection is always health error, reason disconnected"
+          },
+          "health": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded",
+              "error"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "disconnected",
+              "ingest-warehouse-unset",
+              "breaker-open",
+              "breaker-half-open",
+              "last-delivery-failed",
+              "never-synced",
+              "sync-lag",
+              "ingest-failures",
+              null
+            ],
+            "description": "Why the health is not ok. disconnected / ingest-warehouse-unset (error — channel orders land nowhere); then /channels' own rule (connectionHealth): breaker-open (error), breaker-half-open, last-delivery-failed, never-synced, sync-lag (degraded); then ingest-failures (degraded — a genuine order-ingest failure in 24 h; refusals and settled cancellations are not failures). Null when ok"
+          },
+          "lagSeconds": {
+            "type": "number",
+            "nullable": true,
+            "description": "Seconds since the last successful availability sync; null when it never synced"
+          },
+          "ingestFailures24h": {
+            "type": "number",
+            "description": "Genuine order-ingest failures in the 24 h before asOf (a policy refusal or a settled cancellation is not one)"
+          }
+        },
+        "required": [
+          "integrationId",
+          "provider",
+          "status",
+          "health",
+          "reason",
+          "lagSeconds",
+          "ingestFailures24h"
+        ]
+      },
+      "SyncHealthTileDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "description": "`ok`: every figure was computed. `unavailable`: the tile timed out, missed the overall deadline, or failed — every value is null (there is no 'estimated' state)"
+          },
+          "connections": {
+            "nullable": true,
+            "description": "Channel connections (connected or disconnected) ingesting into this warehouse or with no ingest warehouse set; null when unavailable",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SyncConnectionHealthDto"
+            }
+          },
+          "drill": {
+            "$ref": "#/components/schemas/ReportingDrillDto"
+          }
+        },
+        "required": [
+          "state",
+          "connections",
+          "drill"
+        ]
+      },
+      "DispatchPipelineTileDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "description": "`ok`: every figure was computed. `unavailable`: the tile timed out, missed the overall deadline, or failed — every value is null (there is no 'estimated' state)"
+          },
+          "accepted": {
+            "description": "Live: orders accepted, not yet packed",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingFigureDto"
+              }
+            ]
+          },
+          "readyToDispatch": {
+            "description": "Live: orders packed, ready to dispatch",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingFigureDto"
+              }
+            ]
+          },
+          "labelledNotManifested": {
+            "description": "Live: shipments labelled but not yet on a manifest (no list of their own — drills to the packed orders)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingFigureDto"
+              }
+            ]
+          },
+          "ordersDispatched": {
+            "description": "Orders dispatched in the window",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "accepted",
+          "readyToDispatch",
+          "labelledNotManifested",
+          "ordersDispatched"
+        ]
+      },
+      "Sm8TileDto": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "unavailable"
+            ],
+            "description": "`ok`: every figure was computed. `unavailable`: the tile timed out, missed the overall deadline, or failed — every value is null (there is no 'estimated' state)"
+          },
+          "eligible": {
+            "description": "E-way bills queued in the window for this warehouse's invoices (dismissed bills and voided invoices excluded)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "gatewayGenerated": {
+            "description": "Of those, generated through the gateway",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "gatewayShare": {
+            "description": "SM-8: gatewayGenerated ÷ eligible, 0–1; null with none eligible. Reads 0 until a live gateway adapter exists",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "invoicesIssued": {
+            "description": "This warehouse's invoices issued in the window",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          },
+          "noManualPricingShare": {
+            "description": "Secondary: the share (0–1) of those issued with no manually priced line; null with none issued",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ReportingWindowedFigureDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "state",
+          "eligible",
+          "gatewayGenerated",
+          "gatewayShare",
+          "invoicesIssued",
+          "noManualPricingShare"
+        ]
+      },
+      "ReportingTilesDto": {
+        "type": "object",
+        "properties": {
+          "dockToStock": {
+            "$ref": "#/components/schemas/DockToStockTileDto"
+          },
+          "pickRate": {
+            "$ref": "#/components/schemas/PickRateTileDto"
+          },
+          "shortPicks": {
+            "$ref": "#/components/schemas/ShortPicksTileDto"
+          },
+          "grnVariances": {
+            "$ref": "#/components/schemas/GrnVariancesTileDto"
+          },
+          "orderAccuracy": {
+            "$ref": "#/components/schemas/OrderAccuracyTileDto"
+          },
+          "oversell": {
+            "$ref": "#/components/schemas/OversellTileDto"
+          },
+          "expiryAlerts": {
+            "$ref": "#/components/schemas/ExpiryAlertsTileDto"
+          },
+          "syncHealth": {
+            "$ref": "#/components/schemas/SyncHealthTileDto"
+          },
+          "dispatchPipeline": {
+            "$ref": "#/components/schemas/DispatchPipelineTileDto"
+          },
+          "sm8": {
+            "$ref": "#/components/schemas/Sm8TileDto"
+          }
+        },
+        "required": [
+          "dockToStock",
+          "pickRate",
+          "shortPicks",
+          "grnVariances",
+          "orderAccuracy",
+          "oversell",
+          "expiryAlerts",
+          "syncHealth",
+          "dispatchPipeline",
+          "sm8"
+        ]
+      },
+      "ReportingOverviewResponse": {
+        "type": "object",
+        "properties": {
+          "asOf": {
+            "type": "string",
+            "description": "ISO-8601 UTC — the instant every figure was read at"
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "True whenever any tile is unavailable"
+          },
+          "window": {
+            "$ref": "#/components/schemas/ReportingWindowDto"
+          },
+          "tiles": {
+            "$ref": "#/components/schemas/ReportingTilesDto"
+          }
+        },
+        "required": [
+          "asOf",
+          "stale",
+          "window",
+          "tiles"
         ]
       },
       "ChannelWebhookOrderResponse": {

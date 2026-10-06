@@ -223,9 +223,13 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     // Story 4.6c — the label + manifest records join the same ownership.
     'shipments',
     'manifests',
+    // Story 9-1 — the two reporting facts are outbound's: the refusals they
+    // record are outbound's own (the pack verification, the reject policy).
+    'packVerificationFailures',
+    'ingestBackorderRefusals',
   ] as const;
   const RAW_ORDER_TABLES =
-    'orders|order_lines|wave_policies|waves|picklists|picklist_lines|picks|shipments|manifests';
+    'orders|order_lines|wave_policies|waves|picklists|picklist_lines|picks|shipments|manifests|pack_verification_failures|ingest_backorder_refusals';
   const outboundRoot = join(SRC_ROOT, 'modules', 'outbound');
 
   it('no order-table write happens outside the outbound module', () => {
@@ -318,6 +322,12 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     const dispatchSource = readFileSync(join(outboundRoot, 'dispatch.command.ts'), 'utf8');
     expect(drizzleWriteOn('shipments').test(dispatchSource)).toBe(false);
     expect(drizzleWriteOn('manifests').test(dispatchSource)).toBe(false);
+    // Story 9-1's half: the pack command writes the failed-verification
+    // fact, the order command writes the reject-policy refusal fact.
+    const packSource = readFileSync(join(outboundRoot, 'pack.command.ts'), 'utf8');
+    expect(drizzleWriteOn('packVerificationFailures').test(packSource)).toBe(true);
+    const orderSource = readFileSync(join(outboundRoot, 'order.command.ts'), 'utf8');
+    expect(drizzleWriteOn('ingestBackorderRefusals').test(orderSource)).toBe(true);
   });
 
   it('the pick command moves stock ONLY through the inventory facade (4.3)', () => {
@@ -1389,5 +1399,67 @@ describe('architecture: invoices are invoicing-module-owned (story 8-1)', () => 
     for (const table of ['ewayBills', 'ewayStateThresholds', 'ewayGstinSettings'] as const) {
       expect(drizzleWriteOn(table).test(eway)).toBe(true);
     }
+  });
+});
+
+describe('architecture: reporting is a read-only exception, imported only by the api shell (story 9-1, decision 6)', () => {
+  /**
+   * Decision 6 lets the reporting tiles read the owning modules' tables
+   * directly — the ONE named exception to AD-6's facade rule. Its terms are
+   * what keep it an exception rather than a precedent:
+   *   1. reporting writes nothing — no Drizzle insert/update/delete on any
+   *      table object, no raw INSERT/UPDATE/DELETE/TRUNCATE in its SQL;
+   *   2. nothing imports the reporting module but the api shell (and the
+   *      root composition, which wires every spine module) — no sibling may
+   *      build on a read model that is allowed to bypass facades.
+   */
+  const reportingRoot = join(SRC_ROOT, 'modules', 'reporting');
+  const reportingFiles = files.filter((file) => file.path.startsWith(reportingRoot));
+  const DRIZZLE_ANY_WRITE = /\.(insert|update|delete)\(\s*[A-Za-z_]/;
+  const RAW_ANY_WRITE = /\b(insert\s+into|update\s+[a-z_]+\s+set|delete\s+from|truncate)\b/i;
+
+  it('the detectors bite (the test is meaningful)', () => {
+    expect(reportingFiles.length).toBeGreaterThanOrEqual(3);
+    expect(DRIZZLE_ANY_WRITE.test('await tx.insert(orders).values({})')).toBe(true);
+    expect(DRIZZLE_ANY_WRITE.test('await tx.update(picks).set({})')).toBe(true);
+    expect(RAW_ANY_WRITE.test('sql`insert into orders (id) values (1)`')).toBe(true);
+    expect(RAW_ANY_WRITE.test('sql`update picks set qty = 0`')).toBe(true);
+    expect(RAW_ANY_WRITE.test('sql`DELETE FROM batch_alerts`')).toBe(true);
+    expect(RAW_ANY_WRITE.test('sql`select count(*) from picks where updated_at < now()`')).toBe(false);
+  });
+
+  it('nothing under src/modules/reporting writes any table', () => {
+    const offenders: string[] = [];
+    for (const file of reportingFiles) {
+      for (const pattern of [DRIZZLE_ANY_WRITE, RAW_ANY_WRITE]) {
+        if (pattern.test(file.source)) {
+          offenders.push(`${file.path}: /${pattern.source}/`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('only the api shell (and the root composition) imports the reporting module', () => {
+    const importsReporting = /(?:modules\/reporting|\.\.\/reporting)\//;
+    const allowed = (path: string): boolean =>
+      path.startsWith(join(SRC_ROOT, 'api')) ||
+      path === join(SRC_ROOT, 'app.module.ts') ||
+      path.startsWith(reportingRoot);
+    const importers = files.filter((file) => importsReporting.test(file.source));
+    // Meaningful: the api shell DOES import it (controller + module wiring).
+    expect(importers.some((file) => file.path === join(SRC_ROOT, 'api', 'api.module.ts'))).toBe(true);
+    expect(importers.some((file) => file.path === join(SRC_ROOT, 'api', 'reporting.controller.ts'))).toBe(true);
+    expect(importers.filter((file) => !allowed(file.path)).map((file) => file.path)).toEqual([]);
+  });
+
+  it('the reporting module owns no table and exports only its facade', () => {
+    const moduleSource = readFileSync(join(reportingRoot, 'reporting.module.ts'), 'utf8');
+    expect(moduleSource).toMatch(/exports:\s*\[ReportingFacade\]/);
+    const schemaSource = readFileSync(join(SRC_ROOT, 'shared', 'db', 'schema.ts'), 'utf8');
+    // Both 9-1 fact tables are declared — and owned by outbound (the order
+    // block above), never by reporting.
+    expect(schemaSource).toContain("pgTable(\n  'pack_verification_failures'");
+    expect(schemaSource).toContain("pgTable(\n  'ingest_backorder_refusals'");
   });
 });

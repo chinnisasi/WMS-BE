@@ -3,7 +3,7 @@ import {
   MAX_QUANTITY_BASE,
   QUANTITY_DECIMALS,
   QUANTITY_FIELD_DESCRIPTION,
-} from '../../shared/primitives/quantity';
+  } from '../../shared/primitives/quantity';
 import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
 import { UOMS } from '../catalog/uom';
 import {
@@ -21,8 +21,10 @@ import {
   Max,
   Min,
   ValidateNested,
+  IsBoolean,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
+import { BooleanFlag, IsInstant } from '../../shared/primitives/instant-range';
 import { PurchaseOrderLineDto } from './inbound.dto';
 import {
   MAX_HANDLING_UNIT_WEIGHT_GRAMS,
@@ -325,6 +327,27 @@ export class GoodsReceiptListQuery {
   @IsUUID()
   warehouseId?: string;
 
+  @ApiProperty({
+    required: false,
+    type: Boolean,
+    description:
+      "Story 9-1 — `true`: only BLIND receipts (no purchase order — flagged for PO matching); `false`: only PO-backed ones. Exactly 'true' or 'false'",
+  })
+  @IsOptional()
+  @BooleanFlag()
+  @IsBoolean()
+  poless?: boolean;
+
+  @ApiProperty({ required: false, format: 'date-time', description: 'Story 9-1 — only receipts whose `created_at` (server time) is at or after this instant. ISO-8601 with a zone designator' })
+  @IsOptional()
+  @IsInstant()
+  from?: string;
+
+  @ApiProperty({ required: false, format: 'date-time', description: 'Story 9-1 — only receipts whose `created_at` is strictly before this instant (exclusive). Must be after `from`' })
+  @IsOptional()
+  @IsInstant()
+  to?: string;
+
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()
@@ -410,6 +433,21 @@ export class OverReceiptListQuery {
   @IsOptional()
   @IsIn(['pending', 'approved', 'rejected'])
   status?: 'pending' | 'approved' | 'rejected';
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Story 9-1 — narrow to one warehouse (404 when it is not this tenant\'s)' })
+  @IsOptional()
+  @IsUUID()
+  warehouseId?: string;
+
+  @ApiProperty({ required: false, format: 'date-time', description: 'Story 9-1 — only over-receipts requested (`requested_at`, server time) at or after this instant. ISO-8601 with a zone designator' })
+  @IsOptional()
+  @IsInstant()
+  from?: string;
+
+  @ApiProperty({ required: false, format: 'date-time', description: 'Story 9-1 — only over-receipts requested strictly before this instant (exclusive). Must be after `from`' })
+  @IsOptional()
+  @IsInstant()
+  to?: string;
 
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()

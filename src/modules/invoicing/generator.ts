@@ -11,7 +11,7 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { isGstinStateCode } from '../../shared/primitives/gstin';
 import { nicText } from '../../shared/primitives/nic-text';
-import { nowIso } from '../../shared/primitives/time';
+import { IST_OFFSET_MS, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { OutboundFacade } from '../outbound/outbound.facade';
 import type { OrderInvoiceFacts } from '../outbound/outbound.facade';
@@ -186,8 +186,12 @@ export interface InvoiceDraft {
 
 // ── FY numbering ─────────────────────────────────────────────────────────────
 
-/** India is UTC+05:30 year-round (no DST) — the FY is read off the IST clock. */
-export const IST_OFFSET_MS = 5.5 * 3600 * 1000;
+/**
+ * India is UTC+05:30 year-round (no DST) — the FY is read off the IST clock.
+ * Story 9-1 moved the constant to `shared/primitives/time.ts` (reporting's
+ * IST windows read it too); re-exported here so invoicing's importers stand.
+ */
+export { IST_OFFSET_MS };
 
 /**
  * The financial-year label of an issuance instant: April 1 – March 31 in

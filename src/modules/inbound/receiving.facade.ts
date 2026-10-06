@@ -27,7 +27,7 @@ import { CatalogFacade } from '../catalog/catalog.facade';
 import type { PurchaseOrderLineSnapshot } from './po.command';
 import { lineSnapshot } from './po.command';
 import type { OverReceiptEntry } from './receiving.command';
-import { canonicalInstant } from '../../shared/primitives/time';
+import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/time';
 import { fromMilli } from '../../shared/primitives/quantity';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
@@ -50,12 +50,22 @@ export interface GoodsReceiptEntry {
 
 export interface ListGoodsReceiptsQuery {
   readonly warehouseId?: string | undefined;
+  /** Story 9-1 — `true`: blind receipts only (`po_id IS NULL`); `false`: PO-backed only. */
+  readonly poless?: boolean | undefined;
+  /** Story 9-1 — `[from, to)` on `created_at` (server time). */
+  readonly from?: string | undefined;
+  readonly to?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
 
 export interface ListOverReceiptsQuery {
   readonly status?: 'pending' | 'approved' | 'rejected' | undefined;
+  /** Story 9-1 — one warehouse (asserted in-tenant first). */
+  readonly warehouseId?: string | undefined;
+  /** Story 9-1 — `[from, to)` on `requested_at` (server time — stamped at the GRN's own commit). */
+  readonly from?: string | undefined;
+  readonly to?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -224,6 +234,8 @@ export class ReceivingFacade {
           occurredAt: goodsReceiptNotes.occurredAt,
           recordedAt: goodsReceiptNotes.recordedAt,
           createdAt: goodsReceiptNotes.createdAt,
+          // Story 9-1: the cursor's FULL-precision instant (see listEvents).
+          createdAtText: sql<string>`${goodsReceiptNotes.createdAt}::text`,
         })
         .from(goodsReceiptNotes)
         .where(
@@ -232,6 +244,13 @@ export class ReceivingFacade {
             query.warehouseId === undefined
               ? undefined
               : eq(goodsReceiptNotes.warehouseId, query.warehouseId),
+            query.poless === undefined
+              ? undefined
+              : query.poless
+                ? sql`${goodsReceiptNotes.poId} is null`
+                : sql`${goodsReceiptNotes.poId} is not null`,
+            query.from === undefined ? undefined : sql`${goodsReceiptNotes.createdAt} >= ${query.from}::timestamptz`,
+            query.to === undefined ? undefined : sql`${goodsReceiptNotes.createdAt} < ${query.to}::timestamptz`,
             before === undefined
               ? undefined
               : sql`(${goodsReceiptNotes.createdAt}, ${goodsReceiptNotes.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -266,7 +285,11 @@ export class ReceivingFacade {
                 },
               ]),
             );
-      const items = rows.map((row) => ({
+      const items = rows.map((full) => {
+        // `createdAtText` is the cursor-only projection — never in the body.
+        const { createdAtText, ...row } = full;
+        void createdAtText;
+        return {
         ...row,
         lineCount: aggregates.get(row.id)?.lineCount ?? 0,
         // int8 arrives as text through postgres.js; the contract is a number.
@@ -277,8 +300,9 @@ export class ReceivingFacade {
         occurredAt: canonicalInstant(row.occurredAt),
         recordedAt: canonicalInstant(row.recordedAt),
         createdAt: canonicalInstant(row.createdAt),
-      }));
-      return buildPage(items, pageSize);
+        };
+      });
+      return fullPrecisionPage(rows, items, pageSize);
     });
   }
 
@@ -295,10 +319,17 @@ export class ReceivingFacade {
     const pageSize = query.limit ?? DEFAULT_RECEIVING_PAGE_SIZE;
     const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
     return withTenantTransaction(this.db, tenantId, async (tx) => {
+      if (query.warehouseId !== undefined) {
+        await assertWarehouseInTenant(tx, tenantId, query.warehouseId);
+      }
       const rows = await tx
         .select({
           overReceipt: overReceipts,
           grnCode: goodsReceiptNotes.code,
+          // Story 9-1: one GRN commits all its over-receipts in ONE
+          // transaction (one shared `now()`), so the cursor must carry the
+          // full-precision instant or the next page skips the tie group.
+          createdAtText: sql<string>`${overReceipts.createdAt}::text`,
         })
         .from(overReceipts)
         .innerJoin(goodsReceiptNotes, eq(goodsReceiptNotes.id, overReceipts.grnId))
@@ -306,6 +337,9 @@ export class ReceivingFacade {
           and(
             eq(overReceipts.tenantId, tenantId),
             query.status === undefined ? undefined : eq(overReceipts.status, query.status),
+            query.warehouseId === undefined ? undefined : eq(overReceipts.warehouseId, query.warehouseId),
+            query.from === undefined ? undefined : sql`${overReceipts.requestedAt} >= ${query.from}::timestamptz`,
+            query.to === undefined ? undefined : sql`${overReceipts.requestedAt} < ${query.to}::timestamptz`,
             before === undefined
               ? undefined
               : sql`(${overReceipts.createdAt}, ${overReceipts.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -332,7 +366,7 @@ export class ReceivingFacade {
         decidedAt: row.decidedAt === null ? null : canonicalInstant(row.decidedAt),
         createdAt: canonicalInstant(row.createdAt),
       }));
-      return buildPage(items, pageSize);
+      return fullPrecisionPage(rows, items, pageSize);
     });
   }
 
@@ -415,4 +449,21 @@ export class ReceivingFacade {
       };
     });
   }
+}
+/**
+ * Story 9-1 — a page whose cursor carries each row's FULL-precision instant
+ * (`createdAtText`, the `::text` projection) while the items keep their
+ * canonical millisecond shape. The dashboard's drills page these lists to
+ * exhaustion; a millisecond-truncated cursor skips the rest of a tie group.
+ */
+function fullPrecisionPage<T extends { readonly id: string }>(
+  rows: readonly { readonly createdAtText: string }[],
+  items: readonly T[],
+  pageSize: number,
+): Page<T> {
+  const page = buildPage(
+    items.map((item, index) => ({ createdAt: fullPrecisionInstant(rows[index]!.createdAtText), id: item.id, entry: item })),
+    pageSize,
+  );
+  return { items: page.items.map((wrapped) => wrapped.entry), nextCursor: page.nextCursor };
 }

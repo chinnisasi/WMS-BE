@@ -35,6 +35,7 @@ import {
   UpsertExpiryPolicyDto,
   UpsertReorderPolicyDto,
 } from '../modules/replenishment/replenishment.dto';
+import { assertInstantRange } from '../shared/primitives/instant-range';
 
 const IDEMPOTENCY_HEADER = [
   {
@@ -388,7 +389,7 @@ export class ReplenishmentController {
       "Lists the tenant's batch alerts (the expiry/aging queue), kind/status/warehouse-filterable (keyset cursor pagination — open to any member); each row's on-hand is re-read live",
   })
   @ApiOkResponse({ type: BatchAlertListResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed kind, status, cursor, or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed kind, status, cursor, out-of-range limit, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed / invalid-cursor)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('A filtered warehouse does not exist in this tenant (not-found)') })
@@ -399,10 +400,13 @@ export class ReplenishmentController {
     @Query() query: BatchAlertListQuery,
   ): Promise<BatchAlertListResponse> {
     assertOwnTenant(session, tenantId);
+    assertInstantRange(query.from, query.to);
     const listQuery: ListBatchAlertsQuery = {
       kind: query.kind,
       status: query.status,
       warehouseId: query.warehouseId,
+      from: query.from,
+      to: query.to,
       cursor: query.cursor,
       limit: query.limit,
     };

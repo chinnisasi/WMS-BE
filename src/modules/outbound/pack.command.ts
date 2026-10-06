@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -8,10 +8,12 @@ import {
   idempotencyKeys,
   orderLines,
   orders,
+  packVerificationFailures,
   picklistLines,
   picks,
   skus,
 } from '../../shared/db/schema';
+import type { PackFailureEntry } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import {
   MAX_QUANTITY_MILLI,
@@ -122,6 +124,13 @@ export interface PackOrderCommand {
    * authority is the session's own role.
    */
   readonly deviceId?: string | undefined;
+  /**
+   * Story 9-1 — which entry path reached the command, recorded on a failed
+   * verification's fact row only (never hashed, never branched on). Absent,
+   * it is derived: `device` when `deviceId` is set, else `tenant`. The
+   * sync-report apply passes `sync` explicitly.
+   */
+  readonly entry?: PackFailureEntry | undefined;
   readonly orderId: string;
   /** What the operator scanned into the parcel (aggregated per SKU here). */
   readonly scanned: readonly PackScanLineInput[];
@@ -206,6 +215,8 @@ export interface PackSnapshot {
  */
 @Injectable()
 export class PackCommandService {
+  private readonly logger = new Logger('PackCommand');
+
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
@@ -258,7 +269,89 @@ export class PackCommandService {
     // rule): a mirror applied for a transaction that did not commit reads as
     // ATP the journal still holds — the overselling direction — and an outer
     // `let` would do exactly that if the callback were ever retried.
-    const committed = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+    // Story 9-1: a failed scan verification is RECORDED — after the pack
+    // transaction has rolled back (its order/device `FOR UPDATE` locks are
+    // released by then, so the fact write's own connection never waits on
+    // them), in a fresh tenant transaction, best-effort. The caller gets the
+    // unchanged 422 either way. The catch sits HERE, around the one
+    // transaction every entry path (tenant route, device route, sync-report
+    // apply) reaches, so all three are covered by construction.
+    let committed: { snapshot: PackSnapshot; counterRestores: ReadonlyMap<string, number>; warehouseId: string | null };
+    try {
+      committed = await this.packInTransaction(command, idempotencyKey, payloadHash, scannedBySku, handlingUnitIdsBySku);
+    } catch (err) {
+      if (err instanceof PackMismatchError) {
+        await this.recordPackFailure(command, idempotencyKey, err);
+      }
+      throw err;
+    }
+
+    // ── the counter mirror, now that the journal half is durable ──────────
+    // Journal first, mirror second (the 4.4 ordering): a mirror that never
+    // lands only leaves ATP understated until the next rebuild, which is the
+    // fail-safe direction; one applied for a rolled-back transaction would
+    // hand out stock the journal still holds.
+    if (committed.warehouseId !== null) {
+      for (const [skuId, units] of committed.counterRestores) {
+        await this.inventory.restoreReservedUnits(
+          command.tenantId,
+          committed.warehouseId,
+          skuId,
+          units,
+        );
+      }
+    }
+    return committed.snapshot;
+  }
+
+  /**
+   * Story 9-1 — the failed-verification fact. Best-effort by contract: it
+   * runs only after the pack transaction rolled back, in its OWN tenant
+   * transaction, and a failure here is logged and swallowed — the operator's
+   * refusal must be exactly today's 422, never a 500 for a bookkeeping row.
+   */
+  private async recordPackFailure(
+    command: PackOrderCommand,
+    idempotencyKey: string,
+    err: PackMismatchError,
+  ): Promise<void> {
+    try {
+      await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+        await tx
+          .insert(packVerificationFailures)
+          .values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          warehouseId: err.warehouseId,
+          orderId: err.orderId,
+          entry: command.entry ?? (command.deviceId === undefined ? 'tenant' : 'device'),
+          actorUserId: command.actorUserId,
+          mismatch: err.mismatch,
+          // A retry of the same failed attempt (same key — the route's
+          // Idempotency-Key, or the sync-report op's ULID) adds no row.
+          idempotencyKey,
+        })
+        .onConflictDoNothing({
+          target: [packVerificationFailures.tenantId, packVerificationFailures.idempotencyKey],
+          where: sql`idempotency_key is not null`,
+        });
+      });
+    } catch (writeErr) {
+      this.logger.error(
+        `Pack verification failure for order ${err.orderId} was refused (pack-mismatch) but its fact row could not be written — ` +
+          `${writeErr instanceof Error ? writeErr.message : String(writeErr)}`,
+      );
+    }
+  }
+
+  private async packInTransaction(
+    command: PackOrderCommand,
+    idempotencyKey: string,
+    payloadHash: string,
+    scannedBySku: ReadonlyMap<string, number>,
+    handlingUnitIdsBySku: ReadonlyMap<string, readonly string[]>,
+  ): Promise<{ snapshot: PackSnapshot; counterRestores: ReadonlyMap<string, number>; warehouseId: string | null }> {
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── authority: the role is re-read from the DB per command (AD-10) ──
       assertPermission(
         await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
@@ -470,7 +563,7 @@ export class PackCommandService {
       // each-counted SKU is not a discrepancy to reconcile, it is a value the
       // unit cannot hold.
       assertScanPrecision(command.scanned, skuById);
-      this.assertScanMatchesPicked(order.id, pickedBySku, scannedBySku, skuById);
+      this.assertScanMatchesPicked(order.warehouseId, order.id, pickedBySku, scannedBySku, skuById);
 
       // ── story 10.3: the catch-weight units, resolved BEFORE any write ────
       // Every refusal below is a refusal of the whole pack: a parcel that
@@ -707,23 +800,6 @@ export class PackCommandService {
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
       return { snapshot, counterRestores, warehouseId: order.warehouseId };
     });
-
-    // ── the counter mirror, now that the journal half is durable ──────────
-    // Journal first, mirror second (the 4.4 ordering): a mirror that never
-    // lands only leaves ATP understated until the next rebuild, which is the
-    // fail-safe direction; one applied for a rolled-back transaction would
-    // hand out stock the journal still holds.
-    if (committed.warehouseId !== null) {
-      for (const [skuId, units] of committed.counterRestores) {
-        await this.inventory.restoreReservedUnits(
-          command.tenantId,
-          committed.warehouseId,
-          skuId,
-          units,
-        );
-      }
-    }
-    return committed.snapshot;
   }
 
   // ── the verification ───────────────────────────────────────────────────────
@@ -739,12 +815,14 @@ export class PackCommandService {
    * parcel and the customer discovers it.
    */
   private assertScanMatchesPicked(
+    warehouseId: string,
     orderId: string,
     picked: ReadonlyMap<string, number>,
     scanned: ReadonlyMap<string, number>,
     skuById: ReadonlyMap<string, { code: string; name: string }>,
   ): void {
     const discrepancies: string[] = [];
+    const mismatch: PackMismatchLine[] = [];
     for (const skuId of [...new Set([...picked.keys(), ...scanned.keys()])].sort()) {
       const pickedQty = picked.get(skuId) ?? 0;
       const scannedQty = scanned.get(skuId) ?? 0;
@@ -752,6 +830,7 @@ export class PackCommandService {
         continue;
       }
       const code = skuById.get(skuId)?.code ?? skuId;
+      mismatch.push({ skuId, skuCode: code, pickedMilli: pickedQty, scannedMilli: scannedQty });
       // Operator-facing text speaks base units (story 10.1).
       discrepancies.push(
         `SKU ${code} (${skuId}): picked ${fromMilli(pickedQty)}, scanned ${fromMilli(scannedQty)}`,
@@ -760,10 +839,10 @@ export class PackCommandService {
     if (discrepancies.length === 0) {
       return;
     }
-    throw new ProblemException(
-      'pack-mismatch',
-      422,
-      'Scanned contents do not match what was picked',
+    throw new PackMismatchError(
+      warehouseId,
+      orderId,
+      mismatch,
       `Order "${orderId}" was not packed — ${discrepancies.length} discrepancy(ies): ${namedSample(
         discrepancies,
       )}. Nothing was written.`,
@@ -1192,4 +1271,31 @@ function packValidation(detail: string): ProblemException {
 
 function packConflict(title: string, detail: string): ProblemException {
   return new ProblemException('conflict', 409, title, detail);
+}
+
+/** Story 9-1 — one divergent SKU of a failed verification, in milli-units (the fact row's shape). */
+export interface PackMismatchLine {
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly pickedMilli: number;
+  readonly scannedMilli: number;
+}
+
+/**
+ * Story 9-1 — the scan-vs-picked refusal, TYPED so `packOrder` can recognise
+ * it after the transaction rolled back and record the fact. It renders
+ * exactly the problem it always did (`pack-mismatch`, 422, the same title and
+ * detail): the carried fields are instance properties the filter never sees.
+ * Only the scan-vs-picked check throws it — the catch-weight `pack-mismatch`
+ * arms are unit-accounting refusals, not a parcel that differs from the pick.
+ */
+export class PackMismatchError extends ProblemException {
+  constructor(
+    readonly warehouseId: string,
+    readonly orderId: string,
+    readonly mismatch: readonly PackMismatchLine[],
+    detail: string,
+  ) {
+    super('pack-mismatch', 422, 'Scanned contents do not match what was picked', detail);
+  }
 }

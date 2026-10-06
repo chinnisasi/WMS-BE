@@ -506,3 +506,12 @@ export function getLedgerEventType(type: string): LedgerEventTypeDefinition | un
 export function isRegisteredLedgerEventType(type: string): boolean {
   return REGISTRY.has(type);
 }
+/**
+ * Story 9-1 — every registered type, in registration order: the timeline's
+ * `type` filter validates against it (an unknown type is a 400 naming the
+ * known set, never a silently empty page). Read at call time, never frozen
+ * into a module-load constant, so a type registered later is admitted too.
+ */
+export function registeredLedgerEventTypes(): readonly string[] {
+  return [...REGISTRY.keys()];
+}

@@ -33,6 +33,7 @@ import {
   QcHoldListResponse,
   QcHoldResponse,
 } from '../modules/inbound/qc.dto';
+import { assertInstantRange } from '../shared/primitives/instant-range';
 const IDEMPOTENCY_HEADER = [
   {
     name: 'Idempotency-Key',
@@ -211,7 +212,7 @@ export class ReceivingController {
     type: GoodsReceiptListResponse,
     description: 'The GRN page (headers with line/unit sums — the Inbound surface\'s list read)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor (invalid-cursor), malformed warehouseId, or out-of-range limit (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor (invalid-cursor), malformed warehouseId, out-of-range limit, a poless flag other than true/false, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The warehouseId filter names a warehouse outside this tenant (not-found)') })
@@ -225,8 +226,12 @@ export class ReceivingController {
     if (query.warehouseId !== undefined) {
       assertUuidParam(query.warehouseId, 'warehouseId');
     }
+    assertInstantRange(query.from, query.to);
     const page = await this.receiving.listGoodsReceipts(tenantId, {
       warehouseId: query.warehouseId,
+      poless: query.poless,
+      from: query.from,
+      to: query.to,
       cursor: query.cursor,
       limit: query.limit,
     });
@@ -240,9 +245,10 @@ export class ReceivingController {
     summary: 'Lists over-receipts (keyset cursor pagination, status-filterable — the Conflicts & Reviews queue read)',
   })
   @ApiOkResponse({ type: OverReceiptListResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed status, cursor, or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed status, warehouseId, cursor, out-of-range limit, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed / invalid-cursor)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouseId filter names a warehouse outside this tenant (not-found)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async listOverReceipts(
     @Param('tenantId') tenantId: string,
@@ -250,8 +256,12 @@ export class ReceivingController {
     @Query() query: OverReceiptListQuery,
   ): Promise<OverReceiptListResponse> {
     assertOwnTenantToken(session.tenantId, tenantId);
+    assertInstantRange(query.from, query.to);
     const page = await this.receiving.listOverReceipts(tenantId, {
       status: query.status,
+      warehouseId: query.warehouseId,
+      from: query.from,
+      to: query.to,
       cursor: query.cursor,
       limit: query.limit,
     });

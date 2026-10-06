@@ -134,6 +134,16 @@ export interface LedgerTimelineQuery {
    * quotes seq(s) from this timeline).
    */
   readonly binId?: string | undefined;
+  /** Story 9-1 — only these registered types (validated at the DTO). */
+  readonly types?: readonly string[] | undefined;
+  /** Story 9-1 — `recorded_at >= from` (the server stamp; inclusive). */
+  readonly from?: string | undefined;
+  /** Story 9-1 — `recorded_at < to` (exclusive). */
+  readonly to?: string | undefined;
+  /** Story 9-1 — `reference_doc ->> 'orderId'` equals this order. */
+  readonly orderId?: string | undefined;
+  /** Story 9-1 — the reference doc's `shortPick` flag is (not) set. */
+  readonly shortPick?: boolean | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -470,6 +480,29 @@ export class InventoryFacade {
             query.binId === undefined
               ? undefined
               : sql`(${ledgerEvents.fromBinId} = ${query.binId}::uuid OR ${ledgerEvents.toBinId} = ${query.binId}::uuid)`,
+            // Story 9-1 — the dashboard drill filters. The window is on
+            // `recorded_at` (server-stamped), so a replayed offline op never
+            // revises "today"; `(tenant, warehouse, type, recorded_at)` is
+            // 0058's index for exactly this shape.
+            query.types === undefined || query.types.length === 0
+              ? undefined
+              : inArray(ledgerEvents.type, [...query.types]),
+            query.from === undefined ? undefined : sql`${ledgerEvents.recordedAt} >= ${query.from}::timestamptz`,
+            query.to === undefined ? undefined : sql`${ledgerEvents.recordedAt} < ${query.to}::timestamptz`,
+            // Compared as TEXT against the lowercased uuid: the reference
+            // doc stores canonical lowercase ids, and an uppercase query must
+            // still match (a `::uuid` cast of the stored text would 500 on a
+            // malformed legacy value).
+            query.orderId === undefined
+              ? undefined
+              : sql`${ledgerEvents.referenceDoc} ->> 'orderId' = ${query.orderId.toLowerCase()}`,
+            // Text comparison, never a `::boolean` cast — a non-boolean stored
+            // value must read as "not a short pick", not 500 the read.
+            query.shortPick === undefined
+              ? undefined
+              : query.shortPick
+                ? sql`(${ledgerEvents.referenceDoc} ->> 'shortPick') = 'true'`
+                : sql`(${ledgerEvents.referenceDoc} ->> 'shortPick') is distinct from 'true'`,
             before === undefined
               ? undefined
               : sql`(${ledgerEvents.createdAt}, ${ledgerEvents.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
