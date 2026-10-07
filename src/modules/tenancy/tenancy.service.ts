@@ -260,6 +260,25 @@ export interface ClientInvoiceSupplierFacts {
   readonly warehouses: readonly ClientInvoiceWarehouseFacts[];
 }
 
+/**
+ * Story 21-5b — the emails of a set of the tenant's users (the dispute
+ * drill names each record's actor): userId → email, read inside the
+ * caller's transaction through this exported seam (the
+ * `clientInvoiceSupplierFactsInTx` precedent — billing never imports a
+ * tenancy table). An id that is not a user of this tenant is simply absent
+ * (the caller shows `null`); malformed ids are skipped, never bound.
+ */
+export async function userEmailsInTx(tx: TenantTx, tenantId: string, userIds: readonly string[]): Promise<Map<string, string>> {
+  const distinct = [...new Set(userIds)].filter((id) => UUID_RE.test(id));
+  if (distinct.length === 0) return new Map();
+  const rows = (await tx.execute(sql`
+    select u.id as "id", u.email as "email"
+    from users u
+    where u.tenant_id = ${tenantId}::uuid and u.id = any(${sql.param(distinct)}::uuid[])
+  `)) as unknown as { id: string; email: string }[];
+  return new Map(rows.map((row) => [row.id, row.email]));
+}
+
 export async function clientInvoiceSupplierFactsInTx(tx: TenantTx, tenantId: string): Promise<ClientInvoiceSupplierFacts> {
   const tenantRows = await tx
     .select({ name: tenants.name, gstin: tenants.gstin })

@@ -1,4 +1,4 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, getSchemaPath } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { IsOptional, IsString, Matches, ValidateBy } from 'class-validator';
 import {
@@ -12,6 +12,7 @@ import {
   type ClientInvoiceWarningCode,
 } from '../modules/billing/client-invoices';
 import { CHARGE_CODES, RATE_BASES, type ChargeCode, type RateBasis } from '../modules/billing/rate-cards';
+import { LINE_RECORD_KINDS, type LineRecordKind } from '../modules/billing/invoice-records';
 
 /**
  * Story 21-5 — the client-invoice DTOs. Shape only: the command owns every
@@ -129,6 +130,9 @@ export class ClientInvoiceTotalsDto {
 }
 
 export class ClientInvoiceLineDto {
+  @ApiProperty({ format: 'uuid', description: "The line's id — the dispute drill's address (21-5b). A draft's lines are rewritten (new ids) when it is refreshed or answers stale" })
+  id!: string;
+
   @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The rate card that priced the line (null: no card in force)' })
   rateCardId!: string | null;
 
@@ -229,4 +233,138 @@ export class PrepareClientInvoicesResponse {
 export class ClientInvoiceListResponse {
   @ApiProperty({ type: [ClientInvoiceEntryDto] }) items!: ClientInvoiceEntryDto[];
   @ApiProperty({ type: String, nullable: true }) nextCursor!: string | null;
+}
+
+// ── story 21-5b — the dispute drill-down ─────────────────────────────────────
+
+export class OrderRefDto {
+  @ApiProperty({ type: String, nullable: true, example: 'manual', description: '`manual` or the channel the order came from; null only when the order row is missing' })
+  source!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: "The channel's event id (the web labels it \"Channel ref\"); null on a manual order — there is no order number yet" })
+  externalEventId!: string | null;
+
+  @ApiProperty({ format: 'uuid' })
+  orderId!: string;
+}
+
+export class ReceiptLineRecordDto {
+  @ApiProperty({ enum: ['receipt-line'] }) kind!: 'receipt-line';
+  @ApiProperty({ format: 'uuid', description: 'The GRN line' }) id!: string;
+  @ApiProperty() grnCode!: string;
+  @ApiProperty({ type: String, nullable: true, description: 'The purchase order the GRN booked against — null on a blind receipt' }) poCode!: string | null;
+  @ApiProperty({ description: "The GRN's recorded_at (the server stamp), ISO-8601 UTC at full precision" }) recordedAt!: string;
+  @ApiProperty({ format: 'uuid' }) warehouseId!: string;
+  @ApiProperty() warehouseCode!: string;
+  @ApiProperty({ format: 'uuid' }) skuId!: string;
+  @ApiProperty() skuCode!: string;
+  @ApiProperty() skuName!: string;
+  @ApiProperty({ example: '12.5', description: 'Received, base units — a decimal string' }) qty!: string;
+  @ApiProperty({ description: 'Applied at once (the rest pended as an over-receipt), base units — a decimal string' }) appliedQty!: string;
+  @ApiProperty({ format: 'uuid' }) actorId!: string;
+  @ApiProperty({ type: String, nullable: true, description: "The actor's email; null when the user is unknown" }) actorEmail!: string | null;
+}
+
+export class PickRecordDto {
+  @ApiProperty({ enum: ['pick'] }) kind!: 'pick';
+  @ApiProperty({ format: 'uuid', description: 'The pick row' }) id!: string;
+  @ApiProperty({ description: "The pick row's created_at (the server clock), ISO-8601 UTC at full precision" }) pickedAt!: string;
+  @ApiProperty({ format: 'uuid' }) warehouseId!: string;
+  @ApiProperty() warehouseCode!: string;
+  @ApiProperty({ type: OrderRefDto }) orderRef!: OrderRefDto;
+  @ApiProperty({ format: 'uuid' }) skuId!: string;
+  @ApiProperty() skuCode!: string;
+  @ApiProperty() skuName!: string;
+  @ApiProperty({ description: 'Picked, base units — a decimal string' }) qty!: string;
+  @ApiProperty({ type: String, nullable: true, description: 'The bin the operator scanned' }) binCode!: string | null;
+  @ApiProperty({ format: 'uuid' }) actorId!: string;
+  @ApiProperty({ type: String, nullable: true }) actorEmail!: string | null;
+}
+
+export class OrderRecordDto {
+  @ApiProperty({ enum: ['order'] }) kind!: 'order';
+  @ApiProperty({ format: 'uuid', description: "The order's FIRST dispatch event (the one that billed it)" }) id!: string;
+  @ApiProperty({ description: "That event's recorded_at, ISO-8601 UTC at full precision" }) dispatchedAt!: string;
+  @ApiProperty({ format: 'uuid' }) warehouseId!: string;
+  @ApiProperty() warehouseCode!: string;
+  @ApiProperty({ type: OrderRefDto }) orderRef!: OrderRefDto;
+  @ApiProperty({ description: "The order's dispatch events in this window and group — one per order line shipped" }) lines!: number;
+  @ApiProperty({ type: String, nullable: true, description: "The first event's carrier" }) carrierName!: string | null;
+  @ApiProperty({ type: String, nullable: true }) trackingNumber!: string | null;
+  @ApiProperty({ format: 'uuid' }) actorId!: string;
+  @ApiProperty({ type: String, nullable: true }) actorEmail!: string | null;
+}
+
+export class StorageDayRecordDto {
+  @ApiProperty({ enum: ['storage-day'] }) kind!: 'storage-day';
+  @ApiProperty({ example: '2026-09-14', description: 'The IST day this is the closing stock of' }) date!: string;
+  @ApiProperty({ format: 'uuid' }) warehouseId!: string;
+  @ApiProperty() warehouseCode!: string;
+  @ApiProperty({ description: 'The base UoM (the line’s)' }) uom!: string;
+  @ApiProperty({ example: '300', description: 'On hand at the end of the IST day, base units — a decimal string' }) onHand!: string;
+}
+
+export const LINE_RECORD_DTOS = [ReceiptLineRecordDto, PickRecordDto, OrderRecordDto, StorageDayRecordDto] as const;
+
+export type LineRecordDto = ReceiptLineRecordDto | PickRecordDto | OrderRecordDto | StorageDayRecordDto;
+
+export class LineRecordsSummaryDto {
+  @ApiProperty({ example: '412', description: "The line's quantity as the line view states it (storage base-unit-days, a whole count otherwise)" })
+  lineQuantity!: string;
+
+  @ApiProperty({ example: '412', description: 'The same figure re-derived now from every record of the predicate, in the same units' })
+  recordsQuantity!: string;
+
+  @ApiProperty({ description: 'The two are exactly equal' })
+  reconciles!: boolean;
+}
+
+export class ClientInvoiceLineRecordsResponse {
+  @ApiProperty({ enum: [...LINE_RECORD_KINDS], description: 'The kind of every record on this line' })
+  kind!: LineRecordKind;
+
+  @ApiProperty({ enum: [...CLIENT_INVOICE_STATUSES], description: 'The invoice status the drill was read under' })
+  invoiceStatus!: ClientInvoiceStatus;
+
+  @ApiProperty({ type: LineRecordsSummaryDto, required: false, description: 'The first page only (no cursor)' })
+  summary?: LineRecordsSummaryDto;
+
+  @ApiProperty({
+    type: 'array',
+    items: {
+      oneOf: LINE_RECORD_DTOS.map((dto) => ({ $ref: getSchemaPath(dto) })),
+      discriminator: {
+        propertyName: 'kind',
+        mapping: {
+          'receipt-line': getSchemaPath(ReceiptLineRecordDto),
+          pick: getSchemaPath(PickRecordDto),
+          order: getSchemaPath(OrderRecordDto),
+          'storage-day': getSchemaPath(StorageDayRecordDto),
+        },
+      },
+    },
+  })
+  records!: LineRecordDto[];
+
+  @ApiProperty({ type: String, nullable: true })
+  nextCursor!: string | null;
+}
+
+export class StorageBreakdownSkuDto {
+  @ApiProperty({ format: 'uuid' }) skuId!: string;
+  @ApiProperty() skuCode!: string;
+  @ApiProperty() skuName!: string;
+  @ApiProperty({ example: '120.5', description: 'On hand at the end of the day, signed base units — a negative SKU is kept (it is part of the sum)' }) onHand!: string;
+}
+
+export class StorageBreakdownResponse {
+  @ApiProperty({ example: '2026-09-14' }) date!: string;
+  @ApiProperty({ format: 'uuid' }) warehouseId!: string;
+  @ApiProperty() warehouseCode!: string;
+  @ApiProperty() uom!: string;
+  @ApiProperty({ type: [StorageBreakdownSkuDto], description: 'Every SKU of the base UoM whose on-hand is not zero, by code' }) skus!: StorageBreakdownSkuDto[];
+  @ApiProperty({ description: 'Σ of the SKUs, base units' }) total!: string;
+  @ApiProperty({ type: String, nullable: true, description: "The day's snapshot, base units — null when the day closed at ≤ 0 (no snapshot is written)" })
+  snapshotOnHand!: string | null;
+  @ApiProperty({ description: 'total = snapshotOnHand (or total ≤ 0 when there is no snapshot)' }) reconciles!: boolean;
 }

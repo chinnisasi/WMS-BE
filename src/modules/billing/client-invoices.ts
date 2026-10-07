@@ -578,6 +578,23 @@ export function clientInvoiceContentHash(draft: Omit<ClientInvoiceDraft, 'conten
   return createHash('sha256').update(canonicalJson(content), 'utf8').digest('hex');
 }
 
+/** A draft as a compute stores it: the hashed content plus the (unhashed) storage measured-through day. */
+export interface ComputedDraft extends ClientInvoiceDraft {
+  /** Story 21-5b — the group's snapshot watermark clipped to `period_end` (`period_start − 1`: the group has no snapshot scope). */
+  readonly storageMeasuredThrough: string;
+}
+
+/**
+ * The group watermark, clipped to the month's last day. A group with NO
+ * watermark (no snapshot scope) stores `period_start − 1` — nothing measured
+ * — never NULL: NULL is reserved for a row stored before 0063 (read as
+ * `period_end` only on a non-draft invoice; see `storageDays`).
+ */
+export function measuredThroughOf(groupWatermark: string | null, periodStart: string, periodEnd: string): string {
+  if (groupWatermark === null) return addIsoDays(periodStart, -1);
+  return groupWatermark < periodEnd ? groupWatermark : periodEnd;
+}
+
 // ── the period ───────────────────────────────────────────────────────────────
 
 const MONTH_RE = /^(\d{4})-(0[1-9]|1[0-2])$/;
@@ -601,6 +618,8 @@ export function monthPeriod(month: string): { periodStart: string; periodEnd: st
 // ── the views ────────────────────────────────────────────────────────────────
 
 export interface ClientInvoiceLineView {
+  /** Story 21-5b — the line's id (the drill's address). A draft's lines are rewritten on refresh and issue (new ids). */
+  readonly id: string;
   readonly rateCardId: string | null;
   /** IST dates, inclusive. */
   readonly segmentFrom: string;
@@ -694,6 +713,7 @@ const numberOrNull = (value: string | number | null): number | null => (value ==
 async function linesOfInTx(tx: TenantTx, tenantId: string, invoiceId: string): Promise<ClientInvoiceLineView[]> {
   const rows = await tx
     .select({
+      id: clientInvoiceLines.id,
       rateCardId: clientInvoiceLines.rateCardId,
       segmentFrom: clientInvoiceLines.segmentFrom,
       segmentTo: clientInvoiceLines.segmentTo,
@@ -717,6 +737,7 @@ async function linesOfInTx(tx: TenantTx, tenantId: string, invoiceId: string): P
     .map((row) => ({ ...row, segmentFrom: new Date(row.segmentFrom).toISOString(), segmentTo: new Date(row.segmentTo).toISOString() }))
     .sort(compareLines)
     .map((row) => ({
+      id: row.id,
       rateCardId: row.rateCardId,
       segmentFrom: istDateOf(row.segmentFrom),
       segmentTo: addIsoDays(istDateOf(row.segmentTo), -1),
@@ -763,7 +784,7 @@ function invoiceNotDraft(row: ClientInvoice): ProblemException {
   );
 }
 
-function portalRefused(): ProblemException {
+export function portalRefused(): ProblemException {
   return new ProblemException(
     'role-denied',
     403,
@@ -952,7 +973,10 @@ export class ClientInvoiceService {
 
       const context = await this.contextInTx(tx, command.tenantId);
       const draft = await this.computeInTx(tx, command.tenantId, client, groupOf(context.groups, row.supplierGstin), row.periodStart, row.periodEnd, context);
-      const stored = draft.contentHash === row.contentHash ? row : await this.rewriteDraftInTx(tx, row, draft);
+      const stored =
+        draft.contentHash !== row.contentHash
+          ? await this.rewriteDraftInTx(tx, row, draft)
+          : await this.restampMeasuredThroughInTx(tx, row, draft.storageMeasuredThrough);
 
       const result: ClientInvoiceMutationResult = { invoice: await viewOfInTx(tx, stored) };
       await this.audit(tx, command, 'client_invoice.refreshed', row.id, idempotencyKey);
@@ -1027,6 +1051,7 @@ export class ClientInvoiceService {
           issuedAt,
           issuedBy: command.actorUserId,
           party: draft.party,
+          storageMeasuredThrough: draft.storageMeasuredThrough,
           updatedAt: nowIso(),
         })
         .where(and(eq(clientInvoices.tenantId, command.tenantId), eq(clientInvoices.id, row.id), eq(clientInvoices.status, 'draft')))
@@ -1177,7 +1202,7 @@ export class ClientInvoiceService {
     periodStart: string,
     periodEnd: string,
     context: { supplier: ClientInvoiceSupplierFacts; states: GstStateResolver },
-  ): Promise<ClientInvoiceDraft> {
+  ): Promise<ComputedDraft> {
     const narrowed = await this.metering.meterPeriodInTx(tx, tenantId, client.id, periodStart, periodEnd, {
       warehouseIds: group.warehouses.map((warehouse) => warehouse.id),
     });
@@ -1189,7 +1214,7 @@ export class ClientInvoiceService {
       storageCompleteThrough: await this.metering.clientStorageCompleteThroughInTx(tx, tenantId, client.id),
     };
     const eInvoiceApplies = group.supplierGstin === null ? false : await this.invoicing.eInvoiceAppliesInTx(tx, tenantId, group.supplierGstin);
-    return computeClientInvoiceDraft({
+    const draft = computeClientInvoiceDraft({
       periodStart,
       periodEnd,
       tenantName: context.supplier.tenantName,
@@ -1199,10 +1224,14 @@ export class ClientInvoiceService {
       eInvoiceApplies,
       states: context.states,
     });
+    // Story 21-5b: the storage lines counted the GROUP's measured days (the
+    // narrowed watermark), clipped to the month — what the drill lists.
+    return { ...draft, storageMeasuredThrough: measuredThroughOf(narrowed.storageCompleteThrough, periodStart, periodEnd) };
   }
 
-  private draftColumns(draft: ClientInvoiceDraft) {
+  private draftColumns(draft: ComputedDraft) {
     return {
+      storageMeasuredThrough: draft.storageMeasuredThrough,
       placeOfSupply: draft.placeOfSupply,
       supplyType: draft.supplyType,
       subtotalPaise: draft.totals.subtotalPaise,
@@ -1224,7 +1253,7 @@ export class ClientInvoiceService {
     tx: TenantTx,
     command: { tenantId: string; actorUserId: string },
     clientId: string,
-    draft: ClientInvoiceDraft,
+    draft: ComputedDraft,
     replacesInvoiceId: string | null,
   ): Promise<ClientInvoice> {
     let row: ClientInvoice;
@@ -1260,12 +1289,29 @@ export class ClientInvoiceService {
     return row;
   }
 
-  private async rewriteDraftInTx(tx: TenantTx, row: ClientInvoice, draft: ClientInvoiceDraft): Promise<ClientInvoice> {
+  private async rewriteDraftInTx(tx: TenantTx, row: ClientInvoice, draft: ComputedDraft): Promise<ClientInvoice> {
     await tx.delete(clientInvoiceLines).where(and(eq(clientInvoiceLines.tenantId, row.tenantId), eq(clientInvoiceLines.invoiceId, row.id)));
     await this.insertLinesInTx(tx, row, draft.lines);
     const rows = await tx
       .update(clientInvoices)
       .set({ ...this.draftColumns(draft), updatedAt: nowIso() })
+      .where(and(eq(clientInvoices.tenantId, row.tenantId), eq(clientInvoices.id, row.id), eq(clientInvoices.status, 'draft')))
+      .returning();
+    return rows[0]!;
+  }
+
+  /**
+   * Story 21-5b — a refresh whose figures did not move still records the
+   * group's measured-through day when it moved (a watermark crossing only
+   * zero-stock days changes no figure). Only that column — the row and its
+   * lines are otherwise untouched (`updated_at` included); nothing at all
+   * when it is unchanged.
+   */
+  private async restampMeasuredThroughInTx(tx: TenantTx, row: ClientInvoice, measuredThrough: string): Promise<ClientInvoice> {
+    if (row.storageMeasuredThrough === measuredThrough) return row;
+    const rows = await tx
+      .update(clientInvoices)
+      .set({ storageMeasuredThrough: measuredThrough })
       .where(and(eq(clientInvoices.tenantId, row.tenantId), eq(clientInvoices.id, row.id), eq(clientInvoices.status, 'draft')))
       .returning();
     return rows[0]!;
@@ -1471,7 +1517,7 @@ function clientNotFoundProblem(clientId: string): ProblemException {
   return new ProblemException('not-found', 404, 'Client not found', `No client with id "${clientId}" exists in this tenant.`);
 }
 
-function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
+export function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
   try {
     const decoded = decodeCursor(cursor);
     if (!UUID_RE.test(decoded.id) || !CURSOR_INSTANT_RE.test(decoded.createdAt) || Number.isNaN(Date.parse(decoded.createdAt))) {

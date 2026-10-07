@@ -1,6 +1,7 @@
 import { sql, type SQL } from 'drizzle-orm';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { warehouseFilter } from '../../shared/db/warehouse-filter';
+import type { KeysetWindow } from '../../shared/primitives/pagination';
 
 /**
  * Story 21-4 — the ledger reads client billing meters from (AD-25: billing is
@@ -205,4 +206,99 @@ export async function countDispatchedOrdersInTx(
     where ${dispatchedOrderEventsPredicate(scope, from, to)}
   `)) as unknown as { n: string | number }[];
   return Number(rows[0]?.n ?? 0);
+}
+
+/** Story 21-5b — one order of the dispatched-order drill: its FIRST dispatch event in the window. */
+export interface DispatchedOrderRecordRow {
+  /** The first event's id — the keyset tiebreaker. */
+  readonly eventId: string;
+  /** The first event's `recorded_at::text` — the raw Postgres text. */
+  readonly recordedAt: string;
+  readonly warehouseId: string;
+  readonly orderId: string;
+  /** The order's dispatch events in this window (and warehouse set) — one per order line shipped. */
+  readonly lines: number;
+  /** The first event's carrier arms (absent on a dispatch with no carrier recorded). */
+  readonly carrierName: string | null;
+  readonly trackingNumber: string | null;
+  readonly actorId: string;
+}
+
+/**
+ * Story 21-5b — the `per_order` dispute drill: one row per order the
+ * `per_order` count counts, on the SAME predicate
+ * (`dispatchedOrderEventsPredicate`). The order is represented by its first
+ * dispatch event in the window — `DISTINCT ON (orderId)` ordered by
+ * `(recorded_at, id)`; by the predicate's global "no earlier dispatch" probe
+ * that is the order's first dispatch anywhere, so an order is billed and
+ * drilled exactly once. `lines` counts the order's matching events (a window
+ * function, evaluated before the DISTINCT ON). Ascending on the first event's
+ * `(recorded_at, id)`, keyset-paged after `window.after`.
+ */
+export async function dispatchedOrderRecordsInTx(
+  tx: TenantTx,
+  scope: ClientScope,
+  from: string,
+  to: string,
+  window: KeysetWindow,
+): Promise<DispatchedOrderRecordRow[]> {
+  const after =
+    window.after === null ? sql`` : sql`where (f.recorded_at, f.id) > (${window.after.createdAt}::timestamptz, ${window.after.id}::uuid)`;
+  const rows = (await tx.execute(sql`
+    select f.id as "eventId", f.recorded_at::text as "recordedAt", f.warehouse_id as "warehouseId", f.order_id as "orderId",
+      f.lines::text as "lines", f.carrier_name as "carrierName", f.tracking_number as "trackingNumber", f.actor_user_id as "actorId"
+    from (
+      select distinct on (le.reference_doc ->> 'orderId')
+        le.id, le.recorded_at, le.warehouse_id, le.reference_doc ->> 'orderId' as order_id,
+        count(*) over (partition by le.reference_doc ->> 'orderId') as lines,
+        le.reference_doc ->> 'carrierName' as carrier_name,
+        le.reference_doc ->> 'trackingNumber' as tracking_number,
+        le.actor_user_id
+      from ledger_events le
+      where ${dispatchedOrderEventsPredicate(scope, from, to)}
+      order by le.reference_doc ->> 'orderId', le.recorded_at, le.id
+    ) f
+    ${after}
+    order by f.recorded_at, f.id
+    limit ${window.limit}
+  `)) as unknown as (Omit<DispatchedOrderRecordRow, 'lines'> & { lines: string })[];
+  return rows.map((row) => ({ ...row, lines: Number(row.lines) }));
+}
+
+/** Story 21-5b — one SKU's on-hand in a storage breakdown (milli-units, signed). */
+export interface ClientSkuOnHand {
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly skuName: string;
+  readonly milli: bigint;
+}
+
+/**
+ * Story 21-5b — the storage drill's per-SKU breakdown of ONE (day,
+ * warehouse): one client's on-hand per SKU of one base UoM at `toInstant`,
+ * folded from genesis with `ON_HAND_FOLD_TERM` on `le.client_id` (the event's
+ * stamp — the snapshot's own grouping). Rows whose on-hand is not zero —
+ * NEGATIVE ones included (the sum must equal the snapshot, and a negative
+ * SKU is part of it). Ordered by SKU code.
+ */
+export async function clientOnHandBySkuAtInTx(
+  tx: TenantTx,
+  scope: ClientWarehouseScope,
+  uom: string,
+  toInstant: string,
+): Promise<ClientSkuOnHand[]> {
+  const rows = (await tx.execute(sql`
+    select s.id as "skuId", s.code as "skuCode", s.name as "skuName", sum(${ON_HAND_FOLD_TERM})::text as "milli"
+    from ledger_events le
+    join skus s on s.tenant_id = le.tenant_id and s.id = le.sku_id
+    where le.tenant_id = ${scope.tenantId}::uuid
+      and le.client_id = ${scope.clientId}::uuid
+      and le.warehouse_id = ${scope.warehouseId}::uuid
+      and s.uom = ${uom}
+      and le.recorded_at < ${toInstant}::timestamptz
+    group by s.id, s.code, s.name
+    having sum(${ON_HAND_FOLD_TERM}) <> 0
+    order by s.code, s.id
+  `)) as unknown as { skuId: string; skuCode: string; skuName: string; milli: string }[];
+  return rows.map((row) => ({ skuId: row.skuId, skuCode: row.skuCode, skuName: row.skuName, milli: BigInt(row.milli) }));
 }

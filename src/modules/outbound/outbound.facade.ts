@@ -17,7 +17,7 @@ import {
 } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
-import type { Page } from '../../shared/primitives/pagination';
+import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { addressFromColumns } from '../../shared/primitives/address';
@@ -1192,6 +1192,86 @@ export class OutboundFacade {
     `)) as unknown as { n: string | number }[];
     return Number(rows[0]?.n ?? 0);
   }
+
+  /**
+   * Story 21-5b — the `per_pick` dispute drill: the `picks` rows
+   * `countPicksInTx` counts, one row each, on the SAME predicate
+   * (`picksPredicate`), ascending on `(created_at, id)` and keyset-paged
+   * after `window.after` (picks of one transaction share a `created_at`, so
+   * the id breaks the tie). Each row names its order (source and channel
+   * event id — the order row is outbound's own), the SKU, the scanned bin,
+   * the quantity (milli-units, as text) and the picker. `createdAt` is the
+   * raw `::text`.
+   */
+  async pickRecordsInTx(
+    tx: TenantTx,
+    scope: ClientCountScope,
+    from: string,
+    to: string,
+    window: KeysetWindow,
+  ): Promise<PickRecordRow[]> {
+    const after =
+      window.after === null ? sql`` : sql`and (p.created_at, p.id) > (${window.after.createdAt}::timestamptz, ${window.after.id}::uuid)`;
+    const rows = (await tx.execute(sql`
+      select p.id as "id", p.created_at::text as "createdAt", p.warehouse_id as "warehouseId",
+        p.order_id as "orderId", o.source as "orderSource", o.external_event_id as "orderExternalEventId",
+        p.sku_id as "skuId", s.code as "skuCode", s.name as "skuName", p.qty::text as "qtyMilli",
+        b.code as "binCode", p.picked_by as "actorId"
+      from picks p
+      join skus s on s.tenant_id = p.tenant_id and s.id = p.sku_id
+      left join orders o on o.tenant_id = p.tenant_id and o.id = p.order_id
+      left join bins b on b.tenant_id = p.tenant_id and b.id = p.bin_id
+      where ${picksPredicate(scope, from, to)}
+        ${after}
+      order by p.created_at, p.id
+      limit ${window.limit}
+    `)) as unknown as PickRecordRow[];
+    return rows.map((row) => ({ ...row }));
+  }
+
+  /**
+   * Story 21-5b — the client-facing reference of each order: its source
+   * (`manual` or a channel) and the channel's event id (null on a manual
+   * order — there is no order number yet, PENDING). The dispatched-order
+   * drill reads its orders from the ledger (inventory) and names them here.
+   * An id with no order row is absent from the map.
+   */
+  async orderRefsInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, OrderRef>> {
+    const distinct = [...new Set(orderIds)].filter((id) => UUID_RE.test(id));
+    if (distinct.length === 0) return new Map();
+    const rows = (await tx.execute(sql`
+      select o.id as "orderId", o.source as "source", o.external_event_id as "externalEventId"
+      from orders o
+      where o.tenant_id = ${tenantId}::uuid and o.id = any(${sql.param(distinct)}::uuid[])
+    `)) as unknown as OrderRef[];
+    return new Map(rows.map((row) => [row.orderId, { orderId: row.orderId, source: row.source, externalEventId: row.externalEventId }]));
+  }
+}
+
+/** Story 21-5b — an order's client-facing reference. */
+export interface OrderRef {
+  readonly orderId: string;
+  readonly source: string;
+  /** The channel's event id; null on a manual order. */
+  readonly externalEventId: string | null;
+}
+
+/** Story 21-5b — one pick of a pick drill (quantity milli-units as text). */
+export interface PickRecordRow {
+  readonly id: string;
+  /** `p.created_at::text` — the raw Postgres text. */
+  readonly createdAt: string;
+  readonly warehouseId: string;
+  readonly orderId: string;
+  /** Null only when the order row is missing. */
+  readonly orderSource: string | null;
+  readonly orderExternalEventId: string | null;
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly skuName: string;
+  readonly qtyMilli: string;
+  readonly binCode: string | null;
+  readonly actorId: string;
 }
 
 /**

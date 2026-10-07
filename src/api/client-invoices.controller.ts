@@ -30,8 +30,13 @@ import {
   type ClientInvoiceVerb,
   type ClientInvoiceView,
 } from '../modules/billing/client-invoices';
+import { InvoiceRecordsService, LINE_RECORDS_DEFAULT_LIMIT, LINE_RECORDS_MAX_LIMIT } from '../modules/billing/invoice-records';
 import {
+  ClientInvoiceLineRecordsResponse,
   ClientInvoiceListResponse,
+  LINE_RECORD_DTOS,
+  StorageBreakdownResponse,
+  type LineRecordDto,
   ClientInvoiceNoteDto,
   ClientInvoiceResponse,
   IssueClientInvoiceResponse,
@@ -80,6 +85,33 @@ export class ClientInvoiceListQuery {
   limit?: number;
 }
 
+/** Story 21-5b — a line drill's page query. */
+export class ClientInvoiceLineRecordsQuery {
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from a previous page (no cursor = the first page, which carries the summary)' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, minimum: 1, maximum: LINE_RECORDS_MAX_LIMIT, default: LINE_RECORDS_DEFAULT_LIMIT })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(LINE_RECORDS_MAX_LIMIT)
+  limit?: number;
+}
+
+/** Story 21-5b — a storage day's per-SKU breakdown query (both required; the service checks a real date and a uuid). */
+export class StorageBreakdownQueryDto {
+  @ApiProperty({ example: '2026-09-14', description: 'An IST day of the line’s measured segment, YYYY-MM-DD' })
+  @IsString()
+  date!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'A warehouse of the invoice’s supplying-GSTIN group' })
+  @IsString()
+  warehouseId!: string;
+}
+
 const MUTATION_403 =
   'Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)';
 const READ_403 = 'Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): this is an operator surface';
@@ -92,10 +124,13 @@ const READ_403 = 'Session belongs to another tenant (permission-denied), or a cl
  * locks, the period rule, the gaps and the transitions; this maps DTOs.
  */
 @ApiTags('billing')
-@ApiExtraModels(ProblemDetailsDto)
+@ApiExtraModels(ProblemDetailsDto, ...LINE_RECORD_DTOS)
 @Controller('tenants')
 export class ClientInvoicesController {
-  constructor(@Inject(ClientInvoiceService) private readonly invoices: ClientInvoiceService) {}
+  constructor(
+    @Inject(ClientInvoiceService) private readonly invoices: ClientInvoiceService,
+    @Inject(InvoiceRecordsService) private readonly records: InvoiceRecordsService,
+  ) {}
 
   @Post(':tenantId/clients/:clientId/invoices')
   @HttpCode(HttpStatus.CREATED)
@@ -178,6 +213,80 @@ export class ClientInvoicesController {
     assertOwnTenant(session, tenantId);
     assertUuidParam(invoiceId, 'invoiceId');
     return { invoice: toInvoiceDto(await this.invoices.get(tenantId, session.userId, invoiceId)) };
+  }
+
+  @Get(':tenantId/client-invoices/:invoiceId/lines/:lineId/records')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "The dispute drill-down (21-5b): one keyset page of the records a client-invoice line's quantity was counted from — GRN lines, picks, orders at their first dispatch, or (day, warehouse) storage snapshots — on any status; the first page carries `summary {lineQuantity, recordsQuantity, reconciles}`",
+  })
+  @ApiOkResponse({ type: ClientInvoiceLineRecordsResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed invoiceId or lineId, a limit outside 1–1,000 (validation-failed), or a malformed cursor (invalid-cursor)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(READ_403) })
+  @ApiResponse({
+    status: 404,
+    ...problemJsonResponse("No such invoice in this tenant, or no such line on it — a draft's line ids change when it is refreshed: reload (not-found)"),
+  })
+  @ApiResponse({ status: 409, ...problemJsonResponse("The invoice's supplying GSTIN no longer maps to any warehouse (invoice-group-changed)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'invoiceId', format: 'uuid' })
+  @ApiParam({ name: 'lineId', format: 'uuid' })
+  async lineRecords(
+    @Param('tenantId') tenantId: string,
+    @Param('invoiceId') invoiceId: string,
+    @Param('lineId') lineId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: ClientInvoiceLineRecordsQuery,
+  ): Promise<ClientInvoiceLineRecordsResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(invoiceId, 'invoiceId');
+    assertUuidParam(lineId, 'lineId');
+    const page = await this.records.lineRecords(tenantId, session.userId, invoiceId, lineId, { cursor: query.cursor, limit: query.limit });
+    return {
+      kind: page.kind,
+      invoiceStatus: page.invoiceStatus,
+      ...(page.summary === undefined ? {} : { summary: { ...page.summary } }),
+      records: page.records.map((record) => ({ ...record }) as LineRecordDto),
+      nextCursor: page.nextCursor,
+    };
+  }
+
+  @Get(':tenantId/client-invoices/:invoiceId/lines/:lineId/storage-breakdown')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "A storage line's one-day per-SKU breakdown (21-5b): the client's on-hand per SKU of the line's base UoM at the end of the IST day in one warehouse, folded from the ledger, beside that day's snapshot",
+  })
+  @ApiOkResponse({ type: StorageBreakdownResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed invoiceId, lineId, date or warehouseId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(READ_403) })
+  @ApiResponse({
+    status: 404,
+    ...problemJsonResponse(
+      'No such invoice or line; not a storage line; a date outside the line’s measured segment; or a warehouse outside the invoice’s group (not-found)',
+    ),
+  })
+  @ApiResponse({ status: 409, ...problemJsonResponse("The invoice's supplying GSTIN no longer maps to any warehouse (invoice-group-changed)") })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'invoiceId', format: 'uuid' })
+  @ApiParam({ name: 'lineId', format: 'uuid' })
+  async storageBreakdown(
+    @Param('tenantId') tenantId: string,
+    @Param('invoiceId') invoiceId: string,
+    @Param('lineId') lineId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: StorageBreakdownQueryDto,
+  ): Promise<StorageBreakdownResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(invoiceId, 'invoiceId');
+    assertUuidParam(lineId, 'lineId');
+    const view = await this.records.storageBreakdown(tenantId, session.userId, invoiceId, lineId, { date: query.date, warehouseId: query.warehouseId });
+    return { ...view, skus: view.skus.map((sku) => ({ ...sku })) };
   }
 
   @Post(':tenantId/client-invoices/:invoiceId/refresh')

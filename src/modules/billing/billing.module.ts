@@ -6,6 +6,7 @@ import { OutboundModule } from '../outbound/outbound.module';
 import { InvoicingModule } from '../invoicing/invoicing.module';
 import { BillingFacade } from './billing.facade';
 import { ClientInvoiceService } from './client-invoices';
+import { InvoiceRecordsService } from './invoice-records';
 import { MeteringService } from './metering';
 import { RateCardCommand } from './rate-card.command';
 import { StorageSnapshotService } from './storage-snapshot';
@@ -27,10 +28,15 @@ import { StorageSnapshotService } from './storage-snapshot';
  * it imports `InvoicingModule` for TWO facade reads only (the per-GSTIN
  * e-invoicing flag and the CBIC state-code list — invoicing imports nothing
  * back) and reads the supplier facts through tenancy's in-tx seam.
+ *
+ * Story 21-5b adds the dispute drill-down (`InvoiceRecordsService`): a line's
+ * records through the inbound, outbound and inventory facades' row reads
+ * (beside their counts, on the same predicates), the actors' emails through
+ * tenancy's in-tx seam, and its own storage snapshots.
  */
 @Module({
   imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, InvoicingModule],
-  providers: [RateCardCommand, BillingFacade, MeteringService, StorageSnapshotService, ClientInvoiceService],
-  exports: [RateCardCommand, BillingFacade, ClientInvoiceService],
+  providers: [RateCardCommand, BillingFacade, MeteringService, StorageSnapshotService, ClientInvoiceService, InvoiceRecordsService],
+  exports: [RateCardCommand, BillingFacade, ClientInvoiceService, InvoiceRecordsService],
 })
 export class BillingModule {}

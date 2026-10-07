@@ -6,7 +6,7 @@ import type { Database } from '../../shared/db/db';
 import { purchaseOrderLines, purchaseOrders, vendors } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
-import type { Page } from '../../shared/primitives/pagination';
+import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
@@ -338,6 +338,60 @@ export class InboundFacade {
     `)) as unknown as { n: string | number }[];
     return Number(rows[0]?.n ?? 0);
   }
+
+  /**
+   * Story 21-5b — the `per_receipt_line` dispute drill: the GRN lines
+   * `countReceiptLinesInTx` counts, one row each, on the SAME predicate
+   * (`receiptLinesPredicate`), ascending on `(grn.recorded_at, grl.id)` and
+   * keyset-paged after `window.after`. Each row names its GRN, its PO (null
+   * on a blind receipt), the SKU, both quantities (milli-units, as text —
+   * the caller formats) and the recording actor. `recordedAt` is the raw
+   * `::text` (the caller renders it through `fullPrecisionInstant`, which is
+   * also the cursor). The sort rides no index today (PENDING).
+   */
+  async receiptLineRecordsInTx(
+    tx: TenantTx,
+    scope: ClientCountScope,
+    from: string,
+    to: string,
+    window: KeysetWindow,
+  ): Promise<ReceiptLineRecordRow[]> {
+    const after =
+      window.after === null
+        ? sql``
+        : sql`and (grn.recorded_at, grl.id) > (${window.after.createdAt}::timestamptz, ${window.after.id}::uuid)`;
+    const rows = (await tx.execute(sql`
+      select grl.id as "id", grn.recorded_at::text as "recordedAt", grn.code as "grnCode", po.code as "poCode",
+        grn.warehouse_id as "warehouseId", grl.sku_id as "skuId", s.code as "skuCode", s.name as "skuName",
+        grl.qty::text as "qtyMilli", grl.applied_qty::text as "appliedQtyMilli", grn.recorded_by as "actorId"
+      from goods_receipt_lines grl
+      join goods_receipt_notes grn on grn.tenant_id = grl.tenant_id and grn.id = grl.grn_id
+      join skus s on s.tenant_id = grl.tenant_id and s.id = grl.sku_id
+      left join purchase_orders po on po.tenant_id = grn.tenant_id and po.id = grn.po_id
+      where ${receiptLinesPredicate(scope, from, to)}
+        ${after}
+      order by grn.recorded_at, grl.id
+      limit ${window.limit}
+    `)) as unknown as ReceiptLineRecordRow[];
+    return rows.map((row) => ({ ...row }));
+  }
+}
+
+/** Story 21-5b — one GRN line of a receipt-line drill (quantities milli-units as text). */
+export interface ReceiptLineRecordRow {
+  readonly id: string;
+  /** `grn.recorded_at::text` — the raw Postgres text. */
+  readonly recordedAt: string;
+  readonly grnCode: string;
+  /** Null on a blind receipt. */
+  readonly poCode: string | null;
+  readonly warehouseId: string;
+  readonly skuId: string;
+  readonly skuCode: string;
+  readonly skuName: string;
+  readonly qtyMilli: string;
+  readonly appliedQtyMilli: string;
+  readonly actorId: string;
 }
 
 /**
