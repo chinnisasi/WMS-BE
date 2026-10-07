@@ -5,6 +5,7 @@ import { DATABASE } from '../../shared/shared.module';
 import {
   ewayBills,
   ewayGstinSettings,
+  gstStateCodes,
   ewayStateThresholds,
   invoiceLines,
   invoices,
@@ -42,6 +43,7 @@ import {
 } from './view';
 import type { InvoiceEntry, InvoiceView } from './view';
 import { CatalogFacade } from '../catalog/catalog.facade';
+import { normalizeStateName, resolveStateCode, type StateCodeEntry } from './generator';
 import {
   assertGstinParam,
   hsnSummaryGstinsInTx,
@@ -50,6 +52,14 @@ import {
   type HsnSummaryGstin,
   type HsnSummaryView,
 } from './hsn-summary';
+
+/** Story 21-5 — the state-code list as a resolver (`InvoicingFacade.gstStateResolverInTx`). */
+export interface GstStateResolver {
+  /** The official state name of a two-digit code, or null. */
+  nameOf(code: string): string | null;
+  /** An address's free-text state resolved to its code (normalised, aliases applied), or null. */
+  codeOfText(text: string | null): string | null;
+}
 
 /**
  * The invoicing module's read surface (story 8-1): the invoice list, an
@@ -202,6 +212,45 @@ export class InvoicingFacade {
         (gstin) => byGstin.get(gstin) ?? { gstin, eInvoiceApplies: false, updatedBy: null, updatedAt: null },
       );
     });
+  }
+
+  /**
+   * Story 21-5 — whether e-invoicing (IRN) applies to one of the tenant's
+   * GSTINs: the 8-2b per-GSTIN setting (`e_invoice_applies`), false when
+   * never set. In the caller's transaction — billing's client-invoice draft
+   * raises an `einvoice-required` gap on it (IRN itself is out of scope).
+   */
+  async eInvoiceAppliesInTx(tx: TenantTx, tenantId: string, gstin: string): Promise<boolean> {
+    const rows = await tx
+      .select({ applies: ewayGstinSettings.eInvoiceApplies })
+      .from(ewayGstinSettings)
+      .where(and(eq(ewayGstinSettings.tenantId, tenantId), eq(ewayGstinSettings.gstin, gstin)))
+      .limit(1);
+    return rows[0]?.applies ?? false;
+  }
+
+  /**
+   * Story 21-5 — the CBIC state-code list as a resolver, in the caller's
+   * transaction: `nameOf(code)` (the official name, or null) and
+   * `codeOfText(text)` (an address's free-text state resolved the way the
+   * goods invoice resolves it — normalised, aliases applied — or null).
+   * Billing's client invoice prints the place of supply by name and code and
+   * compares a warehouse's origin state against its GSTIN's state.
+   */
+  async gstStateResolverInTx(tx: TenantTx): Promise<GstStateResolver> {
+    const rows = await tx.select().from(gstStateCodes);
+    const byCode = new Map<string, StateCodeEntry>();
+    const byName = new Map<string, StateCodeEntry>();
+    for (const row of rows) {
+      const entry: StateCodeEntry = { stateCode: row.stateCode, stateName: row.stateName };
+      byCode.set(entry.stateCode, entry);
+      byName.set(normalizeStateName(entry.stateName), entry);
+    }
+    const noGstin = new Map<string, StateCodeEntry>();
+    return {
+      nameOf: (code) => byCode.get(code)?.stateName ?? null,
+      codeOfText: (text) => resolveStateCode(noGstin, byName, null, text)?.code ?? null,
+    };
   }
 
   /**

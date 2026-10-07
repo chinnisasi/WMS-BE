@@ -867,8 +867,13 @@ describe('users, roles, and permission gating (e2e)', () => {
     // reverses 8-1's "the accountant does not set prices" for the client
     // price list only — the tax document's rate override stays
     // `invoice.generate` (owner + ops_manager, pinned below); ops_manager
-    // does NOT hold `rates.manage`.
-    expect([...CAPABILITIES]).toHaveLength(38);
+    // does NOT hold `rates.manage`. Story 21-5 grows it to 39 with
+    // `billing.invoice` — owner + ACCOUNTANT (client invoices and the client
+    // tax details are finance work, the `rates.manage` rationale);
+    // ops_manager does NOT hold it.
+    expect([...CAPABILITIES]).toHaveLength(39);
+    expect(CAPABILITIES).toContain('billing.invoice');
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('billing.invoice'))).toEqual(['owner', 'accountant']);
     expect(CAPABILITIES).toContain('rates.manage');
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('rates.manage'))).toEqual(['owner', 'accountant']);
     expect(CAPABILITIES).toContain('clients.manage');
@@ -877,7 +882,7 @@ describe('users, roles, and permission gating (e2e)', () => {
     expect(CAPABILITIES).toContain('eway.configure');
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('eway.manage'))).toEqual(['owner', 'ops_manager', 'accountant']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('eway.configure'))).toEqual(['owner']);
-    expect([...ROLE_CAPABILITIES.accountant]).toEqual(['eway.manage', 'rates.manage']);
+    expect([...ROLE_CAPABILITIES.accountant]).toEqual(['eway.manage', 'rates.manage', 'billing.invoice']);
     expect(CAPABILITIES).toContain('invoice.generate');
     expect(ROLE_CAPABILITIES.owner.has('invoice.generate')).toBe(true);
     expect(ROLE_CAPABILITIES.ops_manager.has('invoice.generate')).toBe(true);

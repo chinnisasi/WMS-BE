@@ -1,5 +1,6 @@
 import { sql, type SQL } from 'drizzle-orm';
 import type { TenantTx } from '../../shared/db/tenant-scope';
+import { warehouseFilter } from '../../shared/db/warehouse-filter';
 
 /**
  * Story 21-4 — the ledger reads client billing meters from (AD-25: billing is
@@ -21,10 +22,17 @@ export interface ClientWarehouseScope {
   readonly warehouseId: string;
 }
 
-/** One client across every warehouse — the handling counts' scope. */
+/**
+ * One client across every warehouse — the handling counts' scope. Story 21-5:
+ * an optional `warehouseIds` narrows it to a set of warehouses (a client
+ * invoice meters each supplying GSTIN over ITS warehouses only). Absent =
+ * every warehouse, and the predicate is byte-identical to 21-4's; an EMPTY
+ * list matches nothing.
+ */
 export interface ClientScope {
   readonly tenantId: string;
   readonly clientId: string;
+  readonly warehouseIds?: readonly string[] | undefined;
 }
 
 /** One IST day's net on-hand movement of one base UoM, in milli-units. */
@@ -165,11 +173,14 @@ export async function firstEventInstantInTx(tx: TenantTx, scope: ClientWarehouse
  * `reference_doc->>'orderId'` partial index (hence the `? 'orderId'` qual).
  */
 export function dispatchedOrderEventsPredicate(scope: ClientScope, from: string, to: string): SQL {
+  // Story 21-5: the warehouse narrowing filters the OUTER (window) events
+  // only — the "no earlier dispatch" probe stays across every warehouse, so
+  // an order is still attributed to its first dispatch, wherever that was.
   return sql`le.tenant_id = ${scope.tenantId}::uuid
     and le.client_id = ${scope.clientId}::uuid
     and le.type = 'dispatch.dispatched'
     and le.recorded_at >= ${from}::timestamptz
-    and le.recorded_at < ${to}::timestamptz
+    and le.recorded_at < ${to}::timestamptz${warehouseFilter(sql`le.warehouse_id`, scope.warehouseIds)}
     and not exists (
       select 1 from ledger_events earlier
       where earlier.reference_doc ? 'orderId'

@@ -1,5 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, sql, type SQL } from 'drizzle-orm';
+import { warehouseFilter, type ClientCountScope } from '../../shared/db/warehouse-filter';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { getClientsInTx } from '../clients/clients.facade';
@@ -1179,7 +1180,7 @@ export class OutboundFacade {
    */
   async countPicksInTx(
     tx: TenantTx,
-    scope: { readonly tenantId: string; readonly clientId: string },
+    scope: ClientCountScope,
     from: string,
     to: string,
   ): Promise<number> {
@@ -1202,13 +1203,10 @@ export class OutboundFacade {
  * A zero-unit short pick writes no row, and transfers create no picks — so
  * neither is billed as a pick.
  */
-export function picksPredicate(
-  scope: { readonly tenantId: string; readonly clientId: string },
-  from: string,
-  to: string,
-): SQL {
+export function picksPredicate(scope: ClientCountScope, from: string, to: string): SQL {
+  // Story 21-5: `scope.warehouseIds` narrows to the pick's warehouse.
   return sql`p.tenant_id = ${scope.tenantId}::uuid
     and s.client_id = ${scope.clientId}::uuid
     and p.created_at >= ${from}::timestamptz
-    and p.created_at < ${to}::timestamptz`;
+    and p.created_at < ${to}::timestamptz${warehouseFilter(sql`p.warehouse_id`, scope.warehouseIds)}`;
 }

@@ -36,6 +36,7 @@ import { ClientsController } from './clients.controller';
 import { ClientsModule } from '../modules/clients/clients.module';
 import { RateCardsController } from './rate-cards.controller';
 import { BillingUsageController } from './billing-usage.controller';
+import { ClientInvoicesController } from './client-invoices.controller';
 import { BillingModule } from '../modules/billing/billing.module';
 
 /**
@@ -124,6 +125,9 @@ import { BillingModule } from '../modules/billing/billing.module';
     RateCardsController,
     // Story 21-4 — the metered-usage read (member-open; never the portal's).
     BillingUsageController,
+    // Story 21-5 — client invoices (prepare, list, detail, refresh, discard,
+    // issue, dispute/settle/void) — `ClientInvoiceService` owns every rule.
+    ClientInvoicesController,
     // Story 7-2 — the channel webhook surface (guardless by construction:
     // the provider's AUTHORITY is its signature, not a session). The
     // last-siblings convention keeps NotFoundController LAST (registered

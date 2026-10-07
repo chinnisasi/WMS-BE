@@ -19,7 +19,7 @@ import type { TenantSession } from '../modules/tenancy/jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { ClientsCommand } from '../modules/clients/clients.command';
 import { ClientsFacade, type ClientSnapshot } from '../modules/clients/clients.facade';
-import { ClientListResponse, ClientResponse, CreateClientDto, RenameClientDto } from './clients.dto';
+import { ClientListResponse, ClientResponse, CreateClientDto, RenameClientDto, UpdateClientTaxDetailsDto } from './clients.dto';
 import type { ClientDto } from './clients.dto';
 
 const IDEMPOTENCY_HEADER = [
@@ -132,10 +132,78 @@ export class ClientsController {
     );
     return { client: toClientDto(snapshot.client) };
   }
+
+  // Story 21-5 — the literal `tax-details` segment sits under `:clientId`,
+  // so it cannot collide with the PATCH above (a different path depth).
+  @Patch(':tenantId/clients/:clientId/tax-details')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Sets a client brand's tax details — legal name, GSTIN and billing address (owner + accountant, billing.invoice). Absent fields are unchanged; null or blank clears",
+  })
+  @ApiBody({ type: UpdateClientTaxDetailsDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ClientResponse })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      "Missing or malformed Idempotency-Key, a malformed clientId, a malformed GSTIN or one whose prefix is not a registration state code, a billing state code off the registration list, a GSTIN in another state than the billing state, a pincode that is not six digits, an over-long field, or the tenant's own self client (validation-failed)",
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async updateTaxDetails(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UpdateClientTaxDetailsDto,
+  ): Promise<ClientResponse> {
+    assertOwnTenant(session, tenantId);
+    if (!UUID_RE.test(clientId)) {
+      throw new ProblemException('validation-failed', 400, 'Malformed clientId', `clientId must be a uuid (got "${clientId}").`);
+    }
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.updateTaxDetails(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        clientId,
+        legalName: dto.legalName,
+        gstin: dto.gstin,
+        billingLine1: dto.billingLine1,
+        billingLine2: dto.billingLine2,
+        billingCity: dto.billingCity,
+        billingStateCode: dto.billingStateCode,
+        billingPincode: dto.billingPincode,
+      },
+      key,
+    );
+    return { client: toClientDto(snapshot.client) };
+  }
 }
 
 function toClientDto(client: ClientSnapshot): ClientDto {
-  return { ...client };
+  // A replay of a pre-21-5 snapshot carries no tax details — read them as unset.
+  return {
+    ...client,
+    taxDetails: client.taxDetails ?? {
+      legalName: null,
+      gstin: null,
+      billingLine1: null,
+      billingLine2: null,
+      billingCity: null,
+      billingStateCode: null,
+      billingPincode: null,
+    },
+  };
 }
 
 function assertOwnTenant(session: TenantSession, tenantId: string): void {

@@ -1521,8 +1521,18 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
    */
   // Story 21-4 adds the storage snapshots and their per-scope watermark —
   // billing-owned the same way (a projection over the ledger, AD-25).
-  const BILLING_TABLES = ['rateCards', 'rateCardLines', 'storageSnapshots', 'storageSnapshotProgress'] as const;
-  const RAW_BILLING_TABLES = 'rate_cards|rate_card_lines|storage_snapshots|storage_snapshot_progress';
+  // Story 21-5 adds the client invoices, their lines and the services series.
+  const BILLING_TABLES = [
+    'rateCards',
+    'rateCardLines',
+    'storageSnapshots',
+    'storageSnapshotProgress',
+    'clientInvoices',
+    'clientInvoiceLines',
+    'clientInvoiceSeries',
+  ] as const;
+  const RAW_BILLING_TABLES =
+    'rate_cards|rate_card_lines|storage_snapshots|storage_snapshot_progress|client_invoices|client_invoice_lines|client_invoice_series';
   const billingRoot = join(SRC_ROOT, 'modules', 'billing');
   const billingFiles = files.filter((file) => file.path.startsWith(billingRoot));
 
@@ -1573,11 +1583,11 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
     const schemaFile = join(SRC_ROOT, 'shared', 'db', 'schema.ts');
     const offenders = files
       .filter((file) => !file.path.startsWith(billingRoot) && file.path !== schemaFile)
-      .filter((file) => /\b(rateCards|rateCardLines|storageSnapshots|storageSnapshotProgress)\b/.test(file.source))
+      .filter((file) => /\b(rateCards|rateCardLines|storageSnapshots|storageSnapshotProgress|clientInvoices|clientInvoiceLines|clientInvoiceSeries)\b/.test(file.source))
       .map((file) => file.path);
     expect(offenders).toEqual([]);
     const publicVocabulary = readFileSync(join(billingRoot, 'rate-cards.ts'), 'utf8');
-    expect(/export\s*\{[^}]*\b(rateCards|rateCardLines|storageSnapshots|storageSnapshotProgress)\b/.test(publicVocabulary)).toBe(false);
+    expect(/export\s*\{[^}]*\b(rateCards|rateCardLines|storageSnapshots|storageSnapshotProgress|clientInvoices|clientInvoiceLines|clientInvoiceSeries)\b/.test(publicVocabulary)).toBe(false);
     // Meaningful: the facade really does read them.
     expect(/\bfrom\(\s*rateCards\b/.test(readFileSync(join(billingRoot, 'billing.facade.ts'), 'utf8'))).toBe(true);
   });
@@ -1600,6 +1610,20 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
     expect(/update storage_snapshot_progress\b/i.test(snapshots)).toBe(true);
     expect(/\.delete\(\s*storageSnapshots\b/.test(snapshots)).toBe(true);
     expect(/\bfrom\(\s*storageSnapshots\b/.test(readFileSync(join(billingRoot, 'metering.ts'), 'utf8'))).toBe(true);
+  });
+
+  it('the client-invoice service really writes the three 21-5 tables, and reaches invoicing only through its facade (the test is meaningful)', () => {
+    const service = readFileSync(join(billingRoot, 'client-invoices.ts'), 'utf8');
+    for (const table of ['clientInvoices', 'clientInvoiceLines', 'clientInvoiceSeries'] as const) {
+      expect(drizzleWriteOn(table).test(service)).toBe(true);
+    }
+    // Billing reads the e-invoicing flag and the state codes ONLY through
+    // `InvoicingFacade` — never invoicing's tables or internals.
+    const offenders = billingFiles
+      .filter((file) => /from '\.\.\/invoicing\/(?!facade'|invoicing\.module')/.test(file.source) || /\b(ewayGstinSettings|gstStateCodes|invoiceSeries)\b/.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+    expect(service).toContain("from '../invoicing/facade'");
   });
 
   it('billing reads the ledger, the GRN lines and the picks ONLY through the inventory, inbound and outbound facades (story 21-4)', () => {

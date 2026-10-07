@@ -1,6 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsString, Length, Matches } from 'class-validator';
+import { IsOptional, IsString, Length, Matches, MaxLength, ValidateIf } from 'class-validator';
 import { CLIENT_NAME_MAX, CLIENT_STATUSES, type ClientStatus } from '../modules/clients/clients.schema';
 
 /**
@@ -43,6 +43,88 @@ export class RenameClientDto {
   name!: string;
 }
 
+/**
+ * Story 21-5 — the tax-details patch. Every field optional: ABSENT leaves it
+ * unchanged, `null` (or a blank string) clears it. The DTO checks only that
+ * a present value is a string (or null) within the column ceilings; every
+ * shape rule (GSTIN, state code, pincode, the GSTIN-vs-state agreement) is
+ * the command's, behind the replay lookup.
+ */
+export class UpdateClientTaxDetailsDto {
+  @ApiProperty({ required: false, nullable: true, type: String, maxLength: 200, example: 'Acme Foods Private Limited', description: 'The legal name printed as the recipient' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(400)
+  legalName?: string | null;
+
+  @ApiProperty({ required: false, nullable: true, type: String, example: '27AAACA1234A1Z5', description: 'The client GSTIN (uppercased). Its two-digit prefix must equal billingStateCode when both are set' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(40)
+  gstin?: string | null;
+
+  @ApiProperty({ required: false, nullable: true, type: String, maxLength: 200 })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(400)
+  billingLine1?: string | null;
+
+  @ApiProperty({ required: false, nullable: true, type: String, maxLength: 200 })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(400)
+  billingLine2?: string | null;
+
+  @ApiProperty({ required: false, nullable: true, type: String, maxLength: 100 })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(200)
+  billingCity?: string | null;
+
+  @ApiProperty({ required: false, nullable: true, type: String, example: '27', description: 'A two-digit GST registration state code' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(10)
+  billingStateCode?: string | null;
+
+  @ApiProperty({ required: false, nullable: true, type: String, example: '400001', description: 'Six digits' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(20)
+  billingPincode?: string | null;
+}
+
+/** Story 21-5 — a client's tax details as every read returns them (each nullable). */
+export class ClientTaxDetailsDto {
+  @ApiProperty({ type: String, nullable: true })
+  legalName!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  gstin!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  billingLine1!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  billingLine2!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  billingCity!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'A two-digit GST registration state code' })
+  billingStateCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  billingPincode!: string | null;
+}
+
 export class ClientDto {
   @ApiProperty({ format: 'uuid' })
   id!: string;
@@ -73,6 +155,12 @@ export class ClientDto {
 
   @ApiProperty({ description: 'ISO-8601 UTC last update' })
   updatedAt!: string;
+
+  @ApiProperty({
+    type: ClientTaxDetailsDto,
+    description: "Story 21-5 — the recipient's tax details a services tax invoice names (every field nullable; never required)",
+  })
+  taxDetails!: ClientTaxDetailsDto;
 }
 
 export class ClientResponse {

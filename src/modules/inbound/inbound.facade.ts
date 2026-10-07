@@ -1,5 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, sql, type SQL } from 'drizzle-orm';
+import { warehouseFilter, type ClientCountScope } from '../../shared/db/warehouse-filter';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { purchaseOrderLines, purchaseOrders, vendors } from '../../shared/db/schema';
@@ -324,7 +325,7 @@ export class InboundFacade {
    */
   async countReceiptLinesInTx(
     tx: TenantTx,
-    scope: { readonly tenantId: string; readonly clientId: string },
+    scope: ClientCountScope,
     from: string,
     to: string,
   ): Promise<number> {
@@ -348,15 +349,12 @@ export class InboundFacade {
  * happened); the over-receipt approval's re-emitted `grn.received` writes no
  * second line, so it is never counted twice.
  */
-export function receiptLinesPredicate(
-  scope: { readonly tenantId: string; readonly clientId: string },
-  from: string,
-  to: string,
-): SQL {
+export function receiptLinesPredicate(scope: ClientCountScope, from: string, to: string): SQL {
+  // Story 21-5: `scope.warehouseIds` narrows to the GRN's warehouse.
   return sql`grl.tenant_id = ${scope.tenantId}::uuid
     and s.client_id = ${scope.clientId}::uuid
     and grn.recorded_at >= ${from}::timestamptz
-    and grn.recorded_at < ${to}::timestamptz`;
+    and grn.recorded_at < ${to}::timestamptz${warehouseFilter(sql`grn.warehouse_id`, scope.warehouseIds)}`;
 }
 
 /**

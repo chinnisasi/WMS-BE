@@ -84,6 +84,8 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
   let skuBId: string;
   /** Client A's draft rate card (story 21-3) — the own-client line insert targets it. */
   let rateCardAId: string;
+  /** Story 21-5 — per client: an ISSUED September invoice and a DRAFT October one. */
+  const invoiceIds = new Map<string, { issued: string; draft: string }>();
 
   beforeAll(async () => {
     suiteDb = await useSuiteDatabase('clientisol');
@@ -170,6 +172,34 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       await sql`insert into storage_snapshot_progress (tenant_id, client_id, warehouse_id, last_day, running)
         values (${tenantId}, ${clientId}, ${warehouseId}, '2026-09-01', ${sql.json({ each: '5000' })})`;
     }
+
+    // Story 21-5 — per client, an ISSUED invoice (September) and a DRAFT one
+    // (October), each with one line, plus a services series row. A line is
+    // written only under a draft (the lines trigger), so the September
+    // invoice is born a draft and then issued — through the guard trigger.
+    for (const clientId of [clientA, clientB]) {
+      const ids = { issued: uuidv7(), draft: uuidv7() };
+      invoiceIds.set(clientId, ids);
+      for (const [id, periodStart, periodEnd, segmentFrom, segmentTo] of [
+        [ids.issued, '2026-09-01', '2026-09-30', '2026-08-31T18:30:00Z', '2026-09-30T18:30:00Z'],
+        [ids.draft, '2026-10-01', '2026-10-31', '2026-09-30T18:30:00Z', '2026-10-31T18:30:00Z'],
+      ] as const) {
+        await sql`insert into client_invoices (id, tenant_id, client_id, period_start, period_end, status, supplier_gstin,
+            place_of_supply, supply_type, subtotal_paise, cgst_paise, sgst_paise, igst_paise, tax_paise, total_paise,
+            round_off_paise, payable_paise, gaps, warnings, party, content_hash, created_by)
+          values (${id}, ${tenantId}, ${clientId}, ${periodStart}, ${periodEnd}, 'draft', '29ABCDE1234F1Z5',
+            '29', 'intra', 3000, 270, 270, 0, 540, 3540, -40, 3500, '[]'::jsonb, '[]'::jsonb, '{"seed": true}'::jsonb, 'seed', ${actorId})`;
+        await sql`insert into client_invoice_lines (id, tenant_id, invoice_id, rate_card_id, segment_from, segment_to, charge_code, basis,
+            uom, quantity, unit_amount_paise, amount_paise, sac_code, gst_bps, place_of_supply, supply_type, cgst_paise, sgst_paise, igst_paise)
+          values (${uuidv7()}, ${tenantId}, ${id}, ${uuidv7()}, ${segmentFrom}, ${segmentTo}, 'pick', 'per_pick',
+            null, 10, 300, 3000, '996719', 1800, '29', 'intra', 270, 270, 0)`;
+      }
+      await sql`update client_invoices set status = 'issued', invoice_no = ${'29/S2627/00000' + (clientId === clientA ? '1' : '2')},
+          fy_label = 'FY-2627', series_seq = ${clientId === clientA ? 1 : 2}, issued_at = now(), issued_by = ${actorId}
+        where id = ${ids.issued}`;
+    }
+    await sql`insert into client_invoice_series (id, tenant_id, supplier_gstin, fy_label, last_seq)
+      values (${uuidv7()}, ${tenantId}, '29ABCDE1234F1Z5', 'FY-2627', 2)`;
 
     // The INHERITED rows: stock and batch rows carry no client_id — their
     // isolation rides the SKU join, which the skus policy now filters.
@@ -670,6 +700,53 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       await expectCount((t) => t`select count(*)::int as n from ${t('storage_snapshot_progress')} where tenant_id = ${tenantId} and last_day = '2026-09-01'`, 2);
     });
 
+    it('client invoices: a portal session reads its own ISSUED invoices and their lines — never a draft, never the sibling’s — and writes nothing (21-5)', async () => {
+      const own = invoiceIds.get(clientA)!;
+      const rows = await portal((tx) => tx`select id from client_invoices where tenant_id = ${tenantId}`);
+      expect((rows as unknown as { id: string }[]).map((row) => row.id)).toEqual([own.issued]);
+      // Its own draft is invisible even by id; the sibling's issued one too.
+      expect(await portal((tx) => tx`select id from client_invoices where id = ${own.draft}`)).toHaveLength(0);
+      expect(await portal((tx) => tx`select id from client_invoices where id = ${invoiceIds.get(clientB)!.issued}`)).toHaveLength(0);
+      // Lines INHERIT the parent's visibility: only the issued invoice's line.
+      const lines = await portal((tx) => tx`select invoice_id from client_invoice_lines where tenant_id = ${tenantId}`);
+      expect((lines as unknown as { invoice_id: string }[]).map((row) => row.invoice_id)).toEqual([own.issued]);
+      // The series is operator-only.
+      expect(countOf(await portal((tx) => tx`select count(*)::int as n from client_invoice_series where tenant_id = ${tenantId}`))).toBe(0);
+      // The operator sees every invoice, line and series row.
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from client_invoices where tenant_id = ${tenantId}`))).toBe(4);
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from client_invoice_lines where tenant_id = ${tenantId}`))).toBe(4);
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from client_invoice_series where tenant_id = ${tenantId}`))).toBe(1);
+      // No tenant variable: nothing (the fail-closed idiom).
+      for (const table of ['client_invoices', 'client_invoice_lines', 'client_invoice_series']) {
+        expect(countOf(await probe.unsafe(`select count(*)::int as n from ${table} where tenant_id = '${tenantId}'::uuid`))).toBe(0);
+      }
+
+      // Writes: an own-client INSERT is refused by the operator-only WITH CHECK…
+      await expect(
+        portal((tx) =>
+          tx`insert into client_invoices (id, tenant_id, client_id, period_start, period_end, status, subtotal_paise, cgst_paise,
+              sgst_paise, igst_paise, tax_paise, total_paise, round_off_paise, payable_paise, gaps, warnings, party, content_hash, created_by)
+            values (${uuidv7()}, ${tenantId}, ${clientA}, '2026-11-01', '2026-11-30', 'draft', 0, 0, 0, 0, 0, 0, 0, 0,
+              '[]'::jsonb, '[]'::jsonb, '{}'::jsonb, 'probe', ${uuidv7()})`,
+        ),
+      ).rejects.toMatchObject({ code: '42501' });
+      // …a line under its own draft fails closed in the lines trigger (the
+      // parent is invisible to the portal — P0001 before the WITH CHECK)…
+      await expect(
+        portal((tx) =>
+          tx`insert into client_invoice_lines (id, tenant_id, invoice_id, rate_card_id, segment_from, segment_to, charge_code, basis,
+              uom, quantity, unit_amount_paise, amount_paise, sac_code, gst_bps, place_of_supply, supply_type, cgst_paise, sgst_paise, igst_paise)
+            values (${uuidv7()}, ${tenantId}, ${own.draft}, null, '2026-09-30T18:30:00Z', '2026-10-31T18:30:00Z', 'pick', 'per_pick',
+              null, 1, null, null, '996719', 1800, null, null, 0, 0, 0)`,
+        ),
+      ).rejects.toMatchObject({ code: 'P0001' });
+      // …and UPDATE / DELETE of its own rows bind nothing.
+      expect(await portal((tx) => tx`update client_invoices set status_note = 'x' where client_id = ${clientA} returning id`)).toHaveLength(0);
+      expect(await portal((tx) => tx`delete from client_invoice_lines where invoice_id = ${own.issued} returning id`)).toHaveLength(0);
+      expect(await portal((tx) => tx`update client_invoice_series set last_seq = 99 returning id`)).toHaveLength(0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('client_invoices')} where tenant_id = ${tenantId} and status_note is null`, 4);
+    });
+
     it('the UPDATE and DELETE arms bind too: a portal session cannot re-stamp its row to the sibling, and deletes ZERO of the sibling’s rows', async () => {
       // UPDATE arm (WITH CHECK on skus): the session's own row is visible
       // (USING passes) but may not be MOVED to the sibling's client.
@@ -814,8 +891,25 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // 0060 (story 21-3) added eight more — rate_cards and rate_card_lines,
       // each a client-scoped SELECT policy plus operator-only INSERT, UPDATE
       // and DELETE policies; 0061 (story 21-4) added eight more in the same
-      // shape — storage_snapshots and storage_snapshot_progress. None lost.
-      expect(policies).toHaveLength(88);
+      // shape — storage_snapshots and storage_snapshot_progress; 0062 (story
+      // 21-5) added nine more — client_invoices and client_invoice_lines in
+      // the same four-policy shape (the invoice read clause also hides
+      // drafts; the lines read clause inherits through the parent) and
+      // client_invoice_series, one operator-only tenant policy. None lost.
+      expect(policies).toHaveLength(97);
+      const invoiceRead = policies.find((row) => row.policyname === 'client_invoices_tenant_isolation')!;
+      expect(invoiceRead.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      expect(invoiceRead.qual).toContain("(status <> 'draft'::text)");
+      const lineRead = policies.find((row) => row.policyname === 'client_invoice_lines_tenant_isolation')!;
+      expect(lineRead.qual).toContain('client_invoices');
+      for (const table of ['client_invoices', 'client_invoice_lines']) {
+        expect(policies.filter((row) => row.tablename === table).map((row) => row.policyname).sort()).toEqual(
+          [`${table}_operator_delete`, `${table}_operator_insert`, `${table}_operator_update`, `${table}_tenant_isolation`].sort(),
+        );
+      }
+      const series = policies.filter((row) => row.tablename === 'client_invoice_series');
+      expect(series.map((row) => row.policyname)).toEqual(['client_invoice_series_tenant_isolation']);
+      expect(series[0]!.qual).toContain("(NULLIF(current_setting('app.client_id'::text, true), ''::text) IS NULL)");
 
       for (const table of READ_ONLY_CLIENT_TABLES) {
         const own = policies.filter((row) => row.tablename === table);
