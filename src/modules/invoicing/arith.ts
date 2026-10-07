@@ -1,4 +1,4 @@
-import type { Paise } from '../../shared/primitives/money';
+import { divideRoundHalfUp, type Paise } from '../../shared/primitives/money';
 import { QUANTITY_SCALE, type GstBps } from '../../shared/primitives/quantity';
 
 /**
@@ -225,13 +225,12 @@ export function roundToRupee(total: Paise): { payable: Paise; roundOff: number }
   return { payable: asPaise(payable), roundOff };
 }
 
-/** The BigInt half-up divide arith.ts runs everything through. */
-function divideRoundHalfUp(numerator: bigint, denominator: bigint): bigint {
-  if (numerator === 0n) return 0n;
-  const quotient = numerator / denominator;
-  const remainder = numerator - quotient * denominator;
-  return remainder * 2n >= denominator ? quotient + 1n : quotient;
-}
+/**
+ * The BigInt half-up divide arith.ts runs everything through — moved to
+ * `shared/primitives/money.ts` (story 21-4: storage metering rounds the same
+ * way) and re-exported here unchanged.
+ */
+export { divideRoundHalfUp };
 
 function toSafeNumber(value: bigint): number {
   if (value > BigInt(Number.MAX_SAFE_INTEGER)) {

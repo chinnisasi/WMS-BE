@@ -13,6 +13,8 @@ import { ReplenishmentModule } from '../modules/replenishment/replenishment.modu
 import { ReplenishmentFacade, MAX_REPLENISHMENT_SCOPES_PER_TICK } from '../modules/replenishment/replenishment.facade';
 import { ChannelsModule } from '../modules/channels/channels.module';
 import { ChannelsFacade } from '../modules/channels/channels.facade';
+import { BillingModule } from '../modules/billing/billing.module';
+import { BillingFacade } from '../modules/billing/billing.facade';
 
 /** The problem code a failed ATP read fails closed with (A8's store split). */
 function codeOf(error: ProblemException): string | null {
@@ -791,6 +793,153 @@ export class ChannelsSyncWorker implements OnApplicationBootstrap, OnApplication
 }
 
 /**
+ * The storage snapshot worker's poll interval, in milliseconds, from
+ * `STORAGE_SNAPSHOT_POLL_MS` (story 21-4) — the sibling workers' env-gate
+ * conventions (unset/`0` is OFF — a deployment that bills client brands sets
+ * e.g. `300000`; a non-negative integer is required or the boot fails
+ * loudly; tests drive `tick()` and the facade directly).
+ */
+export function parseStorageSnapshotPollMs(raw: string | undefined): number {
+  if (raw === undefined || raw === '') {
+    return 0;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(
+      `STORAGE_SNAPSHOT_POLL_MS must be a non-negative integer of milliseconds (got "${raw}")`,
+    );
+  }
+  return parsed;
+}
+
+/** Per-tick scope bound (story 21-4): a tick snapshots at most this many (client, warehouse) scopes. */
+export const MAX_STORAGE_SNAPSHOT_SCOPES_PER_TICK = 200;
+
+/**
+ * Story 21-4 — the daily storage snapshot worker (FR-78, CAP-6). Each tick:
+ * discovers every tenant cross-tenant (BYPASSRLS read — the replenishment
+ * scheduler's `authDb` precedent; the enumeration is read-only), lists each
+ * tenant's scopes through `BillingFacade.snapshotScopesOf` — non-`self`
+ * clients × the warehouses they have ledger events in (a tenant with no
+ * client brand yields none) — and runs one `snapshotScope` per scope, each
+ * in its own tenant transaction under its own advisory lock. The scope set
+ * is capped per tick with a ROTATING window (a head-only slice would starve
+ * the tail forever), and a failing tenant or scope is logged and retried
+ * next tick, never starving the rest. A scope writes at most 31 days per
+ * call, so a backfill advances a month per tick. Single-flight in-process
+ * (`running`); two instances are safe — the per-scope advisory lock
+ * serialises them and the watermark only moves forward. Env-gated OFF when
+ * `STORAGE_SNAPSHOT_POLL_MS` is unset/`0`; `unref`'d timer; shutdown hook.
+ */
+@Injectable()
+export class StorageSnapshotWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('StorageSnapshotWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+  /** The truncating ticks' rotating-window offset. */
+  private tickOffset = 0;
+
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(BillingFacade) private readonly billing: BillingFacade,
+  ) {
+    this.pollMs = parseStorageSnapshotPollMs(process.env.STORAGE_SNAPSHOT_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off (tests, or a deployment that bills nobody)
+    }
+    this.logger.log(`Storage snapshot worker started (poll every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /**
+   * One cycle. `nowMs` is the snapshot clock (default the wall clock) — the
+   * tests pass a fixed instant so the IST-day arithmetic is deterministic.
+   * Returns how many scopes it carried (the plumbing tests read it).
+   */
+  async tick(nowMs: number = Date.now()): Promise<{ carried: number; total: number }> {
+    if (this.running) {
+      return { carried: 0, total: 0 }; // shed: one cycle at a time in this process
+    }
+    this.running = true;
+    try {
+      const tenants = (await this.authDb.execute(sql`
+        select id as "tenantId" from tenants order by id asc
+      `)) as unknown as { tenantId: string }[];
+      const scopes: { tenantId: string; clientId: string; warehouseId: string }[] = [];
+      for (const { tenantId } of tenants) {
+        try {
+          scopes.push(...(await this.billing.snapshotScopesOf(tenantId)));
+        } catch (error) {
+          this.logger.error(
+            `Storage snapshot worker could not list the scopes of tenant ${tenantId} — skipped this cycle: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      const carried =
+        scopes.length <= MAX_STORAGE_SNAPSHOT_SCOPES_PER_TICK
+          ? scopes
+          : this.rotatingWindow(scopes, MAX_STORAGE_SNAPSHOT_SCOPES_PER_TICK);
+      if (scopes.length > carried.length) {
+        this.logger.warn(
+          `Storage snapshot worker carried ${carried.length} of ${scopes.length} scope(s) this tick ` +
+            `— the rotating window advances each tick until every scope is snapshotted`,
+        );
+      }
+      for (const scope of carried) {
+        try {
+          await this.billing.snapshotScope(scope.tenantId, scope.clientId, scope.warehouseId, nowMs);
+        } catch (error) {
+          this.logger.error(
+            `Storage snapshot worker could not snapshot client ${scope.clientId} in warehouse ${scope.warehouseId} ` +
+              `— skipped this cycle: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      return { carried: carried.length, total: scopes.length };
+    } catch (error) {
+      this.logger.error(
+        `Storage snapshot cycle failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return { carried: 0, total: 0 };
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /**
+   * `cap` scopes from the tick offset, wrapping; the offset advances by the
+   * number of scopes CARRIED, so the next tick starts where this one stopped
+   * and every scope is reached within ⌈length / cap⌉ ticks (a one-scope
+   * advance would leave the tail waiting ~length ticks).
+   */
+  private rotatingWindow<T>(ordered: readonly T[], cap: number): T[] {
+    const start = this.tickOffset % ordered.length;
+    const window: T[] = [];
+    for (let i = 0; i < cap && i < ordered.length; i += 1) {
+      const scope = ordered[(start + i) % ordered.length];
+      if (scope !== undefined) {
+        window.push(scope);
+      }
+    }
+    this.tickOffset = (start + window.length) % ordered.length;
+    return window;
+  }
+}
+
+/**
  * jobs shell — background/relay workers (outbox relay, reconciliation,
  * reservation reaper, count scheduler, replenishment scheduler, channels
  * sync, import batches, notifications dispatch). The event bus + outbox
@@ -798,14 +947,15 @@ export class ChannelsSyncWorker implements OnApplicationBootstrap, OnApplication
  * shared/events and are provided by SharedModule. All workers are env-gated
  * OFF unless `OUTBOX_RELAY_POLL_MS` / `OUTBOX_RECONCILE_POLL_MS` /
  * `RESERVATION_REAPER_POLL_MS` / `COUNT_SCHEDULER_POLL_MS` /
- * `REPLENISHMENT_SCHEDULER_POLL_MS` / `CHANNELS_SYNC_POLL_MS` is set (tests
+ * `REPLENISHMENT_SCHEDULER_POLL_MS` / `CHANNELS_SYNC_POLL_MS` /
+ * `STORAGE_SNAPSHOT_POLL_MS` is set (tests
  * exercise `drain()` / `reconcileNext()` / `expireDueReservations()` /
  * `generateScheduledCountTasks()` / `sweepScope()` /
  * `publishConnectionSnapshot()` directly, plus one plumbing test driving
  * `ReplenishmentSchedulerWorker.tick()` itself).
  */
 @Module({
-  imports: [SharedModule, InventoryModule, MovementsModule, ReplenishmentModule, ChannelsModule],
+  imports: [SharedModule, InventoryModule, MovementsModule, ReplenishmentModule, ChannelsModule, BillingModule],
   providers: [
     OutboxRelayWorker,
     ReconciliationWorker,
@@ -815,6 +965,8 @@ export class ChannelsSyncWorker implements OnApplicationBootstrap, OnApplication
     // Story 7-1's T3 — the availability publisher (env-gated OFF by
     // default; the facade carries the cycle, the worker only times it).
     ChannelsSyncWorker,
+    // Story 21-4 — the daily storage snapshots (env-gated OFF by default).
+    StorageSnapshotWorker,
   ],
   exports: [],
 })

@@ -32,7 +32,7 @@ import {
  */
 
 /** class-validator: a real calendar date in `YYYY-MM-DD` (shape AND existence). */
-function IsIsoDate(): PropertyDecorator {
+export function IsIsoDate(): PropertyDecorator {
   return ValidateBy({
     name: 'isIsoDate',
     validator: {

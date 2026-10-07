@@ -25,3 +25,18 @@ export function addPaise(a: Paise, b: Paise): Paise {
 export function isPaise(value: number): value is Paise {
   return Number.isSafeInteger(value);
 }
+
+/**
+ * The BigInt half-up divide — `numerator ÷ denominator` rounded once, half
+ * up, for a non-negative numerator and a positive denominator. Moved here
+ * from `invoicing/arith.ts` (story 21-4): invoice line maths and storage
+ * metering (`Σ milli-unit-days × rate ÷ 1,000,000`) round the same way, in
+ * BigInt because the product can pass 2⁵³. `invoicing/arith.ts` re-exports
+ * it unchanged.
+ */
+export function divideRoundHalfUp(numerator: bigint, denominator: bigint): bigint {
+  if (numerator === 0n) return 0n;
+  const quotient = numerator / denominator;
+  const remainder = numerator - quotient * denominator;
+  return remainder * 2n >= denominator ? quotient + 1n : quotient;
+}

@@ -1,4 +1,4 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, forwardRef } from '@nestjs/common';
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lt, lte, or, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -6,7 +6,11 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { rateCardLines, rateCards, type RateCard } from '../../shared/db/schema';
 import { assertUtcIso, istDateOf } from '../../shared/primitives/time';
-import { assertClientInTenantInTx } from '../clients/clients.facade';
+import { assertClientInTenantInTx, listClientsInTx } from '../clients/clients.facade';
+import { getMemberClientIdIn } from '../tenancy/tenancy.service';
+import { InventoryFacade } from '../inventory/inventory.facade';
+import { MeteringService, type MeteredPeriod } from './metering';
+import { StorageSnapshotService, type SnapshotTickResult, type SnapshotVerifyResult } from './storage-snapshot';
 import { MAX_DRAFT_LIST, sortLines, type ChargeCode, type RateBasis, type RateCardStatus } from './rate-cards';
 
 /** One priced line as every read returns it. */
@@ -126,7 +130,77 @@ async function snapshotsOf(tx: TenantTx, tenantId: string, rows: readonly RateCa
  */
 @Injectable()
 export class BillingFacade {
-  constructor(@Inject(DATABASE) private readonly db: Database) {}
+  constructor(
+    @Inject(DATABASE) private readonly db: Database,
+    // Story 21-4 — metering and the storage snapshots, behind the same seam.
+    // `forwardRef`: metering.ts imports this file's `rateCardSegmentsInTx`,
+    // so the two files form an import cycle; the lazy token keeps the
+    // injection independent of which file loads first.
+    @Inject(forwardRef(() => MeteringService)) private readonly metering: MeteringService,
+    @Inject(StorageSnapshotService) private readonly snapshots: StorageSnapshotService,
+    @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+  ) {}
+
+  /**
+   * Story 21-4 — meter one client over an inclusive IST date period: each
+   * charge's quantity per rate-card segment, priced. Member-open (like the
+   * cards); 400 for a bad period, 404 for an unknown or foreign client.
+   */
+  async meterPeriod(tenantId: string, actorUserId: string, clientId: string, fromDate: string, toDate: string): Promise<MeteredPeriod> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      // An operator read of commercial terms: a client-portal user (a user
+      // carrying a client, AD-23) is refused, whichever client it asks for.
+      if ((await getMemberClientIdIn(tx, tenantId, actorUserId)) !== null) {
+        throw new ProblemException(
+          'role-denied',
+          403,
+          'Client-portal sessions cannot read usage',
+          'Metered usage is an operator read; a client-portal user cannot read it.',
+        );
+      }
+      return this.metering.meterPeriodInTx(tx, tenantId, clientId, fromDate, toDate);
+    });
+  }
+
+  /**
+   * Story 21-4 — the snapshot job's scopes for one tenant: every non-`self`
+   * client × every warehouse it has a ledger event in (decision 4: the
+   * tenant's own client is never snapshotted; a tenant with no client brand
+   * yields nothing). Through the clients and inventory facades.
+   */
+  async snapshotScopesOf(tenantId: string): Promise<{ tenantId: string; clientId: string; warehouseId: string }[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const brands = (await listClientsInTx(tx, tenantId)).filter((client) => !client.systemOwned);
+      if (brands.length === 0) return [];
+      const pairs = await this.inventory.clientWarehousesWithEventsInTx(
+        tx,
+        tenantId,
+        brands.map((client) => client.id),
+      );
+      return pairs.map((pair) => ({ tenantId, clientId: pair.clientId, warehouseId: pair.warehouseId }));
+    });
+  }
+
+  /** Story 21-4 — one snapshot tick for one scope, in its own tenant transaction. */
+  async snapshotScope(tenantId: string, clientId: string, warehouseId: string, nowMs: number): Promise<SnapshotTickResult> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.snapshots.snapshotScopeInTx(tx, tenantId, clientId, warehouseId, nowMs),
+    );
+  }
+
+  /** Story 21-4 — the dry-run re-fold of one scope against its stored snapshots (writes nothing). */
+  async verifySnapshots(tenantId: string, clientId: string, warehouseId: string): Promise<SnapshotVerifyResult> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.snapshots.verifySnapshotsInTx(tx, tenantId, clientId, warehouseId),
+    );
+  }
+
+  /** Story 21-4 — rebuild one scope's snapshots from genesis through its watermark (the operator's `--write`). */
+  async rebuildSnapshots(tenantId: string, clientId: string, warehouseId: string): Promise<SnapshotVerifyResult> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      this.snapshots.rebuildScopeInTx(tx, tenantId, clientId, warehouseId),
+    );
+  }
 
   /**
    * A client's cards: drafts first (the newest `MAX_DRAFT_LIST`, newest
