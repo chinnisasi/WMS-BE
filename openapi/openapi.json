@@ -17301,6 +17301,135 @@
         ]
       }
     },
+    "/tenants/{tenantId}/clients/{clientId}/tax-details": {
+      "patch": {
+        "operationId": "ClientsController_updateTaxDetails",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateClientTaxDetailsDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, a malformed GSTIN or one whose prefix is not a registration state code, a billing state code off the registration list, a GSTIN in another state than the billing state, a pincode that is not six digits, an over-long field, or the tenant's own self client (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Sets a client brand's tax details — legal name, GSTIN and billing address (owner + accountant, billing.invoice). Absent fields are unchanged; null or blank clears",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
     "/tenants/{tenantId}/clients/{clientId}/rate-cards/in-force": {
       "get": {
         "operationId": "RateCardsController_inForce",
@@ -18288,6 +18417,1070 @@
           }
         ],
         "summary": "A client's metered usage over an inclusive IST date period — storage (per base UoM, through the snapshot watermark), receipt lines, picks and dispatched orders — split by the rate card in force and priced; an estimate until invoiced",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/invoices": {
+      "post": {
+        "operationId": "ClientInvoicesController_prepare",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrepareClientInvoicesDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The drafts created and the live invoices already covering a group",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrepareClientInvoicesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, or a month that is not YYYY-MM (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The month has not ended (period-not-ended), the tenant's own client (client-not-billable), no group has any usage (nothing-to-invoice), a live invoice raced in (invoice-exists), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Prepares a client's invoice drafts for an ended IST month (billing.invoice): one per supplying GSTIN with usage and no live invoice — `created` and `existing`",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoices": {
+      "get": {
+        "operationId": "ClientInvoicesController_list",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "One client's invoices",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "draft",
+                "issued",
+                "disputed",
+                "settled",
+                "void"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientInvoiceListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId or status, a limit outside 1–100 (validation-failed), or a malformed cursor (invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): this is an operator surface",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists client invoices, newest first (keyset on createdAt, id), optionally one client’s or one status’s",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoices/{invoiceId}": {
+      "get": {
+        "operationId": "ClientInvoicesController_get",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientInvoiceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed invoiceId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): this is an operator surface",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client invoice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One client invoice: its lines, gaps, warnings, party and totals",
+        "tags": [
+          "billing"
+        ]
+      },
+      "delete": {
+        "operationId": "ClientInvoicesController_discard",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Discarded (a replay under the same key answers 204 too)"
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed invoiceId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client invoice with this id exists in this tenant — including one already discarded under another key (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The invoice is not a draft (invoice-not-draft), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Discards a draft (billing.invoice). An issued invoice is never deleted — void it",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoices/{invoiceId}/refresh": {
+      "post": {
+        "operationId": "ClientInvoicesController_refresh",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientInvoiceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed invoiceId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client invoice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The invoice is not a draft (invoice-not-draft), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Re-derives a draft from the current figures, client tax details and rate cards (billing.invoice)",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoices/{invoiceId}/issue": {
+      "post": {
+        "operationId": "ClientInvoicesController_issue",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssueClientInvoiceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed invoiceId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client invoice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The draft has gaps — the `gaps` member names them (invoice-has-gaps), it has no line (nothing-to-invoice), it is not a draft (invoice-not-draft), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Issues a draft (billing.invoice): re-meters first — `stale` if the figures moved (the fresh draft is stored, nothing issued, no number used) — then numbers it in its own services series and freezes it",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoices/{invoiceId}/dispute": {
+      "post": {
+        "operationId": "ClientInvoicesController_dispute",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClientInvoiceNoteDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientInvoiceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed invoiceId, or no note (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client invoice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Only an issued invoice can be disputed (invoice-transition-invalid), or a concurrent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Marks an issued invoice disputed (billing.invoice) — a note is required",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoices/{invoiceId}/settle": {
+      "post": {
+        "operationId": "ClientInvoicesController_settle",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClientInvoiceNoteDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientInvoiceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed invoiceId, or an over-long note (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client invoice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Only an issued or disputed invoice can be settled (invoice-transition-invalid), or a concurrent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Marks an issued or disputed invoice settled (billing.invoice) — a note is optional. Recording a settlement only: no payment is collected",
+        "tags": [
+          "billing"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/client-invoices/{invoiceId}/void": {
+      "post": {
+        "operationId": "ClientInvoicesController_void",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClientInvoiceNoteDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientInvoiceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed invoiceId, or no note (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks billing.invoice — owner and accountant only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client invoice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Only an issued or disputed invoice can be voided (invoice-transition-invalid), or a concurrent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Voids an issued or disputed invoice (billing.invoice) — a note is required. The void keeps its number; the next prepare for its month and GSTIN drafts a replacement naming it",
         "tags": [
           "billing"
         ]
@@ -30734,6 +31927,49 @@
           "tiles"
         ]
       },
+      "ClientTaxDetailsDto": {
+        "type": "object",
+        "properties": {
+          "legalName": {
+            "type": "string",
+            "nullable": true
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "billingLine1": {
+            "type": "string",
+            "nullable": true
+          },
+          "billingLine2": {
+            "type": "string",
+            "nullable": true
+          },
+          "billingCity": {
+            "type": "string",
+            "nullable": true
+          },
+          "billingStateCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "A two-digit GST registration state code"
+          },
+          "billingPincode": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "legalName",
+          "gstin",
+          "billingLine1",
+          "billingLine2",
+          "billingCity",
+          "billingStateCode",
+          "billingPincode"
+        ]
+      },
       "ClientDto": {
         "type": "object",
         "properties": {
@@ -30774,6 +32010,14 @@
           "updatedAt": {
             "type": "string",
             "description": "ISO-8601 UTC last update"
+          },
+          "taxDetails": {
+            "description": "Story 21-5 — the recipient's tax details a services tax invoice names (every field nullable; never required)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientTaxDetailsDto"
+              }
+            ]
           }
         },
         "required": [
@@ -30784,7 +32028,8 @@
           "status",
           "systemOwned",
           "createdAt",
-          "updatedAt"
+          "updatedAt",
+          "taxDetails"
         ]
       },
       "ClientListResponse": {
@@ -30849,6 +32094,51 @@
         "required": [
           "name"
         ]
+      },
+      "UpdateClientTaxDetailsDto": {
+        "type": "object",
+        "properties": {
+          "legalName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "example": "Acme Foods Private Limited",
+            "description": "The legal name printed as the recipient"
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true,
+            "example": "27AAACA1234A1Z5",
+            "description": "The client GSTIN (uppercased). Its two-digit prefix must equal billingStateCode when both are set"
+          },
+          "billingLine1": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200
+          },
+          "billingLine2": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200
+          },
+          "billingCity": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 100
+          },
+          "billingStateCode": {
+            "type": "string",
+            "nullable": true,
+            "example": "27",
+            "description": "A two-digit GST registration state code"
+          },
+          "billingPincode": {
+            "type": "string",
+            "nullable": true,
+            "example": "400001",
+            "description": "Six digits"
+          }
+        }
       },
       "RateCardLineResponseDto": {
         "type": "object",
@@ -31263,6 +32553,693 @@
           "segments",
           "totals"
         ]
+      },
+      "PrepareClientInvoicesDto": {
+        "type": "object",
+        "properties": {
+          "month": {
+            "type": "string",
+            "example": "2026-09",
+            "description": "One IST calendar month, YYYY-MM — it must have ended"
+          }
+        },
+        "required": [
+          "month"
+        ]
+      },
+      "ClientInvoiceTotalsDto": {
+        "type": "object",
+        "properties": {
+          "subtotal": {
+            "type": "number",
+            "description": "Taxable value, integer paise"
+          },
+          "cgst": {
+            "type": "number"
+          },
+          "sgst": {
+            "type": "number"
+          },
+          "igst": {
+            "type": "number"
+          },
+          "tax": {
+            "type": "number",
+            "description": "cgst + sgst + igst"
+          },
+          "roundOff": {
+            "type": "number",
+            "description": "Signed rupee round-off, −49…+50 paise"
+          },
+          "payable": {
+            "type": "number",
+            "description": "subtotal + tax + roundOff — a whole number of rupees, in paise"
+          }
+        },
+        "required": [
+          "subtotal",
+          "cgst",
+          "sgst",
+          "igst",
+          "tax",
+          "roundOff",
+          "payable"
+        ]
+      },
+      "ClientInvoiceGapDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "supplier-gstin-missing",
+              "supplier-address-missing",
+              "client-legal-name-missing",
+              "client-billing-address-missing",
+              "storage-not-complete",
+              "line-unpriced",
+              "einvoice-required"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "segmentFrom": {
+            "type": "string",
+            "description": "The IST date the line’s rate-card segment starts (line-scoped gaps)"
+          }
+        },
+        "required": [
+          "code",
+          "detail"
+        ]
+      },
+      "ClientInvoiceWarningDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "supplier-state-differs"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "detail"
+        ]
+      },
+      "ClientInvoiceSupplierAddressDto": {
+        "type": "object",
+        "properties": {
+          "line1": {
+            "type": "string"
+          },
+          "line2": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "The origin address state, as entered"
+          },
+          "pincode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "line1",
+          "line2",
+          "city",
+          "state",
+          "pincode"
+        ]
+      },
+      "ClientInvoiceSupplierDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The tenant's name"
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "stateCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The GSTIN's two-digit state code"
+          },
+          "stateName": {
+            "type": "string",
+            "nullable": true
+          },
+          "address": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientInvoiceSupplierAddressDto"
+              }
+            ]
+          },
+          "warehouseCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The warehouse whose origin address is printed"
+          }
+        },
+        "required": [
+          "name",
+          "gstin",
+          "stateCode",
+          "stateName",
+          "address",
+          "warehouseCode"
+        ]
+      },
+      "ClientInvoiceRecipientAddressDto": {
+        "type": "object",
+        "properties": {
+          "line1": {
+            "type": "string",
+            "nullable": true
+          },
+          "line2": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string",
+            "nullable": true
+          },
+          "stateCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "pincode": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "line1",
+          "line2",
+          "city",
+          "stateCode",
+          "pincode"
+        ]
+      },
+      "ClientInvoiceRecipientDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "legalName": {
+            "type": "string",
+            "nullable": true
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "stateCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "stateName": {
+            "type": "string",
+            "nullable": true
+          },
+          "address": {
+            "$ref": "#/components/schemas/ClientInvoiceRecipientAddressDto"
+          }
+        },
+        "required": [
+          "name",
+          "code",
+          "legalName",
+          "gstin",
+          "stateCode",
+          "stateName",
+          "address"
+        ]
+      },
+      "ClientInvoicePartyDto": {
+        "type": "object",
+        "properties": {
+          "supplier": {
+            "$ref": "#/components/schemas/ClientInvoiceSupplierDto"
+          },
+          "recipient": {
+            "$ref": "#/components/schemas/ClientInvoiceRecipientDto"
+          }
+        },
+        "required": [
+          "supplier",
+          "recipient"
+        ]
+      },
+      "ClientInvoiceLineDto": {
+        "type": "object",
+        "properties": {
+          "rateCardId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The rate card that priced the line (null: no card in force)"
+          },
+          "segmentFrom": {
+            "type": "string",
+            "example": "2026-09-01",
+            "description": "First IST date of the rate-card segment (inclusive)"
+          },
+          "segmentTo": {
+            "type": "string",
+            "example": "2026-09-30",
+            "description": "Last IST date of the segment (inclusive)"
+          },
+          "chargeCode": {
+            "type": "string",
+            "enum": [
+              "storage",
+              "inbound_handling",
+              "pick",
+              "outbound_handling"
+            ]
+          },
+          "basis": {
+            "type": "string",
+            "enum": [
+              "per_thousand_units_per_day",
+              "per_receipt_line",
+              "per_pick",
+              "per_order"
+            ]
+          },
+          "uom": {
+            "type": "string",
+            "nullable": true,
+            "description": "The base UoM of a storage line; null for handling"
+          },
+          "quantity": {
+            "type": "string",
+            "example": "1234.567",
+            "description": "A decimal string: base-unit-days for storage (up to three decimals), a whole count otherwise"
+          },
+          "unitAmountPaise": {
+            "type": "number",
+            "nullable": true,
+            "description": "Integer paise per unit of the basis (null: unpriced, a draft only)"
+          },
+          "amountPaise": {
+            "type": "number",
+            "nullable": true,
+            "description": "The taxable value, integer paise (null: unpriced, a draft only)"
+          },
+          "sac": {
+            "type": "string",
+            "example": "996729",
+            "description": "The SAC (services accounting code)"
+          },
+          "gstBps": {
+            "type": "number",
+            "example": 1800
+          },
+          "placeOfSupply": {
+            "type": "string",
+            "nullable": true,
+            "description": "Two-digit state code of the place of supply"
+          },
+          "supplyType": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "intra",
+              "inter",
+              null
+            ]
+          },
+          "cgstPaise": {
+            "type": "number"
+          },
+          "sgstPaise": {
+            "type": "number",
+            "description": "SGST/UTGST"
+          },
+          "igstPaise": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "rateCardId",
+          "segmentFrom",
+          "segmentTo",
+          "chargeCode",
+          "basis",
+          "uom",
+          "quantity",
+          "unitAmountPaise",
+          "amountPaise",
+          "sac",
+          "gstBps",
+          "placeOfSupply",
+          "supplyType",
+          "cgstPaise",
+          "sgstPaise",
+          "igstPaise"
+        ]
+      },
+      "ClientInvoiceDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "periodStart": {
+            "type": "string",
+            "example": "2026-09-01"
+          },
+          "periodEnd": {
+            "type": "string",
+            "example": "2026-09-30"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "issued",
+              "disputed",
+              "settled",
+              "void"
+            ]
+          },
+          "invoiceNo": {
+            "type": "string",
+            "nullable": true,
+            "example": "29/S2627/000001"
+          },
+          "fyLabel": {
+            "type": "string",
+            "nullable": true,
+            "example": "FY-2627"
+          },
+          "supplierGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "The supplying GSTIN (the group key)"
+          },
+          "placeOfSupply": {
+            "type": "string",
+            "nullable": true
+          },
+          "supplyType": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "intra",
+              "inter",
+              null
+            ]
+          },
+          "totals": {
+            "$ref": "#/components/schemas/ClientInvoiceTotalsDto"
+          },
+          "issuedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC"
+          },
+          "statusNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "The latest dispute / settle / void note"
+          },
+          "replacesInvoiceId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The void invoice this one replaces"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "gaps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientInvoiceGapDto"
+            }
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientInvoiceWarningDto"
+            }
+          },
+          "party": {
+            "description": "Supplier and recipient as printed — computed live on a draft, frozen at issue",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientInvoicePartyDto"
+              }
+            ]
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientInvoiceLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "clientId",
+          "periodStart",
+          "periodEnd",
+          "status",
+          "invoiceNo",
+          "fyLabel",
+          "supplierGstin",
+          "placeOfSupply",
+          "supplyType",
+          "totals",
+          "issuedAt",
+          "statusNote",
+          "replacesInvoiceId",
+          "createdAt",
+          "gaps",
+          "warnings",
+          "party",
+          "lines"
+        ]
+      },
+      "PrepareClientInvoicesResponse": {
+        "type": "object",
+        "properties": {
+          "created": {
+            "description": "The drafts created — one per supplying GSTIN with usage and no live invoice",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientInvoiceDto"
+            }
+          },
+          "existing": {
+            "description": "The live (not void) invoices that already cover a group",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientInvoiceDto"
+            }
+          }
+        },
+        "required": [
+          "created",
+          "existing"
+        ]
+      },
+      "ClientInvoiceEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "periodStart": {
+            "type": "string",
+            "example": "2026-09-01"
+          },
+          "periodEnd": {
+            "type": "string",
+            "example": "2026-09-30"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "issued",
+              "disputed",
+              "settled",
+              "void"
+            ]
+          },
+          "invoiceNo": {
+            "type": "string",
+            "nullable": true,
+            "example": "29/S2627/000001"
+          },
+          "fyLabel": {
+            "type": "string",
+            "nullable": true,
+            "example": "FY-2627"
+          },
+          "supplierGstin": {
+            "type": "string",
+            "nullable": true,
+            "description": "The supplying GSTIN (the group key)"
+          },
+          "placeOfSupply": {
+            "type": "string",
+            "nullable": true
+          },
+          "supplyType": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "intra",
+              "inter",
+              null
+            ]
+          },
+          "totals": {
+            "$ref": "#/components/schemas/ClientInvoiceTotalsDto"
+          },
+          "issuedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC"
+          },
+          "statusNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "The latest dispute / settle / void note"
+          },
+          "replacesInvoiceId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The void invoice this one replaces"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "gapCount": {
+            "type": "number",
+            "description": "How many gaps block issue (0 on every issued invoice)"
+          }
+        },
+        "required": [
+          "id",
+          "clientId",
+          "periodStart",
+          "periodEnd",
+          "status",
+          "invoiceNo",
+          "fyLabel",
+          "supplierGstin",
+          "placeOfSupply",
+          "supplyType",
+          "totals",
+          "issuedAt",
+          "statusNote",
+          "replacesInvoiceId",
+          "createdAt",
+          "gapCount"
+        ]
+      },
+      "ClientInvoiceListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientInvoiceEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "ClientInvoiceResponse": {
+        "type": "object",
+        "properties": {
+          "invoice": {
+            "$ref": "#/components/schemas/ClientInvoiceDto"
+          }
+        },
+        "required": [
+          "invoice"
+        ]
+      },
+      "IssueClientInvoiceResponse": {
+        "type": "object",
+        "properties": {
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "issued",
+              "stale"
+            ],
+            "description": "`stale`: the figures changed since the draft was last computed — the fresh draft is stored and returned, nothing is issued and no number is used. Review it and issue again (with a NEW Idempotency-Key)"
+          },
+          "invoice": {
+            "$ref": "#/components/schemas/ClientInvoiceDto"
+          }
+        },
+        "required": [
+          "outcome",
+          "invoice"
+        ]
+      },
+      "ClientInvoiceNoteDto": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Why — REQUIRED to dispute or void (400 without one), optional to settle. The invoice keeps the latest note; the audit trail keeps every one"
+          }
+        }
       },
       "ChannelWebhookOrderResponse": {
         "type": "object",

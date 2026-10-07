@@ -27,6 +27,7 @@ import {
   type SupplyType,
 } from './arith';
 import { isValidHsn, normalizeHsn } from './hsn';
+import { fyLabelFor, formatInvoiceNo } from '../../shared/primitives/gst';
 
 /**
  * The derive-from-facts generator (story 8-1): ONE computation both the
@@ -194,54 +195,12 @@ export interface InvoiceDraft {
 export { IST_OFFSET_MS };
 
 /**
- * The financial-year label of an issuance instant: April 1 – March 31 in
- * Asia/Kolkata, rendered `FY-2627` (October 2026 opens FY-2627; March 2027
- * still closes FY-2627 — the label of the FY the instant falls INSIDE).
+ * The FY label, the Rule 46 length ceiling and the goods number format moved
+ * UNCHANGED to `shared/primitives/gst.ts` (story 21-5: the services invoice
+ * shares the FY rule and numbers beside them with `formatServiceInvoiceNo`).
+ * Re-exported here so invoicing's importers stand.
  */
-export function fyLabelFor(instant: string): string {
-  const ist = new Date(Date.parse(instant) + IST_OFFSET_MS);
-  const year = ist.getUTCFullYear();
-  // getUTCMonth(): 0 = January … 3 = April. Month ≥ 3 (April) opens the FY
-  // named for THAT year; Jan–Mar belongs to the FY the previous year opened.
-  const startYear = ist.getUTCMonth() >= 3 ? year : year - 1;
-  const pad = (n: number): string => String(n % 100).padStart(2, '0');
-  return `FY-${pad(startYear)}${pad(startYear + 1)}`;
-}
-
-/**
- * GST's ceiling on a tax-invoice number (Rule 46(b), CGST Rules): at most 16
- * characters. The format below is 14 at a 6-digit sequence; a 7- or 8-digit
- * sequence (15 / 16 chars, up to 99,999,999) still passes, and the assertion
- * throws from sequence 100,000,000 (17 chars) on.
- */
-export const INVOICE_NO_MAX_LENGTH = 16;
-
-/**
- * The invoice number (story 8-1b): the supplier GSTIN's two-digit state code,
- * the FY digits, and the 6-digit sequence — `29/2627/000001` (14 chars). The
- * prefix is ALWAYS the GSTIN's own first two characters, never a resolved
- * state code (`resolveStateCode` may answer from address text). Two GSTINs
- * in one state print identical numbers by design; consumers key on
- * (originGstin, invoiceNo), never the number alone.
- */
-export function formatInvoiceNo(originGstin: string, fyLabel: string, seq: number): string {
-  if (!/^FY-\d{4}$/.test(fyLabel)) {
-    throw new ArithmeticOverflowError(`invoice number: malformed FY label "${fyLabel}"`);
-  }
-  if (!/^[0-9]{2}/.test(originGstin)) {
-    throw new ArithmeticOverflowError(`invoice number: supplier GSTIN "${originGstin}" carries no state-code prefix`);
-  }
-  if (!Number.isSafeInteger(seq) || seq < 1) {
-    throw new ArithmeticOverflowError(`invoice number: sequence must be a positive integer (got ${String(seq)})`);
-  }
-  const invoiceNo = `${originGstin.slice(0, 2)}/${fyLabel.slice(3)}/${String(seq).padStart(6, '0')}`;
-  if (invoiceNo.length > INVOICE_NO_MAX_LENGTH) {
-    throw new ArithmeticOverflowError(
-      `invoice number "${invoiceNo}" exceeds GST's ${INVOICE_NO_MAX_LENGTH}-character limit — the series for ${originGstin} ${fyLabel} is exhausted`,
-    );
-  }
-  return invoiceNo;
-}
+export { fyLabelFor, formatInvoiceNo, INVOICE_NO_MAX_LENGTH } from '../../shared/primitives/gst';
 
 /**
  * The series-row allocation: one row per (tenant, supplier GSTIN, FY),

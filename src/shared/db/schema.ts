@@ -145,6 +145,24 @@ export const clients = pgTable(
     status: text('status').notNull().default('active'),
     systemOwned: boolean('system_owned').notNull().default(false),
     ...tenantTimestamps,
+    /**
+     * Story 21-5 — the client's tax details, what a services tax invoice
+     * names the recipient by (Rule 46). All nullable and never required at
+     * create; each is shape-checked when present (the CHECKs live ONLY in
+     * `drizzle/0062_client_invoices.sql`), and a GSTIN whose prefix differs
+     * from `billing_state_code` is refused. Written only by
+     * `ClientsCommand.updateTaxDetails` (`billing.invoice`). An issued
+     * invoice prints its frozen `party` snapshot, never these live columns.
+     */
+    legalName: text('legal_name'),
+    gstin: text('gstin'),
+    billingLine1: text('billing_line1'),
+    billingLine2: text('billing_line2'),
+    billingCity: text('billing_city'),
+    /** A two-digit GST registration state code (`GSTIN_STATE_CODES`). */
+    billingStateCode: text('billing_state_code'),
+    /** Six digits, text (leading zeros are significant). */
+    billingPincode: text('billing_pincode'),
   },
   (table) => [
     uniqueIndex('clients_tenant_id_code_unique').on(table.tenantId, table.code),
@@ -4321,3 +4339,149 @@ export const storageSnapshotProgress = pgTable(
 
 export type StorageSnapshotProgress = typeof storageSnapshotProgress.$inferSelect;
 
+
+/**
+ * Story 21-5 — client invoices: a monthly SERVICES (SAC) GST tax invoice to a
+ * client brand, one per (client, IST calendar month, supplying GSTIN). A
+ * draft is derived from the 21-4 metering read and recomputable; issuing it
+ * numbers it in its own series and FREEZES it — from then on only the status
+ * transitions (issued → disputed | settled | void, disputed → settled |
+ * void) and their note and stamps ever change. The vocabularies live in
+ * `src/modules/billing/client-invoices.ts`; the CHECKs, the guard / lines /
+ * no-truncate triggers, the one-live-invoice index and the RLS policies (the
+ * AD-24 client clause with `status <> 'draft'`) live ONLY in
+ * `drizzle/0062_client_invoices.sql`. No FKs (house rule).
+ */
+export const clientInvoices = pgTable(
+  'client_invoices',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    /** The IST calendar month: its first and last day. */
+    periodStart: date('period_start', { mode: 'string' }).notNull(),
+    periodEnd: date('period_end', { mode: 'string' }).notNull(),
+    status: text('status').notNull().default('draft'),
+    /** The group key: `warehouses.gstin ?? tenants.gstin` — null only on a draft that cannot issue. */
+    supplierGstin: text('supplier_gstin'),
+    /** The client-side state (s.12(2)) every line carries today; null while unresolvable. */
+    placeOfSupply: text('place_of_supply'),
+    supplyType: text('supply_type'),
+    invoiceNo: text('invoice_no'),
+    fyLabel: text('fy_label'),
+    seriesSeq: integer('series_seq'),
+    subtotalPaise: bigint('subtotal_paise', { mode: 'number' }).notNull(),
+    cgstPaise: bigint('cgst_paise', { mode: 'number' }).notNull(),
+    sgstPaise: bigint('sgst_paise', { mode: 'number' }).notNull(),
+    igstPaise: bigint('igst_paise', { mode: 'number' }).notNull(),
+    taxPaise: bigint('tax_paise', { mode: 'number' }).notNull(),
+    totalPaise: bigint('total_paise', { mode: 'number' }).notNull(),
+    roundOffPaise: bigint('round_off_paise', { mode: 'number' }).notNull(),
+    payablePaise: bigint('payable_paise', { mode: 'number' }).notNull(),
+    gaps: jsonb('gaps').notNull(),
+    warnings: jsonb('warnings').notNull(),
+    /** The supplier and recipient as printed (computed live on a draft, frozen at issue). */
+    party: jsonb('party').notNull(),
+    /** sha256 over the canonical v1 content (`clientInvoiceContentHash`). */
+    contentHash: text('content_hash').notNull(),
+    replacesInvoiceId: uuid('replaces_invoice_id'),
+    issuedAt: timestamp('issued_at', { withTimezone: true, mode: 'string' }),
+    issuedBy: uuid('issued_by'),
+    statusNote: text('status_note'),
+    statusChangedAt: timestamp('status_changed_at', { withTimezone: true, mode: 'string' }),
+    statusChangedBy: uuid('status_changed_by'),
+    createdBy: uuid('created_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    // One LIVE (non-void) invoice per (client, month, supplying GSTIN) — the
+    // backstop behind prepare's client-row lock; a 23505 maps to 409
+    // `invoice-exists`. The null GSTIN group is one group (coalesce).
+    uniqueIndex('client_invoices_one_live_per_group')
+      .on(table.tenantId, table.clientId, table.periodStart, sql`coalesce(${table.supplierGstin}, '')`)
+      .where(sql`status <> 'void'`),
+    uniqueIndex('client_invoices_tenant_gstin_invoice_no_unique')
+      .on(table.tenantId, table.supplierGstin, table.invoiceNo)
+      .where(sql`invoice_no is not null`),
+    index('client_invoices_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    index('client_invoices_tenant_client_period_idx').on(table.tenantId, table.clientId, table.periodStart),
+  ],
+);
+
+export type ClientInvoice = typeof clientInvoices.$inferSelect;
+
+/**
+ * Story 21-5 — one line of a client invoice: one metered (rate-card segment,
+ * charge, base UoM) with quantity > 0. `quantity` is milli-unit-days for
+ * storage (the CHECK pairs `uom` with the storage basis), a count otherwise.
+ * `rate_card_id` / `unit_amount_paise` / `amount_paise` are null only on a
+ * draft (an unpriced line — the guard trigger refuses issue while any is
+ * null). The tax is per line (`computeLineTax`), with its own place of
+ * supply (decision 5).
+ */
+export const clientInvoiceLines = pgTable(
+  'client_invoice_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    invoiceId: uuid('invoice_id').notNull(),
+    rateCardId: uuid('rate_card_id'),
+    segmentFrom: timestamp('segment_from', { withTimezone: true, mode: 'string' }).notNull(),
+    segmentTo: timestamp('segment_to', { withTimezone: true, mode: 'string' }).notNull(),
+    chargeCode: text('charge_code').notNull(),
+    basis: text('basis').notNull(),
+    uom: text('uom'),
+    /** Milli-unit-days (storage) or a count — can pass 2⁵³: read raw as text. */
+    quantity: bigint('quantity', { mode: 'number' }).notNull(),
+    unitAmountPaise: bigint('unit_amount_paise', { mode: 'number' }),
+    amountPaise: bigint('amount_paise', { mode: 'number' }),
+    sacCode: text('sac_code').notNull(),
+    gstBps: integer('gst_bps').notNull(),
+    placeOfSupply: text('place_of_supply'),
+    supplyType: text('supply_type'),
+    cgstPaise: bigint('cgst_paise', { mode: 'number' }).notNull(),
+    sgstPaise: bigint('sgst_paise', { mode: 'number' }).notNull(),
+    igstPaise: bigint('igst_paise', { mode: 'number' }).notNull(),
+  },
+  (table) => [
+    index('client_invoice_lines_tenant_invoice_idx').on(table.tenantId, table.invoiceId),
+    // One line per metered (segment, charge, uom) — handling lines carry no uom.
+    uniqueIndex('client_invoice_lines_invoice_segment_charge_uom_unique').on(
+      table.invoiceId,
+      table.segmentFrom,
+      table.chargeCode,
+      sql`coalesce(${table.uom}, '')`,
+    ),
+  ],
+);
+
+export type ClientInvoiceLine = typeof clientInvoiceLines.$inferSelect;
+
+/**
+ * Story 21-5 — the services invoice series: one row per (tenant, supplying
+ * GSTIN, FY), `last_seq` advanced only under the row's FOR UPDATE lock —
+ * gap-free, reset each FY, never interleaved with the goods `invoice_series`
+ * (decision 3).
+ */
+export const clientInvoiceSeries = pgTable(
+  'client_invoice_series',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    supplierGstin: text('supplier_gstin').notNull(),
+    fyLabel: text('fy_label').notNull(),
+    lastSeq: integer('last_seq').notNull().default(0),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('client_invoice_series_tenant_gstin_fy_unique').on(table.tenantId, table.supplierGstin, table.fyLabel),
+  ],
+);
+
+export type ClientInvoiceSeries = typeof clientInvoiceSeries.$inferSelect;

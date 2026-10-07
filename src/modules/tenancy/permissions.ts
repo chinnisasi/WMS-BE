@@ -226,6 +226,17 @@ export const CAPABILITIES = [
   // floor, it does not negotiate contracts. Every member READS cards (reads
   // are never gated). Mirrored into wms-fe `src/lib/users.ts`.
   'rates.manage',
+  // Story 21-5 — client invoices: prepare a client's monthly services
+  // invoice drafts, refresh or discard a draft, ISSUE it (a numbered GST tax
+  // document), and mark an issued invoice disputed, settled or void — plus
+  // the client TAX-DETAILS write (legal name, GSTIN, billing address), so the
+  // person who clears an invoice's recipient gaps can actually fix them.
+  // OWNER + ACCOUNTANT (the `rates.manage` rationale: billing a client is
+  // finance work). Ops Manager absent — it runs the floor. Every member READS
+  // client invoices (reads are never gated); a client-portal session is
+  // refused at the read. Mirrored into wms-fe `src/lib/users.ts`
+  // (CAPABILITIES + OPS_EXCLUDED_CAPABILITIES).
+  'billing.invoice',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -240,7 +251,8 @@ export type Capability = (typeof CAPABILITIES)[number];
  * records what it observes) and NOT `secure.move` (Story 12-3 — the
  * cage is off-limits to floor staff); Accountant is read-only except
  * `eway.manage` (Story 8-2b — e-way paperwork is finance work) and
- * `rates.manage` (Story 21-3 — a client's rate card is finance work). Reads stay
+ * `rates.manage` (Story 21-3 — a client's rate card is finance work) and
+ * `billing.invoice` (Story 21-5 — client invoices and tax details). Reads stay
  * open to any tenant member.
  */
 export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability>>> = {
@@ -328,7 +340,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
   // which reverses 8-1's "the accountant does not set prices" for a client's
   // service price list; a tax document's rate override stays
   // `invoice.generate`). Everything else stays read-only.
-  accountant: new Set<Capability>(['eway.manage', 'rates.manage']),
+  // Story 21-5: client invoices and the client tax details (finance work).
+  accountant: new Set<Capability>(['eway.manage', 'rates.manage', 'billing.invoice']),
 };
 
 /**

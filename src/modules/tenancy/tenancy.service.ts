@@ -1,5 +1,5 @@
 import { forwardRef, Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { bins, tenants, users, warehouses, zones } from '../../shared/db/schema';
@@ -223,6 +223,88 @@ export async function invoicePartyFactsInTx(
       state: warehouse.originState,
       pincode: warehouse.originPincode,
     }),
+  };
+}
+
+/**
+ * Story 21-5 — the supplier facts a 3PL client invoice needs: the tenant's
+ * name and default GSTIN, and EVERY warehouse of the tenant with its code,
+ * name, GSTIN and origin address (the `origin_*` columns). Billing groups the
+ * warehouses by supplying GSTIN (`warehouses.gstin ?? tenants.gstin`) and
+ * prints the supplier address from the group's warehouse — a READ of tenancy
+ * tables through this exported seam (the `invoicePartyFactsInTx`
+ * precedent); billing never imports a tenancy table. Warehouses ordered by
+ * code (the supplier-address pick is "the lowest-code warehouse with a full
+ * address").
+ */
+export interface ClientInvoiceWarehouseFacts {
+  readonly id: string;
+  readonly code: string;
+  readonly name: string;
+  readonly gstin: string | null;
+  /** The raw origin columns — any may be null on a pre-11.1 row. */
+  readonly origin: {
+    readonly contactName: string | null;
+    readonly phone: string | null;
+    readonly line1: string | null;
+    readonly line2: string | null;
+    readonly city: string | null;
+    readonly state: string | null;
+    readonly pincode: string | null;
+  };
+}
+
+export interface ClientInvoiceSupplierFacts {
+  readonly tenantName: string;
+  readonly tenantGstin: string | null;
+  readonly warehouses: readonly ClientInvoiceWarehouseFacts[];
+}
+
+export async function clientInvoiceSupplierFactsInTx(tx: TenantTx, tenantId: string): Promise<ClientInvoiceSupplierFacts> {
+  const tenantRows = await tx
+    .select({ name: tenants.name, gstin: tenants.gstin })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1);
+  const tenant = tenantRows[0];
+  if (tenant === undefined) {
+    throw new ProblemException('not-found', 404, 'Tenant not found', 'The tenant row backing this invoice could not be read.');
+  }
+  const rows = await tx
+    .select({
+      id: warehouses.id,
+      code: warehouses.code,
+      name: warehouses.name,
+      gstin: warehouses.gstin,
+      contactName: warehouses.originContactName,
+      phone: warehouses.originPhone,
+      line1: warehouses.originLine1,
+      line2: warehouses.originLine2,
+      city: warehouses.originCity,
+      state: warehouses.originState,
+      pincode: warehouses.originPincode,
+    })
+    .from(warehouses)
+    .where(eq(warehouses.tenantId, tenantId))
+    .orderBy(asc(warehouses.code), asc(warehouses.id));
+  return {
+    tenantName: tenant.name,
+    tenantGstin: tenant.gstin,
+    warehouses: rows.map((row) => ({
+      id: row.id,
+      code: row.code,
+      name: row.name,
+      gstin: row.gstin,
+      origin: {
+        contactName: row.contactName,
+        phone: row.phone,
+        line1: row.line1,
+        line2: row.line2,
+        city: row.city,
+        state: row.state,
+        pincode: row.pincode,
+      },
+    })),
   };
 }
 

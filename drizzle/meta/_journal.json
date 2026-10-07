@@ -435,6 +435,13 @@
       "when": 1791314909322,
       "tag": "0061_storage_snapshots",
       "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1791343003088,
+      "tag": "0062_client_invoices",
+      "breakpoints": true
     }
   ]
 }

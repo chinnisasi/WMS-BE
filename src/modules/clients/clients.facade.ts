@@ -17,6 +17,24 @@ export interface ClientSnapshot {
   readonly systemOwned: boolean;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /**
+   * Story 21-5 — the tax details a services tax invoice names the recipient
+   * by. All nullable (never required at create); written only by
+   * `ClientsCommand.updateTaxDetails`.
+   */
+  readonly taxDetails: ClientTaxDetails;
+}
+
+/** Story 21-5 — a client's tax details (every field nullable). */
+export interface ClientTaxDetails {
+  readonly legalName: string | null;
+  readonly gstin: string | null;
+  readonly billingLine1: string | null;
+  readonly billingLine2: string | null;
+  readonly billingCity: string | null;
+  /** A two-digit GST registration state code. */
+  readonly billingStateCode: string | null;
+  readonly billingPincode: string | null;
 }
 
 /** The facts the attribution rules need about one client (bulk read). */
@@ -36,6 +54,15 @@ export function toClientSnapshot(row: typeof clients.$inferSelect): ClientSnapsh
     systemOwned: row.systemOwned,
     createdAt: new Date(row.createdAt).toISOString(),
     updatedAt: new Date(row.updatedAt).toISOString(),
+    taxDetails: {
+      legalName: row.legalName,
+      gstin: row.gstin,
+      billingLine1: row.billingLine1,
+      billingLine2: row.billingLine2,
+      billingCity: row.billingCity,
+      billingStateCode: row.billingStateCode,
+      billingPincode: row.billingPincode,
+    },
   };
 }
 
@@ -90,6 +117,24 @@ export async function assertClientInTenantInTx(
     throw clientNotFound(clientId);
   }
   return row;
+}
+
+/**
+ * Story 21-5 — one client's full snapshot (its tax details included), 404
+ * `not-found` when absent. Billing's client invoice reads the recipient
+ * through it (after locking the row with `lockClientInTx`).
+ */
+export async function getClientInTx(tx: TenantTx, tenantId: string, clientId: string): Promise<ClientSnapshot> {
+  const rows = await tx
+    .select()
+    .from(clients)
+    .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
+    .limit(1);
+  const row = rows[0];
+  if (row === undefined) {
+    throw clientNotFound(clientId);
+  }
+  return toClientSnapshot(row);
 }
 
 /** A client's facts plus its status — what a priced relationship checks (21-3). */

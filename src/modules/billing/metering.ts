@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, eq, gte, lte, sql } from 'drizzle-orm';
+import { and, eq, gte, inArray, lte, sql } from 'drizzle-orm';
 import { storageSnapshots } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { divideRoundHalfUp } from '../../shared/primitives/money';
@@ -148,8 +148,35 @@ export class MeteringService {
   ) {}
 
   /**
+   * Story 21-5 — the CLIENT-wide storage watermark (the minimum over every
+   * warehouse the client has events in), whatever warehouses a read narrows
+   * to: a client invoice's `storage-not-complete` gap reads THIS, so a GSTIN
+   * group with counts but no stock events (no snapshot scope) can still
+   * issue. Null for the tenant's own client and a client with no events.
+   */
+  async clientStorageCompleteThroughInTx(tx: TenantTx, tenantId: string, clientId: string): Promise<string | null> {
+    const client = await assertClientInTenantInTx(tx, tenantId, clientId);
+    if (client.systemOwned) return null;
+    const scopes = (await this.inventory.clientWarehousesWithEventsInTx(tx, tenantId, [clientId])).map((scope) => ({
+      tenantId,
+      clientId,
+      warehouseId: scope.warehouseId,
+    }));
+    return this.snapshots.storageCompleteThroughInTx(tx, scopes);
+  }
+
+  /**
    * Meter `[fromDate, toDate]` (IST dates, inclusive) for one client: guards
    * the period FIRST (400s), then the client (404), then reads.
+   *
+   * Story 21-5 — `options.warehouseIds` narrows the whole read to a set of
+   * warehouses (a client invoice meters each supplying GSTIN over its own
+   * warehouses): the storage scopes and sum, the receipt-line, pick and
+   * dispatched-order counts (the order count's "no earlier dispatch" probe
+   * stays tenant-wide). `storageCompleteThrough` is then the minimum over
+   * THOSE warehouses' scopes. Absent = every warehouse — byte-identical to
+   * 21-4 (the metering suite proves it); the sum over a partition of the
+   * tenant's warehouses equals the unfiltered read, charge by charge.
    */
   async meterPeriodInTx(
     tx: TenantTx,
@@ -157,7 +184,9 @@ export class MeteringService {
     clientId: string,
     fromDate: string,
     toDate: string,
+    options: { readonly warehouseIds?: readonly string[] | undefined } = {},
   ): Promise<MeteredPeriod> {
+    const warehouseIds = options.warehouseIds === undefined ? undefined : [...new Set(options.warehouseIds)];
     assertMeteringPeriod(fromDate, toDate);
     const client = await assertClientInTenantInTx(tx, tenantId, clientId);
     const periodFrom = istMidnightOf(fromDate);
@@ -184,13 +213,15 @@ export class MeteringService {
     let storageCompleteThrough: string | null = null;
     const storageByDay = new Map<string, Map<string, bigint>>();
     if (!client.systemOwned) {
-      const scopes = (await this.inventory.clientWarehousesWithEventsInTx(tx, tenantId, [clientId])).map((scope) => ({
-        tenantId,
-        clientId,
-        warehouseId: scope.warehouseId,
-      }));
+      const scopes = (await this.inventory.clientWarehousesWithEventsInTx(tx, tenantId, [clientId]))
+        .filter((scope) => warehouseIds === undefined || warehouseIds.includes(scope.warehouseId))
+        .map((scope) => ({
+          tenantId,
+          clientId,
+          warehouseId: scope.warehouseId,
+        }));
       storageCompleteThrough = await this.snapshots.storageCompleteThroughInTx(tx, scopes);
-      if (storageCompleteThrough !== null && storageCompleteThrough >= fromDate) {
+      if (storageCompleteThrough !== null && storageCompleteThrough >= fromDate && (warehouseIds === undefined || warehouseIds.length > 0)) {
         const through = storageCompleteThrough < toDate ? storageCompleteThrough : toDate;
         const rows = await tx
           .select({
@@ -205,6 +236,7 @@ export class MeteringService {
               eq(storageSnapshots.clientId, clientId),
               gte(storageSnapshots.snapshotDate, fromDate),
               lte(storageSnapshots.snapshotDate, through),
+              warehouseIds === undefined ? undefined : inArray(storageSnapshots.warehouseId, warehouseIds),
             ),
           )
           .groupBy(storageSnapshots.snapshotDate, storageSnapshots.uom);
@@ -216,7 +248,7 @@ export class MeteringService {
       }
     }
 
-    const scope = { tenantId, clientId };
+    const scope = warehouseIds === undefined ? { tenantId, clientId } : { tenantId, clientId, warehouseIds };
     let billedPaise = 0n;
     let unbilledLines = 0;
     const segments: MeteredSegment[] = [];
