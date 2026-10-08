@@ -1445,7 +1445,10 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     try {
       await sql`
         insert into goods_receipt_notes (id, tenant_id, warehouse_id, code, po_id, blind_reason_code, status, device_id, recorded_by, occurred_at, recorded_at)
-        values (${uuidv7()}, ${tenantId}, ${warehouseId}, 'GRN-99999999999', null, null, 'recorded', ${deviceId}, ${operatorUserId}, now(), now())`;
+        values (${uuidv7()}, ${tenantId}, ${warehouseId}, 'GRN-99999999999', null, 'other', 'recorded', ${deviceId}, ${operatorUserId}, now(), now())`;
+      // (Story 21-6: a blind reason, because 0064's pairing CHECK closed the
+      // hole this fixture used to slip through — `NULL IN (…)` passed 0013's
+      // CHECK. The test pins the code allocation, not the pairing.)
     } finally {
       await sql.end();
     }

@@ -3,6 +3,8 @@ import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
+  advanceShipmentNotices,
+  asnLines,
   goodsReceiptLines,
   goodsReceiptNotes,
   overReceipts,
@@ -29,6 +31,7 @@ import { lineSnapshot } from './po.command';
 import type { OverReceiptEntry } from './receiving.command';
 import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/time';
 import { fromMilli } from '../../shared/primitives/quantity';
+import { OPEN_ASN_STATUSES, asnLineSnapshot, type AsnLineSnapshot } from './asn.command';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
 export interface GoodsReceiptEntry {
@@ -37,6 +40,9 @@ export interface GoodsReceiptEntry {
   readonly warehouseId: string;
   readonly code: string;
   readonly poId: string | null;
+  /** Story 21-6 — present only on an ASN receipt. */
+  readonly asnId?: string;
+  readonly asnCode?: string;
   readonly blindReasonCode: string | null;
   readonly status: string;
   readonly recordedBy: string;
@@ -50,8 +56,12 @@ export interface GoodsReceiptEntry {
 
 export interface ListGoodsReceiptsQuery {
   readonly warehouseId?: string | undefined;
-  /** Story 9-1 — `true`: blind receipts only (`po_id IS NULL`); `false`: PO-backed only. */
-  readonly poless?: boolean | undefined;
+  /**
+   * Story 21-6 — `true`: blind receipts only (`blind_reason_code IS NOT
+   * NULL` — no PO and no ASN); `false`: document-backed only. (9-1's
+   * `poless` is its alias at the controller.)
+   */
+  readonly blind?: boolean | undefined;
   /** Story 9-1 — `[from, to)` on `created_at` (server time). */
   readonly from?: string | undefined;
   readonly to?: string | undefined;
@@ -109,6 +119,15 @@ export interface CatalogSnapshot {
     readonly warehouseId: string;
     readonly vendorId: string;
     readonly lines: readonly PurchaseOrderLineSnapshot[];
+  }[];
+  /** Story 21-6 (additive): the warehouse's open ASNs (announced or partially received). */
+  readonly openAsns: readonly {
+    readonly id: string;
+    readonly code: string;
+    readonly clientId: string;
+    readonly warehouseId: string;
+    readonly expectedAt: string | null;
+    readonly lines: readonly AsnLineSnapshot[];
   }[];
   // ── Story 3.5 (additive): the putaway decision fields ────────────────────
   /** Every bin of the warehouse (blocked/system bins INCLUDED — the device needs them to reject a scan against them pre-queue). */
@@ -228,6 +247,8 @@ export class ReceivingFacade {
           warehouseId: goodsReceiptNotes.warehouseId,
           code: goodsReceiptNotes.code,
           poId: goodsReceiptNotes.poId,
+          asnId: goodsReceiptNotes.asnId,
+          asnCode: advanceShipmentNotices.asnCode,
           blindReasonCode: goodsReceiptNotes.blindReasonCode,
           status: goodsReceiptNotes.status,
           recordedBy: goodsReceiptNotes.recordedBy,
@@ -238,17 +259,26 @@ export class ReceivingFacade {
           createdAtText: sql<string>`${goodsReceiptNotes.createdAt}::text`,
         })
         .from(goodsReceiptNotes)
+        .leftJoin(
+          advanceShipmentNotices,
+          and(
+            eq(advanceShipmentNotices.tenantId, goodsReceiptNotes.tenantId),
+            eq(advanceShipmentNotices.id, goodsReceiptNotes.asnId),
+          ),
+        )
         .where(
           and(
             eq(goodsReceiptNotes.tenantId, tenantId),
             query.warehouseId === undefined
               ? undefined
               : eq(goodsReceiptNotes.warehouseId, query.warehouseId),
-            query.poless === undefined
+            // Story 21-6: blind is the REASON, not the absent PO — an ASN
+            // receipt has no PO and is not blind.
+            query.blind === undefined
               ? undefined
-              : query.poless
-                ? sql`${goodsReceiptNotes.poId} is null`
-                : sql`${goodsReceiptNotes.poId} is not null`,
+              : query.blind
+                ? sql`${goodsReceiptNotes.blindReasonCode} is not null`
+                : sql`${goodsReceiptNotes.blindReasonCode} is null`,
             query.from === undefined ? undefined : sql`${goodsReceiptNotes.createdAt} >= ${query.from}::timestamptz`,
             query.to === undefined ? undefined : sql`${goodsReceiptNotes.createdAt} < ${query.to}::timestamptz`,
             before === undefined
@@ -287,10 +317,12 @@ export class ReceivingFacade {
             );
       const items = rows.map((full) => {
         // `createdAtText` is the cursor-only projection — never in the body.
-        const { createdAtText, ...row } = full;
+        const { createdAtText, asnId, asnCode, ...row } = full;
         void createdAtText;
         return {
         ...row,
+        // Story 21-6: present only on an ASN receipt.
+        ...(asnId === null ? {} : { asnId, ...(asnCode === null ? {} : { asnCode }) }),
         lineCount: aggregates.get(row.id)?.lineCount ?? 0,
         // int8 arrives as text through postgres.js; the contract is a number.
         // Story 10.1: and a read-model number is in BASE units, not the
@@ -326,6 +358,7 @@ export class ReceivingFacade {
         .select({
           overReceipt: overReceipts,
           grnCode: goodsReceiptNotes.code,
+          asnCode: advanceShipmentNotices.asnCode,
           // Story 9-1: one GRN commits all its over-receipts in ONE
           // transaction (one shared `now()`), so the cursor must carry the
           // full-precision instant or the next page skips the tie group.
@@ -333,6 +366,13 @@ export class ReceivingFacade {
         })
         .from(overReceipts)
         .innerJoin(goodsReceiptNotes, eq(goodsReceiptNotes.id, overReceipts.grnId))
+        .leftJoin(
+          advanceShipmentNotices,
+          and(
+            eq(advanceShipmentNotices.tenantId, overReceipts.tenantId),
+            eq(advanceShipmentNotices.id, overReceipts.asnId),
+          ),
+        )
         .where(
           and(
             eq(overReceipts.tenantId, tenantId),
@@ -347,7 +387,7 @@ export class ReceivingFacade {
         )
         .orderBy(desc(overReceipts.createdAt), desc(overReceipts.id))
         .limit(pageSize + 1);
-      const items = rows.map(({ overReceipt: row, grnCode }) => ({
+      const items = rows.map(({ overReceipt: row, grnCode, asnCode }) => ({
         id: row.id,
         tenantId: row.tenantId,
         warehouseId: row.warehouseId,
@@ -356,6 +396,10 @@ export class ReceivingFacade {
         grnLineId: row.grnLineId,
         poId: row.poId,
         poLineId: row.poLineId,
+        // Story 21-6: present only on an ASN receipt's over-receipt.
+        ...(row.asnId === null ? {} : { asnId: row.asnId }),
+        ...(row.asnLineId === null ? {} : { asnLineId: row.asnLineId }),
+        ...(asnCode === null ? {} : { asnCode }),
         skuId: row.skuId,
         // Read model — base units at the edge (story 10.1).
         excessQty: fromMilli(row.excessQty),
@@ -416,6 +460,39 @@ export class ReceivingFacade {
         list.push(lineSnapshot(line));
         linesByPo.set(line.poId, list);
       }
+      // Story 21-6: the warehouse's open ASNs — a direct read on THIS
+      // transaction (the module's own tables; no nested connection).
+      const asnRows = await tx
+        .select({
+          id: advanceShipmentNotices.id,
+          code: advanceShipmentNotices.asnCode,
+          clientId: advanceShipmentNotices.clientId,
+          warehouseId: advanceShipmentNotices.warehouseId,
+          expectedAt: advanceShipmentNotices.expectedAt,
+        })
+        .from(advanceShipmentNotices)
+        .where(
+          and(
+            eq(advanceShipmentNotices.tenantId, tenantId),
+            eq(advanceShipmentNotices.warehouseId, warehouseId),
+            inArray(advanceShipmentNotices.status, [...OPEN_ASN_STATUSES]),
+          ),
+        )
+        .orderBy(desc(advanceShipmentNotices.createdAt), desc(advanceShipmentNotices.id));
+      const asnLineRows =
+        asnRows.length === 0
+          ? []
+          : await tx
+              .select()
+              .from(asnLines)
+              .where(inArray(asnLines.asnId, asnRows.map((row) => row.id)))
+              .orderBy(asnLines.createdAt, asnLines.id);
+      const linesByAsn = new Map<string, AsnLineSnapshot[]>();
+      for (const line of asnLineRows) {
+        const list = linesByAsn.get(line.asnId) ?? [];
+        list.push(asnLineSnapshot(line));
+        linesByAsn.set(line.asnId, list);
+      }
       // Story 3.5 (additive): the putaway decision fields ride the same
       // snapshot — the bins (for the wrong-bin/blocked pre-queue checks) and
       // the derived tasks (suggestions advisory; the server re-gates).
@@ -443,6 +520,14 @@ export class ReceivingFacade {
           warehouseId: po.warehouseId,
           vendorId: po.vendorId,
           lines: linesByPo.get(po.id) ?? [],
+        })),
+        openAsns: asnRows.map((row) => ({
+          id: row.id,
+          code: row.code,
+          clientId: row.clientId,
+          warehouseId: row.warehouseId,
+          expectedAt: row.expectedAt === null ? null : canonicalInstant(row.expectedAt),
+          lines: linesByAsn.get(row.id) ?? [],
         })),
         bins: binSummaries,
         putawayTasks: putawayTasks.map((task) => ({ ...task })),

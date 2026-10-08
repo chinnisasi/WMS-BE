@@ -870,8 +870,15 @@ describe('users, roles, and permission gating (e2e)', () => {
     // does NOT hold `rates.manage`. Story 21-5 grows it to 39 with
     // `billing.invoice` — owner + ACCOUNTANT (client invoices and the client
     // tax details are finance work, the `rates.manage` rationale);
-    // ops_manager does NOT hold it.
-    expect([...CAPABILITIES]).toHaveLength(39);
+    // ops_manager does NOT hold it. Story 21-6 grows it to 40 with
+    // `asn.manage` — owner + ops_manager, the `po.manage` holder set (an ASN
+    // is the PO's mirror).
+    expect([...CAPABILITIES]).toHaveLength(40);
+    expect(CAPABILITIES).toContain('asn.manage');
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('asn.manage'))).toEqual(
+      roles.filter((role) => ROLE_CAPABILITIES[role].has('po.manage')),
+    );
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('asn.manage'))).toEqual(['owner', 'ops_manager']);
     expect(CAPABILITIES).toContain('billing.invoice');
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('billing.invoice'))).toEqual(['owner', 'accountant']);
     expect(CAPABILITIES).toContain('rates.manage');

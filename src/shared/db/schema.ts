@@ -1674,6 +1674,12 @@ export const goodsReceiptNotes = pgTable(
     warehouseId: uuid('warehouse_id').notNull(),
     code: text('code').notNull(),
     poId: uuid('po_id'),
+    /**
+     * Story 21-6 — the advance shipment notice received against. A GRN
+     * references exactly one of a PO, an ASN, or neither (blind, with a
+     * reason): `goods_receipt_notes_blind_pairing`, widened by 0064, enforces it.
+     */
+    asnId: uuid('asn_id'),
     blindReasonCode: text('blind_reason_code'),
     status: text('status').notNull().default('recorded'),
     deviceId: uuid('device_id').notNull(),
@@ -1696,6 +1702,8 @@ export const goodsReceiptNotes = pgTable(
       table.createdAt,
       table.id,
     ),
+    // Story 21-6 — the receipts of an ASN (the cancel guard, the drill join).
+    index('goods_receipt_notes_tenant_asn_idx').on(table.tenantId, table.asnId),
   ],
 );
 
@@ -1723,6 +1731,8 @@ export const goodsReceiptLines = pgTable(
     tenantId: uuid('tenant_id').notNull(),
     grnId: uuid('grn_id').notNull(),
     poLineId: uuid('po_line_id'),
+    /** Story 21-6 — the ASN line credited; never set beside `po_line_id` (0064 CHECK). */
+    asnLineId: uuid('asn_line_id'),
     skuId: uuid('sku_id').notNull(),
     batchId: uuid('batch_id'),
     /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
@@ -1763,6 +1773,12 @@ export const overReceipts = pgTable(
     grnLineId: uuid('grn_line_id').notNull(),
     poId: uuid('po_id'),
     poLineId: uuid('po_line_id'),
+    /**
+     * Story 21-6 — exactly one of the pairs `(po_id, po_line_id)` and
+     * `(asn_id, asn_line_id)` is set, each pair together (0064 CHECK).
+     */
+    asnId: uuid('asn_id'),
+    asnLineId: uuid('asn_line_id'),
     skuId: uuid('sku_id').notNull(),
     /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
     excessQty: bigint('excess_qty', { mode: 'number' }).notNull(),
@@ -1782,10 +1798,95 @@ export const overReceipts = pgTable(
       table.id,
     ),
     index('over_receipts_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    // Story 21-6 — the close guard's pending probe per document.
+    index('over_receipts_tenant_po_idx').on(table.tenantId, table.poId),
+    index('over_receipts_tenant_asn_idx').on(table.tenantId, table.asnId),
   ],
 );
 
 export type OverReceipt = typeof overReceipts.$inferSelect;
+
+/**
+ * Story 21-6 — advance shipment notices (CAP-9): a client announces an
+ * inbound shipment before it arrives, and receiving books against it exactly
+ * as it books against a purchase order (one `grn.submit`, the same partial /
+ * blind / over-receipt handling). A deliberate MIRROR of `purchase_orders`
+ * with its own lifecycle: `announced | partially_received | received` are
+ * DERIVED from the lines' received against announced quantities (in the
+ * same transaction as every receipt, approval and amend); `closed` (a short
+ * ASN, from `partially_received`) and `cancelled` (from `announced`) are
+ * explicit, terminal and carry a note. The client is EXPLICIT on the request
+ * and checked against the SKUs; the code is the client's own, so it is
+ * unique per (tenant, client, code). The status vocabulary
+ * (`ASN_STATUSES`) lives in `src/modules/inbound/asn.command.ts`; the
+ * CHECKs and the RLS policies (the AD-24 client clause) live ONLY in
+ * `drizzle/0064_advance_shipment_notices.sql`. No FKs (house rule).
+ */
+export const advanceShipmentNotices = pgTable(
+  'advance_shipment_notices',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    asnCode: text('asn_code').notNull(),
+    status: text('status').notNull().default('announced'),
+    expectedAt: timestamp('expected_at', { withTimezone: true, mode: 'string' }),
+    /** The operator's note on close / cancel — set exactly on those two statuses. */
+    statusNote: text('status_note'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('advance_shipment_notices_tenant_client_code_unique').on(
+      table.tenantId,
+      table.clientId,
+      table.asnCode,
+    ),
+    // The device snapshot's open-ASN read and the status-filtered list.
+    index('advance_shipment_notices_tenant_warehouse_status_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.status,
+    ),
+    // The warehouse list's keyset.
+    index('advance_shipment_notices_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type AdvanceShipmentNotice = typeof advanceShipmentNotices.$inferSelect;
+
+/**
+ * Story 21-6 — one announced line of an ASN: `announced_qty` > 0 and
+ * `received_qty` ≥ 0 in milli-units, with NO upper ceiling CHECK (an approved
+ * over-receipt drives received past announced, as on a PO line). Lines carry
+ * no status — the ASN's status is derived from them. Visibility rides the
+ * parent's RLS (0064).
+ */
+export const asnLines = pgTable(
+  'asn_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    asnId: uuid('asn_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** Milli-units — base UoM × 10³. */
+    announcedQty: bigint('announced_qty', { mode: 'number' }).notNull(),
+    receivedQty: bigint('received_qty', { mode: 'number' }).notNull().default(0),
+    ...tenantTimestamps,
+  },
+  (table) => [index('asn_lines_asn_id_idx').on(table.asnId, table.createdAt, table.id)],
+);
+
+export type AsnLine = typeof asnLines.$inferSelect;
 
 /**
  * QC holds (Story 3.4): one row per Ops-Manager quarantine decision over a

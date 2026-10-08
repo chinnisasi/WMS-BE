@@ -51,10 +51,18 @@ export type LedgerReferenceDoc =
   | {
       readonly kind: 'grn-receipt';
       readonly grnId: string;
-      /** Absent on a blind receipt's events (no PO to name). */
+      /** Absent on a blind receipt's events (no PO to name) and on an ASN's. */
       readonly poId?: string;
-      /** Absent on the blind arm and on an approved-excess event with no line. */
+      /** Absent on the blind arm, an unmatched line, and an approved-excess event with no line. */
       readonly poLineId?: string;
+      /**
+       * Story 21-6 — the advance shipment notice received against, and the
+       * ASN line credited. ADDITIVE optional keys, omitted when absent (on
+       * submit AND approve), so a PO or blind event's canonical bytes are
+       * unchanged.
+       */
+      readonly asnId?: string;
+      readonly asnLineId?: string;
     }
   // Story 3.4 — the QC-hold arm: every `qc.held` / `qc.released` movement
   // names the hold that produced it. `fromBinId` rides the `qc.held` events

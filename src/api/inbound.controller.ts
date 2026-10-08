@@ -9,11 +9,18 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/
 import { UUID_RE } from '../shared/primitives/ids';
 import { InboundFacade } from '../modules/inbound/inbound.facade';
 import type { ListPurchaseOrdersQuery } from '../modules/inbound/inbound.facade';
+import type { AsnDetail } from '../modules/inbound/asn.command';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
+  AmendAsnDto,
   AmendPurchaseOrderDto,
+  AsnListQuery,
+  AsnListResponse,
+  AsnNoteDto,
+  AsnResponse,
+  CreateAsnDto,
   ClosePurchaseOrderDto,
   CreatePurchaseOrderDto,
   CreateVendorDto,
@@ -25,6 +32,11 @@ import {
   VendorListResponse,
   VendorResponse,
 } from '../modules/inbound/inbound.dto';
+
+const ASN_WRITE_403 =
+  'Session belongs to another tenant (permission-denied), the caller lacks asn.manage (role-denied), or a client-portal session (role-denied — 21-7 opens the portal)';
+const ASN_READ_403 =
+  'Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): 21-7 opens the portal';
 
 const IDEMPOTENCY_HEADER = [
   {
@@ -249,7 +261,7 @@ export class InboundController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks po.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('PO or a referenced line id does not exist in this tenant (not-found), or a line\'s SKU is unknown (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The PO is not open (po-not-open, naming the status), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The PO is not open (po-not-open, naming the status), a line that has received stock would be removed, change SKU or order less than it received (po-line-received), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'poId', format: 'uuid' })
@@ -302,7 +314,7 @@ export class InboundController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks po.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('PO or a dispositioned line id does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The PO is already closed (po-not-open, naming the status), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The PO is already closed (po-not-open, naming the status), an over-receipt of it awaits a decision (over-receipt-pending), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'poId', format: 'uuid' })
@@ -330,10 +342,237 @@ export class InboundController {
       successor: snapshot.successor === null ? null : { ...snapshot.successor },
     };
   }
+
+  // ── story 21-6: advance shipment notices ──────────────────────────────────
+
+  @Post(':tenantId/inbound/asns')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Announces an inbound shipment — an advance shipment notice (asn.manage): one client's SKUs, one warehouse, code unique per client; receiving books against it exactly as against a PO",
+  })
+  @ApiBody({ type: CreateAsnDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: AsnResponse, description: 'The ASN, announced (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, a malformed expectedAt, or a quantity finer than its unit (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(ASN_WRITE_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("The warehouse, the client, or a line's SKU does not exist in this tenant (not-found)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse("The lines span clients (mixed-client), their client is not clientId (sku-client-mismatch), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)") })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async createAsn(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: CreateAsnDto,
+  ): Promise<AsnResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.inbound.createAsn(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        clientId: dto.clientId,
+        warehouseId: dto.warehouseId,
+        asnCode: dto.asnCode,
+        expectedAt: dto.expectedAt ?? null,
+        // BASE units cross this edge; the command scales them behind its
+        // replay lookup (story 10.2).
+        lines: dto.lines.map((line) => ({ skuId: line.skuId, announcedQty: line.announcedQty })),
+      },
+      key,
+    );
+    return { asn: toAsnDto(snapshot.asn) };
+  }
+
+  @Get(':tenantId/warehouses/:warehouseId/inbound/asns')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Lists one warehouse's advance shipment notices, newest first (keyset on createdAt, id), optionally one status's or one client's — with line counts and announced / received totals",
+  })
+  @ApiOkResponse({ type: AsnListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed warehouseId, status or clientId, a limit outside 1–100 (validation-failed), or a malformed cursor (invalid-cursor)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(ASN_READ_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async listAsns(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: AsnListQuery,
+  ): Promise<AsnListResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    const page = await this.inbound.listAsns(tenantId, session.userId, warehouseId, {
+      status: query.status,
+      clientId: query.clientId,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items.map((item) => ({ ...item })), nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/inbound/asns/:asnId')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'One advance shipment notice with its lines — announced / received / open per line' })
+  @ApiOkResponse({ type: AsnResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed asnId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(ASN_READ_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No advance shipment notice with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'asnId', format: 'uuid' })
+  async getAsn(
+    @Param('tenantId') tenantId: string,
+    @Param('asnId') asnId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<AsnResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(asnId, 'asnId');
+    const asn = await this.inbound.getAsn(tenantId, session.userId, asnId);
+    if (asn === null) {
+      throw new ProblemException(
+        'not-found',
+        404,
+        'Advance shipment notice not found',
+        `No advance shipment notice with id "${asnId}" exists in this tenant.`,
+      );
+    }
+    return { asn: toAsnDto(asn) };
+  }
+
+  @Patch(':tenantId/inbound/asns/:asnId')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Amends an announced or partially received ASN (asn.manage) — expectedAt and the full line set: update by id, add without id, remove by absence',
+  })
+  @ApiBody({ type: AmendAsnDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: AsnResponse, description: 'The amended ASN — its status re-derived from the lines (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, a repeated line id, a malformed expectedAt, or a quantity finer than its unit (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(ASN_WRITE_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse("The ASN, a referenced line id, or a line's SKU does not exist in this tenant (not-found)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse("The ASN is received, closed or cancelled (asn-not-open), a line that has received stock would be removed, change SKU or announce less than it received (asn-line-received), a SKU of another client (sku-client-mismatch), or a concurrent idempotent request (conflict)") })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'asnId', format: 'uuid' })
+  async amendAsn(
+    @Param('tenantId') tenantId: string,
+    @Param('asnId') asnId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: AmendAsnDto,
+  ): Promise<AsnResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(asnId, 'asnId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.inbound.amendAsn(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        asnId,
+        ...(dto.expectedAt === undefined ? {} : { expectedAt: dto.expectedAt }),
+        lines: dto.lines.map((line) => ({
+          ...(line.id === undefined ? {} : { id: line.id }),
+          skuId: line.skuId,
+          announcedQty: line.announcedQty,
+        })),
+      },
+      key,
+    );
+    return { asn: toAsnDto(snapshot.asn) };
+  }
+
+  @Post(':tenantId/inbound/asns/:asnId/close')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Closes a partially received ASN short (asn.manage) — terminal, with a note; it leaves the open list and the device snapshot, and nothing carries forward',
+  })
+  @ApiBody({ type: AsnNoteDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: AsnResponse, description: 'The closed ASN (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed asnId, or a note that is blank or over 500 characters (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(ASN_WRITE_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No advance shipment notice with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The ASN is not partially received (asn-transition-invalid), an over-receipt of it awaits a decision (over-receipt-pending), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'asnId', format: 'uuid' })
+  async closeAsn(
+    @Param('tenantId') tenantId: string,
+    @Param('asnId') asnId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: AsnNoteDto,
+  ): Promise<AsnResponse> {
+    return this.transitionAsn(tenantId, asnId, idempotencyKey, session, dto, 'close');
+  }
+
+  @Post(':tenantId/inbound/asns/:asnId/cancel')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Cancels an ASN nothing was received against (asn.manage) — terminal, with a note',
+  })
+  @ApiBody({ type: AsnNoteDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: AsnResponse, description: 'The cancelled ASN (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed asnId, or a note that is blank or over 500 characters (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(ASN_WRITE_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No advance shipment notice with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The ASN is not announced — something was received, so close it short instead (asn-transition-invalid), goods receipts reference it (asn-has-receipts), an over-receipt of it awaits a decision (over-receipt-pending), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'asnId', format: 'uuid' })
+  async cancelAsn(
+    @Param('tenantId') tenantId: string,
+    @Param('asnId') asnId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: AsnNoteDto,
+  ): Promise<AsnResponse> {
+    return this.transitionAsn(tenantId, asnId, idempotencyKey, session, dto, 'cancel');
+  }
+
+  private async transitionAsn(
+    tenantId: string,
+    asnId: string,
+    idempotencyKey: string | undefined,
+    session: TenantSession,
+    dto: AsnNoteDto,
+    transition: 'close' | 'cancel',
+  ): Promise<AsnResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(asnId, 'asnId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.inbound.transitionAsn(
+      { tenantId, actorUserId: session.userId, asnId, transition, note: dto.note },
+      key,
+    );
+    return { asn: toAsnDto(snapshot.asn) };
+  }
 }
 
 /** Inbound uuid path params fail 400 (not a 500 from the `::uuid` cast). */
-function assertUuidParam(value: string, name: 'poId' | 'warehouseId'): void {
+function assertUuidParam(value: string, name: 'poId' | 'warehouseId' | 'asnId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',
@@ -362,4 +601,9 @@ function assertOwnTenant(session: TenantSession, tenantId: string): void {
       'The session token tenant does not own this path.',
     );
   }
+}
+
+/** A fresh object per response (the shell never hands out the snapshot itself). */
+function toAsnDto(asn: AsnDetail): AsnResponse['asn'] {
+  return { ...asn, lines: asn.lines.map((line) => ({ ...line })) };
 }

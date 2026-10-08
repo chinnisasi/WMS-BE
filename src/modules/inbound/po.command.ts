@@ -23,6 +23,7 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
 import { uomPrecision } from '../catalog/uom';
+import { assertNoPendingOverReceiptsInTx } from './asn.command';
 
 export interface PoLineInput {
   readonly skuId: string;
@@ -386,11 +387,39 @@ export class PurchaseOrderCommand {
       // Story 10.2: same position, same reason — behind the replay lookup.
       const lines = this.scaleLines(command.lines, uomBySku);
 
+      // Story 21-6 (PENDING :50): a line that has received anything keeps
+      // its history — it may not be removed, change SKU, or order less than
+      // it already received (the same guard the ASN amend carries).
+      const requestedById = new Map(
+        lines.filter((line) => line.id !== undefined).map((line) => [line.id!, line]),
+      );
+      for (const line of existingLines) {
+        if (line.receivedQty <= 0) continue;
+        const next = requestedById.get(line.id);
+        const refusal =
+          next === undefined
+            ? 'it cannot be removed'
+            : next.skuId !== line.skuId
+              ? 'its SKU cannot change'
+              : // Only a LOWERED quantity ending below received refuses (an
+                // approved over-receipt leaves received > ordered; resending
+                // the line unchanged must still amend).
+                next.orderedQty < line.orderedQty && next.orderedQty < line.receivedQty
+                ? `it cannot order less (got ${fromMilli(next.orderedQty)})`
+                : null;
+        if (refusal !== null) {
+          throw new ProblemException(
+            'po-line-received',
+            409,
+            'PO line has already received stock',
+            `Line "${line.id}" of purchase order "${po.code}" has received ${fromMilli(line.receivedQty)} — ${refusal}.`,
+          );
+        }
+      }
+
       // Removals first (lines absent from the request are removed), then
       // updates in place — `received_qty` is never touched by an amend.
-      const requestedIds = new Set(
-        lines.filter((line) => line.id !== undefined).map((line) => line.id!),
-      );
+      const requestedIds = new Set(requestedById.keys());
       const removedIds = existingLines
         .map((line) => line.id)
         .filter((lineId) => !requestedIds.has(lineId));
@@ -463,6 +492,9 @@ export class PurchaseOrderCommand {
       // Already closed → 409 `po-not-open` naming the status (the stored
       // replay above re-serves the original close's snapshot first).
       const po = await this.loadOpenPo(tx, command.tenantId, command.poId);
+      // Story 21-6 (decision 3): never close past an undecided excess — under
+      // the PO lock, which an approve also takes, so the two serialise.
+      await assertNoPendingOverReceiptsInTx(tx, command.tenantId, { poId: po.id }, `Purchase order "${po.code}"`);
       // Story 10.1: the RAW rows — close does quantity arithmetic on them
       // (`ordered − received` becomes the successor's ordered quantity), so it
       // must stay in the domain's milli-units the whole way.

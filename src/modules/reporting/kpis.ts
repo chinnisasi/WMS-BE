@@ -533,7 +533,9 @@ function grnShape(
     blindGrns: windowed(
       ctx,
       DRILL.goodsReceipts(ctx.scope),
-      { warehouseId: w, poless: 'true' },
+      // Story 21-6: the drill pages the `blind` filter (blind = a reason,
+      // not an absent PO — an ASN receipt has neither PO nor reason).
+      { warehouseId: w, blind: 'true' },
       true,
       values?.blind ?? null,
     ),
@@ -564,7 +566,7 @@ const grnVariances: TileDefinition<'grnVariances'> = {
           from goods_receipt_notes
           where tenant_id = ${scope.tenantId}::uuid
             and warehouse_id = ${scope.warehouseId}::uuid
-            and po_id is null
+            and blind_reason_code is not null
             and created_at >= ${ts(window.d7From)}
             and created_at < ${ts(window.asOf)}`,
     );

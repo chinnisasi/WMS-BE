@@ -5924,7 +5924,7 @@
             }
           },
           "409": {
-            "description": "The PO is not open (po-not-open, naming the status), or a concurrent idempotent request (conflict)",
+            "description": "The PO is not open (po-not-open, naming the status), a line that has received stock would be removed, change SKU or order less than it received (po-line-received), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6053,7 +6053,7 @@
             }
           },
           "409": {
-            "description": "The PO is already closed (po-not-open, naming the status), or a concurrent idempotent request (conflict)",
+            "description": "The PO is already closed (po-not-open, naming the status), an over-receipt of it awaits a decision (over-receipt-pending), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6079,6 +6079,731 @@
           }
         ],
         "summary": "Closes a purchase order (po.manage) with a per-line disposition — carried open quantities auto-create one successor open PO",
+        "tags": [
+          "inbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inbound/asns": {
+      "post": {
+        "operationId": "InboundController_createAsn",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAsnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The ASN, announced (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsnResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid body, a malformed expectedAt, or a quantity finer than its unit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks asn.manage (role-denied), or a client-portal session (role-denied — 21-7 opens the portal)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse, the client, or a line's SKU does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The lines span clients (mixed-client), their client is not clientId (sku-client-mismatch), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Announces an inbound shipment — an advance shipment notice (asn.manage): one client's SKUs, one warehouse, code unique per client; receiving books against it exactly as against a PO",
+        "tags": [
+          "inbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/inbound/asns": {
+      "get": {
+        "operationId": "InboundController_listAsns",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Only ASNs of one status",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "announced",
+                "partially_received",
+                "received",
+                "closed",
+                "cancelled"
+              ]
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Only one client's ASNs",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsnListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed warehouseId, status or clientId, a limit outside 1–100 (validation-failed), or a malformed cursor (invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): 21-7 opens the portal",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists one warehouse's advance shipment notices, newest first (keyset on createdAt, id), optionally one status's or one client's — with line counts and announced / received totals",
+        "tags": [
+          "inbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inbound/asns/{asnId}": {
+      "get": {
+        "operationId": "InboundController_getAsn",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "asnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsnResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed asnId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — a user with a client (role-denied): 21-7 opens the portal",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No advance shipment notice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One advance shipment notice with its lines — announced / received / open per line",
+        "tags": [
+          "inbound"
+        ]
+      },
+      "patch": {
+        "operationId": "InboundController_amendAsn",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "asnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AmendAsnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The amended ASN — its status re-derived from the lines (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsnResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an invalid body, a repeated line id, a malformed expectedAt, or a quantity finer than its unit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks asn.manage (role-denied), or a client-portal session (role-denied — 21-7 opens the portal)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The ASN, a referenced line id, or a line's SKU does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The ASN is received, closed or cancelled (asn-not-open), a line that has received stock would be removed, change SKU or announce less than it received (asn-line-received), a SKU of another client (sku-client-mismatch), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Amends an announced or partially received ASN (asn.manage) — expectedAt and the full line set: update by id, add without id, remove by absence",
+        "tags": [
+          "inbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inbound/asns/{asnId}/close": {
+      "post": {
+        "operationId": "InboundController_closeAsn",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "asnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AsnNoteDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The closed ASN (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsnResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed asnId, or a note that is blank or over 500 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks asn.manage (role-denied), or a client-portal session (role-denied — 21-7 opens the portal)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No advance shipment notice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The ASN is not partially received (asn-transition-invalid), an over-receipt of it awaits a decision (over-receipt-pending), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Closes a partially received ASN short (asn.manage) — terminal, with a note; it leaves the open list and the device snapshot, and nothing carries forward",
+        "tags": [
+          "inbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inbound/asns/{asnId}/cancel": {
+      "post": {
+        "operationId": "InboundController_cancelAsn",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "asnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AsnNoteDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The cancelled ASN (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsnResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed asnId, or a note that is blank or over 500 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks asn.manage (role-denied), or a client-portal session (role-denied — 21-7 opens the portal)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No advance shipment notice with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The ASN is not announced — something was received, so close it short instead (asn-transition-invalid), goods receipts reference it (asn-has-receipts), an over-receipt of it awaits a decision (over-receipt-pending), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Cancels an ASN nothing was received against (asn.manage) — terminal, with a note",
         "tags": [
           "inbound"
         ]
@@ -9112,7 +9837,7 @@
             }
           },
           "404": {
-            "description": "Warehouse, purchase order, or a line's SKU does not exist in this tenant (not-found)",
+            "description": "Warehouse, purchase order, advance shipment notice, or a line's SKU does not exist in this tenant (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9122,7 +9847,7 @@
             }
           },
           "409": {
-            "description": "The PO is not open (po-not-open, naming the status), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)",
+            "description": "The PO is not open (po-not-open, naming the status), the ASN is not announced or partially received (asn-not-open), the document belongs to another warehouse (document-warehouse-mismatch), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9176,10 +9901,20 @@
             }
           },
           {
+            "name": "blind",
+            "required": false,
+            "in": "query",
+            "description": "Story 21-6 — `true`: only BLIND receipts (no PO and no ASN — `blind_reason_code` set); `false`: only document-backed ones (a PO or an ASN). Exactly 'true' or 'false'",
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "name": "poless",
             "required": false,
             "in": "query",
-            "description": "Story 9-1 — `true`: only BLIND receipts (no purchase order — flagged for PO matching); `false`: only PO-backed ones. Exactly 'true' or 'false'",
+            "deprecated": true,
+            "description": "Story 9-1, kept as an ALIAS of `blind` since 21-6 (it means blind — an ASN receipt has no PO but is not blind). Exactly 'true' or 'false'; refused when it disagrees with `blind`",
             "schema": {
               "type": "boolean"
             }
@@ -9237,7 +9972,7 @@
             }
           },
           "400": {
-            "description": "Malformed cursor (invalid-cursor), malformed warehouseId, out-of-range limit, a poless flag other than true/false, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed)",
+            "description": "Malformed cursor (invalid-cursor), malformed warehouseId, out-of-range limit, a blind/poless flag other than true/false or the two disagreeing, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -23112,7 +23847,17 @@
           "poLineId": {
             "type": "string",
             "format": "uuid",
-            "description": "The exact PO line (grn-receipt arm only — absent on the blind arm)"
+            "description": "The exact PO line (grn-receipt arm only — absent on the blind arm and on an unmatched line)"
+          },
+          "asnId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 21-6 — the advance shipment notice received against (grn-receipt arm only)"
+          },
+          "asnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 21-6 — the exact ASN line credited (grn-receipt arm only)"
           }
         },
         "required": [
@@ -24004,6 +24749,327 @@
         "required": [
           "purchaseOrder",
           "successor"
+        ]
+      },
+      "AsnLineInputDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Existing line to update (amend only) — omitted means a new line"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "announcedQty": {
+            "type": "number",
+            "description": "Announced quantity. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
+          }
+        },
+        "required": [
+          "skuId",
+          "announcedQty"
+        ]
+      },
+      "CreateAsnDto": {
+        "type": "object",
+        "properties": {
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The client the shipment is for — checked against the lines' SKUs"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse the shipment arrives at — fixed at create"
+          },
+          "asnCode": {
+            "type": "string",
+            "description": "The client's own ASN code — unique per client; 1–64 characters, counted in code points",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "expectedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When the shipment is expected (ISO-8601 UTC, Z-suffixed); optional",
+            "minLength": 20,
+            "maxLength": 35
+          },
+          "lines": {
+            "minItems": 1,
+            "maxItems": 200,
+            "description": "At least one line with a known SKU of the client",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AsnLineInputDto"
+            }
+          }
+        },
+        "required": [
+          "clientId",
+          "warehouseId",
+          "asnCode",
+          "lines"
+        ]
+      },
+      "AsnLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "announcedQty": {
+            "type": "number",
+            "description": "Announced quantity in base UoM"
+          },
+          "receivedQty": {
+            "type": "number",
+            "description": "Received to date in base UoM",
+            "minimum": 0
+          },
+          "openQty": {
+            "type": "number",
+            "description": "Derived: announcedQty − receivedQty (negative after an approved over-receipt)"
+          }
+        },
+        "required": [
+          "id",
+          "skuId",
+          "announcedQty",
+          "receivedQty",
+          "openQty"
+        ]
+      },
+      "AsnDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "The client's ASN code"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "announced",
+              "partially_received",
+              "received",
+              "closed",
+              "cancelled"
+            ],
+            "description": "announced / partially_received / received are derived from the lines; closed (short) and cancelled are explicit"
+          },
+          "expectedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When the shipment is expected (ISO-8601 UTC), null when unset"
+          },
+          "lineCount": {
+            "type": "number",
+            "description": "Number of lines"
+          },
+          "linesComplete": {
+            "type": "number",
+            "description": "Lines whose received quantity has reached announced — the unit-safe progress figure (\"N of M lines received\")"
+          },
+          "announcedTotal": {
+            "type": "number",
+            "description": "Σ announced over the lines, in base units — sums across UoMs, so indicative only"
+          },
+          "receivedTotal": {
+            "type": "number",
+            "description": "Σ received over the lines, in base units"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time (the keyset field)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "statusNote": {
+            "type": "string",
+            "nullable": true,
+            "description": "The close / cancel note — set exactly on those two statuses"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last-mutation time"
+          },
+          "lines": {
+            "description": "Per-line announced / received / open, oldest first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AsnLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "clientId",
+          "status",
+          "expectedAt",
+          "lineCount",
+          "linesComplete",
+          "announcedTotal",
+          "receivedTotal",
+          "createdAt",
+          "warehouseId",
+          "statusNote",
+          "updatedAt",
+          "lines"
+        ]
+      },
+      "AsnResponse": {
+        "type": "object",
+        "properties": {
+          "asn": {
+            "$ref": "#/components/schemas/AsnDto"
+          }
+        },
+        "required": [
+          "asn"
+        ]
+      },
+      "AsnEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "The client's ASN code"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "announced",
+              "partially_received",
+              "received",
+              "closed",
+              "cancelled"
+            ],
+            "description": "announced / partially_received / received are derived from the lines; closed (short) and cancelled are explicit"
+          },
+          "expectedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When the shipment is expected (ISO-8601 UTC), null when unset"
+          },
+          "lineCount": {
+            "type": "number",
+            "description": "Number of lines"
+          },
+          "linesComplete": {
+            "type": "number",
+            "description": "Lines whose received quantity has reached announced — the unit-safe progress figure (\"N of M lines received\")"
+          },
+          "announcedTotal": {
+            "type": "number",
+            "description": "Σ announced over the lines, in base units — sums across UoMs, so indicative only"
+          },
+          "receivedTotal": {
+            "type": "number",
+            "description": "Σ received over the lines, in base units"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time (the keyset field)"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "clientId",
+          "status",
+          "expectedAt",
+          "lineCount",
+          "linesComplete",
+          "announcedTotal",
+          "receivedTotal",
+          "createdAt"
+        ]
+      },
+      "AsnListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AsnEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "AmendAsnDto": {
+        "type": "object",
+        "properties": {
+          "expectedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "Omitted: unchanged; null: cleared; otherwise an ISO-8601 UTC instant (Z-suffixed)",
+            "minLength": 20,
+            "maxLength": 35
+          },
+          "lines": {
+            "minItems": 1,
+            "maxItems": 200,
+            "description": "The complete new line set (update by id, add without id, remove by absence). A line that has received anything cannot be removed, change SKU, or announce less than it received",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AsnLineInputDto"
+            }
+          }
+        },
+        "required": [
+          "lines"
+        ]
+      },
+      "AsnNoteDto": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "type": "string",
+            "description": "Why — required, 1–500 characters",
+            "minLength": 1,
+            "maxLength": 1000
+          }
+        },
+        "required": [
+          "note"
         ]
       },
       "OrderLineInputDto": {
@@ -26279,6 +27345,12 @@
             "nullable": true,
             "description": "The PO line received against — null on a blind receipt's lines"
           },
+          "asnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 21-6 — the ASN line received against (only beside asnId). A line with no line reference, or whose SKU differs from the referenced line's, settles unmatched: applied in full, crediting no line"
+          },
           "skuId": {
             "type": "string",
             "format": "uuid"
@@ -26330,7 +27402,13 @@
             "type": "string",
             "format": "uuid",
             "nullable": true,
-            "description": "The purchase order received against — null on a blind receipt"
+            "description": "The purchase order received against — exactly one of poId, asnId and blindReasonCode"
+          },
+          "asnId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 21-6 — the advance shipment notice received against — exactly one of poId, asnId and blindReasonCode"
           },
           "blindReasonCode": {
             "type": "string",
@@ -26338,9 +27416,10 @@
             "enum": [
               "unannounced-delivery",
               "po-not-found",
-              "other"
+              "other",
+              null
             ],
-            "description": "The blind-receive reason code (required when poId is null, forbidden otherwise)"
+            "description": "The blind-receive reason code (required when neither poId nor asnId is given, forbidden otherwise)"
           },
           "occurredAt": {
             "type": "string",
@@ -26378,7 +27457,13 @@
           "poLineId": {
             "type": "string",
             "format": "uuid",
-            "nullable": true
+            "nullable": true,
+            "description": "The PO line credited — null on a blind, ASN or unmatched line"
+          },
+          "asnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 21-6 — the ASN line credited; present only when one was"
           },
           "skuId": {
             "type": "string",
@@ -26433,7 +27518,14 @@
         "properties": {
           "poLineId": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "nullable": true,
+            "description": "The PO line named — null on an ASN line rejection"
+          },
+          "asnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 21-6 — the ASN line named; present only on an ASN line rejection"
           },
           "skuId": {
             "type": "string",
@@ -26441,11 +27533,16 @@
           },
           "qty": {
             "type": "number",
-            "minimum": 1
+            "minimum": 0.001
           },
           "code": {
             "type": "string",
-            "description": "Machine reason (po-line-not-found | po-line-not-open)"
+            "enum": [
+              "po-line-not-found",
+              "po-line-not-open",
+              "asn-line-not-found"
+            ],
+            "description": "Machine reason"
           },
           "reason": {
             "type": "string",
@@ -26457,6 +27554,28 @@
           "skuId",
           "qty",
           "code",
+          "reason"
+        ]
+      },
+      "UnmatchedGrnLineDto": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "number",
+            "minimum": 0,
+            "description": "The line's index in the request's lines array"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "no-line-reference",
+              "line-sku-mismatch"
+            ],
+            "description": "no-line-reference: the line named no document line; line-sku-mismatch: its SKU is not the referenced line's"
+          }
+        },
+        "required": [
+          "index",
           "reason"
         ]
       },
@@ -26484,12 +27603,22 @@
             "format": "uuid",
             "nullable": true
           },
+          "asnId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 21-6 — the ASN received against; present only on an ASN receipt"
+          },
+          "asnCode": {
+            "type": "string",
+            "description": "Story 21-6 — the ASN's code; present only on an ASN receipt"
+          },
           "blindReasonCode": {
             "type": "string",
             "enum": [
               "unannounced-delivery",
               "po-not-found",
-              "other"
+              "other",
+              null
             ],
             "nullable": true
           },
@@ -26523,6 +27652,13 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RejectedGrnLineDto"
+            }
+          },
+          "unmatchedLines": {
+            "description": "Story 21-6 — present only when some lines of a PO/ASN receipt settled unmatched (booked in full, crediting no document line)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnmatchedGrnLineDto"
             }
           }
         },
@@ -26707,6 +27843,79 @@
           "code",
           "warehouseId",
           "vendorId",
+          "lines"
+        ]
+      },
+      "CatalogSnapshotAsnLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "announcedQty": {
+            "type": "number",
+            "description": "Announced quantity. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded."
+          },
+          "receivedQty": {
+            "type": "number",
+            "description": "Received to date, in base UoM",
+            "minimum": 0
+          },
+          "openQty": {
+            "type": "number",
+            "description": "Derived: announcedQty − receivedQty (negative after an approved over-receipt)"
+          }
+        },
+        "required": [
+          "id",
+          "skuId",
+          "announcedQty",
+          "receivedQty",
+          "openQty"
+        ]
+      },
+      "CatalogSnapshotAsnDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "The client-supplied ASN code"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expectedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When the shipment is expected (ISO-8601 UTC), null when unannounced"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogSnapshotAsnLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "clientId",
+          "warehouseId",
+          "expectedAt",
           "lines"
         ]
       },
@@ -27212,6 +28421,13 @@
               "$ref": "#/components/schemas/CatalogSnapshotPoDto"
             }
           },
+          "openAsns": {
+            "description": "Story 21-6 (additive): the warehouse's open advance shipment notices (announced or partially received) with per-line announced / received / open — receiving books against them exactly as against a PO",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogSnapshotAsnDto"
+            }
+          },
           "bins": {
             "description": "Story 3.5 (additive): every bin of the warehouse — blocked/system bins included so the device can reject a scan against them pre-queue",
             "type": "array",
@@ -27267,6 +28483,7 @@
           "warehouseId",
           "skus",
           "openPurchaseOrders",
+          "openAsns",
           "bins",
           "putawayTasks",
           "pickTasks",
@@ -27300,12 +28517,22 @@
             "format": "uuid",
             "nullable": true
           },
+          "asnId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 21-6 — the ASN received against; present only on an ASN receipt"
+          },
+          "asnCode": {
+            "type": "string",
+            "description": "Story 21-6 — the ASN's code; present only on an ASN receipt"
+          },
           "blindReasonCode": {
             "type": "string",
             "enum": [
               "unannounced-delivery",
               "po-not-found",
-              "other"
+              "other",
+              null
             ],
             "nullable": true,
             "description": "Set only on a blind receipt"
@@ -27414,6 +28641,20 @@
             "type": "string",
             "format": "uuid",
             "nullable": true
+          },
+          "asnId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 21-6 — present only on an ASN receipt's over-receipt"
+          },
+          "asnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 21-6 — the ASN line; present only on an ASN receipt's over-receipt"
+          },
+          "asnCode": {
+            "type": "string",
+            "description": "Story 21-6 — the ASN's code; present only on an ASN receipt's over-receipt"
           },
           "skuId": {
             "type": "string",
@@ -32826,7 +34067,16 @@
           "poCode": {
             "type": "string",
             "nullable": true,
-            "description": "The purchase order the GRN booked against — null on a blind receipt"
+            "description": "The purchase order the GRN booked against — null on a blind or ASN receipt"
+          },
+          "asnCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 21-6 — the advance shipment notice the GRN booked against — null on a PO or blind receipt"
+          },
+          "blind": {
+            "type": "boolean",
+            "description": "Story 21-6 — the GRN was blind (a reason, no PO or ASN). Both codes are null on a blind line, but ALSO on another client's line received against a PO/ASN (the document's code is that client's to see) — only this flag says blind"
           },
           "recordedAt": {
             "type": "string",
@@ -32873,6 +34123,8 @@
           "id",
           "grnCode",
           "poCode",
+          "asnCode",
+          "blind",
           "recordedAt",
           "warehouseId",
           "warehouseCode",

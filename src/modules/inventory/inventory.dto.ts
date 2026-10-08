@@ -426,9 +426,23 @@ export class LedgerReferenceDocDto {
   @ApiProperty({
     required: false,
     format: 'uuid',
-    description: 'The exact PO line (grn-receipt arm only — absent on the blind arm)',
+    description: 'The exact PO line (grn-receipt arm only — absent on the blind arm and on an unmatched line)',
   })
   poLineId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'Story 21-6 — the advance shipment notice received against (grn-receipt arm only)',
+  })
+  asnId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'Story 21-6 — the exact ASN line credited (grn-receipt arm only)',
+  })
+  asnLineId?: string;
 }
 
 /** One event-timeline row. */

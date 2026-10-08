@@ -237,6 +237,13 @@ export const CAPABILITIES = [
   // refused at the read. Mirrored into wms-fe `src/lib/users.ts`
   // (CAPABILITIES + OPS_EXCLUDED_CAPABILITIES).
   'billing.invoice',
+  // Story 21-6 — advance shipment notices: create, amend, close (short) and
+  // cancel an ASN. Owner + Ops Manager, the same holders as `po.manage` — an
+  // ASN is the PO's mirror, an inbound document the floor receives against.
+  // Every member READS ASNs (reads are never gated); a client-portal session
+  // is refused on reads and writes until 21-7 opens them. Mirrored into
+  // wms-fe `src/lib/users.ts`.
+  'asn.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -267,6 +274,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'stock.adjust',
     'vendor.manage',
     'po.manage',
+    // Story 21-6 — the ASN verbs, beside `po.manage` (owner holds everything).
+    'asn.manage',
     'device.manage',
     'review.decide',
     'qc.manage',

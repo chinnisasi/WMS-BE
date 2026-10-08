@@ -82,6 +82,10 @@ export interface ReceiptLineRecordView {
   readonly id: string;
   readonly grnCode: string;
   readonly poCode: string | null;
+  /** Story 21-6 — the advance shipment notice the GRN booked against; null otherwise. */
+  readonly asnCode: string | null;
+  /** Story 21-6 — the GRN carried a blind reason (no PO, no ASN). */
+  readonly blind: boolean;
   /** The GRN's `recorded_at`, ISO-8601 UTC at full precision. */
   readonly recordedAt: string;
   readonly warehouseId: string;
@@ -342,6 +346,8 @@ export class InvoiceRecordsService {
             id: row.id,
             grnCode: row.grnCode,
             poCode: row.poCode,
+            asnCode: row.asnCode,
+            blind: row.blind === true,
             recordedAt: fullPrecisionInstant(row.recordedAt),
             warehouseId: row.warehouseId,
             warehouseCode: codeOf(row.warehouseId),

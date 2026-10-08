@@ -15,6 +15,7 @@ import {
   orderLines,
   products,
   purchaseOrderLines,
+  asnLines,
   reservations,
   serials,
   skus,
@@ -63,6 +64,8 @@ const HISTORY_SOURCES: readonly {
   { label: 'ledger events', table: ledgerEvents, tenantId: ledgerEvents.tenantId, skuId: ledgerEvents.skuId },
   { label: 'order lines', table: orderLines, tenantId: orderLines.tenantId, skuId: orderLines.skuId },
   { label: 'purchase order lines', table: purchaseOrderLines, tenantId: purchaseOrderLines.tenantId, skuId: purchaseOrderLines.skuId },
+  // Story 21-6 — an ASN line is an inbound document line, like a PO line.
+  { label: 'advance shipment notice lines', table: asnLines, tenantId: asnLines.tenantId, skuId: asnLines.skuId },
   { label: 'transfer order lines', table: transferOrderLines, tenantId: transferOrderLines.tenantId, skuId: transferOrderLines.skuId },
   { label: 'pending stock adjustments', table: stockAdjustmentPendings, tenantId: stockAdjustmentPendings.tenantId, skuId: stockAdjustmentPendings.skuId },
   { label: 'count task lines', table: countTaskLines, tenantId: countTaskLines.tenantId, skuId: countTaskLines.skuId },

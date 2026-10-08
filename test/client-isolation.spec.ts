@@ -36,6 +36,10 @@ const STAMPED_TABLES: readonly string[] = [
   // stamped: a client's daily stock is its own commercial fact.
   'storage_snapshots',
   'storage_snapshot_progress',
+  // Story 21-6 — the advance shipment notice header, born stamped: an ASN is
+  // an inbound document authored for one client (the purchase_orders shape —
+  // reads AND writes carry the clause; 21-7's portal announces shipments).
+  'advance_shipment_notices',
 ];
 
 /** The five policies migration 0041 recreated with the client clause. */
@@ -86,6 +90,8 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
   let rateCardAId: string;
   /** Story 21-5 — per client: an ISSUED September invoice and a DRAFT October one. */
   const invoiceIds = new Map<string, { issued: string; draft: string }>();
+  /** Story 21-6 — per client: one announced ASN. */
+  const asnIds = new Map<string, string>();
 
   beforeAll(async () => {
     suiteDb = await useSuiteDatabase('clientisol');
@@ -134,6 +140,20 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       values (${uuidv7()}, ${tenantId}, ${clientA}, ${warehouseId}, 'accepted', 'manual')`;
     await sql`insert into orders (id, tenant_id, client_id, warehouse_id, status, source)
       values (${uuidv7()}, ${tenantId}, ${clientB}, ${warehouseId}, 'accepted', 'manual')`;
+
+    // Story 21-6 — one ASN (with one line) per client. The lines carry no
+    // client column: their visibility rides the parent header.
+    for (const [clientId, skuId] of [
+      [clientA, skuAId],
+      [clientB, skuBId],
+    ] as const) {
+      const asnId = uuidv7();
+      asnIds.set(clientId, asnId);
+      await sql`insert into advance_shipment_notices (id, tenant_id, client_id, warehouse_id, asn_code, status)
+        values (${asnId}, ${tenantId}, ${clientId}, ${warehouseId}, 'CI-ASN', 'announced')`;
+      await sql`insert into asn_lines (id, tenant_id, asn_id, sku_id, announced_qty)
+        values (${uuidv7()}, ${tenantId}, ${asnId}, ${skuId}, 4000)`;
+    }
 
     // One ledger event per client — billing aggregates over this table
     // constantly, so it is probed with the rest.
@@ -573,6 +593,11 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
             tx`insert into storage_snapshot_progress (tenant_id, client_id, warehouse_id, last_day, running)
               values (${tenantId}, ${clientB}, ${uuidv7()}, '2026-09-02', '{}'::jsonb)`,
           );
+        } else if (table === 'advance_shipment_notices') {
+          rejected = portal((tx) =>
+            tx`insert into advance_shipment_notices (id, tenant_id, client_id, warehouse_id, asn_code)
+              values (${uuidv7()}, ${tenantId}, ${clientB}, ${warehouseId}, 'CI-ASN-FOREIGN')`,
+          );
         } else {
           rejected = portal((tx) =>
             tx`insert into ledger_events (
@@ -636,6 +661,31 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
         (t) => t`select count(*)::int as n from ${t('ledger_events')} where tenant_id = ${tenantId} and seq = 9101`,
         1,
       );
+    });
+
+    it('ASN lines inherit the header: a portal session sees, and writes, only lines under its own client’s ASN (21-6)', async () => {
+      const ownAsn = asnIds.get(clientA)!;
+      const foreignAsn = asnIds.get(clientB)!;
+      const lines = await portal((tx) => tx`select asn_id from asn_lines where tenant_id = ${tenantId}`);
+      expect((lines as unknown as { asn_id: string }[]).map((row) => row.asn_id)).toEqual([ownAsn]);
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from asn_lines where tenant_id = ${tenantId}`))).toBe(2);
+      // A line under the sibling's ASN: the parent is invisible, so the
+      // inherited WITH CHECK refuses it.
+      await expect(
+        portal((tx) =>
+          tx`insert into asn_lines (id, tenant_id, asn_id, sku_id, announced_qty)
+            values (${uuidv7()}, ${tenantId}, ${foreignAsn}, ${skuBId}, 1000)`,
+        ),
+      ).rejects.toMatchObject({ code: '42501' });
+      // A line under its own ASN lands.
+      await portal((tx) =>
+        tx`insert into asn_lines (id, tenant_id, asn_id, sku_id, announced_qty)
+          values (${uuidv7()}, ${tenantId}, ${ownAsn}, ${skuAId}, 1000)`,
+      );
+      expect(countOf(await operator((tx) => tx`select count(*)::int as n from asn_lines where asn_id = ${ownAsn}`))).toBe(2);
+      // No tenant variable: nothing.
+      const unscoped = await probe.unsafe(`select count(*)::int as n from asn_lines where tenant_id = '${tenantId}'::uuid`);
+      expect(countOf(unscoped)).toBe(0);
     });
 
     it('rate cards are READ-ONLY to a portal session: it reads its own, and cannot insert, update or delete even its own (21-3)', async () => {
@@ -895,8 +945,17 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // 21-5) added nine more — client_invoices and client_invoice_lines in
       // the same four-policy shape (the invoice read clause also hides
       // drafts; the lines read clause inherits through the parent) and
-      // client_invoice_series, one operator-only tenant policy. None lost.
-      expect(policies).toHaveLength(97);
+      // client_invoice_series, one operator-only tenant policy; 0064 (story
+      // 21-6) added two more — advance_shipment_notices (the purchase_orders
+      // shape, both arms bound to the client) and asn_lines (both arms
+      // inherit through the parent). None lost.
+      expect(policies).toHaveLength(99);
+      const asnPolicy = policies.find((row) => row.policyname === 'advance_shipment_notices_tenant_isolation')!;
+      expect(asnPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      expect(asnPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      const asnLinePolicy = policies.find((row) => row.policyname === 'asn_lines_tenant_isolation')!;
+      expect(asnLinePolicy.qual).toContain('advance_shipment_notices');
+      expect(asnLinePolicy.with_check).toContain('advance_shipment_notices');
       const invoiceRead = policies.find((row) => row.policyname === 'client_invoices_tenant_isolation')!;
       expect(invoiceRead.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(invoiceRead.qual).toContain("(status <> 'draft'::text)");
