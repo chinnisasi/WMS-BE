@@ -5,7 +5,7 @@ import type { Database } from '../../shared/db/db';
 import { batchOnHand, bins, ledgerEvents, skus, stockOnHand } from '../../shared/db/schema';
 import type { LedgerEvent, UserRole } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
-import type { Page } from '../../shared/primitives/pagination';
+import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { fromMilli, QUANTITY_DECIMALS, QUANTITY_SCALE } from '../../shared/primitives/quantity';
@@ -37,15 +37,19 @@ import {
   clientOnHandAtInTx as clientOnHandAtInTxImpl,
   clientOnHandFoldByDayInTx as clientOnHandFoldByDayInTxImpl,
   clientWarehousesWithEventsInTx as clientWarehousesWithEventsInTxImpl,
+  clientOnHandBySkuAtInTx as clientOnHandBySkuAtInTxImpl,
   countDispatchedOrdersInTx as countDispatchedOrdersInTxImpl,
+  dispatchedOrderRecordsInTx as dispatchedOrderRecordsInTxImpl,
   firstEventInstantInTx as firstEventInstantInTxImpl,
   type ClientDayDelta,
+  type ClientSkuOnHand,
+  type DispatchedOrderRecordRow,
   type ClientScope,
   type ClientWarehouseScope,
 } from './client-metering';
 // Story 21-4 — the metering scope shapes and the shared dispatched-order
 // predicate (21-5's dispute drill-down reuses it) cross the seam here.
-export type { ClientDayDelta, ClientScope, ClientWarehouseScope } from './client-metering';
+export type { ClientDayDelta, ClientScope, ClientSkuOnHand, ClientWarehouseScope, DispatchedOrderRecordRow } from './client-metering';
 export { dispatchedOrderEventsPredicate } from './client-metering';
 import type { LedgerReferenceDoc } from './ledger-registry';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -1228,6 +1232,30 @@ export class InventoryFacade {
    */
   async countDispatchedOrdersInTx(tx: TenantTx, scope: ClientScope, from: string, to: string): Promise<number> {
     return countDispatchedOrdersInTxImpl(tx, scope, from, to);
+  }
+
+  /**
+   * Story 21-5b — the `per_order` dispute drill: one row per order the count
+   * above counts (the same predicate), represented by its first dispatch
+   * event in the window, ascending on that event's `(recorded_at, id)`.
+   */
+  async dispatchedOrderRecordsInTx(
+    tx: TenantTx,
+    scope: ClientScope,
+    from: string,
+    to: string,
+    window: KeysetWindow,
+  ): Promise<DispatchedOrderRecordRow[]> {
+    return dispatchedOrderRecordsInTxImpl(tx, scope, from, to, window);
+  }
+
+  /**
+   * Story 21-5b — the storage drill's per-SKU breakdown of one (day,
+   * warehouse): the client's on-hand per SKU of one base UoM at `toInstant`,
+   * folded from genesis on the event's client; non-zero rows, negatives kept.
+   */
+  async clientOnHandBySkuAtInTx(tx: TenantTx, scope: ClientWarehouseScope, uom: string, toInstant: string): Promise<ClientSkuOnHand[]> {
+    return clientOnHandBySkuAtInTxImpl(tx, scope, uom, toInstant);
   }
 
   /**

@@ -4387,6 +4387,17 @@ export const clientInvoices = pgTable(
     /** sha256 over the canonical v1 content (`clientInvoiceContentHash`). */
     contentHash: text('content_hash').notNull(),
     replacesInvoiceId: uuid('replaces_invoice_id'),
+    /**
+     * Story 21-5b (0063) — the last IST day the invoice's storage lines were
+     * measured through at its last compute: the GROUP's snapshot watermark,
+     * clipped to `period_end`; `period_start − 1` (nothing measured) when the
+     * group has no snapshot scope. The dispute drill reads a storage line's
+     * days up to it. NULL only on a row stored before 0063: read as
+     * `period_end` on a non-draft invoice (issue already required storage
+     * complete through the month's end), as nothing measured on a draft. Not
+     * in the content hash — it moves no figure.
+     */
+    storageMeasuredThrough: date('storage_measured_through', { mode: 'string' }),
     issuedAt: timestamp('issued_at', { withTimezone: true, mode: 'string' }),
     issuedBy: uuid('issued_by'),
     statusNote: text('status_note'),

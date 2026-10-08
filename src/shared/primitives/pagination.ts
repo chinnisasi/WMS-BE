@@ -28,6 +28,16 @@ export function decodeCursor(cursor: string): CursorPayload {
   return parsed as CursorPayload;
 }
 
+/**
+ * Story 21-5b — one keyset window of an ascending record read: the rows
+ * strictly after `after` (null = from the start), at most `limit` of them.
+ * A caller detecting a next page asks for `limit + 1`.
+ */
+export interface KeysetWindow {
+  readonly after: CursorPayload | null;
+  readonly limit: number;
+}
+
 export interface Page<T> {
   readonly items: readonly T[];
   /** Cursor to fetch the next page; null when no more rows exist. */
