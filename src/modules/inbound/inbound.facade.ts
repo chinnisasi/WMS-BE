@@ -1,16 +1,28 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { warehouseFilter, type ClientCountScope } from '../../shared/db/warehouse-filter';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { purchaseOrderLines, purchaseOrders, vendors } from '../../shared/db/schema';
+import { advanceShipmentNotices, asnLines, purchaseOrderLines, purchaseOrders, vendors } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
+import { fullPrecisionInstant } from '../../shared/primitives/time';
+import { fromMilli } from '../../shared/primitives/quantity';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
+import { assertWarehouseInTenant, getMemberClientIdIn } from '../tenancy/tenancy.service';
+import { AsnCommand, asnPortalRefused, readAsnInTx } from './asn.command';
+import type {
+  AmendAsnCommand,
+  AsnDetail,
+  AsnEntry,
+  AsnSnapshot,
+  AsnStatus,
+  CreateAsnCommand,
+  TransitionAsnCommand,
+} from './asn.command';
 import { VendorCommand } from './vendors.command';
 import type { CreateVendorCommand, VendorSnapshot } from './vendors.command';
 import { PurchaseOrderCommand, lineSnapshot } from './po.command';
@@ -56,6 +68,13 @@ export interface ListVendorsQuery {
 
 export interface ListPurchaseOrdersQuery {
   readonly status?: PoStatus | undefined;
+  readonly cursor?: string | undefined;
+  readonly limit?: number | undefined;
+}
+
+export interface ListAsnsQuery {
+  readonly status?: AsnStatus | undefined;
+  readonly clientId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -108,7 +127,115 @@ export class InboundFacade {
     @Inject(DATABASE) private readonly db: Database,
     @Inject(VendorCommand) private readonly vendorCommand: VendorCommand,
     @Inject(PurchaseOrderCommand) private readonly poCommand: PurchaseOrderCommand,
+    @Inject(AsnCommand) private readonly asnCommand: AsnCommand,
   ) {}
+
+  // ── story 21-6: advance shipment notices ──────────────────────────────────
+
+  async createAsn(command: CreateAsnCommand, idempotencyKey: string): Promise<AsnSnapshot> {
+    return this.asnCommand.create(command, idempotencyKey);
+  }
+
+  async amendAsn(command: AmendAsnCommand, idempotencyKey: string): Promise<AsnSnapshot> {
+    return this.asnCommand.amend(command, idempotencyKey);
+  }
+
+  async transitionAsn(command: TransitionAsnCommand, idempotencyKey: string): Promise<AsnSnapshot> {
+    return this.asnCommand.transition(command, idempotencyKey);
+  }
+
+  /**
+   * One warehouse's ASNs, newest first, keyset `(created_at, id)`, optionally
+   * one status's or one client's, with the per-ASN line count and totals
+   * folded in a second query over the page's ids only. Member-open; a
+   * client-portal session is refused (21-7 opens it).
+   */
+  async listAsns(
+    tenantId: string,
+    actorUserId: string,
+    warehouseId: string,
+    query: ListAsnsQuery = {},
+  ): Promise<Page<AsnEntry>> {
+    const pageSize = query.limit ?? DEFAULT_INBOUND_PAGE_SIZE;
+    const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      if ((await getMemberClientIdIn(tx, tenantId, actorUserId)) !== null) throw asnPortalRefused();
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      const rows = await tx
+        .select({
+          id: advanceShipmentNotices.id,
+          code: advanceShipmentNotices.asnCode,
+          clientId: advanceShipmentNotices.clientId,
+          status: advanceShipmentNotices.status,
+          expectedAt: advanceShipmentNotices.expectedAt,
+          createdAt: advanceShipmentNotices.createdAt,
+          createdAtText: sql<string>`${advanceShipmentNotices.createdAt}::text`,
+        })
+        .from(advanceShipmentNotices)
+        .where(
+          and(
+            eq(advanceShipmentNotices.tenantId, tenantId),
+            eq(advanceShipmentNotices.warehouseId, warehouseId),
+            query.status === undefined ? undefined : eq(advanceShipmentNotices.status, query.status),
+            query.clientId === undefined ? undefined : eq(advanceShipmentNotices.clientId, query.clientId),
+            before === undefined
+              ? undefined
+              : sql`(${advanceShipmentNotices.createdAt}, ${advanceShipmentNotices.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
+          ),
+        )
+        .orderBy(desc(advanceShipmentNotices.createdAt), desc(advanceShipmentNotices.id))
+        .limit(pageSize + 1);
+      const ids = rows.map((row) => row.id);
+      const totals =
+        ids.length === 0
+          ? []
+          : await tx
+              .select({
+                asnId: asnLines.asnId,
+                lineCount: sql<number>`count(*)::int`,
+                // Lines fully received — the unit-safe progress figure (the
+                // totals below sum across UoMs and are only indicative).
+                // A line count, cast bigint (the 10.1 guard forbids `::int` over a
+                // quantity expression) and narrowed below.
+                linesComplete: sql<string>`count(*) filter (where ${asnLines.receivedQty} >= ${asnLines.announcedQty})`,
+                // bigint sums arrive as text through postgres.js.
+                announced: sql<string>`coalesce(sum(${asnLines.announcedQty}), 0)::bigint`,
+                received: sql<string>`coalesce(sum(${asnLines.receivedQty}), 0)::bigint`,
+              })
+              .from(asnLines)
+              .where(inArray(asnLines.asnId, ids))
+              .groupBy(asnLines.asnId);
+      const totalsById = new Map(totals.map((row) => [row.asnId, row]));
+      const items = rows.map((row) => {
+        const total = totalsById.get(row.id);
+        return {
+          id: row.id,
+          code: row.code,
+          clientId: row.clientId,
+          status: row.status as AsnStatus,
+          expectedAt: row.expectedAt === null ? null : canonicalInstant(row.expectedAt),
+          lineCount: total?.lineCount ?? 0,
+          linesComplete: Number(total?.linesComplete ?? 0),
+          announcedTotal: fromMilli(Number(total?.announced ?? 0)),
+          receivedTotal: fromMilli(Number(total?.received ?? 0)),
+          createdAt: canonicalInstant(row.createdAt),
+        };
+      });
+      const page = buildPage(
+        items.map((item, index) => ({ createdAt: fullPrecisionInstant(rows[index]!.createdAtText), id: item.id, entry: item })),
+        pageSize,
+      );
+      return { items: page.items.map((wrapped) => wrapped.entry), nextCursor: page.nextCursor };
+    });
+  }
+
+  /** One ASN with its lines, or null (404 at the shell). Portal sessions refused. */
+  async getAsn(tenantId: string, actorUserId: string, asnId: string): Promise<AsnDetail | null> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      if ((await getMemberClientIdIn(tx, tenantId, actorUserId)) !== null) throw asnPortalRefused();
+      return readAsnInTx(tx, tenantId, asnId);
+    });
+  }
 
   /** `vendor.created` — the vendor master data's first producer. */
   async createVendor(
@@ -362,12 +489,17 @@ export class InboundFacade {
         : sql`and (grn.recorded_at, grl.id) > (${window.after.createdAt}::timestamptz, ${window.after.id}::uuid)`;
     const rows = (await tx.execute(sql`
       select grl.id as "id", grn.recorded_at::text as "recordedAt", grn.code as "grnCode", po.code as "poCode",
+        asn.asn_code as "asnCode", (grn.blind_reason_code is not null) as "blind",
         grn.warehouse_id as "warehouseId", grl.sku_id as "skuId", s.code as "skuCode", s.name as "skuName",
         grl.qty::text as "qtyMilli", grl.applied_qty::text as "appliedQtyMilli", grn.recorded_by as "actorId"
       from goods_receipt_lines grl
       join goods_receipt_notes grn on grn.tenant_id = grl.tenant_id and grn.id = grl.grn_id
       join skus s on s.tenant_id = grl.tenant_id and s.id = grl.sku_id
-      left join purchase_orders po on po.tenant_id = grn.tenant_id and po.id = grn.po_id
+      -- Story 21-6: a document's code shows only when the document is the
+      -- SKU's client's — an unmatched line of another client's SKU on ACME's
+      -- PO/ASN must not print ACME's reference in BETA's drill.
+      left join purchase_orders po on po.tenant_id = grn.tenant_id and po.id = grn.po_id and po.client_id = s.client_id
+      left join advance_shipment_notices asn on asn.tenant_id = grn.tenant_id and asn.id = grn.asn_id and asn.client_id = s.client_id
       where ${receiptLinesPredicate(scope, from, to)}
         ${after}
       order by grn.recorded_at, grl.id
@@ -383,8 +515,16 @@ export interface ReceiptLineRecordRow {
   /** `grn.recorded_at::text` — the raw Postgres text. */
   readonly recordedAt: string;
   readonly grnCode: string;
-  /** Null on a blind receipt. */
+  /** Null on a blind or ASN receipt. */
   readonly poCode: string | null;
+  /** Story 21-6 — the ASN's code; null on a PO or blind receipt. */
+  readonly asnCode: string | null;
+  /**
+   * Story 21-6 — the GRN was blind (a reason, no document). Distinct from
+   * "no code shown": a foreign-client line on a PO/ASN hides the document's
+   * code but was not blind.
+   */
+  readonly blind: boolean;
   readonly warehouseId: string;
   readonly skuId: string;
   readonly skuCode: string;

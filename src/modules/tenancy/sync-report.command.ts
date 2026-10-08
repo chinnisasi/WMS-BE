@@ -205,6 +205,8 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
   'grn.submit': [
     ['warehouseId', 'uuid'],
     ['poId', 'uuid-or-null'],
+    // Story 21-6 — absent on every pre-21-6 payload (uuid-or-null admits it).
+    ['asnId', 'uuid-or-null'],
     ['blindReasonCode', 'string-or-null'],
     ['lines', 'array'],
   ],
@@ -1128,6 +1130,10 @@ export class SyncReportCommand {
             operatorUserId,
             warehouseId: payload.warehouseId as string,
             poId: (payload.poId ?? null) as string | null,
+            // Story 21-6: a stored pre-21-6 payload has none; the command
+            // hashes it only when present and normalises each line's
+            // `asnLineId` before validation, so an old op re-applies as before.
+            asnId: (payload.asnId ?? null) as string | null,
             blindReasonCode: (payload.blindReasonCode ?? null) as string | null,
             // The op's business time: the payload's own, else the row's
             // opOccurredAt stamp (the device-sealed instant).

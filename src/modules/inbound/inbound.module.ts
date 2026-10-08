@@ -5,6 +5,7 @@ import { InventoryModule } from '../inventory/inventory.module';
 import { PutawayModule } from '../putaway/putaway.module';
 import { VendorCommand } from './vendors.command';
 import { PurchaseOrderCommand } from './po.command';
+import { AsnCommand } from './asn.command';
 import { InboundFacade } from './inbound.facade';
 import { ReceivingCommand } from './receiving.command';
 import { ReceivingFacade } from './receiving.facade';
@@ -50,6 +51,8 @@ import { QcFacade } from './qc.facade';
   providers: [
     VendorCommand,
     PurchaseOrderCommand,
+    // Story 21-6 — the advance shipment notice lifecycle.
+    AsnCommand,
     InboundFacade,
     ReceivingCommand,
     ReceivingFacade,

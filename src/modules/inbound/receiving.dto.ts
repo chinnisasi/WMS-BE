@@ -30,7 +30,7 @@ import {
   MAX_HANDLING_UNIT_WEIGHT_GRAMS,
   MAX_HANDLING_UNITS_PER_REQUEST,
 } from '../catalog/handling-unit';
-import { MAX_HANDLING_UNITS_PER_GRN_LINE } from './receiving.command';
+import { MAX_HANDLING_UNITS_PER_GRN_LINE, UNMATCHED_LINE_REASONS } from './receiving.command';
 // Story 3.5 (additive): the snapshot's putaway decision fields reuse the
 // putaway module's DTOs (one shape on every surface).
 import { PutawayBinDto, PutawayTaskDto } from '../putaway/putaway.dto';
@@ -53,6 +53,18 @@ export class GrnLineInputDto {
   @IsOptional()
   @IsUUID()
   poLineId?: string | null;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    type: String,
+    nullable: true,
+    description:
+      "Story 21-6 — the ASN line received against (only beside asnId). A line with no line reference, or whose SKU differs from the referenced line's, settles unmatched: applied in full, crediting no line",
+  })
+  @IsOptional()
+  @IsUUID()
+  asnLineId?: string | null;
 
   @ApiProperty({ format: 'uuid' })
   @IsUUID()
@@ -127,7 +139,7 @@ export class SubmitGoodsReceiptDto {
     format: 'uuid',
     type: String,
     nullable: true,
-    description: 'The purchase order received against — null on a blind receipt',
+    description: 'The purchase order received against — exactly one of poId, asnId and blindReasonCode',
   })
   @IsOptional()
   @IsUUID()
@@ -135,10 +147,21 @@ export class SubmitGoodsReceiptDto {
 
   @ApiProperty({
     required: false,
+    format: 'uuid',
     type: String,
     nullable: true,
-    enum: BLIND_REASON_ENUM,
-    description: 'The blind-receive reason code (required when poId is null, forbidden otherwise)',
+    description: 'Story 21-6 — the advance shipment notice received against — exactly one of poId, asnId and blindReasonCode',
+  })
+  @IsOptional()
+  @IsUUID()
+  asnId?: string | null;
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    enum: [...BLIND_REASON_ENUM, null],
+    description: 'The blind-receive reason code (required when neither poId nor asnId is given, forbidden otherwise)',
   })
   @IsOptional()
   @IsIn(BLIND_REASON_ENUM as unknown as string[])
@@ -174,8 +197,11 @@ export class GrnLineDto {
   grnId!: string;
 
   @ApiProperty({ format: 'uuid', type: String,
-    nullable: true })
+    nullable: true, description: 'The PO line credited — null on a blind, ASN or unmatched line' })
   poLineId!: string | null;
+
+  @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — the ASN line credited; present only when one was' })
+  asnLineId?: string;
 
   @ApiProperty({ format: 'uuid' })
   skuId!: string;
@@ -209,20 +235,35 @@ export class GrnLineDto {
 
 /** One line the server refused to settle (naming the reason — the others settle). */
 export class RejectedGrnLineDto {
-  @ApiProperty({ format: 'uuid' })
-  poLineId!: string;
+  @ApiProperty({ format: 'uuid', type: String, nullable: true, description: 'The PO line named — null on an ASN line rejection' })
+  poLineId!: string | null;
+
+  @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — the ASN line named; present only on an ASN line rejection' })
+  asnLineId?: string;
 
   @ApiProperty({ format: 'uuid' })
   skuId!: string;
 
-  @ApiProperty({ minimum: 1 })
+  @ApiProperty({ minimum: 0.001 })
   qty!: number;
 
-  @ApiProperty({ description: 'Machine reason (po-line-not-found | po-line-not-open)' })
+  @ApiProperty({ enum: ['po-line-not-found', 'po-line-not-open', 'asn-line-not-found'], description: 'Machine reason' })
   code!: string;
 
   @ApiProperty({ description: 'Human-readable reason naming the line state' })
   reason!: string;
+}
+
+/** Story 21-6 — one request line that settled unmatched (applied in full, no line credited). */
+export class UnmatchedGrnLineDto {
+  @ApiProperty({ minimum: 0, description: 'The line\'s index in the request\'s lines array' })
+  index!: number;
+
+  @ApiProperty({
+    enum: [...UNMATCHED_LINE_REASONS],
+    description: 'no-line-reference: the line named no document line; line-sku-mismatch: its SKU is not the referenced line\'s',
+  })
+  reason!: (typeof UNMATCHED_LINE_REASONS)[number];
 }
 
 /** The GRN as the submit response / replay returns it. */
@@ -243,7 +284,13 @@ export class GoodsReceiptDto {
     nullable: true })
   poId!: string | null;
 
-  @ApiProperty({ enum: BLIND_REASON_ENUM, type: String,
+  @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — the ASN received against; present only on an ASN receipt' })
+  asnId?: string;
+
+  @ApiProperty({ required: false, description: 'Story 21-6 — the ASN\'s code; present only on an ASN receipt' })
+  asnCode?: string;
+
+  @ApiProperty({ enum: [...BLIND_REASON_ENUM, null], type: String,
     nullable: true })
   blindReasonCode!: string | null;
 
@@ -267,6 +314,13 @@ export class GoodsReceiptDto {
 
   @ApiProperty({ type: [RejectedGrnLineDto], required: false })
   rejectedLines?: readonly RejectedGrnLineDto[];
+
+  @ApiProperty({
+    type: [UnmatchedGrnLineDto],
+    required: false,
+    description: 'Story 21-6 — present only when some lines of a PO/ASN receipt settled unmatched (booked in full, crediting no document line)',
+  })
+  unmatchedLines?: readonly UnmatchedGrnLineDto[];
 }
 
 export class GoodsReceiptResponse {
@@ -292,7 +346,13 @@ export class GoodsReceiptEntryDto {
     nullable: true })
   poId!: string | null;
 
-  @ApiProperty({ enum: BLIND_REASON_ENUM, type: String,
+  @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — the ASN received against; present only on an ASN receipt' })
+  asnId?: string;
+
+  @ApiProperty({ required: false, description: 'Story 21-6 — the ASN\'s code; present only on an ASN receipt' })
+  asnCode?: string;
+
+  @ApiProperty({ enum: [...BLIND_REASON_ENUM, null], type: String,
     nullable: true, description: 'Set only on a blind receipt' })
   blindReasonCode!: string | null;
 
@@ -331,7 +391,19 @@ export class GoodsReceiptListQuery {
     required: false,
     type: Boolean,
     description:
-      "Story 9-1 — `true`: only BLIND receipts (no purchase order — flagged for PO matching); `false`: only PO-backed ones. Exactly 'true' or 'false'",
+      "Story 21-6 — `true`: only BLIND receipts (no PO and no ASN — `blind_reason_code` set); `false`: only document-backed ones (a PO or an ASN). Exactly 'true' or 'false'",
+  })
+  @IsOptional()
+  @BooleanFlag()
+  @IsBoolean()
+  blind?: boolean;
+
+  @ApiProperty({
+    required: false,
+    type: Boolean,
+    deprecated: true,
+    description:
+      "Story 9-1, kept as an ALIAS of `blind` since 21-6 (it means blind — an ASN receipt has no PO but is not blind). Exactly 'true' or 'false'; refused when it disagrees with `blind`",
   })
   @IsOptional()
   @BooleanFlag()
@@ -399,6 +471,15 @@ export class OverReceiptDto {
   @ApiProperty({ format: 'uuid', type: String,
     nullable: true })
   poLineId!: string | null;
+
+  @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — present only on an ASN receipt\'s over-receipt' })
+  asnId?: string;
+
+  @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — the ASN line; present only on an ASN receipt\'s over-receipt' })
+  asnLineId?: string;
+
+  @ApiProperty({ required: false, description: 'Story 21-6 — the ASN\'s code; present only on an ASN receipt\'s over-receipt' })
+  asnCode?: string;
 
   @ApiProperty({ format: 'uuid' })
   skuId!: string;
@@ -567,6 +648,45 @@ export class CatalogSnapshotPoDto {
   lines!: readonly PurchaseOrderLineDto[];
 }
 
+/** Story 21-6 — one line of an open ASN on the device snapshot. */
+export class CatalogSnapshotAsnLineDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ description: `Announced quantity. ${QUANTITY_FIELD_DESCRIPTION}` })
+  announcedQty!: number;
+
+  @ApiProperty({ description: 'Received to date, in base UoM', minimum: 0 })
+  receivedQty!: number;
+
+  @ApiProperty({ description: 'Derived: announcedQty − receivedQty (negative after an approved over-receipt)' })
+  openQty!: number;
+}
+
+/** Story 21-6 — one open (announced or partially received) ASN of the device snapshot. */
+export class CatalogSnapshotAsnDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: 'The client-supplied ASN code' })
+  code!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  clientId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'When the shipment is expected (ISO-8601 UTC), null when unannounced' })
+  expectedAt!: string | null;
+
+  @ApiProperty({ type: [CatalogSnapshotAsnLineDto] })
+  lines!: readonly CatalogSnapshotAsnLineDto[];
+}
+
 /** One pack task of the device snapshot (story 10.7, additive) — the bench's unit of work. */
 export class CatalogPackTaskDto {
   @ApiProperty({ format: 'uuid', description: 'The fully-picked, still-accepted order' })
@@ -724,6 +844,13 @@ export class CatalogSnapshotResponse {
 
   @ApiProperty({ type: [CatalogSnapshotPoDto], description: 'The warehouse\'s open POs with their lines' })
   openPurchaseOrders!: readonly CatalogSnapshotPoDto[];
+
+  @ApiProperty({
+    type: [CatalogSnapshotAsnDto],
+    description:
+      'Story 21-6 (additive): the warehouse\'s open advance shipment notices (announced or partially received) with per-line announced / received / open — receiving books against them exactly as against a PO',
+  })
+  openAsns!: readonly CatalogSnapshotAsnDto[];
 
   @ApiProperty({ type: [PutawayBinDto], description: 'Story 3.5 (additive): every bin of the warehouse — blocked/system bins included so the device can reject a scan against them pre-queue' })
   bins!: readonly PutawayBinDto[];

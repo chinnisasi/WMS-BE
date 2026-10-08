@@ -1116,7 +1116,7 @@ describe('architecture: the replenishment planning state is replenishment-module
     // table, the ATP numbers come from the inventory facade only, and the
     // scan's on-hand/batch facts from the facades' in-tx reads (never a
     // cross-module table reach — AD-6).
-    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'binStateEpochs', 'reservations', 'purchaseOrders', 'skus', 'vendors', 'batches'] as const) {
+    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'binStateEpochs', 'reservations', 'purchaseOrders', 'advanceShipmentNotices', 'asnLines', 'skus', 'vendors', 'batches'] as const) {
       expect(drizzleWriteOn(table).test(command)).toBe(false);
       expect(drizzleWriteOn(table).test(sweep)).toBe(false);
       expect(drizzleWriteOn(table).test(scan)).toBe(false);
@@ -1193,6 +1193,8 @@ describe('architecture: channel connections are channels-module-owned (story 7-1
         'skus',
         'batches',
         'purchaseOrders',
+        'advanceShipmentNotices',
+        'asnLines',
         'warehouses',
         'memberships',
         'carrierConnections',
@@ -1552,7 +1554,7 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
   it('the billing module writes no stock, ledger, client or order table', () => {
     const offenders: string[] = [];
     for (const file of billingFiles) {
-      for (const table of [...STOCK_TABLES, 'clients', 'skus', 'orders', 'orderLines', 'purchaseOrders'] as const) {
+      for (const table of [...STOCK_TABLES, 'clients', 'skus', 'orders', 'orderLines', 'purchaseOrders', 'advanceShipmentNotices', 'asnLines'] as const) {
         if (drizzleWriteOn(table).test(file.source)) offenders.push(`${file.path}: writes ${table}`);
       }
       if (new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_STOCK_TABLES}|clients)\\b`, 'i').test(file.source)) {
@@ -1653,5 +1655,40 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
     expect(metering).toContain("from '../inventory/inventory.facade'");
     expect(metering).toContain("from '../inbound/inbound.facade'");
     expect(metering).toContain("from '../outbound/outbound.facade'");
+  });
+});
+
+describe('architecture: advance shipment notices are inbound-module-owned (story 21-6)', () => {
+  /**
+   * Story 21-6 adds the ASN beside the PO in the inbound module (spec-3pl
+   * `architecture.md`: "inbound — gains the ASN document beside the PO (same
+   * module, same GRN flow)"). `advance_shipment_notices` and `asn_lines` are
+   * written ONLY under `src/modules/inbound` — the ASN commands and the
+   * receiving fold (received quantities, the derived status). Readers
+   * elsewhere (the SKU client-correction history probe, billing's drill
+   * through `InboundFacade`) read; nothing outside writes.
+   */
+  const inboundRoot = join(SRC_ROOT, 'modules', 'inbound');
+
+  it('no ASN-table write happens outside the inbound module', () => {
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => !f.path.startsWith(inboundRoot))) {
+      for (const pattern of [
+        drizzleWriteOn('advanceShipmentNotices'),
+        drizzleWriteOn('asnLines'),
+        new RegExp('\\b(insert into|update|delete from)\\s+"?(advance_shipment_notices|asn_lines)\\b', 'i'),
+      ]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the inbound module really writes both tables (the test is meaningful)', () => {
+    const command = readFileSync(join(inboundRoot, 'asn.command.ts'), 'utf8');
+    expect(drizzleWriteOn('advanceShipmentNotices').test(command)).toBe(true);
+    expect(drizzleWriteOn('asnLines').test(command)).toBe(true);
+    const receiving = readFileSync(join(inboundRoot, 'receiving.command.ts'), 'utf8');
+    expect(/\.update\(\s*asnLines\b/.test(receiving)).toBe(true);
   });
 });

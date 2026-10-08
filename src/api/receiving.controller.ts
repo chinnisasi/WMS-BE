@@ -87,8 +87,8 @@ export class ReceivingController {
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or the operator was demoted to accountant (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, purchase order, or a line\'s SKU does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The PO is not open (po-not-open, naming the status), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, purchase order, advance shipment notice, or a line\'s SKU does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The PO is not open (po-not-open, naming the status), the ASN is not announced or partially received (asn-not-open), the document belongs to another warehouse (document-warehouse-mismatch), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
   async submitGoodsReceipt(
@@ -110,10 +110,14 @@ export class ReceivingController {
         operatorUserId: session.userId,
         warehouseId: dto.warehouseId,
         poId: dto.poId ?? null,
+        // Story 21-6: absent → null, like poId (the command hashes it only
+        // when present, so the two spellings hash identically).
+        asnId: dto.asnId ?? null,
         blindReasonCode: dto.blindReasonCode ?? null,
         occurredAt: dto.occurredAt,
         lines: dto.lines.map((line) => ({
           poLineId: line.poLineId ?? null,
+          asnLineId: line.asnLineId ?? null,
           skuId: line.skuId,
           batchCode: line.batchCode ?? null,
           mfgDate: line.mfgDate ?? null,
@@ -212,7 +216,7 @@ export class ReceivingController {
     type: GoodsReceiptListResponse,
     description: 'The GRN page (headers with line/unit sums — the Inbound surface\'s list read)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor (invalid-cursor), malformed warehouseId, out-of-range limit, a poless flag other than true/false, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor (invalid-cursor), malformed warehouseId, out-of-range limit, a blind/poless flag other than true/false or the two disagreeing, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The warehouseId filter names a warehouse outside this tenant (not-found)') })
@@ -227,9 +231,19 @@ export class ReceivingController {
       assertUuidParam(query.warehouseId, 'warehouseId');
     }
     assertInstantRange(query.from, query.to);
+    // Story 21-6: `poless` stays accepted as an alias of `blind` (an ASN
+    // receipt has no PO and is not blind, so "poless" now MEANS blind).
+    if (query.blind !== undefined && query.poless !== undefined && query.blind !== query.poless) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'blind and poless disagree',
+        '`poless` is an alias of `blind` — send one, or both with the same value.',
+      );
+    }
     const page = await this.receiving.listGoodsReceipts(tenantId, {
       warehouseId: query.warehouseId,
-      poless: query.poless,
+      blind: query.blind ?? query.poless,
       from: query.from,
       to: query.to,
       cursor: query.cursor,

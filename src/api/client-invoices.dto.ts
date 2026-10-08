@@ -252,7 +252,9 @@ export class ReceiptLineRecordDto {
   @ApiProperty({ enum: ['receipt-line'] }) kind!: 'receipt-line';
   @ApiProperty({ format: 'uuid', description: 'The GRN line' }) id!: string;
   @ApiProperty() grnCode!: string;
-  @ApiProperty({ type: String, nullable: true, description: 'The purchase order the GRN booked against — null on a blind receipt' }) poCode!: string | null;
+  @ApiProperty({ type: String, nullable: true, description: 'The purchase order the GRN booked against — null on a blind or ASN receipt' }) poCode!: string | null;
+  @ApiProperty({ type: String, nullable: true, description: 'Story 21-6 — the advance shipment notice the GRN booked against — null on a PO or blind receipt' }) asnCode!: string | null;
+  @ApiProperty({ description: "Story 21-6 — the GRN was blind (a reason, no PO or ASN). Both codes are null on a blind line, but ALSO on another client's line received against a PO/ASN (the document's code is that client's to see) — only this flag says blind" }) blind!: boolean;
   @ApiProperty({ description: "The GRN's recorded_at (the server stamp), ISO-8601 UTC at full precision" }) recordedAt!: string;
   @ApiProperty({ format: 'uuid' }) warehouseId!: string;
   @ApiProperty() warehouseCode!: string;

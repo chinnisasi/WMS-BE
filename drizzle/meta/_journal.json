@@ -449,6 +449,13 @@
       "when": 1791395101992,
       "tag": "0063_invoice_storage_measured_through",
       "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1791479557233,
+      "tag": "0064_advance_shipment_notices",
+      "breakpoints": true
     }
   ]
 }

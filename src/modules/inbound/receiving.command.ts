@@ -3,6 +3,8 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
+  advanceShipmentNotices,
+  asnLines,
   auditEvents,
   devices,
   goodsReceiptLines,
@@ -45,6 +47,13 @@ import { kitCannotHoldStock } from '../catalog/kit.store';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { LedgerMovement } from '../inventory/inventory.facade';
 import { canonicalInstant } from '../../shared/primitives/time';
+import {
+  RECEIVABLE_ASN_STATUSES,
+  asnNotFound,
+  asnNotOpen,
+  deriveAsnStatusInTx,
+  type AsnStatus,
+} from './asn.command';
 
 // ── command inputs ────────────────────────────────────────────────────────────
 
@@ -56,6 +65,14 @@ export type BlindReasonCode = (typeof BLIND_REASON_CODES)[number];
 export interface GrnLineInput {
   /** The PO line received against — null on a blind receipt's lines. */
   readonly poLineId: string | null;
+  /**
+   * Story 21-6 — the ASN line received against. Optional on the wire AND on
+   * a stored pre-21-6 payload (the replay rebuild passes lines through raw),
+   * so the command normalises it to `asnLineId ?? null` before validation.
+   * Hashed only when present (`?? undefined`), so every pre-21-6 PO or blind
+   * op hashes byte-for-byte as before.
+   */
+  readonly asnLineId?: string | null | undefined;
   readonly skuId: string;
   /** Catalog batch code (required for batch-tracked SKUs, forbidden otherwise). */
   readonly batchCode: string | null;
@@ -86,8 +103,13 @@ export interface SubmitGoodsReceiptCommand {
   /** The badge-in operator — authority is re-read from the DB at command entry. */
   readonly operatorUserId: string;
   readonly warehouseId: string;
-  /** Null on a blind receipt (then `blindReasonCode` is required). */
+  /** Null on an ASN or blind receipt. Exactly one of poId / asnId / blindReasonCode. */
   readonly poId: string | null;
+  /**
+   * Story 21-6 — the advance shipment notice received against. Optional (a
+   * stored pre-21-6 payload has none); hashed only when present.
+   */
+  readonly asnId?: string | null | undefined;
   readonly blindReasonCode: string | null;
   /** Device time (AD-1) — the ledger events' and GRN's business time. */
   readonly occurredAt: string;
@@ -108,8 +130,10 @@ export interface DecideOverReceiptCommand {
 export interface GoodsReceiptLineSnapshot {
   readonly id: string;
   readonly grnId: string;
-  /** Null on a blind receipt's lines. */
+  /** Null on a blind receipt's lines, an ASN receipt's, and an unmatched line. */
   readonly poLineId: string | null;
+  /** Story 21-6 — the ASN line credited; present only when one was. */
+  readonly asnLineId?: string;
   readonly skuId: string;
   /** The catalog batch identity — null on non-batch-tracked SKUs. */
   readonly batchId: string | null;
@@ -131,11 +155,28 @@ export interface GoodsReceiptLineSnapshot {
 
 /** One line the server refused to settle (naming the reason — the other lines settle). */
 export interface RejectedGrnLine {
-  readonly poLineId: string;
+  /** Null on an ASN line's rejection (story 21-6). */
+  readonly poLineId: string | null;
+  /** Story 21-6 — present only on an ASN line's rejection (`asn-line-not-found`). */
+  readonly asnLineId?: string;
   readonly skuId: string;
   readonly qty: number;
   readonly code: string;
   readonly reason: string;
+}
+
+/**
+ * Story 21-6 — why a line settled UNMATCHED: applied in full with no line
+ * reference, no ceiling and no over-receipt, so goods that arrived always
+ * reach the ledger (zero-scan-loss) while the document line is not credited.
+ */
+export const UNMATCHED_LINE_REASONS = ['no-line-reference', 'line-sku-mismatch'] as const;
+export type UnmatchedLineReason = (typeof UNMATCHED_LINE_REASONS)[number];
+
+/** One request line (by its index in `lines`) that settled unmatched. */
+export interface UnmatchedGrnLine {
+  readonly index: number;
+  readonly reason: UnmatchedLineReason;
 }
 
 /** The GRN as every surface returns it (the idempotency snapshot). */
@@ -146,6 +187,9 @@ export interface GoodsReceiptSnapshot {
     readonly warehouseId: string;
     readonly code: string;
     readonly poId: string | null;
+    /** Story 21-6 — present only on an ASN receipt (a pre-21-6 snapshot is byte-identical). */
+    readonly asnId?: string;
+    readonly asnCode?: string;
     readonly blindReasonCode: string | null;
     readonly status: string;
     readonly deviceId: string;
@@ -155,6 +199,8 @@ export interface GoodsReceiptSnapshot {
     readonly lines: readonly GoodsReceiptLineSnapshot[];
     /** Present only when the submit rejected some lines (partial settlement). */
     readonly rejectedLines?: readonly RejectedGrnLine[];
+    /** Story 21-6 — present only when some lines of a PO/ASN receipt settled unmatched. */
+    readonly unmatchedLines?: readonly UnmatchedGrnLine[];
   };
 }
 
@@ -168,6 +214,10 @@ export interface OverReceiptEntry {
   readonly grnLineId: string;
   readonly poId: string | null;
   readonly poLineId: string | null;
+  /** Story 21-6 — present only on an ASN receipt's over-receipt. */
+  readonly asnId?: string;
+  readonly asnLineId?: string;
+  readonly asnCode?: string;
   readonly skuId: string;
   readonly excessQty: number;
   readonly status: 'pending' | 'approved' | 'rejected';
@@ -212,8 +262,11 @@ function grnCode(n: number): string {
 /** One over-receipt request collected during settlement (row insert pending). */
 interface OverReceiptRequest {
   readonly grnLineId: string;
-  readonly poId: string;
-  readonly poLineId: string;
+  /** Exactly one document pair is set (story 21-6, `over_receipts_document_pair`). */
+  readonly poId: string | null;
+  readonly poLineId: string | null;
+  readonly asnId: string | null;
+  readonly asnLineId: string | null;
   readonly skuId: string;
   readonly excessQty: number;
 }
@@ -278,10 +331,19 @@ export class ReceivingCommand {
       operatorUserId: command.operatorUserId,
       warehouseId: command.warehouseId,
       poId: command.poId,
+      // ── story 21-6: ADDITIVE, the 10.3 `weightsGrams` precedent ─────────
+      // The hash is built from THIS hand-assembled object, where JSON drops
+      // `undefined` but keeps `null`. `?? undefined` makes an absent (or
+      // null) ASN reference vanish, so every queued pre-21-6 PO or blind op
+      // hashes byte-for-byte as before and still replays (a literal pinned
+      // in `test/asn.spec.ts`); an always-present `null` key would answer
+      // every one of them 422 `idempotency-key-reuse`.
+      asnId: command.asnId ?? undefined,
       blindReasonCode: command.blindReasonCode,
       occurredAt: command.occurredAt,
       lines: command.lines.map((line) => ({
         poLineId: line.poLineId,
+        asnLineId: line.asnLineId ?? undefined,
         skuId: line.skuId,
         batchCode: line.batchCode,
         mfgDate: line.mfgDate,
@@ -304,7 +366,24 @@ export class ReceivingCommand {
     // whether or not its key was used before. The FLAG-dependent half (this
     // SKU requires weights / must not carry them) needs the SKU row and
     // therefore runs behind the replay lookup, below.
-    assertWeightShape(command.lines);
+    // ── story 21-6: normalise the optional fields BEFORE validation ──────
+    // A stored payload re-applied through the sync-report rebuild passes its
+    // lines through RAW: a pre-21-6 op carries no `asnId` and no
+    // `asnLineId`, and a device may have omitted any optional key (the
+    // weights, the batch fields) rather than sending null. Every rule below
+    // reads the normalised form, so an absent key means exactly what null
+    // means — an old op re-applies cleanly. The HASH above is untouched: it
+    // was computed over the command as received.
+    const asnId = command.asnId ?? null;
+    const inputLines: readonly GrnLineInput[] = command.lines.map((line) => ({
+      ...line,
+      poLineId: line.poLineId ?? null,
+      asnLineId: line.asnLineId ?? null,
+      batchCode: line.batchCode ?? null,
+      mfgDate: line.mfgDate ?? null,
+      weightsGrams: line.weightsGrams ?? null,
+    }));
+    assertWeightShape(inputLines);
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── device re-authorization (fail-closed, the selfTestEcho mirror) ──
@@ -352,15 +431,15 @@ export class ReceivingCommand {
       }
 
       // ── input validation (400 before any write) ────────────────────────
-      if (command.lines.length === 0) {
+      if (inputLines.length === 0) {
         throw grnValidation('A goods receipt needs at least one line.');
       }
-      if (command.lines.length > 200) {
-        throw grnValidation(`A goods receipt carries at most 200 lines (got ${command.lines.length}).`);
+      if (inputLines.length > 200) {
+        throw grnValidation(`A goods receipt carries at most 200 lines (got ${inputLines.length}).`);
       }
       const occurredAt = assertUtc(command.occurredAt, 'occurredAt');
-      const blindReasonCode = this.validateBlindPairing(command.poId, command.blindReasonCode);
-      for (const line of command.lines) {
+      const blindReasonCode = this.validateDocumentPairing(command.poId, asnId, command.blindReasonCode);
+      for (const line of inputLines) {
         // Story 10.2: `line.qty` is in BASE units here — shape and range only.
         // Whether the SKU's own unit may express this many decimals is asked
         // below, once `loadSkus` has read the units, and therefore behind the
@@ -376,8 +455,21 @@ export class ReceivingCommand {
         if (line.mfgDate !== null) {
           assertUtc(line.mfgDate, 'mfgDate');
         }
+        // Story 21-6: a line reference names a line of THE document — a
+        // `poLineId` only beside `poId`, an `asnLineId` only beside `asnId`.
         if (command.poId === null && line.poLineId !== null) {
-          throw grnValidation('A blind receipt carries no PO line references.');
+          throw grnValidation(
+            asnId === null
+              ? 'A blind receipt carries no PO line references.'
+              : 'A receipt against an advance shipment notice carries no PO line references.',
+          );
+        }
+        if (asnId === null && line.asnLineId !== null) {
+          throw grnValidation(
+            command.poId === null
+              ? 'A blind receipt carries no ASN line references.'
+              : 'A receipt against a purchase order carries no ASN line references.',
+          );
         }
       }
 
@@ -387,7 +479,7 @@ export class ReceivingCommand {
       const skuById = await this.loadSkus(
         tx,
         command.tenantId,
-        command.lines.map((line) => line.skuId),
+        inputLines.map((line) => line.skuId),
       );
 
       // ── story 11.4: a kit SKU never receives stock (FR-38) ──────────────
@@ -398,7 +490,7 @@ export class ReceivingCommand {
       const kitSkuIds = await this.catalog.getKitSkuIdsInTx(
         tx,
         command.tenantId,
-        command.lines.map((line) => line.skuId),
+        inputLines.map((line) => line.skuId),
       );
       if (kitSkuIds.length > 0) {
         throw kitCannotHoldStock(
@@ -413,7 +505,7 @@ export class ReceivingCommand {
       // every other SKU must carry none. Both directions fail CLOSED — a
       // weight list silently ignored on a non-catch-weight SKU would be a
       // weight the operator recorded and the system threw away.
-      for (const line of command.lines) {
+      for (const line of inputLines) {
         const sku = skuById.get(line.skuId)!;
         if (sku.catchWeightTracked) {
           if (sku.serialTracked) {
@@ -441,7 +533,7 @@ export class ReceivingCommand {
       // Behind the replay lookup and with each line's unit in hand. Below
       // this point every quantity is milli-units; `command.lines` is not read
       // for a quantity again.
-      const lines: readonly GrnLineInput[] = command.lines.map((line) => {
+      const lines: readonly GrnLineInput[] = inputLines.map((line) => {
         const uom = skuById.get(line.skuId)!.uom;
         return {
           ...line,
@@ -477,11 +569,48 @@ export class ReceivingCommand {
           // 409 naming the state — a stale queued receipt retracts visibly.
           throw poNotOpen(poRow.code, poRow.status);
         }
+        // Story 21-6: a document is received only in its own warehouse.
+        if (poRow.warehouseId !== command.warehouseId) {
+          throw documentWarehouseMismatch(`Purchase order "${poRow.code}"`);
+        }
         po = poRow;
         poLines = await tx
           .select()
           .from(purchaseOrderLines)
           .where(eq(purchaseOrderLines.poId, poRow.id))
+          .for('update');
+      }
+
+      // ── story 21-6: the ASN arm — locked exactly where the PO is ────────
+      // SKUs (above) → the ASN → its lines: the same order as the PO arm and
+      // as the approve arm, so a receipt, an approval and a close serialise
+      // on the document row instead of deadlocking.
+      let asn: typeof advanceShipmentNotices.$inferSelect | null = null;
+      let asnLineRows: (typeof asnLines.$inferSelect)[] = [];
+      if (asnId !== null) {
+        const asnRows = await tx
+          .select()
+          .from(advanceShipmentNotices)
+          .where(
+            and(eq(advanceShipmentNotices.id, asnId), eq(advanceShipmentNotices.tenantId, command.tenantId)),
+          )
+          .limit(1)
+          .for('update');
+        const asnRow = asnRows[0];
+        if (asnRow === undefined) {
+          throw asnNotFound(asnId);
+        }
+        if (!RECEIVABLE_ASN_STATUSES.includes(asnRow.status as AsnStatus)) {
+          throw asnNotOpen(asnRow.asnCode, asnRow.status);
+        }
+        if (asnRow.warehouseId !== command.warehouseId) {
+          throw documentWarehouseMismatch(`Advance shipment notice "${asnRow.asnCode}"`);
+        }
+        asn = asnRow;
+        asnLineRows = await tx
+          .select()
+          .from(asnLines)
+          .where(eq(asnLines.asnId, asnRow.id))
           .for('update');
       }
 
@@ -501,6 +630,7 @@ export class ReceivingCommand {
         warehouseId: command.warehouseId,
         code,
         poId: command.poId,
+        asnId,
         blindReasonCode,
         status: 'recorded',
         deviceId: command.deviceId,
@@ -510,79 +640,112 @@ export class ReceivingCommand {
       });
 
       // ── settlement: within-open applies now; the excess pends ──────────
-      // The line's remaining open quantity starts at `ordered − received`
-      // (derived, read under the PO-line locks) and shrinks line by line, so
-      // two lines for the same PO line settle in receipt order.
+      // ONE fold for both documents (story 21-6). A document line's
+      // remaining open quantity starts at `ordered|announced − received`
+      // (derived, read under the line locks) and shrinks line by line, so
+      // two receipt lines against the same document line settle in receipt
+      // order.
       const openRemaining = new Map<string, number>();
       for (const poLine of poLines) {
         openRemaining.set(poLine.id, poLine.orderedQty - poLine.receivedQty);
       }
+      for (const asnLine of asnLineRows) {
+        openRemaining.set(asnLine.id, asnLine.announcedQty - asnLine.receivedQty);
+      }
       const poLineById = new Map(poLines.map((line) => [line.id, line]));
+      const asnLineById = new Map(asnLineRows.map((line) => [line.id, line]));
 
       interface SettledLine {
         readonly input: GrnLineInput;
         readonly lineId: string;
+        /** The document line actually credited — null on a blind or unmatched line. */
+        readonly poLineId: string | null;
+        readonly asnLineId: string | null;
         readonly batchId: string | null;
         readonly batchCode: string | null;
         readonly applied: number;
       }
       const settled: SettledLine[] = [];
       const rejected: RejectedGrnLine[] = [];
+      const unmatched: UnmatchedGrnLine[] = [];
       const overReceiptRequests: OverReceiptRequest[] = [];
+      const documentLabel =
+        po !== null ? `purchase order "${po.code}"` : asn !== null ? `advance shipment notice "${asn.asnCode}"` : '';
 
-      for (const input of lines) {
+      for (const [index, input] of lines.entries()) {
         const identity = batchIdentity.get(`${input.skuId}:${input.batchCode}`) ?? null;
-        if (command.poId === null || input.poLineId === null) {
-          // Blind arm: the physical quantity applies in full (no PO to gate it).
-          settled.push({
-            input,
-            lineId: uuidv7(),
-            batchId: identity?.id ?? null,
-            batchCode: identity?.code ?? null,
-            applied: input.qty,
-          });
-          continue;
-        }
-        const poLine = poLineById.get(input.poLineId);
-        if (poLine === undefined) {
-          rejected.push({
-            poLineId: input.poLineId,
-            skuId: input.skuId,
-            qty: fromMilli(input.qty),
-            code: 'po-line-not-found',
-            reason: `No line with id "${input.poLineId}" exists on purchase order "${po!.code}".`,
-          });
-          continue;
-        }
-        if (poLine.status !== 'open') {
-          // The line-state rejection: the other lines still settle.
-          rejected.push({
-            poLineId: input.poLineId,
-            skuId: input.skuId,
-            qty: fromMilli(input.qty),
-            code: 'po-line-not-open',
-            reason: `Purchase order line "${input.poLineId}" is ${poLine.status} — it cannot receive.`,
-          });
-          continue;
-        }
-        const lineId = uuidv7();
-        const remaining = openRemaining.get(input.poLineId) ?? 0;
-        const applied = Math.max(0, Math.min(input.qty, remaining));
-        const excess = input.qty - applied;
-        openRemaining.set(input.poLineId, remaining - applied);
-        settled.push({
+        const base = {
           input,
-          lineId,
           batchId: identity?.id ?? null,
           batchCode: identity?.code ?? null,
+        };
+        if (po === null && asn === null) {
+          // Blind arm: the physical quantity applies in full (no document to gate it).
+          settled.push({ ...base, lineId: uuidv7(), poLineId: null, asnLineId: null, applied: input.qty });
+          continue;
+        }
+        const reference = po !== null ? input.poLineId : (input.asnLineId ?? null);
+        if (reference === null) {
+          // Story 21-6 — UNMATCHED (the old no-`poLineId` arm, now named):
+          // applied in full, no line credited, no ceiling, no over-receipt.
+          settled.push({ ...base, lineId: uuidv7(), poLineId: null, asnLineId: null, applied: input.qty });
+          unmatched.push({ index, reason: 'no-line-reference' });
+          continue;
+        }
+        const documentLine =
+          po !== null ? poLineById.get(reference) : asnLineById.get(reference);
+        if (documentLine === undefined) {
+          rejected.push({
+            poLineId: po !== null ? reference : null,
+            ...(asn !== null ? { asnLineId: reference } : {}),
+            skuId: input.skuId,
+            qty: fromMilli(input.qty),
+            code: po !== null ? 'po-line-not-found' : 'asn-line-not-found',
+            reason: `No line with id "${reference}" exists on ${documentLabel}.`,
+          });
+          continue;
+        }
+        if (documentLine.skuId !== input.skuId) {
+          // Story 21-6 — the scanned goods are not what the referenced line
+          // announced: book them (they arrived) without crediting the line.
+          settled.push({ ...base, lineId: uuidv7(), poLineId: null, asnLineId: null, applied: input.qty });
+          unmatched.push({ index, reason: 'line-sku-mismatch' });
+          continue;
+        }
+        if (po !== null) {
+          const poLine = poLineById.get(reference)!;
+          if (poLine.status !== 'open') {
+            // The line-state rejection: the other lines still settle.
+            rejected.push({
+              poLineId: reference,
+              skuId: input.skuId,
+              qty: fromMilli(input.qty),
+              code: 'po-line-not-open',
+              reason: `Purchase order line "${reference}" is ${poLine.status} — it cannot receive.`,
+            });
+            continue;
+          }
+        }
+        const lineId = uuidv7();
+        const remaining = openRemaining.get(reference) ?? 0;
+        const applied = Math.max(0, Math.min(input.qty, remaining));
+        const excess = input.qty - applied;
+        openRemaining.set(reference, remaining - applied);
+        settled.push({
+          ...base,
+          lineId,
+          poLineId: po !== null ? reference : null,
+          asnLineId: asn !== null ? reference : null,
           applied,
         });
         if (excess > 0) {
           // Pending over-receipt: the excess applies only on approval.
           overReceiptRequests.push({
             grnLineId: lineId,
-            poId: command.poId,
-            poLineId: input.poLineId,
+            poId: po?.id ?? null,
+            poLineId: po !== null ? reference : null,
+            asnId: asn?.id ?? null,
+            asnLineId: asn !== null ? reference : null,
             skuId: input.skuId,
             excessQty: excess,
           });
@@ -590,14 +753,15 @@ export class ReceivingCommand {
       }
 
       // An all-rejected receipt (every line named an unknown or non-open
-      // PO line — a stale cache) settles nothing and still records.
+      // document line — a stale cache) settles nothing and still records.
       if (settled.length > 0) {
         await tx.insert(goodsReceiptLines).values(
           settled.map((entry) => ({
             id: entry.lineId,
             tenantId: command.tenantId,
             grnId,
-            poLineId: entry.input.poLineId,
+            poLineId: entry.poLineId,
+            asnLineId: entry.asnLineId,
             skuId: entry.input.skuId,
             batchId: entry.batchId,
             qty: entry.input.qty,
@@ -687,35 +851,26 @@ export class ReceivingCommand {
           actorUserId: command.operatorUserId,
           occurredAt,
           recordedAt,
-          referenceDoc: {
-            kind: 'grn-receipt',
-            grnId,
-            ...(command.poId === null ? {} : { poId: command.poId }),
-            ...(entry.input.poLineId === null ? {} : { poLineId: entry.input.poLineId }),
-          },
+          // Story 21-6: the document AND the line actually credited — an
+          // unmatched line names its document but no line; absent keys are
+          // omitted, so a PO or blind event's canonical bytes are unchanged.
+          referenceDoc: grnReferenceDoc(grnId, {
+            poId: command.poId,
+            poLineId: entry.poLineId,
+            asnId,
+            asnLineId: entry.asnLineId,
+          }),
         };
         await this.inventory.appendLedgerEventInTx(tx, movement);
       }
 
-      // Applied portions move `received_qty` (open stays derived).
-      const appliedByPoLine = new Map<string, number>();
-      for (const entry of settled) {
-        if (entry.input.poLineId === null || entry.applied <= 0) {
-          continue;
-        }
-        appliedByPoLine.set(
-          entry.input.poLineId,
-          // Compared against the received-quantity ceiling below, so a sum
-          // that rounded would compare against the wrong number (story 10.1).
-          assertExactQuantity(
-            (appliedByPoLine.get(entry.input.poLineId) ?? 0) + entry.applied,
-            `received quantity for po line ${entry.input.poLineId}`,
-          ),
-        );
-      }
+      // Applied portions move `received_qty` (open stays derived) — on the
+      // document line actually credited (an unmatched line credits none).
+      const appliedByPoLine = sumAppliedBy(settled, (entry) => entry.poLineId);
+      const appliedByAsnLine = sumAppliedBy(settled, (entry) => entry.asnLineId);
       for (const [poLineId, applied] of appliedByPoLine) {
         // Cumulative ceiling: the per-line @Max admits quantities whose
-        // summed receipts exceed the int4 column — a 400 beats a SQL
+        // summed receipts exceed the column's exact range — a 400 beats a SQL
         // overflow 500 (and an approve arm that can never land).
         if (poLineById.get(poLineId)!.receivedQty + applied > MAX_GRN_LINE_QTY) {
           throw grnValidation(
@@ -736,6 +891,26 @@ export class ReceivingCommand {
           .set({ updatedAt: nowIso() })
           .where(eq(purchaseOrders.id, command.poId!));
       }
+      for (const [asnLineId, applied] of appliedByAsnLine) {
+        // The same cumulative ceiling as the PO line.
+        if (asnLineById.get(asnLineId)!.receivedQty + applied > MAX_GRN_LINE_QTY) {
+          throw grnValidation(
+            `ASN line "${asnLineId}" would exceed its received-quantity ceiling of ${fromMilli(MAX_GRN_LINE_QTY)}.`,
+          );
+        }
+        await tx
+          .update(asnLines)
+          .set({ receivedQty: sql`${asnLines.receivedQty} + ${applied}::bigint`, updatedAt: nowIso() })
+          .where(eq(asnLines.id, asnLineId));
+      }
+      if (asn !== null) {
+        // The ASN's status follows its lines, in this same transaction.
+        await deriveAsnStatusInTx(tx, command.tenantId, asn.id);
+        await tx
+          .update(advanceShipmentNotices)
+          .set({ updatedAt: nowIso() })
+          .where(eq(advanceShipmentNotices.id, asn.id));
+      }
 
       // ── over-receipt rows (the excess pends for review.decide) ──────────
       const pendingOverReceipts: { id: string; request: OverReceiptRequest }[] = [];
@@ -750,6 +925,8 @@ export class ReceivingCommand {
           grnLineId: request.grnLineId,
           poId: request.poId,
           poLineId: request.poLineId,
+          asnId: request.asnId,
+          asnLineId: request.asnLineId,
           skuId: request.skuId,
           excessQty: request.excessQty,
           status: 'pending',
@@ -766,6 +943,9 @@ export class ReceivingCommand {
           warehouseId: command.warehouseId,
           code,
           poId: command.poId,
+          // Story 21-6: present only on an ASN receipt, so a PO or blind
+          // GRN's snapshot is byte-identical to its pre-21-6 shape.
+          ...(asn === null ? {} : { asnId: asn.id, asnCode: asn.asnCode }),
           blindReasonCode,
           status: 'recorded',
           deviceId: command.deviceId,
@@ -775,7 +955,8 @@ export class ReceivingCommand {
           lines: settled.map((entry) => ({
             id: entry.lineId,
             grnId,
-            poLineId: entry.input.poLineId,
+            poLineId: entry.poLineId,
+            ...(entry.asnLineId === null ? {} : { asnLineId: entry.asnLineId }),
             skuId: entry.input.skuId,
             batchId: entry.batchId,
             batchCode: entry.batchCode,
@@ -792,6 +973,7 @@ export class ReceivingCommand {
               : {}),
           })),
           ...(rejected.length === 0 ? {} : { rejectedLines: rejected }),
+          ...(unmatched.length === 0 ? {} : { unmatchedLines: unmatched }),
         },
       };
 
@@ -815,6 +997,7 @@ export class ReceivingCommand {
             grnCode: code,
             poId: pending.request.poId,
             poLineId: pending.request.poLineId,
+            ...asnRefs(pending.request.asnId, pending.request.asnLineId),
             skuId: pending.request.skuId,
             excessQty: fromMilli(pending.request.excessQty),
             requestedBy: command.operatorUserId,
@@ -916,6 +1099,8 @@ export class ReceivingCommand {
       // The audit action / outbox type: over_receipt.approved | rejected.
       const decisionEvent = `over_receipt.${status}`;
 
+      // Story 21-6 — the ASN code, for the response and the outbox payload.
+      let asnCode: string | null = null;
       if (command.decision === 'approve') {
         // Story 11.4: the approval is a third +stock writer — the excess
         // applies as a fresh `grn.received` delta at DECISION time, days after
@@ -942,6 +1127,70 @@ export class ReceivingCommand {
         if (overReceiptKitIds.length > 0) {
           throw kitCannotHoldStock('over-receipt approval', [lockedSkus[0]?.code ?? row.skuId]);
         }
+
+        // ── story 21-6 (decision 3): lock the DOCUMENT, then its line ─────
+        // The lock order everywhere: over-receipt row → SKU → PO or ASN →
+        // line. A concurrent close locks the same document row and then
+        // refuses while this excess is pending, so the two serialise (PENDING
+        // :48). Approve NEVER refuses on the document's status — a closed PO
+        // (a pre-21-6 leftover) or a `received`/`closed` ASN still takes the
+        // excess, so stock that physically arrived is never stranded.
+        let poLineReceived: number | null = null;
+        let asnLineReceived: number | null = null;
+        if (row.poId !== null) {
+          await tx
+            .select({ id: purchaseOrders.id })
+            .from(purchaseOrders)
+            .where(and(eq(purchaseOrders.tenantId, command.tenantId), eq(purchaseOrders.id, row.poId)))
+            .limit(1)
+            .for('update');
+          if (row.poLineId !== null) {
+            const poLineRows = await tx
+              .select({ receivedQty: purchaseOrderLines.receivedQty })
+              .from(purchaseOrderLines)
+              .where(eq(purchaseOrderLines.id, row.poLineId))
+              .limit(1)
+              .for('update');
+            if (poLineRows[0] === undefined) {
+              throw grnValidation(`Purchase order line "${row.poLineId}" no longer exists.`);
+            }
+            poLineReceived = poLineRows[0].receivedQty;
+          }
+        } else if (row.asnId !== null) {
+          const asnRows = await tx
+            .select({ code: advanceShipmentNotices.asnCode })
+            .from(advanceShipmentNotices)
+            .where(and(eq(advanceShipmentNotices.tenantId, command.tenantId), eq(advanceShipmentNotices.id, row.asnId)))
+            .limit(1)
+            .for('update');
+          asnCode = asnRows[0]?.code ?? null;
+          if (row.asnLineId !== null) {
+            const asnLineRows = await tx
+              .select({ receivedQty: asnLines.receivedQty })
+              .from(asnLines)
+              .where(eq(asnLines.id, row.asnLineId))
+              .limit(1)
+              .for('update');
+            if (asnLineRows[0] === undefined) {
+              throw grnValidation(`ASN line "${row.asnLineId}" no longer exists.`);
+            }
+            asnLineReceived = asnLineRows[0].receivedQty;
+          }
+        }
+        // Cumulative ceiling (the submit arm enforces the same): an approval
+        // that would overflow must be a 400, never a SQL overflow 500 that
+        // leaves the row pending forever.
+        if (poLineReceived !== null && poLineReceived + row.excessQty > MAX_GRN_LINE_QTY) {
+          throw grnValidation(
+            `Approving would push purchase order line "${row.poLineId}" past its received-quantity ceiling of ${fromMilli(MAX_GRN_LINE_QTY)}.`,
+          );
+        }
+        if (asnLineReceived !== null && asnLineReceived + row.excessQty > MAX_GRN_LINE_QTY) {
+          throw grnValidation(
+            `Approving would push ASN line "${row.asnLineId}" past its received-quantity ceiling of ${fromMilli(MAX_GRN_LINE_QTY)}.`,
+          );
+        }
+
         // The excess applies as a normal ledger append (corrections are new
         // events) — the system Receiving bin (ensured, idempotent) is its
         // location, the GRN line's batch identity its batch arm.
@@ -959,30 +1208,15 @@ export class ReceivingCommand {
           actorUserId: command.actorUserId,
           occurredAt: decidedAt,
           recordedAt: decidedAt,
-          referenceDoc: {
-            kind: 'grn-receipt',
-            grnId: row.grnId,
-            ...(row.poId === null ? {} : { poId: row.poId }),
-            ...(row.poLineId === null ? {} : { poLineId: row.poLineId }),
-          },
+          // Story 21-6: the same reference shape as the submit's event.
+          referenceDoc: grnReferenceDoc(row.grnId, {
+            poId: row.poId,
+            poLineId: row.poLineId,
+            asnId: row.asnId,
+            asnLineId: row.asnLineId,
+          }),
         });
         if (row.poLineId !== null) {
-          // Cumulative ceiling (the submit arm enforces the same): an
-          // approval that would overflow the int4 column must be a 400,
-          // never a SQL overflow 500 that leaves the row pending forever.
-          const poLineRows = await tx
-            .select({ receivedQty: purchaseOrderLines.receivedQty })
-            .from(purchaseOrderLines)
-            .where(eq(purchaseOrderLines.id, row.poLineId))
-            .limit(1);
-          if (poLineRows[0] === undefined) {
-            throw grnValidation(`Purchase order line "${row.poLineId}" no longer exists.`);
-          }
-          if (poLineRows[0].receivedQty + row.excessQty > MAX_GRN_LINE_QTY) {
-            throw grnValidation(
-              `Approving would push purchase order line "${row.poLineId}" past its received-quantity ceiling of ${fromMilli(MAX_GRN_LINE_QTY)}.`,
-            );
-          }
           await tx
             .update(purchaseOrderLines)
             .set({
@@ -991,6 +1225,26 @@ export class ReceivingCommand {
             })
             .where(eq(purchaseOrderLines.id, row.poLineId));
         }
+        if (row.asnLineId !== null && row.asnId !== null) {
+          await tx
+            .update(asnLines)
+            .set({
+              receivedQty: sql`${asnLines.receivedQty} + ${row.excessQty}::bigint`,
+              updatedAt: decidedAt,
+            })
+            .where(eq(asnLines.id, row.asnLineId));
+          // Re-derived like every receipt (a terminal ASN stays terminal).
+          await deriveAsnStatusInTx(tx, command.tenantId, row.asnId);
+        }
+      } else if (row.asnId !== null) {
+        // The reject arm stays lock-free beyond its own row: a plain read
+        // of the code for the response.
+        const asnRows = await tx
+          .select({ code: advanceShipmentNotices.asnCode })
+          .from(advanceShipmentNotices)
+          .where(and(eq(advanceShipmentNotices.tenantId, command.tenantId), eq(advanceShipmentNotices.id, row.asnId)))
+          .limit(1);
+        asnCode = asnRows[0]?.code ?? null;
       }
 
       // ── story 10.3: the handling units that pended WITH this excess ─────
@@ -1038,6 +1292,7 @@ export class ReceivingCommand {
           grnCode: grn.code,
           poId: row.poId,
           poLineId: row.poLineId,
+          ...asnRefs(row.asnId, row.asnLineId),
           skuId: row.skuId,
           excessQty: fromMilli(row.excessQty),
           decidedBy: command.actorUserId,
@@ -1055,6 +1310,8 @@ export class ReceivingCommand {
           grnLineId: row.grnLineId,
           poId: row.poId,
           poLineId: row.poLineId,
+          ...asnRefs(row.asnId, row.asnLineId),
+          ...(asnCode === null ? {} : { asnCode }),
           skuId: row.skuId,
           excessQty: fromMilli(row.excessQty),
           status: status as OverReceiptEntry['status'],
@@ -1136,18 +1393,32 @@ export class ReceivingCommand {
     return byId;
   }
 
-  /** `poId: null` ⇔ `blindReasonCode` present and inside the fixed enum. */
-  private validateBlindPairing(poId: string | null, blindReasonCode: string | null): string | null {
-    if (poId === null) {
-      if (blindReasonCode === null || !BLIND_REASON_CODES.includes(blindReasonCode as BlindReasonCode)) {
+  /**
+   * Story 21-6 — a receipt references EXACTLY ONE of a purchase order, an
+   * advance shipment notice, or neither (blind, then with a reason from the
+   * fixed enum); anything else is a 400. The friendly front end of
+   * `goods_receipt_notes_blind_pairing` (0064).
+   */
+  private validateDocumentPairing(
+    poId: string | null,
+    asnId: string | null,
+    blindReasonCode: string | null,
+  ): string | null {
+    const given = [poId, asnId, blindReasonCode].filter((value) => value !== null).length;
+    if (given !== 1) {
+      throw grnValidation(
+        given === 0
+          ? `A receipt names a purchase order (poId), an advance shipment notice (asnId), or — when blind — a reason code from ${JSON.stringify(BLIND_REASON_CODES)}.`
+          : 'A receipt names exactly one of poId, asnId or blindReasonCode — never two.',
+      );
+    }
+    if (blindReasonCode !== null) {
+      if (!BLIND_REASON_CODES.includes(blindReasonCode as BlindReasonCode)) {
         throw grnValidation(
           `A blind receipt requires a reason code from ${JSON.stringify(BLIND_REASON_CODES)}.`,
         );
       }
       return blindReasonCode;
-    }
-    if (blindReasonCode !== null) {
-      throw grnValidation('A receipt against a purchase order carries no blind reason code.');
     }
     return null;
   }
@@ -1290,4 +1561,70 @@ export function poNotOpen(code: string, status: string): ProblemException {
     'Purchase order is not open',
     `Purchase order "${code}" is ${status} — receipts land only against an open PO.`,
   );
+}
+
+/** 409 `document-warehouse-mismatch` — a receipt lands only in its document's warehouse (story 21-6). */
+export function documentWarehouseMismatch(subject: string): ProblemException {
+  return new ProblemException(
+    'document-warehouse-mismatch',
+    409,
+    "Receipt warehouse is not the document's",
+    `${subject} belongs to another warehouse — receive it in the warehouse it was raised for.`,
+  );
+}
+
+/**
+ * Story 21-6 — the `grn.received` reference: the GRN, plus the document and
+ * the line it credited, each key OMITTED when absent — so a PO or blind
+ * event's canonical bytes are exactly their pre-21-6 shape. Used by the
+ * submit AND the approve arm, so the two can never disagree.
+ */
+export function grnReferenceDoc(
+  grnId: string,
+  refs: {
+    readonly poId: string | null;
+    readonly poLineId: string | null;
+    readonly asnId: string | null;
+    readonly asnLineId: string | null;
+  },
+): {
+  kind: 'grn-receipt';
+  grnId: string;
+  poId?: string;
+  poLineId?: string;
+  asnId?: string;
+  asnLineId?: string;
+} {
+  return {
+    kind: 'grn-receipt',
+    grnId,
+    ...(refs.poId === null ? {} : { poId: refs.poId }),
+    ...(refs.poLineId === null ? {} : { poLineId: refs.poLineId }),
+    ...(refs.asnId === null ? {} : { asnId: refs.asnId }),
+    ...(refs.asnLineId === null ? {} : { asnLineId: refs.asnLineId }),
+  };
+}
+
+/** `{asnId, asnLineId}` when set — omitted entirely on a PO's over-receipt. */
+function asnRefs(asnId: string | null, asnLineId: string | null): { asnId?: string; asnLineId?: string } {
+  return {
+    ...(asnId === null ? {} : { asnId }),
+    ...(asnLineId === null ? {} : { asnLineId }),
+  };
+}
+
+/** Σ applied per credited document line (exact — compared against a ceiling). */
+function sumAppliedBy<T extends { readonly applied: number }>(
+  settled: readonly T[],
+  lineOf: (entry: T) => string | null,
+): Map<string, number> {
+  const sums = new Map<string, number>();
+  for (const entry of settled) {
+    const lineId = lineOf(entry);
+    if (lineId === null || entry.applied <= 0) {
+      continue;
+    }
+    sums.set(lineId, assertExactQuantity((sums.get(lineId) ?? 0) + entry.applied, `received quantity for line ${lineId}`));
+  }
+  return sums;
 }

@@ -1052,8 +1052,9 @@ describe('reporting: the operational dashboard (e2e, story 9-1)', () => {
     expect(((await list(`warehouses/${warehouseId}/outbound/orders`, { source: 'ingested', backordered: 'false' }).expect(200)).body.items as unknown[]).length).toBe(0);
     await list(`warehouses/${warehouseId}/outbound/orders`, { backordered: 'maybe' }).expect(400);
     await list(`warehouses/${warehouseId}/outbound/orders`, { status: 'teleported' }).expect(400);
-    expect(((await list('receiving/goods-receipts', { warehouseId, poless: 'true' }).expect(200)).body.items as { poId: string | null }[]).every((g) => g.poId === null)).toBe(true);
-    expect(((await list('receiving/goods-receipts', { warehouseId, poless: 'false' }).expect(200)).body.items as { poId: string | null }[]).every((g) => g.poId !== null)).toBe(true);
+    // Story 21-6: `poless` is the alias of `blind` — it means the blind REASON, not the absent PO.
+    expect(((await list('receiving/goods-receipts', { warehouseId, poless: 'true' }).expect(200)).body.items as { blindReasonCode: string | null }[]).every((g) => g.blindReasonCode !== null)).toBe(true);
+    expect(((await list('receiving/goods-receipts', { warehouseId, poless: 'false' }).expect(200)).body.items as { blindReasonCode: string | null }[]).every((g) => g.blindReasonCode === null)).toBe(true);
     await list('receiving/over-receipts', { warehouseId: uuidv7() }).expect(404);
     expect(((await list('receiving/over-receipts', { warehouseId: emptyWarehouseId }).expect(200)).body.items as unknown[]).length).toBe(0);
     await list('eway/bills', { warehouseId: uuidv7() }).expect(404);
