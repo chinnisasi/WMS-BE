@@ -875,8 +875,16 @@ describe('users, roles, and permission gating (e2e)', () => {
     // tax details are finance work, the `rates.manage` rationale);
     // ops_manager does NOT hold it. Story 21-6 grows it to 40 with
     // `asn.manage` — owner + ops_manager, the `po.manage` holder set (an ASN
-    // is the PO's mirror).
-    expect([...CAPABILITIES]).toHaveLength(40);
+    // is the PO's mirror). Story 21-7b grows it to 41 with `asn.announce` —
+    // the client portal's one write (a client user announces its own
+    // shipment): held by `client`, and by owner only because owner holds
+    // everything (the fence keeps owner tokens off portal routes and the
+    // command's client re-check refuses a user without a client); never by
+    // ops_manager, operator or accountant (they key ASNs via `asn.manage`).
+    expect([...CAPABILITIES]).toHaveLength(41);
+    expect(CAPABILITIES).toContain('asn.announce');
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('asn.announce'))).toEqual(['owner', 'client']);
+    expect([...ROLE_CAPABILITIES.client]).toEqual(['asn.announce']);
     expect(CAPABILITIES).toContain('asn.manage');
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('asn.manage'))).toEqual(
       roles.filter((role) => ROLE_CAPABILITIES[role].has('po.manage')),

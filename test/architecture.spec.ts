@@ -1746,6 +1746,9 @@ describe('architecture: the client portal (story 21-7)', () => {
     { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder'] },
     { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice'] },
     { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },
+    // Story 21-7b — the announce form's two reads.
+    { file: join(SRC_ROOT, 'modules', 'catalog', 'catalog.facade.ts'), methods: ['portalSkus'] },
+    { file: join(SRC_ROOT, 'modules', 'tenancy', 'tenancy.service.ts'), methods: ['portalWarehouses'] },
   ];
 
   /** The body of one method or function: from its declaration to the next top-level member. */
@@ -1777,8 +1780,77 @@ describe('architecture: the client portal (story 21-7)', () => {
       [...readFileSync(file, 'utf8').matchAll(/\n {2}async (portal[A-Z]\w*)\(/g)].map((match) => match[1]!),
     );
     expect(declared.sort()).toEqual(
-      ['portalStock', 'portalOrders', 'portalOrder', 'portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalInvoices', 'portalInvoice', 'portalMe'].sort(),
+      [
+        'portalStock',
+        'portalOrders',
+        'portalOrder',
+        'portalAsns',
+        'portalAsn',
+        'portalPurchaseOrders',
+        'portalPurchaseOrder',
+        'portalInvoices',
+        'portalInvoice',
+        'portalMe',
+        'portalSkus',
+        'portalWarehouses',
+      ].sort(),
     );
+  });
+
+  /**
+   * Story 21-7b — the portal's WRITES carry the same two layers. The stamp
+   * lives in the COMMAND, not the facade (`InboundFacade.announceAsn` is a
+   * one-line delegation, deliberately not `portal*`-named, so the read scan
+   * above never sees it): the command opens its own `withTenantTransaction`
+   * stamped with the SESSION's client (`{ clientId: command.clientId }`).
+   */
+  const PORTAL_WRITES: readonly { file: string; methods: readonly string[] }[] = [
+    { file: join(SRC_ROOT, 'modules', 'inbound', 'asn.command.ts'), methods: ['announce'] },
+  ];
+
+  function stampsCommandClient(body: string): boolean {
+    return /withTenantTransaction\(/.test(body) && /\{\s*clientId:\s*command\.clientId\s*,?\s*\}\s*,?\s*\)/.test(body);
+  }
+
+  it('every portal write command opens withTenantTransaction stamped with { clientId: command.clientId }', () => {
+    const offenders: string[] = [];
+    for (const { file, methods } of PORTAL_WRITES) {
+      const source = readFileSync(file, 'utf8');
+      for (const method of methods) {
+        const body = bodyOf(source, method);
+        if (body === null) offenders.push(`${file}: no ${method}`);
+        else if (!stampsCommandClient(body)) offenders.push(`${file}: ${method} does not stamp { clientId: command.clientId }`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the write-stamp detector bites (the test is meaningful)', () => {
+    const stamped = `
+  async announce(command: AnnounceAsnCommand, key: string) {
+    return withTenantTransaction(
+      this.db,
+      command.tenantId,
+      async (tx) => writeInTx(tx, command),
+      { clientId: command.clientId },
+    );
+  }
+`;
+    const unstamped = `
+  async announce(command: AnnounceAsnCommand, key: string) {
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => writeInTx(tx, command));
+  }
+`;
+    const wrongClient = `
+  async announce(command: AnnounceAsnCommand, key: string) {
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => writeInTx(tx, command), { clientId: body.clientId });
+  }
+`;
+    expect(stampsCommandClient(bodyOf(stamped, 'announce')!)).toBe(true);
+    expect(stampsCommandClient(bodyOf(unstamped, 'announce')!)).toBe(false);
+    expect(stampsCommandClient(bodyOf(wrongClient, 'announce')!)).toBe(false);
+    // The real command is found by name (a rename would empty the scan).
+    expect(bodyOf(readFileSync(PORTAL_WRITES[0]!.file, 'utf8'), 'announce')).not.toBeNull();
   });
 
   it('the stamp detector bites (the test is meaningful)', () => {

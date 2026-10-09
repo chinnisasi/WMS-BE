@@ -550,6 +550,38 @@ export class TenancyService {
   }
 
   /**
+   * Story 21-7b — the client portal's warehouse list (the announce form's
+   * picker; decision 1: a client may announce into EVERY warehouse of the
+   * tenant). The 21-7 facade-read pattern: the transaction is stamped with
+   * the client (`{ clientId }` — `warehouses` is tenant-scoped, so the stamp
+   * filters nothing here, but every portal read carries it) and the query
+   * carries its explicit scope predicate (`tenant_id = $t`). An EXACT key
+   * allowlist rebuilt key by key: `{warehouseId, warehouseName, city}` —
+   * never a code, an address line, a contact or a GSTIN. `city` is the
+   * origin city (null on a pre-11.1 row), the disambiguator for two
+   * warehouses of one name. Ordered `(name, id)`; unpaginated — a tenant
+   * has few warehouses — and capped at `MAX_WAREHOUSE_PAGE_SIZE`.
+   */
+  async portalWarehouses(
+    tenantId: string,
+    clientId: string,
+  ): Promise<{ warehouseId: string; warehouseName: string; city: string | null }[]> {
+    const rows = await withTenantTransaction(
+      this.db,
+      tenantId,
+      (tx) =>
+        tx
+          .select({ id: warehouses.id, name: warehouses.name, city: warehouses.originCity })
+          .from(warehouses)
+          .where(eq(warehouses.tenantId, tenantId))
+          .orderBy(asc(warehouses.name), asc(warehouses.id))
+          .limit(MAX_WAREHOUSE_PAGE_SIZE),
+      { clientId },
+    );
+    return rows.map((row) => ({ warehouseId: row.id, warehouseName: row.name, city: row.city }));
+  }
+
+  /**
    * Zones of one warehouse (Story 1.3): the warehouse must belong to the
    * tenant (404 otherwise), keyset cursor pagination on (created_at, id),
    * tenant-scoped on both the app path and the RLS session setting.
