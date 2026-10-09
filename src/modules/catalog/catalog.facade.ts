@@ -28,6 +28,10 @@ import {
 } from './handling-unit.store';
 import { getKitCompositionInTx, getKitSkuIdsInTx } from './kit.store';
 import type { KitCompositionLine } from './kit.store';
+import { portalSkusInTx, type PortalSkuRow } from './portal-skus';
+import type { Page } from '../../shared/primitives/pagination';
+import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
+export type { PortalSkuRow } from './portal-skus';
 import type {
   CreateHandlingUnitInput,
   HandlingUnitIdentity,
@@ -199,6 +203,26 @@ export interface SkuSummary {
 @Injectable()
 export class CatalogFacade {
   constructor(@Inject(DATABASE) private readonly db: Database) {}
+
+  // ── story 21-7b: the client portal's SKU list (the announce form) ─────────
+  // The 21-7 facade-read pattern — two layers, both required: the
+  // transaction is stamped with the client (`{ clientId }` — the `skus`
+  // policy filters by client) AND the query carries the explicit
+  // `client_id` predicate (`portal-skus.ts`). Kits are excluded.
+
+  async portalSkus(
+    tenantId: string,
+    clientId: string,
+    query: { readonly cursor?: string; readonly limit?: number } = {},
+  ): Promise<Page<PortalSkuRow>> {
+    const limit = query.limit ?? PORTAL_PAGE_DEFAULT_LIMIT;
+    return withTenantTransaction(
+      this.db,
+      tenantId,
+      (tx) => portalSkusInTx(tx, tenantId, clientId, { ...(query.cursor === undefined ? {} : { cursor: query.cursor }), limit }),
+      { clientId },
+    );
+  }
 
   async getImportSummary(tenantId: string): Promise<CatalogImportSummary> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {

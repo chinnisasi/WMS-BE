@@ -18,17 +18,27 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
-import { assertWarehouseInTenant, getMemberClientIdIn, getMemberRoleIn } from '../tenancy/tenancy.service';
+import {
+  assertWarehouseInTenant,
+  getMemberClientIdIn,
+  getMemberPortalFactsIn,
+  getMemberRoleIn,
+} from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import {
   assertClientInTenantInTx,
   assertSingleClientInTx,
+  clientSuspended,
   getClientLabelsInTx,
+  getClientStatusInTx,
 } from '../clients/clients.facade';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
 import { uomPrecision } from '../catalog/uom';
+import { CatalogFacade } from '../catalog/catalog.facade';
+import { kitCannotHoldStock } from '../catalog/kit.store';
+import { portalAsnInTx, type PortalAsnDetail } from './portal-inbound';
 
 // ── vocabularies ─────────────────────────────────────────────────────────────
 
@@ -91,6 +101,24 @@ export interface CreateAsnCommand {
   readonly actorUserId: string;
   /** Explicit, and checked against the client derived from the lines' SKUs. */
   readonly clientId: string;
+  readonly warehouseId: string;
+  readonly asnCode: string;
+  readonly expectedAt?: string | null | undefined;
+  readonly lines: readonly AsnLineInput[];
+}
+
+/**
+ * Story 21-7b — a client user announces its OWN inbound shipment from the
+ * portal. `clientId` is the portal session's (the guard's re-read), never a
+ * body field; the command re-checks it against the actor in its own
+ * transaction.
+ */
+export interface AnnounceAsnCommand {
+  readonly tenantId: string;
+  /** From `PortalSession` — never from the request body. */
+  readonly clientId: string;
+  /** The client-portal user. */
+  readonly actorUserId: string;
   readonly warehouseId: string;
   readonly asnCode: string;
   readonly expectedAt?: string | null | undefined;
@@ -385,6 +413,14 @@ export function normalizedAsnNote(note: string): string {
   return trimmed;
 }
 
+/** The code, counted in CODE POINTS — the unit of 0064's `char_length` CHECK (400 otherwise). */
+function assertAsnCodeShape(asnCode: string): void {
+  const codePoints = [...asnCode].length;
+  if (codePoints === 0 || codePoints > MAX_ASN_CODE_LENGTH) {
+    throw asnValidation(`asnCode must be 1–${MAX_ASN_CODE_LENGTH} characters (got ${codePoints}).`);
+  }
+}
+
 function assertLineShape(lines: readonly AsnLineInput[]): void {
   if (lines.length === 0) {
     throw asnValidation('An advance shipment notice needs at least one line.');
@@ -392,6 +428,11 @@ function assertLineShape(lines: readonly AsnLineInput[]): void {
   if (lines.length > MAX_ASN_LINES) {
     throw asnValidation(`An advance shipment notice carries at most ${MAX_ASN_LINES} lines (got ${lines.length}).`);
   }
+}
+
+/** The operator commands' response and stored snapshot: `{asn}`. */
+function operatorSnapshot(_tx: TenantTx, asn: AsnDetail): AsnSnapshot {
+  return { asn };
 }
 
 // ── the commands ─────────────────────────────────────────────────────────────
@@ -415,6 +456,9 @@ export class AsnCommand {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
+    // Story 21-7b — the kit lookup for the portal announce (catalog owns
+    // `kit_compositions`; the receiving command's facade seam).
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
   ) {}
 
   async create(command: CreateAsnCommand, idempotencyKey: string): Promise<AsnSnapshot> {
@@ -438,10 +482,7 @@ export class AsnCommand {
       // Behind authority and replay (an unauthorised caller learns nothing;
       // a committed op re-serves). The code is counted in CODE POINTS — the
       // unit of 0064's `char_length` CHECK.
-      const codePoints = [...asnCode].length;
-      if (codePoints === 0 || codePoints > MAX_ASN_CODE_LENGTH) {
-        throw asnValidation(`asnCode must be 1–${MAX_ASN_CODE_LENGTH} characters (got ${codePoints}).`);
-      }
+      assertAsnCodeShape(asnCode);
       assertLineShape(command.lines);
 
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
@@ -463,40 +504,143 @@ export class AsnCommand {
       }
       const lines = this.scaleLines(command.lines, skuFacts);
 
-      // Read before the insert: a unique violation aborts the transaction,
-      // so the refusal's label cannot be fetched after it.
-      const clientLabels = await getClientLabelsInTx(tx, command.tenantId, [client.id]);
-      const asnId = uuidv7();
-      try {
-        await tx.insert(advanceShipmentNotices).values({
-          id: asnId,
+      const asnId = await this.insertAsn(tx, {
+        tenantId: command.tenantId,
+        clientId: command.clientId,
+        clientCode: client.code,
+        warehouseId: command.warehouseId,
+        asnCode,
+        expectedAt,
+        lines,
+      });
+
+      return this.finish(tx, command.tenantId, command.actorUserId, asnId, 'asn.created', idempotencyKey, payloadHash, operatorSnapshot);
+    });
+  }
+
+  /**
+   * Story 21-7b — the portal's first write: a client user announces its OWN
+   * inbound shipment. A separate command on the same tables (never a flag
+   * on `create`): the client comes from the portal session, the SKUs are
+   * read FILTERED by it, the fingerprint carries `surface: 'portal'`, and
+   * the stored snapshot is the portal's `PortalAsnDetail`. The result is an
+   * ordinary ASN — operators, the device snapshot and receiving see it
+   * exactly as one an operator keyed.
+   *
+   * Two layers (21-7): the transaction is stamped `{ clientId }` (the
+   * header's WITH CHECK requires `client_id = app.client_id`), and every
+   * read carries the explicit client predicate. It does NOT share
+   * `assertAuthority` (`asn.manage` + the portal refusal stay the operator
+   * path's, untouched): authority is `asn.announce`, then the actor and its
+   * client are re-read IN THIS transaction — the guard's re-read ran in
+   * another one, and on a write the window between them matters (a
+   * suspended brand's in-flight request must not commit).
+   *
+   * Order: hash → authority (capability, then the user — not active 401,
+   * another client 403 — then the client — not active 403
+   * `client-suspended`) → replay → code and line shape → warehouse in
+   * tenant (404) → the client's SKUs (404, never confirming another
+   * client's) → kits (409) → scale → insert (409 `duplicate-asn-code`) →
+   * outbox `asn.created` / audit (actor = the client user) / key. `mixed-
+   * client` and `sku-client-mismatch` are unreachable by construction.
+   */
+  async announce(command: AnnounceAsnCommand, idempotencyKey: string): Promise<PortalAsnDetail> {
+    const asnCode = command.asnCode.trim();
+    const expectedAt = normalizedExpectedAt(command.expectedAt) ?? null;
+    // The portal fingerprint: `surface` FIRST, so an identical payload can
+    // never replay the operator surface's snapshot under a shared key
+    // (`idempotency_keys` is unique on (tenant_id, key) across surfaces).
+    // Key order is fixed — pinned by a golden in test/portal-asn.spec.ts.
+    const payloadHash = hashCommandPayload({
+      surface: 'portal',
+      tenantId: command.tenantId,
+      clientId: command.clientId,
+      warehouseId: command.warehouseId,
+      asnCode,
+      expectedAt,
+      lines: command.lines.map(({ skuId, announcedQty }) => ({ skuId, announcedQty })),
+    });
+
+    return withTenantTransaction(
+      this.db,
+      command.tenantId,
+      async (tx) => {
+        assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'asn.announce');
+        const actor = await getMemberPortalFactsIn(tx, command.tenantId, command.actorUserId);
+        if (actor === null || actor.status !== 'active') {
+          throw new ProblemException(
+            'unauthenticated',
+            401,
+            'Authentication required',
+            'The session no longer describes an active client-portal user — sign in again.',
+          );
+        }
+        if (actor.clientId !== command.clientId) {
+          throw new ProblemException(
+            'role-denied',
+            403,
+            'Role lacks the required capability',
+            'Only a client-portal user of this client may announce its shipments.',
+          );
+        }
+        const client = await getClientStatusInTx(tx, command.tenantId, command.clientId);
+        if (client.status !== 'active') {
+          throw clientSuspended();
+        }
+
+        const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+        if (replay !== null) {
+          return replay as PortalAsnDetail;
+        }
+
+        assertAsnCodeShape(asnCode);
+        assertLineShape(command.lines);
+
+        await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
+        const skuFacts = await this.readClientSkus(
+          tx,
+          command.tenantId,
+          command.clientId,
+          command.lines.map((line) => line.skuId),
+        );
+        // FR-38: receiving refuses a kit line, so a kit announced here could
+        // never be received (`portal/skus` never lists one either).
+        const kitSkuIds = await this.catalog.getKitSkuIdsInTx(
+          tx,
+          command.tenantId,
+          command.lines.map((line) => line.skuId),
+        );
+        if (kitSkuIds.length > 0) {
+          throw kitCannotHoldStock(
+            'Advance shipment notice line',
+            [...new Set(kitSkuIds)].map((skuId) => skuFacts.get(skuId)!.code),
+          );
+        }
+        const lines = this.scaleLines(command.lines, skuFacts);
+
+        const asnId = await this.insertAsn(tx, {
           tenantId: command.tenantId,
           clientId: command.clientId,
+          clientCode: client.code,
           warehouseId: command.warehouseId,
           asnCode,
-          status: 'announced',
           expectedAt,
-          statusNote: null,
+          lines,
         });
-      } catch (err) {
-        if (isUniqueViolationOn(err, ASN_TENANT_CLIENT_CODE)) {
-          throw duplicateAsnCode(asnCode, clientLabels.get(client.id) ?? client.code);
-        }
-        throw err;
-      }
-      await tx.insert(asnLines).values(
-        lines.map((line) => ({
-          id: uuidv7(),
-          tenantId: command.tenantId,
-          asnId,
-          skuId: line.skuId,
-          announcedQty: line.announcedQty,
-          receivedQty: 0,
-        })),
-      );
 
-      return this.finish(tx, command.tenantId, command.actorUserId, asnId, 'asn.created', idempotencyKey, payloadHash);
-    });
+        return this.finish(
+          tx,
+          command.tenantId,
+          command.actorUserId,
+          asnId,
+          'asn.created',
+          idempotencyKey,
+          payloadHash,
+          async (inner) => (await portalAsnInTx(inner, command.tenantId, command.clientId, asnId))!,
+        );
+      },
+      { clientId: command.clientId },
+    );
   }
 
   async amend(command: AmendAsnCommand, idempotencyKey: string): Promise<AsnSnapshot> {
@@ -616,7 +760,7 @@ export class AsnCommand {
       // was received) or reopen nothing: the status follows the lines.
       await deriveAsnStatusInTx(tx, command.tenantId, asn.id);
 
-      return this.finish(tx, command.tenantId, command.actorUserId, asn.id, 'asn.amended', idempotencyKey, payloadHash);
+      return this.finish(tx, command.tenantId, command.actorUserId, asn.id, 'asn.amended', idempotencyKey, payloadHash, operatorSnapshot);
     });
   }
 
@@ -684,6 +828,7 @@ export class AsnCommand {
         command.transition === 'close' ? 'asn.closed' : 'asn.cancelled',
         idempotencyKey,
         payloadHash,
+        operatorSnapshot,
       );
     });
   }
@@ -698,8 +843,15 @@ export class AsnCommand {
     }
   }
 
-  /** Snapshot → outbox → audit → idempotency key (the skeleton's tail). */
-  private async finish(
+  /**
+   * Snapshot → outbox → audit → idempotency key (the skeleton's tail). The
+   * outbox payload is ALWAYS the operator `{asn}` (one event shape whoever
+   * raised the ASN); `snapshotOf` builds the surface's own response — the
+   * stored idempotency snapshot — on the same transaction: `{asn}` for the
+   * operator commands (`operatorSnapshot`), the `PortalAsnDetail` for the
+   * portal announce.
+   */
+  private async finish<S>(
     tx: TenantTx,
     tenantId: string,
     actorUserId: string,
@@ -707,9 +859,10 @@ export class AsnCommand {
     event: 'asn.created' | 'asn.amended' | 'asn.closed' | 'asn.cancelled',
     idempotencyKey: string,
     payloadHash: string,
-  ): Promise<AsnSnapshot> {
+    snapshotOf: (tx: TenantTx, asn: AsnDetail) => S | Promise<S>,
+  ): Promise<S> {
     const asn = (await readAsnInTx(tx, tenantId, asnId))!;
-    const snapshot: AsnSnapshot = { asn };
+    const snapshot = await snapshotOf(tx, asn);
     const at = nowIso();
     await this.outbox.append(tx, {
       messageId: uuidv7(),
@@ -764,6 +917,84 @@ export class AsnCommand {
       }
     }
     return byId;
+  }
+
+  /**
+   * Story 21-7b — the portal's SKU read: every line's SKU in the tenant AND
+   * of THIS client (the explicit predicate; the stamped transaction's RLS
+   * filters `skus` a second time). An unknown id and another client's SKU
+   * are the SAME 404 — another client's SKU is never confirmed to exist.
+   * Unit and code; NO lock (the PO amend precedent).
+   */
+  private async readClientSkus(
+    tx: TenantTx,
+    tenantId: string,
+    clientId: string,
+    skuIds: readonly string[],
+  ): Promise<Map<string, { uom: string; code: string }>> {
+    const distinct = [...new Set(skuIds)];
+    const rows = await tx
+      .select({ id: skus.id, uom: skus.uom, code: skus.code })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), eq(skus.clientId, clientId), inArray(skus.id, distinct)));
+    const byId = new Map(rows.map((row) => [row.id, { uom: row.uom, code: row.code }]));
+    for (const skuId of distinct) {
+      if (!byId.has(skuId)) {
+        throw new ProblemException('not-found', 404, 'SKU not found', `No SKU with id "${skuId}" exists for this client.`);
+      }
+    }
+    return byId;
+  }
+
+  /**
+   * The one insert path (create and announce): the header — a duplicate
+   * code for the client is 409 `duplicate-asn-code` (the unique index is
+   * the arbiter) — then its lines (milli-units, nothing received).
+   */
+  private async insertAsn(
+    tx: TenantTx,
+    asn: {
+      readonly tenantId: string;
+      readonly clientId: string;
+      readonly clientCode: string;
+      readonly warehouseId: string;
+      readonly asnCode: string;
+      readonly expectedAt: string | null;
+      readonly lines: readonly AsnLineInput[];
+    },
+  ): Promise<string> {
+    // Read before the insert: a unique violation aborts the transaction,
+    // so the refusal's label cannot be fetched after it.
+    const clientLabels = await getClientLabelsInTx(tx, asn.tenantId, [asn.clientId]);
+    const asnId = uuidv7();
+    try {
+      await tx.insert(advanceShipmentNotices).values({
+        id: asnId,
+        tenantId: asn.tenantId,
+        clientId: asn.clientId,
+        warehouseId: asn.warehouseId,
+        asnCode: asn.asnCode,
+        status: 'announced',
+        expectedAt: asn.expectedAt,
+        statusNote: null,
+      });
+    } catch (err) {
+      if (isUniqueViolationOn(err, ASN_TENANT_CLIENT_CODE)) {
+        throw duplicateAsnCode(asn.asnCode, clientLabels.get(asn.clientId) ?? asn.clientCode);
+      }
+      throw err;
+    }
+    await tx.insert(asnLines).values(
+      asn.lines.map((line) => ({
+        id: uuidv7(),
+        tenantId: asn.tenantId,
+        asnId,
+        skuId: line.skuId,
+        announcedQty: line.announcedQty,
+        receivedQty: 0,
+      })),
+    );
+    return asnId;
   }
 
   /** Base → milli with the precision refusal, behind the replay lookup (story 10.2). */

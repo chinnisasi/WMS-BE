@@ -244,6 +244,15 @@ export const CAPABILITIES = [
   // is refused on reads and writes until 21-7 opens them. Mirrored into
   // wms-fe `src/lib/users.ts`.
   'asn.manage',
+  // Story 21-7b — the client portal's first write: a client user announces
+  // its OWN inbound shipment (`POST portal/inbound/asns`, the client taken
+  // from the session). Held by `client` (and by owner, who holds
+  // everything — harmless: the fence keeps owner tokens off portal routes,
+  // and the announce command's client re-check refuses a user without a
+  // client). Never by ops_manager, operator or accountant: an operator keys
+  // an ASN through `asn.manage`. Mirrored into wms-fe `src/lib/users.ts`
+  // (CAPABILITIES + OPS_EXCLUDED_CAPABILITIES + the client grant).
+  'asn.announce',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -352,9 +361,12 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
   // Story 21-5: client invoices and the client tax details (finance work).
   accountant: new Set<Capability>(['eway.manage', 'rates.manage', 'billing.invoice']),
   // Story 21-7 — the client-portal persona (decision 1): a client brand's
-  // own user holds NO capability. Every operator route refuses its session
-  // at the guard (the fence), and the portal is read-only (decision 2).
-  client: new Set<Capability>([]),
+  // own user. Every operator route refuses its session at the guard (the
+  // fence). 21-7 made the portal read-only and the set empty; story 21-7b
+  // grants exactly one write — `asn.announce`, its own inbound shipment
+  // announced from the portal (the command takes the client from the
+  // session, never from the body). Nothing else.
+  client: new Set<Capability>(['asn.announce']),
 };
 
 /**

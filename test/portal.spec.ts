@@ -447,6 +447,9 @@ describe('client portal (e2e, story 21-7)', () => {
     'ALL api/v1/{*path}',
   ]);
 
+  /** Story 21-7b — the portal's ONLY writes, by exact method and path. */
+  const PORTAL_WRITES = new Set(['POST api/v1/tenants/:tenantId/portal/inbound/asns']);
+
   const SESSION_GUARDS = [TenantSessionGuard, DeviceSessionGuard, AnySessionGuard, PortalSessionGuard];
 
   function concretePath(path: string): string {
@@ -462,8 +465,8 @@ describe('client portal (e2e, story 21-7)', () => {
   // ── the role and its invite ───────────────────────────────────────────────
 
   describe('the client role and its invite', () => {
-    it('ROLE_CAPABILITIES.client is the empty set', () => {
-      expect([...ROLE_CAPABILITIES.client]).toEqual([]);
+    it('ROLE_CAPABILITIES.client is exactly asn.announce (21-7 made it empty; 21-7b grants the one portal write)', () => {
+      expect([...ROLE_CAPABILITIES.client]).toEqual(['asn.announce']);
     });
 
     it('an owner invites a client user for one client brand: invited, carrying its clientId', async () => {
@@ -683,13 +686,18 @@ describe('client portal (e2e, story 21-7)', () => {
         if (sessionGuards.length !== 1) offenders.push(`${id}: ${sessionGuards.length} session guards`);
         const isPortal = /^api\/v1\/tenants\/:tenantId\/portal\//.test(route.path);
         if (isPortal !== sessionGuards.includes(PortalSessionGuard)) offenders.push(`${id}: portal=${isPortal} but PortalSessionGuard=${!isPortal}`);
-        if (isPortal && route.method !== 'GET') offenders.push(`${id}: a portal write (decision 2: read-only)`);
+        // 21-7 decision 2 made the portal read-only; 21-7b opens EXACTLY one
+        // write — the announce. Any other portal write is an offender.
+        if (isPortal && route.method !== 'GET' && !PORTAL_WRITES.has(id)) offenders.push(`${id}: a portal write outside the 21-7b allowlist`);
       }
       expect(offenders).toEqual([]);
       // Every allowlisted route exists (a stale entry hides nothing).
       const declared = new Set(all.map((route) => `${route.method} ${route.path}`));
       expect([...UNGUARDED].filter((id) => !declared.has(id))).toEqual([]);
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(10);
+      // Every allowlisted portal write exists, too.
+      expect([...PORTAL_WRITES].filter((id) => !declared.has(id))).toEqual([]);
+      // 21-7's ten reads, plus 21-7b's announce and its two form reads.
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(13);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {
@@ -1132,7 +1140,9 @@ describe('client portal (e2e, story 21-7)', () => {
           '/tenants/{tenantId}/portal/me',
           '/tenants/{tenantId}/portal/orders',
           '/tenants/{tenantId}/portal/orders/{orderId}',
+          '/tenants/{tenantId}/portal/skus',
           '/tenants/{tenantId}/portal/stock',
+          '/tenants/{tenantId}/portal/warehouses',
         ].sort(),
       );
     });

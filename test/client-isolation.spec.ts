@@ -1214,4 +1214,135 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       expect(((await stamped(invoiceShape, null)) as unknown[]).length).toBe(4);
     });
   });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Story 21-7b — the portal's first WRITE. `AsnCommand.announce` runs every
+  // statement in a transaction stamped with the session's client; this runs
+  // the WHOLE announce write set as `wms_rls_probe` under client A's stamp —
+  // the header, a line, the idempotency key, the audit row and the outbox
+  // message, plus the `portalAsnInTx` read-back (its SQL with the client
+  // predicate removed) — and proves every statement is admitted, with a
+  // positive control (the same header for client B is refused 42501 inside
+  // the same transaction), then rolls it all back. A policy that refused one
+  // of these tables to a stamped session would 500 every portal announce in
+  // production while every superuser e2e test stayed green.
+  // ──────────────────────────────────────────────────────────────────────────
+  describe('story 21-7b: the announce write set and the portal/skus shape under a client stamp', () => {
+    let probe: postgres.Sql<Record<string, unknown>>;
+    const ROLLBACK = 'probe-rollback';
+    let kitAId: string;
+
+    beforeAll(async () => {
+      await ensureProbeRole();
+      probe = postgres(probeUrl(), { max: 1 });
+      // A kit of client A (a composition row makes a SKU a kit) — the
+      // portal/skus shape excludes it.
+      kitAId = uuidv7();
+      await sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode)
+        values (${kitAId}, ${tenantId}, ${clientA}, 'CI-KIT-A', 'Isolation kit A', 'each', 1800, ${ulid()})`;
+      await sql`insert into kit_compositions (id, tenant_id, kit_sku_id, component_sku_id, qty)
+        values (${uuidv7()}, ${tenantId}, ${kitAId}, ${skuAId}, 1000)`;
+    });
+
+    afterAll(async () => {
+      await probe?.end();
+    });
+
+    it('every statement of the announce runs under client A’s stamp — header, line, key, audit, outbox, read-back — with a positive control, all rolled back', async () => {
+      const asnId = uuidv7();
+      const key = ulid();
+      const seen: Record<string, unknown> = {};
+      const run = probe.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+        await tx`select set_config('app.client_id', ${clientA}, true)`;
+        // The reads before the write: the warehouse, the client, A's SKUs.
+        seen.warehouse = (await tx`select id from warehouses where tenant_id = ${tenantId} and id = ${warehouseId}`).length;
+        seen.client = (await tx`select status from clients where tenant_id = ${tenantId} and id = ${clientA}`).map((row) => row.status);
+        seen.skus = (await tx`select id from skus where tenant_id = ${tenantId} and id in (${skuAId}, ${skuBId})`).map((row) => row.id);
+        // The write set.
+        await tx`insert into advance_shipment_notices (id, tenant_id, client_id, warehouse_id, asn_code, status)
+          values (${asnId}, ${tenantId}, ${clientA}, ${warehouseId}, 'CI-ASN-PORTAL', 'announced')`;
+        await tx`insert into asn_lines (id, tenant_id, asn_id, sku_id, announced_qty, received_qty)
+          values (${uuidv7()}, ${tenantId}, ${asnId}, ${skuAId}, 2500, 0)`;
+        await tx`insert into outbox_messages (id, tenant_id, type, payload, occurred_at)
+          values (${uuidv7()}, ${tenantId}, 'asn.created', ${tx.json({ asn: { id: asnId } })}, now())`;
+        await tx`insert into audit_events (id, tenant_id, actor_user_id, action, target_type, target_id, reference, occurred_at)
+          values (${uuidv7()}, ${tenantId}, ${uuidv7()}, 'asn.created', 'advance_shipment_notice', ${asnId}, ${key}, now())`;
+        // The read-back (`portalAsnInTx`, header and lines) MINUS the client predicate.
+        seen.header = await tx`
+          select a.id, a.asn_code as "code", w.name as "warehouseName", coalesce(t.line_count, 0)::int as "lineCount"
+          from advance_shipment_notices a
+          join warehouses w on w.tenant_id = a.tenant_id and w.id = a.warehouse_id
+          left join lateral (
+            select count(*) as line_count from asn_lines al where al.tenant_id = a.tenant_id and al.asn_id = a.id
+          ) t on true
+          where a.tenant_id = ${tenantId} and a.id = ${asnId}`;
+        seen.lines = await tx`
+          select s.code as "skuCode", al.announced_qty::bigint as "announcedMilli"
+          from asn_lines al
+          join advance_shipment_notices a on a.tenant_id = al.tenant_id and a.id = al.asn_id
+          left join skus s on s.tenant_id = al.tenant_id and s.id = al.sku_id
+          where al.tenant_id = ${tenantId} and al.asn_id = ${asnId}`;
+        // The idempotency key is LAST (the commit marker), as in the command.
+        await tx`insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+          values (${uuidv7()}, ${tenantId}, ${key}, 'probe', ${tx.json({ id: asnId })})`;
+        // Positive control: the same header for client B is refused by the
+        // stamp (a savepoint keeps the transaction usable).
+        seen.control = await tx
+          .savepoint((sp) => sp`insert into advance_shipment_notices (id, tenant_id, client_id, warehouse_id, asn_code, status)
+            values (${uuidv7()}, ${tenantId}, ${clientB}, ${warehouseId}, 'CI-ASN-PORTAL-B', 'announced')`)
+          .then(
+            () => 'admitted',
+            (error: { code?: string }) => error.code,
+          );
+        throw new Error(ROLLBACK);
+      });
+      await expect(run).rejects.toThrow(ROLLBACK);
+
+      expect(seen).toEqual({
+        warehouse: 1,
+        client: ['active'],
+        skus: [skuAId],
+        header: [{ id: asnId, code: 'CI-ASN-PORTAL', warehouseName: 'Isolation WH', lineCount: 1 }],
+        lines: [{ skuCode: 'CI-SKU-A', announcedMilli: '2500' }],
+        control: '42501',
+      });
+      // Rolled back: nothing of it remains.
+      await expectCount((t) => t`select count(*)::int as n from ${t('advance_shipment_notices')} where id = ${asnId}`, 0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('asn_lines')} where asn_id = ${asnId}`, 0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('idempotency_keys')} where key = ${key}`, 0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('audit_events')} where target_id = ${asnId}`, 0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('outbox_messages')} where payload->'asn'->>'id' = ${asnId}`, 0);
+    });
+
+    // The portal/skus shape (`catalog/portal-skus.ts`) MINUS `s.client_id = $client`.
+    const skuShape = (tx: postgres.TransactionSql<Record<string, unknown>>) => tx`
+      select s.id from skus s
+      where s.tenant_id = ${tenantId}
+        and not exists (select 1 from kit_compositions k where k.tenant_id = s.tenant_id and k.kit_sku_id = s.id)
+      order by s.code asc, s.id asc`;
+
+    function stamped(client: string | null): Promise<string[]> {
+      return probe.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+        if (client !== null) await tx`select set_config('app.client_id', ${client}, true)`;
+        return (await skuShape(tx)).map((row) => row.id as string);
+      });
+    }
+
+    it('portal/skus: client-stamped, the shape returns ONLY client A’s non-kit SKUs', async () => {
+      const ownNonKit = (
+        await sql`select s.id from skus s where s.tenant_id = ${tenantId} and s.client_id = ${clientA}
+          and not exists (select 1 from kit_compositions k where k.tenant_id = s.tenant_id and k.kit_sku_id = s.id)
+          order by s.code asc, s.id asc`
+      ).map((row) => row.id as string);
+      expect(ownNonKit).toContain(skuAId);
+      expect(ownNonKit).not.toContain(kitAId);
+      const rows = await stamped(clientA);
+      expect(rows).toEqual(ownNonKit);
+      expect(rows).not.toContain(skuBId);
+      // Meaningful: unstamped (the operator shape), B's SKU is there too.
+      expect(await stamped(null)).toContain(skuBId);
+    });
+  });
 });

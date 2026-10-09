@@ -31,6 +31,7 @@ import type {
   AsnEntry,
   AsnSnapshot,
   AsnStatus,
+  AnnounceAsnCommand,
   CreateAsnCommand,
   TransitionAsnCommand,
 } from './asn.command';
@@ -198,6 +199,16 @@ export class InboundFacade {
 
   async createAsn(command: CreateAsnCommand, idempotencyKey: string): Promise<AsnSnapshot> {
     return this.asnCommand.create(command, idempotencyKey);
+  }
+
+  /**
+   * Story 21-7b — the client portal's announce: a client user's own ASN,
+   * the client taken from the portal session (`AsnCommand.announce` opens
+   * its own client-stamped transaction). Answers the bare `PortalAsnDetail`
+   * — the portal's own shape, the same as `portalAsn`.
+   */
+  async announceAsn(command: AnnounceAsnCommand, idempotencyKey: string): Promise<PortalAsnDetail> {
+    return this.asnCommand.announce(command, idempotencyKey);
   }
 
   async amendAsn(command: AmendAsnCommand, idempotencyKey: string): Promise<AsnSnapshot> {

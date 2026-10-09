@@ -1,9 +1,25 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
-import { IsIn, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { Transform, Type } from 'class-transformer';
+import {
+  ArrayMaxSize,
+  ArrayMinSize,
+  IsArray,
+  IsIn,
+  IsInt,
+  IsNumber,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Length,
+  Matches,
+  Max,
+  Min,
+  ValidateNested,
+} from 'class-validator';
 import { PORTAL_PAGE_DEFAULT_LIMIT, PORTAL_PAGE_MAX_LIMIT } from '../shared/primitives/portal-page';
+import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../shared/primitives/quantity';
 import { ORDER_SOURCES, ORDER_STATUSES, type OrderStatus } from '../modules/outbound/order.command';
-import { ASN_STATUSES, type AsnStatus } from '../modules/inbound/asn.command';
+import { ASN_STATUSES, MAX_ASN_CODE_LENGTH, MAX_ASN_LINES, type AsnStatus } from '../modules/inbound/asn.command';
 import { PO_STATUSES, type PoStatus } from '../modules/inbound/po.command';
 import { CHARGE_CODES, RATE_BASES } from '../modules/billing/rate-cards';
 import { SessionClientResponse, USER_STATUSES } from '../modules/tenancy/tenancy.dto';
@@ -239,6 +255,119 @@ export class PortalAsnLineDto {
 export class PortalAsnDetailResponse extends PortalAsnRowDto {
   @ApiProperty({ type: [PortalAsnLineDto] })
   lines!: PortalAsnLineDto[];
+}
+
+// ── story 21-7b: announcing a shipment from the portal ─────────────────────
+
+/** Trim at the validation boundary (the inbound DTO pattern). */
+function Trim() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return Transform(({ value }: { value: any }) => (typeof value === 'string' ? value.trim() : value));
+}
+
+/**
+ * One announced line. The validators are `AsnLineInputDto`'s, WITHOUT an
+ * `id` (there is no portal amend) — a line `id` is 400 `validation-failed`
+ * through the global `forbidNonWhitelisted`.
+ */
+export class PortalAsnLineInputDto {
+  @ApiProperty({ format: 'uuid', description: "One of this client's SKUs (portal/skus) — never a kit" })
+  @IsUUID()
+  skuId!: string;
+
+  @ApiProperty({
+    description: `Announced quantity. ${QUANTITY_FIELD_DESCRIPTION}`,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
+  })
+  @Type(() => Number)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
+  announcedQty!: number;
+}
+
+/**
+ * `POST /tenants/{t}/portal/inbound/asns` body — `CreateAsnDto`'s
+ * validators WITHOUT `clientId`: the client is the portal session's, never
+ * the request's (a body `clientId` is 400 `validation-failed`).
+ */
+export class PortalCreateAsnDto {
+  @ApiProperty({ format: 'uuid', description: 'The warehouse the shipment arrives at (portal/warehouses)' })
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({ description: 'Your own ASN reference — unique per company; 1–64 characters, counted in code points', minLength: 1, maxLength: MAX_ASN_CODE_LENGTH })
+  @Trim()
+  @IsString()
+  @Matches(new RegExp(`^.{1,${MAX_ASN_CODE_LENGTH}}$`, 'su'), {
+    message: `asnCode must be 1–${MAX_ASN_CODE_LENGTH} characters`,
+  })
+  asnCode!: string;
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    description: 'When the shipment is expected (ISO-8601 UTC, Z-suffixed); optional',
+    minLength: 20,
+    maxLength: 35,
+  })
+  @IsOptional()
+  @IsString()
+  @Length(20, 35)
+  expectedAt?: string | null;
+
+  @ApiProperty({ type: [PortalAsnLineInputDto], minItems: 1, maxItems: MAX_ASN_LINES, description: "At least one line with one of this client's SKUs" })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_ASN_LINES)
+  @ValidateNested({ each: true })
+  @Type(() => PortalAsnLineInputDto)
+  lines!: PortalAsnLineInputDto[];
+}
+
+/** One option of the announce form's SKU picker (portal vocabulary, as on `portal/stock`). */
+export class PortalSkuDto {
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty()
+  skuName!: string;
+
+  @ApiProperty({ example: 'each', description: 'The SKU base UoM — announced quantities are in it' })
+  baseUom!: string;
+
+  @ApiProperty({ example: 0, description: 'Decimal places the unit admits (0 = whole units only)' })
+  uomPrecision!: number;
+}
+
+export class PortalSkuPageResponse {
+  @ApiProperty({ type: [PortalSkuDto] })
+  items!: PortalSkuDto[];
+
+  @ApiProperty({ type: String, nullable: true })
+  nextCursor!: string | null;
+}
+
+/** One warehouse a client may announce into — never a code, address line or GSTIN. */
+export class PortalWarehouseDto {
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty()
+  warehouseName!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: 'The origin city — tells apart two warehouses of one name' })
+  city!: string | null;
+}
+
+export class PortalWarehouseListResponse {
+  @ApiProperty({ type: [PortalWarehouseDto] })
+  items!: PortalWarehouseDto[];
 }
 
 export class PortalPurchaseOrderRowDto {

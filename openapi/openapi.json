@@ -20929,6 +20929,124 @@
         "tags": [
           "portal"
         ]
+      },
+      "post": {
+        "operationId": "PortalController_announceAsn",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PortalCreateAsnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The announced ASN, in the shape of GET portal/inbound/asns/{asnId} (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalAsnDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing (idempotency-key-required) or malformed (idempotency-key-invalid) Idempotency-Key; an invalid body — a clientId or a line id, no lines or more than 200, a code over 64 characters, a malformed expectedAt, or a quantity finer than its unit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended); or the user may not announce for this client (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse is not the tenant's, or a line's SKU is unknown or not this client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A line names a kit SKU (kit-cannot-hold-stock), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Announces this client's inbound shipment — an advance shipment notice of its own SKUs into one of the tenant's warehouses (asn.announce; the client is the session's). The result is an ordinary ASN the warehouse receives against",
+        "tags": [
+          "portal"
+        ]
       }
     },
     "/tenants/{tenantId}/portal/inbound/asns/{asnId}": {
@@ -21200,6 +21318,152 @@
           }
         ],
         "summary": "One purchase order of this client with its lines",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/skus": {
+      "get": {
+        "operationId": "PortalController_skus",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalSkuPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor (invalid-cursor) or a limit outside 1–100 (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "This client's SKUs — every one but kits (a kit cannot be received) — the announce form's options; keyset by code",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/warehouses": {
+      "get": {
+        "operationId": "PortalController_warehouses",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalWarehouseListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The tenant's warehouses a client may announce a shipment into — name and city only, by name; unpaginated (capped at 200)",
         "tags": [
           "portal"
         ]
@@ -36544,6 +36808,63 @@
           "nextCursor"
         ]
       },
+      "PortalAsnLineInputDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "One of this client's SKUs (portal/skus) — never a kit"
+          },
+          "announcedQty": {
+            "type": "number",
+            "description": "Announced quantity. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
+          }
+        },
+        "required": [
+          "skuId",
+          "announcedQty"
+        ]
+      },
+      "PortalCreateAsnDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse the shipment arrives at (portal/warehouses)"
+          },
+          "asnCode": {
+            "type": "string",
+            "description": "Your own ASN reference — unique per company; 1–64 characters, counted in code points",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "expectedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "When the shipment is expected (ISO-8601 UTC, Z-suffixed); optional",
+            "minLength": 20,
+            "maxLength": 35
+          },
+          "lines": {
+            "minItems": 1,
+            "maxItems": 200,
+            "description": "At least one line with one of this client's SKUs",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalAsnLineInputDto"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "asnCode",
+          "lines"
+        ]
+      },
       "PortalAsnLineDto": {
         "type": "object",
         "properties": {
@@ -36772,6 +37093,93 @@
           "receivedTotal",
           "createdAt",
           "lines"
+        ]
+      },
+      "PortalSkuDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "baseUom": {
+            "type": "string",
+            "example": "each",
+            "description": "The SKU base UoM — announced quantities are in it"
+          },
+          "uomPrecision": {
+            "type": "number",
+            "example": 0,
+            "description": "Decimal places the unit admits (0 = whole units only)"
+          }
+        },
+        "required": [
+          "skuId",
+          "skuCode",
+          "skuName",
+          "baseUom",
+          "uomPrecision"
+        ]
+      },
+      "PortalSkuPageResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalSkuDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PortalWarehouseDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseName": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string",
+            "nullable": true,
+            "description": "The origin city — tells apart two warehouses of one name"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "warehouseName",
+          "city"
+        ]
+      },
+      "PortalWarehouseListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalWarehouseDto"
+            }
+          }
+        },
+        "required": [
+          "items"
         ]
       },
       "PortalInvoiceTotalsDto": {
