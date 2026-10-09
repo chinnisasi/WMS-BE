@@ -27,7 +27,7 @@ import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
-import { assertPermission } from './permissions';
+import { assertPermission, isFloorRole } from './permissions';
 import { deviceRevoked } from './enrollment.command';
 import { assertWarehouseInTenant, getMemberRoleIn } from './tenancy.service';
 // Story 5-6 — the cross-module re-execution seams (the owning commands, never
@@ -558,7 +558,7 @@ export class SyncReportCommand {
           .where(and(eq(users.id, command.operatorUserId), eq(users.tenantId, command.tenantId)))
           .limit(1);
         const operator = operatorRows[0];
-        if (operator === undefined || operator.status !== 'active' || operator.role === 'accountant') {
+        if (operator === undefined || operator.status !== 'active' || !isFloorRole(operator.role)) {
           throw new ProblemException(
             'role-denied',
             403,

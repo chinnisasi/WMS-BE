@@ -253,15 +253,18 @@ describe('users, roles, and permission gating (e2e)', () => {
     }
   }
 
-  test('sign-in carries the user shape (id, email, role, status)', async () => {
+  test('sign-in carries the user shape (id, email, role, status, clientId)', async () => {
     const email = `owner-${ulid().toLowerCase()}@example.com`;
     const { tenantId, ownerId } = await registerTenant(email);
     const { user } = await signIn(email);
+    // Story 21-7 deliberately widens the shape: every user carries `clientId`
+    // (null for the tenant's own staff, set for a client-portal user).
     expect(user).toEqual({
       id: ownerId,
       email,
       role: 'owner',
       status: 'active',
+      clientId: null,
       createdAt: expect.any(String),
     });
     expect(tenantId).toMatch(/^[0-9a-f-]{36}$/);

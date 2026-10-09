@@ -24,6 +24,8 @@ import { addressFromColumns } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/time';
+import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
+import { portalOrderInTx, portalOrdersInTx, type PortalOrderDetail, type PortalOrderRow } from './portal-orders';
 import {
   listBackorderRefusalsInTx,
   listPackFailuresInTx,
@@ -84,6 +86,7 @@ import type {
 
 // Story 9-1 — the dashboard fact-list row types ride the facade seam.
 export type { BackorderRefusalEntry, PackFailureEntry, PicklistLineEntry };
+export type { PortalOrderComponent, PortalOrderDetail, PortalOrderLine, PortalOrderRow } from './portal-orders';
 
 /** One header row of the order-list read (no lines — detail carries them). */
 export interface OrderEntry {
@@ -601,6 +604,34 @@ export class OutboundFacade {
         ratePaise: line.ratePaise,
       })),
     };
+  }
+
+  /**
+   * Story 21-7 — the client portal's order list (AD-6: the owning module's
+   * facade, never the operator route): ONE client's orders, newest first,
+   * keyset `(created_at desc, id)` over the full-precision instant,
+   * optionally one status. Two layers, both required: the transaction is
+   * stamped with the client (`{ clientId }` — RLS on `orders`) AND the query
+   * carries the explicit `client_id` predicate (`portal-orders.ts`).
+   */
+  async portalOrders(
+    tenantId: string,
+    clientId: string,
+    query: { readonly status?: OrderStatus; readonly cursor?: string; readonly limit?: number } = {},
+  ): Promise<Page<PortalOrderRow>> {
+    const limit = query.limit ?? PORTAL_PAGE_DEFAULT_LIMIT;
+    const before = query.cursor === undefined ? null : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(
+      this.db,
+      tenantId,
+      (tx) => portalOrdersInTx(tx, tenantId, clientId, { ...(query.status === undefined ? {} : { status: query.status }), before, limit }),
+      { clientId },
+    );
+  }
+
+  /** Story 21-7 — one order of this client with its lines (kit components nested), or null → 404. */
+  async portalOrder(tenantId: string, clientId: string, orderId: string): Promise<PortalOrderDetail | null> {
+    return withTenantTransaction(this.db, tenantId, (tx) => portalOrderInTx(tx, tenantId, clientId, orderId), { clientId });
   }
 
   /**

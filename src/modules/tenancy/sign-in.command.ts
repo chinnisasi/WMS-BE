@@ -7,6 +7,7 @@ import type { UserRole, UserStatus } from '../../shared/db/schema';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { SESSION_TTL_SECONDS, signTenantSession, tenantSessionSecret } from './jwt-session';
 import { DUMMY_HASH, verifyPassword } from './passwords';
+import { clientSuspended, readSessionClientIn } from '../clients/clients.facade';
 
 export interface SignInInput {
   readonly email: string;
@@ -19,7 +20,16 @@ export interface SignInUser {
   readonly email: string;
   readonly role: UserRole;
   readonly status: UserStatus;
+  /** Story 21-7 — the portal user's client; null for the tenant's own staff. */
+  readonly clientId: string | null;
   readonly createdAt: string;
+}
+
+/** Story 21-7 — the portal user's client, for the portal shell's header. */
+export interface SignInClient {
+  readonly id: string;
+  readonly code: string;
+  readonly name: string;
 }
 
 /**
@@ -50,6 +60,7 @@ export class SignInCommand {
     expiresInSeconds: number;
     tenant: { id: string; name: string; gstin: string | null };
     user: SignInUser;
+    client: SignInClient | null;
   }> {
     const email = command.email.trim().toLowerCase();
     const userRows = await this.authDb
@@ -91,8 +102,27 @@ export class SignInCommand {
       .limit(1);
     const tenant = tenantRows[0]!;
 
+    // Story 21-7 — a client-portal user: its client must be `active`.
+    // Checked AFTER the password (a wrong password stays the one 401, so a
+    // suspension is disclosed only to a holder of the credential), read by
+    // tenant AND id. The token then carries `client_id` — the fence's claim.
+    let client: SignInClient | null = null;
+    if (user.clientId !== null) {
+      const facts = await readSessionClientIn(this.authDb, user.tenantId, user.clientId);
+      if (facts === null || facts.status !== 'active') {
+        throw clientSuspended();
+      }
+      client = { id: facts.id, code: facts.code, name: facts.name };
+    }
+
     return {
-      accessToken: signTenantSession(user.tenantId, user.id, tenantSessionSecret()),
+      accessToken: signTenantSession(
+        user.tenantId,
+        user.id,
+        tenantSessionSecret(),
+        undefined,
+        user.clientId ?? undefined,
+      ),
       tokenType: 'Bearer',
       expiresInSeconds: SESSION_TTL_SECONDS,
       tenant: { id: tenant.id, name: tenant.name, gstin: tenant.gstin },
@@ -101,8 +131,10 @@ export class SignInCommand {
         email: user.email,
         role: user.role,
         status: user.status as UserStatus,
+        clientId: user.clientId,
         createdAt: user.createdAt,
       },
+      client,
     };
   }
 }

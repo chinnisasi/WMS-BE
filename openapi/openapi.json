@@ -120,6 +120,16 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Invitation not yet accepted (invite-pending), or a client-portal user whose client is not active (client-suspended, story 21-7)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
           }
         },
         "summary": "Verifies the password and issues a short-lived session token",
@@ -1460,7 +1470,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or invalid body",
+            "description": "Missing or malformed Idempotency-Key, invalid body, a client invite without clientId / a staff invite with one, or the tenant’s own client (story 21-7)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1489,8 +1499,18 @@
               }
             }
           },
+          "404": {
+            "description": "Story 21-7: the named client does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
           "409": {
-            "description": "Email already has an account in any tenant (email-exists), or a concurrent idempotent request (conflict)",
+            "description": "Email already has an account in any tenant (email-exists), the named client is not active (client-not-active, story 21-7), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1665,7 +1685,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or invalid body",
+            "description": "Missing or malformed Idempotency-Key, invalid body, or a client-portal user as the target (story 21-7 — its role is fixed at invite)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -20473,6 +20493,883 @@
         ]
       }
     },
+    "/tenants/{tenantId}/portal/me": {
+      "get": {
+        "operationId": "PortalController_me",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalMeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The signed-in client-portal user and its client brand",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/stock": {
+      "get": {
+        "operationId": "PortalController_stock",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalStockPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor (invalid-cursor), a limit outside 1–100 or a status outside its vocabulary (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "This client's stock, one row per (SKU, warehouse) where on-hand or allocated is above zero — on hand across every bin, allocated to open orders; keyset by SKU code then warehouse",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/orders": {
+      "get": {
+        "operationId": "PortalController_orders",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "accepted",
+                "ready_to_dispatch",
+                "dispatched",
+                "cancelled"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalOrderPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor (invalid-cursor), a limit outside 1–100 or a status outside its vocabulary (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "This client's orders, newest first (keyset), optionally one status",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/orders/{orderId}": {
+      "get": {
+        "operationId": "PortalController_order",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "orderId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalOrderDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed orderId path parameter (validation-failed — it must be a uuid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such order of this client — unknown, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One order of this client with its lines (kit components nested under their kit line)",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/inbound/asns": {
+      "get": {
+        "operationId": "PortalController_asns",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "announced",
+                "partially_received",
+                "received",
+                "closed",
+                "cancelled"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalAsnPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor (invalid-cursor), a limit outside 1–100 or a status outside its vocabulary (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "This client's advance shipment notices, newest first (keyset), optionally one status",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/inbound/asns/{asnId}": {
+      "get": {
+        "operationId": "PortalController_asn",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "asnId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalAsnDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed asnId path parameter (validation-failed — it must be a uuid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such ASN of this client — unknown, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One advance shipment notice of this client with its lines",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/inbound/purchase-orders": {
+      "get": {
+        "operationId": "PortalController_purchaseOrders",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "open",
+                "closed"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalPurchaseOrderPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor (invalid-cursor), a limit outside 1–100 or a status outside its vocabulary (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "This client's purchase orders, newest first (keyset), optionally one status",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/inbound/purchase-orders/{poId}": {
+      "get": {
+        "operationId": "PortalController_purchaseOrder",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "poId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalPurchaseOrderDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed poId path parameter (validation-failed — it must be a uuid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such purchase order of this client — unknown, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One purchase order of this client with its lines",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/invoices": {
+      "get": {
+        "operationId": "PortalController_invoices",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from a previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalInvoicePageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed cursor (invalid-cursor) or a limit outside 1–100 (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "This client's issued invoices (never a draft), newest first (keyset) — the invoice and its lines only",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/invoices/{invoiceId}": {
+      "get": {
+        "operationId": "PortalController_invoice",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "invoiceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PortalInvoiceDetailResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such invoice of this client — unknown, malformed, a draft, or another client's (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One issued invoice of this client: the frozen party and its lines (no drill-down, no rate card)",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
     "/tenants/{tenantId}/webhooks/channels/{provider}/{connectionId}/orders": {
       "post": {
         "operationId": "WebhooksController_ingestOrder",
@@ -20920,7 +21817,8 @@
               "owner",
               "ops_manager",
               "operator",
-              "accountant"
+              "accountant",
+              "client"
             ],
             "example": "owner"
           },
@@ -20932,6 +21830,12 @@
             ],
             "example": "active"
           },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 21-7 — the client brand a client-portal user belongs to (role `client`); null for the tenant’s own staff"
+          },
           "createdAt": {
             "type": "string",
             "example": "2026-09-08T00:00:00.000Z"
@@ -20942,7 +21846,30 @@
           "email",
           "role",
           "status",
+          "clientId",
           "createdAt"
+        ]
+      },
+      "SessionClientResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "BRAND-A"
+          },
+          "name": {
+            "type": "string",
+            "example": "Brand A Apparel"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "name"
         ]
       },
       "SignInResponse": {
@@ -20950,7 +21877,7 @@
         "properties": {
           "accessToken": {
             "type": "string",
-            "description": "HS256 session token (15 min), claims: sub + tenant_id"
+            "description": "HS256 session token (15 min), claims: sub + tenant_id (+ client_id for a client-portal user, story 21-7)"
           },
           "tokenType": {
             "type": "string",
@@ -20965,6 +21892,16 @@
           },
           "user": {
             "$ref": "#/components/schemas/UserResponse"
+          },
+          "client": {
+            "nullable": true,
+            "description": "Story 21-7 — the client brand of a client-portal user (the portal shell prints its name); null for the tenant’s own staff",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionClientResponse"
+              }
+            ]
           }
         },
         "required": [
@@ -20972,7 +21909,8 @@
           "tokenType",
           "expiresInSeconds",
           "tenant",
-          "user"
+          "user",
+          "client"
         ]
       },
       "AddressDto": {
@@ -21739,9 +22677,15 @@
               "owner",
               "ops_manager",
               "operator",
-              "accountant"
+              "accountant",
+              "client"
             ],
             "example": "operator"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 21-7 — required when role is `client` (the client brand the portal user belongs to); refused for every other role"
           }
         },
         "required": [
@@ -22886,7 +23830,8 @@
               "owner",
               "ops_manager",
               "operator",
-              "accountant"
+              "accountant",
+              "client"
             ]
           }
         },
@@ -35201,6 +36146,1077 @@
             "description": "Why — REQUIRED to dispute or void (400 without one), optional to settle. The invoice keeps the latest note; the audit trail keeps every one"
           }
         }
+      },
+      "PortalUserDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "email": {
+            "type": "string",
+            "example": "buyer@brand-a.example"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "client"
+            ],
+            "example": "client"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "invited",
+              "active"
+            ],
+            "example": "active"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "role",
+          "status",
+          "clientId"
+        ]
+      },
+      "PortalMeResponse": {
+        "type": "object",
+        "properties": {
+          "user": {
+            "$ref": "#/components/schemas/PortalUserDto"
+          },
+          "client": {
+            "$ref": "#/components/schemas/SessionClientResponse"
+          }
+        },
+        "required": [
+          "user",
+          "client"
+        ]
+      },
+      "PortalStockRowDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "baseUom": {
+            "type": "string",
+            "example": "each",
+            "description": "The SKU base UoM every quantity of the row is in"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseName": {
+            "type": "string"
+          },
+          "onHand": {
+            "type": "number",
+            "description": "On hand across EVERY bin of the warehouse (receiving and QC included), base units"
+          },
+          "allocated": {
+            "type": "number",
+            "description": "Allocated to open orders (held or committed reservations), base units"
+          }
+        },
+        "required": [
+          "skuId",
+          "skuCode",
+          "skuName",
+          "baseUom",
+          "warehouseId",
+          "warehouseName",
+          "onHand",
+          "allocated"
+        ]
+      },
+      "PortalStockPageResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalStockRowDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PortalOrderRowDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "ready_to_dispatch",
+              "dispatched",
+              "cancelled"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "ingested"
+            ]
+          },
+          "externalRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The sales channel's own order reference; null for a manual order"
+          },
+          "warehouseName": {
+            "type": "string"
+          },
+          "destinationName": {
+            "type": "string",
+            "nullable": true
+          },
+          "destinationCity": {
+            "type": "string",
+            "nullable": true
+          },
+          "destinationPincode": {
+            "type": "string",
+            "nullable": true
+          },
+          "lineCount": {
+            "type": "number",
+            "description": "Top-level lines — a kit counts once"
+          },
+          "createdAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "source",
+          "externalRef",
+          "warehouseName",
+          "destinationName",
+          "destinationCity",
+          "destinationPincode",
+          "lineCount",
+          "createdAt"
+        ]
+      },
+      "PortalOrderPageResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalOrderRowDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PortalOrderComponentDto": {
+        "type": "object",
+        "properties": {
+          "skuCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "skuName": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "description": "Base units"
+          }
+        },
+        "required": [
+          "skuCode",
+          "skuName",
+          "qty"
+        ]
+      },
+      "PortalOrderLineDto": {
+        "type": "object",
+        "properties": {
+          "skuCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "skuName": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "description": "Base units"
+          },
+          "components": {
+            "description": "A kit line's components; empty for a plain line",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalOrderComponentDto"
+            }
+          }
+        },
+        "required": [
+          "skuCode",
+          "skuName",
+          "qty",
+          "components"
+        ]
+      },
+      "PortalOrderDetailResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "ready_to_dispatch",
+              "dispatched",
+              "cancelled"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "ingested"
+            ]
+          },
+          "externalRef": {
+            "type": "string",
+            "nullable": true,
+            "description": "The sales channel's own order reference; null for a manual order"
+          },
+          "warehouseName": {
+            "type": "string"
+          },
+          "destinationName": {
+            "type": "string",
+            "nullable": true
+          },
+          "destinationCity": {
+            "type": "string",
+            "nullable": true
+          },
+          "destinationPincode": {
+            "type": "string",
+            "nullable": true
+          },
+          "lineCount": {
+            "type": "number",
+            "description": "Top-level lines — a kit counts once"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalOrderLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "source",
+          "externalRef",
+          "warehouseName",
+          "destinationName",
+          "destinationCity",
+          "destinationPincode",
+          "lineCount",
+          "createdAt",
+          "lines"
+        ]
+      },
+      "PortalAsnRowDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "announced",
+              "partially_received",
+              "received",
+              "closed",
+              "cancelled"
+            ]
+          },
+          "expectedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "warehouseName": {
+            "type": "string"
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "announcedTotal": {
+            "type": "number",
+            "description": "Σ announced across lines (base units, mixed UoMs — indicative)"
+          },
+          "receivedTotal": {
+            "type": "number",
+            "description": "Σ received across lines (base units, mixed UoMs — indicative)"
+          },
+          "createdAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "expectedAt",
+          "warehouseName",
+          "lineCount",
+          "announcedTotal",
+          "receivedTotal",
+          "createdAt"
+        ]
+      },
+      "PortalAsnPageResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalAsnRowDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PortalAsnLineDto": {
+        "type": "object",
+        "properties": {
+          "skuCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "skuName": {
+            "type": "string",
+            "nullable": true
+          },
+          "announcedQty": {
+            "type": "number"
+          },
+          "receivedQty": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "skuCode",
+          "skuName",
+          "announcedQty",
+          "receivedQty"
+        ]
+      },
+      "PortalAsnDetailResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "announced",
+              "partially_received",
+              "received",
+              "closed",
+              "cancelled"
+            ]
+          },
+          "expectedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "warehouseName": {
+            "type": "string"
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "announcedTotal": {
+            "type": "number",
+            "description": "Σ announced across lines (base units, mixed UoMs — indicative)"
+          },
+          "receivedTotal": {
+            "type": "number",
+            "description": "Σ received across lines (base units, mixed UoMs — indicative)"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalAsnLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "expectedAt",
+          "warehouseName",
+          "lineCount",
+          "announcedTotal",
+          "receivedTotal",
+          "createdAt",
+          "lines"
+        ]
+      },
+      "PortalPurchaseOrderRowDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "closed"
+            ]
+          },
+          "warehouseName": {
+            "type": "string"
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "orderedTotal": {
+            "type": "number"
+          },
+          "receivedTotal": {
+            "type": "number"
+          },
+          "createdAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "warehouseName",
+          "lineCount",
+          "orderedTotal",
+          "receivedTotal",
+          "createdAt"
+        ]
+      },
+      "PortalPurchaseOrderPageResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalPurchaseOrderRowDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PortalPurchaseOrderLineDto": {
+        "type": "object",
+        "properties": {
+          "skuCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "skuName": {
+            "type": "string",
+            "nullable": true
+          },
+          "orderedQty": {
+            "type": "number"
+          },
+          "receivedQty": {
+            "type": "number"
+          },
+          "expectedDate": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "skuCode",
+          "skuName",
+          "orderedQty",
+          "receivedQty",
+          "expectedDate"
+        ]
+      },
+      "PortalPurchaseOrderDetailResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "closed"
+            ]
+          },
+          "warehouseName": {
+            "type": "string"
+          },
+          "lineCount": {
+            "type": "number"
+          },
+          "orderedTotal": {
+            "type": "number"
+          },
+          "receivedTotal": {
+            "type": "number"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalPurchaseOrderLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "status",
+          "warehouseName",
+          "lineCount",
+          "orderedTotal",
+          "receivedTotal",
+          "createdAt",
+          "lines"
+        ]
+      },
+      "PortalInvoiceTotalsDto": {
+        "type": "object",
+        "properties": {
+          "subtotal": {
+            "type": "number"
+          },
+          "cgst": {
+            "type": "number"
+          },
+          "sgst": {
+            "type": "number"
+          },
+          "igst": {
+            "type": "number"
+          },
+          "tax": {
+            "type": "number"
+          },
+          "roundOff": {
+            "type": "number"
+          },
+          "payable": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "subtotal",
+          "cgst",
+          "sgst",
+          "igst",
+          "tax",
+          "roundOff",
+          "payable"
+        ]
+      },
+      "PortalInvoiceRowDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceNo": {
+            "type": "string",
+            "description": "Always set — the portal serves non-draft invoices only"
+          },
+          "fyLabel": {
+            "type": "string",
+            "example": "FY-2627"
+          },
+          "periodStart": {
+            "type": "string",
+            "example": "2026-09-01"
+          },
+          "periodEnd": {
+            "type": "string",
+            "example": "2026-09-30"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "issued",
+              "disputed",
+              "settled",
+              "void"
+            ],
+            "description": "Never draft — a portal sees issued documents only"
+          },
+          "issuedAt": {
+            "type": "string"
+          },
+          "replacesInvoiceId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "placeOfSupply": {
+            "type": "string",
+            "nullable": true
+          },
+          "supplyType": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "intra",
+              "inter",
+              null
+            ]
+          },
+          "totals": {
+            "description": "Integer paise",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalInvoiceTotalsDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "invoiceNo",
+          "fyLabel",
+          "periodStart",
+          "periodEnd",
+          "status",
+          "issuedAt",
+          "replacesInvoiceId",
+          "placeOfSupply",
+          "supplyType",
+          "totals"
+        ]
+      },
+      "PortalInvoicePageResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalInvoiceRowDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PortalSupplierAddressDto": {
+        "type": "object",
+        "properties": {
+          "line1": {
+            "type": "string"
+          },
+          "line2": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "pincode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "line1",
+          "line2",
+          "city",
+          "state",
+          "pincode"
+        ]
+      },
+      "PortalInvoiceSupplierDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "stateCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "stateName": {
+            "type": "string",
+            "nullable": true
+          },
+          "address": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalSupplierAddressDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "gstin",
+          "stateCode",
+          "stateName",
+          "address"
+        ]
+      },
+      "PortalRecipientAddressDto": {
+        "type": "object",
+        "properties": {
+          "line1": {
+            "type": "string",
+            "nullable": true
+          },
+          "line2": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string",
+            "nullable": true
+          },
+          "stateCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "pincode": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "line1",
+          "line2",
+          "city",
+          "stateCode",
+          "pincode"
+        ]
+      },
+      "PortalInvoiceRecipientDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "legalName": {
+            "type": "string",
+            "nullable": true
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "stateCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "stateName": {
+            "type": "string",
+            "nullable": true
+          },
+          "address": {
+            "$ref": "#/components/schemas/PortalRecipientAddressDto"
+          }
+        },
+        "required": [
+          "name",
+          "legalName",
+          "gstin",
+          "stateCode",
+          "stateName",
+          "address"
+        ]
+      },
+      "PortalInvoicePartyDto": {
+        "type": "object",
+        "properties": {
+          "supplier": {
+            "$ref": "#/components/schemas/PortalInvoiceSupplierDto"
+          },
+          "recipient": {
+            "$ref": "#/components/schemas/PortalInvoiceRecipientDto"
+          }
+        },
+        "required": [
+          "supplier",
+          "recipient"
+        ]
+      },
+      "PortalInvoiceLineDto": {
+        "type": "object",
+        "properties": {
+          "segmentFrom": {
+            "type": "string",
+            "example": "2026-09-01",
+            "description": "IST date, inclusive"
+          },
+          "segmentTo": {
+            "type": "string",
+            "example": "2026-09-30",
+            "description": "IST date, inclusive"
+          },
+          "chargeCode": {
+            "type": "string",
+            "enum": [
+              "storage",
+              "inbound_handling",
+              "pick",
+              "outbound_handling"
+            ]
+          },
+          "basis": {
+            "type": "string",
+            "enum": [
+              "per_thousand_units_per_day",
+              "per_receipt_line",
+              "per_pick",
+              "per_order"
+            ]
+          },
+          "uom": {
+            "type": "string",
+            "nullable": true
+          },
+          "quantity": {
+            "type": "string",
+            "description": "A decimal string — base-unit-days for storage, a whole count otherwise"
+          },
+          "unitAmountPaise": {
+            "type": "number",
+            "nullable": true
+          },
+          "amountPaise": {
+            "type": "number",
+            "nullable": true
+          },
+          "sac": {
+            "type": "string"
+          },
+          "gstBps": {
+            "type": "number"
+          },
+          "cgstPaise": {
+            "type": "number"
+          },
+          "sgstPaise": {
+            "type": "number"
+          },
+          "igstPaise": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "segmentFrom",
+          "segmentTo",
+          "chargeCode",
+          "basis",
+          "uom",
+          "quantity",
+          "unitAmountPaise",
+          "amountPaise",
+          "sac",
+          "gstBps",
+          "cgstPaise",
+          "sgstPaise",
+          "igstPaise"
+        ]
+      },
+      "PortalInvoiceDetailResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "invoiceNo": {
+            "type": "string",
+            "description": "Always set — the portal serves non-draft invoices only"
+          },
+          "fyLabel": {
+            "type": "string",
+            "example": "FY-2627"
+          },
+          "periodStart": {
+            "type": "string",
+            "example": "2026-09-01"
+          },
+          "periodEnd": {
+            "type": "string",
+            "example": "2026-09-30"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "issued",
+              "disputed",
+              "settled",
+              "void"
+            ],
+            "description": "Never draft — a portal sees issued documents only"
+          },
+          "issuedAt": {
+            "type": "string"
+          },
+          "replacesInvoiceId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "placeOfSupply": {
+            "type": "string",
+            "nullable": true
+          },
+          "supplyType": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "intra",
+              "inter",
+              null
+            ]
+          },
+          "totals": {
+            "description": "Integer paise",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PortalInvoiceTotalsDto"
+              }
+            ]
+          },
+          "party": {
+            "$ref": "#/components/schemas/PortalInvoicePartyDto"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortalInvoiceLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "invoiceNo",
+          "fyLabel",
+          "periodStart",
+          "periodEnd",
+          "status",
+          "issuedAt",
+          "replacesInvoiceId",
+          "placeOfSupply",
+          "supplyType",
+          "totals",
+          "party",
+          "lines"
+        ]
       },
       "ChannelWebhookOrderResponse": {
         "type": "object",

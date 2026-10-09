@@ -497,7 +497,11 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
       expect((await createAsn({ clientId: acme, warehouseId: wh1, asnCode: 'OP', lines: [{ skuId: acme1, announcedQty: 1 }] }, operatorMemberToken).expect(403)).body.code).toBe('role-denied');
       // A client-portal user: a member whose row names a client.
       const portal = await createMember('ops_manager');
-      await sql`update users set client_id = ${acme} where id = ${portal.userId}`;
+      // Story 21-7: the 0065 CHECK pairs a client with the `client` role, so the
+      // fixture sets both — AFTER minting the token, so the token carries no
+      // `client_id` claim and passes the operator fence: this still proves the
+      // per-route refusal (the DB-read client), not the guard.
+      await sql`update users set role = 'client', client_id = ${acme} where id = ${portal.userId}`;
       expect((await createAsn({ clientId: acme, warehouseId: wh1, asnCode: 'PORTAL', lines: [{ skuId: acme1, announcedQty: 1 }] }, portal.token).expect(403)).body.code).toBe('role-denied');
       await getAsn(asn.id, portal.token).expect(403);
       await http().get(`${API}/${tenantId}/warehouses/${wh1}/inbound/asns`).set('Authorization', `Bearer ${portal.token}`).expect(403);

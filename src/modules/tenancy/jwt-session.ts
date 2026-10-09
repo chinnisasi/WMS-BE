@@ -23,6 +23,15 @@ export const DEVICE_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 export interface TenantSession {
   readonly userId: string;
   readonly tenantId: string;
+  /**
+   * Story 21-7 (AD-4 amended, for the FENCE only) — the client brand of a
+   * client-portal user, from the token's `client_id` claim; null for the
+   * tenant's own staff (no claim). Its one use is refusing operator routes
+   * at the guard (`TenantSessionGuard`, `AnySessionGuard`'s web arm) and
+   * admitting portal routes (`PortalSessionGuard`, which re-reads the user
+   * and the client per request). Capabilities stay a per-command DB read.
+   */
+  readonly clientId: string | null;
   readonly issuedAt: number; // unix seconds
   readonly expiresAt: number; // unix seconds
 }
@@ -41,17 +50,24 @@ function base64url(value: string): string {
   return Buffer.from(value, 'utf8').toString('base64url');
 }
 
+/**
+ * Story 21-7: `clientId` (a client-portal user's client) adds a `client_id`
+ * claim ONLY when given — an operator token's payload keys stay exactly
+ * `sub, tenant_id, iat, exp`, byte for byte (pinned by test/portal.spec.ts).
+ */
 export function signTenantSession(
   tenantId: string,
   userId: string,
   secret: string,
   nowSeconds: number = Math.floor(Date.now() / 1000),
+  clientId?: string,
 ): string {
   const header = base64url(JSON.stringify({ alg: ALGORITHM, typ: 'JWT' }));
   const payload = base64url(
     JSON.stringify({
       sub: userId,
       tenant_id: tenantId,
+      ...(clientId === undefined ? {} : { client_id: clientId }),
       iat: nowSeconds,
       exp: nowSeconds + SESSION_TTL_SECONDS,
     }),
@@ -60,7 +76,16 @@ export function signTenantSession(
   return `${header}.${payload}.${signature}`;
 }
 
-/** Returns the claims for a well-formed, unexpired token — null otherwise. */
+/**
+ * Returns the claims for a well-formed, unexpired token — null otherwise.
+ *
+ * Story 21-7: a `client_id` claim that is present must be a UUID string —
+ * `null`, a number, or a malformed string is an INVALID token (null), never
+ * read as "no client" (which would hand an operator surface to whoever
+ * minted it). And a token carrying `device_id` is a device-family token and
+ * is refused here — the two families are now exclusive in BOTH directions
+ * (the old one-way hole: a badge-in token satisfied this verifier).
+ */
 export function verifyTenantSession(
   token: string,
   secret: string,
@@ -106,9 +131,17 @@ export function verifyTenantSession(
   if (typeof sub !== 'string' || !isUuid(sub)) return null;
   if (typeof tenantId !== 'string' || !isUuid(tenantId)) return null;
   if (typeof exp !== 'number' || exp <= nowSeconds) return null;
+  if ('device_id' in payload) return null;
+  let clientId: string | null = null;
+  if ('client_id' in payload) {
+    const claim = payload.client_id;
+    if (typeof claim !== 'string' || !isUuid(claim)) return null;
+    clientId = claim;
+  }
   return {
     userId: sub,
     tenantId,
+    clientId,
     issuedAt: typeof iat === 'number' ? iat : exp - SESSION_TTL_SECONDS,
     expiresAt: exp,
   };
@@ -177,7 +210,8 @@ export function signBadgeInSession(
 /**
  * Verifies a device-claim token (well-formed, unexpired, HAS a `device_id`).
  * Returns null for tenant-session tokens (no `device_id` claim) — the two
- * token families are mutually exclusive by claim shape.
+ * token families are mutually exclusive by claim shape (both directions since
+ * 21-7). Story 21-7: a token carrying `client_id` is never a device token.
  */
 export function verifyDeviceSession(
   token: string,
@@ -221,6 +255,7 @@ export function verifyDeviceSession(
     return null;
   }
   const { device_id: deviceId, tenant_id: tenantId, sub, iat, exp } = payload;
+  if ('client_id' in payload) return null;
   if (typeof deviceId !== 'string' || !isUuid(deviceId)) return null;
   if (typeof tenantId !== 'string' || !isUuid(tenantId)) return null;
   if (sub !== undefined && (typeof sub !== 'string' || !isUuid(sub))) return null;

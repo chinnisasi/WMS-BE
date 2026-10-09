@@ -25,6 +25,8 @@ import {
 } from '../../shared/primitives/location-type';
 import { storageClassSatisfies } from '../../shared/primitives/storage-class';
 import { fullPrecisionInstant } from '../../shared/primitives/time';
+import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
+import { portalStockInTx, type PortalStockRow } from './portal-stock';
 import { assertSecureBinAuthority } from '../tenancy/permissions';
 import {
   canonicalInstant,
@@ -51,6 +53,7 @@ import {
 // predicate (21-5's dispute drill-down reuses it) cross the seam here.
 export type { ClientDayDelta, ClientScope, ClientSkuOnHand, ClientWarehouseScope, DispatchedOrderRecordRow } from './client-metering';
 export { dispatchedOrderEventsPredicate } from './client-metering';
+export type { PortalStockRow } from './portal-stock';
 import type { LedgerReferenceDoc } from './ledger-registry';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 
@@ -568,6 +571,28 @@ export class InventoryFacade {
         nextCursor: page.nextCursor,
       };
     });
+  }
+
+  /**
+   * Story 21-7 — the client portal's stock read (AD-6: the owning module's
+   * facade, never the operator route). ONE client's rows, per (SKU,
+   * warehouse), on-hand over every bin plus order allocations — no bin, no
+   * cost. Two layers, both required: the transaction is stamped with the
+   * client (`{ clientId }` — RLS on `skus`), and the query carries the
+   * explicit `client_id` predicate (`portal-stock.ts`).
+   */
+  async portalStock(
+    tenantId: string,
+    clientId: string,
+    query: { readonly cursor?: string; readonly limit?: number } = {},
+  ): Promise<Page<PortalStockRow>> {
+    const limit = query.limit ?? PORTAL_PAGE_DEFAULT_LIMIT;
+    return withTenantTransaction(
+      this.db,
+      tenantId,
+      (tx) => portalStockInTx(tx, tenantId, clientId, { ...(query.cursor === undefined ? {} : { cursor: query.cursor }), limit }),
+      { clientId },
+    );
   }
 
   /**

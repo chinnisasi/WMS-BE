@@ -15,6 +15,7 @@ import { idempotencyKeyReuse } from './registration.command';
 import { assertPermission } from './permissions';
 import { getMemberRoleIn } from './tenancy.service';
 import { DUMMY_HASH, hashPassword } from './passwords';
+import { getClientStatusInTx } from '../clients/clients.facade';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -35,6 +36,11 @@ export interface UserView {
   readonly email: string;
   readonly role: UserRole;
   readonly status: UserStatus;
+  /**
+   * Story 21-7 — the client brand of a client-portal user (role `client`);
+   * null for the tenant's own staff. Written only by the invite insert.
+   */
+  readonly clientId: string | null;
   readonly createdAt: string;
 }
 
@@ -43,6 +49,8 @@ export interface InviteUserInput {
   readonly actorUserId: string;
   readonly email: string;
   readonly role: UserRole;
+  /** Story 21-7 — required exactly when `role` is `client`. */
+  readonly clientId?: string;
 }
 
 /**
@@ -77,8 +85,26 @@ export interface AcceptInviteSnapshot {
     readonly email: string;
     readonly role: UserRole;
     readonly status: UserStatus;
+    /** Story 21-7 — absent from a pre-21-7 snapshot; normalised on replay. */
+    readonly clientId?: string | null;
     readonly createdAt: string;
   };
+}
+
+/**
+ * Story 21-7 — a stored snapshot's user, normalised: a pre-21-7 invite,
+ * role-change or accept snapshot carries no `clientId`, which reads as
+ * `null` (every pre-21-7 user was staff). Applied on every replay so the
+ * response shape is the current one.
+ */
+export function normaliseUserView<T extends { clientId?: string | null }>(
+  user: T,
+): Omit<T, 'clientId'> & { clientId: string | null } {
+  return { ...user, clientId: user.clientId ?? null };
+}
+
+function clientRoleShapeRefused(detail: string): ProblemException {
+  return new ProblemException('validation-failed', 400, 'Invalid invitation', detail);
 }
 
 export function hashInviteToken(rawToken: string): string {
@@ -132,10 +158,27 @@ export class UsersCommand {
 
   async invite(command: InviteUserInput, idempotencyKey: string): Promise<InviteUserSnapshot> {
     const email = command.email.trim().toLowerCase();
+    const clientId = command.clientId ?? null;
+    // Story 21-7 — request SHAPE (no DB row needed, so above the
+    // transaction, the guide's tier 1): a `client` invite names its client,
+    // and no other role may.
+    if (command.role === 'client' && clientId === null) {
+      throw clientRoleShapeRefused('A client-portal user (role "client") must name its client — clientId is required.');
+    }
+    if (command.role !== 'client' && clientId !== null) {
+      throw clientRoleShapeRefused(
+        `Only a client-portal user (role "client") belongs to a client — clientId is refused for role "${command.role}".`,
+      );
+    }
+    // The fingerprint gains `clientId` ONLY when present (the 8-1d
+    // conditional-key exception, at a fixed position after `role`): every
+    // staff invite hashes byte-for-byte as before 21-7 (pinned by the golden
+    // in test/portal.spec.ts).
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       email,
       role: command.role,
+      ...(clientId === null ? {} : { clientId }),
     });
 
     const snapshot = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
@@ -156,7 +199,30 @@ export class UsersCommand {
         if (existing[0].payloadHash !== payloadHash) {
           throw idempotencyKeyReuse();
         }
-        return existing[0].responseSnapshot as InviteUserSnapshot;
+        const stored = existing[0].responseSnapshot as InviteUserSnapshot;
+        return { ...stored, user: normaliseUserView(stored.user) };
+      }
+
+      // Story 21-7 — the client checks, BEHIND the replay lookup (a committed
+      // invite re-serves its snapshot even if the client was suspended since):
+      // the client must be this tenant's (read by tenant AND id → 404), a
+      // client brand rather than the tenant's own `self` (400), and active
+      // (409 `client-not-active`, the 21-3 type).
+      if (clientId !== null) {
+        const client = await getClientStatusInTx(tx, command.tenantId, clientId);
+        if (client.systemOwned) {
+          throw clientRoleShapeRefused(
+            "A client-portal user belongs to a client brand — the tenant's own company is not one.",
+          );
+        }
+        if (client.status !== 'active') {
+          throw new ProblemException(
+            'client-not-active',
+            409,
+            'Client is not active',
+            `Client ${client.code} is ${client.status} — portal users are invited only for an active client.`,
+          );
+        }
       }
 
       // Emails are globally unique (one account per email, any tenant). The
@@ -189,6 +255,9 @@ export class UsersCommand {
             passwordHash: DUMMY_HASH,
             role: command.role,
             status: 'invited',
+            // Story 21-7 — the ONLY write of users.client_id anywhere (the
+            // architecture test pins it); paired with role by the 0065 CHECK.
+            clientId,
             inviteTokenHash: hashInviteToken(rawToken),
             inviteExpiresAt,
           })
@@ -229,6 +298,7 @@ export class UsersCommand {
           userId: user.id,
           email: user.email,
           role: command.role,
+          ...(clientId === null ? {} : { clientId }),
         },
       });
       try {
@@ -278,7 +348,7 @@ export class UsersCommand {
         if (existing[0].payloadHash !== payloadHash) {
           throw idempotencyKeyReuse();
         }
-        return (existing[0].responseSnapshot as { user: UserView }).user;
+        return normaliseUserView((existing[0].responseSnapshot as { user: UserView }).user);
       }
 
       const targetRows = await tx
@@ -293,6 +363,18 @@ export class UsersCommand {
           404,
           'User not found',
           'No user with this id exists in this tenant.',
+        );
+      }
+      // Story 21-7 — a client-portal user's role never changes (its client
+      // would go stale, or a staff role would carry a client the CHECK
+      // refuses). Invite a new user instead. (`client` is never ASSIGNED
+      // either: the DTO's ASSIGNABLE_ROLES; this is the command's backstop.)
+      if (target.role === 'client' || command.role === 'client') {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'Client-portal roles cannot change',
+          'A client-portal user’s role is fixed at invite, and no user can be made one — invite a new user instead.',
         );
       }
 
@@ -427,7 +509,8 @@ export class UsersCommand {
       if (existing[0].payloadHash !== payloadHash) {
         throw idempotencyKeyReuse();
       }
-      return existing[0].responseSnapshot as AcceptInviteSnapshot;
+      const stored = existing[0].responseSnapshot as AcceptInviteSnapshot;
+      return { user: normaliseUserView(stored.user) };
     }
 
     const inviteRows = await this.authDb
@@ -497,6 +580,7 @@ export class UsersCommand {
           email: updated.email,
           role: updated.role,
           status: 'active',
+          clientId: updated.clientId,
           createdAt: updated.createdAt,
         },
       };
@@ -593,6 +677,7 @@ function toUserView(row: typeof users.$inferSelect): UserView {
     email: row.email,
     role: row.role,
     status: row.status as UserStatus,
+    clientId: row.clientId,
     createdAt: row.createdAt,
   };
 }

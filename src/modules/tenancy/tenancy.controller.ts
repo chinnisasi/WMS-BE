@@ -131,6 +131,7 @@ export class TenancyController {
   @ApiOkResponse({ type: SignInResponse })
   @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Unknown email or wrong password (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Invitation not yet accepted (invite-pending), or a client-portal user whose client is not active (client-suspended, story 21-7)') })
   async signIn(@Body() dto: SignInDto): Promise<SignInResponse> {
     return this.signInCommand.execute({ email: dto.email, password: dto.password });
   }

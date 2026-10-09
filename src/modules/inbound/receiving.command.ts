@@ -38,7 +38,7 @@ import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { deviceRevoked } from '../tenancy/enrollment.command';
 import { ensureReceivingBinInTx } from '../tenancy/receiving-bin';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
-import { assertPermission } from '../tenancy/permissions';
+import { assertPermission, isFloorRole } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -406,7 +406,7 @@ export class ReceivingCommand {
         .where(and(eq(users.id, command.operatorUserId), eq(users.tenantId, command.tenantId)))
         .limit(1);
       const role = roleRows[0]?.role;
-      if (role === undefined || role === 'accountant') {
+      if (!isFloorRole(role)) {
         throw new ProblemException(
           'role-denied',
           403,

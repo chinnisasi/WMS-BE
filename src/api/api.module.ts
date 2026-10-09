@@ -38,6 +38,8 @@ import { RateCardsController } from './rate-cards.controller';
 import { BillingUsageController } from './billing-usage.controller';
 import { ClientInvoicesController } from './client-invoices.controller';
 import { BillingModule } from '../modules/billing/billing.module';
+import { PortalController } from './portal.controller';
+import { SharedModule } from '../shared/shared.module';
 
 /**
  * api shell: the only HTTP surface of the monolith. Story 1.1 exposes
@@ -74,7 +76,10 @@ import { BillingModule } from '../modules/billing/billing.module';
  * response DTO, so the shell has nothing to redact.
  */
 @Module({
-  imports: [InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule],
+  // Story 21-7 — SharedModule: Nest instantiates a route guard in the
+  // CONTROLLER's module, so `PortalSessionGuard`'s DATABASE dependency must
+  // resolve here too.
+  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule],
   controllers: [
     HealthController,
     EchoController,
@@ -128,6 +133,9 @@ import { BillingModule } from '../modules/billing/billing.module';
     // Story 21-5 — client invoices (prepare, list, detail, refresh, discard,
     // issue, dispute/settle/void) — `ClientInvoiceService` owns every rule.
     ClientInvoicesController,
+    // Story 21-7 — the client portal (read-only, `PortalSessionGuard` from
+    // the clients module): each read is its owning module's facade method.
+    PortalController,
     // Story 7-2 — the channel webhook surface (guardless by construction:
     // the provider's AUTHORITY is its signature, not a session). The
     // last-siblings convention keeps NotFoundController LAST (registered

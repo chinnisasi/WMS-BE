@@ -13,7 +13,7 @@ import type { Page } from '../../shared/primitives/pagination';
 import { generateSecret, seal, MissingEncryptionKeyError } from '../../shared/crypto/envelope';
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
-import { assertPermission } from './permissions';
+import { assertPermission, isFloorRole } from './permissions';
 import { getMemberRoleIn } from './tenancy.service';
 import { DUMMY_HASH, hashPassword, verifyPassword } from './passwords';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
@@ -517,6 +517,20 @@ export class EnrollmentCommand {
       if (!pinOk || !bound) {
         throw badgeInvalid();
       }
+      // Story 21-7 — a client-portal user never binds a floor device. AFTER
+      // the PIN and binding checks, so a wrong PIN stays the one
+      // indistinguishable 401 `badge-invalid` (no role disclosed to a
+      // PIN-guesser); BEFORE the device update, so a refused badge-in binds
+      // nothing. An allowlist: floor roles bind; the accountant keeps its
+      // pre-21-7 badge-in (refused per command instead); every other role is refused.
+      if (!(isFloorRole(operator.role) || operator.role === 'accountant')) {
+        throw new ProblemException(
+          'role-denied',
+          403,
+          'Role lacks the required capability',
+          `Role "${operator.role}" cannot operate a floor device.`,
+        );
+      }
 
       await tx
         .update(devices)
@@ -748,7 +762,7 @@ export class EnrollmentCommand {
         .where(and(eq(users.id, command.operatorUserId), eq(users.tenantId, command.tenantId)))
         .limit(1);
       const role = roleRows[0]?.role;
-      if (role === undefined || role === 'accountant') {
+      if (!isFloorRole(role)) {
         throw new ProblemException(
           'role-denied',
           403,

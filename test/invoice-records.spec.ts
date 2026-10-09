@@ -539,7 +539,9 @@ describe('story 21-5b: the dispute drill-down', () => {
       const skuList = await http().get(`${API}/${tenantId}/catalog/skus?limit=200`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
       for (const item of skuList.body.items as { code: string; id: string }[]) skus.set(item.code, item.id);
 
-      await sql`update users set client_id = ${client('ACME')} where tenant_id = ${tenantId} and email = ${portal.email}`;
+      // Story 21-7: role and client together (the 0065 CHECK), the token minted
+      // before — a claim-less token, so the per-route refusal is what answers.
+      await sql`update users set role = 'client', client_id = ${client('ACME')} where tenant_id = ${tenantId} and email = ${portal.email}`;
       for (const code of ['ACME', 'BETA', 'GAMMA']) {
         await http().patch(`${API}/${tenantId}/clients/${client(code)}/tax-details`).set('Authorization', `Bearer ${accountantToken}`).set(KEY_HEADER, ulid()).send(FULL()).expect(200);
       }

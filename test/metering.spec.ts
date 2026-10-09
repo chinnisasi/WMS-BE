@@ -1209,7 +1209,9 @@ describe('story 21-4: metering and storage snapshots', () => {
         const me = await http().get(`${API}/${tenantId}/me`).set('Authorization', `Bearer ${portalToken}`);
         const userId = (me.body.user?.id ?? me.body.id) as string | undefined;
         expect(userId).toBeDefined();
-        await sql`update users set client_id = ${client('ACME')} where id = ${userId!}`;
+        // Story 21-7: role and client together (the 0065 CHECK), after the token
+        // was minted — a claim-less token, so the per-route refusal answers.
+        await sql`update users set role = 'client', client_id = ${client('ACME')} where id = ${userId!}`;
         expectProblem(await usage(client('ACME'), '2026-09-01', '2026-09-30', portalToken), 403, 'role-denied');
         expectProblem(await usage(client('BETA'), '2026-09-01', '2026-09-30', portalToken), 403, 'role-denied');
       });

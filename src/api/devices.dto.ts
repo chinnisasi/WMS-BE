@@ -1,5 +1,6 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { IsEmail, IsObject, IsString, Length, Matches } from 'class-validator';
+import { USER_ROLES } from '../modules/tenancy/tenancy.dto';
 
 /**
  * Devices HTTP surface DTOs (Story 3.2). Validation lives at the boundary;
@@ -84,7 +85,9 @@ export class BadgeInOperatorResponse {
   @ApiProperty({ format: 'email' })
   email!: string;
 
-  @ApiProperty({ enum: ['owner', 'ops_manager', 'operator', 'accountant'] })
+  // Story 21-7 — derived from the one role tuple (a client user is refused
+  // at badge-in, but the response vocabulary stays the tenancy one).
+  @ApiProperty({ enum: USER_ROLES })
   role!: string;
 }
 

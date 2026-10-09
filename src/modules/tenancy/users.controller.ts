@@ -85,10 +85,11 @@ export class UsersController {
   @ApiOperation({ summary: 'Invites a user (Owner only) — returns the one-time invite token' })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.CREATED, type: InviteUserResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, a client invite without clientId / a staff invite with one, or the tenant\u2019s own client (story 21-7)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks users.invite (role-denied)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Email already has an account in any tenant (email-exists), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Story 21-7: the named client does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Email already has an account in any tenant (email-exists), the named client is not active (client-not-active, story 21-7), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async inviteUser(
@@ -100,7 +101,13 @@ export class UsersController {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const snapshot = await this.usersCommand.invite(
-      { tenantId, actorUserId: session.userId, email: dto.email, role: dto.role },
+      {
+        tenantId,
+        actorUserId: session.userId,
+        email: dto.email,
+        role: dto.role,
+        ...(dto.clientId === undefined ? {} : { clientId: dto.clientId }),
+      },
       key,
     );
     return { ...snapshot, user: { ...snapshot.user } };
@@ -136,7 +143,7 @@ export class UsersController {
   @ApiOperation({ summary: 'Changes a user’s role (Owner capability users.role_change; effective on the user’s next command)' })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.OK, type: UserResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, or a client-portal user as the target (story 21-7 — its role is fixed at invite)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks users.role_change (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('User does not exist in this tenant (not-found)') })
@@ -178,7 +185,7 @@ export class UsersController {
       { tenantId, token: dto.token, password: dto.password },
       key,
     );
-    return { ...snapshot };
+    return { user: { ...snapshot.user, clientId: snapshot.user.clientId ?? null } };
   }
 
   @Get(':tenantId/me')
