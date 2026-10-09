@@ -3,10 +3,22 @@ import { sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import type { TenantTx } from '../../shared/db/tenant-scope';
+import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
+import { assertClientInTenantInTx } from '../clients/clients.facade';
 import { TILES, TILE_STATEMENT_TIMEOUT_MS, TILE_TX_DEADLINES } from './kpis';
 import type { OverviewTiles, ReportingScope, TileContext, TileDefinition, TileName } from './kpis';
 import { reportingWindow } from './window';
+import {
+  armServiceDeadline,
+  assertServicePeriod,
+  readServiceFiguresInTx,
+  SERVICE_STATEMENT_TIMEOUT_MS,
+  SERVICE_TARGET_HOURS,
+  serviceWindow,
+} from './service';
+import type { ServiceFigures, ServiceReport, ServiceReportScope, ServiceWindow } from './service';
 
 export type {
   DockToStockTile,
@@ -28,6 +40,21 @@ export type {
   WindowedFigure,
 } from './kpis';
 export { SYNC_HEALTH_REASONS, SYNC_HEALTH_STATES } from './kpis';
+export type {
+  ServiceDispatchTimeliness,
+  ServiceDockToStock,
+  ServicePickAccuracy,
+  ServiceReport,
+} from './service';
+export { MAX_SERVICE_REPORT_DAYS, SERVICE_STATEMENT_TIMEOUT_MS, SERVICE_TARGET_HOURS } from './service';
+
+/** Story 21-8 — the service report's query: an inclusive IST date period, optionally one warehouse. */
+export interface ServiceReportQuery {
+  readonly from: string;
+  readonly to: string;
+  /** Null or absent: every warehouse of the tenant. */
+  readonly warehouseId?: string | null;
+}
 
 /**
  * At most this many reporting tile transactions run at once IN THE PROCESS —
@@ -147,7 +174,88 @@ export class ReportingFacade {
    */
   tiles: readonly TileDefinition[] = TILES;
 
+  /**
+   * Story 21-8 — the service report's figures, read inside the report's one
+   * timed transaction. A plain field so a suite can force a statement timeout
+   * (or read the armed timeout) without a second production code path.
+   */
+  serviceRead: (tx: TenantTx, scope: ServiceReportScope, window: ServiceWindow) => Promise<ServiceFigures> = readServiceFiguresInTx;
+
   constructor(@Inject(DATABASE) private readonly db: Database) {}
+
+  /**
+   * Story 21-8 — one client's service report (CAP-10), the OPERATOR read:
+   * any client of the tenant (suspended and `self` included). Period rules
+   * first (400), then the client (404), then the warehouse (404), then the
+   * figures — all in ONE tenant transaction under a 5 s `statement_timeout`;
+   * a timeout is 503 `report-unavailable`, nothing partial.
+   */
+  async serviceReport(tenantId: string, clientId: string, query: ServiceReportQuery, now: Date = new Date()): Promise<ServiceReport> {
+    assertServicePeriod(query.from, query.to);
+    return this.readService(
+      () =>
+        withTenantTransaction(this.db, tenantId, (tx) =>
+          this.serviceInTx(tx, { tenantId, clientId, warehouseId: query.warehouseId ?? null }, query, now),
+        ),
+    );
+  }
+
+  /**
+   * Story 21-8 — the same report for the client-portal session's OWN client
+   * (the client comes from `PortalSession`, never the request). The same
+   * figures as the operator read, from the same code, in a transaction
+   * stamped with the client (RLS) on top of every query's explicit
+   * `client_id` predicate.
+   */
+  async portalServiceReport(tenantId: string, clientId: string, query: ServiceReportQuery, now: Date = new Date()): Promise<ServiceReport> {
+    assertServicePeriod(query.from, query.to);
+    return this.readService(() =>
+      withTenantTransaction(
+        this.db,
+        tenantId,
+        (tx) => this.serviceInTx(tx, { tenantId, clientId, warehouseId: query.warehouseId ?? null }, query, now),
+        { clientId },
+      ),
+    );
+  }
+
+  private async serviceInTx(tx: TenantTx, scope: ServiceReportScope, query: ServiceReportQuery, now: Date): Promise<ServiceReport> {
+    // The budget bounds the WHOLE read: every statement below runs under the
+    // time left (transaction-local — it dies with this transaction).
+    const deadlineAt = Date.now() + SERVICE_STATEMENT_TIMEOUT_MS;
+    await armServiceDeadline(tx, deadlineAt);
+    await assertClientInTenantInTx(tx, scope.tenantId, scope.clientId);
+    if (scope.warehouseId !== null) await assertWarehouseInTenant(tx, scope.tenantId, scope.warehouseId);
+    const window = serviceWindow(query.from, query.to, now, deadlineAt);
+    const figures = await this.serviceRead(tx, scope, window);
+    return {
+      from: query.from,
+      to: query.to,
+      warehouseId: scope.warehouseId,
+      asOf: window.asOf,
+      targetHours: SERVICE_TARGET_HOURS,
+      dockToStock: figures.dockToStock,
+      pickAccuracy: figures.pickAccuracy,
+      dispatchTimeliness: figures.dispatchTimeliness,
+    };
+  }
+
+  /** A statement timeout anywhere in the read is 503 `report-unavailable` — never a partial report. */
+  private async readService(run: () => Promise<ServiceReport>): Promise<ServiceReport> {
+    try {
+      return await run();
+    } catch (err) {
+      if (isStatementTimeout(err)) {
+        throw new ProblemException(
+          'report-unavailable',
+          503,
+          'Report unavailable',
+          `The report did not finish within ${SERVICE_STATEMENT_TIMEOUT_MS / 1000} s — try a shorter period.`,
+        );
+      }
+      throw err;
+    }
+  }
 
   async overview(tenantId: string, warehouseId: string, now: Date = new Date()): Promise<Overview> {
     // 404 before any tile runs (its own short transaction — the tiles each

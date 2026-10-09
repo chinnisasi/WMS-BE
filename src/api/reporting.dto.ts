@@ -1,5 +1,8 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { SYNC_HEALTH_REASONS, SYNC_HEALTH_STATES } from '../modules/reporting/reporting.facade';
+import { IsOptional, IsString, Matches } from 'class-validator';
+import { UUID_RE } from '../shared/primitives/ids';
+import { MAX_SERVICE_REPORT_DAYS, SERVICE_TARGET_HOURS, SYNC_HEALTH_REASONS, SYNC_HEALTH_STATES } from '../modules/reporting/reporting.facade';
+import type { ServiceReport } from '../modules/reporting/reporting.facade';
 
 /**
  * Story 9-1 — the Overview's response shape. One flat DTO class per tile
@@ -286,4 +289,153 @@ export class ReportingOverviewResponse {
 
   @ApiProperty({ type: ReportingTilesDto })
   tiles!: ReportingTilesDto;
+}
+
+// ── Story 21-8 — per-client service reporting ─────────────────────────────────
+
+/**
+ * The service report's query, shared by the operator and the portal route
+ * (the `ClientUsageQuery` pattern: a value class bound to `@Query()`). It
+ * checks SHAPE only — the period rules (real dates, `from ≤ to`, at most 366
+ * days) are the facade's, so both routes refuse with identical details. A
+ * `clientId` is not a member: `forbidNonWhitelisted` refuses it with 400.
+ */
+export class ServiceReportQuery {
+  @ApiProperty({ example: '2026-09-01', description: 'First IST date of the period (inclusive), YYYY-MM-DD' })
+  @IsString()
+  from!: string;
+
+  @ApiProperty({
+    example: '2026-09-30',
+    description: `Last IST date of the period (inclusive), YYYY-MM-DD — at most ${MAX_SERVICE_REPORT_DAYS} days after \`from\`, never before it`,
+  })
+  @IsString()
+  to!: string;
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'One warehouse of the tenant; absent means every warehouse' })
+  @IsOptional()
+  @Matches(UUID_RE, { message: 'warehouseId must be a uuid' })
+  warehouseId?: string;
+}
+
+export class ServiceDockToStockDto {
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description:
+      'Median minutes from the GRN being recorded to the placement being recorded, over this client\'s placements recorded in the period (negative intervals excluded), 1 dp; null with none',
+  })
+  medianMinutes!: number | null;
+
+  @ApiProperty({ description: "Placements of this client's SKUs recorded in the period (the median's population)" })
+  placements!: number;
+}
+
+export class ServicePickAccuracyDto {
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description:
+      'Of the order lines dispatched in the period, the share that never had a short pick (a short later recovered still counts against the line), 0–1 to 4 dp; null with no line dispatched',
+  })
+  accuracy!: number | null;
+
+  @ApiProperty({ description: "Order lines of this client's orders first dispatched in the period (one dispatch.dispatched event per line)" })
+  linesDispatched!: number;
+
+  @ApiProperty({ description: 'Of those lines, the ones with any short-picked picklist line' })
+  linesShortPicked!: number;
+
+  @ApiProperty({ description: "Failed pack verifications recorded in the period for this client's orders — shown beside the ratio, never folded into it" })
+  packFailures!: number;
+
+  @ApiProperty({
+    type: String,
+    format: 'date-time',
+    nullable: true,
+    description: 'When failed pack verifications began to be recorded (0058) — a period starting before it is a partial count; null if unknown',
+  })
+  packFailuresCountingSince!: string | null;
+}
+
+export class ServiceDispatchTimelinessDto {
+  @ApiProperty({ description: "This client's orders first dispatched in the period — the same count the client is invoiced for" })
+  ordersDispatched!: number;
+
+  @ApiProperty({
+    description:
+      'Of those, the orders dispatched within targetHours of being received (orders.created_at — the server ingestion time, not the buyer order time)',
+  })
+  onTime!: number;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'onTime ÷ ordersDispatched, 0–1 to 4 dp; null with none dispatched' })
+  onTimeRate!: number | null;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'Median minutes from received to dispatched, over orders (clamped at 0), 1 dp; null with none' })
+  medianMinutes!: number | null;
+
+  @ApiProperty({
+    description:
+      'Orders received in the period, not cancelled, received more than targetHours before asOf, and not dispatched as of asOf — the backlog the dispatched figures cannot see',
+  })
+  lateNotDispatched!: number;
+}
+
+/** The service report — identical on the operator and the portal route, and carrying no client id. */
+export class ServiceReportDto {
+  @ApiProperty({ example: '2026-09-01', description: 'First IST date of the period (inclusive)' })
+  from!: string;
+
+  @ApiProperty({ example: '2026-09-30', description: 'Last IST date of the period (inclusive)' })
+  to!: string;
+
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'The warehouse the report is narrowed to; null for every warehouse' })
+  warehouseId!: string | null;
+
+  @ApiProperty({ format: 'date-time', description: 'When the report was computed — the period is read up to here at most' })
+  asOf!: string;
+
+  @ApiProperty({ example: SERVICE_TARGET_HOURS, description: 'The dispatch timeliness target in hours (fixed)' })
+  targetHours!: number;
+
+  @ApiProperty({ type: ServiceDockToStockDto })
+  dockToStock!: ServiceDockToStockDto;
+
+  @ApiProperty({ type: ServicePickAccuracyDto })
+  pickAccuracy!: ServicePickAccuracyDto;
+
+  @ApiProperty({ type: ServiceDispatchTimelinessDto })
+  dispatchTimeliness!: ServiceDispatchTimelinessDto;
+}
+
+/**
+ * The facade's report onto the DTO, rebuilt key by key (never a spread), so
+ * both routes answer exactly this allowlist — and never a client id.
+ */
+export function toServiceReportDto(report: ServiceReport): ServiceReportDto {
+  return {
+    from: report.from,
+    to: report.to,
+    warehouseId: report.warehouseId,
+    asOf: report.asOf,
+    targetHours: report.targetHours,
+    dockToStock: {
+      medianMinutes: report.dockToStock.medianMinutes,
+      placements: report.dockToStock.placements,
+    },
+    pickAccuracy: {
+      accuracy: report.pickAccuracy.accuracy,
+      linesDispatched: report.pickAccuracy.linesDispatched,
+      linesShortPicked: report.pickAccuracy.linesShortPicked,
+      packFailures: report.pickAccuracy.packFailures,
+      packFailuresCountingSince: report.pickAccuracy.packFailuresCountingSince,
+    },
+    dispatchTimeliness: {
+      ordersDispatched: report.dispatchTimeliness.ordersDispatched,
+      onTime: report.dispatchTimeliness.onTime,
+      onTimeRate: report.dispatchTimeliness.onTimeRate,
+      medianMinutes: report.dispatchTimeliness.medianMinutes,
+      lateNotDispatched: report.dispatchTimeliness.lateNotDispatched,
+    },
+  };
 }

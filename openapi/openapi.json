@@ -17761,6 +17761,134 @@
         ]
       }
     },
+    "/tenants/{tenantId}/reporting/clients/{clientId}/service": {
+      "get": {
+        "description": "The window is [IST midnight of from, min(IST midnight after to, asOf)) on server-stamped columns. Ratios are 0–1 to 4 dp and null with an empty denominator; medians are minutes to 1 dp. `dispatchTimeliness.ordersDispatched` equals the dispatched-order count the client is invoiced for. One transaction with a 5 s budget for the whole read (every statement runs under the time left) — past it, 503 and nothing partial. The client-portal route `GET /tenants/{t}/portal/service` answers the identical body for its own client.",
+        "operationId": "ReportingController_clientService",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": true,
+            "in": "query",
+            "description": "First IST date of the period (inclusive), YYYY-MM-DD",
+            "schema": {
+              "example": "2026-09-01",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": true,
+            "in": "query",
+            "description": "Last IST date of the period (inclusive), YYYY-MM-DD — at most 366 days after `from`, never before it",
+            "schema": {
+              "example": "2026-09-30",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "One warehouse of the tenant; absent means every warehouse",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceReportDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId or warehouseId, a from/to that is not a real YYYY-MM-DD date, from after to, or a period longer than 366 days (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such client, or no such warehouse, in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The report did not finish within its 5 s budget — try a shorter period (report-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One client's service report over an inclusive IST date period: dock-to-stock, pick accuracy and dispatch timeliness (against a fixed 24 h target), from the ledger and its same-transaction projections",
+        "tags": [
+          "reporting"
+        ]
+      }
+    },
     "/tenants/{tenantId}/clients": {
       "get": {
         "operationId": "ClientsController_listClients",
@@ -21464,6 +21592,124 @@
           }
         ],
         "summary": "The tenant's warehouses a client may announce a shipment into — name and city only, by name; unpaginated (capped at 200)",
+        "tags": [
+          "portal"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/portal/service": {
+      "get": {
+        "operationId": "PortalController_service",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": true,
+            "in": "query",
+            "description": "First IST date of the period (inclusive), YYYY-MM-DD",
+            "schema": {
+              "example": "2026-09-01",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": true,
+            "in": "query",
+            "description": "Last IST date of the period (inclusive), YYYY-MM-DD — at most 366 days after `from`, never before it",
+            "schema": {
+              "example": "2026-09-30",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "One warehouse of the tenant; absent means every warehouse",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceReportDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A from/to that is not a real YYYY-MM-DD date, from after to, a period longer than 366 days, a malformed warehouseId, or any other query parameter — a clientId included (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such warehouse in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The report did not finish within its 5 s budget — try a shorter period (report-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "This client's service report over an inclusive IST date period — dock-to-stock, pick accuracy and dispatch timeliness (24 h target); identical to the operator's report for this client",
         "tags": [
           "portal"
         ]
@@ -34627,6 +34873,143 @@
           "stale",
           "window",
           "tiles"
+        ]
+      },
+      "ServiceDockToStockDto": {
+        "type": "object",
+        "properties": {
+          "medianMinutes": {
+            "type": "number",
+            "nullable": true,
+            "description": "Median minutes from the GRN being recorded to the placement being recorded, over this client's placements recorded in the period (negative intervals excluded), 1 dp; null with none"
+          },
+          "placements": {
+            "type": "number",
+            "description": "Placements of this client's SKUs recorded in the period (the median's population)"
+          }
+        },
+        "required": [
+          "medianMinutes",
+          "placements"
+        ]
+      },
+      "ServicePickAccuracyDto": {
+        "type": "object",
+        "properties": {
+          "accuracy": {
+            "type": "number",
+            "nullable": true,
+            "description": "Of the order lines dispatched in the period, the share that never had a short pick (a short later recovered still counts against the line), 0–1 to 4 dp; null with no line dispatched"
+          },
+          "linesDispatched": {
+            "type": "number",
+            "description": "Order lines of this client's orders first dispatched in the period (one dispatch.dispatched event per line)"
+          },
+          "linesShortPicked": {
+            "type": "number",
+            "description": "Of those lines, the ones with any short-picked picklist line"
+          },
+          "packFailures": {
+            "type": "number",
+            "description": "Failed pack verifications recorded in the period for this client's orders — shown beside the ratio, never folded into it"
+          },
+          "packFailuresCountingSince": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When failed pack verifications began to be recorded (0058) — a period starting before it is a partial count; null if unknown"
+          }
+        },
+        "required": [
+          "accuracy",
+          "linesDispatched",
+          "linesShortPicked",
+          "packFailures",
+          "packFailuresCountingSince"
+        ]
+      },
+      "ServiceDispatchTimelinessDto": {
+        "type": "object",
+        "properties": {
+          "ordersDispatched": {
+            "type": "number",
+            "description": "This client's orders first dispatched in the period — the same count the client is invoiced for"
+          },
+          "onTime": {
+            "type": "number",
+            "description": "Of those, the orders dispatched within targetHours of being received (orders.created_at — the server ingestion time, not the buyer order time)"
+          },
+          "onTimeRate": {
+            "type": "number",
+            "nullable": true,
+            "description": "onTime ÷ ordersDispatched, 0–1 to 4 dp; null with none dispatched"
+          },
+          "medianMinutes": {
+            "type": "number",
+            "nullable": true,
+            "description": "Median minutes from received to dispatched, over orders (clamped at 0), 1 dp; null with none"
+          },
+          "lateNotDispatched": {
+            "type": "number",
+            "description": "Orders received in the period, not cancelled, received more than targetHours before asOf, and not dispatched as of asOf — the backlog the dispatched figures cannot see"
+          }
+        },
+        "required": [
+          "ordersDispatched",
+          "onTime",
+          "onTimeRate",
+          "medianMinutes",
+          "lateNotDispatched"
+        ]
+      },
+      "ServiceReportDto": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "type": "string",
+            "example": "2026-09-01",
+            "description": "First IST date of the period (inclusive)"
+          },
+          "to": {
+            "type": "string",
+            "example": "2026-09-30",
+            "description": "Last IST date of the period (inclusive)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The warehouse the report is narrowed to; null for every warehouse"
+          },
+          "asOf": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the report was computed — the period is read up to here at most"
+          },
+          "targetHours": {
+            "type": "number",
+            "example": 24,
+            "description": "The dispatch timeliness target in hours (fixed)"
+          },
+          "dockToStock": {
+            "$ref": "#/components/schemas/ServiceDockToStockDto"
+          },
+          "pickAccuracy": {
+            "$ref": "#/components/schemas/ServicePickAccuracyDto"
+          },
+          "dispatchTimeliness": {
+            "$ref": "#/components/schemas/ServiceDispatchTimelinessDto"
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "warehouseId",
+          "asOf",
+          "targetHours",
+          "dockToStock",
+          "pickAccuracy",
+          "dispatchTimeliness"
         ]
       },
       "ClientTaxDetailsDto": {
