@@ -132,6 +132,34 @@ export async function getMemberClientIdIn(tx: TenantTx, tenantId: string, userId
   return rows[0]?.clientId ?? null;
 }
 
+/**
+ * Story 21-7 — the portal's per-request re-read of its user (the guard, and
+ * `portal/me`): the user's client and status (plus its id, email and role
+ * for `portal/me`), read by tenant AND id inside the caller's tenant
+ * transaction. Null for an unknown user. (The status rides along so the
+ * guard needs one query, not `getMemberClientIdIn` plus a second read.)
+ */
+export interface MemberPortalFacts {
+  readonly id: string;
+  readonly email: string;
+  readonly role: UserRole;
+  readonly status: string;
+  readonly clientId: string | null;
+}
+
+export async function getMemberPortalFactsIn(
+  tx: TenantTx,
+  tenantId: string,
+  userId: string,
+): Promise<MemberPortalFacts | null> {
+  const rows = await tx
+    .select({ id: users.id, email: users.email, role: users.role, status: users.status, clientId: users.clientId })
+    .from(users)
+    .where(and(eq(users.id, userId), eq(users.tenantId, tenantId)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
 export async function getMemberRoleIn(
   tx: TenantTx,
   tenantId: string,

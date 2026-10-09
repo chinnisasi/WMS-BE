@@ -927,7 +927,10 @@ describe('story 21-5: client invoices', () => {
 
       // A portal user: an accountant whose row carries a client (AD-23) — the
       // reads must refuse it.
-      await sql`update users set client_id = ${client('ACME')} where tenant_id = ${tenantId} and email = ${portal.email}`;
+      // Story 21-7: role and client together (the 0065 CHECK); the portal token
+      // was minted before, so it carries no `client_id` claim and reaches the
+      // per-route refusal rather than the operator fence.
+      await sql`update users set role = 'client', client_id = ${client('ACME')} where tenant_id = ${tenantId} and email = ${portal.email}`;
 
       // ── tax details (the accountant holds billing.invoice).
       await taxDetails(client('ACME'), FULL({ legalName: 'Acme Foods Private Limited', gstin: '29AAACA1111A1Z1' })).expect(200);

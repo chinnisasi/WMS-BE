@@ -12,6 +12,27 @@ import { InventoryFacade } from '../inventory/inventory.facade';
 import { MeteringService, type MeteredPeriod } from './metering';
 import { StorageSnapshotService, type SnapshotTickResult, type SnapshotVerifyResult } from './storage-snapshot';
 import { MAX_DRAFT_LIST, sortLines, type ChargeCode, type RateBasis, type RateCardStatus } from './rate-cards';
+import { decodeCursor, type Page } from '../../shared/primitives/pagination';
+import { UUID_RE } from '../../shared/primitives/ids';
+import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
+import { portalInvoiceInTx, portalInvoicesInTx, type PortalInvoiceDetail, type PortalInvoiceRow } from './portal-invoices';
+
+export type { PortalInvoiceDetail, PortalInvoiceLine, PortalInvoiceParty, PortalInvoiceRow } from './portal-invoices';
+
+const PORTAL_CURSOR_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+
+/** Story 21-7 — this facade's `decodeCursorSafe` copy (the house pattern): a crafted cursor is a 400, never a 500. */
+function decodePortalCursor(cursor: string): { createdAt: string; id: string } {
+  try {
+    const decoded = decodeCursor(cursor);
+    if (!UUID_RE.test(decoded.id) || !PORTAL_CURSOR_INSTANT_RE.test(decoded.createdAt) || Number.isNaN(Date.parse(decoded.createdAt))) {
+      throw new Error('malformed cursor payload');
+    }
+    return decoded;
+  } catch {
+    throw new ProblemException('invalid-cursor', 400, 'Malformed pagination cursor', 'The cursor parameter is not a valid opaque page cursor.');
+  }
+}
 
 /** One priced line as every read returns it. */
 export interface RateCardLineSnapshot {
@@ -140,6 +161,30 @@ export class BillingFacade {
     @Inject(StorageSnapshotService) private readonly snapshots: StorageSnapshotService,
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
   ) {}
+
+  // ── story 21-7: the client portal's invoice reads ─────────────────────────
+  // AD-6: the owning module's facade, never the operator route. Two layers,
+  // both required: the transaction is stamped with the client
+  // (`{ clientId }` — RLS hides other clients' invoices AND drafts) and the
+  // query carries `client_id = $client` and `status <> 'draft'`
+  // (`portal-invoices.ts`). Decision 3: the invoice and its lines only.
+
+  async portalInvoices(
+    tenantId: string,
+    clientId: string,
+    query: { readonly cursor?: string; readonly limit?: number } = {},
+  ): Promise<Page<PortalInvoiceRow>> {
+    const limit = query.limit ?? PORTAL_PAGE_DEFAULT_LIMIT;
+    const before = query.cursor === undefined ? null : decodePortalCursor(query.cursor);
+    return withTenantTransaction(this.db, tenantId, (tx) => portalInvoicesInTx(tx, tenantId, clientId, { before, limit }), {
+      clientId,
+    });
+  }
+
+  /** One non-draft invoice of this client, or null (unknown, another client's, or a draft → 404). */
+  async portalInvoice(tenantId: string, clientId: string, invoiceId: string): Promise<PortalInvoiceDetail | null> {
+    return withTenantTransaction(this.db, tenantId, (tx) => portalInvoiceInTx(tx, tenantId, clientId, invoiceId), { clientId });
+  }
 
   /**
    * Story 21-4 — meter one client over an inclusive IST date period: each

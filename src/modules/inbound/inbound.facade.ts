@@ -11,6 +11,17 @@ import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { fullPrecisionInstant } from '../../shared/primitives/time';
 import { fromMilli } from '../../shared/primitives/quantity';
+import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
+import {
+  portalAsnInTx,
+  portalAsnsInTx,
+  portalPurchaseOrderInTx,
+  portalPurchaseOrdersInTx,
+  type PortalAsnDetail,
+  type PortalAsnRow,
+  type PortalPurchaseOrderDetail,
+  type PortalPurchaseOrderRow,
+} from './portal-inbound';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant, getMemberClientIdIn } from '../tenancy/tenancy.service';
 import { AsnCommand, asnPortalRefused, readAsnInTx } from './asn.command';
@@ -35,6 +46,15 @@ import type {
   PurchaseOrderLineSnapshot,
   PurchaseOrderSnapshot,
 } from './po.command';
+
+export type {
+  PortalAsnDetail,
+  PortalAsnLine,
+  PortalAsnRow,
+  PortalPurchaseOrderDetail,
+  PortalPurchaseOrderLine,
+  PortalPurchaseOrderRow,
+} from './portal-inbound';
 
 /** One vendor row of the vendor-list read. */
 export interface VendorEntry {
@@ -129,6 +149,50 @@ export class InboundFacade {
     @Inject(PurchaseOrderCommand) private readonly poCommand: PurchaseOrderCommand,
     @Inject(AsnCommand) private readonly asnCommand: AsnCommand,
   ) {}
+
+  // ── story 21-7: the client portal's inbound reads ─────────────────────────
+  // AD-6: the owning module's facade, never the operator routes. Two layers,
+  // both required: each transaction is stamped with the client
+  // (`{ clientId }` — RLS on the stamped headers) AND each query carries the
+  // explicit `client_id` predicate (`portal-inbound.ts`).
+
+  async portalAsns(
+    tenantId: string,
+    clientId: string,
+    query: { readonly status?: AsnStatus; readonly cursor?: string; readonly limit?: number } = {},
+  ): Promise<Page<PortalAsnRow>> {
+    const limit = query.limit ?? PORTAL_PAGE_DEFAULT_LIMIT;
+    const before = query.cursor === undefined ? null : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(
+      this.db,
+      tenantId,
+      (tx) => portalAsnsInTx(tx, tenantId, clientId, { ...(query.status === undefined ? {} : { status: query.status }), before, limit }),
+      { clientId },
+    );
+  }
+
+  async portalAsn(tenantId: string, clientId: string, asnId: string): Promise<PortalAsnDetail | null> {
+    return withTenantTransaction(this.db, tenantId, (tx) => portalAsnInTx(tx, tenantId, clientId, asnId), { clientId });
+  }
+
+  async portalPurchaseOrders(
+    tenantId: string,
+    clientId: string,
+    query: { readonly status?: PoStatus; readonly cursor?: string; readonly limit?: number } = {},
+  ): Promise<Page<PortalPurchaseOrderRow>> {
+    const limit = query.limit ?? PORTAL_PAGE_DEFAULT_LIMIT;
+    const before = query.cursor === undefined ? null : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(
+      this.db,
+      tenantId,
+      (tx) => portalPurchaseOrdersInTx(tx, tenantId, clientId, { ...(query.status === undefined ? {} : { status: query.status }), before, limit }),
+      { clientId },
+    );
+  }
+
+  async portalPurchaseOrder(tenantId: string, clientId: string, poId: string): Promise<PortalPurchaseOrderDetail | null> {
+    return withTenantTransaction(this.db, tenantId, (tx) => portalPurchaseOrderInTx(tx, tenantId, clientId, poId), { clientId });
+  }
 
   // ── story 21-6: advance shipment notices ──────────────────────────────────
 

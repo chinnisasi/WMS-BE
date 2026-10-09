@@ -424,7 +424,7 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
   });
 
   test('the sync report refuses malformed rows (self-test echo, wrong shapes, attribution keys, budget) and a bare credential', async () => {
-    const { tenantId, badgeSession, deviceToken } = await setupReportingTenant();
+    const { tenantId, ownerToken, badgeSession, deviceToken } = await setupReportingTenant();
 
     // A self-test echo is device diagnostics, never a reviewable op — the
     // boundary refuses it explicitly (frozen rule).
@@ -471,8 +471,11 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
     // The bare (pre-badge-in) credential cannot upload — badge-in first.
     await uploadReport(tenantId, deviceToken, [packOpRow()]).expect(401);
 
-    // Nothing from this test leaked into the queue.
-    const listed = await listRejectedOps(badgeSession, tenantId).expect(200);
+    // Nothing from this test leaked into the queue. (Read with a WEB session:
+    // the queue is a web route, and since story 21-7 a badge-in token no
+    // longer satisfies `TenantSessionGuard` — the old one-way hole this read
+    // used to ride is closed, both families now exclusive by claim shape.)
+    const listed = await listRejectedOps(ownerToken, tenantId).expect(200);
     expect(listed.body.items).toHaveLength(0);
   });
 

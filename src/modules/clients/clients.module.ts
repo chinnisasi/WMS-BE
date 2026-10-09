@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
 import { ClientsCommand } from './clients.command';
 import { ClientsFacade } from './clients.facade';
+import { PortalSessionGuard } from './portal-session.guard';
 
 /**
  * Clients module (story 21-1 stood up the table; 21-2b gives it its admin
@@ -12,7 +13,10 @@ import { ClientsFacade } from './clients.facade';
  */
 @Module({
   imports: [SharedModule],
-  providers: [ClientsCommand, ClientsFacade],
-  exports: [ClientsCommand, ClientsFacade],
+  // Story 21-7 — `PortalSessionGuard` (the clients module owns portal
+  // scoping): DI-wired here and exported so the api shell's portal
+  // controller resolves it with its DATABASE dependency.
+  providers: [ClientsCommand, ClientsFacade, PortalSessionGuard],
+  exports: [ClientsCommand, ClientsFacade, PortalSessionGuard],
 })
 export class ClientsModule {}

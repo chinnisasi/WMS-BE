@@ -1692,3 +1692,113 @@ describe('architecture: advance shipment notices are inbound-module-owned (story
     expect(/\.update\(\s*asnLines\b/.test(receiving)).toBe(true);
   });
 });
+
+describe('architecture: the client portal (story 21-7)', () => {
+  /**
+   * `users.client_id` is written ONLY by the invite insert and never
+   * updated: the token's `client_id` claim (AD-4 amended for the fence) can
+   * then never go stale. The CHECK (0065) pairs it with the `client` role,
+   * and the role is never ASSIGNED `client` nor changed FROM it (the DTO and
+   * the command refusal, proved by HTTP tests in test/portal.spec.ts — a
+   * source scan cannot see role values).
+   */
+  const USERS_CLIENT_UPDATE = /\.update\(\s*users\s*\)\s*\.set\(\s*\{[^}]*\bclientId\b/;
+  const RAW_USERS_CLIENT_UPDATE = /\bupdate\s+"?users"?\s+set\b[^;`]*\bclient_id\b/i;
+  const USERS_CLIENT_INSERT = /\.insert\(\s*users\s*\)\s*\.values\(\s*\{[^}]*\bclientId\b/;
+  const INVITE_FILE = join(SRC_ROOT, 'modules', 'tenancy', 'users.command.ts');
+
+  it('no code path updates users.client_id (Drizzle or raw SQL); only the invite insert writes it', () => {
+    const offenders: string[] = [];
+    for (const file of files) {
+      for (const pattern of [USERS_CLIENT_UPDATE, RAW_USERS_CLIENT_UPDATE]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+      if (file.path !== INVITE_FILE && USERS_CLIENT_INSERT.test(file.source)) {
+        offenders.push(`${file.path}: inserts a users row carrying clientId`);
+      }
+      // Any `.update(users)` whose patch names clientId, however it is built.
+      for (const match of file.source.matchAll(/\.update\(\s*users\s*\)([\s\S]{0,600}?)\.where\(/g)) {
+        if (/\bclientId\b/.test(match[1]!)) offenders.push(`${file.path}: an .update(users) patch names clientId`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the invite really is the writer, and the detectors bite (the test is meaningful)', () => {
+    expect(USERS_CLIENT_INSERT.test(readFileSync(INVITE_FILE, 'utf8'))).toBe(true);
+    expect(USERS_CLIENT_UPDATE.test('tx.update(users).set({ role, clientId: other })')).toBe(true);
+    expect(RAW_USERS_CLIENT_UPDATE.test('UPDATE users SET client_id = $1 WHERE id = $2')).toBe(true);
+    expect(USERS_CLIENT_UPDATE.test('tx.update(users).set({ role: command.role, updatedAt: nowIso() })')).toBe(false);
+    expect(/\.update\(\s*users\s*\)([\s\S]{0,600}?)\.where\(/.exec('tx.update(users).set({ ...patch, clientId }).where(eq(users.id, id))')?.[1]).toContain('clientId');
+  });
+
+  /**
+   * Two layers, both required: every portal read's transaction is stamped
+   * with the client (`withTenantTransaction(…, { clientId })` — RLS), and
+   * its query carries the explicit predicate. jest e2e connects as a
+   * superuser (RLS inert), so the HTTP tests prove only the predicate; this
+   * scan proves the stamp is there, and the `wms_rls_probe` arms in
+   * test/client-isolation.spec.ts prove the stamp alone isolates.
+   */
+  const PORTAL_READS: readonly { file: string; methods: readonly string[] }[] = [
+    { file: join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), methods: ['portalStock'] },
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), methods: ['portalOrders', 'portalOrder'] },
+    { file: join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), methods: ['portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder'] },
+    { file: join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), methods: ['portalInvoices', 'portalInvoice'] },
+    { file: join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), methods: ['portalMeIn'] },
+  ];
+
+  /** The body of one method or function: from its declaration to the next top-level member. */
+  function bodyOf(source: string, name: string): string | null {
+    const start = new RegExp(`\\n\\s*(?:export\\s+)?(?:async\\s+)?(?:function\\s+)?${name}\\s*\\(`).exec(source);
+    if (start === null) return null;
+    const rest = source.slice(start.index + 1);
+    const end = /\n(?: {2}(?:async |\/\*\*|\/\/ ──|get |private |public )|\}\n|export )/.exec(rest.slice(1));
+    return end === null ? rest : rest.slice(0, end.index + 1);
+  }
+
+  function stampsClient(body: string): boolean {
+    return /withTenantTransaction\(/.test(body) && /\{\s*clientId\s*,?\s*\}\s*,?\s*\)/.test(body);
+  }
+
+  it('every portal facade read opens withTenantTransaction stamped with { clientId }', () => {
+    const offenders: string[] = [];
+    for (const { file, methods } of PORTAL_READS) {
+      const source = readFileSync(file, 'utf8');
+      for (const method of methods) {
+        const body = bodyOf(source, method);
+        if (body === null) offenders.push(`${file}: no ${method}`);
+        else if (!stampsClient(body)) offenders.push(`${file}: ${method} does not stamp { clientId }`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Every portal read the facades declare is on the list (a new one cannot slip past).
+    const declared = PORTAL_READS.flatMap(({ file }) =>
+      [...readFileSync(file, 'utf8').matchAll(/\n {2}async (portal[A-Z]\w*)\(/g)].map((match) => match[1]!),
+    );
+    expect(declared.sort()).toEqual(
+      ['portalStock', 'portalOrders', 'portalOrder', 'portalAsns', 'portalAsn', 'portalPurchaseOrders', 'portalPurchaseOrder', 'portalInvoices', 'portalInvoice', 'portalMe'].sort(),
+    );
+  });
+
+  it('the stamp detector bites (the test is meaningful)', () => {
+    const stamped = `
+  async portalThing(tenantId: string, clientId: string) {
+    return withTenantTransaction(this.db, tenantId, (tx) => readInTx(tx, tenantId, clientId), { clientId });
+  }
+`;
+    const unstamped = `
+  async portalThing(tenantId: string, clientId: string) {
+    return withTenantTransaction(this.db, tenantId, (tx) => readInTx(tx, tenantId, clientId));
+  }
+`;
+    const wrongOption = `
+  async portalThing(tenantId: string, clientId: string) {
+    return withTenantTransaction(this.db, tenantId, (tx) => readInTx(tx, tenantId, clientId), { isolationLevel: 'repeatable read' });
+  }
+`;
+    expect(stampsClient(bodyOf(stamped, 'portalThing')!)).toBe(true);
+    expect(stampsClient(bodyOf(unstamped, 'portalThing')!)).toBe(false);
+    expect(stampsClient(bodyOf(wrongOption, 'portalThing')!)).toBe(false);
+  });
+});

@@ -1011,4 +1011,207 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       }
     });
   });
+
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Part 3 — story 21-7: the PORTAL READ SHAPES, proved at the database.
+  // The jest e2e suites connect as a superuser, so RLS never applies there
+  // and test/portal.spec.ts proves only the app predicate. Here the portal
+  // query shapes run as `wms_rls_probe`, client-stamped, with the explicit
+  // `client_id = $client` predicate REMOVED — the RLS layer alone must
+  // return only client A's rows (two layers, each proved on its own). The
+  // inherited rows (stock, reservations, order / PO / invoice lines) reach
+  // the client only through their stamped parent, exactly as the reads do.
+  // ──────────────────────────────────────────────────────────────────────────
+  describe('story 21-7: the portal read shapes isolate with RLS alone (no app predicate)', () => {
+    let probe: postgres.Sql<Record<string, unknown>>;
+    const lineIds = new Map<string, { orderLine: string; poLine: string }>();
+
+    beforeAll(async () => {
+      await ensureProbeRole();
+      probe = postgres(probeUrl(), { max: 1 });
+      // One order and one PO with a line per client, and a held order
+      // reservation per client — below the API, like the rest of this suite.
+      const vendorId = uuidv7();
+      await sql`insert into vendors (id, tenant_id, code, name) values (${vendorId}, ${tenantId}, 'CI-V-21-7', 'Portal probe vendor')`;
+      for (const [clientId, skuId] of [
+        [clientA, skuAId],
+        [clientB, skuBId],
+      ] as const) {
+        const orderId = uuidv7();
+        const orderLine = uuidv7();
+        await sql`insert into orders (id, tenant_id, client_id, warehouse_id, status, source)
+          values (${orderId}, ${tenantId}, ${clientId}, ${warehouseId}, 'accepted', 'manual')`;
+        await sql`insert into order_lines (id, tenant_id, order_id, sku_id, qty)
+          values (${orderLine}, ${tenantId}, ${orderId}, ${skuId}, 2000)`;
+        const poId = uuidv7();
+        const poLine = uuidv7();
+        await sql`insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code, status)
+          values (${poId}, ${tenantId}, ${clientId}, ${warehouseId}, ${vendorId}, ${'CI-PO-21-7-' + clientId.slice(-4)}, 'open')`;
+        await sql`insert into purchase_order_lines (id, tenant_id, po_id, sku_id, ordered_qty, unit_cost_paise)
+          values (${poLine}, ${tenantId}, ${poId}, ${skuId}, 3000, 100)`;
+        await sql`insert into reservations (id, tenant_id, warehouse_id, sku_id, owner_type, owner_id, quantity, state, expires_at)
+          values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${skuId}, 'order', ${orderId}, 1000, 'held', now() + interval '1 day')`;
+        lineIds.set(clientId, { orderLine, poLine });
+      }
+    });
+
+    afterAll(async () => {
+      await probe?.end();
+    });
+
+    function stamped(
+      run: (tx: postgres.TransactionSql<Record<string, unknown>>) => Promise<unknown>,
+      client: string | null,
+    ): Promise<unknown[]> {
+      return probe.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+        if (client !== null) await tx`select set_config('app.client_id', ${client}, true)`;
+        return (await run(tx)) as unknown[];
+      });
+    }
+
+    // The portal stock shape (`inventory/portal-stock.ts`) MINUS both
+    // `s.client_id = $client` predicates.
+    const stockShape = (tx: postgres.TransactionSql<Record<string, unknown>>) => tx`
+      with oh as (
+        select so.sku_id as sku, so.warehouse_id as wh, sum(so.quantity)::bigint as q
+        from stock_on_hand so
+        join skus s on s.tenant_id = so.tenant_id and s.id = so.sku_id
+        where so.tenant_id = ${tenantId}
+        group by so.sku_id, so.warehouse_id
+      ),
+      al as (
+        select r.sku_id as sku, r.warehouse_id as wh, sum(r.quantity)::bigint as q
+        from reservations r
+        join skus s on s.tenant_id = r.tenant_id and s.id = r.sku_id
+        where r.tenant_id = ${tenantId} and r.owner_type = 'order' and r.state in ('held', 'committed')
+        group by r.sku_id, r.warehouse_id
+      )
+      select s.id as "skuId", coalesce(oh.q, 0)::bigint as "onHand", coalesce(al.q, 0)::bigint as "allocated"
+      from oh
+      full join al on al.sku = oh.sku and al.wh = oh.wh
+      join skus s on s.tenant_id = ${tenantId} and s.id = coalesce(oh.sku, al.sku)
+      join warehouses w on w.tenant_id = ${tenantId} and w.id = coalesce(oh.wh, al.wh)
+      where (coalesce(oh.q, 0) > 0 or coalesce(al.q, 0) > 0)
+      order by s.code asc, w.id asc`;
+
+    // The portal order-line shape (`outbound/portal-orders.ts`) MINUS `o.client_id = $client`.
+    const orderLineShape = (tx: postgres.TransactionSql<Record<string, unknown>>) => tx`
+      select ol.id from order_lines ol
+      join orders o on o.tenant_id = ol.tenant_id and o.id = ol.order_id
+      left join skus s on s.tenant_id = ol.tenant_id and s.id = ol.sku_id
+      where ol.tenant_id = ${tenantId}`;
+
+    // The portal PO-line shape (`inbound/portal-inbound.ts`) MINUS `p.client_id = $client`.
+    const poLineShape = (tx: postgres.TransactionSql<Record<string, unknown>>) => tx`
+      select pl.id from purchase_order_lines pl
+      join purchase_orders p on p.tenant_id = pl.tenant_id and p.id = pl.po_id
+      left join skus s on s.tenant_id = pl.tenant_id and s.id = pl.sku_id
+      where pl.tenant_id = ${tenantId}`;
+
+    // The portal invoice shapes (`billing/portal-invoices.ts`) MINUS
+    // `client_id = $client` AND `status <> 'draft'` — the policy alone must
+    // hide the sibling's invoices and every draft.
+    const invoiceShape = (tx: postgres.TransactionSql<Record<string, unknown>>) => tx`
+      select id from client_invoices where tenant_id = ${tenantId}`;
+    const invoiceLineShape = (tx: postgres.TransactionSql<Record<string, unknown>>) => tx`
+      select i.id from client_invoice_lines l
+      join client_invoices i on i.tenant_id = l.tenant_id and i.id = l.invoice_id
+      where l.tenant_id = ${tenantId}`;
+
+    // The header list shapes (orders / ASNs / POs) MINUS `client_id = $client`,
+    // and the ASN-line shape MINUS `a.client_id = $client` — copies of the
+    // portal SQL (the probe cannot drive the production functions: they run
+    // on the app's connection, never as wms_rls_probe).
+    const orderHeaderShape = (tx: postgres.TransactionSql<Record<string, unknown>>) => tx`
+      select o.id,
+             (select count(*)::int from order_lines ol
+                where ol.tenant_id = o.tenant_id and ol.order_id = o.id and ol.parent_line_id is null) as "lineCount"
+      from orders o
+      join warehouses w on w.tenant_id = o.tenant_id and w.id = o.warehouse_id
+      where o.tenant_id = ${tenantId}
+      order by o.created_at desc, o.id desc`;
+    const asnHeaderShape = (tx: postgres.TransactionSql<Record<string, unknown>>) => tx`
+      select a.id, coalesce(t.line_count, 0)::int as "lineCount"
+      from advance_shipment_notices a
+      join warehouses w on w.tenant_id = a.tenant_id and w.id = a.warehouse_id
+      left join lateral (
+        select count(*) as line_count from asn_lines al where al.tenant_id = a.tenant_id and al.asn_id = a.id
+      ) t on true
+      where a.tenant_id = ${tenantId}
+      order by a.created_at desc, a.id desc`;
+    const asnLineShape = (tx: postgres.TransactionSql<Record<string, unknown>>) => tx`
+      select al.asn_id as "asnId" from asn_lines al
+      join advance_shipment_notices a on a.tenant_id = al.tenant_id and a.id = al.asn_id
+      left join skus s on s.tenant_id = al.tenant_id and s.id = al.sku_id
+      where al.tenant_id = ${tenantId}`;
+    const poHeaderShape = (tx: postgres.TransactionSql<Record<string, unknown>>) => tx`
+      select p.id from purchase_orders p
+      join warehouses w on w.tenant_id = p.tenant_id and w.id = p.warehouse_id
+      where p.tenant_id = ${tenantId}
+      order by p.created_at desc, p.id desc`;
+
+    async function idsOf(table: 'orders' | 'purchase_orders', clientId: string): Promise<string[]> {
+      const rows = await sql`select id from ${sql(table)} where tenant_id = ${tenantId} and client_id = ${clientId}`;
+      return rows.map((row) => row.id as string).sort();
+    }
+
+    it('order, ASN and PO header lists and ASN lines: client-stamped, only client A’s rows', async () => {
+      const orders = ((await stamped(orderHeaderShape, clientA)) as { id: string }[]).map((row) => row.id).sort();
+      expect(orders).toEqual(await idsOf('orders', clientA));
+      expect(orders.length).toBeGreaterThan(0);
+      const pos = ((await stamped(poHeaderShape, clientA)) as { id: string }[]).map((row) => row.id).sort();
+      expect(pos).toEqual(await idsOf('purchase_orders', clientA));
+      expect(pos.length).toBeGreaterThan(0);
+      // (Earlier probe tests add lines to A's ASN — count them as the superuser.)
+      const ownLines = Number((await sql`select count(*)::int as n from asn_lines where asn_id = ${asnIds.get(clientA)!}`)[0]!.n);
+      const allLines = Number((await sql`select count(*)::int as n from asn_lines where tenant_id = ${tenantId}`)[0]!.n);
+      expect(allLines).toBeGreaterThan(ownLines);
+      const asns = (await stamped(asnHeaderShape, clientA)) as { id: string; lineCount: number }[];
+      expect(asns).toEqual([{ id: asnIds.get(clientA)!, lineCount: ownLines }]);
+      const asnLines = (await stamped(asnLineShape, clientA)) as { asnId: string }[];
+      expect(asnLines.map((row) => row.asnId)).toEqual(Array.from({ length: ownLines }, () => asnIds.get(clientA)!));
+      // Meaningful: unstamped, both clients' rows are there.
+      const allOrders = ((await stamped(orderHeaderShape, null)) as unknown[]).length;
+      expect(allOrders).toBe((await idsOf('orders', clientA)).length + (await idsOf('orders', clientB)).length);
+      expect(((await stamped(poHeaderShape, null)) as unknown[]).length).toBe(
+        (await idsOf('purchase_orders', clientA)).length + (await idsOf('purchase_orders', clientB)).length,
+      );
+      expect(((await stamped(asnHeaderShape, null)) as unknown[]).length).toBe(2);
+      expect(((await stamped(asnLineShape, null)) as unknown[]).length).toBe(allLines);
+    });
+
+    it('stock: client-stamped, the shape returns ONLY client A’s SKU — the shared bin and B’s reservation never leak', async () => {
+      const rows = (await stamped(stockShape, clientA)) as { skuId: string; onHand: string; allocated: string }[];
+      expect(rows.map((row) => ({ skuId: row.skuId, onHand: Number(row.onHand), allocated: Number(row.allocated) }))).toEqual([
+        { skuId: skuAId, onHand: 5000, allocated: 1000 },
+      ]);
+      // Meaningful: the operator shape (no client stamp) sees BOTH clients'
+      // rows — the sibling's stock shares the same bin.
+      const all = (await stamped(stockShape, null)) as { skuId: string }[];
+      expect(new Set(all.map((row) => row.skuId))).toEqual(new Set([skuAId, skuBId]));
+    });
+
+    it('order lines and PO lines: reached only through the stamped parent, only client A’s', async () => {
+      const own = lineIds.get(clientA)!;
+      const orderLines = (await stamped(orderLineShape, clientA)) as { id: string }[];
+      expect(orderLines.map((row) => row.id)).toEqual([own.orderLine]);
+      const poLines = (await stamped(poLineShape, clientA)) as { id: string }[];
+      expect(poLines.map((row) => row.id)).toEqual([own.poLine]);
+      // Meaningful: unstamped, both clients' lines are there.
+      expect(((await stamped(orderLineShape, null)) as unknown[]).length).toBe(2);
+      expect(((await stamped(poLineShape, null)) as unknown[]).length).toBe(2);
+    });
+
+    it('invoices: client-stamped, only client A’s ISSUED invoice and its line — never B’s, never a draft', async () => {
+      const own = invoiceIds.get(clientA)!;
+      const invoices = (await stamped(invoiceShape, clientA)) as { id: string }[];
+      expect(invoices.map((row) => row.id)).toEqual([own.issued]);
+      const lines = (await stamped(invoiceLineShape, clientA)) as { id: string }[];
+      expect(lines.map((row) => row.id)).toEqual([own.issued]);
+      // Meaningful: unstamped, all four invoices (two clients × issued + draft).
+      expect(((await stamped(invoiceShape, null)) as unknown[]).length).toBe(4);
+    });
+  });
 });

@@ -60,10 +60,16 @@ export const tenants = pgTable('tenants', {
 export type Tenant = typeof tenants.$inferSelect;
 
 /**
- * The four coarse roles (Story 1.5): Owner, Ops Manager, Operator, Accountant.
- * Authority is a per-command DB read of this column — never a JWT claim.
+ * The coarse roles (Story 1.5): Owner, Ops Manager, Operator, Accountant —
+ * and (Story 21-7, migration 0065) `client`, the client-portal persona,
+ * paired with `users.client_id` by the `users_client_role_pairing` CHECK and
+ * holding NO capabilities. Authority (capabilities) is a per-command DB read
+ * of this column — never a JWT claim. The one exception (AD-4 amended by
+ * 21-7, for the fence only): a portal user's session token carries a
+ * `client_id` claim, used solely to refuse operator routes at the guard; the
+ * column it mirrors is written only at invite and never changes.
  */
-export const userRoleEnum = pgEnum('user_role', ['owner', 'ops_manager', 'operator', 'accountant']);
+export const userRoleEnum = pgEnum('user_role', ['owner', 'ops_manager', 'operator', 'accountant', 'client']);
 
 export type UserRole = (typeof userRoleEnum.enumValues)[number];
 
@@ -99,8 +105,9 @@ export const users = pgTable('users', {
   /**
    * Story 21-1 — the client-portal persona arm (AD-23): null = a member of
    * the tenant's own staff; set = a client-portal user. Nullable BY DESIGN
-   * (the attribute, not a scoping column) and INERT until a portal session
-   * exists (21-2/21-7 own the persona question and the RLS clause).
+   * (the attribute, not a scoping column). Story 21-7: set exactly when
+   * `role = 'client'` (the `users_client_role_pairing` CHECK, 0065), written
+   * ONLY by the invite insert and never updated (the architecture test).
    */
   clientId: uuid('client_id'),
   inviteTokenHash: text('invite_token_hash'),

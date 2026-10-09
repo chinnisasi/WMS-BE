@@ -8,6 +8,7 @@ import {
   type DeviceSession,
   type TenantSession,
 } from './jwt-session';
+import { operatorSurfaceRefused } from './tenant-session.guard';
 
 export interface AnySessionRequest {
   headers: Record<string, unknown>;
@@ -19,12 +20,11 @@ export interface AnySessionRequest {
  * record route accepts a WEB session (the 12-5 surface, unchanged) or a
  * DEVICE session (the floor's arm). The branch key is frozen and
  * load-bearing — the **presence of the `device_id` claim**, read from the
- * token's unverified payload. A badge-in token verifies under the tenant-JWT
- * verifier too (`verifyTenantSession` ignores `device_id` entirely — the
- * PENDING-1 accident), so a composite that tries the tenant family first
- * would silently route every device token down the web arm and revocation
- * would never bite, with every typed-token test staying green. Branching on
- * the claim routes device tokens to device semantics (the command re-resolves
+ * token's unverified payload. Before 21-7 a badge-in token also verified
+ * under the tenant-JWT verifier (the PENDING-1 accident), so a composite that
+ * tried the tenant family first would have routed device tokens down the web
+ * arm; since 21-7 `verifyTenantSession` refuses any token carrying
+ * `device_id`. Branching on the claim routes device tokens to device semantics (the command re-resolves
  * the device row in its tenant transaction, so revocation works) and web
  * tokens to web semantics; both verifiers reject the other family by shape.
  */
@@ -70,6 +70,11 @@ export class AnySessionGuard implements CanActivate {
       : mapNullable('web', verifyTenantSession(token, secret));
     if (session === null) {
       throw unauthenticated('The session token is invalid or expired.');
+    }
+    // Story 21-7 — the fence on the web arm (the device verifier already
+    // rejects any token carrying `client_id`).
+    if (session.family === 'web' && session.session.clientId !== null) {
+      throw operatorSurfaceRefused();
     }
     request.anySession = session;
     return true;

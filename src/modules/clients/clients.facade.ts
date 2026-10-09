@@ -5,6 +5,8 @@ import type { Database } from '../../shared/db/db';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { MAX_CLIENT_LIST, clients, type ClientStatus } from './clients.schema';
+import type { UserRole, UserStatus } from '../../shared/db/schema';
+import { getMemberPortalFactsIn } from '../tenancy/tenancy.service';
 
 /** One client as every read of this module returns it. */
 export interface ClientSnapshot {
@@ -84,6 +86,11 @@ export class ClientsFacade {
    */
   async listClients(tenantId: string): Promise<ClientSnapshot[]> {
     return withTenantTransaction(this.db, tenantId, (tx) => listClientsInTx(tx, tenantId));
+  }
+
+  /** Story 21-7 — `GET …/portal/me` (see `portalMeIn`). */
+  async portalMe(tenantId: string, userId: string, clientId: string): Promise<PortalMe> {
+    return portalMeIn(this.db, tenantId, userId, clientId);
   }
 }
 
@@ -273,5 +280,89 @@ export function clientNotFound(clientId: string): ProblemException {
     404,
     'Client not found',
     `No client with id "${clientId}" exists in this tenant.`,
+  );
+}
+
+/** Story 21-7 — what a client-portal session knows about its client. */
+export interface SessionClientFacts {
+  readonly id: string;
+  readonly code: string;
+  readonly name: string;
+  readonly status: ClientStatus;
+}
+
+/**
+ * Story 21-7 — the client a portal user belongs to, read by tenant AND id,
+ * on whichever runner the caller holds: sign-in's auth-time connection (it
+ * has no tenant transaction yet — the tenant read beside it is the same
+ * shape) or a tenant transaction. Null when absent. A read, never a lock.
+ */
+export async function readSessionClientIn(
+  runner: Pick<TenantTx, 'select'> | Pick<Database, 'select'>,
+  tenantId: string,
+  clientId: string,
+): Promise<SessionClientFacts | null> {
+  const rows = await (runner as Pick<TenantTx, 'select'>)
+    .select({ id: clients.id, code: clients.code, name: clients.name, status: clients.status })
+    .from(clients)
+    .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
+    .limit(1);
+  const row = rows[0];
+  return row === undefined ? null : { ...row, status: row.status as ClientStatus };
+}
+
+/**
+ * Story 21-7 — 403 `client-suspended`: a client-portal user whose client is
+ * not `active` (suspended or departed). Sign-in answers it AFTER the password
+ * check (a wrong password stays 401); the portal guard answers it on every
+ * request, so suspension bites before the 15-minute token expires. Distinct
+ * from 409 `client-not-active` (a state conflict on a command's target).
+ */
+export function clientSuspended(): ProblemException {
+  return new ProblemException(
+    'client-suspended',
+    403,
+    'Client portal access is suspended',
+    'This client brand’s portal access is suspended — contact the warehouse.',
+  );
+}
+
+/** Story 21-7 — `GET …/portal/me`: the portal user and its client, exact keys. */
+export interface PortalMe {
+  readonly user: {
+    readonly id: string;
+    readonly email: string;
+    readonly role: UserRole;
+    readonly status: UserStatus;
+    readonly clientId: string;
+  };
+  readonly client: { readonly id: string; readonly code: string; readonly name: string };
+}
+
+/**
+ * Story 21-7 — the portal's own `me` (the operator `/me` stays behind the
+ * operator fence): re-read in a transaction stamped with the client, after
+ * `PortalSessionGuard` already confirmed both rows. A row gone between the
+ * guard and here reads as the guard's own refusals.
+ */
+export async function portalMeIn(db: Database, tenantId: string, userId: string, clientId: string): Promise<PortalMe> {
+  return withTenantTransaction(
+    db,
+    tenantId,
+    async (tx) => {
+      const user = await getMemberPortalFactsIn(tx, tenantId, userId);
+      if (user === null || user.status !== 'active' || user.clientId !== clientId) {
+        throw new ProblemException('unauthenticated', 401, 'Authentication required', 'The session no longer describes a client-portal user — sign in again.');
+      }
+      const client = await readSessionClientIn(tx, tenantId, clientId);
+      if (client === null || client.status !== 'active') {
+        throw clientSuspended();
+      }
+      return {
+        user: { id: user.id, email: user.email, role: user.role, status: user.status as UserStatus, clientId },
+        client: { id: client.id, code: client.code, name: client.name },
+      };
+    },
+    { clientId },
   );
 }

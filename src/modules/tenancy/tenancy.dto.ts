@@ -237,9 +237,24 @@ export class TenantRegistrationResponse {
   owner!: OwnerUserResponse;
 }
 
-/** The four coarse roles (spec 1.5) — validated, never free-form. */
-export const USER_ROLES = ['owner', 'ops_manager', 'operator', 'accountant'] as const;
+/**
+ * The coarse roles (spec 1.5) — validated, never free-form. Story 21-7 adds
+ * `client`, the client-portal persona (an invite names its client; a user
+ * response carries it). Every response DTO naming a role derives from THIS
+ * tuple (`BadgeInOperatorResponse` included), so the generated clients see
+ * one vocabulary.
+ */
+export const USER_ROLES = ['owner', 'ops_manager', 'operator', 'accountant', 'client'] as const;
 export type UserRoleDto = (typeof USER_ROLES)[number];
+
+/**
+ * Story 21-7 — the roles a role change may ASSIGN: the four staff roles. A
+ * portal user is created only by an invite naming its client (`client` is
+ * never assigned, and a client user's role never changes — the command
+ * refuses the target too), so `users.client_id` cannot go stale.
+ */
+export const ASSIGNABLE_ROLES = ['owner', 'ops_manager', 'operator', 'accountant'] as const;
+export type AssignableRoleDto = (typeof ASSIGNABLE_ROLES)[number];
 
 export const USER_STATUSES = ['invited', 'active'] as const;
 
@@ -256,6 +271,15 @@ export class UserResponse {
   @ApiProperty({ enum: USER_STATUSES, example: 'active' })
   status!: string;
 
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    description:
+      'Story 21-7 — the client brand a client-portal user belongs to (role `client`); null for the tenant’s own staff',
+  })
+  clientId!: string | null;
+
   @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
   createdAt!: string;
 }
@@ -269,12 +293,22 @@ export class InviteUserDto {
   @ApiProperty({ enum: USER_ROLES, example: 'operator' })
   @IsIn(USER_ROLES)
   role!: UserRoleDto;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      'Story 21-7 — required when role is `client` (the client brand the portal user belongs to); refused for every other role',
+  })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
 }
 
 export class SetUserRoleDto {
-  @ApiProperty({ enum: USER_ROLES, example: 'ops_manager' })
-  @IsIn(USER_ROLES)
-  role!: UserRoleDto;
+  @ApiProperty({ enum: ASSIGNABLE_ROLES, example: 'ops_manager' })
+  @IsIn(ASSIGNABLE_ROLES)
+  role!: AssignableRoleDto;
 }
 
 export class AcceptInviteDto {
@@ -318,8 +352,23 @@ export class MeResponse {
   user!: UserResponse;
 }
 
+/** Story 21-7 — the client brand a portal session belongs to (no tax details, no status). */
+export class SessionClientResponse {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ example: 'BRAND-A' })
+  code!: string;
+
+  @ApiProperty({ example: 'Brand A Apparel' })
+  name!: string;
+}
+
 export class SignInResponse {
-  @ApiProperty({ description: 'HS256 session token (15 min), claims: sub + tenant_id' })
+  @ApiProperty({
+    description:
+      'HS256 session token (15 min), claims: sub + tenant_id (+ client_id for a client-portal user, story 21-7)',
+  })
   accessToken!: string;
 
   @ApiProperty({ example: 'Bearer' })
@@ -333,6 +382,14 @@ export class SignInResponse {
 
   @ApiProperty({ type: UserResponse })
   user!: UserResponse;
+
+  @ApiProperty({
+    type: SessionClientResponse,
+    nullable: true,
+    description:
+      'Story 21-7 — the client brand of a client-portal user (the portal shell prints its name); null for the tenant’s own staff',
+  })
+  client!: SessionClientResponse | null;
 }
 
 export class WarehouseResponse {

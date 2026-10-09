@@ -456,6 +456,13 @@
       "when": 1791479557233,
       "tag": "0064_advance_shipment_notices",
       "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1791560000000,
+      "tag": "0065_portal_client_role",
+      "breakpoints": true
     }
   ]
 }

@@ -17,7 +17,7 @@ export const CurrentSession = createParamDecorator(
 );
 
 /**
- * Session transport for warehouse endpoints (spec decision): a valid,
+ * Session transport for operator endpoints (spec decision): a valid,
  * unexpired HS256 Bearer token minted by sign-in. Transport only — the token
  * proves *who* is calling; tenant-ownership of the path is enforced at the
  * controller boundary (`assertOwnTenant`), so any future non-HTTP caller of a
@@ -37,9 +37,27 @@ export class TenantSessionGuard implements CanActivate {
     if (!session) {
       throw unauthenticated('The session token is invalid or expired.');
     }
+    // Story 21-7 — the fence: a client-portal token never opens an operator
+    // route. One check here covers every route behind this guard, so no
+    // per-controller copy can forget it.
+    if (session.clientId !== null) {
+      throw operatorSurfaceRefused();
+    }
     request.tenantSession = session;
     return true;
   }
+}
+
+/** Story 21-7 — the fence's one refusal (exact detail pinned by test/portal.spec.ts). */
+export const OPERATOR_SURFACE_DETAIL = 'This is an operator surface.';
+
+export function operatorSurfaceRefused(): ProblemException {
+  return new ProblemException(
+    'role-denied',
+    403,
+    'Role lacks the required capability',
+    OPERATOR_SURFACE_DETAIL,
+  );
 }
 
 export function requireTenantSession(request: TenantSessionRequest): TenantSession {

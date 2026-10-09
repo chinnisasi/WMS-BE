@@ -351,7 +351,23 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
   // `invoice.generate`). Everything else stays read-only.
   // Story 21-5: client invoices and the client tax details (finance work).
   accountant: new Set<Capability>(['eway.manage', 'rates.manage', 'billing.invoice']),
+  // Story 21-7 — the client-portal persona (decision 1): a client brand's
+  // own user holds NO capability. Every operator route refuses its session
+  // at the guard (the fence), and the portal is read-only (decision 2).
+  client: new Set<Capability>([]),
 };
+
+/**
+ * Story 21-7 — the roles that may operate a floor device (badge-in, every
+ * device command's per-command role re-read). An ALLOWLIST, never a denylist:
+ * the old `role === 'accountant'` checks admitted any role added later — the
+ * `client` persona first among them (design review #7).
+ */
+export const FLOOR_ROLES = ['owner', 'ops_manager', 'operator'] as const satisfies readonly UserRole[];
+
+export function isFloorRole(role: UserRole | undefined): boolean {
+  return role !== undefined && (FLOOR_ROLES as readonly UserRole[]).includes(role);
+}
 
 /**
  * The single authorization primitive (Story 1.5). Called at **command-service
