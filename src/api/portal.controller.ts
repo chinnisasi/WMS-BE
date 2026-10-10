@@ -22,6 +22,11 @@ import { InboundFacade } from '../modules/inbound/inbound.facade';
 import { BillingFacade } from '../modules/billing/billing.facade';
 import { CatalogFacade } from '../modules/catalog/catalog.facade';
 import { TenancyService } from '../modules/tenancy/tenancy.service';
+import { ReportingFacade } from '../modules/reporting/reporting.facade';
+import { ServiceReportDto, toServiceReportDto } from './reporting.dto';
+// Bound to @Query() — a value import (see the portal.dto import below).
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { ServiceReportQuery } from './reporting.dto';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 // The query classes are bound to @Query() and read by the ValidationPipe
 // through emitDecoratorMetadata — a type-only import would erase them.
@@ -88,6 +93,7 @@ export class PortalController {
     @Inject(BillingFacade) private readonly billing: BillingFacade,
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(TenancyService) private readonly tenancy: TenancyService,
+    @Inject(ReportingFacade) private readonly reporting: ReportingFacade,
   ) {}
 
   @Get(':tenantId/portal/me')
@@ -359,6 +365,46 @@ export class PortalController {
   ): Promise<PortalWarehouseListResponse> {
     assertOwnTenant(session, tenantId);
     return { items: await this.tenancy.portalWarehouses(tenantId, session.clientId) };
+  }
+
+  /**
+   * Story 21-8 — this client's service report (CAP-10): the SAME facade read
+   * as the operator's `GET reporting/clients/{c}/service`, for the session's
+   * own client — so both sides see identical figures. A query `clientId` is
+   * not a member of the query class (`forbidNonWhitelisted` → 400).
+   */
+  @Get(':tenantId/portal/service')
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "This client's service report over an inclusive IST date period — dock-to-stock, pick accuracy and dispatch timeliness (24 h target); identical to the operator's report for this client",
+  })
+  @ApiOkResponse({ type: ServiceReportDto })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      'A from/to that is not a real YYYY-MM-DD date, from after to, a period longer than 366 days, a malformed warehouseId, or any other query parameter — a clientId included (validation-failed)',
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({ status: 403, ...problemJsonResponse(PORTAL_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such warehouse in this tenant (not-found)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The report did not finish within its 5 s budget — try a shorter period (report-unavailable)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async service(
+    @Param('tenantId') tenantId: string,
+    @CurrentPortalSession() session: PortalSession,
+    @Query() query: ServiceReportQuery,
+  ): Promise<ServiceReportDto> {
+    assertOwnTenant(session, tenantId);
+    return toServiceReportDto(
+      await this.reporting.portalServiceReport(tenantId, session.clientId, {
+        from: query.from,
+        to: query.to,
+        warehouseId: query.warehouseId ?? null,
+      }),
+    );
   }
 
   @Get(':tenantId/portal/invoices')

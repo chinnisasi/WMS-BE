@@ -1345,4 +1345,163 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       expect(await stamped(null)).toContain(skuBId);
     });
   });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Story 21-8 — the SERVICE REPORT's query shapes (`reporting/service.ts`),
+  // proved at the database. `portalServiceReport` runs them in a transaction
+  // stamped with the session's client; here each runs as `wms_rls_probe`
+  // under client A's stamp with ONLY the `client_id = $client` literals
+  // removed — every join kept, because the stamp protects only the
+  // client-policied tables (`skus`, `orders`, `ledger_events`) and each
+  // shape reaches the rest (placements, GRNs, picklist lines, pack failures)
+  // only through one of them. The RLS layer alone must return A's rows only.
+  // ──────────────────────────────────────────────────────────────────────────
+  describe('story 21-8: the service report shapes isolate with RLS alone (joins kept, client literal removed)', () => {
+    let probe: postgres.Sql<Record<string, unknown>>;
+    const from = new Date(Date.now() - 3 * 86_400_000).toISOString();
+    const asOf = new Date(Date.now() + 60_000).toISOString();
+    /** Per client: the rows each shape must return under that client's stamp. */
+    const own = new Map<string, { placement: string; order: string; line: string; failure: string; late: string }>();
+
+    beforeAll(async () => {
+      await ensureProbeRole();
+      probe = postgres(probeUrl(), { max: 1 });
+      const actorId = uuidv7();
+      const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000).toISOString();
+      const anHourAgo = new Date(Date.now() - 3_600_000).toISOString();
+      let seq = Number((await sql`select coalesce(max(seq), 0)::bigint as n from ledger_events where tenant_id = ${tenantId} and warehouse_id = ${warehouseId}`)[0]!.n);
+      // One cross-client wave: both clients' picklist lines share it.
+      const waveId = uuidv7();
+      const picklistId = uuidv7();
+      for (const [clientId, skuId] of [
+        [clientA, skuAId],
+        [clientB, skuBId],
+      ] as const) {
+        const grnId = uuidv7();
+        const grnLineId = uuidv7();
+        const placement = uuidv7();
+        await sql`insert into goods_receipt_notes (id, tenant_id, warehouse_id, code, po_id, blind_reason_code, status, device_id, recorded_by, occurred_at, recorded_at, created_at)
+          values (${grnId}, ${tenantId}, ${warehouseId}, ${'CI-GRN-' + ulid().slice(14)}, null, 'other', 'recorded', ${uuidv7()}, ${actorId}, ${twoDaysAgo}, ${twoDaysAgo}, ${twoDaysAgo})`;
+        await sql`insert into goods_receipt_lines (id, tenant_id, grn_id, sku_id, qty, applied_qty)
+          values (${grnLineId}, ${tenantId}, ${grnId}, ${skuId}, 1000, 1000)`;
+        await sql`insert into putaway_placements (id, tenant_id, warehouse_id, grn_id, grn_line_id, sku_id, qty, from_bin_id, to_bin_id, placed_by, placed_at, device_id, created_at)
+          values (${placement}, ${tenantId}, ${warehouseId}, ${grnId}, ${grnLineId}, ${skuId}, 1000, ${binId}, ${binId}, ${actorId}, ${anHourAgo}, ${uuidv7()}, ${anHourAgo})`;
+        // A dispatched order (one line, short-picked in the shared wave) …
+        const order = uuidv7();
+        const line = uuidv7();
+        await sql`insert into orders (id, tenant_id, client_id, warehouse_id, status, source, created_at)
+          values (${order}, ${tenantId}, ${clientId}, ${warehouseId}, 'dispatched', 'manual', ${twoDaysAgo})`;
+        await sql`insert into order_lines (id, tenant_id, order_id, sku_id, qty) values (${line}, ${tenantId}, ${order}, ${skuId}, 2000)`;
+        await sql`insert into picklist_lines (id, tenant_id, picklist_id, wave_id, order_id, order_line_id, sku_id, bin_id, bin_code, qty, shortfall_qty, reason_code, slice_seq, walk_seq, status)
+          values (${uuidv7()}, ${tenantId}, ${picklistId}, ${waveId}, ${order}, ${line}, ${skuId}, ${binId}, 'A-01-01', 2000, 2000, 'bin-empty', 0, 0, 'short')`;
+        seq += 1;
+        await sql`
+          insert into ledger_events (
+            id, tenant_id, client_id, warehouse_id, seq, type, schema_version, sku_id, quantity_delta,
+            actor_user_id, occurred_at, recorded_at, reference_doc, prev_hash, event_hash
+          ) values (
+            ${uuidv7()}, ${tenantId}, ${clientId}, ${warehouseId}, ${seq}, 'dispatch.dispatched', 1, ${skuId}, 0,
+            ${actorId}, ${anHourAgo}, ${anHourAgo}, ${sql.json({ kind: 'dispatch', orderId: order, orderLineId: line, dispatchedQty: 2 })}, ${GENESIS}, ${'svc-hash-' + clientId}
+          )`;
+        const failure = uuidv7();
+        await sql`insert into pack_verification_failures (id, tenant_id, warehouse_id, order_id, entry, actor_user_id, mismatch, created_at)
+          values (${failure}, ${tenantId}, ${warehouseId}, ${order}, 'tenant', ${actorId}, ${sql.json({ seeded: true })}, ${anHourAgo})`;
+        // … and an undispatched order received two days ago (the backlog).
+        const late = uuidv7();
+        await sql`insert into orders (id, tenant_id, client_id, warehouse_id, status, source, created_at)
+          values (${late}, ${tenantId}, ${clientId}, ${warehouseId}, 'accepted', 'manual', ${twoDaysAgo})`;
+        own.set(clientId, { placement, order, line, failure, late });
+      }
+    });
+
+    afterAll(async () => {
+      await probe?.end();
+    });
+
+    type Tx = postgres.TransactionSql<Record<string, unknown>>;
+
+    // Dock-to-stock MINUS `s.client_id = $client` (the SKU join kept).
+    const dockShape = (tx: Tx) => tx`
+      select pp.id from putaway_placements pp
+      join goods_receipt_notes g on g.id = pp.grn_id and g.tenant_id = pp.tenant_id
+      join skus s on s.id = pp.sku_id and s.tenant_id = pp.tenant_id
+      where pp.tenant_id = ${tenantId}
+        and pp.created_at >= ${from}::timestamptz and pp.created_at < ${asOf}::timestamptz
+        and pp.created_at >= g.created_at`;
+
+    // The dispatched CTE (billing's predicate) MINUS `le.client_id = $client`
+    // and `o.client_id = $client` — the earlier-dispatch probe's
+    // `earlier.client_id = le.client_id` is a join, kept — with the lines and
+    // their short-picked subset.
+    const dispatchedShape = (tx: Tx) => tx`
+      with ev as (
+        select le.reference_doc ->> 'orderId' as order_id, le.reference_doc ->> 'orderLineId' as order_line_id, le.recorded_at
+        from ledger_events le
+        where le.tenant_id = ${tenantId}
+          and le.type = 'dispatch.dispatched'
+          and le.recorded_at >= ${from}::timestamptz and le.recorded_at < ${asOf}::timestamptz
+          and not exists (
+            select 1 from ledger_events earlier
+            where earlier.reference_doc ? 'orderId'
+              and earlier.reference_doc ->> 'orderId' = le.reference_doc ->> 'orderId'
+              and earlier.tenant_id = le.tenant_id
+              and earlier.client_id = le.client_id
+              and earlier.type = 'dispatch.dispatched'
+              and earlier.recorded_at < ${from}::timestamptz
+          )
+      ),
+      dispatched as (
+        select ev.order_id, min(ev.recorded_at) as dispatched_at, o.created_at as received_at
+        from ev join orders o on o.tenant_id = ${tenantId} and o.id = ev.order_id::uuid
+        group by ev.order_id, o.created_at
+      )
+      select ev.order_id as "orderId", ev.order_line_id as "lineId",
+             exists (select 1 from picklist_lines pl
+                     where pl.tenant_id = ${tenantId} and pl.order_line_id = ev.order_line_id::uuid and pl.reason_code is not null) as short
+      from ev join dispatched d on d.order_id = ev.order_id`;
+
+    // Pack failures MINUS `o.client_id = $client` (the orders join kept).
+    const packShape = (tx: Tx) => tx`
+      select f.id from pack_verification_failures f
+      join orders o on o.tenant_id = f.tenant_id and o.id = f.order_id
+      where f.tenant_id = ${tenantId} and f.created_at >= ${from}::timestamptz and f.created_at < ${asOf}::timestamptz`;
+
+    // The backlog MINUS `o.client_id = $client` (the dispatch probe's
+    // `le.client_id = o.client_id` is a join, kept).
+    const lateShape = (tx: Tx) => tx`
+      select o.id from orders o
+      where o.tenant_id = ${tenantId}
+        and o.created_at >= ${from}::timestamptz and o.created_at < ${asOf}::timestamptz
+        and o.status <> 'cancelled'
+        and o.created_at <= ${asOf}::timestamptz - interval '24 hours'
+        and not exists (
+          select 1 from ledger_events le
+          where le.reference_doc ? 'orderId' and le.reference_doc ->> 'orderId' = o.id::text
+            and le.tenant_id = o.tenant_id and le.client_id = o.client_id
+            and le.type = 'dispatch.dispatched' and le.recorded_at < ${asOf}::timestamptz
+        )`;
+
+    async function stamped<T>(shape: (tx: Tx) => PromiseLike<unknown>, client: string | null): Promise<T[]> {
+      const rows = await probe.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+        if (client !== null) await tx`select set_config('app.client_id', ${client}, true)`;
+        return (await shape(tx)) as unknown[];
+      });
+      return rows as unknown as T[];
+    }
+
+    it('every shape under client A’s stamp returns only A’s rows — and unstamped, both clients’', async () => {
+      const a = own.get(clientA)!;
+      const b = own.get(clientB)!;
+      expect((await stamped<{ id: string }>(dockShape, clientA)).map((row) => row.id)).toEqual([a.placement]);
+      expect(await stamped(dispatchedShape, clientA)).toEqual([{ orderId: a.order, lineId: a.line, short: true }]);
+      expect((await stamped<{ id: string }>(packShape, clientA)).map((row) => row.id)).toEqual([a.failure]);
+      expect((await stamped<{ id: string }>(lateShape, clientA)).map((row) => row.id)).toEqual([a.late]);
+      // Meaningful: the operator shape (no stamp) sees B's rows in every shape.
+      expect((await stamped<{ id: string }>(dockShape, null)).map((row) => row.id).sort()).toEqual([a.placement, b.placement].sort());
+      expect((await stamped<{ orderId: string }>(dispatchedShape, null)).map((row) => row.orderId).sort()).toEqual([a.order, b.order].sort());
+      expect((await stamped<{ id: string }>(packShape, null)).map((row) => row.id).sort()).toEqual([a.failure, b.failure].sort());
+      expect((await stamped<{ id: string }>(lateShape, null)).map((row) => row.id).sort()).toEqual([a.late, b.late].sort());
+    });
+  });
 });

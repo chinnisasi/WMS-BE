@@ -1,4 +1,4 @@
-import { Controller, Get, Inject, Param, UseGuards } from '@nestjs/common';
+import { Controller, Get, Inject, Param, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiExtraModels, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
@@ -8,7 +8,11 @@ import type { TenantSession } from '../modules/tenancy/jwt-session';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ReportingFacade } from '../modules/reporting/reporting.facade';
 import type { Figure, Overview, SyncConnectionHealth, WindowedFigure } from '../modules/reporting/reporting.facade';
-import { ReportingOverviewResponse } from './reporting.dto';
+import { ReportingOverviewResponse, ServiceReportDto, toServiceReportDto } from './reporting.dto';
+// The query class is bound to @Query() and read by the ValidationPipe through
+// emitDecoratorMetadata — a type-only import would erase it.
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { ServiceReportQuery } from './reporting.dto';
 import type { ReportingFigureDto, ReportingWindowedFigureDto, SyncConnectionHealthDto } from './reporting.dto';
 
 /**
@@ -48,6 +52,55 @@ export class ReportingController {
     assertOwnTenantToken(session.tenantId, tenantId);
     assertUuidParam(warehouseId, 'warehouseId');
     return toOverviewResponse(await this.reporting.overview(tenantId, warehouseId));
+  }
+
+  /**
+   * Story 21-8 — one client's service report (CAP-10). Member-open like the
+   * Overview: floor-performance figures with no money in them. Any client of
+   * the tenant — a suspended one and the tenant's own (`self`) included.
+   * The portal's `GET portal/service` serves the same facade read.
+   */
+  @Get(':tenantId/reporting/clients/:clientId/service')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "One client's service report over an inclusive IST date period: dock-to-stock, pick accuracy and dispatch timeliness (against a fixed 24 h target), from the ledger and its same-transaction projections",
+    description:
+      'The window is [IST midnight of from, min(IST midnight after to, asOf)) on server-stamped columns. Ratios are 0–1 to 4 dp and null with an empty denominator; medians are minutes to 1 dp. ' +
+      '`dispatchTimeliness.ordersDispatched` equals the dispatched-order count the client is invoiced for. One transaction with a 5 s budget for the whole read (every statement runs under the time left) — past it, 503 and nothing partial. The client-portal route `GET /tenants/{t}/portal/service` answers the identical body for its own client.',
+  })
+  @ApiOkResponse({ type: ServiceReportDto })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      'A malformed clientId or warehouseId, a from/to that is not a real YYYY-MM-DD date, from after to, or a period longer than 366 days (validation-failed)',
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({
+    status: 403,
+    ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session — "This is an operator surface." (role-denied)'),
+  })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such client, or no such warehouse, in this tenant (not-found)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The report did not finish within its 5 s budget — try a shorter period (report-unavailable)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async clientService(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: ServiceReportQuery,
+  ): Promise<ServiceReportDto> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(clientId, 'clientId');
+    return toServiceReportDto(
+      await this.reporting.serviceReport(tenantId, clientId, {
+        from: query.from,
+        to: query.to,
+        warehouseId: query.warehouseId ?? null,
+      }),
+    );
   }
 }
 
@@ -145,7 +198,7 @@ function assertOwnTenantToken(tokenTenantId: string, tenantId: string): void {
 }
 
 /** A uuid path param fails 400 (never a 500 from the `::uuid` cast) — the outbound controller's shape. */
-function assertUuidParam(value: string, name: 'warehouseId'): void {
+function assertUuidParam(value: string, name: 'warehouseId' | 'clientId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

@@ -1749,6 +1749,8 @@ describe('architecture: the client portal (story 21-7)', () => {
     // Story 21-7b — the announce form's two reads.
     { file: join(SRC_ROOT, 'modules', 'catalog', 'catalog.facade.ts'), methods: ['portalSkus'] },
     { file: join(SRC_ROOT, 'modules', 'tenancy', 'tenancy.service.ts'), methods: ['portalWarehouses'] },
+    // Story 21-8 — the client's service report (the operator read's twin, stamped).
+    { file: join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), methods: ['portalServiceReport'] },
   ];
 
   /** The body of one method or function: from its declaration to the next top-level member. */
@@ -1793,6 +1795,7 @@ describe('architecture: the client portal (story 21-7)', () => {
         'portalMe',
         'portalSkus',
         'portalWarehouses',
+        'portalServiceReport',
       ].sort(),
     );
   });

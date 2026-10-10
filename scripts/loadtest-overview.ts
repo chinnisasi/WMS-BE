@@ -23,7 +23,11 @@
  *      invoices + lines + e-way bills; both 9-1 fact tables;
  *   5. reads `GET …/reporting/overview` `--reads` times (after a warm-up) and
  *      reports min / median / p95 / max overall AND per tile (each tile run
- *      timed in-process), plus how many reads came back `stale`.
+ *      timed in-process), plus how many reads came back `stale`;
+ *   6. (story 21-8) reads the per-client service report for the seeded
+ *      (self) client over a 366-day period ending today — the longest period
+ *      it admits — `--reads` times, and reports its min / median / p95 / max
+ *      against the read's 5 s statement budget.
  *
  * Usage (from wms-be, local compose Postgres :55432 + Valkey :56379):
  *   bun scripts/loadtest-overview.ts [--events 25000] [--batch 500] [--reads 40] [--keep-db]
@@ -272,9 +276,11 @@ async function main(): Promise<void> {
       const placedAt = new Date(Date.parse(at) + 45 * 60_000).toISOString();
       const grnId = uuidv7();
       const lineId = uuidv7();
+      // 0064's blind pairing: a non-blind GRN names its document (a synthetic PO id — no FKs).
       await direct`
         insert into goods_receipt_notes (id, tenant_id, warehouse_id, code, po_id, blind_reason_code, device_id, recorded_by, occurred_at, recorded_at, created_at, updated_at)
-        values (${grnId}, ${tenantId}, ${warehouseId}, ${`GRN-OVL-${index}`}, null, ${index % 4 === 0 ? 'unannounced-delivery' : null},
+        values (${grnId}, ${tenantId}, ${warehouseId}, ${`GRN-OVL-${index}`},
+          ${index % 4 === 0 ? null : uuidv7()}, ${index % 4 === 0 ? 'unannounced-delivery' : null},
           ${deviceId}, ${ownerId}, ${at}, ${at}, ${at}, ${at})`;
       await direct`
         insert into goods_receipt_lines (id, tenant_id, grn_id, sku_id, qty, applied_qty, created_at, updated_at)
@@ -339,12 +345,14 @@ async function main(): Promise<void> {
       }
     }
     const grnRows = (await direct`
-      select g.id as grn_id, l.id as line_id, l.sku_id, g.created_at::text as at from goods_receipt_notes g
-      join goods_receipt_lines l on l.grn_id = g.id where g.tenant_id = ${tenantId}`) as unknown as {
-      grn_id: string; line_id: string; sku_id: string; at: string;
+      select g.id as grn_id, g.po_id, l.id as line_id, l.sku_id, g.created_at::text as at from goods_receipt_notes g
+      join goods_receipt_lines l on l.grn_id = g.id where g.tenant_id = ${tenantId} and g.po_id is not null`) as unknown as {
+      grn_id: string; po_id: string; line_id: string; sku_id: string; at: string;
     }[];
+    // 0064's document pair: an over-receipt names its PO and PO line.
     const overRows = grnRows.filter((_, index) => index % 5 === 0).map((row, index) => ({
       id: uuidv7(), tenant_id: tenantId, warehouse_id: warehouseId, grn_id: row.grn_id, grn_line_id: row.line_id, sku_id: row.sku_id,
+      po_id: row.po_id, po_line_id: uuidv7(),
       excess_qty: 1000, status: index % 2 === 0 ? 'pending' : 'approved', requested_by: ownerId, requested_at: row.at, created_at: row.at, updated_at: row.at,
     }));
     if (overRows.length > 0) await direct`insert into over_receipts ${direct(overRows)}`;
@@ -437,6 +445,40 @@ async function main(): Promise<void> {
       if ((answer.body as { stale: boolean }).stale) stale += 1;
     }
     const sorted = [...durations].sort((a, b) => a - b);
+
+    // ── story 21-8: the service report over its longest period ────────────
+    // The seeded dispatch events name synthetic orders; give each one its
+    // `orders` row (received 6 h before, so the timeliness join runs) and a
+    // short-picked picklist line for every fourth line, AFTER the Overview
+    // reads above (their figures are unaffected).
+    await direct`
+      insert into orders (id, tenant_id, client_id, warehouse_id, status, source, created_at, updated_at)
+      select (le.reference_doc ->> 'orderId')::uuid, le.tenant_id, le.client_id, le.warehouse_id, 'dispatched', 'manual',
+             le.recorded_at - interval '6 hours', le.recorded_at
+      from ledger_events le
+      where le.tenant_id = ${tenantId} and le.type = 'dispatch.dispatched'`;
+    await direct`
+      insert into picklist_lines (id, tenant_id, picklist_id, wave_id, order_id, order_line_id, sku_id, bin_id, bin_code, qty, shortfall_qty, reason_code, slice_seq, walk_seq, status)
+      select gen_random_uuid(), le.tenant_id, gen_random_uuid(), gen_random_uuid(), (le.reference_doc ->> 'orderId')::uuid,
+             (le.reference_doc ->> 'orderLineId')::uuid, le.sku_id, ${binId}, 'A-01-01', 1000, 1000, 'bin-empty', 0, 0, 'short'
+      from ledger_events le
+      where le.tenant_id = ${tenantId} and le.type = 'dispatch.dispatched' and le.seq % 4 = 0`;
+    await direct`analyze`;
+    const today = new Date(Date.now() + 5.5 * 3_600_000).toISOString().slice(0, 10);
+    const yearAgo = new Date(Date.parse(`${today}T00:00:00Z`) - 365 * 86_400_000).toISOString().slice(0, 10);
+    const servicePath = `/tenants/${tenantId}/reporting/clients/${clientId}/service?from=${yearAgo}&to=${today}`;
+    for (let warm = 0; warm < 3; warm += 1) await call(origin, servicePath, 'GET', undefined, token);
+    const serviceDurations: number[] = [];
+    let serviceBody: unknown = null;
+    for (let read = 0; read < args.reads; read += 1) {
+      const started = performance.now();
+      const answer = await call(origin, servicePath, 'GET', undefined, token);
+      serviceDurations.push(performance.now() - started);
+      if (answer.status !== 200) throw new Error(`service report answered ${answer.status}: ${JSON.stringify(answer.body)}`);
+      serviceBody = answer.body;
+    }
+    const serviceSorted = [...serviceDurations].sort((a, b) => a - b);
+
     const report = {
       ledgerEventsIn7d: counted[0]!.n,
       picksRows: pickRows.length,
@@ -468,6 +510,16 @@ async function main(): Promise<void> {
       ),
       budgetP95Ms: 2000,
       withinBudget: percentile(sorted, 95) < 2000,
+      serviceReport366d: {
+        ms: {
+          min: Math.round(serviceSorted[0]!),
+          median: Math.round(percentile(serviceSorted, 50)),
+          p95: Math.round(percentile(serviceSorted, 95)),
+          max: Math.round(serviceSorted.at(-1)!),
+        },
+        statementBudgetMs: 5000,
+        figures: serviceBody,
+      },
     };
     console.log(JSON.stringify(report, null, 2));
   } finally {

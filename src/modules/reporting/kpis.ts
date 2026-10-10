@@ -1,8 +1,10 @@
 import { sql } from 'drizzle-orm';
-import type { SQL } from 'drizzle-orm';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { RECEIVING_BIN_CODE } from '../tenancy/receiving-bin';
 import type { ReportingWindow } from './window';
+// Story 21-8 — the SQL helpers moved to `sql.ts` (the service read shares them); figures unchanged.
+import { countingSinceInTx, n, nf, ratio, rowsOf, ts } from './sql';
+export { TILE_STATEMENT_TIMEOUT_MS, TILE_TX_DEADLINES } from './sql';
 import type { IntegrationCallStatus } from '../../shared/db/schema';
 // The ONE connection-health rule, through the channels facade specifier.
 import { connectionHealth } from '../channels/channels.facade';
@@ -283,51 +285,6 @@ function live(apiPath: string, query: Record<string, string>, reconciles: boolea
   return { value, drill: drill(apiPath, query, reconciles) };
 }
 
-// ── SQL helpers ───────────────────────────────────────────────────────────────
-
-/** The per-statement ceiling: no tile statement runs longer than this. */
-export const TILE_STATEMENT_TIMEOUT_MS = 1500;
-
-/**
- * The runner's overall deadline (epoch ms) for each tile transaction it
- * opened. Every tile statement re-arms the transaction-local
- * `statement_timeout` to `min(1500 ms, time left)` first, so no tile outlives
- * the overview's deadline by more than a round trip.
- */
-export const TILE_TX_DEADLINES = new WeakMap<object, number>();
-
-async function rowsOf<T>(tx: TenantTx, query: SQL): Promise<T[]> {
-  const deadlineAt = TILE_TX_DEADLINES.get(tx);
-  if (deadlineAt !== undefined) {
-    const timeoutMs = Math.max(1, Math.min(TILE_STATEMENT_TIMEOUT_MS, deadlineAt - Date.now()));
-    await tx.execute(sql`select set_config('statement_timeout', ${String(timeoutMs)}, true)`);
-  }
-  return (await tx.execute(query)) as unknown as T[];
-}
-
-/** `count(*)::bigint` arrives as a STRING through postgres.js (the int8 boundary) — coerce here. */
-function n(value: string | number | null | undefined): number {
-  return value === null || value === undefined ? 0 : Number(value);
-}
-
-/** A nullable float aggregate (a median) — null stays null ("no data"), never 0. */
-function nf(value: string | number | null | undefined, decimals = 1): number | null {
-  if (value === null || value === undefined) return null;
-  const factor = 10 ** decimals;
-  return Math.round(Number(value) * factor) / factor;
-}
-
-/** A ratio, null when the denominator is zero ("no data", never a fake 0). */
-function ratio(numerator: number, denominator: number, decimals = 4): number | null {
-  if (denominator === 0) return null;
-  const factor = 10 ** decimals;
-  return Math.round((numerator / denominator) * factor) / factor;
-}
-
-function ts(value: string): SQL {
-  return sql`${value}::timestamptz`;
-}
-
 interface WindowCounts {
   readonly today: string;
   readonly d7: string;
@@ -335,22 +292,6 @@ interface WindowCounts {
 
 function counts(row: WindowCounts | undefined): { today: number; d7: number } {
   return { today: n(row?.today), d7: n(row?.d7) };
-}
-
-/**
- * When the 0058 facts began to be recorded. `app_metadata` is
- * infrastructure (no tenant, no RLS); the value is a JSON string holding a
- * timestamptz rendering, normalized to canonical ISO here.
- */
-async function countingSinceInTx(tx: TenantTx): Promise<string | null> {
-  const rows = await rowsOf<{ value: unknown }>(
-    tx,
-    sql`select value from app_metadata where key = 'reporting_facts_since' limit 1`,
-  );
-  const raw = rows[0]?.value;
-  if (typeof raw !== 'string') return null;
-  const ms = Date.parse(raw);
-  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
 }
 
 // ── the shared counts (two tiles read each) ───────────────────────────────────
