@@ -158,8 +158,10 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     }
     expect(skuIds.size).toBe(SKU_CODES.length);
 
-    // Cold-start bootstrap: seed the tenant's reservation counters + ready
-    // marker from the (still empty) journal.
+    // State reset, not a readiness requirement: seed the warehouse's
+    // reservation counters + ready marker from the (still empty) journal.
+    // Since the cold-warehouse fix the first order create's ATP read arms a
+    // cold warehouse itself; the call stays as an explicit starting state.
     await app.get(InventoryFacade).rebuildReservationCounters(tenantId, warehouseId);
   });
 

@@ -433,9 +433,10 @@ describe('story 21-1: the client dimension — one system-owned self client per 
         .expect(200);
       skuId = (skus.body.items as { code: string; id: string }[])[0]!.id;
 
-      // Cold-start bootstrap (the orders-suite precedent): seed the tenant's
-      // reservation counters + ready marker from the (still empty) journal —
-      // without it the first order create answers 503 not-ready, not 201.
+      // State reset, not a readiness requirement: seed the warehouse's
+      // reservation counters + ready marker from the (still empty) journal.
+      // Since the cold-warehouse fix the first order create's ATP read arms a
+      // cold warehouse itself; the call stays as an explicit starting state.
       await app.get(InventoryFacade).rebuildReservationCounters(tenantId, warehouseId);
     }, 60_000);
 

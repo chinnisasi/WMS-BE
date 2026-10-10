@@ -294,8 +294,10 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       reasonCode: 'stock-count',
       note: 'transfer-suite epoch-touch',
     });
-    // Cold-start bootstrap: the ATP reads below need the warehouses' counters
-    // set ready — same as the sibling suites.
+    // State reset, not a readiness requirement: seed the warehouses'
+    // reservation counters + ready marker from the (still empty) journal.
+    // Since the cold-warehouse fix the first ATP read arms a cold warehouse
+    // itself; the call stays as an explicit starting state.
     await reservations.rebuildReservationCounters(tenantId, sourceWarehouseId);
     await reservations.rebuildReservationCounters(tenantId, destWarehouseId);
 

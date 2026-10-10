@@ -42,6 +42,22 @@ export const COUNTER_TTL_SECONDS = 7 * 24 * 3600;
 export const REAP_BATCH = 100;
 
 /**
+ * How long a FAILED not-ready repair (`ensureReady`) backs off before the next
+ * read or grant may try another journal rebuild of the same warehouse. Without
+ * it, a persistently failing repair re-runs a full rebuild — and logs — on
+ * every read (the replenishment sweep and channel publish loops read per SKU).
+ */
+export const READY_REPAIR_BACKOFF_MS = 5000;
+
+/**
+ * The repair backoff's clock — an exported, mutable object (the
+ * `rateCardClock` pattern, IMPLEMENTATION-GUIDE §7c) so a test can move time
+ * past the backoff window by ASSIGNING `now`, never `spyOn` (jest's
+ * `restoreMocks` would undo it between tests).
+ */
+export const reservationRepairClock = { now: (): number => Date.now() };
+
+/**
  * The named hooks (story 2.3 boundary): QC holds, in-transit stock and
  * channel buffers subtract from ATP. Story 3.4 populates the QC hook — the
  * held quantity is exactly the stock sitting in the warehouse's system
@@ -396,6 +412,23 @@ function requireUuid(value: string, name: string): void {
 export class ReservationService implements OnModuleInit {
   private readonly logger = new Logger('ReservationService');
 
+  /**
+   * Single-flight rebuilds: one in-process journal rebuild per
+   * `tenant:warehouse` at a time, shared by EVERY caller of `rebuildCounters`
+   * (startup, the parity pass, the facade, the not-ready grant repair and the
+   * not-ready ATP repair). Every rebuild disarms and then force-SETs counters,
+   * so two overlapping rebuilds of one warehouse could overwrite an increment
+   * a grant made between them; joining the flight removes that overlap within
+   * a process. Per process only — cross-instance overlap is a recorded limit.
+   */
+  private readonly inFlight = new Map<string, Promise<ReservationRebuildReport>>();
+
+  /**
+   * The failure backoff of the not-ready repair (`ensureReady`): when a
+   * repair of `tenant:warehouse` last failed, by `reservationRepairClock`.
+   */
+  private readonly repairFailedAt = new Map<string, number>();
+
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     // The reaper's one cross-tenant read (due holds) runs on the BYPASSRLS
@@ -408,7 +441,9 @@ export class ReservationService implements OnModuleInit {
    * Cold start: the journal is truth, so on module init every tenant's
    * counters are rebuilt from `reservations` (disarm → reseed → arm).
    * Best-effort — if Valkey is down the rebuild logs and grants fail closed
-   * until the next explicit or not-ready-triggered rebuild succeeds.
+   * until the next explicit or not-ready-triggered (read or grant) rebuild
+   * succeeds. A warehouse this discovery misses (created later, stock-less)
+   * is armed by its first ATP read or grant.
    */
   async onModuleInit(): Promise<void> {
     try {
@@ -762,29 +797,32 @@ export class ReservationService implements OnModuleInit {
   /**
    * Real-time ATP (story 2.3): `on-hand (open-quarantined scopes excluded) −
    * reserved − QC-held − buffer` (the QC hook reads its real source since
-   * 3.4; the buffer hook stays zero-valued). Fails closed (503) when Valkey
-   * is unreachable or its counters are not loaded — a read that cannot prove
-   * the reserved figure never invents one. A missing counter under a ready
-   * marker is divergence: healed from the journal (Postgres wins) before the
-   * read.
+   * 3.4; the buffer hook stays zero-valued). Counters not loaded (no ready
+   * marker) are repaired from the journal and the read answers; it fails
+   * closed (503) when Valkey is unreachable or that repair fails — a read
+   * that cannot prove the reserved figure never invents one. A missing
+   * counter under a ready marker is divergence: healed from the journal
+   * (Postgres wins) before the read.
    */
   async atp(tenantId: string, warehouseId: string, skuId: string): Promise<AtpSnapshot> {
     requireUuid(tenantId, 'tenantId');
     requireUuid(warehouseId, 'warehouseId');
     requireUuid(skuId, 'skuId');
-    const { onHand, qcHeld, inTransit, buffer } = await withTenantTransaction(this.db, tenantId, async (tx) => ({
-      onHand: await this.committedOnHand(tx, tenantId, warehouseId, skuId),
-      // Story 3.4: the QC hook reads its real source — the stock sitting in
-      // the warehouse's system QC-hold bin (same committed-read tx).
-      qcHeld: await qcHeldUnits(tx, tenantId, warehouseId, skuId),
-      // Story 5-1: the in-transit hook reads its real source — the stock
-      // parked in the warehouse's system IN-TRANSIT bin (same committed-read
-      // tx).
-      inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
-      // Story 7.1: the standing-buffer figure is a journal read (AD-13) —
-      // transparency only, ALREADY inside `reserved` (see the formula note).
-      buffer: await bufferUnits(tx, tenantId, warehouseId, skuId),
-    }));
+    const readInputs = () =>
+      withTenantTransaction(this.db, tenantId, async (tx) => ({
+        onHand: await this.committedOnHand(tx, tenantId, warehouseId, skuId),
+        // Story 3.4: the QC hook reads its real source — the stock sitting in
+        // the warehouse's system QC-hold bin (same committed-read tx).
+        qcHeld: await qcHeldUnits(tx, tenantId, warehouseId, skuId),
+        // Story 5-1: the in-transit hook reads its real source — the stock
+        // parked in the warehouse's system IN-TRANSIT bin (same committed-read
+        // tx).
+        inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
+        // Story 7.1: the standing-buffer figure is a journal read (AD-13) —
+        // transparency only, ALREADY inside `reserved` (see the formula note).
+        buffer: await bufferUnits(tx, tenantId, warehouseId, skuId),
+      }));
+    let { onHand, qcHeld, inTransit, buffer } = await readInputs();
     const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
     const readyKey = reservationReadyKey(tenantId, warehouseId);
 
@@ -795,12 +833,23 @@ export class ReservationService implements OnModuleInit {
       throw this.valkeyDown(err, 'ATP read');
     }
     if (!ready) {
-      // Counters not loaded (cold start / rebuild in progress): fail closed
-      // with the A8 machine code (story 4.1) — a read that cannot prove the
-      // reserved figure never invents one.
-      throw reservationStoreUnavailable(
-        `Warehouse ${warehouseId} counters are being (re)built from the journal — ATP is unavailable, not zero.`,
-      );
+      // Counters not loaded (a warehouse created after start, a stock-less
+      // warehouse, a flushed store, or a rebuild in progress): repair the
+      // warehouse from the journal — joining any rebuild already in flight —
+      // and answer THIS read. A repair that fails (or is backing off after a
+      // failure) fails closed with the A8 machine code (story 4.1): a read
+      // that cannot prove the reserved figure never invents one, and a failed
+      // repair is never ATP 0. Callers pass a validated warehouse — a read for
+      // an unknown id would arm a ready key for it.
+      if (!(await this.ensureReady(tenantId, warehouseId, 'atp'))) {
+        throw reservationStoreUnavailable(
+          `Warehouse ${warehouseId} counters are being (re)built from the journal — ATP is unavailable, not zero.`,
+        );
+      }
+      // Re-read the Postgres inputs AFTER the repair, so on-hand and the
+      // counter come from the same side of the rebuild (never pre-rebuild
+      // on-hand against a post-rebuild reserved figure).
+      ({ onHand, qcHeld, inTransit, buffer } = await readInputs());
     }
     let reserved: number;
     try {
@@ -842,9 +891,12 @@ export class ReservationService implements OnModuleInit {
    * Rebuild (the repair/cold-start path): re-seeds every scope's reserved
    * counter from the journal (`state IN ('held','committed')` sums — Postgres
    * wins on divergence). The warehouse's ready marker is disarmed FIRST, so
-   * grants and ATP reads fail closed for the whole rebuild, and armed only
-   * after the counters are written. Rebuilds every warehouse of the tenant
-   * when no warehouse is named.
+   * grants fail closed for the whole rebuild (an ATP read joins it and
+   * answers after), and armed only after the counters are written. Rebuilds
+   * every warehouse of the tenant when no warehouse is named. Each warehouse's
+   * rebuild is SINGLE-FLIGHT in this process: a caller arriving while one is
+   * running joins it (startup, parity, the facade and both not-ready repairs
+   * all come through here).
    */
   async rebuildCounters(tenantId: string, warehouseId?: string): Promise<ReservationRebuildReport[]> {
     requireUuid(tenantId, 'tenantId');
@@ -873,50 +925,141 @@ export class ReservationService implements OnModuleInit {
 
     const reports: ReservationRebuildReport[] = [];
     for (const target of targets) {
-      const readyKey = reservationReadyKey(tenantId, target);
-      await this.valkey.disarmReady(readyKey);
-      // Fail closed from here until the counters agree with the journal.
-      let sums = await this.journalReservedSums(tenantId, target);
-      // Scopes with on-hand but no live reservation still need a counter
-      // (seeded at their — possibly zero — reserved sum), or every future
-      // grant against them would read a missing counter as divergence.
-      const onHandSkus = await withTenantTransaction(this.db, tenantId, (tx) =>
-        tx
-          .selectDistinct({ skuId: stockOnHand.skuId })
-          .from(stockOnHand)
-          .where(and(eq(stockOnHand.tenantId, tenantId), eq(stockOnHand.warehouseId, target))),
-      );
-      const reservedBySku = new Map<string, number>(sums.map((row) => [row.skuId, row.reserved]));
-      for (const { skuId } of onHandSkus) {
-        if (!reservedBySku.has(skuId)) {
-          reservedBySku.set(skuId, 0);
-        }
+      // Single-flight per warehouse, whoever asks: join a rebuild already in
+      // flight rather than start a second, overlapping one (whose disarm and
+      // forced SETs could drop an increment landing between the two).
+      const flightKey = `${tenantId}:${target}`;
+      let flight = this.inFlight.get(flightKey);
+      if (flight === undefined) {
+        flight = this.rebuildWarehouse(tenantId, target)
+          .then((report) => {
+            // A completed rebuild (whoever started it) ends any repair backoff.
+            this.repairFailedAt.delete(flightKey);
+            return report;
+          })
+          .finally(() => {
+            this.inFlight.delete(flightKey);
+          });
+        this.inFlight.set(flightKey, flight);
       }
-      const scopes: { skuId: string; reserved: number }[] = [];
-      for (const [skuId, reserved] of reservedBySku) {
-        await this.valkey.setCounter(reservationCounterKey(tenantId, target, skuId), reserved, COUNTER_TTL_SECONDS, true);
-        scopes.push({ skuId, reserved });
-      }
-      // Correction pass: a hold whose script won just before the disarm (its
-      // journal row commits during the rebuild) must not be lost — where the
-      // journal grew past the counter just written, Postgres wins again.
-      // (In-flight grants that commit AFTER this read re-converge the moment
-      // their journal lands; the residual window is the documented
-      // rebuild-vs-in-flight-grant race — the next rebuild heals it.)
-      sums = await this.journalReservedSums(tenantId, target);
-      for (const { skuId, reserved } of sums) {
-        const current = await this.valkey.getCounter(reservationCounterKey(tenantId, target, skuId));
-        if (current === null || current < reserved) {
-          await this.valkey.setCounter(reservationCounterKey(tenantId, target, skuId), reserved, COUNTER_TTL_SECONDS, true);
-        }
-      }
-      await this.valkey.setReady(readyKey);
-      reports.push({ warehouseId: target, scopes });
-      this.logger.log(
-        `Reservation counters rebuilt from journal: tenant=${tenantId} warehouse=${target} scopes=${scopes.length}`,
-      );
+      reports.push(await flight);
     }
     return reports;
+  }
+
+  /**
+   * True while a journal rebuild of the warehouse is in flight in this
+   * process (`ensureReady`'s double-check skips the re-read then, and joins).
+   */
+  private rebuildInFlight(tenantId: string, warehouseId: string): boolean {
+    return this.inFlight.has(`${tenantId}:${warehouseId}`);
+  }
+
+  /**
+   * The not-ready repair shared by the ATP read and the grant: rebuild the
+   * warehouse's counters from the journal (joining a flight already running)
+   * and report whether the ready marker is now armed. Never throws — a failed
+   * repair records a `READY_REPAIR_BACKOFF_MS` backoff, logs once for the
+   * window, and answers `false` (the caller fails closed). Inside the window
+   * it answers `false` without rebuilding.
+   */
+  private async ensureReady(tenantId: string, warehouseId: string, trigger: 'atp' | 'grant'): Promise<boolean> {
+    const key = `${tenantId}:${warehouseId}`;
+    if (this.inRepairBackoff(key)) {
+      return false;
+    }
+    const readyKey = reservationReadyKey(tenantId, warehouseId);
+    try {
+      // Double-checked: a flight that finished between the caller's not-ready
+      // read and here has armed the marker — starting another (disarming)
+      // rebuild would only re-close the warehouse. While one is in flight,
+      // skip the re-read and join it.
+      if (!this.rebuildInFlight(tenantId, warehouseId) && (await this.valkey.isReady(readyKey))) {
+        return true;
+      }
+      await this.rebuildCounters(tenantId, warehouseId);
+      return await this.valkey.isReady(readyKey);
+    } catch (err) {
+      // N callers joined to one failing flight all land here: only the first
+      // records the backoff and logs — once per backoff window, not N times.
+      if (this.inRepairBackoff(key)) {
+        return false;
+      }
+      this.repairFailedAt.set(key, reservationRepairClock.now());
+      this.logger.error(
+        `Reservation not-ready repair failed — fails closed for ${READY_REPAIR_BACKOFF_MS}ms: ` +
+          `tenant=${tenantId} warehouse=${warehouseId} trigger=${trigger} — ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * True while a failed repair of `key` is younger than
+   * `READY_REPAIR_BACKOFF_MS`. An expired entry is pruned; a NEGATIVE age (the
+   * wall clock stepped back) counts as expired, never as an open-ended backoff.
+   */
+  private inRepairBackoff(key: string): boolean {
+    const failedAt = this.repairFailedAt.get(key);
+    if (failedAt === undefined) {
+      return false;
+    }
+    const age = reservationRepairClock.now() - failedAt;
+    if (age >= 0 && age < READY_REPAIR_BACKOFF_MS) {
+      return true;
+    }
+    this.repairFailedAt.delete(key);
+    return false;
+  }
+
+  /**
+   * One warehouse's rebuild (disarm → seed → correction → arm). Reached ONLY
+   * through `rebuildCounters`' single-flight — never call it directly.
+   */
+  private async rebuildWarehouse(tenantId: string, target: string): Promise<ReservationRebuildReport> {
+    const readyKey = reservationReadyKey(tenantId, target);
+    await this.valkey.disarmReady(readyKey);
+    // Fail closed from here until the counters agree with the journal.
+    let sums = await this.journalReservedSums(tenantId, target);
+    // Scopes with on-hand but no live reservation still need a counter
+    // (seeded at their — possibly zero — reserved sum), or every future
+    // grant against them would read a missing counter as divergence.
+    const onHandSkus = await withTenantTransaction(this.db, tenantId, (tx) =>
+      tx
+        .selectDistinct({ skuId: stockOnHand.skuId })
+        .from(stockOnHand)
+        .where(and(eq(stockOnHand.tenantId, tenantId), eq(stockOnHand.warehouseId, target))),
+    );
+    const reservedBySku = new Map<string, number>(sums.map((row) => [row.skuId, row.reserved]));
+    for (const { skuId } of onHandSkus) {
+      if (!reservedBySku.has(skuId)) {
+        reservedBySku.set(skuId, 0);
+      }
+    }
+    const scopes: { skuId: string; reserved: number }[] = [];
+    for (const [skuId, reserved] of reservedBySku) {
+      await this.valkey.setCounter(reservationCounterKey(tenantId, target, skuId), reserved, COUNTER_TTL_SECONDS, true);
+      scopes.push({ skuId, reserved });
+    }
+    // Correction pass: a hold whose script won just before the disarm (its
+    // journal row commits during the rebuild) must not be lost — where the
+    // journal grew past the counter just written, Postgres wins again.
+    // (In-flight grants that commit AFTER this read re-converge the moment
+    // their journal lands; the residual window is the documented
+    // rebuild-vs-in-flight-grant race — the next rebuild heals it.)
+    sums = await this.journalReservedSums(tenantId, target);
+    for (const { skuId, reserved } of sums) {
+      const current = await this.valkey.getCounter(reservationCounterKey(tenantId, target, skuId));
+      if (current === null || current < reserved) {
+        await this.valkey.setCounter(reservationCounterKey(tenantId, target, skuId), reserved, COUNTER_TTL_SECONDS, true);
+      }
+    }
+    await this.valkey.setReady(readyKey);
+    this.logger.log(
+      `Reservation counters rebuilt from journal: tenant=${tenantId} warehouse=${target} scopes=${scopes.length}`,
+    );
+    return { warehouseId: target, scopes };
   }
 
   /**
@@ -1069,8 +1212,9 @@ export class ReservationService implements OnModuleInit {
 
   /**
    * The grant script, with the two fail-closed repair arms:
-   * - `not-ready` (counters not loaded): triggers the journal rebuild (so the
-   *   NEXT grant can proceed) and fails this one closed.
+   * - `not-ready` (counters not loaded): triggers the shared journal repair
+   *   (`ensureReady` — so the NEXT grant can proceed) and fails this one
+   *   closed whatever the repair answers.
    * - `missing-counter` (divergence under a ready marker): repairs the scope
    *   from the journal (Postgres wins, SET NX so a concurrent winning script
    *   is never clobbered) and retries the script exactly once.
@@ -1108,15 +1252,12 @@ export class ReservationService implements OnModuleInit {
       return 'granted';
     }
     if (reply[1] === 'not-ready') {
-      // Cold start / rebuild gap: repair from the journal so subsequent
-      // grants have counters to decide against; THIS grant still fails
-      // closed (the I/O matrix: grants during rebuild are store-down).
-      await this.rebuildCounters(tenantId, warehouseId).catch((err: unknown) => {
-        this.logger.error(
-          `Reservation rebuild triggered by a not-ready grant failed: tenant=${tenantId} ` +
-            `warehouse=${warehouseId} — ${err instanceof Error ? err.message : String(err)}`,
-        );
-      });
+      // Cold start / rebuild gap: repair from the journal (the shared,
+      // single-flight, backed-off repair) so subsequent grants have counters
+      // to decide against; THIS grant still fails closed whatever the repair
+      // answers (the I/O matrix: grants during rebuild are store-down — no
+      // retry in the same request, grant semantics unchanged).
+      await this.ensureReady(tenantId, warehouseId, 'grant');
       return 'store-down';
     }
     if (reply[1] === 'missing-counter') {

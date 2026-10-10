@@ -283,8 +283,10 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
         .expect(200)
     ).body.accessToken as string;
 
-    // Cold-start bootstrap: seed the tenant's reservation counters + ready
-    // marker from the (still empty) journal.
+    // State reset, not a readiness requirement: seed the warehouse's
+    // reservation counters + ready marker from the (still empty) journal.
+    // Since the cold-warehouse fix the first order create's ATP read arms a
+    // cold warehouse itself; the call stays as an explicit starting state.
     await app.get(InventoryFacade).rebuildReservationCounters(tenantId, warehouseId);
   });
 

@@ -310,8 +310,11 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     }
     expect(skuIds.size).toBe(SKU_CODES.length);
 
-    // Cold-start bootstrap: seed the tenant's counters + ready marker from
-    // the (still empty) journal — the operator path after a Valkey flush.
+    // State reset: seed the warehouse's reservation counters + ready marker
+    // from the (still empty) journal. An ATP read would arm a cold warehouse
+    // itself (the cold-warehouse fix), but a DIRECT grant on one still fails
+    // closed once (503 store-down, arming it for the next) — this keeps that
+    // first-grant 503 out of the suite.
     await facade.rebuildReservationCounters(tenantId, warehouseId);
   });
 
@@ -591,7 +594,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     await expectProblem(grant(skuId, ownerId('q2'), 1), 409, 'unavailable');
   });
 
-  it('divergence + rebuild: a lost counter fails grants closed, then the journal restores it (Postgres wins)', async () => {
+  it('divergence + rebuild: a lost mirror is repaired from the journal by the next read; a not-ready grant still fails closed (Postgres wins)', async () => {
     const skuId = skuIds.get('RSV-REBUILD')!;
     await seedStock(skuId, binA, 2);
     await grant(skuId, ownerId('rb'), 1);
@@ -599,28 +602,35 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
 
     const counterKey = `wms:{${tenantId}}:wh:${warehouseId}:res:${skuId}`;
     const readyKey = `wms:{${tenantId}}:wh:${warehouseId}:res:__ready__`;
+    const service = app.get(ReservationService);
+    // `rebuildWarehouse` is private: spied through an index cast so the
+    // count is the number of journal rebuilds that actually RAN.
+    const rebuildSpy = jest.spyOn(service as unknown as { rebuildWarehouse: () => Promise<unknown> }, 'rebuildWarehouse');
+    try {
+      // Full mirror loss (a `docker compose restart valkey`): the ready marker
+      // goes down with the counters. The fix (spec-fix-new-warehouse-order-
+      // intake): the next ATP read repairs the warehouse from the journal
+      // and ANSWERS — Postgres won, the counter is back at the journal's live
+      // sum. (It used to 503 until a grant or a restart rebuilt it.)
+      await valkey.del(counterKey, readyKey);
+      const afterHeal = await atpUnits(skuId);
+      expect(afterHeal).toMatchObject({ onHand: 2, reserved: 1, atp: 1 });
+      expect(rebuildSpy).toHaveBeenCalledTimes(1);
+      expect(await valkey.exists(readyKey)).toBe(1);
 
-    // Full mirror loss (a `docker compose restart valkey`): the ready marker
-    // goes down with the counters — grants and ATP reads fail closed during
-    // the gap, never oversell.
-    await valkey.del(counterKey, readyKey);
-    const duringGap = await atpUnits(skuId).then(
-      () => {
-        throw new Error('expected the ATP read to fail closed during the rebuild gap');
-      },
-      (error: unknown) => error as ProblemException,
-    );
-    expect(duringGap.getStatus()).toBe(503);
-    // The grant also fails closed — and its not-ready arm triggers (and waits
-    // on) the journal rebuild, so the gap closes with the grant's rejection.
-    // A8 (story 4.1): the store-down arm carries its own 503 machine code,
-    // distinct from the deterministic 409 `unavailable` a losing grant gets.
-    await expectProblem(grant(skuId, ownerId('rb2'), 1), 503, 'reservation-store-unavailable');
+      // The grant's not-ready arm, proved separately: with the marker gone
+      // again, a grant triggers the same repair once and STILL fails closed
+      // for this request — A8 (story 4.1): the store-down arm carries its own
+      // 503 machine code, distinct from the deterministic 409 `unavailable`.
+      rebuildSpy.mockClear();
+      await valkey.del(readyKey);
+      await expectProblem(grant(skuId, ownerId('rb2'), 1), 503, 'reservation-store-unavailable');
+      expect(rebuildSpy).toHaveBeenCalledTimes(1);
+      expect(await valkey.exists(readyKey)).toBe(1);
+    } finally {
+      rebuildSpy.mockRestore();
+    }
 
-    // The not-ready grant above triggered a rebuild from the journal —
-    // Postgres won: the counter came back at the journal's live sum.
-    const afterHeal = await atpUnits(skuId);
-    expect(afterHeal).toMatchObject({ onHand: 2, reserved: 1, atp: 1 });
     // And a follow-up grant now proceeds against the restored counter.
     const second = await grant(skuId, ownerId('rb3'), 1);
     expect(second.state).toBe('held');
@@ -670,17 +680,37 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     // The startup contract, observed with non-empty state: the tenant's whole
     // Valkey keyspace goes down (a `docker compose restart valkey`), the
     // module's init hook re-runs, and ATP reads the journal-reseeded counters.
+    // Since an ATP read now repairs a not-ready warehouse itself, the proof
+    // that INIT did the rebuild is direct: no read happens between the flush
+    // and the hook, the hook's own `rebuildCounters(tenant)` call (no
+    // warehouse — the discovery form) is the one that ran, the marker is
+    // armed before any read, and the read afterwards runs no rebuild of its own.
     const skuId = skuIds.get('RSV-HEALTHY')!;
     expect((await atpUnits(skuId)).reserved).toBe(3);
     const keys = await valkey.keys(`wms:{${tenantId}}:*`);
     expect(keys.length).toBeGreaterThan(0);
     await valkey.del(...keys);
-    expect(await atpUnits(skuId).then(() => true, () => false)).toBe(false);
+    const readyKey = `wms:{${tenantId}}:wh:${warehouseId}:res:__ready__`;
+    expect(await valkey.exists(readyKey)).toBe(0);
 
-    await app.get(ReservationService).onModuleInit();
+    const service = app.get(ReservationService);
+    const countersSpy = jest.spyOn(service, 'rebuildCounters');
+    const rebuildSpy = jest.spyOn(service as unknown as { rebuildWarehouse: () => Promise<unknown> }, 'rebuildWarehouse');
+    try {
+      await service.onModuleInit();
+      // Attributed to init: the discovery-form call (tenant only) for this tenant.
+      expect(countersSpy.mock.calls.some((call) => call[0] === tenantId && call[1] === undefined)).toBe(true);
+      expect(countersSpy.mock.calls.every((call) => call[1] === undefined)).toBe(true);
+      expect(await valkey.exists(readyKey)).toBe(1);
 
-    const after = await atpUnits(skuId);
-    expect(after).toMatchObject({ onHand: 5, reserved: 3, atp: 2 });
+      rebuildSpy.mockClear();
+      const after = await atpUnits(skuId);
+      expect(after).toMatchObject({ onHand: 5, reserved: 3, atp: 2 });
+      expect(rebuildSpy).not.toHaveBeenCalled();
+    } finally {
+      countersSpy.mockRestore();
+      rebuildSpy.mockRestore();
+    }
   });
 
   it('a real closed socket rejects within a bounded window (the fail-closed contract, not a stub)', async () => {
