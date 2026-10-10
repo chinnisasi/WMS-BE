@@ -150,8 +150,11 @@ describe('QC hold and release (e2e, story 3.4)', () => {
     opsUserId = ops.userId;
     operatorToken = (await createMember('operator')).token;
 
-    // Cold-start bootstrap: the grant arms below need the warehouse's counter
-    // set ready (the operator path after a Valkey flush) — same as 2.3's suite.
+    // State reset: seed the warehouse's reservation counters + ready marker
+    // from the (still empty) journal. An ATP read would arm a cold warehouse
+    // itself (the cold-warehouse fix), but a DIRECT grant on one still fails
+    // closed once (503 store-down, arming it for the next) — this keeps that
+    // first-grant 503 out of the suite.
     await facade.rebuildReservationCounters(tenantId, warehouseId);
   });
 

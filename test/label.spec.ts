@@ -1010,9 +1010,10 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     // Same tenant, different warehouse: RLS resolves the row fine — the
     // command's warehouse predicate is the guard that refuses.
     const wh2 = await secondWarehouse();
-    // Cold-start bootstrap (the orders-suite precedent): the new warehouse's
-    // reservation counters must be armed before its first order create,
-    // which would otherwise answer 503 not-ready.
+    // State reset, not a readiness requirement: seed the warehouse's
+    // reservation counters + ready marker from the (still empty) journal.
+    // Since the cold-warehouse fix the first order create's ATP read arms a
+    // cold warehouse itself; the call stays as an explicit starting state.
     await app.get(InventoryFacade).rebuildReservationCounters(tenantId, wh2.warehouseId);
     const { orderId } = await packedOrder('LBL-WH2', 2, 'wh2', 12, wh2);
     const labelled = await labelOrder(orderId, sandboxConnectionId).expect(201);

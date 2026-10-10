@@ -159,8 +159,10 @@ describe('Temperature excursions (e2e, story 12-5)', () => {
     operatorEmail = operator.email;
     accountantToken = (await createMember('accountant')).token;
 
-    // Cold-start bootstrap: the ATP reads below need the warehouse's counter
-    // set ready — same as the sibling suites.
+    // State reset, not a readiness requirement: seed the warehouse's
+    // reservation counters + ready marker from the (still empty) journal.
+    // Since the cold-warehouse fix the first ATP read arms a cold warehouse
+    // itself; the call stays as an explicit starting state.
     await facade.rebuildReservationCounters(tenantId, warehouseId);
   });
 

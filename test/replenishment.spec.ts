@@ -195,8 +195,10 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
     expectedDefaultVendorId = (minDefault[0] as unknown as { id: string }).id;
     expect(expectedDefaultVendorId).toBe(v1); // created FIRST → the smallest
 
-    // ATP for W1 must be readable (cold-start bootstrap — the counters +
-    // ready marker from the still-empty journal, the reservations-suite arm).
+    // State reset, not a readiness requirement: seed the warehouse's
+    // reservation counters + ready marker from the (still empty) journal.
+    // Since the cold-warehouse fix the first ATP read arms a cold warehouse
+    // itself; the call stays as an explicit starting state.
     await app.get(InventoryFacade).rebuildReservationCounters(tenantId, warehouseId);
 
     breachIds = {};
