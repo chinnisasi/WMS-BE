@@ -30,7 +30,7 @@ import type {
   PutawayPlacementSnapshot,
   PlacePutawayCommand,
 } from './putaway.command';
-import { binCandidatesInTx, candidateFitsSku } from './putaway.command';
+import { approvedExcessByLine, binCandidatesInTx, candidateFitsSku } from './putaway.command';
 import { fromMilli } from '../../shared/primitives/quantity';
 
 export const DEFAULT_PUTAWAY_PAGE_SIZE = 50;
@@ -201,7 +201,8 @@ export class PutawayFacade {
   /**
    * The derived putaway tasks (FR-10): one task per GRN line whose applied
    * stock still sits in the warehouse's system Receiving bin — remaining is
-   * the per-line `min(line.appliedQty, receiving-bin on-hand for that
+   * the per-line `min(line.appliedQty + approved over-receipt excess (story
+   * 21-9), receiving-bin on-hand for that
    * (sku, batch))` (completion is approximate when two GRNs carry the same
    * (sku, batch) — the fold attributes stock to no line); each task names
    * the capacity-only v1 suggestion (the lowest-occupancy eligible bin) or
@@ -248,29 +249,40 @@ export class PutawayFacade {
       return [];
     }
 
-    // The applied GRN lines of the warehouse, oldest receipt first.
-    const lineRows = await tx
-      .select({
-        grnId: goodsReceiptLines.grnId,
-        grnCode: goodsReceiptNotes.code,
-        grnLineId: goodsReceiptLines.id,
-        skuId: goodsReceiptLines.skuId,
-        batchId: goodsReceiptLines.batchId,
-        appliedQty: goodsReceiptLines.appliedQty,
-        lineCreatedAt: goodsReceiptLines.createdAt,
-      })
-      .from(goodsReceiptLines)
-      .innerJoin(goodsReceiptNotes, eq(goodsReceiptNotes.id, goodsReceiptLines.grnId))
-      .where(
-        and(
-          eq(goodsReceiptNotes.tenantId, tenantId),
-          eq(goodsReceiptNotes.warehouseId, warehouseId),
-          // A GRN's lines are immutable once recorded; every recorded GRN's
-          // applied stock is putaway work until it lands in a storage bin.
-          sql`${goodsReceiptLines.appliedQty} > 0`,
-        ),
-      )
-      .orderBy(asc(goodsReceiptNotes.code), asc(goodsReceiptLines.createdAt), asc(goodsReceiptLines.id));
+    // The GRN lines of the warehouse with putaway work, oldest receipt
+    // first. Story 21-9 (decision 4): a line's putaway quantity is its
+    // `applied_qty` PLUS every APPROVED over-receipt excess of that line —
+    // approval puts the excess into the Receiving bin as a further
+    // `grn.received`, and GRN lines stay immutable, so the approval rows are
+    // summed beside them (one aggregate for the warehouse, never per line).
+    const approvedExcess = approvedExcessByLine(tx, tenantId, warehouseId);
+    const putawayQty = sql<string>`(${goodsReceiptLines.appliedQty} + coalesce(${approvedExcess.excessQty}, 0))::bigint`;
+    const lineRows = (
+      await tx
+        .select({
+          grnId: goodsReceiptLines.grnId,
+          grnCode: goodsReceiptNotes.code,
+          grnLineId: goodsReceiptLines.id,
+          skuId: goodsReceiptLines.skuId,
+          batchId: goodsReceiptLines.batchId,
+          putawayQty,
+          lineCreatedAt: goodsReceiptLines.createdAt,
+        })
+        .from(goodsReceiptLines)
+        .innerJoin(goodsReceiptNotes, eq(goodsReceiptNotes.id, goodsReceiptLines.grnId))
+        .leftJoin(approvedExcess, eq(approvedExcess.grnLineId, goodsReceiptLines.id))
+        .where(
+          and(
+            eq(goodsReceiptNotes.tenantId, tenantId),
+            eq(goodsReceiptNotes.warehouseId, warehouseId),
+            // A GRN's lines are immutable once recorded; every recorded GRN's
+            // applied (and approved-excess) stock is putaway work until it
+            // lands in a storage bin.
+            sql`${putawayQty} > 0`,
+          ),
+        )
+        .orderBy(asc(goodsReceiptNotes.code), asc(goodsReceiptLines.createdAt), asc(goodsReceiptLines.id))
+    ).map((row) => ({ ...row, putawayQty: Number(row.putawayQty) }));
     if (lineRows.length === 0) {
       return [];
     }
@@ -348,7 +360,7 @@ export class PutawayFacade {
         row.batchId !== null
           ? (bySkuBatch.get(`${row.skuId}:${row.batchId}`) ?? 0)
           : (plainBySku.get(row.skuId) ?? 0);
-      const remaining = Math.min(row.appliedQty, onHand);
+      const remaining = Math.min(row.putawayQty, onHand);
       if (remaining <= 0) {
         continue; // already placed (or the stock moved elsewhere) — no task
       }
@@ -426,3 +438,4 @@ export class PutawayFacade {
     return rows.map((row) => ({ ...row, capacity: fromMilli(row.capacity) }));
   }
 }
+

@@ -1781,8 +1781,11 @@ export const overReceipts = pgTable(
     poId: uuid('po_id'),
     poLineId: uuid('po_line_id'),
     /**
-     * Story 21-6 — exactly one of the pairs `(po_id, po_line_id)` and
-     * `(asn_id, asn_line_id)` is set, each pair together (0064 CHECK).
+     * Story 21-6 — exactly one document is set, `po_id` or `asn_id`, and a
+     * line only beside its own document (`over_receipts_document_pair`).
+     * Story 21-9 (0066) made the LINE optional: a late receipt's unmatched
+     * line (no reference, a SKU mismatch, an unknown line id) pends against
+     * its document with no line, and approving it credits no line.
      */
     asnId: uuid('asn_id'),
     asnLineId: uuid('asn_line_id'),

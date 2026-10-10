@@ -197,10 +197,10 @@ export class GrnLineDto {
   grnId!: string;
 
   @ApiProperty({ format: 'uuid', type: String,
-    nullable: true, description: 'The PO line credited — null on a blind, ASN or unmatched line' })
+    nullable: true, description: 'The PO line credited — null on a blind, ASN or unmatched line. Story 21-9: on a late receipt (a closed PO) the line the excess pends against, null when it matched none' })
   poLineId!: string | null;
 
-  @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — the ASN line credited; present only when one was' })
+  @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — the ASN line credited; present only when one was. Story 21-9: on a late receipt (a cancelled or closed ASN) the line the excess pends against, when it matched one' })
   asnLineId?: string;
 
   @ApiProperty({ format: 'uuid' })
@@ -218,10 +218,10 @@ export class GrnLineDto {
   @ApiProperty({ description: 'Physical truth: everything that arrived', minimum: 0.001 })
   qty!: number;
 
-  @ApiProperty({ description: 'The within-open portion applied immediately', minimum: 0 })
+  @ApiProperty({ description: 'The within-open portion applied immediately — 0 on every line of a late receipt (story 21-9)', minimum: 0 })
   appliedQty!: number;
 
-  @ApiProperty({ description: 'The excess pended for approval', minimum: 0 })
+  @ApiProperty({ description: 'The excess pended for approval — the whole quantity on a late receipt against a closed or cancelled document (story 21-9)', minimum: 0 })
   excessQty!: number;
 
   @ApiProperty({
@@ -247,7 +247,11 @@ export class RejectedGrnLineDto {
   @ApiProperty({ minimum: 0.001 })
   qty!: number;
 
-  @ApiProperty({ enum: ['po-line-not-found', 'po-line-not-open', 'asn-line-not-found'], description: 'Machine reason' })
+  @ApiProperty({
+    enum: ['po-line-not-found', 'po-line-not-open', 'asn-line-not-found'],
+    description:
+      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients',
+  })
   code!: string;
 
   @ApiProperty({ description: 'Human-readable reason naming the line state' })
@@ -281,8 +285,11 @@ export class GoodsReceiptDto {
   code!: string;
 
   @ApiProperty({ format: 'uuid', type: String,
-    nullable: true })
+    nullable: true, description: 'The PO booked against. Story 21-9: a receipt against a closed PO with an open carried successor is booked against the successor, named here' })
   poId!: string | null;
+
+  @ApiProperty({ required: false, description: 'Story 21-9 — the successor PO\'s code; present only on a receipt re-targeted from a closed PO to its open successor' })
+  poCode?: string;
 
   @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — the ASN received against; present only on an ASN receipt' })
   asnId?: string;
@@ -469,13 +476,13 @@ export class OverReceiptDto {
   poId!: string | null;
 
   @ApiProperty({ format: 'uuid', type: String,
-    nullable: true })
+    nullable: true, description: 'The PO line the excess pends against — null on an ASN receipt\'s over-receipt, and (story 21-9) on a late receipt\'s line that matched no PO line: approving that credits no line' })
   poLineId!: string | null;
 
   @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — present only on an ASN receipt\'s over-receipt' })
   asnId?: string;
 
-  @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — the ASN line; present only on an ASN receipt\'s over-receipt' })
+  @ApiProperty({ format: 'uuid', required: false, description: 'Story 21-6 — the ASN line; present only on an ASN receipt\'s over-receipt that names one (story 21-9: absent on a late receipt\'s line that matched no ASN line)' })
   asnLineId?: string;
 
   @ApiProperty({ required: false, description: 'Story 21-6 — the ASN\'s code; present only on an ASN receipt\'s over-receipt' })

@@ -49,6 +49,7 @@ import type { LedgerMovement } from '../inventory/inventory.facade';
 import { canonicalInstant } from '../../shared/primitives/time';
 import {
   RECEIVABLE_ASN_STATUSES,
+  TERMINAL_ASN_STATUSES,
   asnNotFound,
   asnNotOpen,
   deriveAsnStatusInTx,
@@ -186,7 +187,14 @@ export interface GoodsReceiptSnapshot {
     readonly tenantId: string;
     readonly warehouseId: string;
     readonly code: string;
+    /**
+     * The PO booked against. Story 21-9: on a receipt against a closed PO
+     * that was RE-TARGETED, this is the open successor, not the PO the
+     * device named.
+     */
     readonly poId: string | null;
+    /** Story 21-9 — the successor's code, present only on a re-targeted receipt. */
+    readonly poCode?: string;
     /** Story 21-6 — present only on an ASN receipt (a pre-21-6 snapshot is byte-identical). */
     readonly asnId?: string;
     readonly asnCode?: string;
@@ -254,6 +262,14 @@ export const MAX_GRN_LINE_QTY = MAX_QUANTITY_MILLI;
  */
 export const MAX_HANDLING_UNITS_PER_GRN_LINE = 500;
 
+/**
+ * Story 21-9 — how far a receipt against a closed PO walks its carry-forward
+ * chain looking for an open successor. Each close mints at most one
+ * successor, so ten closes deep is far past any real chain; the bound keeps a
+ * corrupt (cyclic) chain from looping.
+ */
+export const MAX_SUCCESSOR_HOPS = 10;
+
 /** GRN codes are `GRN-<n>`, zero-padded to 4 digits, unique per tenant. */
 function grnCode(n: number): string {
   return `GRN-${String(n).padStart(4, '0')}`;
@@ -286,10 +302,14 @@ interface OverReceiptRequest {
  * event for Ops Manager approval. Batch identity is created through the
  * catalog facade's in-transaction ensure (never a direct `batches` write);
  * stock lands in the warehouse's system Receiving bin (ensured through
- * tenancy's receiving-bin helper — bin master data stays tenancy-owned). PO
- * state is re-checked at server write time — a closed PO is a 409
- * `po-not-open`; a cancelled LINE is rejected in the response naming the line
- * state while the other lines settle.
+ * tenancy's receiving-bin helper — bin master data stays tenancy-owned).
+ * Document state is re-checked at server write time, under the document lock.
+ * Story 21-9: a receipt against a TERMINAL document (a closed PO, a cancelled
+ * or closed ASN) is accepted and HELD — every line pends as an over-receipt
+ * against that document (with its line when it matches one, else none) for
+ * an operator to approve or reject; a closed PO with an open successor is
+ * re-targeted to the successor, where close moved the open quantity. Nothing
+ * a device scanned is refused for its document's state.
  */
 @Injectable()
 export class ReceivingCommand {
@@ -545,8 +565,23 @@ export class ReceivingCommand {
       const receivingBin = await ensureReceivingBinInTx(tx, command.tenantId, command.warehouseId);
 
       // ── the PO arm (server re-authorization at write time) ──────────────
+      // Story 21-9: a receipt against a TERMINAL document is accepted and
+      // held, never refused — the cartons are on the dock. Three outcomes:
+      //   open PO                        → the fold as before;
+      //   closed PO with an open successor (following `carried_from_po_id`)
+      //                                  → RE-TARGET: booked against the
+      //                                    successor, where close moved the
+      //                                    open quantity (decision 5);
+      //   closed PO, no open successor   → TERMINAL: every line pends as an
+      //                                    over-receipt on the closed PO.
+      // The warehouse check runs BEFORE the status (a terminal document of
+      // another warehouse is `document-warehouse-mismatch`, deliberately).
       let po: typeof purchaseOrders.$inferSelect | null = null;
       let poLines: (typeof purchaseOrderLines.$inferSelect)[] = [];
+      /** Story 21-9 — every line pends against the (terminal) document. */
+      let terminal = false;
+      /** Story 21-9 — the re-target arm: booked against the closed PO's open successor. */
+      let retargeted = false;
       if (command.poId !== null) {
         const poRows = await tx
           .select()
@@ -565,19 +600,31 @@ export class ReceivingCommand {
             `No purchase order with id "${command.poId}" exists in this tenant.`,
           );
         }
-        if (poRow.status !== 'open') {
-          // 409 naming the state — a stale queued receipt retracts visibly.
-          throw poNotOpen(poRow.code, poRow.status);
-        }
         // Story 21-6: a document is received only in its own warehouse.
         if (poRow.warehouseId !== command.warehouseId) {
           throw documentWarehouseMismatch(`Purchase order "${poRow.code}"`);
         }
-        po = poRow;
+        if (poRow.status === 'open') {
+          po = poRow;
+        } else if (poRow.status === 'closed') {
+          const successor = await this.openSuccessorInTx(tx, command.tenantId, poRow, command.warehouseId);
+          if (successor === null) {
+            po = poRow;
+            terminal = true;
+          } else {
+            // Nothing on the closed PO is read further or written.
+            retargeted = true;
+            po = successor;
+          }
+        } else {
+          // Fail closed on a status this code does not know (an allow-list,
+          // IMPLEMENTATION-GUIDE §4) — unreachable under the 0011 CHECK.
+          throw poNotOpen(poRow.code, poRow.status);
+        }
         poLines = await tx
           .select()
           .from(purchaseOrderLines)
-          .where(eq(purchaseOrderLines.poId, poRow.id))
+          .where(eq(purchaseOrderLines.poId, po.id))
           .for('update');
       }
 
@@ -600,11 +647,16 @@ export class ReceivingCommand {
         if (asnRow === undefined) {
           throw asnNotFound(asnId);
         }
-        if (!RECEIVABLE_ASN_STATUSES.includes(asnRow.status as AsnStatus)) {
-          throw asnNotOpen(asnRow.asnCode, asnRow.status);
-        }
         if (asnRow.warehouseId !== command.warehouseId) {
           throw documentWarehouseMismatch(`Advance shipment notice "${asnRow.asnCode}"`);
+        }
+        // Story 21-9: a cancelled or closed ASN is TERMINAL — the receipt is
+        // accepted and every line pends against it (decision 1). An ASN has
+        // no successor. Any other status fails closed (an allow-list).
+        if (TERMINAL_ASN_STATUSES.includes(asnRow.status as AsnStatus)) {
+          terminal = true;
+        } else if (!RECEIVABLE_ASN_STATUSES.includes(asnRow.status as AsnStatus)) {
+          throw asnNotOpen(asnRow.asnCode, asnRow.status);
         }
         asn = asnRow;
         asnLineRows = await tx
@@ -629,7 +681,7 @@ export class ReceivingCommand {
         tenantId: command.tenantId,
         warehouseId: command.warehouseId,
         code,
-        poId: command.poId,
+        poId: po?.id ?? null,
         asnId,
         blindReasonCode,
         status: 'recorded',
@@ -684,7 +736,69 @@ export class ReceivingCommand {
           settled.push({ ...base, lineId: uuidv7(), poLineId: null, asnLineId: null, applied: input.qty });
           continue;
         }
-        const reference = po !== null ? input.poLineId : (input.asnLineId ?? null);
+        /**
+         * Story 21-9 — the whole line pends against the document: applied 0,
+         * the physical quantity is the excess, and the GRN line names the
+         * same line (or none) as its over-receipt row. Nothing reaches the
+         * ledger or `received_qty` until an operator approves.
+         */
+        const pendWhole = (documentLineId: string | null): void => {
+          const lineId = uuidv7();
+          settled.push({
+            ...base,
+            lineId,
+            poLineId: po !== null ? documentLineId : null,
+            asnLineId: asn !== null ? documentLineId : null,
+            applied: 0,
+          });
+          overReceiptRequests.push({
+            grnLineId: lineId,
+            poId: po?.id ?? null,
+            poLineId: po !== null ? documentLineId : null,
+            asnId: asn?.id ?? null,
+            asnLineId: asn !== null ? documentLineId : null,
+            skuId: input.skuId,
+            excessQty: input.qty,
+          });
+        };
+        const requested = po !== null ? input.poLineId : (input.asnLineId ?? null);
+        if (terminal) {
+          // ── story 21-9: the TERMINAL arm (decisions 1–3) ───────────────
+          // A matched line (known id, same SKU) pends against that line;
+          // no reference, a SKU mismatch or an unknown id pends with NO
+          // line. Never `unmatchedLines` / `rejectedLines`: the device would
+          // read either as booked or as lost, and the line is neither.
+          const known =
+            requested === null
+              ? undefined
+              : po !== null
+                ? poLineById.get(requested)
+                : asnLineById.get(requested);
+          // A CARRIED line of a closed PO pends with no line: its open
+          // quantity moved to a successor, so crediting it on approval would
+          // count the units on both POs (the successor walk found none open,
+          // but the carried quantity still lives there).
+          pendWhole(
+            known !== undefined && known.skuId === input.skuId && !('status' in known && known.status === 'carried') ? known.id : null,
+          );
+          continue;
+        }
+        let reference = requested;
+        if (retargeted) {
+          // ── story 21-9: the RE-TARGET arm (decision 5) ─────────────────
+          // The SCANNED SKU is what physically arrived: the line books
+          // against the successor's ONE open line of that SKU (close matched
+          // carried lines by SKU alone), whatever line of the closed PO the
+          // device named — none, an unknown id, or another SKU's. Zero or
+          // several open successor lines of the SKU pend on the successor
+          // with no line.
+          const candidates = poLines.filter((line) => line.skuId === input.skuId && line.status === 'open');
+          if (candidates.length !== 1) {
+            pendWhole(null);
+            continue;
+          }
+          reference = candidates[0]!.id;
+        }
         if (reference === null) {
           // Story 21-6 — UNMATCHED (the old no-`poLineId` arm, now named):
           // applied in full, no line credited, no ceiling, no over-receipt.
@@ -715,7 +829,12 @@ export class ReceivingCommand {
         if (po !== null) {
           const poLine = poLineById.get(reference)!;
           if (poLine.status !== 'open') {
-            // The line-state rejection: the other lines still settle.
+            // DEFENSIVE since story 21-9: a line's status changes only at
+            // close (`po.command.ts`), so an OPEN PO has no cancelled or
+            // carried line, and a closed PO now takes the terminal or the
+            // re-target arm above. Kept (with its `po-line-not-open` code,
+            // still in the DTO enum for older clients) so a line in a state
+            // this fold does not expect is refused rather than credited.
             rejected.push({
               poLineId: reference,
               skuId: input.skuId,
@@ -753,7 +872,8 @@ export class ReceivingCommand {
       }
 
       // An all-rejected receipt (every line named an unknown or non-open
-      // document line — a stale cache) settles nothing and still records.
+      // line of an OPEN document — a stale cache) settles nothing and still
+      // records. A terminal document's lines never reject (story 21-9).
       if (settled.length > 0) {
         await tx.insert(goodsReceiptLines).values(
           settled.map((entry) => ({
@@ -855,7 +975,7 @@ export class ReceivingCommand {
           // unmatched line names its document but no line; absent keys are
           // omitted, so a PO or blind event's canonical bytes are unchanged.
           referenceDoc: grnReferenceDoc(grnId, {
-            poId: command.poId,
+            poId: po?.id ?? null,
             poLineId: entry.poLineId,
             asnId,
             asnLineId: entry.asnLineId,
@@ -889,7 +1009,7 @@ export class ReceivingCommand {
         await tx
           .update(purchaseOrders)
           .set({ updatedAt: nowIso() })
-          .where(eq(purchaseOrders.id, command.poId!));
+          .where(eq(purchaseOrders.id, po!.id));
       }
       for (const [asnLineId, applied] of appliedByAsnLine) {
         // The same cumulative ceiling as the PO line.
@@ -903,8 +1023,10 @@ export class ReceivingCommand {
           .set({ receivedQty: sql`${asnLines.receivedQty} + ${applied}::bigint`, updatedAt: nowIso() })
           .where(eq(asnLines.id, asnLineId));
       }
-      if (asn !== null) {
+      if (asn !== null && !terminal) {
         // The ASN's status follows its lines, in this same transaction.
+        // Story 21-9: a terminal ASN is never re-derived nor touched — the
+        // late receipt only pends against it.
         await deriveAsnStatusInTx(tx, command.tenantId, asn.id);
         await tx
           .update(advanceShipmentNotices)
@@ -942,7 +1064,11 @@ export class ReceivingCommand {
           tenantId: command.tenantId,
           warehouseId: command.warehouseId,
           code,
-          poId: command.poId,
+          poId: po?.id ?? null,
+          // Story 21-9: present only on a RE-TARGETED receipt — the
+          // successor it was booked against, whose code the device's cache
+          // may not hold. Every other snapshot is byte-identical.
+          ...(!retargeted || po === null ? {} : { poCode: po.code }),
           // Story 21-6: present only on an ASN receipt, so a PO or blind
           // GRN's snapshot is byte-identical to its pre-21-6 shape.
           ...(asn === null ? {} : { asnId: asn.id, asnCode: asn.asnCode }),
@@ -1135,6 +1261,13 @@ export class ReceivingCommand {
         // :48). Approve NEVER refuses on the document's status — a closed PO
         // (a pre-21-6 leftover) or a `received`/`closed` ASN still takes the
         // excess, so stock that physically arrived is never stranded.
+        //
+        // Story 21-9: a row may carry its document and NO line (0066 — a late
+        // receipt's unmatched line). Approving it locks the document, appends
+        // `grn.received` naming `{grnId, poId | asnId}` only, and credits no
+        // line. A lined row on a terminal document credits that line; neither
+        // re-derives a terminal document (`deriveAsnStatusInTx` leaves a
+        // terminal ASN as it is, and a PO's status is never derived at all).
         let poLineReceived: number | null = null;
         let asnLineReceived: number | null = null;
         if (row.poId !== null) {
@@ -1328,6 +1461,44 @@ export class ReceivingCommand {
   }
 
   // ── shared pieces ─────────────────────────────────────────────────────────
+
+  /**
+   * Story 21-9 (decision 5) — the open successor of a CLOSED purchase order:
+   * walk `carried_from_po_id` forward (the successor is the PO whose
+   * `carried_from_po_id` is this one — close creates at most one) to the
+   * first `open` PO in the receipt's warehouse, at most
+   * `MAX_SUCCESSOR_HOPS` hops. Each hop is locked `FOR UPDATE` and its status
+   * read under that lock (the PO → PO order close itself takes: the
+   * predecessor first), so a successor closed concurrently is walked past,
+   * never booked against. Null when the chain ends, leaves the warehouse, or
+   * runs past the bound — the caller then pends on the closed PO.
+   */
+  private async openSuccessorInTx(
+    tx: TenantTx,
+    tenantId: string,
+    closed: typeof purchaseOrders.$inferSelect,
+    warehouseId: string,
+  ): Promise<typeof purchaseOrders.$inferSelect | null> {
+    let current = closed;
+    for (let hop = 0; hop < MAX_SUCCESSOR_HOPS; hop += 1) {
+      const rows = await tx
+        .select()
+        .from(purchaseOrders)
+        .where(and(eq(purchaseOrders.tenantId, tenantId), eq(purchaseOrders.carriedFromPoId, current.id)))
+        .orderBy(purchaseOrders.createdAt, purchaseOrders.id)
+        .limit(1)
+        .for('update');
+      const next = rows[0];
+      if (next === undefined || next.warehouseId !== warehouseId) {
+        return null;
+      }
+      if (next.status === 'open') {
+        return next;
+      }
+      current = next;
+    }
+    return null;
+  }
 
   private async writeIdempotencyKey(
     tx: TenantTx,
@@ -1553,13 +1724,17 @@ function assertUtc(value: string, field: string): string {
 
 /** Postgres returns `timestamptz` in its own text shape; the read contract is ISO-8601 UTC. */
 
-/** The PO-state rejection (409 naming the status — the stale-receipt retraction). */
+/**
+ * The PO-state rejection (409 naming the status). Story 21-9: receiving no
+ * longer refuses a closed PO (it pends or re-targets) — this survives only as
+ * the fail-closed arm for a status the receiving fold does not know.
+ */
 export function poNotOpen(code: string, status: string): ProblemException {
   return new ProblemException(
     'po-not-open',
     409,
     'Purchase order is not open',
-    `Purchase order "${code}" is ${status} — receipts land only against an open PO.`,
+    `Purchase order "${code}" has status ${status} — it cannot receive.`,
   );
 }
 

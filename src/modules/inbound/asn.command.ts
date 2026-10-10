@@ -66,10 +66,21 @@ export const OPEN_ASN_STATUSES: readonly AsnStatus[] = ['announced', 'partially_
  * The states a RECEIPT may land against (spec change log, 2026-10-08): a
  * `received` ASN still accepts goods — a scan queued while it was partly
  * received and replayed after must reach the ledger; everything beyond
- * announced pends as an over-receipt, exactly as on a PO. Only the explicit
- * terminals (`closed`, `cancelled`) refuse 409 `asn-not-open`.
+ * announced pends as an over-receipt, exactly as on a PO. The explicit
+ * terminals (`closed`, `cancelled`) are not receivable in this sense; since
+ * story 21-9 a receipt against one pends whole (see `TERMINAL_ASN_STATUSES`)
+ * rather than refusing 409 `asn-not-open`, which amend still answers.
  */
 export const RECEIVABLE_ASN_STATUSES: readonly AsnStatus[] = ['announced', 'partially_received', 'received'];
+
+/**
+ * Story 21-9 — the explicit terminals. A receipt against one is no longer
+ * refused: it is accepted and every line pends as an over-receipt against the
+ * ASN for an operator to approve or reject (`receiving.command.ts`, the
+ * terminal arm). Together with `RECEIVABLE_ASN_STATUSES` it covers every
+ * status; an unknown one still fails closed with `asn-not-open`.
+ */
+export const TERMINAL_ASN_STATUSES: readonly AsnStatus[] = ['closed', 'cancelled'];
 
 /** The two explicit transitions and the one state each may leave. */
 export const ASN_TRANSITIONS = { close: 'partially_received', cancel: 'announced' } as const satisfies Record<
@@ -200,7 +211,7 @@ export function asnNotOpen(code: string, status: string): ProblemException {
     `Advance shipment notice "${code}" is ${status} — ${
       status === 'received'
         ? 'a fully received ASN can still receive (the excess pends), but no longer be amended'
-        : 'a closed or cancelled ASN can no longer be received or amended'
+        : 'a closed or cancelled ASN can no longer be amended (a late receipt against it pends for approval)'
     }.`,
   );
 }

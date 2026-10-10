@@ -169,6 +169,7 @@ describe('catch weight and handling units (e2e, story 10.3)', () => {
     'CW-KG,Salmon by kilo,kg,,1800,,false,false,true,,,',
     'CW-OVER,Beef case over-received,case,,1800,,false,false,true,,,',
     'CW-REJECT,Beef case rejected excess,case,,1800,,false,false,true,,,',
+    'CW-LATE,Beef case received late,case,,1800,,false,false,true,,,',
     'CW-ADJ,Beef case written off,case,,1800,,false,false,true,,,',
     'CW-ADJUP,Beef case adjusted upward,case,,1800,,false,false,true,,,',
     'CW-QC,Beef case quarantined,case,,1800,,false,false,true,,,',
@@ -972,6 +973,45 @@ describe('catch weight and handling units (e2e, story 10.3)', () => {
 
     const after = await unitsOfGrn(line.id as string);
     expect(after).toHaveLength(6);
+    expect(after.every((unit) => unit.status === 'active')).toBe(true);
+  });
+
+  it('story 21-9 — a late receipt on a CLOSED PO creates every unit pending_approval (applied 0); approval settles them by grnLineId to active', async () => {
+    const { poId, poLineId } = await createPo(sku('CW-LATE'), 4);
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/inbound/purchase-orders/${poId}/close`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ lines: [{ lineId: poLineId, disposition: 'cancelled' }] })
+      .expect(200);
+    const received = await submitGrn({
+      warehouseId,
+      poId,
+      blindReasonCode: null,
+      occurredAt: nowUtc(),
+      lines: [{ poLineId, skuId: sku('CW-LATE'), batchCode: null, mfgDate: null, qty: 3, weightsGrams: [18_000, 18_100, 18_200] }],
+    }).expect(201);
+    const line = received.body.goodsReceipt.lines[0];
+    expect(line).toMatchObject({ poLineId, appliedQty: 0, excessQty: 3 });
+    expect((line.handlingUnitIds as string[])).toHaveLength(3);
+    const units = await unitsOfGrn(line.id as string);
+    expect(units.map((u) => u.status)).toEqual(['pending_approval', 'pending_approval', 'pending_approval']);
+
+    const pending = (
+      await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/receiving/over-receipts?status=pending`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .expect(200)
+    ).body.items as { id: string; skuId: string }[];
+    const mine = pending.find((row) => row.skuId === sku('CW-LATE'))!;
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/over-receipts/${mine.id}/approve`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({})
+      .expect(200);
+    const after = await unitsOfGrn(line.id as string);
+    expect(after).toHaveLength(3);
     expect(after.every((unit) => unit.status === 'active')).toBe(true);
   });
 

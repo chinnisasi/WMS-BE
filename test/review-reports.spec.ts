@@ -1058,6 +1058,120 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
 
 
 
+  // ── story 21-9: a receipt the device dropped as asn-not-open now applies ──
+
+  /** Story 21-9 — the tenant's own (`self`) client, which an imported SKU belongs to. */
+  async function selfClientId(ownerToken: string, tenantId: string): Promise<string> {
+    const clients = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/clients`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    return (clients.body.items as { id: string; systemOwned: boolean }[]).find((c) => c.systemOwned)!.id;
+  }
+
+  /** Story 21-9 — one announced ASN (ported from `asn.spec.ts`'s helper). */
+  async function createAsn(
+    ownerToken: string,
+    tenantId: string,
+    body: { clientId: string; warehouseId: string; lines: { skuId: string; announcedQty: number }[] },
+  ): Promise<{ id: string; code: string; lines: { id: string }[] }> {
+    const res = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/inbound/asns`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ ...body, asnCode: `ASN-${ulid().slice(14)}` })
+      .expect(201);
+    return res.body.asn;
+  }
+
+  test('story 21-9 — a stuck grn.submit the device dropped as asn-not-open (its ASN was cancelled) now APPLIES: 201 with every line pending on the ASN', async () => {
+    const { tenantId, ownerToken, badgeSession } = await setupReportingTenant();
+    const { warehouseId } = await createWarehouseAndBin(ownerToken, tenantId, 'A-01-01');
+    const skuId = await importSku(ownerToken, tenantId, 'LATE-ASN-1');
+    const asn = await createAsn(ownerToken, tenantId, {
+      clientId: await selfClientId(ownerToken, tenantId),
+      warehouseId,
+      lines: [{ skuId, announcedQty: 10 }],
+    });
+    const lineId = asn.lines[0]!.id;
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/inbound/asns/${asn.id}/cancel`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ note: 'Client withdrew it' })
+      .expect(200);
+
+    // The device's own refusal, as a pre-21-9 server answered it.
+    const row = reportRow('grn.submit', {
+      warehouseId,
+      poId: null,
+      asnId: asn.id,
+      blindReasonCode: null,
+      lines: [{ poLineId: null, asnLineId: lineId, skuId, batchCode: null, mfgDate: null, qty: 6, weightsGrams: null }],
+    }, { classification: 'rejected', problemCode: 'asn-not-open', problemDetail: 'Advance shipment notice is cancelled', opOccurredAt: ENQUEUED_AT });
+    await uploadReport(tenantId, badgeSession, [row], ulid()).expect(201);
+    const { items } = (await listRejectedOps(ownerToken, tenantId, { status: 'open' }).expect(200)).body;
+    const op = items.find((i: { opId: string }) => i.opId === row.opId)!;
+    expect(op.problemCode).toBe('asn-not-open');
+
+    const applied = await resolveOp(ownerToken, tenantId, op.id, { decision: 'apply' }, ulid()).expect(200);
+    expect(applied.body.rejectedOp.status).toBe('applied');
+    expect(applied.body.outcome).toMatchObject({ kind: 'applied', command: 'grn.submit' });
+    const grn = applied.body.outcome.snapshot.goodsReceipt;
+    expect(grn).toMatchObject({ asnId: asn.id, asnCode: asn.code, poId: null });
+    expect(grn.lines).toEqual([expect.objectContaining({ asnLineId: lineId, qty: 6, appliedQty: 0, excessQty: 6 })]);
+
+    const pending = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/receiving/over-receipts`)
+      .query({ status: 'pending' })
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    expect(pending.body.items).toEqual([
+      expect.objectContaining({ grnId: grn.id, asnId: asn.id, asnLineId: lineId, asnCode: asn.code, excessQty: 6, status: 'pending' }),
+    ]);
+    const asnAfter = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/inbound/asns/${asn.id}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    expect(asnAfter.body.asn).toMatchObject({ status: 'cancelled', receivedTotal: 0 });
+  });
+
+  test('story 21-9 — the po-not-open twin: a stuck grn.submit against a PO since CLOSED with an open successor applies — 201, re-targeted to the successor', async () => {
+    const { tenantId, ownerToken, badgeSession } = await setupReportingTenant();
+    const { warehouseId } = await createWarehouseAndBin(ownerToken, tenantId, 'A-01-01');
+    const skuId = await importSku(ownerToken, tenantId, 'LATE-PO-1');
+    const owner = (path: string) =>
+      request(app.getHttpServer()).post(`${API}/${tenantId}${path}`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid());
+    const vendorId = (await owner('/vendors').send({ code: 'V-LATE', name: 'Late Vendor' }).expect(201)).body.vendor.id as string;
+    const po = (
+      await owner('/inbound/purchase-orders')
+        .send({ warehouseId, vendorId, code: 'PO-LATE-1', lines: [{ skuId, orderedQty: 10, unitCostPaise: 100 }] })
+        .expect(201)
+    ).body.purchaseOrder as { id: string; lines: { id: string }[] };
+    const lineId = po.lines[0]!.id;
+    const successor = (
+      await owner(`/inbound/purchase-orders/${po.id}/close`).send({ lines: [{ lineId, disposition: 'carried' }] }).expect(200)
+    ).body.successor as { id: string; code: string; lines: { id: string }[] };
+
+    // The device's own refusal, as a pre-21-9 server answered it.
+    const row = reportRow('grn.submit', {
+      warehouseId,
+      poId: po.id,
+      blindReasonCode: null,
+      lines: [{ poLineId: lineId, skuId, batchCode: null, mfgDate: null, qty: 4, weightsGrams: null }],
+    }, { classification: 'rejected', problemCode: 'po-not-open', problemDetail: 'Purchase order is closed', opOccurredAt: ENQUEUED_AT });
+    await uploadReport(tenantId, badgeSession, [row], ulid()).expect(201);
+    const { items } = (await listRejectedOps(ownerToken, tenantId, { status: 'open' }).expect(200)).body;
+    const op = items.find((i: { opId: string }) => i.opId === row.opId)!;
+
+    const applied = await resolveOp(ownerToken, tenantId, op.id, { decision: 'apply' }, ulid()).expect(200);
+    expect(applied.body.rejectedOp.status).toBe('applied');
+    expect(applied.body.outcome).toMatchObject({ kind: 'applied', command: 'grn.submit' });
+    const grn = applied.body.outcome.snapshot.goodsReceipt;
+    expect(grn).toMatchObject({ poId: successor.id, poCode: successor.code });
+    expect(grn.lines).toEqual([expect.objectContaining({ poLineId: successor.lines[0]!.id, qty: 4, appliedQty: 4, excessQty: 0 })]);
+  });
+
   test('resolve authority is review.decide exactly — an ops_manager decides, an operator cannot, a foreign session cannot reach the row', async () => {
     const email = `owner-${ulid().toLowerCase()}@example.com`;
     const { tenantId } = await registerTenant(email);

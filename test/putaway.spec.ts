@@ -2271,4 +2271,110 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     await tankOnlyPlace('bulk-asset').expect(201);
     expect(await plainOnHand(onlyTank, tankSkuId)).toBe(1);
   });
+
+  // ── story 21-9 (decision 4): approved over-receipt excess is putaway work ──
+
+  describe('story 21-9 — approved over-receipt excess is putaway work', () => {
+    // A warehouse of its own PER TEST: the task derivation's on-hand half is
+    // per (sku, batch) in the Receiving bin, attributed to no line, so stock
+    // another test left there (or placed lines of the same SKU) must not
+    // decide these assertions.
+    let wh: string;
+    let bin: string;
+    let vendor: string;
+
+    const nowZ = () => new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+    const owner = (method: 'get' | 'post', path: string) =>
+      request(app.getHttpServer())[method](`${API}/${tenantId}${path}`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid());
+
+    beforeAll(async () => {
+      vendor = (await owner('post', '/vendors').send({ code: `V-PX-${ulid().slice(18)}`, name: 'Excess Vendor' }).expect(201)).body.vendor
+        .id as string;
+    });
+
+    beforeEach(async () => {
+      wh = (
+        await owner('post', '/warehouses')
+          .send({ origin: testAddress(), code: `PX-${ulid().slice(10, 16).toUpperCase()}`, name: `Excess Depot ${ulid()}` })
+          .expect(201)
+      ).body.id as string;
+      const zone = (await owner('post', `/warehouses/${wh}/zones`).send({ code: 'X', name: 'Excess' }).expect(201)).body.id as string;
+      bin = (await owner('post', `/warehouses/${wh}/zones/${zone}/bins`).send({ code: 'X-01', capacity: 1000, type: 'shelf' }).expect(201)).body
+        .id as string;
+    });
+
+    async function newPo(orderedQty: number): Promise<{ poId: string; lineId: string }> {
+      const res = await owner('post', '/inbound/purchase-orders')
+        .send({ warehouseId: wh, vendorId: vendor, code: `PO-${ulid().slice(12)}`, lines: [{ skuId: plainSkuId, orderedQty, unitCostPaise: 100 }] })
+        .expect(201);
+      return { poId: res.body.purchaseOrder.id as string, lineId: res.body.purchaseOrder.lines[0].id as string };
+    }
+
+    async function receivePo(poId: string, poLineId: string, qty: number): Promise<{ grnId: string; lineId: string }> {
+      const res = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/goods-receipts`)
+        .set('Authorization', `Bearer ${operatorToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ warehouseId: wh, poId, blindReasonCode: null, occurredAt: nowZ(), lines: [{ poLineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty }] })
+        .expect(201);
+      return { grnId: res.body.goodsReceipt.id as string, lineId: res.body.goodsReceipt.lines[0].id as string };
+    }
+
+    async function pendingOf(grnId: string): Promise<string> {
+      const res = await owner('get', '/receiving/over-receipts').query({ status: 'pending', limit: 200 }).expect(200);
+      return (res.body.items as { id: string; grnId: string }[]).find((o) => o.grnId === grnId)!.id;
+    }
+
+    async function tasksOf(grnLineId: string): Promise<{ qty: number }[]> {
+      const res = await owner('get', `/putaway/tasks?warehouseId=${wh}`).expect(200);
+      return (res.body.items as { grnLineId: string; qty: number }[]).filter((t) => t.grnLineId === grnLineId);
+    }
+
+    async function awaiting(): Promise<number> {
+      const res = await owner('get', `/warehouses/${wh}/reporting/overview`).expect(200);
+      return res.body.tiles.dockToStock.awaitingPutaway.value as number;
+    }
+
+    function placeAll(grnId: string, grnLineId: string, qty: number): SupertestTest {
+      return place({ warehouseId: wh, grnId, grnLineId, skuId: plainSkuId, batchId: null, qty, toBinId: bin, reasonCode: null, occurredAt: nowZ() });
+    }
+
+    it('an approved over-receipt on an OPEN PO: the task carries applied + excess, and the whole receipt places (it used to strand the excess)', async () => {
+      const { poId, lineId } = await newPo(5);
+      const grn = await receivePo(poId, lineId, 8); // 5 apply, 3 pend
+      expect(await tasksOf(grn.lineId)).toEqual([expect.objectContaining({ qty: 5 })]);
+      await owner('post', `/receiving/over-receipts/${await pendingOf(grn.grnId)}/approve`).expect(200);
+      expect(await tasksOf(grn.lineId)).toEqual([expect.objectContaining({ qty: 8 })]);
+      await placeAll(grn.grnId, grn.lineId, 8).expect(201);
+      expect(await tasksOf(grn.lineId)).toEqual([]);
+      expect(await plainOnHand(bin, plainSkuId)).toBeGreaterThanOrEqual(8);
+    });
+
+    it('a late receipt on a closed PO: no task while it pends; approved, it becomes a task, the awaiting tile counts it, and it places', async () => {
+      const { poId, lineId } = await newPo(10);
+      await owner('post', `/inbound/purchase-orders/${poId}/close`).send({ lines: [{ lineId, disposition: 'cancelled' }] }).expect(200);
+      const before = await awaiting();
+      const grn = await receivePo(poId, lineId, 4); // all 4 pend
+      expect(await tasksOf(grn.lineId)).toEqual([]);
+      expect(await awaiting()).toBe(before);
+      // A placement against the unapproved line is refused (nothing to place).
+      expect((await placeAll(grn.grnId, grn.lineId, 4).expect(400)).body.detail).toContain('no approved over-receipt');
+
+      await owner('post', `/receiving/over-receipts/${await pendingOf(grn.grnId)}/approve`).expect(200);
+      expect(await tasksOf(grn.lineId)).toEqual([expect.objectContaining({ qty: 4 })]);
+      expect(await awaiting()).toBe(before + 1);
+      await placeAll(grn.grnId, grn.lineId, 4).expect(201);
+      expect(await tasksOf(grn.lineId)).toEqual([]);
+      expect(await awaiting()).toBe(before);
+    });
+
+    it('a REJECTED late receipt never becomes work', async () => {
+      const { poId, lineId } = await newPo(10);
+      await owner('post', `/inbound/purchase-orders/${poId}/close`).send({ lines: [{ lineId, disposition: 'cancelled' }] }).expect(200);
+      const grn = await receivePo(poId, lineId, 2);
+      await owner('post', `/receiving/over-receipts/${await pendingOf(grn.grnId)}/reject`).expect(200);
+      expect(await tasksOf(grn.lineId)).toEqual([]);
+      await placeAll(grn.grnId, grn.lineId, 2).expect(400);
+    });
+  });
 });
