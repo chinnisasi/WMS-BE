@@ -174,6 +174,37 @@ export async function lockClientInTx(
   return { ...row, status: row.status as ClientStatus };
 }
 
+/**
+ * Story 21-10 — the client's facts under a `FOR SHARE` row lock on the
+ * caller's transaction, 404 `not-found` when absent. The gates that refuse a
+ * non-active client while CREATING something under it (the rate-card draft,
+ * the portal ASN announce, the portal-user invite) read status through this,
+ * so a suspend (`ClientsCommand.updateStatus`, which takes `FOR UPDATE`)
+ * cannot commit between the gate's read and its insert: a gate already
+ * holding the share lock makes the suspend wait, and a gate arriving behind
+ * a committing suspend waits and — READ COMMITTED — re-reads the committed
+ * `suspended`. Lock order: the client first, then documents; nothing locks a
+ * card or an ASN before its client, so there is no cycle. Share locks do not
+ * conflict with each other, so concurrent gates never serialise.
+ */
+export async function shareLockClientInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientId: string,
+): Promise<LockedClientFacts> {
+  const rows = await tx
+    .select({ id: clients.id, code: clients.code, systemOwned: clients.systemOwned, status: clients.status })
+    .from(clients)
+    .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
+    .limit(1)
+    .for('share');
+  const row = rows[0];
+  if (row === undefined) {
+    throw clientNotFound(clientId);
+  }
+  return { ...row, status: row.status as ClientStatus };
+}
+
 /** The client's status alongside its facts, without a lock (21-3's draft create). */
 export async function getClientStatusInTx(
   tx: TenantTx,

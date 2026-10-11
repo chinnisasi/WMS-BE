@@ -311,8 +311,13 @@ describe('story 21-3: rate cards', () => {
       selfClientId = clients.body.items[0].id as string;
       acmeId = await createClient('ACME');
       suspendedId = await createClient('SLEEPY');
-      // Nothing can suspend a client yet but SQL (clients.md) — the fixture says so.
-      await sql`update clients set status = 'suspended' where id = ${suspendedId}`;
+      // Story 21-10 — suspended through the owner's real status command.
+      await http()
+        .patch(`${API}/${tenantId}/clients/${suspendedId}/status`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set('Idempotency-Key', ulid())
+        .send({ status: 'suspended' })
+        .expect(200);
 
       const foreign = await register(`Foreign Co ${ulid()}`);
       const foreignClient = (

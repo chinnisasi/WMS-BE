@@ -1257,7 +1257,9 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
         await tx`select set_config('app.client_id', ${clientA}, true)`;
         // The reads before the write: the warehouse, the client, A's SKUs.
         seen.warehouse = (await tx`select id from warehouses where tenant_id = ${tenantId} and id = ${warehouseId}`).length;
-        seen.client = (await tx`select status from clients where tenant_id = ${tenantId} and id = ${clientA}`).map((row) => row.status);
+        // Story 21-10 — the announce reads its client under FOR SHARE: a row
+        // lock needs the stamped session admitted to the clients policy too.
+        seen.client = (await tx`select status from clients where tenant_id = ${tenantId} and id = ${clientA} for share`).map((row) => row.status);
         seen.skus = (await tx`select id from skus where tenant_id = ${tenantId} and id in (${skuAId}, ${skuBId})`).map((row) => row.id);
         // The write set.
         await tx`insert into advance_shipment_notices (id, tenant_id, client_id, warehouse_id, asn_code, status)

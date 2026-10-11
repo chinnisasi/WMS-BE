@@ -21,6 +21,8 @@ import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { InvoiceDeliveryHandler } from '../src/modules/invoicing/delivery';
 import { ORDER_DISPATCHED_EVENT } from '../src/modules/invoicing/events';
 import { ChannelsIngestCommand } from '../src/modules/channels/channels.ingest.command';
+import { CLIENT_STATUS_TARGETS, ClientsCommand } from '../src/modules/clients/clients.command';
+import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 
@@ -524,6 +526,7 @@ describe('story 21-2b: client admin and attribution', () => {
           expect.arrayContaining([
             '/tenants/{tenantId}/clients',
             '/tenants/{tenantId}/clients/{clientId}',
+            '/tenants/{tenantId}/clients/{clientId}/status',
             '/tenants/{tenantId}/catalog/skus/{skuId}/client',
           ]),
         );
@@ -1151,6 +1154,361 @@ describe('story 21-2b: client admin and attribution', () => {
       const importReplay = await importCsv(['LEGACY-1,Legacy,pcs,1800,,,'], { clientId: acmeId, key: importKey }).expect(201);
       expect(importReplay.body.committedRows).toBe(1);
       expect(importReplay.body.clientId).toBeUndefined();
+    });
+
+    // ── story 21-10: suspend and reactivate ──────────────────────────────────
+    describe('client suspension (story 21-10)', () => {
+      const PASSWORD = 'correct-horse-battery';
+      let suspId: string;
+      let departedId: string;
+      let suspSkuId: string;
+
+      function setStatus(clientId: string, status: unknown, token = ownerToken, key: string | null = ulid()): SupertestTest {
+        const req = http().patch(`${API}/${tenantId}/clients/${clientId}/status`).set('Authorization', `Bearer ${token}`);
+        return (key === null ? req : req.set(KEY_HEADER, key)).send({ status });
+      }
+
+      async function statusOf(clientId: string): Promise<string> {
+        return (await sql<{ status: string }[]>`select status from clients where id = ${clientId}`)[0]!.status;
+      }
+
+      async function auditActions(clientId: string): Promise<string[]> {
+        const rows = await sql<{ action: string }[]>`
+          select action from audit_events where tenant_id = ${tenantId} and target_id = ${clientId} order by occurred_at, id`;
+        return rows.map((row) => row.action);
+      }
+
+      function signIn(email: string): SupertestTest {
+        return http().post(`${API}/sign-in`).send({ email, password: PASSWORD });
+      }
+
+      // Copied from test/portal.spec.ts (`accept` / `portalUser`).
+      async function accept(inviteToken: string): Promise<void> {
+        await http().post(`${API}/${tenantId}/accept-invite`).set(KEY_HEADER, ulid()).send({ token: inviteToken, password: PASSWORD }).expect(200);
+      }
+
+      function invitePortal(clientId: string, email = `portal-${ulid().toLowerCase()}@brand.example`): SupertestTest {
+        return http()
+          .post(`${API}/${tenantId}/users`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ email, role: 'client', clientId });
+      }
+
+      async function portalUser(clientId: string): Promise<{ email: string; token: string }> {
+        const email = `portal-${ulid().toLowerCase()}@brand.example`;
+        const invited = await invitePortal(clientId, email).expect(201);
+        await accept(invited.body.inviteToken as string);
+        return { email, token: (await signIn(email).expect(200)).body.accessToken as string };
+      }
+
+      function portalMe(token: string): SupertestTest {
+        return http().get(`${API}/${tenantId}/portal/me`).set('Authorization', `Bearer ${token}`);
+      }
+
+      function announce(token: string): SupertestTest {
+        return http()
+          .post(`${API}/${tenantId}/portal/inbound/asns`)
+          .set('Authorization', `Bearer ${token}`)
+          .set(KEY_HEADER, ulid())
+          .send({ warehouseId, asnCode: `ASN-S-${ulid().slice(16)}`, lines: [{ skuId: suspSkuId, announcedQty: 2 }] });
+      }
+
+      function draftRateCard(clientId: string): SupertestTest {
+        return http()
+          .post(`${API}/${tenantId}/clients/${clientId}/rate-cards`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ lines: [{ chargeCode: 'pick', basis: 'per_pick', amountPaise: 300 }] });
+      }
+
+      beforeAll(async () => {
+        suspId = (await createClient({ code: 'SUSP-A', name: 'Suspendable Brand' }).expect(201)).body.client.id as string;
+        departedId = (await createClient({ code: 'GONE-A', name: 'Departed Brand' }).expect(201)).body.client.id as string;
+        // Nothing writes `departed` (the story's Never list) — only SQL can.
+        await sql`update clients set status = 'departed' where id = ${departedId}`;
+        await importCsv(['SUSP-1,Suspendable SKU,pcs,1800,,,'], { clientId: suspId }).expect(201);
+        await refreshSkus();
+        suspSkuId = sku('SUSP-1');
+      });
+
+      it('suspend → 200 suspended, audited client.suspended; a replay re-serves it with no second audit; another body on the key is 422; reactivate → 200 active, audited client.reactivated', async () => {
+        const key = ulid();
+        const suspended = await setStatus(suspId, 'suspended', ownerToken, key).expect(200);
+        expect(suspended.body.client).toMatchObject({ id: suspId, code: 'SUSP-A', status: 'suspended', systemOwned: false });
+        expect(await statusOf(suspId)).toBe('suspended');
+        const audit = await sql`select action, target_type, reference from audit_events where tenant_id = ${tenantId} and target_id = ${suspId} and action = 'client.suspended'`;
+        expect(audit).toEqual([{ action: 'client.suspended', target_type: 'client', reference: key }]);
+
+        const replay = await setStatus(suspId, 'suspended', ownerToken, key).expect(200);
+        expect(replay.body).toEqual(suspended.body);
+        expectProblem(await setStatus(suspId, 'active', ownerToken, key), 422, 'idempotency-key-reuse');
+
+        const reactivated = await setStatus(suspId, 'active').expect(200);
+        expect(reactivated.body.client).toMatchObject({ id: suspId, status: 'active' });
+        expect(await statusOf(suspId)).toBe('active');
+        expect(await auditActions(suspId)).toEqual(['client.created', 'client.suspended', 'client.reactivated']);
+      });
+
+      it('a same-status request is a no-op: 200 with the current client, no write, no audit — but the key IS stored, under the pinned fingerprint (golden)', async () => {
+        const before = await sql<{ updated_at: string }[]>`select updated_at::text from clients where id = ${suspId}`;
+        const auditBefore = await auditActions(suspId);
+        const key = ulid();
+        const res = await setStatus(suspId, 'active', ownerToken, key).expect(200);
+        expect(res.body.client).toMatchObject({ id: suspId, status: 'active' });
+        expect(await sql`select updated_at::text from clients where id = ${suspId}`).toEqual(before);
+        expect(await auditActions(suspId)).toEqual(auditBefore);
+        const stored = await sql<{ payload_hash: string; response_snapshot: { client: { status: string } } }[]>`
+          select payload_hash, response_snapshot from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`;
+        // The key order is the contract: arm, tenantId, clientId, status.
+        const golden = createHash('sha256')
+          .update(`{"arm":"status","tenantId":"${tenantId}","clientId":"${suspId}","status":"active"}`, 'utf8')
+          .digest('hex');
+        expect(stored).toHaveLength(1);
+        expect(stored[0]!.payload_hash).toBe(golden);
+        expect(stored[0]!.response_snapshot.client.status).toBe('active');
+      });
+
+      it('a late retry of a stored no-op replays its snapshot and never re-applies after someone else changed the status', async () => {
+        await setStatus(suspId, 'suspended').expect(200);
+        const k = ulid();
+        const noop = await setStatus(suspId, 'suspended', ownerToken, k).expect(200);
+        expect(noop.body.client.status).toBe('suspended');
+        await setStatus(suspId, 'active', ownerToken, ulid()).expect(200);
+        const auditBefore = await auditActions(suspId);
+        const updatedBefore = await sql`select updated_at::text from clients where id = ${suspId}`;
+
+        const late = await setStatus(suspId, 'suspended', ownerToken, k).expect(200);
+        expect(late.body).toEqual(noop.body);
+        expect(late.body.client.status).toBe('suspended');
+        // No write: the client stays active, nothing audited, nothing touched.
+        expect(await statusOf(suspId)).toBe('active');
+        expect(await auditActions(suspId)).toEqual(auditBefore);
+        expect(await sql`select updated_at::text from clients where id = ${suspId}`).toEqual(updatedBefore);
+      });
+
+      it('refusals: self 400, departed 409 client-not-active, a bad body 400, a non-owner 403 role-denied, another tenant 403 permission-denied, unknown or foreign 404, malformed id 400, no key 400 idempotency-key-required', async () => {
+        const self = await setStatus(selfClientId, 'suspended');
+        expectProblem(self, 400, 'validation-failed');
+        expect(self.body.detail).toMatch(/self client cannot be suspended or reactivated/);
+
+        const departed = await setStatus(departedId, 'active');
+        expectProblem(departed, 409, 'client-not-active');
+        expect(departed.body.detail).toBe('Client "GONE-A" has departed — its status cannot change.');
+        expectProblem(await setStatus(departedId, 'suspended'), 409, 'client-not-active');
+        expect(await statusOf(departedId)).toBe('departed');
+
+        for (const bad of ['departed', 'gone', '', null, 1]) {
+          expectProblem(await setStatus(suspId, bad), 400, 'validation-failed');
+        }
+        expectProblem(
+          await http().patch(`${API}/${tenantId}/clients/${suspId}/status`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send({}),
+          400,
+          'validation-failed',
+        );
+
+        for (const token of [opsToken, accountantToken, operatorWebToken]) {
+          expectProblem(await setStatus(suspId, 'suspended', token), 403, 'role-denied');
+        }
+        expectProblem(await setStatus(suspId, 'suspended', otherTenant.ownerToken), 403, 'permission-denied');
+        expectProblem(await setStatus(uuidv7(), 'suspended'), 404, 'not-found');
+        expectProblem(await setStatus(otherTenant.clientId, 'suspended'), 404, 'not-found');
+        expectProblem(await setStatus('not-a-uuid', 'suspended'), 400, 'validation-failed');
+        expectProblem(await setStatus(suspId, 'suspended', ownerToken, null), 400, 'idempotency-key-required');
+        expect(await statusOf(suspId)).toBe('active');
+      });
+
+      it('the command is its own boundary: a status outside the targets is 400 before any transaction', async () => {
+        const actor = (await sql<{ id: string }[]>`select id from users where tenant_id = ${tenantId} and role = 'owner' limit 1`)[0]!.id;
+        const error = (await app
+          .get(ClientsCommand)
+          .updateStatus({ tenantId, actorUserId: actor, clientId: suspId, status: 'departed' }, ulid())
+          .catch((caught: unknown) => caught)) as ProblemException;
+        expect(error).toBeInstanceOf(ProblemException);
+        expect(error.getStatus()).toBe(400);
+        expect(error.getResponse()).toMatchObject({ code: 'validation-failed' });
+        expect(await statusOf(suspId)).toBe('active');
+        expect([...CLIENT_STATUS_TARGETS]).toEqual(['active', 'suspended']);
+      });
+
+      it('suspension makes every gate reachable without SQL — and operator work continues (an order is 201)', async () => {
+        const portal = await portalUser(suspId);
+        await setStatus(suspId, 'suspended').expect(200);
+        try {
+          expectProblem(await draftRateCard(suspId), 409, 'client-not-active');
+          expectProblem(await invitePortal(suspId), 409, 'client-not-active');
+          expectProblem(await announce(portal.token), 403, 'client-suspended');
+          // Decision 1: operator work for a suspended client behaves as today.
+          await createOrder([{ skuId: suspSkuId, quantity: 1 }]).expect(201);
+        } finally {
+          await setStatus(suspId, 'active').expect(200);
+        }
+        await draftRateCard(suspId).expect(201);
+        await announce(portal.token).expect(201);
+      });
+
+      it('portal end to end: signed in → suspended (me and sign-in 403 client-suspended) → reactivated (the same token works again)', async () => {
+        const portal = await portalUser(suspId);
+        await portalMe(portal.token).expect(200);
+
+        await setStatus(suspId, 'suspended').expect(200);
+        expectProblem(await portalMe(portal.token), 403, 'client-suspended');
+        expectProblem(await signIn(portal.email), 403, 'client-suspended');
+
+        await setStatus(suspId, 'active').expect(200);
+        const me = await portalMe(portal.token).expect(200);
+        expect(me.body.client).toEqual({ id: suspId, code: 'SUSP-A', name: 'Suspendable Brand' });
+        await signIn(portal.email).expect(200);
+      });
+
+      describe('races (deterministic: parked waiters, pg_blocking_pids)', () => {
+        const handle = () => postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+
+        /** Wait until `min` sessions are parked on the clients row lock held by `holderPid`. */
+        const waitParked = async (holderPid: number, lockClause: 'for share' | 'for update', min: number): Promise<void> => {
+          const probe = handle();
+          try {
+            const deadline = Date.now() + 10_000;
+            while (Date.now() < deadline) {
+              const waiting = (await probe`
+                select a.pid, pg_blocking_pids(a.pid) as blockers from pg_stat_activity a
+                where a.wait_event_type = 'Lock' and a.state = 'active'
+                  and a.query ilike '%clients%' and a.query ilike ${`%${lockClause}%`}
+              `) as unknown as { pid: number; blockers: number[] }[];
+              // A second waiter on one row queues behind the FIRST waiter's
+              // tuple lock, so its blocker is that waiter, not the holder:
+              // count the chain that leads back to the holder.
+              const chain = new Set<number>([holderPid]);
+              for (let grew = true; grew; ) {
+                grew = false;
+                for (const row of waiting) {
+                  if (!chain.has(row.pid) && row.blockers.some((pid) => chain.has(pid))) {
+                    chain.add(row.pid);
+                    grew = true;
+                  }
+                }
+              }
+              if (chain.size - 1 >= min) return;
+              await new Promise((r) => setTimeout(r, 25));
+            }
+            throw new Error(`fewer than ${min} request(s) parked on the client row (${lockClause})`);
+          } finally {
+            await probe.end();
+          }
+        };
+
+        it('a draft, a portal announce and a portal-user invite parked behind a committing suspend are all refused', async () => {
+          const portal = await portalUser(suspId);
+          const inviteEmail = `portal-${ulid().toLowerCase()}@brand.example`;
+          const usersOfClient = async () =>
+            (await sql<{ n: number }[]>`select count(*)::int as n from users where client_id = ${suspId}`)[0]!.n;
+          const usersBefore = await usersOfClient();
+          const documentCounts = async () => ({
+            cards: (await sql<{ n: number }[]>`select count(*)::int as n from rate_cards where client_id = ${suspId}`)[0]!.n,
+            asns: (await sql<{ n: number }[]>`select count(*)::int as n from advance_shipment_notices where client_id = ${suspId}`)[0]!.n,
+          });
+          const before = await documentCounts();
+          const holder = handle();
+          let drafting: Promise<request.Response> | undefined;
+          let announcing: Promise<request.Response> | undefined;
+          let inviting: Promise<request.Response> | undefined;
+          try {
+            await holder.begin(async (tx) => {
+              const locked = (await tx`
+                select pg_backend_pid() as pid from clients where tenant_id = ${tenantId} and id = ${suspId} for update
+              `) as unknown as { pid: number }[];
+              await tx`update clients set status = 'suspended', updated_at = now() where id = ${suspId}`;
+              drafting = (async () => draftRateCard(suspId))();
+              announcing = (async () => announce(portal.token))();
+              inviting = (async () => invitePortal(suspId, inviteEmail))();
+              // All three gates must be ON the lock — an unlocked status read
+              // would never park here, and this throws.
+              await waitParked(locked[0]!.pid, 'for share', 3);
+            });
+            const [draft, asn, invited] = await Promise.all([drafting!, announcing!, inviting!]);
+            expectProblem(draft, 409, 'client-not-active');
+            expectProblem(asn, 403, 'client-suspended');
+            expectProblem(invited, 409, 'client-not-active');
+            // Nothing committed past the suspension.
+            expect(await documentCounts()).toEqual(before);
+            expect(await usersOfClient()).toBe(usersBefore);
+            expect(await sql`select 1 from users where email = ${inviteEmail}`).toHaveLength(0);
+          } finally {
+            // Settle every in-flight request BEFORE the cleanup reactivation,
+            // so none can land after it.
+            await Promise.allSettled([drafting, announcing, inviting]);
+            await holder.end();
+            await setStatus(suspId, 'active').expect(200);
+          }
+        });
+
+        it('a suspend parks behind a gate holding the share lock and succeeds once it is released', async () => {
+          const holder = handle();
+          let suspending: Promise<request.Response> | undefined;
+          let settledEarly = false;
+          try {
+            await holder.begin(async (tx) => {
+              const locked = (await tx`
+                select pg_backend_pid() as pid, status from clients where tenant_id = ${tenantId} and id = ${suspId} for share
+              `) as unknown as { pid: number; status: string }[];
+              expect(locked[0]!.status).toBe('active');
+              suspending = (async () => setStatus(suspId, 'suspended'))();
+              void suspending.then(() => {
+                settledEarly = true;
+              });
+              await waitParked(locked[0]!.pid, 'for update', 1);
+              expect(settledEarly).toBe(false);
+            });
+            const res = await suspending!;
+            expect(res.status).toBe(200);
+            expect(res.body.client.status).toBe('suspended');
+            expect(await statusOf(suspId)).toBe('suspended');
+          } finally {
+            await Promise.allSettled([suspending]);
+            await holder.end();
+            await setStatus(suspId, 'active').expect(200);
+          }
+        });
+
+        it('two same-key suspends parked on the client lock: the second replays under the lock — both 200, identical, one audit row, one key', async () => {
+          const key = ulid();
+          const auditCount = async () =>
+            (await sql<{ n: number }[]>`select count(*)::int as n from audit_events
+              where tenant_id = ${tenantId} and target_id = ${suspId} and action = 'client.suspended' and reference = ${key}`)[0]!.n;
+          const holder = handle();
+          let first: Promise<request.Response> | undefined;
+          let second: Promise<request.Response> | undefined;
+          try {
+            await holder.begin(async (tx) => {
+              const locked = (await tx`
+                select pg_backend_pid() as pid from clients where tenant_id = ${tenantId} and id = ${suspId} for update
+              `) as unknown as { pid: number }[];
+              first = (async () => setStatus(suspId, 'suspended', ownerToken, key))();
+              second = (async () => setStatus(suspId, 'suspended', ownerToken, key))();
+              await waitParked(locked[0]!.pid, 'for update', 2);
+            });
+            const [a, b] = await Promise.all([first!, second!]);
+            expect([a.status, b.status]).toEqual([200, 200]);
+            expect(b.body).toEqual(a.body);
+            expect(a.body.client.status).toBe('suspended');
+            expect(await auditCount()).toBe(1);
+            expect(await sql`select 1 from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`).toHaveLength(1);
+          } finally {
+            await Promise.allSettled([first, second]);
+            await holder.end();
+            await setStatus(suspId, 'active').expect(200);
+          }
+        });
+      });
+
+      it('the route is in the OpenAPI document with every documented arm', async () => {
+        const doc = await http().get('/api/v1/openapi.json').expect(200);
+        const op = (doc.body.paths as Record<string, Record<string, { responses: Record<string, unknown> }>>)[
+          '/tenants/{tenantId}/clients/{clientId}/status'
+        ]?.patch;
+        expect(op).toBeDefined();
+        expect(Object.keys(op!.responses).sort()).toEqual(['200', '400', '401', '403', '404', '409', '422']);
+      });
     });
 
     // ── the ledger sweep ─────────────────────────────────────────────────────

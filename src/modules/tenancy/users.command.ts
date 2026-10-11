@@ -15,7 +15,7 @@ import { idempotencyKeyReuse } from './registration.command';
 import { assertPermission } from './permissions';
 import { getMemberRoleIn } from './tenancy.service';
 import { DUMMY_HASH, hashPassword } from './passwords';
-import { getClientStatusInTx } from '../clients/clients.facade';
+import { shareLockClientInTx } from '../clients/clients.facade';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -209,7 +209,9 @@ export class UsersCommand {
       // client brand rather than the tenant's own `self` (400), and active
       // (409 `client-not-active`, the 21-3 type).
       if (clientId !== null) {
-        const client = await getClientStatusInTx(tx, command.tenantId, clientId);
+        // Story 21-10 — FOR SHARE, so a suspend cannot commit between this
+        // read and the invite insert.
+        const client = await shareLockClientInTx(tx, command.tenantId, clientId);
         if (client.systemOwned) {
           throw clientRoleShapeRefused(
             "A client-portal user belongs to a client brand — the tenant's own company is not one.",
