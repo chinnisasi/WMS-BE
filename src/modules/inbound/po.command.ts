@@ -331,9 +331,17 @@ export class PurchaseOrderCommand {
         return { snapshot: replay as PurchaseOrderSnapshot, replayed: true };
       }
 
-      // The PO must exist in this tenant and still be open (409
-      // `po-not-open` naming the status otherwise — the I/O matrix).
-      const po = await this.loadOpenPo(tx, command.tenantId, command.poId);
+      // The PO must exist in this tenant (404) and still be open (409
+      // `po-not-open` naming the status otherwise — the I/O matrix). The
+      // second replay sits BETWEEN the lock and the status check: a
+      // concurrent same-key duplicate parked on the lock re-serves the
+      // winner's snapshot instead of failing on the key's unique index.
+      const po = await this.lockPo(tx, command.tenantId, command.poId);
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return { snapshot: replayedUnderLock as PurchaseOrderSnapshot, replayed: true };
+      }
+      assertPoOpen(po);
 
       // Every referenced existing line must belong to this PO (404 naming
       // the unknown id); entries without an id are new lines. A repeated id
@@ -491,7 +499,15 @@ export class PurchaseOrderCommand {
 
       // Already closed → 409 `po-not-open` naming the status (the stored
       // replay above re-serves the original close's snapshot first).
-      const po = await this.loadOpenPo(tx, command.tenantId, command.poId);
+      // The lock, then the second replay UNDER it, then the status: a
+      // concurrent same-key duplicate parked on the lock must re-serve the
+      // winner's close — a status check first would answer it po-not-open.
+      const po = await this.lockPo(tx, command.tenantId, command.poId);
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return { snapshot: replayedUnderLock as ClosePoSnapshot, replayed: true };
+      }
+      assertPoOpen(po);
       // Story 21-6 (decision 3): never close past an undecided excess — under
       // the PO lock, which an approve also takes, so the two serialise.
       await assertNoPendingOverReceiptsInTx(tx, command.tenantId, { poId: po.id }, `Purchase order "${po.code}"`);
@@ -678,8 +694,14 @@ export class PurchaseOrderCommand {
     }
   }
 
-  /** The PO row of the mutation, locked against concurrent lifecycle changes. */
-  private async loadOpenPo(tx: TenantTx, tenantId: string, poId: string): Promise<PurchaseOrderRow> {
+  /**
+   * The PO row of the mutation, locked against concurrent lifecycle changes
+   * (404 when absent). It deliberately does NOT check the status — that is
+   * `assertPoOpen`, called after the replay under this lock (story 21-11a:
+   * a lock helper that also refused a non-open PO made the replay under the
+   * lock unreachable for `close`).
+   */
+  private async lockPo(tx: TenantTx, tenantId: string, poId: string): Promise<PurchaseOrderRow> {
     const rows = await tx
       .select()
       .from(purchaseOrders)
@@ -694,9 +716,6 @@ export class PurchaseOrderCommand {
         'Purchase order not found',
         `No purchase order with id "${poId}" exists in this tenant.`,
       );
-    }
-    if (po.status !== 'open') {
-      throw poNotOpen(po.code, po.status as PoStatus);
     }
     return po;
   }
@@ -925,4 +944,11 @@ function duplicatePoCode(code: string): ProblemException {
  */
 function canonicalInstant(value: string): string {
   return new Date(value).toISOString();
+}
+
+/** The locked PO must still be open — 409 `po-not-open` naming the status otherwise. */
+function assertPoOpen(po: PurchaseOrderRow): void {
+  if (po.status !== 'open') {
+    throw poNotOpen(po.code, po.status as PoStatus);
+  }
 }

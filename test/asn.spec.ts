@@ -928,6 +928,132 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
     });
   });
 
+  // Story 21-11a (retro B2) — the replay UNDER the lock. A raw holder locks
+  // the ASN row; two same-key requests park behind it; on release the first
+  // commits and the second must re-serve its snapshot. Without the second
+  // replay, an amend's duplicate re-amends and fails on the key's unique
+  // index (409 conflict), and a transition's reads the status the winner
+  // already moved (409 asn-transition-invalid).
+  describe('same-key races: the replay under the ASN lock (story 21-11a)', () => {
+    const handle = () => postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+    /** A response as 200, or `"<status> <code>"` — so a failed race names the refusal. */
+    const outcome = (res: request.Response): number | string =>
+      res.status === 200 ? 200 : `${res.status} ${(res.body as { code?: string }).code}`;
+
+    /** Wait until `min` sessions are parked on a `table` row lock held by `holderPid` (the 21-10 helper). */
+    async function waitParked(table: 'advance_shipment_notices', holderPid: number, min: number): Promise<void> {
+      const probe = handle();
+      try {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const waiting = (await probe`
+            select a.pid, pg_blocking_pids(a.pid) as blockers from pg_stat_activity a
+            where a.wait_event_type = 'Lock' and a.state = 'active'
+              and a.query ilike ${`%"${table}"%`} and a.query ilike '%for update%'
+          `) as unknown as { pid: number; blockers: number[] }[];
+          // A second waiter queues behind the FIRST waiter's tuple lock:
+          // count the chain that leads back to the holder.
+          const chain = new Set<number>([holderPid]);
+          for (let grew = true; grew; ) {
+            grew = false;
+            for (const row of waiting) {
+              if (!chain.has(row.pid) && row.blockers.some((pid) => chain.has(pid))) {
+                chain.add(row.pid);
+                grew = true;
+              }
+            }
+          }
+          if (chain.size - 1 >= min) return;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        throw new Error(`fewer than ${min} request(s) parked on the ${table} row`);
+      } finally {
+        await probe.end();
+      }
+    }
+
+    /** Fire `send` twice while a raw holder has the ASN row `FOR UPDATE`; release once both are parked. */
+    async function raceTwice(asnId: string, send: () => SupertestTest): Promise<[request.Response, request.Response]> {
+      const holder = handle();
+      let first: Promise<request.Response> | undefined;
+      let second: Promise<request.Response> | undefined;
+      try {
+        await holder.begin(async (tx) => {
+          const locked = (await tx`
+            select pg_backend_pid() as pid from advance_shipment_notices where tenant_id = ${tenantId} and id = ${asnId} for update
+          `) as unknown as { pid: number }[];
+          first = (async () => send())();
+          second = (async () => send())();
+          await waitParked('advance_shipment_notices', locked[0]!.pid, 2);
+        });
+        return await Promise.all([first!, second!]);
+      } finally {
+        await Promise.allSettled([first, second]);
+        await holder.end();
+      }
+    }
+
+    async function auditRows(asnId: string, action: string, key: string): Promise<number> {
+      return (
+        await sql<{ n: number }[]>`select count(*)::int as n from audit_events
+          where tenant_id = ${tenantId} and target_id = ${asnId} and action = ${action} and reference = ${key}`
+      )[0]!.n;
+    }
+
+    async function keyRows(key: string): Promise<number> {
+      return (await sql<{ n: number }[]>`select count(*)::int as n from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`)[0]!.n;
+    }
+
+    it('amend: two same-key amends parked on the lock both answer the same body — one amend, one key', async () => {
+      const asn = await newAsn([{ skuId: acme1, announcedQty: 10 }]);
+      const key = ulid();
+      const [a, b] = await raceTwice(asn.id, () =>
+        amendAsn(asn.id, { lines: [{ id: asn.lines[0]!.id, skuId: acme1, announcedQty: 12 }, { skuId: acme2, announcedQty: 3 }] }, opsToken, key),
+      );
+      expect([a, b].map(outcome)).toEqual([200, 200]);
+      expect(b.body).toEqual(a.body);
+      expect(a.body.asn).toMatchObject({ lineCount: 2, announcedTotal: 15 });
+      // Exactly one effect: one added line, one audit row, one outbox event, one key.
+      expect(((await getAsn(asn.id).expect(200)).body.asn as AsnBody).lines).toHaveLength(2);
+      expect(await auditRows(asn.id, 'asn.amended', key)).toBe(1);
+      expect(
+        (await sql`select 1 from outbox_messages where tenant_id = ${tenantId} and type = 'asn.amended' and payload->'asn'->>'id' = ${asn.id}`).length,
+      ).toBe(1);
+      expect(await keyRows(key)).toBe(1);
+    });
+
+    it('cancel: two same-key cancels parked on the lock both answer the same body — one transition, one key', async () => {
+      const asn = await newAsn([{ skuId: acme1, announcedQty: 10 }]);
+      const key = ulid();
+      const [a, b] = await raceTwice(asn.id, () => transition(asn.id, 'cancel', 'Client withdrew it', key));
+      expect([a, b].map(outcome)).toEqual([200, 200]);
+      expect(b.body).toEqual(a.body);
+      expect(a.body.asn).toMatchObject({ status: 'cancelled', statusNote: 'Client withdrew it' });
+      expect(await auditRows(asn.id, 'asn.cancelled', key)).toBe(1);
+      expect(
+        (await sql`select 1 from outbox_messages where tenant_id = ${tenantId} and type = 'asn.cancelled' and payload->'asn'->>'id' = ${asn.id}`).length,
+      ).toBe(1);
+      expect(await keyRows(key)).toBe(1);
+    });
+
+    it('close: two same-key short closes parked on the lock (partially received, nothing pending) both answer the same body — one transition, one key', async () => {
+      const asn = await newAsn([{ skuId: acme1, announcedQty: 10 }]);
+      // A receipt within the line's opening: partially_received, no excess pending.
+      await receive(asnReceipt(asn, [line(acme1, 4, { asnLineId: asn.lines[0]!.id })]), 'device');
+      expect(((await getAsn(asn.id).expect(200)).body.asn as AsnBody).status).toBe('partially_received');
+      const key = ulid();
+      const [a, b] = await raceTwice(asn.id, () => transition(asn.id, 'close', 'Short by six', key));
+      expect([a, b].map(outcome)).toEqual([200, 200]);
+      expect(b.body).toEqual(a.body);
+      expect(a.body.asn).toMatchObject({ status: 'closed', statusNote: 'Short by six' });
+      expect(await auditRows(asn.id, 'asn.closed', key)).toBe(1);
+      expect(
+        (await sql`select 1 from outbox_messages where tenant_id = ${tenantId} and type = 'asn.closed' and payload->'asn'->>'id' = ${asn.id}`).length,
+      ).toBe(1);
+      expect(await keyRows(key)).toBe(1);
+    });
+  });
+
   describe('cancel with receipts, and the drill’s same-client rule', () => {
     it('an ASN whose only receipt credited no line stays announced, but cannot be cancelled (409 asn-has-receipts)', async () => {
       const asn = await newAsn([{ skuId: acme1, announcedQty: 10 }]);

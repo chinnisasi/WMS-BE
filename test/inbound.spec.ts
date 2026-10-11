@@ -722,6 +722,130 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
 
   // ── Reads: keyset paging, filters, error arms ─────────────────────────────
 
+  // Story 21-11a (retro B2) — the replay UNDER the PO lock. `lockPo` locks
+  // (404) and `assertPoOpen` refuses a non-open PO AFTER the second replay —
+  // the old `loadOpenPo` did both, so a close's same-key duplicate was
+  // refused po-not-open before any replay could run. A raw holder locks the
+  // PO row; two same-key requests park behind it; on release the loser must
+  // re-serve the winner's snapshot.
+  describe('same-key races: the replay under the PO lock (story 21-11a)', () => {
+    const handle = () => postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+    /** A response as 200, or `"<status> <code>"` — so a failed race names the refusal. */
+    const outcome = (res: request.Response): number | string =>
+      res.status === 200 ? 200 : `${res.status} ${(res.body as { code?: string }).code}`;
+
+    /** Wait until `min` sessions are parked on a `table` row lock held by `holderPid` (the 21-10 helper). */
+    async function waitParked(table: 'purchase_orders', holderPid: number, min: number): Promise<void> {
+      const probe = handle();
+      try {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const waiting = (await probe`
+            select a.pid, pg_blocking_pids(a.pid) as blockers from pg_stat_activity a
+            where a.wait_event_type = 'Lock' and a.state = 'active'
+              and a.query ilike ${`%"${table}"%`} and a.query ilike '%for update%'
+          `) as unknown as { pid: number; blockers: number[] }[];
+          // A second waiter queues behind the FIRST waiter's tuple lock:
+          // count the chain that leads back to the holder.
+          const chain = new Set<number>([holderPid]);
+          for (let grew = true; grew; ) {
+            grew = false;
+            for (const row of waiting) {
+              if (!chain.has(row.pid) && row.blockers.some((pid) => chain.has(pid))) {
+                chain.add(row.pid);
+                grew = true;
+              }
+            }
+          }
+          if (chain.size - 1 >= min) return;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        throw new Error(`fewer than ${min} request(s) parked on the ${table} row`);
+      } finally {
+        await probe.end();
+      }
+    }
+
+    /** Fire `send` twice while a raw holder has the PO row `FOR UPDATE`; release once both are parked. */
+    async function raceTwice(poId: string, send: () => SupertestTest): Promise<[request.Response, request.Response]> {
+      const holder = handle();
+      let first: Promise<request.Response> | undefined;
+      let second: Promise<request.Response> | undefined;
+      try {
+        await holder.begin(async (tx) => {
+          const locked = (await tx`
+            select pg_backend_pid() as pid from purchase_orders where tenant_id = ${tenantId} and id = ${poId} for update
+          `) as unknown as { pid: number }[];
+          first = (async () => send())();
+          second = (async () => send())();
+          await waitParked('purchase_orders', locked[0]!.pid, 2);
+        });
+        return await Promise.all([first!, second!]);
+      } finally {
+        await Promise.allSettled([first, second]);
+        await holder.end();
+      }
+    }
+
+    async function newPo(): Promise<{ id: string; lines: { id: string }[] }> {
+      const created = await createPo({
+        warehouseId,
+        vendorId,
+        code: `PO-${ulid().slice(10, 18).toUpperCase()}`,
+        lines: [
+          { skuId: skuIds.get('INB-A')!, orderedQty: 10, unitCostPaise: 1000 },
+          { skuId: skuIds.get('INB-B')!, orderedQty: 4, unitCostPaise: 2000 },
+        ],
+      }).expect(201);
+      return created.body.purchaseOrder as { id: string; lines: { id: string }[] };
+    }
+
+    it('amend: two same-key amends parked on the lock both answer the same body — one amend, one key', async () => {
+      const po = await newPo();
+      const key = ulid();
+      const [a, b] = await raceTwice(po.id, () =>
+        amendPo(
+          po.id,
+          [
+            { id: po.lines[0]!.id, skuId: skuIds.get('INB-A')!, orderedQty: 7, unitCostPaise: 1000 },
+            { id: po.lines[1]!.id, skuId: skuIds.get('INB-B')!, orderedQty: 4, unitCostPaise: 2000 },
+            { skuId: skuIds.get('INB-B')!, orderedQty: 2, unitCostPaise: 2000 },
+          ],
+          key,
+        ),
+      );
+      expect([a, b].map(outcome)).toEqual([200, 200]);
+      expect(b.body).toEqual(a.body);
+      expect(a.body.purchaseOrder.lines).toHaveLength(3);
+      // Exactly one effect: three lines (one added, not two), one po.amended, one key.
+      expect(await dbCount('purchase_order_lines', 'and po_id = $2', [po.id])).toBe(3);
+      expect(await dbCount('outbox_messages', "and type = 'po.amended' and payload->'purchaseOrder'->>'id' = $2", [po.id])).toBe(1);
+      expect(await dbCount('idempotency_keys', 'and key = $2', [key])).toBe(1);
+    });
+
+    it('close: two same-key closes parked on the lock both answer the same body — one close, one successor, one key', async () => {
+      const po = await newPo();
+      const key = ulid();
+      const [a, b] = await raceTwice(po.id, () =>
+        closePo(
+          po.id,
+          [
+            { lineId: po.lines[0]!.id, disposition: 'carried' },
+            { lineId: po.lines[1]!.id, disposition: 'cancelled' },
+          ],
+          key,
+        ),
+      );
+      expect([a, b].map(outcome)).toEqual([200, 200]);
+      expect(b.body).toEqual(a.body);
+      expect(a.body.purchaseOrder.status).toBe('closed');
+      expect(a.body.successor).not.toBeNull();
+      expect(await dbCount('purchase_orders', 'and carried_from_po_id = $2', [po.id])).toBe(1);
+      expect(await dbCount('outbox_messages', "and type = 'po.closed' and payload->'purchaseOrder'->>'id' = $2", [po.id])).toBe(1);
+      expect(await dbCount('idempotency_keys', 'and key = $2', [key])).toBe(1);
+    });
+  });
+
   it('PO list: walks the keyset to exhaustion with no dup/miss; malformed cursor and out-of-range limit are 400', async () => {
     // Three more POs on top of the earlier ones, all in this warehouse.
     for (let i = 0; i < 3; i += 1) {

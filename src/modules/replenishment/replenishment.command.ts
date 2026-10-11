@@ -300,7 +300,7 @@ export function poMintPayloadHash(mint: {
 
 /**
  * The breach row of a mutation, locked against concurrent transitions
- * (worker recovery, a second dismissal — the loadOpenPo shape).
+ * (worker recovery, a second dismissal — the PO command's `lockPo` shape).
  */
 export async function loadBreachInTenant(
   tx: TenantTx,

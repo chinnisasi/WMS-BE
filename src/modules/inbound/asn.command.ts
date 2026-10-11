@@ -678,6 +678,13 @@ export class AsnCommand {
       assertLineShape(command.lines);
 
       const asn = await this.lockAsn(tx, command.tenantId, command.asnId);
+      // Replay again UNDER the lock (the same-key race fix, guide §1): a
+      // concurrent same-key duplicate parked on the lock re-serves the
+      // winner's snapshot instead of failing on the key's unique index.
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock as AsnSnapshot;
+      }
       if (!OPEN_ASN_STATUSES.includes(asn.status as AsnStatus)) {
         throw asnNotOpen(asn.asnCode, asn.status);
       }
@@ -798,6 +805,13 @@ export class AsnCommand {
       }
 
       const asn = await this.lockAsn(tx, command.tenantId, command.asnId);
+      // Replay again UNDER the lock: a concurrent same-key duplicate parked
+      // on the lock re-serves the winner's snapshot — without this it reads
+      // the status the winner already moved and answers asn-transition-invalid.
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock as AsnSnapshot;
+      }
       if (asn.status !== ASN_TRANSITIONS[command.transition]) {
         throw asnTransitionInvalid(asn.asnCode, asn.status, command.transition);
       }

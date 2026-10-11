@@ -160,8 +160,12 @@ export function normalizeClientCode(code: string): string {
  * Client admin (story 21-2b): an owner registers a client brand and renames
  * it. The house skeleton (IMPLEMENTATION-GUIDE §1): the payload is
  * normalized and hashed BEFORE the transaction; inside it, authority
- * (`clients.manage`, owner-only, re-read from the DB) → replay → shape
- * validation → the write → the audit row → the idempotency key LAST. No
+ * (`clients.manage`, owner-only, re-read from the DB; `billing.invoice` for
+ * the tax details) → replay → shape validation → the write → the audit row →
+ * the idempotency key LAST. `create` takes no row lock and replays once;
+ * `rename`, `updateTaxDetails` and `updateStatus` lock the client row
+ * `FOR UPDATE` after the first replay and replay AGAIN under the lock
+ * before any guard (the same-key race step — rename's since 21-11a). No
  * outbox event — nothing downstream consumes a client's existence yet.
  *
  * Deliberately absent (the story's Never list): departure, deletion, and
@@ -257,6 +261,14 @@ export class ClientsCommand {
       const current = lockedRows[0];
       if (current === undefined) {
         throw clientNotFound(command.clientId);
+      }
+      // Replay again UNDER the lock — the skeleton's same-key race step
+      // (story 21-11a). Here it is for consistency only: a parked same-key
+      // duplicate would otherwise take the no-op arm below, which already
+      // answers the winner's body and writes nothing.
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
       }
       if (current.systemOwned) {
         throw new ProblemException(

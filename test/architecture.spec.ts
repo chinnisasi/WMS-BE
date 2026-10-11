@@ -1876,4 +1876,361 @@ describe('architecture: the client portal (story 21-7)', () => {
     expect(stampsClient(bodyOf(unstamped, 'portalThing')!)).toBe(false);
     expect(stampsClient(bodyOf(wrongOption, 'portalThing')!)).toBe(false);
   });
+
+  /**
+   * Story 21-11a (epic-21 retro X3) — the scans above check the NAMED facade
+   * methods; nothing tied the portal controller's calls to them. A new portal
+   * route calling an unstamped facade read (the operator `listOrders`, say)
+   * would return every client's rows — the policies are open when the
+   * transaction is unstamped (0041) — and every test would still pass. So:
+   *
+   *   1. the controller's injected fields are pinned (field → class), so a
+   *      new facade cannot arrive with methods that share a stamped name;
+   *   2. every `this.<field>.<method>(` call — multi-line and optional calls
+   *      included — must be a `field.method` pair from PORTAL_READS (via the
+   *      file's class and its field) or a DECLARED delegation;
+   *   3. no escape hatch: every `this.<field>` must be immediately called
+   *      (an alias, a destructure or a facade passed as an argument fails);
+   *   4. each delegation's target is itself on PORTAL_READS / PORTAL_WRITES,
+   *      and the delegating method is a single `return <target>(…);`.
+   */
+  const PORTAL_CONTROLLER = join(SRC_ROOT, 'api', 'portal.controller.ts');
+
+  const PORTAL_CONTROLLER_FIELDS: Readonly<Record<string, string>> = {
+    clients: 'ClientsFacade',
+    inventory: 'InventoryFacade',
+    outbound: 'OutboundFacade',
+    inbound: 'InboundFacade',
+    billing: 'BillingFacade',
+    catalog: 'CatalogFacade',
+    tenancy: 'TenancyService',
+    reporting: 'ReportingFacade',
+  };
+
+  /** Each PORTAL_READS file's class — the one the controller injects. */
+  const PORTAL_READ_CLASS_BY_FILE: ReadonlyMap<string, string> = new Map([
+    [join(SRC_ROOT, 'modules', 'inventory', 'inventory.facade.ts'), 'InventoryFacade'],
+    [join(SRC_ROOT, 'modules', 'outbound', 'outbound.facade.ts'), 'OutboundFacade'],
+    [join(SRC_ROOT, 'modules', 'inbound', 'inbound.facade.ts'), 'InboundFacade'],
+    [join(SRC_ROOT, 'modules', 'billing', 'billing.facade.ts'), 'BillingFacade'],
+    [join(SRC_ROOT, 'modules', 'clients', 'clients.facade.ts'), 'ClientsFacade'],
+    [join(SRC_ROOT, 'modules', 'catalog', 'catalog.facade.ts'), 'CatalogFacade'],
+    [join(SRC_ROOT, 'modules', 'tenancy', 'tenancy.service.ts'), 'TenancyService'],
+    [join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), 'ReportingFacade'],
+  ]);
+
+  /**
+   * The facade methods the controller calls that are not themselves on the
+   * lists, each a one-statement hand-off to a target that is. `via` names
+   * the injected member (and its class) the hand-off goes through; without
+   * it the target is a function in the facade's own file.
+   */
+  const PORTAL_DELEGATIONS: readonly {
+    field: string;
+    method: string;
+    target: string;
+    via?: { member: string; className: string };
+    /** The method's whole body, whitespace-normalised — nothing else may ride in it, its arguments included. */
+    statement: string;
+  }[] = [
+    { field: 'clients', method: 'portalMe', target: 'portalMeIn', statement: 'return portalMeIn(this.db, tenantId, userId, clientId);' },
+    {
+      field: 'inbound',
+      method: 'announceAsn',
+      target: 'announce',
+      via: { member: 'asnCommand', className: 'AsnCommand' },
+      statement: 'return this.asnCommand.announce(command, idempotencyKey);',
+    },
+  ];
+
+  /**
+   * The client argument every controller call must carry: the SESSION's
+   * client (the guard's re-read), never one from the path, query or body.
+   * Every `<x>.clientId` in a call's arguments must be `session.clientId`,
+   * and at least one must be present. `portalMe` additionally passes the
+   * session's user — its whole argument list is pinned.
+   */
+  const SESSION_CLIENT = 'session.clientId';
+  const PINNED_CALL_ARGS: Readonly<Record<string, string>> = {
+    'clients.portalMe': 'tenantId, session.userId, session.clientId',
+  };
+
+  /** `@Inject(X) private readonly <field>: X` pairs of the controller's constructor. */
+  function controllerFields(source: string): Record<string, string> {
+    const ctor = /\n\s*constructor\(([\s\S]*?)\)\s*\{\s*\}/.exec(source);
+    if (ctor === null) return {};
+    const fields: Record<string, string> = {};
+    const params = ctor[1]!;
+    const injected = [...params.matchAll(/@Inject\((\w+)\)\s+private\s+readonly\s+(\w+)\s*:\s*(\w+)/g)];
+    for (const [, token, field, type] of injected) {
+      // The token and the declared type must agree (a mismatched token injects another class).
+      fields[field!] = token === type ? type! : `${token}≠${type}`;
+    }
+    // A parameter injected any other way is a field the map does not see.
+    const declared = [...params.matchAll(/\b(?:private|public|protected|readonly)\s+(?:readonly\s+)?(\w+)\s*:/g)];
+    for (const [, field] of declared) {
+      if (!(field! in fields)) fields[field!] = '<not @Inject-ed>';
+    }
+    return fields;
+  }
+
+  const CONTROLLER_CALL = /this\.(\w+)\s*\??\.\s*(\w+)\s*\(/g;
+
+  /**
+   * The source with every comment and string literal blanked to spaces
+   * (offsets kept), so prose like "this client's orders" in an `@ApiOperation`
+   * summary is not read as code. A template literal's `${…}` stays code.
+   */
+  function codeOnly(source: string): string {
+    const out = source.split('');
+    const blank = (from: number, to: number): void => {
+      for (let k = from; k < to; k += 1) if (out[k] !== '\n') out[k] = ' ';
+    };
+    let i = 0;
+    const templateDepth: number[] = []; // brace depth at each open `${`
+    let braces = 0;
+    while (i < source.length) {
+      const c = source[i]!;
+      const next = source[i + 1];
+      if (c === '/' && next === '/') {
+        const end = source.indexOf('\n', i);
+        const stop = end === -1 ? source.length : end;
+        blank(i, stop);
+        i = stop;
+      } else if (c === '/' && next === '*') {
+        const end = source.indexOf('*/', i + 2);
+        const stop = end === -1 ? source.length : end + 2;
+        blank(i, stop);
+        i = stop;
+      } else if (c === "'" || c === '"') {
+        let j = i + 1;
+        while (j < source.length && source[j] !== c && source[j] !== '\n') j += source[j] === '\\' ? 2 : 1;
+        blank(i, j + 1);
+        i = j + 1;
+      } else if (c === '`' || (c === '}' && templateDepth.length > 0 && templateDepth[templateDepth.length - 1] === braces)) {
+        if (c === '}') templateDepth.pop();
+        // Inside a template: blank up to the closing backtick or the next `${`.
+        let j = i + 1;
+        while (j < source.length && source[j] !== '`' && !(source[j] === '$' && source[j + 1] === '{')) j += source[j] === '\\' ? 2 : 1;
+        blank(i, j);
+        if (source[j] === '$') {
+          templateDepth.push(braces);
+          i = j + 2;
+        } else {
+          out[j] = ' ';
+          i = j + 1;
+        }
+      } else {
+        if (c === '{') braces += 1;
+        else if (c === '}') braces -= 1;
+        i += 1;
+      }
+    }
+    return out.join('');
+  }
+
+  /** The argument text of a call whose `(` ends just before `from`, up to its matching `)` (unbalanced → the rest). */
+  function callArguments(source: string, from: number): string {
+    let depth = 1;
+    for (let i = from; i < source.length; i += 1) {
+      const c = source[i];
+      if (c === '(') depth += 1;
+      else if (c === ')' && (depth -= 1) === 0) return source.slice(from, i);
+    }
+    return source.slice(from);
+  }
+
+  /** Every offence in a controller source: an unknown field, an unlisted pair, an escape hatch, a non-session client. */
+  function portalControllerOffenders(rawSource: string, fields: ReadonlySet<string>, allowed: ReadonlySet<string>): string[] {
+    const source = codeOnly(rawSource);
+    const offenders: string[] = [];
+    const callStarts = new Set<number>();
+    for (const match of source.matchAll(CONTROLLER_CALL)) {
+      callStarts.add(match.index!);
+      const [, field, method] = match;
+      if (!fields.has(field!)) offenders.push(`this.${field}.${method}( — ${field} is not a pinned field`);
+      else if (!allowed.has(`${field}.${method}`)) offenders.push(`this.${field}.${method}( — not a stamped portal read or a declared delegation`);
+      const args = callArguments(source, match.index! + match[0].length);
+      const pinned = PINNED_CALL_ARGS[`${field}.${method}`];
+      if (pinned !== undefined) {
+        if (args.replace(/\s+/g, ' ').trim() !== pinned) offenders.push(`this.${field}.${method}( — arguments are not exactly (${pinned})`);
+      } else if (!args.includes(SESSION_CLIENT)) {
+        offenders.push(`this.${field}.${method}( — does not pass ${SESSION_CLIENT}`);
+      }
+      for (const client of args.matchAll(/(?:\b[\w$]+\s*\??\.\s*)+clientId\b/g)) {
+        if (client[0].replace(/\s+/g, '') !== SESSION_CLIENT) {
+          offenders.push(`this.${field}.${method}( — passes ${client[0].replace(/\s+/g, '')}, not ${SESSION_CLIENT}`);
+        }
+      }
+    }
+    for (const match of source.matchAll(/\bthis\b(\s*\??\.\s*(\w+))?/g)) {
+      if (callStarts.has(match.index!)) continue;
+      offenders.push(
+        match[2] === undefined
+          ? `\`this\` used bare at offset ${match.index} (a destructure or a pass-through)`
+          : `this.${match[2]} is not immediately called (an alias, or the facade passed as a value)`,
+      );
+    }
+    return offenders;
+  }
+
+  /** The allowed `field.method` pairs: PORTAL_READS through file → class → field, plus the delegations. */
+  function allowedPortalPairs(): Set<string> {
+    const fieldOfClass = new Map(Object.entries(PORTAL_CONTROLLER_FIELDS).map(([field, cls]) => [cls, field]));
+    const allowed = new Set<string>();
+    for (const { file, methods } of PORTAL_READS) {
+      const cls = PORTAL_READ_CLASS_BY_FILE.get(file);
+      if (cls === undefined) throw new Error(`PORTAL_READS file ${file} has no entry in PORTAL_READ_CLASS_BY_FILE`);
+      const field = fieldOfClass.get(cls);
+      if (field === undefined) throw new Error(`${cls} (from ${file}) is not an injected portal controller field`);
+      for (const method of methods) allowed.add(`${field}.${method}`);
+    }
+    for (const { field, method } of PORTAL_DELEGATIONS) allowed.add(`${field}.${method}`);
+    return allowed;
+  }
+
+  it('PortalSessionGuard guards routes in portal.controller.ts only (the scan below covers every portal route)', () => {
+    const users = files.filter((file) => /@UseGuards\([^)]*\bPortalSessionGuard\b/.test(file.source)).map((file) => file.path);
+    expect(users).toEqual([PORTAL_CONTROLLER]);
+  });
+
+  it('the portal controller injects exactly the pinned facades (field → class)', () => {
+    expect(controllerFields(readFileSync(PORTAL_CONTROLLER, 'utf8'))).toEqual(PORTAL_CONTROLLER_FIELDS);
+    // Every PORTAL_READS file is mapped to a class it really declares, and that class is injected.
+    for (const { file } of PORTAL_READS) {
+      const cls = PORTAL_READ_CLASS_BY_FILE.get(file);
+      expect(cls).toBeDefined();
+      expect(readFileSync(file, 'utf8')).toMatch(new RegExp(`\\nexport class ${cls}\\b`));
+      expect(Object.values(PORTAL_CONTROLLER_FIELDS)).toContain(cls);
+    }
+  });
+
+  it('every portal controller call is a stamped portal read or a declared delegation — no escape hatch', () => {
+    const source = readFileSync(PORTAL_CONTROLLER, 'utf8');
+    const fields = new Set(Object.keys(PORTAL_CONTROLLER_FIELDS));
+    expect(portalControllerOffenders(source, fields, allowedPortalPairs())).toEqual([]);
+    // The scan really reads the controller's calls (a broken regex would pass empty).
+    const calls = [...source.matchAll(CONTROLLER_CALL)].map((match) => `${match[1]}.${match[2]}`);
+    expect(calls.length).toBeGreaterThanOrEqual(14);
+    expect(calls).toEqual(expect.arrayContaining(['outbound.portalOrders', 'inbound.announceAsn', 'clients.portalMe']));
+  });
+
+  it('each declared delegation is exactly its pinned `return <target>(…);` to a listed portal read or write', () => {
+    const listedTargets = new Map<string, string[]>();
+    for (const { file, methods } of [...PORTAL_READS, ...PORTAL_WRITES]) {
+      for (const method of methods) listedTargets.set(method, [...(listedTargets.get(method) ?? []), file]);
+    }
+    const fileOfClass = new Map([...PORTAL_READ_CLASS_BY_FILE].map(([file, cls]) => [cls, file]));
+    const offenders: string[] = [];
+    for (const { field, method, target, via, statement } of PORTAL_DELEGATIONS) {
+      const facadeFile = fileOfClass.get(PORTAL_CONTROLLER_FIELDS[field]!)!;
+      const source = readFileSync(facadeFile, 'utf8');
+      const targetFiles = listedTargets.get(target) ?? [];
+      if (via === undefined) {
+        // A function of the facade's own file, listed against that file.
+        if (!targetFiles.includes(facadeFile)) offenders.push(`${field}.${method} → ${target}: not listed for ${facadeFile}`);
+      } else {
+        // The member is injected as the named class, and the target is listed against the file declaring it.
+        if (!new RegExp(`@Inject\\(${via.className}\\)\\s+private\\s+readonly\\s+${via.member}\\s*:\\s*${via.className}\\b`).test(source)) {
+          offenders.push(`${field}.${method}: ${via.member} is not an injected ${via.className}`);
+        }
+        if (!targetFiles.some((file) => new RegExp(`\\nexport class ${via.className}\\b`).test(readFileSync(file, 'utf8')))) {
+          offenders.push(`${field}.${method} → ${target}: not listed for ${via.className}`);
+        }
+      }
+      const body = bodyOf(source, method);
+      if (body === null || delegationStatement(body) !== statement) {
+        offenders.push(`${field}.${method}: its body is not exactly \`${statement}\``);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  /** A method's whole body, comments dropped and whitespace normalised (null when it cannot be parsed). */
+  function delegationStatement(body: string): string | null {
+    const inner = /\)\s*(?::\s*[^{]+)?\{([\s\S]*)\}\s*$/.exec(body.trimEnd());
+    if (inner === null) return null;
+    return inner[1]!
+      .replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '')
+      .replace(/\s+/g, ' ')
+      .replace(/\(\s/g, '(')
+      .replace(/\s\)/g, ')')
+      .trim();
+  }
+
+  it('the controller-call scan bites: an unknown call, a multi-line call, an optional call and an alias are flagged', () => {
+    const fields = new Set(Object.keys(PORTAL_CONTROLLER_FIELDS));
+    const allowed = allowedPortalPairs();
+    const clean = `
+    const page = await this.outbound.portalOrders(tenantId, session.clientId, query);
+    return this.clients.portalMe(tenantId, session.userId, session.clientId);`;
+    const unknownCall = `
+    const page = await this.outbound.listOrders(tenantId, query);`;
+    const multiLine = `
+    const page = await this.outbound
+      .listOrders(tenantId, session.clientId, query);`;
+    const optional = `
+    const page = await this.outbound?.listOrders(tenantId, query);`;
+    const alias = `
+    const o = this.outbound;
+    return o.listOrders(tenantId, query);`;
+    const destructure = `
+    const { outbound } = this;
+    return outbound.listOrders(tenantId, query);`;
+    const passedAsValue = `
+    return readThrough(this.outbound, tenantId);`;
+    const unknownField = `
+    return this.reservations.portalStock(tenantId, session.clientId);`;
+    expect(portalControllerOffenders(clean, fields, allowed)).toEqual([]);
+    for (const fixture of [unknownCall, multiLine, optional, alias, destructure, passedAsValue, unknownField]) {
+      expect(portalControllerOffenders(fixture, fields, allowed)).not.toEqual([]);
+    }
+    // Prose and comments are not code; a template's `${…}` is.
+    expect(portalControllerOffenders(`summary: "This client's orders — this.outbound" // this.outbound`, fields, allowed)).toEqual([]);
+    expect(portalControllerOffenders('const s = `orders ${readThrough(this.outbound)}`;', fields, allowed)).not.toEqual([]);
+    expect(portalControllerOffenders(multiLine, fields, allowed)).toEqual([
+      'this.outbound.listOrders( — not a stamped portal read or a declared delegation',
+    ]);
+    // The field map catches a new or re-typed injection.
+    const extraField = `
+  constructor(
+    @Inject(ClientsFacade) private readonly clients: ClientsFacade,
+    @Inject(OrdersService) private readonly orders: OrdersService,
+  ) {}`;
+    expect(controllerFields(extraField)).toEqual({ clients: 'ClientsFacade', orders: 'OrdersService' });
+    // The delegation shape check refuses an extra statement hidden inside.
+    const twoStatements = `
+  async portalMe(tenantId: string, userId: string, clientId: string): Promise<PortalMe> {
+    const leak = await listEveryClientsOrders(tenantId);
+    return portalMeIn(this.db, tenantId, userId, clientId);
+  }
+`;
+    const oneStatement = `
+  async portalMe(tenantId: string, userId: string, clientId: string): Promise<PortalMe> {
+    return portalMeIn(this.db, tenantId, userId, clientId);
+  }
+`;
+    const workInArgs = `
+  async portalMe(tenantId: string, userId: string, clientId: string): Promise<PortalMe> {
+    return portalMeIn(this.db, tenantId, userId, (await listEveryClientsOrders(tenantId), clientId));
+  }
+`;
+    const pinned = PORTAL_DELEGATIONS.find((d) => d.method === 'portalMe')!.statement;
+    expect(delegationStatement(bodyOf(oneStatement, 'portalMe')!)).toBe(pinned);
+    expect(delegationStatement(bodyOf(twoStatements, 'portalMe')!)).not.toBe(pinned);
+    expect(delegationStatement(bodyOf(workInArgs, 'portalMe')!)).not.toBe(pinned);
+    // A client id from the query, the body or the path is flagged, even on an allowed read.
+    for (const foreign of [
+      'const page = await this.outbound.portalOrders(tenantId, query.clientId, {});',
+      'const page = await this.outbound.portalOrders(tenantId, dto.clientId ?? session.clientId, {});',
+      'return this.clients.portalMe(tenantId, session.userId, query.clientId);',
+      'const page = await this.inventory.portalStock(tenantId, clientId, pageQuery(query));',
+    ]) {
+      expect(portalControllerOffenders(foreign, fields, allowed)).not.toEqual([]);
+    }
+    // The announce shape — the session's client inside an object argument — passes.
+    expect(
+      portalControllerOffenders('const asn = await this.inbound.announceAsn({ tenantId, clientId: session.clientId, lines }, key);', fields, allowed),
+    ).toEqual([]);
+  });
 });

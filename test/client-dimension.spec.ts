@@ -10,6 +10,7 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { createDatabase } from '../src/shared/db/db';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
+import { CLIENT_STATUSES } from '../src/modules/clients/clients.schema';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
@@ -350,6 +351,18 @@ describe('story 21-1: the client dimension — one system-owned self client per 
       // designed vocabulary is live.
       await sql`insert into clients (id, tenant_id, code, name, status, system_owned)
         values (${uuidv7()}, ${tenantIds[1]}, 'departed-brand', 'Gone Brand', 'departed', false)`;
+    });
+
+    // Story 21-11a (epic-21 retro B6) — the TS tuple and the CHECK are one
+    // vocabulary in two copies; pin them together (the rate-cards pattern).
+    it('the CLIENT_STATUSES tuple equals the clients_status_check arms', async () => {
+      const rows = await sql<{ def: string }[]>`
+        select pg_get_constraintdef(oid) as def from pg_constraint
+          where conname = 'clients_status_check' and conrelid = 'clients'::regclass`;
+      expect(rows).toHaveLength(1);
+      const arms = [...rows[0]!.def.matchAll(/'([a-z_]+)'/g)].map((match) => match[1]!);
+      expect(arms.length).toBeGreaterThan(0);
+      expect(arms.sort()).toEqual([...CLIENT_STATUSES].sort());
     });
   });
 

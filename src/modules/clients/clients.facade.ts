@@ -205,24 +205,6 @@ export async function shareLockClientInTx(
   return { ...row, status: row.status as ClientStatus };
 }
 
-/** The client's status alongside its facts, without a lock (21-3's draft create). */
-export async function getClientStatusInTx(
-  tx: TenantTx,
-  tenantId: string,
-  clientId: string,
-): Promise<LockedClientFacts> {
-  const rows = await tx
-    .select({ id: clients.id, code: clients.code, systemOwned: clients.systemOwned, status: clients.status })
-    .from(clients)
-    .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
-    .limit(1);
-  const row = rows[0];
-  if (row === undefined) {
-    throw clientNotFound(clientId);
-  }
-  return { ...row, status: row.status as ClientStatus };
-}
-
 /** Bulk facts for a set of client ids (one query; unknown ids are absent). */
 export async function getClientsInTx(
   tx: TenantTx,

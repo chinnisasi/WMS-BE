@@ -121,16 +121,9 @@ export class SkuClientCommand {
         'clients.manage',
       );
 
-      const existing = await tx
-        .select()
-        .from(idempotencyKeys)
-        .where(and(eq(idempotencyKeys.tenantId, command.tenantId), eq(idempotencyKeys.key, idempotencyKey)))
-        .limit(1);
-      if (existing[0] !== undefined) {
-        if (existing[0].payloadHash !== payloadHash) {
-          throw idempotencyKeyReuse();
-        }
-        return existing[0].responseSnapshot as SkuClientCorrectionSnapshot;
+      const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
       }
 
       // Non-HTTP callers skip the controller's uuid checks — the command is
@@ -164,6 +157,14 @@ export class SkuClientCommand {
         .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.id, unlocked.skuIds)))
         .orderBy(skus.id)
         .for('update');
+      // Replay again UNDER the last lock (the same-key race fix, guide §1):
+      // a concurrent same-key duplicate parked on the locks re-serves the
+      // winner's snapshot — without this it takes the no-op arm below and
+      // answers only the target SKU where the winner answered the group.
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
+      }
       const group = await readGroup(tx, command.tenantId, command.skuId);
       if (
         group === null ||
@@ -252,6 +253,31 @@ export class SkuClientCommand {
       }
       return snapshot;
     });
+  }
+
+  /**
+   * A key that already committed returns its snapshot (a different payload
+   * under it is 422 `idempotency-key-reuse`); `null` when the key is new.
+   * Called twice: after authority, and again under the last row lock.
+   */
+  private async replay(
+    tx: TenantTx,
+    tenantId: string,
+    idempotencyKey: string,
+    payloadHash: string,
+  ): Promise<SkuClientCorrectionSnapshot | null> {
+    const existing = await tx
+      .select()
+      .from(idempotencyKeys)
+      .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+      .limit(1);
+    if (existing[0] === undefined) {
+      return null;
+    }
+    if (existing[0].payloadHash !== payloadHash) {
+      throw idempotencyKeyReuse();
+    }
+    return existing[0].responseSnapshot as SkuClientCorrectionSnapshot;
   }
 }
 
