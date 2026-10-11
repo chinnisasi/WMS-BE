@@ -7,7 +7,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { addIsoDays, isIsoDate, istDateOf, istMidnightOf, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
-import { getClientStatusInTx, lockClientInTx, type LockedClientFacts } from '../clients/clients.facade';
+import { lockClientInTx, shareLockClientInTx, type LockedClientFacts } from '../clients/clients.facade';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { assertPermission } from '../tenancy/permissions';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -110,7 +110,9 @@ export class RateCardCommand {
       if (replayed !== null) return replayed as RateCardMutationSnapshot;
 
       if (!UUID_RE.test(command.clientId)) throw clientIdNotFound(command.clientId);
-      assertPricedClient(await getClientStatusInTx(tx, command.tenantId, command.clientId));
+      // Story 21-10 — the client's status under a FOR SHARE lock, so a
+      // suspend cannot commit between this read and the draft insert.
+      assertPricedClient(await shareLockClientInTx(tx, command.tenantId, command.clientId));
       assertLines(lines);
 
       const id = uuidv7();

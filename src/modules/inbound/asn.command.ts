@@ -30,7 +30,7 @@ import {
   assertSingleClientInTx,
   clientSuspended,
   getClientLabelsInTx,
-  getClientStatusInTx,
+  shareLockClientInTx,
 } from '../clients/clients.facade';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -545,7 +545,10 @@ export class AsnCommand {
    * path's, untouched): authority is `asn.announce`, then the actor and its
    * client are re-read IN THIS transaction — the guard's re-read ran in
    * another one, and on a write the window between them matters (a
-   * suspended brand's in-flight request must not commit).
+   * suspended brand's in-flight request must not commit). Since 21-10 the
+   * client is read under `FOR SHARE` (`shareLockClientInTx`), which closes
+   * the last window: a suspend committing between that read and the insert
+   * now waits for this transaction, or is re-read here once it commits.
    *
    * Order: hash → authority (capability, then the user — not active 401,
    * another client 403 — then the client — not active 403
@@ -594,7 +597,9 @@ export class AsnCommand {
             'Only a client-portal user of this client may announce its shipments.',
           );
         }
-        const client = await getClientStatusInTx(tx, command.tenantId, command.clientId);
+        // Story 21-10 — FOR SHARE: a suspend committing mid-request either
+        // waits for this announce or is re-read here once it commits.
+        const client = await shareLockClientInTx(tx, command.tenantId, command.clientId);
         if (client.status !== 'active') {
           throw clientSuspended();
         }

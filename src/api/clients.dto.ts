@@ -1,7 +1,8 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsOptional, IsString, Length, Matches, MaxLength, ValidateIf } from 'class-validator';
+import { IsIn, IsOptional, IsString, Length, Matches, MaxLength, ValidateIf } from 'class-validator';
 import { CLIENT_NAME_MAX, CLIENT_STATUSES, type ClientStatus } from '../modules/clients/clients.schema';
+import { CLIENT_STATUS_TARGETS, type ClientStatusTarget } from '../modules/clients/clients.command';
 
 /**
  * Story 21-2b — the client admin surface's DTOs. The DTO mirrors the shape
@@ -41,6 +42,22 @@ export class RenameClientDto {
   @IsString()
   @Length(1, CLIENT_NAME_MAX)
   name!: string;
+}
+
+/**
+ * Story 21-10 — suspend (`suspended`) or reactivate (`active`) a client
+ * brand. `departed` is not a target here (departure is a later, deliberate
+ * change); the command re-checks the same tuple (it is the boundary).
+ */
+export class UpdateClientStatusDto {
+  @ApiProperty({
+    enum: [...CLIENT_STATUS_TARGETS],
+    example: 'suspended',
+    description:
+      'The status to move the client to: `suspended` stops its portal (sign-in, every portal call, ASN announce), new portal users and new rate-card drafts and activation; `active` restores them. Operator work continues either way',
+  })
+  @IsIn(CLIENT_STATUS_TARGETS)
+  status!: ClientStatusTarget;
 }
 
 /**

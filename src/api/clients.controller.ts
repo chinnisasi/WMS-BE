@@ -19,7 +19,14 @@ import type { TenantSession } from '../modules/tenancy/jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { ClientsCommand } from '../modules/clients/clients.command';
 import { ClientsFacade, type ClientSnapshot } from '../modules/clients/clients.facade';
-import { ClientListResponse, ClientResponse, CreateClientDto, RenameClientDto, UpdateClientTaxDetailsDto } from './clients.dto';
+import {
+  ClientListResponse,
+  ClientResponse,
+  CreateClientDto,
+  RenameClientDto,
+  UpdateClientStatusDto,
+  UpdateClientTaxDetailsDto,
+} from './clients.dto';
 import type { ClientDto } from './clients.dto';
 
 const IDEMPOTENCY_HEADER = [
@@ -33,7 +40,8 @@ const IDEMPOTENCY_HEADER = [
 
 /**
  * Story 21-2b — the client admin surface: list (member-open), create and
- * rename (owner-only, `clients.manage`). Holds no rules — the command owns
+ * rename (owner-only, `clients.manage`); 21-5 tax details; 21-10 suspend /
+ * reactivate (owner-only). Holds no rules — the command owns
  * authority, replay and the shape rules; this maps DTOs.
  */
 @ApiTags('clients')
@@ -184,6 +192,52 @@ export class ClientsController {
         billingStateCode: dto.billingStateCode,
         billingPincode: dto.billingPincode,
       },
+      key,
+    );
+    return { client: toClientDto(snapshot.client) };
+  }
+
+  // Story 21-10 — the literal `status` segment sits under `:clientId` and is
+  // declared after it, as with `tax-details`: a different path depth, so the
+  // `:clientId` PATCH above can never capture it.
+  @Patch(':tenantId/clients/:clientId/status')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Suspends or reactivates a client brand (owner-only). Suspension stops its portal (sign-in and every portal call), portal ASN announce, new portal users and rate-card drafts and activation; operator work and billing continue, and open ASNs stay open. An unchanged status is a no-op (nothing written or audited; the key is stored)',
+  })
+  @ApiBody({ type: UpdateClientStatusDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ClientResponse, description: 'The client after the change (a matching Idempotency-Key replays it)' })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      "Missing or malformed Idempotency-Key, a malformed clientId, a status other than active or suspended, or the tenant's own self client (validation-failed)",
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage — owner only (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The client has departed — its status cannot change (client-not-active), or a concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async updateClientStatus(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UpdateClientStatusDto,
+  ): Promise<ClientResponse> {
+    assertOwnTenant(session, tenantId);
+    if (!UUID_RE.test(clientId)) {
+      throw new ProblemException('validation-failed', 400, 'Malformed clientId', `clientId must be a uuid (got "${clientId}").`);
+    }
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.updateStatus(
+      { tenantId, actorUserId: session.userId, clientId, status: dto.status },
       key,
     );
     return { client: toClientDto(snapshot.client) };

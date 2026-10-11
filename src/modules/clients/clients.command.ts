@@ -11,7 +11,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
-import { CLIENT_CODE_RE, CLIENT_NAME_MAX, SELF_CLIENT_CODE, clients } from './clients.schema';
+import { CLIENT_CODE_RE, CLIENT_NAME_MAX, SELF_CLIENT_CODE, clients, type ClientStatus } from './clients.schema';
 import { clientNotFound, toClientSnapshot, type ClientSnapshot, type ClientTaxDetails } from './clients.facade';
 import { ADDRESS_FIELD_LENGTHS, PINCODE_RE } from '../../shared/primitives/address';
 import { GSTIN_RE, gstinPrefixProblem, isGstinStateCode } from '../../shared/primitives/gstin';
@@ -29,6 +29,22 @@ export interface RenameClientCommand {
   readonly actorUserId: string;
   readonly clientId: string;
   readonly name: string;
+}
+
+/**
+ * Story 21-10 — the statuses an owner may move a client between. A closed
+ * subset of `CLIENT_STATUSES`: `departed` is a later, deliberate change
+ * (PENDING), never reachable through this command. One tuple, used by the
+ * command's own shape check, the DTO's `@IsIn` and its OpenAPI enum.
+ */
+export const CLIENT_STATUS_TARGETS = ['active', 'suspended'] as const satisfies readonly ClientStatus[];
+export type ClientStatusTarget = (typeof CLIENT_STATUS_TARGETS)[number];
+
+export interface UpdateClientStatusCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly clientId: string;
+  readonly status: string;
 }
 
 /**
@@ -148,10 +164,11 @@ export function normalizeClientCode(code: string): string {
  * validation → the write → the audit row → the idempotency key LAST. No
  * outbox event — nothing downstream consumes a client's existence yet.
  *
- * Deliberately absent (the story's Never list): status transitions,
- * deletion, and any write to the system-owned `self` client — it is created
- * only by registration (`ensureSelfClientInTx`) and its name mirrors the
- * tenant's, so a rename of it is refused 400.
+ * Deliberately absent (the story's Never list): departure, deletion, and
+ * any write to the system-owned `self` client — it is created only by
+ * registration (`ensureSelfClientInTx`) and its name mirrors the tenant's,
+ * so a rename of it is refused 400. Story 21-10 adds `updateStatus`
+ * (suspend / reactivate, `active` ⇄ `suspended` only).
  */
 @Injectable()
 export class ClientsCommand {
@@ -340,6 +357,105 @@ export class ClientsCommand {
     });
   }
 
+  /**
+   * Story 21-10 — suspend or reactivate a client brand (`active` ⇄
+   * `suspended`). Owner-only (`clients.manage`). The house skeleton: the
+   * status shape check (400) and the hash (`arm: 'status'` first — pinned by
+   * a golden) before the tx; inside it, authority → replay → the id shape →
+   * lock the client row `FOR UPDATE` (404) → replay AGAIN under the lock →
+   * the self client (400) → a departed client (409 `client-not-active`) → a
+   * same-status no-op → the write → audit `client.suspended` /
+   * `client.reactivated` → the key LAST. No outbox event.
+   *
+   * The no-op DOES write the key, unlike rename: a status is not idempotent
+   * in value. After someone else reactivates, a late retry of a stored
+   * no-op "suspend" must replay the stored answer, never suspend again.
+   *
+   * What suspension stops is decided by the gates that read status per
+   * request (the portal guard, portal sign-in and `me`, the portal announce,
+   * the portal-user invite, rate-card draft and activation); operator work
+   * is untouched (21-10 decision 1), and open ASNs stay open (decision 2).
+   */
+  async updateStatus(command: UpdateClientStatusCommand, idempotencyKey: string): Promise<ClientMutationSnapshot> {
+    // The command is the boundary (a non-HTTP caller skips the DTO): a
+    // request-shape check, above the transaction (IMPLEMENTATION-GUIDE §1).
+    if (!(CLIENT_STATUS_TARGETS as readonly string[]).includes(command.status)) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Invalid client status',
+        `status must be one of ${JSON.stringify(CLIENT_STATUS_TARGETS)} (got ${JSON.stringify(command.status)}).`,
+      );
+    }
+    const status = command.status as ClientStatusTarget;
+    const payloadHash = hashCommandPayload({ arm: 'status', tenantId: command.tenantId, clientId: command.clientId, status });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'clients.manage');
+      const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
+      }
+      if (!UUID_RE.test(command.clientId)) {
+        throw clientNotFound(command.clientId);
+      }
+      const lockedRows = await tx
+        .select()
+        .from(clients)
+        .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, command.clientId)))
+        .limit(1)
+        .for('update');
+      const current = lockedRows[0];
+      if (current === undefined) {
+        throw clientNotFound(command.clientId);
+      }
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
+      }
+      if (current.systemOwned) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'The self client cannot be suspended or reactivated',
+          "The tenant's own client has no portal and is never suspended — the self client cannot be suspended or reactivated.",
+        );
+      }
+      if (current.status === 'departed') {
+        throw new ProblemException(
+          'client-not-active',
+          409,
+          'Client is not active',
+          `Client "${current.code}" has departed — its status cannot change.`,
+        );
+      }
+      if (current.status === status) {
+        // A no-op writes and audits nothing — but the key IS stored (see above).
+        const unchanged: ClientMutationSnapshot = { client: toClientSnapshot(current) };
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
+        return unchanged;
+      }
+
+      const rows = await tx
+        .update(clients)
+        .set({ status, updatedAt: nowIso() })
+        .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, current.id)))
+        .returning();
+      const snapshot: ClientMutationSnapshot = { client: toClientSnapshot(rows[0]!) };
+
+      await this.audit(
+        tx,
+        command.tenantId,
+        command.actorUserId,
+        status === 'suspended' ? 'client.suspended' : 'client.reactivated',
+        current.id,
+        idempotencyKey,
+      );
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
   private async replay(
     tx: TenantTx,
     tenantId: string,
@@ -365,7 +481,12 @@ export class ClientsCommand {
     tx: TenantTx,
     tenantId: string,
     actorUserId: string,
-    action: 'client.created' | 'client.renamed' | 'client.tax-details-updated',
+    action:
+      | 'client.created'
+      | 'client.renamed'
+      | 'client.tax-details-updated'
+      | 'client.suspended'
+      | 'client.reactivated',
     clientId: string,
     reference: string,
   ): Promise<void> {
