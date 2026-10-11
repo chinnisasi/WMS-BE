@@ -11,6 +11,7 @@ import {
   goodsReceiptLines,
   goodsReceiptNotes,
   idempotencyKeys,
+  overReceipts,
   putawayPlacements,
   serials,
   skus,
@@ -349,9 +350,13 @@ export class PutawayCommand {
           `GRN line "${command.grnLineId}" is for SKU "${line.skuId}", not "${command.skuId}" — the wrong item cannot be placed.`,
         );
       }
-      if (line.appliedQty <= 0) {
+      // Story 21-9 (decision 4): the line's putaway quantity is its applied
+      // slice PLUS every approved over-receipt excess of it — the task list
+      // (`PutawayFacade.getPutawayTasksInTx`) derives work by the same rule.
+      const putawayQty = line.appliedQty + (await approvedExcessOfLineInTx(tx, command.tenantId, command.grnLineId));
+      if (putawayQty <= 0) {
         throw putawayValidation(
-          `GRN line "${command.grnLineId}" applied 0 units — nothing was put into the Receiving bin to place.`,
+          `GRN line "${command.grnLineId}" applied 0 units and has no approved over-receipt — nothing was put into the Receiving bin to place.`,
         );
       }
       const skuRows = await tx
@@ -476,7 +481,7 @@ export class PutawayCommand {
       // ── the receiving bin (the from-bin identity) ───────────────────────
       const receivingBin = await ensureReceivingBinInTx(tx, command.tenantId, command.warehouseId);
 
-      // ── the remaining check (min(applied, receiving-bin on-hand)) ───────
+      // ── the remaining check (min(applied + approved excess, receiving-bin on-hand)) ──
       const remainingOnHand = await receivingBinOnHandInTx(
         tx,
         command.tenantId,
@@ -485,7 +490,7 @@ export class PutawayCommand {
         command.skuId,
         batchId,
       );
-      const remaining = Math.min(line.appliedQty, remainingOnHand);
+      const remaining = Math.min(putawayQty, remainingOnHand);
       if (scaled.qty > remaining) {
         throw putawayValidation(
           `Only ${fromMilli(remaining)} of this (sku, batch) remain in the Receiving bin for GRN line "${command.grnLineId}" — ${fromMilli(scaled.qty)} cannot be placed.`,
@@ -1676,4 +1681,49 @@ function assertUtc(value: string, field: string): string {
       `${field} must be a Z-suffixed ISO-8601 UTC timestamp (got "${value}").`,
     );
   }
+}
+
+/**
+ * Story 21-9 (decision 4) — Σ APPROVED over-receipt excess per GRN line of
+ * one warehouse, as a subquery to left-join beside `goods_receipt_lines`. A
+ * line's putaway quantity is `applied_qty + this` (0 when the line has no
+ * approved excess). Milli-units; the `::bigint` sum reads back as a STRING
+ * (IMPLEMENTATION-GUIDE §2) — every reader converts with `Number(...)`.
+ * `PutawayCommand` and the Overview "awaiting putaway" tile (`kpis.ts`) apply
+ * the same rule to one line / in raw SQL.
+ */
+export function approvedExcessByLine(tx: TenantTx, tenantId: string, warehouseId: string) {
+  return tx
+    .select({
+      grnLineId: overReceipts.grnLineId,
+      excessQty: sql<string>`sum(${overReceipts.excessQty})::bigint`.as('approved_excess_qty'),
+    })
+    .from(overReceipts)
+    .where(
+      and(
+        eq(overReceipts.tenantId, tenantId),
+        eq(overReceipts.warehouseId, warehouseId),
+        eq(overReceipts.status, 'approved'),
+      ),
+    )
+    .groupBy(overReceipts.grnLineId)
+    .as('approved_excess');
+}
+
+/**
+ * Story 21-9 — Σ APPROVED over-receipt excess of ONE GRN line, milli-units
+ * (0 when none). The placement's half of the `approvedExcessByLine` rule.
+ */
+export async function approvedExcessOfLineInTx(tx: TenantTx, tenantId: string, grnLineId: string): Promise<number> {
+  const rows = await tx
+    .select({ excessQty: sql<string | null>`sum(${overReceipts.excessQty})::bigint` })
+    .from(overReceipts)
+    .where(
+      and(
+        eq(overReceipts.tenantId, tenantId),
+        eq(overReceipts.grnLineId, grnLineId),
+        eq(overReceipts.status, 'approved'),
+      ),
+    );
+  return Number(rows[0]?.excessQty ?? 0);
 }

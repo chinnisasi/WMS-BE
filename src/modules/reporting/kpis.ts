@@ -342,15 +342,25 @@ const dockToStock: TileDefinition<'dockToStock'> = {
             and pp.created_at >= g.created_at`,
     );
     // The putaway task derivation (`PutawayFacade.getPutawayTasksInTx`) in
-    // one statement: a GRN line with applied units whose (sku, batch) still
+    // one statement: a GRN line with putaway units whose (sku, batch) still
     // has stock in the warehouse's system Receiving bin — remaining =
-    // min(applied, on-hand there) > 0.
+    // min(putaway qty, on-hand there) > 0. Story 21-9 (decision 4): the
+    // putaway qty is `applied_qty` + Σ APPROVED over-receipt excess of the
+    // line (`approvedExcessByLine`), so approved excess counts as work.
     const awaiting = await rowsOf<{ n: string }>(
       tx,
       sql`select count(*)::bigint as n
           from goods_receipt_lines l
           join goods_receipt_notes g on g.id = l.grn_id and g.tenant_id = l.tenant_id
           join skus s on s.id = l.sku_id and s.tenant_id = l.tenant_id
+          left join (
+            select o.grn_line_id, sum(o.excess_qty)::bigint as excess
+            from over_receipts o
+            where o.tenant_id = ${scope.tenantId}::uuid
+              and o.warehouse_id = ${scope.warehouseId}::uuid
+              and o.status = 'approved'
+            group by o.grn_line_id
+          ) ax on ax.grn_line_id = l.id
           cross join lateral (
             select b.id from bins b
             where b.tenant_id = g.tenant_id and b.warehouse_id = g.warehouse_id
@@ -359,9 +369,9 @@ const dockToStock: TileDefinition<'dockToStock'> = {
           ) rb
           where g.tenant_id = ${scope.tenantId}::uuid
             and g.warehouse_id = ${scope.warehouseId}::uuid
-            and l.applied_qty > 0
+            and l.applied_qty + coalesce(ax.excess, 0) > 0
             and least(
-              l.applied_qty,
+              l.applied_qty + coalesce(ax.excess, 0),
               coalesce(
                 case when l.batch_id is null
                   then (select sum(soh.quantity) from stock_on_hand soh

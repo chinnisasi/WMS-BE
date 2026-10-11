@@ -396,10 +396,24 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
       const over = (po: string | null, poLine: string | null, asn: string | null, asnLine: string | null) =>
         sql`insert into over_receipts (id, tenant_id, warehouse_id, grn_id, grn_line_id, po_id, po_line_id, asn_id, asn_line_id, sku_id, excess_qty, requested_by, requested_at)
           values (${uuidv7()}, ${t}, ${t}, ${t}, ${t}, ${po}, ${poLine}, ${asn}, ${asnLine}, ${t}, 1000, ${t}, now())`;
+      // Story 21-9 (0066) REPLACED this set: a document with NO line is now
+      // admitted (a late receipt's unmatched line pends against its document
+      // alone) — 0064's "each pair together" refused both of these. What 0064
+      // refused for any other reason stays refused: no document, both
+      // documents, a document beside the other document's line.
       await refused(over(null, null, null, null));
       await refused(over(uuidv7(), uuidv7(), uuidv7(), uuidv7()));
       await refused(over(uuidv7(), null, null, uuidv7()));
-      await refused(over(null, null, uuidv7(), null));
+      await refused(over(null, uuidv7(), uuidv7(), null));
+      await refused(over(null, uuidv7(), null, null)); // a line with no document
+      await sql.begin(async (tx) => {
+        const admitted = (po: string | null, asn: string | null) =>
+          tx`insert into over_receipts (id, tenant_id, warehouse_id, grn_id, grn_line_id, po_id, po_line_id, asn_id, asn_line_id, sku_id, excess_qty, requested_by, requested_at)
+            values (${uuidv7()}, ${t}, ${t}, ${t}, ${t}, ${po}, ${null}, ${asn}, ${null}, ${t}, 1000, ${t}, now()) returning id`;
+        expect(await admitted(uuidv7(), null)).toHaveLength(1);
+        expect(await admitted(null, uuidv7())).toHaveLength(1);
+        throw new Error('rollback');
+      }).catch((err: Error) => expect(err.message).toBe('rollback'));
       const asnRow = (status: string, note: string | null, code = 'X') =>
         sql`insert into advance_shipment_notices (id, tenant_id, client_id, warehouse_id, asn_code, status, status_note)
           values (${uuidv7()}, ${t}, ${t}, ${t}, ${code}, ${status}, ${note})`;
@@ -566,7 +580,7 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
       expect(counted.every((r) => r.poCode === null)).toBe(true);
     });
 
-    it('a closed ASN is 409 asn-not-open; two references are 400; a GRN in another warehouse is 409 document-warehouse-mismatch', async () => {
+    it('two references are 400; a GRN in another warehouse is 409 document-warehouse-mismatch — also for a CLOSED ASN (story 21-9: the warehouse check now runs first)', async () => {
       const asn = await newAsn([{ skuId: acme1, announcedQty: 10 }]);
       const lineId = asn.lines[0]!.id;
       const wrongWarehouse = await receive(asnReceipt(asn, [line(acme1, 1, { asnLineId: lineId })], wh2), via);
@@ -588,10 +602,15 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
 
       expect((await receive(asnReceipt(asn, [line(acme1, 4, { asnLineId: lineId })]), via)).status).toBe(201);
       await transition(asn.id, 'close', 'Short shipment — six never came').expect(200);
-      const closed = await receive(asnReceipt(asn, [line(acme1, 1, { asnLineId: lineId })]), via);
-      expect(closed.status).toBe(409);
-      expect(closed.body.code).toBe('asn-not-open');
       expect(await snapshotAsnIds()).not.toContain(asn.id);
+      // Story 21-9 — REPLACES the old `asn-not-open` assertion here: a closed
+      // ASN is no longer refused (the late receipt pends — its own tests are
+      // in the 21-9 block below). What stays a refusal is the warehouse: a
+      // terminal ASN of another warehouse answers the mismatch, which used to
+      // be shadowed by `asn-not-open` because the status was checked first.
+      const closedWrongWarehouse = await receive(asnReceipt(asn, [line(acme1, 1, { asnLineId: lineId })], wh2), via);
+      expect(closedWrongWarehouse.status).toBe(409);
+      expect(closedWrongWarehouse.body.code).toBe('document-warehouse-mismatch');
     });
 
     it('a SKU mismatch or a missing line reference settles UNMATCHED (applied in full, line not credited); an unknown line is rejected', async () => {
@@ -660,6 +679,119 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
       const pending = (await pendingOverReceipts()).filter((o) => o.asnId === asn.id);
       expect(pending.map((o) => o.excessQty)).toEqual([5]);
       expect((await getAsn(asn.id).expect(200)).body.asn).toMatchObject({ status: 'received', receivedTotal: 10 });    });
+  });
+
+  // ── story 21-9: a late receipt against a terminal ASN is HELD ──────────────
+
+  describe.each<Via>(['device', 'replay'])('story 21-9 — a receipt against a cancelled or closed ASN pends for approval — via the %s route', (via) => {
+    async function overReceiptRowsOf(grnId: string): Promise<{ id: string; asn_id: string | null; asn_line_id: string | null; po_id: string | null; grn_line_id: string; excess: number }[]> {
+      const rows = await sql<{ id: string; asn_id: string | null; asn_line_id: string | null; po_id: string | null; grn_line_id: string; excess: string }[]>`
+        select id, asn_id, asn_line_id, po_id, grn_line_id, excess_qty::text as excess from over_receipts
+        where tenant_id = ${tenantId} and grn_id = ${grnId} and status = 'pending' order by created_at, id`;
+      return rows.map((row) => ({ ...row, excess: Number(row.excess) / 1000 }));
+    }
+
+    it('a CANCELLED ASN: the replayed receipt is 201, pends on the matched line, the ASN stays cancelled with nothing received and no ledger event', async () => {
+      const asn = await newAsn([{ skuId: acme1, announcedQty: 10 }]);
+      const lineId = asn.lines[0]!.id;
+      await transition(asn.id, 'cancel', 'Client withdrew it').expect(200);
+      const res = await receive(asnReceipt(asn, [line(acme1, 6, { asnLineId: lineId })]), via);
+      expect(res.status).toBe(201);
+      const grn = res.body.goodsReceipt as { id: string; asnId: string; asnCode: string; lines: Record<string, unknown>[] };
+      expect(grn).toMatchObject({ asnId: asn.id, asnCode: asn.code, poId: null });
+      expect(grn).not.toHaveProperty('unmatchedLines');
+      expect(grn).not.toHaveProperty('rejectedLines');
+      expect(grn.lines[0]).toMatchObject({ asnLineId: lineId, qty: 6, appliedQty: 0, excessQty: 6 });
+      const rows = await overReceiptRowsOf(grn.id);
+      expect(rows.map((r) => [r.grn_line_id, r.asn_id, r.asn_line_id, r.po_id, r.excess])).toEqual([[grn.lines[0]!.id, asn.id, lineId, null, 6]]);
+      expect((await refsOf(grn.id)).size).toBe(0);
+      const after = (await getAsn(asn.id).expect(200)).body.asn;
+      expect(after).toMatchObject({ status: 'cancelled', receivedTotal: 0 });
+      // The queue shows it against the ASN.
+      const queued = (await pendingOverReceipts()).find((o) => o.id === rows[0]!.id)!;
+      expect(queued).toMatchObject({ asnId: asn.id, asnLineId: lineId, asnCode: asn.code, poId: null, excessQty: 6 });
+    });
+
+    it('a CLOSED short ASN (remainder 5): 3 arriving late ALL pend — the open remainder counts as 0', async () => {
+      const asn = await newAsn([{ skuId: acme1, announcedQty: 10 }]);
+      const lineId = asn.lines[0]!.id;
+      expect((await receive(asnReceipt(asn, [line(acme1, 5, { asnLineId: lineId })]), 'device')).status).toBe(201);
+      await transition(asn.id, 'close', 'Short — five never came').expect(200);
+      const late = await receive(asnReceipt(asn, [line(acme1, 3, { asnLineId: lineId })]), via);
+      expect(late.status).toBe(201);
+      const grn = late.body.goodsReceipt as { id: string; lines: Record<string, unknown>[] };
+      expect(grn.lines[0]).toMatchObject({ asnLineId: lineId, appliedQty: 0, excessQty: 3 });
+      expect((await overReceiptRowsOf(grn.id)).map((r) => [r.asn_line_id, r.excess])).toEqual([[lineId, 3]]);
+      expect((await refsOf(grn.id)).size).toBe(0);
+      expect((await getAsn(asn.id).expect(200)).body.asn).toMatchObject({ status: 'closed', receivedTotal: 5 });
+    });
+
+    it('unmatched lines on a terminal ASN — no reference, a SKU mismatch, an unknown line id — pend against the ASN with NO line', async () => {
+      const asn = await newAsn([{ skuId: acme1, announcedQty: 10 }]);
+      const lineId = asn.lines[0]!.id;
+      await transition(asn.id, 'cancel', 'Withdrawn').expect(200);
+      const res = await receive(
+        asnReceipt(asn, [
+          line(acme1, 2), // no reference
+          line(acme2, 3, { asnLineId: lineId }), // SKU mismatch
+          line(acme1, 4, { asnLineId: uuidv7() }), // unknown (removed) line id
+        ]),
+        via,
+      );
+      expect(res.status).toBe(201);
+      const grn = res.body.goodsReceipt as { id: string; lines: { id: string; asnLineId?: string; poLineId: string | null; appliedQty: number; excessQty: number }[] };
+      expect(grn).not.toHaveProperty('unmatchedLines');
+      expect(grn).not.toHaveProperty('rejectedLines');
+      expect(grn.lines.map((l) => [l.asnLineId ?? null, l.poLineId, l.appliedQty, l.excessQty])).toEqual([
+        [null, null, 0, 2],
+        [null, null, 0, 3],
+        [null, null, 0, 4],
+      ]);
+      const rows = await overReceiptRowsOf(grn.id);
+      expect(rows.map((r) => [r.grn_line_id, r.asn_id, r.asn_line_id, r.excess])).toEqual(grn.lines.map((l) => [l.id, asn.id, null, l.excessQty]));
+      // The over_receipt.requested payload names the ASN and no line.
+      const payloads = await sql<{ payload: Record<string, unknown> }[]>`
+        select payload from outbox_messages where tenant_id = ${tenantId} and type = 'over_receipt.requested' and payload->>'grnId' = ${grn.id}`;
+      expect(payloads).toHaveLength(3);
+      for (const { payload } of payloads) {
+        expect(payload).toMatchObject({ asnId: asn.id, poId: null, poLineId: null });
+        expect(payload).not.toHaveProperty('asnLineId');
+      }
+      expect((await getAsn(asn.id).expect(200)).body.asn).toMatchObject({ status: 'cancelled', receivedTotal: 0 });
+    });
+  });
+
+  describe('story 21-9 — deciding a late ASN receipt', () => {
+    it('approve a NULL-line row: grn.received names {grnId, asnId} only and credits no line; approve a lined row: credits the line, the ASN stays terminal; reject: no stock', async () => {
+      const asn = await newAsn([{ skuId: acme1, announcedQty: 10 }]);
+      const lineId = asn.lines[0]!.id;
+      await transition(asn.id, 'cancel', 'Withdrawn').expect(200);
+      const res = await receive(
+        asnReceipt(asn, [line(acme1, 4, { asnLineId: lineId }), line(acme1, 2), line(acme1, 7, { asnLineId: uuidv7() })]),
+        'device',
+      );
+      expect(res.status).toBe(201);
+      const grnId = (res.body.goodsReceipt as { id: string }).id;
+      const pending = (await pendingOverReceipts()).filter((o) => o.asnId === asn.id);
+      const lined = pending.find((o) => o.asnLineId === lineId)!;
+      const nullLine = pending.find((o) => o.asnLineId === undefined && o.excessQty === 2)!;
+      const rejectMe = pending.find((o) => o.asnLineId === undefined && o.excessQty === 7)!;
+
+      const approvedNull = await decide(nullLine.id, 'approve').expect(200);
+      expect(approvedNull.body.overReceipt).toMatchObject({ status: 'approved', asnId: asn.id, asnCode: asn.code, poId: null, poLineId: null });
+      expect(approvedNull.body.overReceipt).not.toHaveProperty('asnLineId');
+      expect((await refsOf(grnId)).get(`${acme1}:2`)).toEqual({ kind: 'grn-receipt', grnId, asnId: asn.id });
+      expect((await getAsn(asn.id).expect(200)).body.asn).toMatchObject({ status: 'cancelled', receivedTotal: 0 });
+
+      await decide(lined.id, 'approve').expect(200);
+      expect((await refsOf(grnId)).get(`${acme1}:4`)).toEqual({ kind: 'grn-receipt', grnId, asnId: asn.id, asnLineId: lineId });
+      // Credited, but never re-derived: a cancelled ASN stays cancelled.
+      expect((await getAsn(asn.id).expect(200)).body.asn).toMatchObject({ status: 'cancelled', receivedTotal: 4 });
+
+      await decide(rejectMe.id, 'reject').expect(200);
+      expect((await refsOf(grnId)).size).toBe(2);
+      expect((await getAsn(asn.id).expect(200)).body.asn).toMatchObject({ status: 'cancelled', receivedTotal: 4 });
+    });
   });
 
   // ── close, cancel, amend ───────────────────────────────────────────────────

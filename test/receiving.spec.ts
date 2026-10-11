@@ -736,17 +736,94 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
 
   // ── Server re-authorization ────────────────────────────────────────────────
 
-  it('submit against a closed PO is 409 po-not-open naming the state (the stale queued receipt retracts); against a cancelled line the line is rejected naming it while other lines settle', async () => {
-    // ── a closed PO ──────────────────────────────────────────────────────
+  // ── Story 21-9: a late receipt against a closed PO is HELD, never refused ──
+
+  /** The over-receipt rows one GRN raised (milli-units read back in base units). */
+  async function overReceiptRows(
+    grnId: string,
+  ): Promise<{ id: string; po_id: string | null; po_line_id: string | null; grn_line_id: string; excess: number; status: string }[]> {
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const rows = await sql<{ id: string; po_id: string | null; po_line_id: string | null; grn_line_id: string; excess: string; status: string }[]>`
+        select id, po_id, po_line_id, grn_line_id, excess_qty::text as excess, status from over_receipts
+        where tenant_id = ${tenantId} and grn_id = ${grnId} order by created_at, id`;
+      return rows.map((row) => ({ ...row, excess: fromMilli(Number(row.excess)) }));
+    } finally {
+      await sql.end();
+    }
+  }
+
+  async function poDetail(poId: string): Promise<{ status: string; lines: { id: string; skuId: string; receivedQty: number; status: string }[] }> {
+    const res = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/inbound/purchase-orders/${poId}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    return res.body.purchaseOrder;
+  }
+
+  it('story 21-9 — a closed PO with no open successor takes the receipt: every line pends on the closed PO (its line when matched, else none); no ledger event, no received_qty, status unchanged; the warehouse check runs first', async () => {
+    // REPLACES the old "closed PO → 409 po-not-open" pin (decision 1/3): the
+    // cartons are on the dock, so the receipt is recorded and held.
     const { poId, lineId } = await createOpenPo(10);
     await closePo(poId, [{ lineId, disposition: 'cancelled' }]).expect(200);
-    const closed = await submitGrn(
-      grnBody([{ poLineId: lineId, skuId: batchSkuId, batchCode: 'LOT-CLOSED', mfgDate: null, qty: 4 }], poId),
-    ).expect(409);
-    expect(closed.body).toMatchObject({ status: 409, code: 'po-not-open' });
-    expect(closed.body.detail).toContain('closed');
 
-    // ── a cancelled line on an otherwise-open PO ─────────────────────────
+    const res = await submitGrn(
+      grnBody(
+        [
+          { poLineId: lineId, skuId: batchSkuId, batchCode: 'LOT-CLOSED', mfgDate: null, qty: 4 }, // matched
+          { poLineId: uuidv7(), skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 2 }, // unknown line
+          { poLineId: lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 3 }, // SKU mismatch
+          { poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 1 }, // no reference
+        ],
+        poId,
+      ),
+    ).expect(201);
+    const grn = res.body.goodsReceipt as {
+      id: string;
+      poId: string;
+      lines: { id: string; poLineId: string | null; qty: number; appliedQty: number; excessQty: number }[];
+    };
+    expect(grn.poId).toBe(poId);
+    expect(res.body.goodsReceipt).not.toHaveProperty('rejectedLines');
+    expect(res.body.goodsReceipt).not.toHaveProperty('unmatchedLines');
+    expect(res.body.goodsReceipt).not.toHaveProperty('poCode'); // not re-targeted
+    expect(grn.lines.map((l) => [l.poLineId, l.qty, l.appliedQty, l.excessQty])).toEqual([
+      [lineId, 4, 0, 4],
+      [null, 2, 0, 2],
+      [null, 3, 0, 3],
+      [null, 1, 0, 1],
+    ]);
+    // One pending row per line, each naming the GRN line's own line reference.
+    const rows = await overReceiptRows(grn.id);
+    expect(rows.map((r) => [r.grn_line_id, r.po_id, r.po_line_id, r.excess, r.status])).toEqual(
+      grn.lines.map((l) => [l.id, poId, l.poLineId, l.qty, 'pending']),
+    );
+    expect(await ledgerRows(grn.id)).toHaveLength(0);
+    expect(await outboxRows('grn.recorded', grn.id)).toHaveLength(1);
+    expect(await outboxRows('over_receipt.requested', grn.id)).toHaveLength(4);
+    const po = await poDetail(poId);
+    expect(po.status).toBe('closed');
+    expect(po.lines[0]).toMatchObject({ receivedQty: 0, status: 'cancelled' });
+
+    // A terminal PO of ANOTHER warehouse is the mismatch (the status check
+    // used to run first and answer po-not-open — a deliberate change).
+    const otherWarehouse = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `RCV2-${ulid().slice(10, 16).toUpperCase()}`, name: `Second Depot ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const mismatch = await submitGrn(
+      grnBody([{ poLineId: lineId, skuId: batchSkuId, batchCode: 'LOT-CLOSED', mfgDate: null, qty: 1 }], poId, {
+        warehouseId: otherWarehouse,
+      }),
+    ).expect(409);
+    expect(mismatch.body.code).toBe('document-warehouse-mismatch');
+  });
+
+  it('story 21-9 — a closed PO with an open carried successor RE-TARGETS: a carried SKU applies to the successor up to its remaining (excess pends there); a non-carried SKU pends on the successor with no line', async () => {
     const created = await createPo({
       warehouseId,
       vendorId,
@@ -756,21 +833,228 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
         { skuId: plainSkuId, orderedQty: 8, unitCostPaise: 500 },
       ],
     }).expect(201);
-    const po = created.body.purchaseOrder as { id: string; lines: { id: string; skuId: string }[] };
-    const cancelledLine = po.lines.find((line) => line.skuId === batchSkuId)!;
-    const survivingLine = po.lines.find((line) => line.skuId === plainSkuId)!;
-    await closePo(po.id, [
+    const original = created.body.purchaseOrder as { id: string; lines: { id: string; skuId: string }[] };
+    const cancelledLine = original.lines.find((line) => line.skuId === batchSkuId)!;
+    const carriedLine = original.lines.find((line) => line.skuId === plainSkuId)!;
+    // Receive 5 of the carried 8 first, so the successor's remaining is 3.
+    await submitGrn(grnBody([{ poLineId: carriedLine.id, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 5 }], original.id)).expect(201);
+    const closed = await closePo(original.id, [
       { lineId: cancelledLine.id, disposition: 'cancelled' },
-      { lineId: survivingLine.id, disposition: 'carried' },
+      { lineId: carriedLine.id, disposition: 'carried' },
     ]).expect(200);
-    // The close carried the surviving line onto the successor — submit against
-    // the ORIGINAL (now closed) PO and the whole request is po-not-open.
-    await submitGrn(
-      grnBody([{ poLineId: survivingLine.id, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 2 }], poId),
-    ).expect(409);
+    const successor = closed.body.successor as { id: string; code: string; lines: { id: string; skuId: string; orderedQty: number }[] };
+    const successorLine = successor.lines[0]!;
+    expect(successorLine).toMatchObject({ skuId: plainSkuId, orderedQty: 3 });
+
+    // A stale device still holds the ORIGINAL PO: 4 of the carried SKU arrive
+    // (3 apply on the successor, 1 pends there) plus 2 of the cancelled SKU.
+    const res = await submitGrn(
+      grnBody(
+        [
+          { poLineId: carriedLine.id, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 4 },
+          { poLineId: cancelledLine.id, skuId: batchSkuId, batchCode: 'LOT-RT', mfgDate: null, qty: 2 },
+        ],
+        original.id,
+      ),
+    ).expect(201);
+    const grn = res.body.goodsReceipt as {
+      id: string;
+      poId: string;
+      poCode: string;
+      lines: { id: string; poLineId: string | null; appliedQty: number; excessQty: number }[];
+    };
+    expect(grn.poId).toBe(successor.id);
+    expect(grn.poCode).toBe(successor.code);
+    expect(res.body.goodsReceipt).not.toHaveProperty('rejectedLines');
+    expect(res.body.goodsReceipt).not.toHaveProperty('unmatchedLines');
+    expect(grn.lines.map((l) => [l.poLineId, l.appliedQty, l.excessQty])).toEqual([
+      [successorLine.id, 3, 1],
+      [null, 0, 2],
+    ]);
+    const rows = await overReceiptRows(grn.id);
+    expect(rows.map((r) => [r.po_id, r.po_line_id, r.excess])).toEqual([
+      [successor.id, successorLine.id, 1],
+      [successor.id, null, 2],
+    ]);
+    // Only the matched slice reached the ledger, naming the SUCCESSOR's line.
+    const events = await ledgerRows(grn.id);
+    expect(events.map((e) => [e.quantity_delta, e.reference_doc])).toEqual([
+      [3, { kind: 'grn-receipt', grnId: grn.id, poId: successor.id, poLineId: successorLine.id }],
+    ]);
+    const after = await poDetail(successor.id);
+    expect(after.status).toBe('open');
+    expect(after.lines[0]!.receivedQty).toBe(3);
+    // The closed original is untouched.
+    const originalAfter = await poDetail(original.id);
+    expect(originalAfter.status).toBe('closed');
+    expect(originalAfter.lines.find((l) => l.id === carriedLine.id)!.receivedQty).toBe(5);
+    expect(originalAfter.lines.find((l) => l.id === cancelledLine.id)!.receivedQty).toBe(0);
   });
 
-  it('line-level settlement: an unknown poLineId is rejected in the response naming the reason while the other lines settle; a cancelled line is rejected naming its state', async () => {
+  it('story 21-9 — the successor walk: two closes deep it books on the open grandchild; when every successor is closed the receipt pends on the PO the device named', async () => {
+    // PO → S1 (carried) → S2 (carried, open): a receipt naming PO lands on S2.
+    const a = await createOpenPo(10, plainSkuId);
+    const s1 = (await closePo(a.poId, [{ lineId: a.lineId, disposition: 'carried' }]).expect(200)).body.successor as {
+      id: string;
+      lines: { id: string }[];
+    };
+    const s2 = (await closePo(s1.id, [{ lineId: s1.lines[0]!.id, disposition: 'carried' }]).expect(200)).body.successor as {
+      id: string;
+      code: string;
+      lines: { id: string }[];
+    };
+    const deep = await submitGrn(grnBody([{ poLineId: a.lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 2 }], a.poId)).expect(201);
+    expect(deep.body.goodsReceipt).toMatchObject({ poId: s2.id, poCode: s2.code });
+    expect(deep.body.goodsReceipt.lines[0]).toMatchObject({ poLineId: s2.lines[0]!.id, appliedQty: 2, excessQty: 0 });
+
+    // PO → S1 (carried) → S1 closed cancelled: no open successor, so the
+    // receipt pends on the ORIGINAL PO — with NO line, because the line it
+    // names was CARRIED (crediting it would count the units on both POs).
+    const b = await createOpenPo(10, plainSkuId);
+    const bs1 = (await closePo(b.poId, [{ lineId: b.lineId, disposition: 'carried' }]).expect(200)).body.successor as {
+      id: string;
+      lines: { id: string }[];
+    };
+    await closePo(bs1.id, [{ lineId: bs1.lines[0]!.id, disposition: 'cancelled' }]).expect(200);
+    const stranded = await submitGrn(grnBody([{ poLineId: b.lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 3 }], b.poId)).expect(201);
+    expect(stranded.body.goodsReceipt.poId).toBe(b.poId);
+    expect(stranded.body.goodsReceipt).not.toHaveProperty('poCode');
+    expect(stranded.body.goodsReceipt.lines[0]).toMatchObject({ poLineId: null, appliedQty: 0, excessQty: 3 });
+    const strandedId = stranded.body.goodsReceipt.id as string;
+    const rows = await overReceiptRows(strandedId);
+    expect(rows.map((r) => [r.po_id, r.po_line_id, r.excess])).toEqual([[b.poId, null, 3]]);
+    expect(await ledgerRows(strandedId)).toHaveLength(0);
+    // Approving it books the units and credits no line on either PO.
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/over-receipts/${rows[0]!.id}/approve`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .expect(200);
+    expect((await ledgerRows(strandedId)).map((e) => [e.quantity_delta, e.reference_doc])).toEqual([
+      [3, { kind: 'grn-receipt', grnId: strandedId, poId: b.poId }],
+    ]);
+    expect((await poDetail(b.poId)).lines[0]!.receivedQty).toBe(0);
+    expect((await poDetail(bs1.id)).lines[0]!.receivedQty).toBe(0);
+  });
+
+  it('story 21-9 — re-target resolves by the SCANNED SKU: no reference or a closed line of another SKU still books on the one open successor line; two open lines of the SKU, or none, pend on the successor with no line', async () => {
+    const closeAll = async (po: { id: string; lines: { id: string }[] }) =>
+      (
+        await closePo(po.id, po.lines.map((l) => ({ lineId: l.id, disposition: 'carried' as const }))).expect(200)
+      ).body.successor as { id: string; lines: { id: string; skuId: string }[] };
+    const newPo = async (lines: { skuId: string; orderedQty: number }[]) =>
+      (
+        await createPo({
+          warehouseId,
+          vendorId,
+          code: `PO-${ulid().slice(10, 18).toUpperCase()}`,
+          lines: lines.map((l) => ({ ...l, unitCostPaise: 100 })),
+        }).expect(201)
+      ).body.purchaseOrder as { id: string; lines: { id: string; skuId: string }[] };
+    const plain = (poLineId: string | null, qty: number) => ({ poLineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty });
+
+    // (a) + (b): the original carries plainSku AND batchSku; the successor
+    // has exactly one open plainSku line.
+    const original = await newPo([
+      { skuId: plainSkuId, orderedQty: 10 },
+      { skuId: batchSkuId, orderedQty: 10 },
+    ]);
+    const successor = await closeAll(original);
+    const plainLine = successor.lines.find((l) => l.skuId === plainSkuId)!;
+    const batchClosedLine = original.lines.find((l) => l.skuId === batchSkuId)!;
+    const res = await submitGrn(
+      grnBody([plain(null, 2), plain(batchClosedLine.id, 3)], original.id),
+    ).expect(201);
+    const grn = res.body.goodsReceipt as { id: string; lines: { poLineId: string | null; appliedQty: number; excessQty: number }[] };
+    expect(res.body.goodsReceipt).toMatchObject({ poId: successor.id });
+    expect(res.body.goodsReceipt).not.toHaveProperty('unmatchedLines');
+    expect(res.body.goodsReceipt).not.toHaveProperty('rejectedLines');
+    expect(grn.lines.map((l) => [l.poLineId, l.appliedQty, l.excessQty])).toEqual([
+      [plainLine.id, 2, 0],
+      [plainLine.id, 3, 0],
+    ]);
+    expect((await ledgerRows(grn.id)).map((e) => [e.quantity_delta, e.reference_doc])).toEqual([
+      [2, { kind: 'grn-receipt', grnId: grn.id, poId: successor.id, poLineId: plainLine.id }],
+      [3, { kind: 'grn-receipt', grnId: grn.id, poId: successor.id, poLineId: plainLine.id }],
+    ]);
+    expect(await overReceiptRows(grn.id)).toEqual([]);
+
+    // (c): TWO carried lines of one SKU → ambiguous on the successor.
+    const twin = await newPo([
+      { skuId: plainSkuId, orderedQty: 4 },
+      { skuId: plainSkuId, orderedQty: 6 },
+    ]);
+    const twinSuccessor = await closeAll(twin);
+    const ambiguous = await submitGrn(grnBody([plain(twin.lines[0]!.id, 2)], twin.id)).expect(201);
+    const ambiguousId = ambiguous.body.goodsReceipt.id as string;
+    expect(ambiguous.body.goodsReceipt).toMatchObject({ poId: twinSuccessor.id });
+    expect(ambiguous.body.goodsReceipt).not.toHaveProperty('unmatchedLines');
+    expect(ambiguous.body.goodsReceipt).not.toHaveProperty('rejectedLines');
+    expect(ambiguous.body.goodsReceipt.lines[0]).toMatchObject({ poLineId: null, appliedQty: 0, excessQty: 2 });
+    expect((await overReceiptRows(ambiguousId)).map((r) => [r.po_id, r.po_line_id, r.excess])).toEqual([[twinSuccessor.id, null, 2]]);
+    expect(await ledgerRows(ambiguousId)).toHaveLength(0);
+    expect((await poDetail(twinSuccessor.id)).lines.map((l) => l.receivedQty)).toEqual([0, 0]);
+
+    // (d): a scanned SKU with no successor line at all.
+    const single = await newPo([{ skuId: plainSkuId, orderedQty: 5 }]);
+    const singleSuccessor = await closeAll(single);
+    const stray = await submitGrn(
+      grnBody([{ poLineId: null, skuId: secondBatchSkuId, batchCode: 'LOT-STRAY', mfgDate: null, qty: 1 }], single.id),
+    ).expect(201);
+    const strayId = stray.body.goodsReceipt.id as string;
+    expect(stray.body.goodsReceipt).toMatchObject({ poId: singleSuccessor.id });
+    expect(stray.body.goodsReceipt).not.toHaveProperty('unmatchedLines');
+    expect(stray.body.goodsReceipt).not.toHaveProperty('rejectedLines');
+    expect(stray.body.goodsReceipt.lines[0]).toMatchObject({ poLineId: null, appliedQty: 0, excessQty: 1 });
+    expect((await overReceiptRows(strayId)).map((r) => [r.po_id, r.po_line_id, r.excess])).toEqual([[singleSuccessor.id, null, 1]]);
+    expect(await ledgerRows(strayId)).toHaveLength(0);
+  });
+
+  it('story 21-9 — approving a late PO receipt: a NULL-line row appends grn.received naming {grnId, poId} and credits no line; a lined row credits its closed line; reject writes no stock; the PO stays closed', async () => {
+    const binId = await receivingBinId();
+    const { poId, lineId } = await createOpenPo(10, plainSkuId);
+    await closePo(poId, [{ lineId, disposition: 'cancelled' }]).expect(200);
+    const res = await submitGrn(
+      grnBody(
+        [
+          { poLineId: lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 4 }, // lined
+          { poLineId: null, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 2 }, // null line
+          { poLineId: uuidv7(), skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 5 }, // null line, rejected below
+        ],
+        poId,
+      ),
+    ).expect(201);
+    const grnId = res.body.goodsReceipt.id as string;
+    const [lined, nullLine, rejectMe] = await overReceiptRows(grnId);
+    const before = await onHandAtBin(binId, plainSkuId);
+
+    const decide = (id: string, decision: 'approve' | 'reject') =>
+      request(app.getHttpServer())
+        .post(`${API}/${tenantId}/receiving/over-receipts/${id}/${decision}`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid());
+
+    const approvedNull = await decide(nullLine!.id, 'approve').expect(200);
+    expect(approvedNull.body.overReceipt).toMatchObject({ status: 'approved', poId, poLineId: null, excessQty: 2 });
+    expect((await ledgerRows(grnId)).map((e) => [e.quantity_delta, e.reference_doc])).toEqual([
+      [2, { kind: 'grn-receipt', grnId, poId }],
+    ]);
+    expect((await poDetail(poId)).lines[0]!.receivedQty).toBe(0); // no line credited
+
+    await decide(lined!.id, 'approve').expect(200);
+    const po = await poDetail(poId);
+    expect(po.status).toBe('closed');
+    expect(po.lines[0]).toMatchObject({ receivedQty: 4, status: 'cancelled' });
+    expect((await ledgerRows(grnId)).map((e) => e.reference_doc)).toContainEqual({ kind: 'grn-receipt', grnId, poId, poLineId: lineId });
+
+    const rejected = await decide(rejectMe!.id, 'reject').expect(200);
+    expect(rejected.body.overReceipt).toMatchObject({ status: 'rejected', poLineId: null });
+    expect(await onHandAtBin(binId, plainSkuId)).toBe(before + 6);
+    expect(await ledgerRows(grnId)).toHaveLength(2);
+    expect((await poDetail(poId)).lines[0]!.receivedQty).toBe(4);
+  });
+
+  it('line-level settlement: an unknown poLineId is rejected in the response naming the reason while the other lines settle; a receipt after the line closed cancelled pends on it (story 21-9)', async () => {
     const created = await createPo({
       warehouseId,
       vendorId,
@@ -804,11 +1088,20 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     expect((detail.body.purchaseOrder as { lines: { receivedQty: number }[] }).lines[0]!.receivedQty).toBe(10);
 
     // A cancelled line mid-receive: close it cancelled, then a queued receipt
-    // against it retracts visibly (409 po-not-open — the PO closed with it).
+    // against it. REPLACED by story 21-9 (it used to retract 409
+    // po-not-open): the PO closed with the line, so the receipt pends on that
+    // closed line — nothing reaches stock or received_qty until approved.
     await closePo(po.id, [{ lineId, disposition: 'cancelled' }]).expect(200);
-    await submitGrn(
+    const late = await submitGrn(
       grnBody([{ poLineId: lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 5 }], po.id),
-    ).expect(409);
+    ).expect(201);
+    expect(late.body.goodsReceipt.lines[0]).toMatchObject({ poLineId: lineId, appliedQty: 0, excessQty: 5 });
+    expect(await ledgerRows(late.body.goodsReceipt.id as string)).toHaveLength(0);
+    const closedDetail = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/inbound/purchase-orders/${po.id}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    expect((closedDetail.body.purchaseOrder as { lines: { receivedQty: number }[] }).lines[0]!.receivedQty).toBe(10);
   });
 
   // ── Idempotency + device re-authorization ──────────────────────────────────
