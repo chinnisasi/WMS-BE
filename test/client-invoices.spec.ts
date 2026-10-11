@@ -1278,8 +1278,48 @@ describe('story 21-5: client invoices', () => {
         ]);
       });
 
+      // Story 21-11a (retro S2b) — CAP-5's pinned recompute: a discarded draft
+      // re-prepares to the SAME content. The re-prepare uses a FRESH key, so
+      // it cannot pass by replaying the deleted draft's snapshot; the hash is
+      // re-read from the NEW row. `clientInvoiceContentHash` excludes ids,
+      // the number, timestamps and status — line ids differ on every write.
+      // It leaves GAMMA's September draft REPLACED (a new id): the `stale`
+      // test below issues that replacement, reading it by status.
+      it('CAP-5 recompute: discard GAMMA’s draft and prepare the month again → a new id, the same content hash, totals and lines', async () => {
+        const listed = (await http().get(`${API}/${tenantId}/client-invoices?clientId=${client('GAMMA')}`).set('Authorization', `Bearer ${opsToken}`).expect(200)).body
+          .items as { id: string; status: string }[];
+        expect(listed.map((row) => row.status)).toEqual(['draft']);
+        type Lined = Omit<InvoiceBody, 'lines'> & { lines: (InvoiceBody['lines'][number] & { id: string })[] };
+        const before = (await getInvoice(listed[0]!.id).expect(200)).body.invoice as Lined;
+        const hashBefore = (await contentHash(before.id)).content_hash;
+        expect(hashBefore).toMatch(/^[0-9a-f]{64}$/);
+        const withoutIds = (lines: readonly object[]) => lines.map((line) => Object.fromEntries(Object.entries(line).filter(([key]) => key !== 'id')));
+        expect(before.lines.length).toBeGreaterThan(0);
+
+        await http()
+          .delete(`${API}/${tenantId}/client-invoices/${before.id}`)
+          .set('Authorization', `Bearer ${accountantToken}`)
+          .set(KEY_HEADER, ulid())
+          .expect(204);
+        expect(await sql`select 1 from client_invoices where id = ${before.id}`).toHaveLength(0);
+
+        const again = await prepare(client('GAMMA'), '2026-09', accountantToken, ulid()).expect(201);
+        expect(again.body.existing).toEqual([]);
+        expect(again.body.created).toHaveLength(1);
+        const fresh = again.body.created[0] as Lined;
+        expect(fresh.id).not.toBe(before.id);
+        expect((await contentHash(fresh.id)).content_hash).toBe(hashBefore);
+        expect(fresh.totals).toEqual(before.totals);
+        expect(withoutIds(fresh.lines)).toEqual(withoutIds(before.lines));
+        // The line ids really are new rows (so the equality is not a replay).
+        expect(fresh.lines.map((line) => line.id).filter((id) => before.lines.some((old) => old.id === id))).toEqual([]);
+      });
+
       it('stale: a GRN line arrives late → 200 {outcome: stale}, the fresh draft stored, no number used; issuing again numbers it', async () => {
-        const gamma = (await http().get(`${API}/${tenantId}/client-invoices?clientId=${client('GAMMA')}`).set('Authorization', `Bearer ${opsToken}`).expect(200)).body.items[0] as { id: string };
+        // GAMMA's CURRENT draft — the CAP-5 test above discarded the first one
+        // and prepared a replacement (same content, new id); read by status so
+        // this test does not depend on which of the two it gets.
+        const gamma = (await http().get(`${API}/${tenantId}/client-invoices?clientId=${client('GAMMA')}&status=draft`).set('Authorization', `Bearer ${opsToken}`).expect(200)).body.items[0] as { id: string };
         const seqBefore = await seriesSeq(T29, 'FY-2627');
         await seedGrn('w2', '2026-09-28T10:00', [sku('GAMMA-PC')]);
         const key = ulid();

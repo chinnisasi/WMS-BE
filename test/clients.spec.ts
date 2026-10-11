@@ -338,6 +338,54 @@ describe('story 21-2b: client admin and attribution', () => {
       expect({ status: res.status, code: (res.body as { code?: string }).code }).toEqual({ status, code });
     }
 
+    // ── deterministic races (21-10; parameterised by table in 21-11a) ─────────
+    /** A response as 200, or `"<status> <code>"` — so a failed race names the refusal. */
+    const outcome = (res: request.Response): number | string =>
+      res.status === 200 ? 200 : `${res.status} ${(res.body as { code?: string }).code}`;
+    const handle = () => postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+
+    /**
+     * Wait until `min` sessions are parked on a `table` row lock held by
+     * `holderPid` — a statement on `table` taking `lockClause`, waiting on a
+     * lock, in the chain that leads back to the holder.
+     */
+    const waitParked = async (
+      table: 'clients' | 'products',
+      holderPid: number,
+      lockClause: 'for share' | 'for update',
+      min: number,
+    ): Promise<void> => {
+      const probe = handle();
+      try {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const waiting = (await probe`
+            select a.pid, pg_blocking_pids(a.pid) as blockers from pg_stat_activity a
+            where a.wait_event_type = 'Lock' and a.state = 'active'
+              and a.query ilike ${`%"${table}"%`} and a.query ilike ${`%${lockClause}%`}
+          `) as unknown as { pid: number; blockers: number[] }[];
+          // A second waiter on one row queues behind the FIRST waiter's
+          // tuple lock, so its blocker is that waiter, not the holder:
+          // count the chain that leads back to the holder.
+          const chain = new Set<number>([holderPid]);
+          for (let grew = true; grew; ) {
+            grew = false;
+            for (const row of waiting) {
+              if (!chain.has(row.pid) && row.blockers.some((pid) => chain.has(pid))) {
+                chain.add(row.pid);
+                grew = true;
+              }
+            }
+          }
+          if (chain.size - 1 >= min) return;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        throw new Error(`fewer than ${min} request(s) parked on the ${table} row (${lockClause})`);
+      } finally {
+        await probe.end();
+      }
+    };
+
     beforeAll(async () => {
       suiteDb = await useSuiteDatabase('clients');
       app = await createApp(false);
@@ -764,6 +812,62 @@ describe('story 21-2b: client admin and attribution', () => {
         expect(refused.body.detail).toContain('SKU "SELF-V2"');
         expect(await skuClient('SELF-V1')).toBe(acmeId);
       });
+
+      // Story 21-11a (retro B2) — the replay UNDER the last lock. The product
+      // row is locked first (sku-client.command.ts), so a raw holder on it
+      // parks both requests. Without the second replay, the duplicate finds
+      // the group already moved and takes the no-op arm, answering only the
+      // target SKU where the winner answered the whole (≥ 2-SKU) group.
+      it('two same-key corrections parked on the product lock: both 200 with the winner\'s whole-group body, one audit row per SKU, one key', async () => {
+        await http()
+          .post(`${API}/${tenantId}/catalog/products`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ name: 'Race Tee', axes: ['size'] })
+          .expect(201);
+        const imported = await importCsv(
+          ['RACE-V1,Race variant 1,pcs,1800,Race Tee,size=S,', 'RACE-V2,Race variant 2,pcs,1800,Race Tee,size=M,'],
+          { clientId: selfClientId },
+        ).expect(201);
+        expect(imported.body.committedRows).toBe(2);
+        await refreshSkus();
+        const productId = (await sql<{ product_id: string }[]>`select product_id from skus where id = ${sku('RACE-V1')}`)[0]!.product_id;
+        expect(productId).not.toBeNull();
+        const key = ulid();
+        const send = () =>
+          http()
+            .post(`${API}/${tenantId}/catalog/skus/${sku('RACE-V1')}/client`)
+            .set('Authorization', `Bearer ${ownerToken}`)
+            .set(KEY_HEADER, key)
+            .send({ clientId: acmeId });
+        const holder = handle();
+        let first: Promise<request.Response> | undefined;
+        let second: Promise<request.Response> | undefined;
+        try {
+          await holder.begin(async (tx) => {
+            const locked = (await tx`
+              select pg_backend_pid() as pid from products where tenant_id = ${tenantId} and id = ${productId} for update
+            `) as unknown as { pid: number }[];
+            first = (async () => send())();
+            second = (async () => send())();
+            await waitParked('products', locked[0]!.pid, 'for update', 2);
+          });
+          const [a, b] = await Promise.all([first!, second!]);
+          expect([a, b].map(outcome)).toEqual([200, 200]);
+          // Either request may win; the loser must answer the winner's body.
+          expect(b.body).toEqual(a.body);
+          expect(a.body.skus.map((s: { code: string }) => s.code)).toEqual(['RACE-V1', 'RACE-V2']);
+          // One correction: one audit row per SKU of the group, one key.
+          const audits = await sql`select target_id from audit_events
+            where tenant_id = ${tenantId} and action = 'sku.client-corrected' and reference like ${`%(key ${key})`}`;
+          expect(audits.map((row) => row.target_id as string).sort()).toEqual([sku('RACE-V1'), sku('RACE-V2')].sort());
+          expect(await sql`select 1 from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`).toHaveLength(1);
+          expect(await skuClient('RACE-V2')).toBe(acmeId);
+        } finally {
+          await Promise.allSettled([first, second]);
+          await holder.end();
+        }
+      });
     });
 
     // ── documents derive their client ────────────────────────────────────────
@@ -1156,6 +1260,166 @@ describe('story 21-2b: client admin and attribution', () => {
       expect(importReplay.body.clientId).toBeUndefined();
     });
 
+    // ── story 21-11a: a cross-client wave over HTTP ──────────────────────────
+    // Story 21-11a (retro S2a) — the epic's pinned "cross-client wave" test
+    // over HTTP: isolation is about visibility and ownership, never about
+    // partitioning the floor, so ONE batch wave picks two clients' orders on
+    // one picklist — and the shared picklist must not mis-attribute a pick.
+    describe('a cross-client wave: ACME and BETA on one batch picklist, picked, packed and dispatched', () => {
+      const PASSWORD = 'correct-horse-battery';
+
+      // Copied from test/portal.spec.ts (`accept` / `portalUser`) — per-spec helpers are the convention.
+      async function portalUser(clientId: string): Promise<{ token: string }> {
+        const email = `portal-${ulid().toLowerCase()}@brand.example`;
+        const invited = await http()
+          .post(`${API}/${tenantId}/users`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ email, role: 'client', clientId })
+          .expect(201);
+        await http()
+          .post(`${API}/${tenantId}/accept-invite`)
+          .set(KEY_HEADER, ulid())
+          .send({ token: invited.body.inviteToken as string, password: PASSWORD })
+          .expect(200);
+        const signedIn = await http().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200);
+        return { token: signedIn.body.accessToken as string };
+      }
+
+      function portalGet(token: string, path: string): SupertestTest {
+        return http().get(`${API}/${tenantId}/portal/${path}`).set('Authorization', `Bearer ${token}`);
+      }
+
+      it('one picklist holds both orders; both dispatch; every pick event carries its order\'s client; each portal sees only its own order', async () => {
+        const betaId = (await createClient({ code: 'BETA', name: 'Beta Brands' }).expect(201)).body.client.id as string;
+        await importCsv(['WAVE-ACME,Wave Acme item,pcs,1800,,,'], { clientId: acmeId }).expect(201);
+        await importCsv(['WAVE-BETA,Wave Beta item,pcs,1800,,,'], { clientId: betaId }).expect(201);
+        await refreshSkus();
+        await seedStock(sku('WAVE-ACME'), binA, 6);
+        await seedStock(sku('WAVE-BETA'), binB, 6);
+
+        const acmeOrder = await createOrder([{ skuId: sku('WAVE-ACME'), quantity: 2, ratePaise: 10000 }]).expect(201);
+        const betaOrder = await createOrder([{ skuId: sku('WAVE-BETA'), quantity: 3, ratePaise: 10000 }]).expect(201);
+        const acmeOrderId = acmeOrder.body.order.id as string;
+        const betaOrderId = betaOrder.body.order.id as string;
+        expect(acmeOrder.body.order.clientId).toBe(acmeId);
+        expect(betaOrder.body.order.clientId).toBe(betaId);
+        const clientOfOrder = new Map([
+          [acmeOrderId, acmeId],
+          [betaOrderId, betaId],
+        ]);
+
+        // ONE wave over both orders, batch-grouped.
+        const policy = await http()
+          .post(`${API}/${tenantId}/outbound/wave-policies`)
+          .set('Authorization', `Bearer ${opsToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ warehouseId, name: `cross-${ulid().slice(10, 18)}`, grouping: 'batch' })
+          .expect(201);
+        const wave = await http()
+          .post(`${API}/${tenantId}/outbound/waves`)
+          .set('Authorization', `Bearer ${opsToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ warehouseId, policyId: policy.body.policy.id, orderIds: [acmeOrderId, betaOrderId] })
+          .expect(201);
+        const waveId = wave.body.wave.id as string;
+        await http()
+          .post(`${API}/${tenantId}/outbound/waves/${waveId}/release`)
+          .set('Authorization', `Bearer ${opsToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({})
+          .expect(200);
+        const released = await http()
+          .get(`${API}/${tenantId}/outbound/waves/${waveId}`)
+          .set('Authorization', `Bearer ${accountantToken}`)
+          .expect(200);
+        // The shared picklist: ONE, not per order, holding lines of both.
+        const picklists = released.body.wave.picklists as {
+          id: string;
+          orderId: string | null;
+          lines: { id: string; orderId: string; skuId: string; binId: string; qty: number }[];
+        }[];
+        expect(picklists).toHaveLength(1);
+        const picklist = picklists[0]!;
+        expect(picklist.orderId).toBeNull();
+        expect(new Set(picklist.lines.map((line) => line.orderId))).toEqual(new Set([acmeOrderId, betaOrderId]));
+
+        // Pick every line on the device.
+        for (const line of picklist.lines) {
+          await http()
+            .post(`${API}/${tenantId}/outbound/picks`)
+            .set('Authorization', `Bearer ${deviceOperatorToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({ warehouseId, picklistId: picklist.id, picklistLineId: line.id, skuId: line.skuId, binId: line.binId, qty: line.qty, occurredAt: at() })
+            .expect(201);
+        }
+        // Pack and dispatch each order.
+        for (const [orderId, skuCode, qty] of [
+          [acmeOrderId, 'WAVE-ACME', 2],
+          [betaOrderId, 'WAVE-BETA', 3],
+        ] as const) {
+          await http()
+            .post(`${API}/${tenantId}/outbound/orders/${orderId}/pack`)
+            .set('Authorization', `Bearer ${operatorWebToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({ scanned: [{ skuId: sku(skuCode), qty }] })
+            .expect(201);
+          await http()
+            .post(`${API}/${tenantId}/outbound/orders/${orderId}/dispatch`)
+            .set('Authorization', `Bearer ${operatorWebToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({})
+            .expect(201);
+        }
+        const statuses = await sql<{ id: string; status: string; client_id: string }[]>`
+          select id, status, client_id from orders where id in ${sql([acmeOrderId, betaOrderId])}`;
+        expect(new Map(statuses.map((row) => [row.id, [row.status, row.client_id]]))).toEqual(
+          new Map([
+            [acmeOrderId, ['dispatched', acmeId]],
+            [betaOrderId, ['dispatched', betaId]],
+          ]),
+        );
+
+        // The pick events of each order (linked through reference_doc.orderId)
+        // carry THAT order's client — the shared picklist is where a pick
+        // could be mis-attributed.
+        const picks = await sql<{ order_id: string; client_id: string; sku_id: string }[]>`
+          select reference_doc->>'orderId' as order_id, client_id, sku_id from ledger_events
+          where tenant_id = ${tenantId} and type = 'pick.picked'
+            and reference_doc->>'orderId' in ${sql([acmeOrderId, betaOrderId])}`;
+        expect(new Set(picks.map((row) => row.order_id))).toEqual(new Set([acmeOrderId, betaOrderId]));
+        for (const row of picks) expect(row.client_id).toBe(clientOfOrder.get(row.order_id));
+        // Exactly one pick event per picklist line, per order (untracked SKUs:
+        // no batch or serial arms) — a dropped or duplicated pick fails here.
+        const countBy = (orderIds: readonly string[]) =>
+          Object.fromEntries([acmeOrderId, betaOrderId].map((id) => [id, orderIds.filter((orderId) => orderId === id).length]));
+        expect(countBy(picks.map((row) => row.order_id))).toEqual(countBy(picklist.lines.map((line) => line.orderId)));
+
+        // Each portal sees exactly its own client's orders, and a 404 for the other's.
+        const portalA = await portalUser(acmeId);
+        const portalB = await portalUser(betaId);
+        const listed = async (token: string): Promise<string[]> => {
+          const page = await portalGet(token, 'orders?limit=100').expect(200);
+          expect(page.body.nextCursor).toBeNull();
+          return (page.body.items as { id: string }[]).map((item) => item.id).sort();
+        };
+        const ordersOf = async (clientId: string): Promise<string[]> =>
+          (await sql<{ id: string }[]>`select id from orders where tenant_id = ${tenantId} and client_id = ${clientId}`)
+            .map((row) => row.id)
+            .sort();
+        expect(await listed(portalB.token)).toEqual([betaOrderId]);
+        const acmeListed = await listed(portalA.token);
+        expect(acmeListed).toEqual(await ordersOf(acmeId));
+        expect(acmeListed).toContain(acmeOrderId);
+        expect(acmeListed).not.toContain(betaOrderId);
+        const acmeDetail = await portalGet(portalA.token, `orders/${acmeOrderId}`).expect(200);
+        expect(acmeDetail.body).toMatchObject({ id: acmeOrderId, status: 'dispatched' });
+        await portalGet(portalB.token, `orders/${betaOrderId}`).expect(200);
+        expectProblem(await portalGet(portalA.token, `orders/${betaOrderId}`), 404, 'not-found');
+        expectProblem(await portalGet(portalB.token, `orders/${acmeOrderId}`), 404, 'not-found');
+      });
+    });
+
     // ── story 21-10: suspend and reactivate ──────────────────────────────────
     describe('client suspension (story 21-10)', () => {
       const PASSWORD = 'correct-horse-battery';
@@ -1362,40 +1626,6 @@ describe('story 21-2b: client admin and attribution', () => {
       });
 
       describe('races (deterministic: parked waiters, pg_blocking_pids)', () => {
-        const handle = () => postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
-
-        /** Wait until `min` sessions are parked on the clients row lock held by `holderPid`. */
-        const waitParked = async (holderPid: number, lockClause: 'for share' | 'for update', min: number): Promise<void> => {
-          const probe = handle();
-          try {
-            const deadline = Date.now() + 10_000;
-            while (Date.now() < deadline) {
-              const waiting = (await probe`
-                select a.pid, pg_blocking_pids(a.pid) as blockers from pg_stat_activity a
-                where a.wait_event_type = 'Lock' and a.state = 'active'
-                  and a.query ilike '%clients%' and a.query ilike ${`%${lockClause}%`}
-              `) as unknown as { pid: number; blockers: number[] }[];
-              // A second waiter on one row queues behind the FIRST waiter's
-              // tuple lock, so its blocker is that waiter, not the holder:
-              // count the chain that leads back to the holder.
-              const chain = new Set<number>([holderPid]);
-              for (let grew = true; grew; ) {
-                grew = false;
-                for (const row of waiting) {
-                  if (!chain.has(row.pid) && row.blockers.some((pid) => chain.has(pid))) {
-                    chain.add(row.pid);
-                    grew = true;
-                  }
-                }
-              }
-              if (chain.size - 1 >= min) return;
-              await new Promise((r) => setTimeout(r, 25));
-            }
-            throw new Error(`fewer than ${min} request(s) parked on the client row (${lockClause})`);
-          } finally {
-            await probe.end();
-          }
-        };
 
         it('a draft, a portal announce and a portal-user invite parked behind a committing suspend are all refused', async () => {
           const portal = await portalUser(suspId);
@@ -1423,7 +1653,7 @@ describe('story 21-2b: client admin and attribution', () => {
               inviting = (async () => invitePortal(suspId, inviteEmail))();
               // All three gates must be ON the lock — an unlocked status read
               // would never park here, and this throws.
-              await waitParked(locked[0]!.pid, 'for share', 3);
+              await waitParked('clients', locked[0]!.pid, 'for share', 3);
             });
             const [draft, asn, invited] = await Promise.all([drafting!, announcing!, inviting!]);
             expectProblem(draft, 409, 'client-not-active');
@@ -1456,7 +1686,7 @@ describe('story 21-2b: client admin and attribution', () => {
               void suspending.then(() => {
                 settledEarly = true;
               });
-              await waitParked(locked[0]!.pid, 'for update', 1);
+              await waitParked('clients', locked[0]!.pid, 'for update', 1);
               expect(settledEarly).toBe(false);
             });
             const res = await suspending!;
@@ -1485,7 +1715,7 @@ describe('story 21-2b: client admin and attribution', () => {
               `) as unknown as { pid: number }[];
               first = (async () => setStatus(suspId, 'suspended', ownerToken, key))();
               second = (async () => setStatus(suspId, 'suspended', ownerToken, key))();
-              await waitParked(locked[0]!.pid, 'for update', 2);
+              await waitParked('clients', locked[0]!.pid, 'for update', 2);
             });
             const [a, b] = await Promise.all([first!, second!]);
             expect([a.status, b.status]).toEqual([200, 200]);
