@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Inject, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
@@ -26,6 +26,7 @@ import {
   EnrollDeviceResponse,
   MintEnrollmentCodeDto,
   MintEnrollmentCodeResponse,
+  PushRegistrationDto,
 } from './devices.dto';
 // The Query DTO stays a RUNTIME import (the global ValidationPipe's
 // transform reads design:paramtypes — the movements.controller note's
@@ -270,6 +271,68 @@ export class DevicesController {
     );
   }
 
+  // ── story 9-2b: the handheld's push registration ──────────────────────
+
+  /**
+   * Registers this handheld's Expo push token and its warehouse (badge-in
+   * session required). A natural upsert — 204 and NO Idempotency-Key (a
+   * retry writes the same values; the `notifications/opened` exception
+   * family). The command locks the device and requires it active and bound
+   * to this session's operator.
+   */
+  @Put(':tenantId/devices/push-registration')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @UseGuards(DeviceSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: "Registers the handheld's Expo push token and warehouse (badge-in session) — a natural upsert, no Idempotency-Key",
+    description:
+      'Takes NO Idempotency-Key: re-sending the same token and warehouse writes the same values. The token is cleared from every other device of the tenant (a token belongs to one device).',
+  })
+  @ApiBody({ type: PushRegistrationDto })
+  @ApiResponse({ status: HttpStatus.NO_CONTENT, description: 'Registered' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed body — not an Expo push token, or warehouseId not a uuid (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Token belongs to another tenant (permission-denied), or the device is unknown, revoked or bound to another operator (device-revoked)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
+  async registerPush(
+    @Param('tenantId') tenantId: string,
+    @CurrentDeviceSession() session: DeviceSession,
+    @Body() dto: PushRegistrationDto,
+  ): Promise<void> {
+    assertOwnTenant(session.tenantId, tenantId);
+    const operatorUserId = requireBadgeIn(session);
+    await this.enrollment.registerPush({
+      tenantId,
+      deviceId: session.deviceId,
+      operatorUserId,
+      token: dto.token,
+      warehouseId: dto.warehouseId,
+    });
+  }
+
+  /** Clears this handheld's push registration (badge-in session) — 204, idempotent, no Idempotency-Key. */
+  @Delete(':tenantId/devices/push-registration')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @UseGuards(DeviceSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: "Clears the handheld's push registration (badge-in session) — idempotent, no Idempotency-Key",
+  })
+  @ApiResponse({ status: HttpStatus.NO_CONTENT, description: 'Cleared (or nothing was registered)' })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Token belongs to another tenant (permission-denied), or the device is unknown, revoked or bound to another operator (device-revoked)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
+  async unregisterPush(
+    @Param('tenantId') tenantId: string,
+    @CurrentDeviceSession() session: DeviceSession,
+  ): Promise<void> {
+    assertOwnTenant(session.tenantId, tenantId);
+    const operatorUserId = requireBadgeIn(session);
+    await this.enrollment.unregisterPush({ tenantId, deviceId: session.deviceId, operatorUserId });
+  }
+
   // ── story 5-6: the AD-14 sync report + the rejected-op review queue ─────
 
   /**
@@ -404,6 +467,19 @@ export class DevicesController {
       outcome: snapshot.outcome,
     };
   }
+}
+
+/** A bare enrollment credential has no operator — badge-in first (401). */
+function requireBadgeIn(session: DeviceSession): string {
+  if (session.userId === null) {
+    throw new ProblemException(
+      'unauthenticated',
+      401,
+      'Badge-in required',
+      'This endpoint requires an operator badge-in session.',
+    );
+  }
+  return session.userId;
 }
 
 function toDeviceResponse(device: DeviceView): DeviceResponse {

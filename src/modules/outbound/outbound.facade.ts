@@ -75,6 +75,7 @@ import { RateService } from './rate.service';
 import type { OrderRatesSnapshot } from './rate.service';
 import type {
   CreateWavePolicyCommand,
+  CutoffSweepResult,
   GenerateWaveCommand,
   WaveGrouping,
   WavePolicySnapshot,
@@ -83,6 +84,10 @@ import type {
   WaveStatus,
   WaveTransitionCommand,
 } from './wave.command';
+
+// Story 9-2b — the sweep's result and event type ride the facade seam.
+export type { CutoffSweepResult } from './wave.command';
+export { WAVE_CUTOFF_AT_RISK_EVENT } from './wave.command';
 
 // Story 9-1 — the dashboard fact-list row types ride the facade seam.
 export type { BackorderRefusalEntry, PackFailureEntry, PicklistLineEntry };
@@ -830,6 +835,16 @@ export class OutboundFacade {
   /** `POST .../outbound/waves/{id}/cancel` — frees its orders to be re-waved. */
   async cancelWave(command: WaveTransitionCommand, idempotencyKey: string): Promise<WaveSnapshot> {
     return this.waveCommand.cancelWave(command, idempotencyKey);
+  }
+
+  /**
+   * Story 9-2b — the cutoff sweep for one tenant: raises
+   * `wave.cutoff_at_risk` for each planned wave inside its policy's 60-minute
+   * at-risk window, once per wave per IST date. Driven by the jobs shell's
+   * `WaveCutoffSweepWorker`.
+   */
+  async sweepCutoffRisk(tenantId: string): Promise<CutoffSweepResult> {
+    return this.waveCommand.sweepCutoffRisk(tenantId);
   }
 
   /**

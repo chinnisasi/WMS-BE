@@ -85,7 +85,7 @@ export class NotificationsController {
   @ApiOperation({
     summary: 'Marks the panel opened by the caller (clears the dot)',
     description:
-      "Sets the caller's last-opened time to now and answers {hasNew: false}. Takes NO Idempotency-Key — the one exception among the mutating routes: setting a time to now is naturally idempotent, and a retry only moves it forward.",
+      "Sets the caller's last-opened time to now and answers {hasNew: false}. Takes NO Idempotency-Key — one of the natural-upsert exceptions among the mutating routes (with the handheld's PUT/DELETE devices/push-registration, story 9-2b): setting a time to now is naturally idempotent, and a retry only moves it forward.",
   })
   @ApiOkResponse({ type: NotificationStatusResponse })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })

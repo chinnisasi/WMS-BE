@@ -1615,6 +1615,14 @@ export type PurchaseOrderLine = typeof purchaseOrderLines.$inferSelect;
  *
  * RLS policy + status CHECK live **only in the migration SQL** (0012, the
  * 0005→0011 pattern).
+ *
+ * Story 9-2b — the push registration (`push_token`, `push_warehouse_id`,
+ * `push_registered_at`, all nullable): the handheld's Expo push token and
+ * the warehouse it works in, written only by the device's own PUT/DELETE
+ * `…/devices/push-registration` and cleared by revoke. A token belongs to at
+ * most one device — a PUT clears it from every other row in the tenant, and
+ * the push sender resolves a cross-tenant collision by the latest
+ * `push_registered_at` (the partial index serves that read).
  */
 export const devices = pgTable(
   'devices',
@@ -1634,9 +1642,14 @@ export const devices = pgTable(
     enrolledAt: timestamp('enrolled_at', { withTimezone: true, mode: 'string' }),
     pinHash: text('pin_hash'),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true, mode: 'string' }),
+    pushToken: text('push_token'),
+    pushWarehouseId: uuid('push_warehouse_id'),
+    pushRegisteredAt: timestamp('push_registered_at', { withTimezone: true, mode: 'string' }),
     ...tenantTimestamps,
   },
   (table) => [
+    // Story 9-2b — the send-time token-ownership read (latest registration wins).
+    index('devices_push_token_idx').on(table.pushToken).where(sql`push_token is not null`),
     // One unredeemed code per hash — redemption is a conditional UPDATE on
     // this index (no double-redeem race).
     uniqueIndex('devices_enrollment_code_hash_unique')
@@ -2249,6 +2262,12 @@ export const waves = pgTable(
     status: text('status').notNull().default('planned'),
     releasedAt: timestamp('released_at', { withTimezone: true, mode: 'string' }),
     cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
+    /**
+     * Story 9-2b — the IST date the cutoff sweep last raised
+     * `wave.cutoff_at_risk` for this wave (once per wave per IST date).
+     * Written only by the sweep; never part of a wave snapshot.
+     */
+    cutoffRiskAlertedOn: date('cutoff_risk_alerted_on', { mode: 'string' }),
     ...tenantTimestamps,
   },
   (table) => [
@@ -4669,3 +4688,40 @@ export const notificationReads = pgTable(
   },
   (table) => [primaryKey({ columns: [table.tenantId, table.userId] })],
 );
+
+/**
+ * Story 9-2b — the mobile push queue (notifications module, module-exclusive
+ * writes). One row per (relayed outbox event, eligible handheld): the
+ * outbox handler only INSERTS `pending` rows (`ON CONFLICT DO NOTHING` on the
+ * key — a re-delivered event queues nothing new); the sender worker claims
+ * due rows (`sending`, committed before the network call), sends one batch
+ * through the `PushGateway` port and writes each ticket's outcome. A row
+ * found `sending` past 5 minutes is `failed` (`stale`) and never re-sent
+ * (at-most-once). `warehouse_id` (new-work only) and `approval_source`
+ * (approval only) carry what the send-time eligibility re-check needs. The
+ * vocabulary CHECKs and RLS live only in `drizzle/0068_mobile_pushes.sql`.
+ */
+export const pushDeliveries = pgTable(
+  'push_deliveries',
+  {
+    tenantId: uuid('tenant_id').notNull(),
+    eventId: uuid('event_id').notNull(),
+    deviceId: uuid('device_id').notNull(),
+    kind: text('kind').notNull(),
+    tab: text('tab').notNull(),
+    warehouseId: uuid('warehouse_id'),
+    approvalSource: text('approval_source'),
+    status: text('status').notNull(),
+    gateway: text('gateway'),
+    errorCode: text('error_code'),
+    attempts: integer('attempts').notNull().default(0),
+    nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true, mode: 'string' }).notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    primaryKey({ columns: [table.tenantId, table.eventId, table.deviceId] }),
+    index('push_deliveries_tenant_status_next_attempt_idx').on(table.tenantId, table.status, table.nextAttemptAt),
+  ],
+);
+
+export type PushDeliveryRow = typeof pushDeliveries.$inferSelect;

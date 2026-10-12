@@ -39,9 +39,12 @@ const INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
  *    no-op (an under-threshold count variance, which was never raised);
  *  - a malformed payload, a `ProblemException` < 500 and an SQLSTATE class
  *    22 (data exception) or 23 (integrity violation) ACK and log — no retry
- *    can fix them; anything else RETHROWS so the relay re-delivers (safe: no
- *    other subscriber exists on these types today, and the writes are
- *    idempotent);
+ *    can fix them; anything else RETHROWS so the relay re-delivers. Since
+ *    story 9-2b the three approval raises have a SECOND subscriber, the push
+ *    enqueue (`push.enqueue.ts`); a re-delivery is still safe because both
+ *    writes are idempotent, and this handler subscribes first (provider
+ *    order in `notifications.module.ts`), so a push-enqueue failure can
+ *    never keep the panel entry from being written;
  *  - no outbox events of its own, no audit (no actor — the `delivery.ts`
  *    rule).
  */
@@ -163,7 +166,7 @@ export class NotificationsDeliveryHandler implements OnModuleInit {
  * exception (SQLSTATE class 22) / integrity violation (class 23) anywhere on
  * the error's `cause` chain (drizzle wraps the driver's error).
  */
-function isDataFault(err: unknown): boolean {
+export function isDataFault(err: unknown): boolean {
   if (err instanceof ProblemException) return err.getStatus() < 500;
   let current: unknown = err;
   for (let depth = 0; depth < 5; depth += 1) {
