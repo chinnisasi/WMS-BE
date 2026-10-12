@@ -614,12 +614,14 @@ describe('mobile pushes (e2e, story 9-2b)', () => {
         PUSH_WAVE_CUTOFF_AT_RISK_EVENT,
         { waveId: uuidv7(), warehouseId: t.whA, cutoffLocalTime: '18:00', istDate: '2026-10-12' },
         new Date(now).toISOString(),
+        uuidv7(now), // appended at the frozen instant: the staleness clock is the append time
       );
       const passed = await emit(
         t.tenantId,
         PUSH_WAVE_CUTOFF_AT_RISK_EVENT,
         { waveId: uuidv7(), warehouseId: t.whA, cutoffLocalTime: '17:15', istDate: '2026-10-12' },
         new Date(now).toISOString(),
+        uuidv7(now), // appended at the frozen instant: the staleness clock is the append time
       );
       await drainAll();
       expect((await deliveries(t.tenantId, atRisk)).map((r) => [r.device_id, r.kind, r.tab]).sort()).toEqual(
@@ -629,17 +631,25 @@ describe('mobile pushes (e2e, story 9-2b)', () => {
       expect(accountant.deviceId).toBeDefined();
     });
 
-    it('a stale event (occurredAt two hours old — a backlog or an operator replay) is acked, not queued', async () => {
-      const old = new Date(Date.now() - 2 * 3600_000).toISOString();
-      const id = await emit(t.tenantId, 'wave.released', waveReleased(t.whA), old);
-      const thirtyOne = await emit(t.tenantId, 'wave.released', waveReleased(t.whA), new Date(Date.now() - 31 * 60_000).toISOString());
-      const twentyNine = await emit(t.tenantId, 'wave.released', waveReleased(t.whA), new Date(Date.now() - 29 * 60_000).toISOString());
+    it('staleness is the SERVER append time (the uuidv7 outbox id), never occurredAt: a backdated occurredAt with a fresh append is queued; an old append is acked', async () => {
+      const twoHoursAgo = Date.now() - 2 * 3600_000;
+      // Device time two hours back (a count or transfer queued offline), appended NOW.
+      const backdated = await emit(t.tenantId, 'wave.released', waveReleased(t.whA), new Date(twoHoursAgo).toISOString());
+      // Appended two hours ago (a deploy backlog, an operator replay), occurredAt fresh.
+      const oldAppend = await emit(t.tenantId, 'wave.released', waveReleased(t.whA), nowIso(), uuidv7(twoHoursAgo));
+      // The 30-minute boundary, either side.
+      const thirtyOne = await emit(t.tenantId, 'wave.released', waveReleased(t.whA), nowIso(), uuidv7(Date.now() - 31 * 60_000));
+      const twentyNine = await emit(t.tenantId, 'wave.released', waveReleased(t.whA), nowIso(), uuidv7(Date.now() - 29 * 60_000));
+      // An id that is not a uuidv7 cannot be dated: no push (never a fallback to occurredAt).
+      const undated = await emit(t.tenantId, 'wave.released', waveReleased(t.whA), nowIso(), '0b8f3c2e-4d5a-4b6c-8d7e-9f0a1b2c3d4e');
       await drainAll();
-      expect(await deliveries(t.tenantId, id)).toEqual([]);
+      expect(await deliveries(t.tenantId, backdated)).toHaveLength(2);
+      expect(await deliveries(t.tenantId, oldAppend)).toEqual([]);
       expect(await deliveries(t.tenantId, thirtyOne)).toEqual([]);
       expect(await deliveries(t.tenantId, twentyNine)).toHaveLength(2);
+      expect(await deliveries(t.tenantId, undated)).toEqual([]);
       // Acked: the relay holds nothing for them.
-      expect(await sql`select 1 from outbox_messages where id in (${id}, ${thirtyOne})`).toHaveLength(0);
+      expect(await sql`select 1 from outbox_messages where id in (${oldAppend}, ${thirtyOne}, ${undated})`).toHaveLength(0);
     });
 
     it('the 9-2 panel entry is written and the row acked even when the push enqueue fails (it subscribes first) — and with the gateway down', async () => {
@@ -791,28 +801,57 @@ describe('mobile pushes (e2e, story 9-2b)', () => {
       expect(gateway.batches).toHaveLength(0);
     });
 
-    it('a config fault (invalid EXPO_ACCESS_TOKEN): one error log, rows retried without spending an attempt, failed after an hour', async () => {
+    it('a config fault (invalid EXPO_ACCESS_TOKEN): rows retried without spending an attempt; the codes are RETURNED, and the worker logs once per tick across tenants', async () => {
       await devices(2);
       const eventId = await released();
       const errors = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
       const badCreds = new ScriptedGateway((messages) => messages.map(() => ({ ok: false, code: 'http-401' })));
-      await sender(badCreds).sendDue(t.tenantId);
-      let rows = await deliveries(t.tenantId, eventId);
+      const summary = await sender(badCreds).sendDue(t.tenantId);
+      expect(summary.configCodes).toEqual(['http-401']);
+      const rows = await deliveries(t.tenantId, eventId);
       expect(rows.map((r) => [r.status, r.attempts, r.error_code, r.backoff_s])).toEqual([
         ['pending', 0, 'http-401', 30],
         ['pending', 0, 'http-401', 30],
       ]);
+      // The sender itself logs nothing about credentials (code review B4).
+      expect(errors.mock.calls.filter(([msg]) => String(msg).includes('refused the credentials'))).toHaveLength(0);
+
+      // A second tenant faulting in the SAME tick: still one log line.
+      const other = await setupTenant('SenderOther');
+      const otherOperator = (await invite(other.tenantId, other.ownerToken, 'operator')).userId;
+      await sql`insert into devices (id, tenant_id, operator_user_id, label, status, push_token, push_warehouse_id, push_registered_at)
+                values (${uuidv7()}, ${other.tenantId}, ${otherOperator}, 'other', 'active', ${`ExponentPushToken[other-${ulid()}]`}, ${other.whA}, now())`;
+      await emit(other.tenantId, 'wave.released', waveReleased(other.whA));
+      await drainAll();
+      await sql`update push_deliveries set next_attempt_at = now() where tenant_id in (${t.tenantId}, ${other.tenantId})`;
+      const facade = new NotificationsFacade(app.get<Database>(DATABASE), sender(badCreds));
+      const worker = new PushSenderWorker(app.get(AUTH_DATABASE) as never, facade);
+      const driven = await worker.tick();
+      expect(driven).toEqual(expect.arrayContaining([t.tenantId, other.tenantId]));
       const credentialLogs = errors.mock.calls.filter(([msg]) => String(msg).includes('refused the credentials'));
       expect(credentialLogs).toHaveLength(1);
+      expect(String(credentialLogs[0]![0])).toContain('http-401');
       expect(String(credentialLogs[0]![0])).not.toContain('ExponentPushToken');
+      await sql`delete from push_deliveries where tenant_id = ${other.tenantId}`;
+    });
 
-      await sql`update push_deliveries set created_at = now() - interval '61 minutes', next_attempt_at = now() where tenant_id = ${t.tenantId}`;
-      await sender(badCreds).sendDue(t.tenantId);
-      rows = await deliveries(t.tenantId, eventId);
-      expect(rows.map((r) => [r.status, r.attempts, r.error_code])).toEqual([
-        ['failed', 0, 'http-401'],
-        ['failed', 0, 'http-401'],
-      ]);
+    it('a pending row created more than 30 minutes ago is failed `expired` before any claim — a config-faulted at-risk row an hour on included', async () => {
+      const made = await devices(2);
+      const eventId = await released();
+      await sql`update push_deliveries set created_at = now() - interval '31 minutes' where tenant_id = ${t.tenantId} and device_id = ${made[0]!.id}`;
+      await sql`update push_deliveries set created_at = now() - interval '29 minutes' where tenant_id = ${t.tenantId} and device_id = ${made[1]!.id}`;
+      // An at-risk row still retrying a config fault, an hour after it was queued.
+      const atRiskEvent = uuidv7();
+      await sql`insert into push_deliveries (tenant_id, event_id, device_id, kind, tab, status, error_code, attempts, next_attempt_at, created_at)
+                values (${t.tenantId}, ${atRiskEvent}, ${made[1]!.id}, 'at-risk', 'All', 'pending', 'http-401', 0, now(), now() - interval '61 minutes')`;
+      const gateway = new ScriptedGateway((messages) => messages.map(() => ({ ok: true })));
+      const summary = await sender(gateway).sendDue(t.tenantId);
+      expect(summary).toMatchObject({ expired: 2, claimed: 1, delivered: 1 });
+      expect(gateway.batches.flat().map((m) => m.to)).toEqual([made[1]!.token]);
+      const rows = new Map((await deliveries(t.tenantId, eventId)).map((r) => [r.device_id, r]));
+      expect(rows.get(made[0]!.id)).toMatchObject({ status: 'failed', error_code: 'expired' });
+      expect(rows.get(made[1]!.id)).toMatchObject({ status: 'sent' });
+      expect((await deliveries(t.tenantId, atRiskEvent))[0]).toMatchObject({ kind: 'at-risk', status: 'failed', error_code: 'expired' });
     });
 
     it('re-checks eligibility at send: deactivated, moved to a client, demoted, revoked or re-registered elsewhere → failed `ineligible`, not sent', async () => {

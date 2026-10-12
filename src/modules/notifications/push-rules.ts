@@ -40,22 +40,38 @@ export type ApprovalPushSource = (typeof APPROVAL_PUSH_SOURCES)[number];
 
 // ── timing ──────────────────────────────────────────────────────────────────
 
-/** An event relayed later than this after its `occurredAt` is acked without queueing (deploy backlog, operator replays). */
+/**
+ * An event relayed later than this after its outbox APPEND (the uuidv7
+ * timestamp of its server-minted id — never `occurredAt`) is acked without
+ * queueing (deploy backlog, operator replays).
+ */
 export const PUSH_STALE_EVENT_MS = 30 * 60_000;
+/**
+ * A `pending` row created longer ago than this is failed `expired` at the
+ * start of a send, before any claim: a "new work" push half an hour late is
+ * noise (it bounds every retry path — transient backoff, config faults, a
+ * sender that was off).
+ */
+export const PUSH_PENDING_EXPIRY_MS = 30 * 60_000;
 /** Expo drops a message it could not deliver within this many seconds. */
 export const PUSH_TTL_SECONDS = 3600;
 /** A row claimed `sending` longer than this was in flight when the process died: `failed` (`stale`), never re-sent. */
 export const PUSH_SENDING_STALE_MS = 5 * 60_000;
 /** A transient outcome is retried at most this many attempts in all; the next one is `failed`. */
 export const PUSH_MAX_ATTEMPTS = 5;
-/** A row still failing on a CONFIG fault this long after it was queued is `failed`. */
+/**
+ * A row still failing on a CONFIG fault this long after it was queued is
+ * `failed`. Since code review B2 the 30-minute `PUSH_PENDING_EXPIRY_MS`
+ * expires a pending row first, so this arm only fires for a row whose
+ * pending expiry was skipped (it stays as the outcome's own bound).
+ */
 export const PUSH_CONFIG_FAULT_MAX_AGE_MS = 60 * 60_000;
 /** How long a config-faulted row waits before the next try (a config fault spends no attempt). */
 export const PUSH_CONFIG_FAULT_RETRY_MS = 30_000;
 /** One send is at most this many messages (Expo's per-request limit), and a claim takes at most this many rows. */
 export const PUSH_BATCH_SIZE = 100;
-/** The `error_code` of the three rows the sender fails on its own (not a gateway code). */
-export const PUSH_LOCAL_FAILURES = ['stale', 'ineligible', 'superseded'] as const;
+/** The `error_code`s the sender fails a row with on its own (not a gateway code). */
+export const PUSH_LOCAL_FAILURES = ['stale', 'expired', 'ineligible', 'superseded'] as const;
 
 /** Backoff after the Nth transient failure: `min(2^(attempts-1) · 5 s, 5 min)` — the outbox relay's curve. */
 export function pushBackoffMs(attempts: number): number {

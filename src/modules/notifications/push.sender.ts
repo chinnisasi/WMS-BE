@@ -13,6 +13,7 @@ import {
   PUSH_CONFIG_FAULT_RETRY_MS,
   PUSH_KINDS,
   PUSH_MAX_ATTEMPTS,
+  PUSH_PENDING_EXPIRY_MS,
   PUSH_SENDING_STALE_MS,
   PUSH_TABS,
   PUSH_TTL_SECONDS,
@@ -37,9 +38,17 @@ export interface PushSendSummary {
   readonly retried: number;
   /** Rows failed `stale` by the sweep at the start of the call. */
   readonly stale: number;
+  /** Pending rows failed `expired` (older than 30 minutes) at the start of the call. */
+  readonly expired: number;
+  /**
+   * The CONFIG-fault codes this call met (the deployment's credentials are
+   * wrong). The sender does not log them — the worker logs once per TICK
+   * across every tenant (code review B4). Codes only, never a message.
+   */
+  readonly configCodes: readonly string[];
 }
 
-const EMPTY: PushSendSummary = { claimed: 0, sent: 0, delivered: 0, failed: 0, retried: 0, stale: 0 };
+const EMPTY: PushSendSummary = { claimed: 0, sent: 0, delivered: 0, failed: 0, retried: 0, stale: 0, expired: 0, configCodes: [] };
 
 /** One claimed row headed for the gateway, with the token it is sent to. */
 interface InFlight {
@@ -58,7 +67,8 @@ const APPROVALS: ReadonlySet<string> = new Set(APPROVAL_PUSH_SOURCES);
  *
  *  1. **Claim** (tenant transaction A): rows `sending` for more than 5
  *     minutes are failed `stale` (the process died mid-send — at-most-once:
- *     they are never re-sent); then up to 100 due `pending` rows are taken
+ *     they are never re-sent); `pending` rows created more than 30 minutes
+ *     ago are failed `expired`; then up to 100 due `pending` rows are taken
  *     `FOR UPDATE SKIP LOCKED` (a second sender skips them). Each is
  *     re-checked — the device's base eligibility (tenancy's
  *     `getPushTargetsIn`) and its kind's audience (`pushAudienceAllows`) —
@@ -74,7 +84,8 @@ const APPROVALS: ReadonlySet<string> = new Set(APPROVAL_PUSH_SOURCES);
  *     the device's token when it still equals the token sent); transient →
  *     `pending` with `attempts + 1` and backoff, `failed` once the attempts
  *     reach 5; config → logged ONCE for the call, `pending` without spending
- *     an attempt, `failed` once the row is an hour old.
+ *     an attempt (the 30-minute expiry ends it; config codes are returned
+ *     for the worker to log once per tick).
  *
  * Only `sending` rows are touched in B, so a row the stale sweep already
  * failed is never resurrected. Only codes are stored or logged — never a
@@ -104,6 +115,21 @@ export class PushSender {
         )
         .returning({ eventId: pushDeliveries.eventId });
 
+      // Code review B2: a pending row older than 30 minutes is noise by now
+      // (a transient backoff, a config fault, a sender that was off) —
+      // failed `expired` before any claim, never sent.
+      const expired = await tx
+        .update(pushDeliveries)
+        .set({ status: 'failed', errorCode: 'expired', updatedAt: sql`now()` })
+        .where(
+          and(
+            eq(pushDeliveries.tenantId, tenantId),
+            eq(pushDeliveries.status, 'pending'),
+            sql`${pushDeliveries.createdAt} < now() - make_interval(secs => ${PUSH_PENDING_EXPIRY_MS / 1000}::double precision)`,
+          ),
+        )
+        .returning({ eventId: pushDeliveries.eventId });
+
       const due = await tx
         .select()
         .from(pushDeliveries)
@@ -118,7 +144,7 @@ export class PushSender {
         .limit(PUSH_BATCH_SIZE)
         .for('update', { skipLocked: true });
       if (due.length === 0) {
-        return { stale: stale.length, claimed: 0, failed: 0, inFlight: [] as InFlight[] };
+        return { stale: stale.length, expired: expired.length, claimed: 0, failed: 0, inFlight: [] as InFlight[] };
       }
 
       // The send-time eligibility RE-CHECK.
@@ -169,11 +195,11 @@ export class PushSender {
           .set({ status: 'sending', gateway: this.gateway.mode, updatedAt: sql`now()` })
           .where(keyOf(row));
       }
-      return { stale: stale.length, claimed: due.length, failed: ineligible.length + superseded.length, inFlight };
+      return { stale: stale.length, expired: expired.length, claimed: due.length, failed: ineligible.length + superseded.length, inFlight };
     });
 
     if (claim.inFlight.length === 0) {
-      return { ...EMPTY, stale: claim.stale, claimed: claim.claimed, failed: claim.failed };
+      return { ...EMPTY, stale: claim.stale, expired: claim.expired, claimed: claim.claimed, failed: claim.failed };
     }
 
     // The ONE network call — no transaction, no lock held.
@@ -184,7 +210,7 @@ export class PushSender {
       // The port never throws; a throw is a programming error. The rows stay
       // `sending` and the stale sweep fails them — never a duplicate.
       this.logger.error(`push gateway threw — ${claim.inFlight.length} row(s) left to the stale sweep: ${(err as Error).name}`);
-      return { ...EMPTY, stale: claim.stale, claimed: claim.claimed, sent: claim.inFlight.length, failed: claim.failed };
+      return { ...EMPTY, stale: claim.stale, expired: claim.expired, claimed: claim.claimed, sent: claim.inFlight.length, failed: claim.failed };
     }
 
     let delivered = 0;
@@ -247,14 +273,18 @@ export class PushSender {
         }
       }
     });
-    if (configCodes.size > 0) {
-      // Once per call (one call per tenant per tick): the deployment's
-      // credentials are wrong. The code only — never a provider message.
-      this.logger.error(
-        `push gateway refused the credentials (${[...configCodes].join(', ')}) — check EXPO_ACCESS_TOKEN; rows retried, failed after 1 h`,
-      );
-    }
-    return { stale: claim.stale, claimed: claim.claimed, sent: claim.inFlight.length, delivered, failed, retried };
+    // Config faults are RETURNED, not logged: the worker logs them once per
+    // tick across every tenant (code review B4).
+    return {
+      stale: claim.stale,
+      expired: claim.expired,
+      claimed: claim.claimed,
+      sent: claim.inFlight.length,
+      delivered,
+      failed,
+      retried,
+      configCodes: [...configCodes].sort(),
+    };
   }
 }
 

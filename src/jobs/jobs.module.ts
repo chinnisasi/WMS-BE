@@ -18,7 +18,7 @@ import { BillingFacade } from '../modules/billing/billing.facade';
 import { OutboundModule } from '../modules/outbound/outbound.module';
 import { OutboundFacade } from '../modules/outbound/outbound.facade';
 import { NotificationsModule } from '../modules/notifications/notifications.module';
-import { NotificationsFacade } from '../modules/notifications/notifications.facade';
+import { NotificationsFacade, PUSH_SENDING_STALE_MS } from '../modules/notifications/notifications.facade';
 
 /** The problem code a failed ATP read fails closed with (A8's store split). */
 function codeOf(error: ProblemException): string | null {
@@ -1034,17 +1034,21 @@ export class PushSenderWorker implements OnApplicationBootstrap, OnApplicationSh
     }
     this.running = true;
     try {
+      // The stale bound is the sender's own constant (code review B5) — a
+      // hardcoded interval here would drift from the sweep it gates.
       const tenants = (await this.authDb.execute(sql`
         select distinct tenant_id as "tenantId"
         from push_deliveries
         where (status = 'pending' and next_attempt_at <= now())
-           or (status = 'sending' and updated_at < now() - interval '5 minutes')
+           or (status = 'sending' and updated_at < now() - make_interval(secs => ${PUSH_SENDING_STALE_MS / 1000}::double precision))
         order by tenant_id asc
       `)) as unknown as { tenantId: string }[];
       const driven: string[] = [];
+      const configCodes = new Set<string>();
       for (const { tenantId } of tenants) {
         try {
-          await this.notifications.sendDuePushes(tenantId);
+          const summary = await this.notifications.sendDuePushes(tenantId);
+          for (const code of summary.configCodes) configCodes.add(code);
           driven.push(tenantId);
         } catch (error) {
           this.logger.error(
@@ -1052,6 +1056,15 @@ export class PushSenderWorker implements OnApplicationBootstrap, OnApplicationSh
               `${error instanceof Error ? error.message : String(error)}`,
           );
         }
+      }
+      if (configCodes.size > 0) {
+        // ONCE per tick, across every tenant (code review B4): the
+        // deployment's credentials are wrong. Codes only — never a provider
+        // message (it names the token).
+        this.logger.error(
+          `push gateway refused the credentials (${[...configCodes].sort().join(', ')}) — check EXPO_ACCESS_TOKEN; ` +
+            'rows retried without spending an attempt, expired after 30 minutes',
+        );
       }
       return driven;
     } catch (error) {

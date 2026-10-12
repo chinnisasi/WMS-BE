@@ -6,7 +6,7 @@ import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { Database } from '../../shared/db/db';
 import { DATABASE } from '../../shared/shared.module';
 import { pushDeliveries } from '../../shared/db/schema';
-import { UUID_RE } from '../../shared/primitives/ids';
+import { UUID_RE, uuidv7TimestampMs } from '../../shared/primitives/ids';
 import { istMidnightOf, isIsoDate } from '../../shared/primitives/time';
 import { listPushTargets } from '../tenancy/tenancy.service';
 import { NOTIFICATION_SOURCES, decodeRaise, EVENT_ROUTES } from './notification-sources';
@@ -92,8 +92,9 @@ function cutoffInstantMs(payload: Payload): number | null {
  *  - the three approval raises (`APPROVAL_PUSH_SOURCES`) → approval · All;
  *  - `wave.cutoff_at_risk` → at-risk · All, acked when its cutoff has passed.
  *
- * An event whose `occurredAt` is more than 30 minutes old is acked without
- * queueing (a deploy's backlog, an operator's replay of a quarantined row):
+ * An event APPENDED more than 30 minutes ago (the uuidv7 timestamp of its
+ * outbox row id — never its `occurredAt`, which can be device time) is acked
+ * without queueing (a deploy's backlog, an operator's replay of a quarantined row):
  * a stale "new work" push is noise. The insert is `ON CONFLICT DO NOTHING`
  * on `(tenant_id, event_id, device_id)`, so a re-delivered event queues
  * nothing new. Errors: a malformed payload and a data fault (the 9-2
@@ -130,7 +131,17 @@ export class PushEnqueueHandler implements OnModuleInit {
       return;
     }
     const now = pushClock.now();
-    if (now - Date.parse(event.occurredAt) > PUSH_STALE_EVENT_MS) {
+    // The age is the SERVER's: the outbox row id (`eventId`) is a uuidv7
+    // minted at append (`outbox.append` callers all mint `uuidv7()`; the relay
+    // carries `row.id` as `eventId`). `occurredAt` is business time and can be
+    // device time (a count, a transfer confirm queued offline) — never the
+    // clock here (spec Staleness, amended 2026-10-12, code review BE1).
+    const appendedAt = uuidv7TimestampMs(event.eventId);
+    if (appendedAt === null) {
+      this.logger.error(`${event.type} ${event.eventId}: event id is not a uuidv7 — cannot date it, no push`);
+      return;
+    }
+    if (now - appendedAt > PUSH_STALE_EVENT_MS) {
       // A deploy backlog or an operator replay: acked, never pushed.
       return;
     }

@@ -18,6 +18,9 @@ import {
 import { PushSender, type PushSendSummary } from './push.sender';
 
 export type { PushSendSummary } from './push.sender';
+// The sender's stale bound rides the facade seam: the jobs shell's due-tenant
+// query must use the same interval as the sweep it gates (code review B5).
+export { PUSH_SENDING_STALE_MS } from './push-rules';
 
 export const DEFAULT_NOTIFICATION_PAGE_SIZE = 25;
 export const MAX_NOTIFICATION_PAGE_SIZE = 100;
