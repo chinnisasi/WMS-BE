@@ -39,6 +39,8 @@ import { BillingUsageController } from './billing-usage.controller';
 import { ClientInvoicesController } from './client-invoices.controller';
 import { BillingModule } from '../modules/billing/billing.module';
 import { PortalController } from './portal.controller';
+import { NotificationsController } from './notifications.controller';
+import { NotificationsModule } from '../modules/notifications/notifications.module';
 import { SharedModule } from '../shared/shared.module';
 
 /**
@@ -79,7 +81,7 @@ import { SharedModule } from '../shared/shared.module';
   // Story 21-7 — SharedModule: Nest instantiates a route guard in the
   // CONTROLLER's module, so `PortalSessionGuard`'s DATABASE dependency must
   // resolve here too.
-  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule],
+  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule],
   controllers: [
     HealthController,
     EchoController,
@@ -136,6 +138,9 @@ import { SharedModule } from '../shared/shared.module';
     // Story 21-7 — the client portal (read-only, `PortalSessionGuard` from
     // the clients module): each read is its owning module's facade method.
     PortalController,
+    // Story 9-2 — the notification panel (list, the bell's status, the
+    // opened mark): `NotificationsModule` exports `NotificationsFacade` only.
+    NotificationsController,
     // Story 7-2 — the channel webhook surface (guardless by construction:
     // the provider's AUTHORITY is its signature, not a session). The
     // last-siblings convention keeps NotFoundController LAST (registered

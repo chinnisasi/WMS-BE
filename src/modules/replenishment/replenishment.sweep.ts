@@ -18,6 +18,7 @@ import { InventoryFacade } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { InboundFacade } from '../inbound/inbound.facade';
 import { REPLENISHMENT_SCHEDULER_ACTOR_ID, recoveryGapMilli } from './replenishment.command';
+import { appendBreachCleared } from './replenishment.events';
 
 /**
  * The breach sweep (story 6.1): the worker's per-scope evaluation, in THREE
@@ -56,7 +57,7 @@ export interface SweepReport {
   readonly evaluated: number;
   /** Breaches OPENED this sweep (each with its draft + event + audit row). */
   readonly opened: number;
-  /** Open breaches the ATP read recovered this sweep (no event, by design). */
+  /** Open breaches the ATP read recovered this sweep (each appends `breach_cleared`, story 9-2). */
   readonly recovered: number;
 }
 
@@ -134,7 +135,7 @@ export class ReplenishmentSweep {
           await this.openBreach(tx, tenantId, warehouseId, candidate, atpMilli, await defaultVendor());
           opened += 1;
         } else if (breach !== null) {
-          await this.recoverBreach(tx, breach.id);
+          await this.recoverBreach(tx, tenantId, breach);
           recovered += 1;
         }
       }
@@ -329,15 +330,19 @@ export class ReplenishmentSweep {
 
   /**
    * The breach RECOVER: ATP ≥ point — the row goes `recovered`
-   * (`resolved_by` stays null: nobody acted), its draft KEPT as a draft, and
-   * deliberately NO outbox event (a surface-visible state change only, the
-   * Design Notes' rule).
+   * (`resolved_by` stays null: nobody acted), its draft KEPT as a draft.
+   * Story 9-2 reversed the original "deliberately NO outbox event" rule: the
+   * recovery appends `replenishment.breach_cleared` (`reason: 'recovered'`)
+   * so the notification panel's breach entry resolves — notifications is
+   * the consumer the 6-1 rule said did not exist.
    */
-  private async recoverBreach(tx: TenantTx, breachId: string): Promise<void> {
+  private async recoverBreach(tx: TenantTx, tenantId: string, breach: ReorderBreachRow): Promise<void> {
+    const resolvedAt = nowIso();
     await tx
       .update(reorderBreaches)
-      .set({ status: 'recovered', resolvedAt: nowIso(), updatedAt: nowIso() })
-      .where(eq(reorderBreaches.id, breachId));
+      .set({ status: 'recovered', resolvedAt, updatedAt: resolvedAt })
+      .where(eq(reorderBreaches.id, breach.id));
+    await appendBreachCleared(this.outbox, tx, tenantId, breach, 'recovered', resolvedAt);
   }
 }
 

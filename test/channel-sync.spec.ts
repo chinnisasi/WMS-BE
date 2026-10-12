@@ -339,6 +339,31 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
   }
 
   /**
+   * Story 9-2 — the sync-health episode events still in the outbox, plus the
+   * connection's stored open episode.
+   */
+  async function syncEpisodeEvents(connectionId: string): Promise<{
+    events: { type: string; payload: Record<string, unknown> }[];
+    storedEpisodeId: string | null;
+  }> {
+    const sql = await sqlHandle();
+    try {
+      const events = (await sql`
+        select type, payload from outbox_messages
+        where tenant_id = ${tenantId} and type like 'channel.sync.%'
+          and payload->>'connectionId' = ${connectionId}
+        order by created_at asc, id asc
+      `) as unknown as { type: string; payload: Record<string, unknown> }[];
+      const stored = (await sql`
+        select sync_episode_id from integrations where tenant_id = ${tenantId} and id = ${connectionId}
+      `) as unknown as { sync_episode_id: string | null }[];
+      return { events: [...events], storedEpisodeId: stored[0]?.sync_episode_id ?? null };
+    } finally {
+      await sql.end();
+    }
+  }
+
+  /**
    * Seeds a cached channel inventory_item_id on a mapping row (RD-6
    * amended): the publish arm's own write-back, seeded directly here to
    * make a delivery fail at the SET call (a real transport failure) instead
@@ -600,6 +625,14 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
       breakerState: 'open',
       consecutiveFailures: BREAKER_FAILURE_THRESHOLD,
     });
+    // Story 9-2 — the closed → open transition (and ONLY it: attempts 1–4
+    // kept the breaker closed) opened a sync-health episode: one
+    // `channel.sync.degraded`, carrying the episode the row now stores.
+    const episode = await syncEpisodeEvents(shopifyId);
+    expect(episode.storedEpisodeId).not.toBeNull();
+    expect(episode.events).toEqual([
+      { type: 'channel.sync.degraded', payload: { connectionId: shopifyId, episodeId: episode.storedEpisodeId } },
+    ]);
     const quarantined = await outboxRows(shopifyId);
     expect(quarantined).toHaveLength(1);
     expect(quarantined[0]).toMatchObject({ status: 'quarantined', attempts: 5 });
@@ -636,6 +669,12 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
       .toHaveLength(beforeCount + 1);
     // One strike out of half-open RE-OPENS the breaker.
     expect(await integrationRow(shopifyId)).toMatchObject({ breakerState: 'open' });
+    // Story 9-2 — half-open → open is the SAME episode failing its probe
+    // again: no event (clearOutbox removed the earlier degraded row), and
+    // the stored episode is kept.
+    const episode = await syncEpisodeEvents(shopifyId);
+    expect(episode.events).toEqual([]);
+    expect(episode.storedEpisodeId).not.toBeNull();
   });
 
   it('delivery, succeeding: the echo arm settles ok — the row acks, last_synced_at stamps, the streak resets', async () => {
@@ -934,12 +973,16 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
     // The half-open state exactly as the manual retry leaves it (RN-5's
     // retry-moved shape), seeded with a STALE failure behind it — the heal
     // must clear it, not merely write `closed` over it.
+    // Story 9-2: with the open sync-health episode the trip would have
+    // minted (closed → open) still stored on the row.
+    const openEpisode = uuidv7();
     const seed = await sqlHandle();
     try {
       await seed`
         update integrations
           set breaker_state = 'half-open', consecutive_failures = 0,
-              last_error = 'stale failure (seeded)', last_synced_at = '2020-01-01T00:00:00.000Z'
+              last_error = 'stale failure (seeded)', last_synced_at = '2020-01-01T00:00:00.000Z',
+              sync_episode_id = ${openEpisode}
         where tenant_id = ${tenantId} and id = ${echo2Id}
       `;
     } finally {
@@ -957,6 +1000,14 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
     expect(row).toMatchObject({ breakerState: 'closed', consecutiveFailures: 0, lastError: null });
     expect(row.lastSyncedAt).not.toBeNull();
     expect(await outboxRows(echo2Id)).toEqual([]);
+    // Story 9-2 — half-open → closed ENDS the episode: one
+    // `channel.sync.recovered` naming it, and the row's episode cleared.
+    expect(await syncEpisodeEvents(echo2Id)).toEqual({
+      events: [
+        { type: 'channel.sync.recovered', payload: { connectionId: echo2Id, episodeId: openEpisode, reason: 'recovered' } },
+      ],
+      storedEpisodeId: null,
+    });
 
     // The health read derives OK from the healed row (the arm-4 list).
     const list = await request(app.getHttpServer())

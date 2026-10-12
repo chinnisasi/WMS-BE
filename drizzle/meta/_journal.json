@@ -470,6 +470,13 @@
       "when": 1791650000000,
       "tag": "0066_over_receipt_optional_line",
       "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1791782056598,
+      "tag": "0067_notifications",
+      "breakpoints": true
     }
   ]
 }

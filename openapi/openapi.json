@@ -22009,6 +22009,214 @@
         ]
       }
     },
+    "/tenants/{tenantId}/notifications": {
+      "get": {
+        "description": "Only the entries whose source the caller can act on: stock adjustments awaiting approval (adjustments.approve), over-threshold count variances (owner), over-receipts and rejected device ops (review.decide), reorder breaches and batch alerts (replenishment.manage), QC holds (qc.manage), channel sync episodes (channel.manage). A role that can act on none gets an empty list. Resolved entries stay listed, with their resolution.",
+        "operationId": "NotificationsController_list",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "Page size, default 25",
+            "schema": {
+              "minimum": 1,
+              "maximum": 100,
+              "example": 25,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The page (newest first)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed cursor (invalid-cursor), or a limit outside 1–100 (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the caller's notification entries (keyset cursor pagination, newest raised first)",
+        "tags": [
+          "notifications"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/notifications/status": {
+      "get": {
+        "description": "hasNew is true iff an OPEN entry the caller can act on surfaced after the caller last opened the panel — or the caller has never opened it and such an entry exists. Resolved entries never light it.",
+        "operationId": "NotificationsController_status",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The bell's dot for the caller — never a count",
+        "tags": [
+          "notifications"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/notifications/opened": {
+      "post": {
+        "description": "Sets the caller's last-opened time to now and answers {hasNew: false}. Takes NO Idempotency-Key — the one exception among the mutating routes: setting a time to now is naturally idempotent, and a retry only moves it forward.",
+        "operationId": "NotificationsController_opened",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotificationStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Marks the panel opened by the caller (clears the dot)",
+        "tags": [
+          "notifications"
+        ]
+      }
+    },
     "/tenants/{tenantId}/webhooks/channels/{provider}/{connectionId}/orders": {
       "post": {
         "operationId": "WebhooksController_ingestOrder",
@@ -38159,6 +38367,709 @@
           "totals",
           "party",
           "lines"
+        ]
+      },
+      "StockAdjustmentSummaryDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantityDelta": {
+            "type": "number",
+            "description": "The requested signed adjustment, base units of the SKU’s UoM"
+          },
+          "reasonCode": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "skuId",
+          "quantityDelta",
+          "reasonCode"
+        ]
+      },
+      "StockAdjustmentNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "stock-adjustment"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/StockAdjustmentSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "approved",
+              "rejected",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
+      "CountVarianceSummaryDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "delta": {
+            "type": "number",
+            "description": "Counted − expected, base units"
+          }
+        },
+        "required": [
+          "skuId",
+          "delta"
+        ]
+      },
+      "CountVarianceNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "count-variance"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/CountVarianceSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "adjusted",
+              "recounted",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
+      "OverReceiptSummaryDto": {
+        "type": "object",
+        "properties": {
+          "grnCode": {
+            "type": "string"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "excessQty": {
+            "type": "number",
+            "description": "The units received beyond the document, base units"
+          }
+        },
+        "required": [
+          "grnCode",
+          "skuId",
+          "excessQty"
+        ]
+      },
+      "OverReceiptNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "over-receipt"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/OverReceiptSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "approved",
+              "rejected",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
+      "RejectedOpSummaryDto": {
+        "type": "object",
+        "properties": {
+          "opType": {
+            "type": "string",
+            "description": "The device op type, e.g. `grn.submit`"
+          },
+          "problemCode": {
+            "type": "string",
+            "description": "The refusal’s problem code"
+          }
+        },
+        "required": [
+          "opType",
+          "problemCode"
+        ]
+      },
+      "RejectedOpNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "rejected-op"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/RejectedOpSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "applied",
+              "recounted",
+              "discarded",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
+      "ReorderBreachSummaryDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "atpQty": {
+            "type": "number",
+            "description": "ATP at detection, base units"
+          },
+          "pointQty": {
+            "type": "number",
+            "description": "The effective reorder point at detection, base units"
+          }
+        },
+        "required": [
+          "skuId",
+          "atpQty",
+          "pointQty"
+        ]
+      },
+      "ReorderBreachNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "reorder-breach"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/ReorderBreachSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "recovered",
+              "dismissed",
+              "actioned",
+              "policy-removed",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
+      "BatchAlertSummaryDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "expiry_upcoming",
+              "aged"
+            ]
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchCode": {
+            "type": "string"
+          },
+          "expiryDate": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The batch’s expiry — the expiry_upcoming arm only"
+          },
+          "ageDays": {
+            "type": "number",
+            "description": "The frozen age in whole days — the aged arm only"
+          }
+        },
+        "required": [
+          "kind",
+          "skuId",
+          "batchCode"
+        ]
+      },
+      "BatchAlertNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "batch-alert"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/BatchAlertSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "resolved",
+              "dismissed",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
+      "QcHoldSummaryDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "skuId",
+          "reason"
+        ]
+      },
+      "QcHoldNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "qc-hold"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/QcHoldSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "released",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
+      "ChannelSyncSummaryDto": {
+        "type": "object",
+        "properties": {
+          "connectionId": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "connectionId"
+        ]
+      },
+      "ChannelSyncNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "channel-sync"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/ChannelSyncSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "recovered",
+              "disconnected",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
+      "NotificationListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "description": "Visible entries, newest first. A member sees only the sources it can act on.",
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/StockAdjustmentNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/CountVarianceNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/OverReceiptNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/RejectedOpNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/ReorderBreachNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/BatchAlertNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/QcHoldNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/ChannelSyncNotificationDto"
+                }
+              ],
+              "discriminator": {
+                "propertyName": "sourceType",
+                "mapping": {
+                  "stock-adjustment": "#/components/schemas/StockAdjustmentNotificationDto",
+                  "count-variance": "#/components/schemas/CountVarianceNotificationDto",
+                  "over-receipt": "#/components/schemas/OverReceiptNotificationDto",
+                  "rejected-op": "#/components/schemas/RejectedOpNotificationDto",
+                  "reorder-breach": "#/components/schemas/ReorderBreachNotificationDto",
+                  "batch-alert": "#/components/schemas/BatchAlertNotificationDto",
+                  "qc-hold": "#/components/schemas/QcHoldNotificationDto",
+                  "channel-sync": "#/components/schemas/ChannelSyncNotificationDto"
+                }
+              }
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "NotificationStatusResponse": {
+        "type": "object",
+        "properties": {
+          "hasNew": {
+            "type": "boolean",
+            "description": "Show the bell’s dot: an open entry you can act on surfaced since you last opened the panel (or you never have). Never a count"
+          }
+        },
+        "required": [
+          "hasNew"
         ]
       },
       "ChannelWebhookOrderResponse": {

@@ -20,6 +20,7 @@ import type { BatchScopeSumEntry } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import type { BatchIntake } from '../catalog/catalog.facade';
 import { REPLENISHMENT_SCHEDULER_ACTOR_ID } from './replenishment.command';
+import { appendBatchAlertCleared } from './replenishment.events';
 import type { ExpiryPolicySnapshot } from './replenishment.command';
 
 /**
@@ -54,7 +55,7 @@ export interface BatchScanReport {
   readonly evaluated: number;
   /** Alerts OPENED this scan (each with its event + audit row). */
   readonly raised: number;
-  /** Open alerts auto-resolved (on-hand reached 0 — no event, by design). */
+  /** Open alerts auto-resolved (on-hand reached 0 — each appends `batch_alert_cleared`, story 9-2). */
   readonly resolved: number;
 }
 
@@ -191,11 +192,13 @@ export class ExpiryScan {
       }
 
       // Auto-resolve: every open alert whose scope carries NO positive
-      // on-hand anymore → `resolved`, `resolved_by` null (nobody acted) and
-      // deliberately NO outbox event — a surface-visible state change only
-      // (the breach-recovery rule). A batch that merely stopped TRIGGERING
-      // (expiry only matures; age only grows) keeps its alert — it stands
-      // until consumption or dismissal.
+      // on-hand anymore → `resolved`, `resolved_by` null (nobody acted). A
+      // batch that merely stopped TRIGGERING (expiry only matures; age only
+      // grows) keeps its alert — it stands until consumption or dismissal.
+      // Story 9-2 reversed the original "deliberately NO outbox event" rule:
+      // each auto-resolve appends `replenishment.batch_alert_cleared`
+      // (`reason: 'resolved'`), one per alert, so the notification panel's
+      // entry resolves.
       let resolved = 0;
       for (const alert of openAlerts) {
         if (withOnHand.has(`${alert.skuId}|${alert.batchId}`)) {
@@ -205,6 +208,7 @@ export class ExpiryScan {
           .update(batchAlerts)
           .set({ status: 'resolved', resolvedAt: raisedAt, updatedAt: raisedAt })
           .where(eq(batchAlerts.id, alert.id));
+        await appendBatchAlertCleared(this.outbox, tx, tenantId, alert, 'resolved', raisedAt);
         resolved += 1;
       }
 

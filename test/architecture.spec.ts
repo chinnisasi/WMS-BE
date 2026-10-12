@@ -1450,6 +1450,95 @@ describe('architecture: invoices are invoicing-module-owned (story 8-1)', () => 
   });
 });
 
+describe('architecture: the notification panel is notifications-module-owned (story 9-2)', () => {
+  /**
+   * Story 9-2: `notifications` and `notification_reads` are written ONLY by
+   * the notifications module (the delivery handler projects the outbox
+   * events; the facade records a panel open), and the module reads NO
+   * sibling's table — its entries are a projection of events, never a join
+   * into the source modules (the spec's Never list). Siblings reach it only
+   * through its facade/module.
+   */
+  const NOTIFICATION_TABLES = ['notifications', 'notificationReads'] as const;
+  const RAW_NOTIFICATION_TABLES = 'notifications|notification_reads';
+  const notificationsRoot = join(SRC_ROOT, 'modules', 'notifications');
+  const notificationFiles = files.filter((file) => file.path.startsWith(notificationsRoot));
+  /** The schema names the module may import: its two tables and types. */
+  const OWN_SCHEMA_NAMES = new Set(['notifications', 'notificationReads', 'NotificationRow', 'UserRole']);
+  const SCHEMA_IMPORT = /import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+'[./]*shared\/db\/schema'/g;
+
+  function schemaNames(source: string): string[] {
+    return [...source.matchAll(SCHEMA_IMPORT)].flatMap((match) =>
+      match[1]!
+        .split(',')
+        .map((name) => name.replace(/^\s*type\s+/, '').trim())
+        .filter((name) => name.length > 0),
+    );
+  }
+
+  it('the detectors bite (the test is meaningful)', () => {
+    expect(notificationFiles.length).toBeGreaterThanOrEqual(4);
+    expect(schemaNames("import { notifications, reorderBreaches } from '../../shared/db/schema';")).toEqual([
+      'notifications',
+      'reorderBreaches',
+    ]);
+    expect(schemaNames("import type { UserRole } from '../../shared/db/schema';")).toEqual(['UserRole']);
+    // The delivery writes the entries, the facade the reads — both real.
+    const delivery = readFileSync(join(notificationsRoot, 'notifications.delivery.ts'), 'utf8');
+    const facade = readFileSync(join(notificationsRoot, 'notifications.facade.ts'), 'utf8');
+    expect(drizzleWriteOn('notifications').test(delivery)).toBe(true);
+    expect(drizzleWriteOn('notificationReads').test(facade)).toBe(true);
+    expect(schemaNames(delivery)).toContain('notifications');
+  });
+
+  it('no notifications-table write happens outside the notifications module', () => {
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => !f.path.startsWith(notificationsRoot))) {
+      for (const pattern of [
+        ...NOTIFICATION_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_NOTIFICATION_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) {
+          offenders.push(`${file.path}: /${pattern.source}/`);
+        }
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the notifications module touches no other module’s table (it imports only its own from the schema, and runs no raw SQL statement)', () => {
+    const offenders: string[] = [];
+    for (const file of notificationFiles) {
+      for (const name of schemaNames(file.source)) {
+        if (!OWN_SCHEMA_NAMES.has(name)) offenders.push(`${file.path}: imports ${name}`);
+      }
+      if (/\.execute\(|sql\.raw\(/.test(file.source)) offenders.push(`${file.path}: raw SQL statement`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no other module reaches into the notifications module past the facade (and only the api shell + root import it)', () => {
+    const reaching = /(?:modules\/notifications|\.\.\/notifications)\/(?!notifications\.(?:facade|module)['"])/;
+    expect(reaching.test("from '../modules/notifications/notifications.delivery'")).toBe(true);
+    expect(reaching.test("from '../modules/notifications/notification-sources'")).toBe(true);
+    expect(reaching.test("from '../modules/notifications/notifications.facade'")).toBe(false);
+    const importers = files.filter(
+      (file) => !file.path.startsWith(notificationsRoot) && /(?:modules\/notifications|\.\.\/notifications)\//.test(file.source),
+    );
+    // Meaningful: the api shell does import it.
+    expect(importers.some((file) => file.path === join(SRC_ROOT, 'api', 'notifications.controller.ts'))).toBe(true);
+    const allowedImporter = (path: string): boolean =>
+      path.startsWith(join(SRC_ROOT, 'api')) || path === join(SRC_ROOT, 'app.module.ts');
+    expect(importers.filter((file) => !allowedImporter(file.path)).map((file) => file.path)).toEqual([]);
+    // Sibling MODULES may not reach past the facade at all; the api shell's
+    // DTOs read the source vocabulary (the summaries' resolution enums).
+    const offenders = importers
+      .filter((file) => file.path.startsWith(join(SRC_ROOT, 'modules')) && reaching.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+  });
+});
+
 describe('architecture: reporting is a read-only exception, imported only by the api shell (story 9-1, decision 6)', () => {
   /**
    * Decision 6 lets the reporting tiles read the owning modules' tables

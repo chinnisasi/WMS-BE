@@ -557,10 +557,27 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       expect(drafts[0]!.status).toBe('draft');
       expect(drafts[0]!.breach_id).toBe(breaches[0]!.id);
     }
-    // NO event on recovery (surface-visible state change only).
+    // No new breach or submit event on recovery…
     const eventsAfter = (await outboxPayloads('replenishment.breach_detected', tenantId)).length
       + (await outboxPayloads('replenishment.suggested_po_submitted', tenantId)).length;
     expect(eventsAfter).toBe(eventsBefore);
+    // …but story 9-2 REVERSED the 6-1 "no event on recovery" rule: each
+    // recovery now appends exactly one `replenishment.breach_cleared`
+    // (`reason: 'recovered'`) so the notification panel's entry resolves.
+    const cleared = (await outboxPayloads('replenishment.breach_cleared', tenantId)).filter(
+      (payload) => payload.reason === 'recovered',
+    );
+    expect(cleared.map((payload) => payload.breachId).sort()).toEqual(
+      [breachIds['RP-A'], breachIds['RP-B'], breachIds['RP-C']].sort(),
+    );
+    for (const code of ['RP-A', 'RP-B', 'RP-C'] as const) {
+      expect(cleared.find((payload) => payload.breachId === breachIds[code])).toEqual({
+        breachId: breachIds[code],
+        warehouseId,
+        skuId: skuIds.get(code),
+        reason: 'recovered',
+      });
+    }
   });
 
   it('re-breach: ATP falls back below the point → a NEW breach row opens; the standing draft is REPOINTED (fresh vendor/qty replace the old)', async () => {
@@ -620,6 +637,10 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       .expect(200);
     expect(dismissed.body.breach).toMatchObject({ id: rpC.id, status: 'dismissed' });
     expect(dismissed.body.breach.resolvedBy).toBeTruthy();
+    // Story 9-2: the dismissal clears the panel's entry — one event, in-tx.
+    expect(
+      (await outboxPayloads('replenishment.breach_cleared', tenantId)).filter((payload) => payload.breachId === rpC.id),
+    ).toEqual([{ breachId: rpC.id, warehouseId, skuId: skuIds.get('RP-C'), reason: 'dismissed' }]);
 
     // The draft is untouched by the dismissal (dismissal is about the breach).
     const dC = (await draftRows(tenantId, warehouseId, skuIds.get('RP-C')!))[0]!;
@@ -768,6 +789,10 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
     const rpA = (await breachRows(tenantId, warehouseId, skuIds.get('RP-A')!))[1]!;
     expect(rpA.status).toBe('actioned');
     expect(rpA.resolved_by).not.toBeNull();
+    // Story 9-2: the actioned flip clears the panel's entry.
+    expect(
+      (await outboxPayloads('replenishment.breach_cleared', tenantId)).filter((payload) => payload.breachId === rpA.id),
+    ).toEqual([{ breachId: rpA.id, warehouseId, skuId: skuIds.get('RP-A'), reason: 'actioned' }]);
 
     // The deterministic inner idempotency key landed on the mint.
     const mintKeys = await sql`
@@ -1073,6 +1098,15 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
       .expect(200);
+    // Story 9-2: the deleted policy's open breach is cleared for the panel
+    // (`policy-removed`) in the delete's own transaction — the breach row
+    // itself is left for the next sweep to decide.
+    expect(
+      (await outboxPayloads('replenishment.breach_cleared', tenantId)).filter(
+        (payload) => payload.breachId === overrideBreach.id,
+      ),
+    ).toEqual([{ breachId: overrideBreach.id, warehouseId: w4, skuId: skuIds.get('RP-A'), reason: 'policy-removed' }]);
+    expect((await breachRows(tenantId, w4, skuIds.get('RP-A')!))[0]!.status).toBe('open');
     const afterDelete = await replenishment.sweepScope(tenantId, w4);
     expect(afterDelete).toMatchObject({ evaluated: 2, opened: 0, recovered: 1 });
     const rows = await breachRows(tenantId, w4, skuIds.get('RP-A')!);
@@ -1537,9 +1571,17 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       expect(e1Rows).toHaveLength(2);
       expect(e1Rows.every((row) => row.status === 'resolved' && row.resolved_by === null)).toBe(true);
 
-      // NO event on resolve (surface-visible state change only — the breach
-      // recovery rule).
+      // No raise event on resolve…
       expect((await outboxPayloads('replenishment.batch_alert_raised', tenantId)).length).toBe(eventsBefore);
+      // …but story 9-2 REVERSED the "no event on auto-resolve" rule: one
+      // `replenishment.batch_alert_cleared` per resolved alert.
+      const cleared = (await outboxPayloads('replenishment.batch_alert_cleared', tenantId)).filter((payload) =>
+        e1Rows.some((row) => row.id === payload.alertId),
+      );
+      expect(cleared).toHaveLength(2);
+      for (const payload of cleared) {
+        expect(payload).toEqual({ alertId: payload.alertId, warehouseId, reason: 'resolved' });
+      }
     });
 
     it('dismiss an open batch alert: 200 snapshot (no onHandMilli on the snapshot); replay re-serves; re-dismiss 409 batch-alert-not-open; unknown 404; malformed 400; operator 403', async () => {
@@ -1561,6 +1603,10 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       // stitch both) — the dto contract's optional pair, both absent here.
       expect(dismissed.body.batchAlert.onHandMilli).toBeUndefined();
       expect(dismissed.body.batchAlert.batchCode).toBeUndefined();
+      // Story 9-2: the dismissal clears the panel's entry — one event, in-tx.
+      expect(
+        (await outboxPayloads('replenishment.batch_alert_cleared', tenantId)).filter((payload) => payload.alertId === a1.id),
+      ).toEqual([{ alertId: a1.id, warehouseId, reason: 'dismissed' }]);
 
       const replayed = await request(app.getHttpServer())
         .post(`${API}/${tenantId}/replenishment/batch-alerts/${a1.id}/dismiss`)

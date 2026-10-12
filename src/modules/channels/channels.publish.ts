@@ -19,6 +19,8 @@ import { MAX_WAREHOUSE_PAGE_SIZE } from '../tenancy/tenancy.service';
 import { BREAKER_FAILURE_THRESHOLD, CONNECTION_COLUMNS } from './channels.view';
 import {
   CHANNEL_AVAILABILITY_PUBLISHED_EVENT,
+  CHANNEL_SYNC_DEGRADED_EVENT,
+  CHANNEL_SYNC_RECOVERED_EVENT,
   type ChannelAvailabilityPublication,
   type PublishedScope,
 } from './channels.events';
@@ -186,7 +188,7 @@ export class ChannelsPublishService {
         .where(and(eq(integrations.id, connectionId), eq(integrations.tenantId, tenantId)))
         .limit(1)
         .for('update');
-      const row = (rows as Omit<Integration, 'credentialSealed'>[])[0] ?? null;
+      const row = (rows as Omit<Integration, 'credentialSealed' | 'syncEpisodeId'>[])[0] ?? null;
       if (row === null) {
         return { kind: 'absent' } as const;
       }
@@ -248,7 +250,7 @@ export class ChannelsPublishService {
       halfOpen: boolean;
     },
   ): Promise<
-    | { kind: 'appended'; row: Omit<Integration, 'credentialSealed'> }
+    | { kind: 'appended'; row: Omit<Integration, 'credentialSealed' | 'syncEpisodeId'> }
     | { kind: 'skipped' }
   > {
     const rows = await tx
@@ -259,7 +261,7 @@ export class ChannelsPublishService {
       )
       .limit(1)
       .for('update');
-    const row = (rows as Omit<Integration, 'credentialSealed'>[])[0];
+    const row = (rows as Omit<Integration, 'credentialSealed' | 'syncEpisodeId'>[])[0];
     if (row === undefined) {
       return { kind: 'skipped' };
     }
@@ -284,7 +286,7 @@ export class ChannelsPublishService {
       .returning(CONNECTION_COLUMNS);
     const appendedRow = (updated as Omit<
       Integration,
-      'credentialSealed'
+      'credentialSealed' | 'syncEpisodeId'
     >[])[0]!;
     const publication: ChannelAvailabilityPublication = {
       connectionId: row.id,
@@ -362,12 +364,31 @@ export class ChannelsPublishService {
             lastError: null,
             consecutiveFailures: 0,
             breakerState: 'closed',
+            // Story 9-2: a closing breaker ends the open episode.
+            syncEpisodeId: null,
             updatedAt: now,
           })
           .where(eq(integrations.id, connectionId));
+        // Story 9-2 — open/half-open → closed ends the sync-health episode
+        // (the notification resolves). Only an episode this build opened is
+        // closed: a breaker that opened before the episode column existed
+        // carries none, and no entry was ever raised for it.
+        if (row.breakerState !== 'closed' && row.syncEpisodeId !== null) {
+          await this.outbox.append(tx, {
+            messageId: uuidv7(),
+            tenantId,
+            type: CHANNEL_SYNC_RECOVERED_EVENT,
+            occurredAt: now,
+            payload: { connectionId, episodeId: row.syncEpisodeId, reason: 'recovered' },
+          });
+        }
       } else {
         const failures = row.consecutiveFailures + 1;
         const open = row.breakerState === 'half-open' || failures >= BREAKER_FAILURE_THRESHOLD;
+        // Story 9-2 — ONLY closed → open starts an episode. Half-open → open
+        // (the stored spelling is 'half-open') is the same episode failing
+        // its probe again, and open → open is a re-drain: neither emits.
+        const episodeId = open && row.breakerState === 'closed' ? uuidv7() : null;
         await tx
           .update(integrations)
           .set({
@@ -375,9 +396,19 @@ export class ChannelsPublishService {
             lastError: outcome.error.slice(0, 300),
             consecutiveFailures: failures,
             breakerState: open ? 'open' : 'closed',
+            ...(episodeId === null ? {} : { syncEpisodeId: episodeId }),
             updatedAt: now,
           })
           .where(eq(integrations.id, connectionId));
+        if (episodeId !== null) {
+          await this.outbox.append(tx, {
+            messageId: uuidv7(),
+            tenantId,
+            type: CHANNEL_SYNC_DEGRADED_EVENT,
+            occurredAt: now,
+            payload: { connectionId, episodeId },
+          });
+        }
       }
       await tx.insert(integrationCalls).values({
         id: uuidv7(),
