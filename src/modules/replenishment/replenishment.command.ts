@@ -32,6 +32,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InboundFacade } from '../inbound/inbound.facade';
 import type { PurchaseOrderSnapshot } from '../inbound/po.command';
 import { CatalogFacade } from '../catalog/catalog.facade';
+import { appendBatchAlertCleared, appendBreachCleared } from './replenishment.events';
 
 /**
  * The replenishment commands (story 6.1): the reorder-policy writes, the
@@ -662,6 +663,51 @@ export class ReplenishmentCommand {
       const snapshot = policySnapshot(policy);
       await tx.delete(reorderPolicies).where(eq(reorderPolicies.id, policy.id));
 
+      // Story 9-2 — the policy's open breach (at most one per scope, the
+      // partial unique) and the notification panel's entry must agree.
+      // Without the override the effective point is the SKU's tenant-wide
+      // default:
+      //  - default > 0: the scope is STILL a sweep candidate — leave the
+      //    breach to the next sweep (its `recovered` resolves the entry; a
+      //    scope still under the default stays open, entry and queue alike);
+      //  - default 0 (or the SKU gone): the scope stops being a candidate and
+      //    nothing would ever close the breach — close it HERE (`dismissed`,
+      //    the deleting actor stamped: a human removed the rule it was raised
+      //    under) and clear the entry with `reason: 'policy-removed'`.
+      const defaultPoint = await this.catalog.getSkuReorderPointInTx(tx, command.tenantId, policy.skuId);
+      if (defaultPoint === null || defaultPoint <= 0) {
+        const openBreaches = await tx
+          .select()
+          .from(reorderBreaches)
+          .where(
+            and(
+              eq(reorderBreaches.tenantId, command.tenantId),
+              eq(reorderBreaches.warehouseId, policy.warehouseId),
+              eq(reorderBreaches.skuId, policy.skuId),
+              eq(reorderBreaches.status, 'open'),
+            ),
+          )
+          .for('update');
+        for (const breach of openBreaches) {
+          const resolvedAt = nowIso();
+          await tx
+            .update(reorderBreaches)
+            .set({ status: 'dismissed', resolvedAt, resolvedBy: command.actorUserId, updatedAt: resolvedAt })
+            .where(and(eq(reorderBreaches.id, breach.id), eq(reorderBreaches.status, 'open')));
+          await appendBreachCleared(this.outbox, tx, command.tenantId, breach, 'policy-removed', resolvedAt);
+          await tx.insert(auditEvents).values({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            actorUserId: command.actorUserId,
+            action: 'replenishment.breach_dismissed',
+            targetType: 'reorder_breach',
+            targetId: breach.id,
+            reference: idempotencyKey,
+            occurredAt: resolvedAt,
+          });
+        }
+      }
+
       await tx.insert(auditEvents).values({
         id: uuidv7(),
         tenantId: command.tenantId,
@@ -718,6 +764,8 @@ export class ReplenishmentCommand {
         .update(reorderBreaches)
         .set({ status: 'dismissed', resolvedAt, resolvedBy: command.actorUserId, updatedAt: resolvedAt })
         .where(eq(reorderBreaches.id, breach.id));
+      // Story 9-2 — the panel's breach entry resolves.
+      await appendBreachCleared(this.outbox, tx, command.tenantId, breach, 'dismissed', resolvedAt);
 
       await tx.insert(auditEvents).values({
         id: uuidv7(),
@@ -868,6 +916,8 @@ export class ReplenishmentCommand {
           .update(reorderBreaches)
           .set({ status: 'actioned', resolvedAt, resolvedBy: command.actorUserId, updatedAt: resolvedAt })
           .where(eq(reorderBreaches.id, breach.id));
+        // Story 9-2 — the panel's breach entry resolves.
+        await appendBreachCleared(this.outbox, tx, command.tenantId, breach, 'actioned', resolvedAt);
       }
 
       await this.outbox.append(tx, {
@@ -1047,6 +1097,8 @@ export class ReplenishmentCommand {
         .update(batchAlerts)
         .set({ status: 'dismissed', resolvedAt, resolvedBy: command.actorUserId, updatedAt: resolvedAt })
         .where(eq(batchAlerts.id, alert.id));
+      // Story 9-2 — the panel's batch-alert entry resolves.
+      await appendBatchAlertCleared(this.outbox, tx, command.tenantId, alert, 'dismissed', resolvedAt);
 
       await tx.insert(auditEvents).values({
         id: uuidv7(),

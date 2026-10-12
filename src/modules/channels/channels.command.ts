@@ -56,7 +56,7 @@ import {
   unknownChannelProvider,
 } from './channels.errors';
 import { MAX_SYNC_SCOPES_PER_PUBLISH, type MappedSkuRef } from './channels.publish';
-import type { PublishedScope } from './channels.events';
+import { CHANNEL_SYNC_RECOVERED_EVENT, type PublishedScope } from './channels.events';
 import { CONNECTION_COLUMNS, CONNECTION_RELOCK_COLUMNS, toConnectionView } from './channels.view';
 import type {
   ChannelConnectionView,
@@ -324,7 +324,7 @@ export class ChannelsCommandService {
       }
 
       const id = uuidv7();
-      let row: Omit<Integration, 'credentialSealed'>;
+      let row: Omit<Integration, 'credentialSealed' | 'syncEpisodeId'>;
       try {
         const inserted = await tx
           .insert(integrations)
@@ -902,6 +902,19 @@ export class ChannelsCommandService {
         );
       await tx.delete(integrations).where(eq(integrations.id, existing.id));
 
+      // Story 9-2 — a disconnect while a sync-health episode is open closes
+      // it: the connection is gone, so no delivery will ever close the
+      // breaker, and the episode's notification must not stand orphaned.
+      if (locked.syncEpisodeId !== null && locked.syncEpisodeId !== undefined) {
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: CHANNEL_SYNC_RECOVERED_EVENT,
+          occurredAt: nowIso(),
+          payload: { connectionId: existing.id, episodeId: locked.syncEpisodeId, reason: 'disconnected' },
+        });
+      }
+
       // The revoke attempt's METER row moved after the commit with the
       // attempt itself (RN-7). The audit row + the key row — the landmark
       // tail's order, adapted.
@@ -1292,14 +1305,14 @@ export class ChannelsCommandService {
     tx: TenantTx,
     tenantId: string,
     connectionId: string,
-  ): Promise<Omit<Integration, 'credentialSealed'> | null> {
+  ): Promise<Omit<Integration, 'credentialSealed' | 'syncEpisodeId'> | null> {
     const rows = await tx
       .select(CONNECTION_COLUMNS)
       .from(integrations)
       .where(and(eq(integrations.id, connectionId), eq(integrations.tenantId, tenantId)))
       .limit(1)
       .for('update');
-    return (rows as Omit<Integration, 'credentialSealed'>[])[0] ?? null;
+    return (rows as Omit<Integration, 'credentialSealed' | 'syncEpisodeId'>[])[0] ?? null;
   }
 
   /**

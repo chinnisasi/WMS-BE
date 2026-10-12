@@ -249,6 +249,13 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
 };
 
 const REJECTED_OP_DECISION_SET: ReadonlySet<string> = new Set<string>(REJECTED_OP_DECISIONS);
+/**
+ * Story 9-2 — a dropped device op entered the Conflicts & Reviews queue: the
+ * notification panel's rejected-op raise. Its resolve is the existing
+ * `device.rejected_op.resolved`, keyed by the same `rejectedOpId`.
+ */
+export const REJECTED_OP_RAISED_EVENT = 'device.rejected_op.raised';
+
 const REJECTED_OP_STATUS_SET: ReadonlySet<string> = new Set<string>(REJECTED_OP_STATUSES);
 
 /**
@@ -627,6 +634,26 @@ export class SyncReportCommand {
             })
             .onConflictDoNothing({ target: [rejectedOps.tenantId, rejectedOps.opId] })
             .returning({ id: rejectedOps.id });
+          // Story 9-2 — a row that entered the review queue raises its
+          // notification (the panel's rejected-op source), in this same
+          // transaction. ONLY a fresh insert: a re-posted row the unique
+          // pair absorbed was raised by the post that inserted it.
+          if (inserted.length > 0) {
+            await this.outbox.append(tx, {
+              messageId: uuidv7(),
+              tenantId: command.tenantId,
+              type: REJECTED_OP_RAISED_EVENT,
+              occurredAt: nowIso(),
+              payload: {
+                rejectedOpId: inserted[0]!.id,
+                opId: row.opId,
+                opType: row.opType,
+                problemCode: row.problemCode,
+                deviceId: command.deviceId,
+                operatorUserId: command.operatorUserId,
+              },
+            });
+          }
           acks.push({ opId: row.opId, recorded: inserted.length > 0 });
         }
         const recorded = acks.filter((ack) => ack.recorded).length;

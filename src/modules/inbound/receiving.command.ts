@@ -1119,6 +1119,8 @@ export class ReceivingCommand {
           occurredAt: nowIso(),
           payload: {
             overReceiptId: pending.id,
+            // Story 9-2 — additive: the panel's drill link needs the warehouse.
+            warehouseId: command.warehouseId,
             grnId,
             grnCode: code,
             poId: pending.request.poId,
@@ -1421,6 +1423,8 @@ export class ReceivingCommand {
         occurredAt: decidedAt,
         payload: {
           overReceiptId: row.id,
+          // Story 9-2 — additive, as on `over_receipt.requested`.
+          warehouseId: row.warehouseId,
           grnId: row.grnId,
           grnCode: grn.code,
           poId: row.poId,

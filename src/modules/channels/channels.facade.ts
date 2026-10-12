@@ -230,7 +230,7 @@ export class ChannelsFacade {
         .select(CONNECTION_COLUMNS)
         .from(integrations)
         .where(eq(integrations.tenantId, tenantId))
-        .orderBy(integrations.createdAt, integrations.id)) as Omit<Integration, 'credentialSealed'>[];
+        .orderBy(integrations.createdAt, integrations.id)) as Omit<Integration, 'credentialSealed' | 'syncEpisodeId'>[];
       const buffers = await this.inventory.standingBuffersForTenantInTx(tx, tenantId);
       const buffersByOwner = new Map<string, { warehouseId: string; skuId: string; bufferMilli: number }[]>();
       for (const buffer of buffers) {

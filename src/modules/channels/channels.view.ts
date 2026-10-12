@@ -114,10 +114,13 @@ export const CONNECTION_COLUMNS = {
 export const CONNECTION_RELOCK_COLUMNS = {
   ...CONNECTION_COLUMNS,
   credentialSealed: integrations.credentialSealed,
+  // Story 9-2 — the open sync-health episode the disconnect closes (an
+  // in-process read, never a wire shape — like the blob).
+  syncEpisodeId: integrations.syncEpisodeId,
 } as const;
 
 /** The stored row's public projection (the carriers `toConnectionView` shape). */
-export function toConnectionView(row: Omit<Integration, 'credentialSealed'>): ChannelConnectionView {
+export function toConnectionView(row: Omit<Integration, 'credentialSealed' | 'syncEpisodeId'>): ChannelConnectionView {
   return {
     id: row.id,
     tenantId: row.tenantId,

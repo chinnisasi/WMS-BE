@@ -3820,6 +3820,15 @@ export const integrations = pgTable(
     consecutiveFailures: integer('consecutive_failures').notNull().default(0),
     /** The breaker state: `open` refuses sync appends; retry half-opens. */
     breakerState: text('breaker_state').notNull().default('closed'),
+    /**
+     * Story 9-2 — the open sync-health EPISODE: minted (uuidv7) on the
+     * breaker's closed → open transition and carried by
+     * `channel.sync.degraded`; cleared when the breaker closes again (or the
+     * connection is disconnected), each carried by `channel.sync.recovered`.
+     * Null while the breaker has no open episode. One episode = one
+     * notification entry (a connection trips many times).
+     */
+    syncEpisodeId: uuid('sync_episode_id'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -4607,3 +4616,56 @@ export const clientInvoiceSeries = pgTable(
 );
 
 export type ClientInvoiceSeries = typeof clientInvoiceSeries.$inferSelect;
+
+/**
+ * Story 9-2 — the notification panel's projection (notifications module,
+ * module-exclusive writes). One row per source occurrence: the unique
+ * `(tenant_id, source_type, source_id)` is the idempotency of every
+ * subscriber. A raise fills `summary` (a per-source allowlist, never a raw
+ * payload); a resolve stamps `resolved_at` + `resolution`. A resolve that
+ * arrives before its raise leaves a TOMBSTONE (`summary` null, so
+ * `raised_at`/`surfaced_at` null too) which the late raise fills, keeping
+ * the resolution. `raised_at` (the source event's `occurredAt`) orders the
+ * list; `surfaced_at` (when the projection could first show it) drives the
+ * bell's dot. The `source_type` CHECK, the shape CHECK and RLS live only in
+ * `drizzle/0067_notifications.sql`.
+ */
+export const notifications = pgTable(
+  'notifications',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    sourceType: text('source_type').notNull(),
+    sourceId: uuid('source_id').notNull(),
+    warehouseId: uuid('warehouse_id'),
+    summary: jsonb('summary').$type<Record<string, unknown>>(),
+    raisedAt: timestamp('raised_at', { withTimezone: true, mode: 'string' }),
+    surfacedAt: timestamp('surfaced_at', { withTimezone: true, mode: 'string' }),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true, mode: 'string' }),
+    resolution: text('resolution'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('notifications_tenant_source_unique').on(table.tenantId, table.sourceType, table.sourceId),
+    index('notifications_tenant_raised_at_id_idx').on(table.tenantId, table.raisedAt.desc(), table.id.desc()),
+  ],
+);
+
+export type NotificationRow = typeof notifications.$inferSelect;
+
+/**
+ * Story 9-2 — each member's last panel open: the bell's dot shows when a
+ * visible OPEN entry surfaced after it (or the member has no row yet). No
+ * foreign key (the house convention) — the user is the session user.
+ */
+export const notificationReads = pgTable(
+  'notification_reads',
+  {
+    tenantId: uuid('tenant_id').notNull(),
+    userId: uuid('user_id').notNull(),
+    lastOpenedAt: timestamp('last_opened_at', { withTimezone: true, mode: 'string' }).notNull(),
+  },
+  (table) => [primaryKey({ columns: [table.tenantId, table.userId] })],
+);

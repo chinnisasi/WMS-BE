@@ -465,13 +465,13 @@ export class ChannelsIngestCommand {
   private async readConnection(
     tenantId: string,
     connectionId: string,
-  ): Promise<Omit<Integration, 'credentialSealed'> | null> {
+  ): Promise<Omit<Integration, 'credentialSealed' | 'syncEpisodeId'> | null> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       const rows = (await tx
         .select(CONNECTION_COLUMNS)
         .from(integrations)
         .where(eq(integrations.id, connectionId))
-        .limit(1)) as Omit<Integration, 'credentialSealed'>[];
+        .limit(1)) as Omit<Integration, 'credentialSealed' | 'syncEpisodeId'>[];
       return rows[0] ?? null;
     });
   }

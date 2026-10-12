@@ -1424,6 +1424,13 @@ export class CountService {
               variance.thresholdQuantityMilli === null
                 ? null
                 : fromMilli(variance.thresholdQuantityMilli),
+            // Story 9-2 — additive: true iff submit raised
+            // `count.variance.threshold_exceeded` for this variance (the
+            // SAME frozen-threshold predicate, over the submit-time delta).
+            // The notification panel leaves no row for a false one.
+            overThreshold:
+              variance.thresholdQuantityMilli !== null &&
+              Math.abs(variance.deltaMilli) > variance.thresholdQuantityMilli,
             // The row's contract, echoed: null when the resolution stated
             // nothing (no-statement recount), not an empty array.
             consideredEventSeqs: statedSeqs.length > 0 ? statedSeqs : null,

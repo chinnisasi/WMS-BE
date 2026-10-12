@@ -1,0 +1,480 @@
+import { UUID_RE } from '../../shared/primitives/ids';
+import { fromMilli } from '../../shared/primitives/quantity';
+import { ROLE_CAPABILITIES, type Capability } from '../tenancy/permissions';
+import { COUNT_VARIANCE_STATUSES, REJECTED_OP_STATUSES, type UserRole } from '../../shared/db/schema';
+
+/**
+ * Story 9-2 — the notification panel's sources, as data.
+ *
+ * Every source is one raise event and its resolve event(s), keyed by a
+ * per-occurrence id the raise mints (`source_id`). The event type strings are
+ * the EMITTING modules' (`stock_adjustment.*` inventory, `count.variance.*`
+ * movements, `over_receipt.*` / `qc_hold.*` inbound, `device.rejected_op.*`
+ * tenancy, `replenishment.*` replenishment, `channel.sync.*` channels) —
+ * repeated here as literals because the notifications module may import no
+ * sibling's internals (AD-6; `test/architecture.spec.ts`), and pinned equal
+ * to the emitters' constants by `test/notifications.spec.ts`.
+ *
+ * The vocabulary is mirrored in three layers (IMPLEMENTATION-GUIDE §4): this
+ * tuple, the `notifications_source_type_check` CHECK in
+ * `drizzle/0067_notifications.sql`, and the API's discriminated union — the
+ * first two pinned together by the notifications suite.
+ */
+export const NOTIFICATION_SOURCE_TYPES = [
+  'stock-adjustment',
+  'count-variance',
+  'over-receipt',
+  'rejected-op',
+  'reorder-breach',
+  'batch-alert',
+  'qc-hold',
+  'channel-sync',
+] as const;
+
+export type NotificationSourceType = (typeof NOTIFICATION_SOURCE_TYPES)[number];
+
+// ── the resolutions — what cleared an entry, per source ─────────────────────
+
+/**
+ * Every resolution a source's resolve events can carry (a closed list per
+ * source; a resolve outside it is malformed and acked).
+ */
+/** A status vocabulary minus its one open state — the states a resolve lands on. */
+function resolvedStates<const T extends readonly string[]>(statuses: T): readonly Exclude<T[number], 'open'>[] {
+  return statuses.filter((status): status is Exclude<T[number], 'open'> => status !== 'open');
+}
+
+/**
+ * Where the emitter's vocabulary is a shared tuple it is DERIVED here (the
+ * variance and rejected-op statuses, minus `open`); the replenishment and
+ * channel reasons live in their modules' event files, which this module may
+ * not import (AD-6) — `test/notifications.spec.ts` pins those equal.
+ */
+export const SOURCE_RESOLUTIONS = {
+  'stock-adjustment': ['approved', 'rejected'],
+  'count-variance': resolvedStates(COUNT_VARIANCE_STATUSES),
+  'over-receipt': ['approved', 'rejected'],
+  'rejected-op': resolvedStates(REJECTED_OP_STATUSES),
+  'reorder-breach': ['recovered', 'dismissed', 'actioned', 'policy-removed'],
+  'batch-alert': ['resolved', 'dismissed'],
+  'qc-hold': ['released'],
+  'channel-sync': ['recovered', 'disconnected'],
+} as const satisfies Record<NotificationSourceType, readonly string[]>;
+
+// ── the summaries — a per-source allowlist, built key by key ────────────────
+
+export interface StockAdjustmentSummary {
+  readonly skuId: string;
+  /** Signed, base units of the SKU's UoM. */
+  readonly quantityDelta: number;
+  readonly reasonCode: string;
+}
+export interface CountVarianceSummary {
+  readonly skuId: string;
+  /** Counted − expected, base units. */
+  readonly delta: number;
+}
+export interface OverReceiptSummary {
+  readonly grnCode: string;
+  readonly skuId: string;
+  /** Base units. */
+  readonly excessQty: number;
+}
+export interface RejectedOpSummary {
+  readonly opType: string;
+  readonly problemCode: string;
+}
+export interface ReorderBreachSummary {
+  readonly skuId: string;
+  /** ATP at detection, base units. */
+  readonly atpQty: number;
+  /** The effective reorder point at detection, base units. */
+  readonly pointQty: number;
+}
+export interface BatchAlertSummary {
+  readonly kind: 'expiry_upcoming' | 'aged';
+  readonly skuId: string;
+  readonly batchCode: string;
+  /** The expiry arm only. */
+  readonly expiryDate?: string;
+  /** The aged arm only — the frozen age in whole days. */
+  readonly ageDays?: number;
+}
+export interface QcHoldSummary {
+  readonly skuId: string;
+  readonly reason: string;
+}
+export interface ChannelSyncSummary {
+  readonly connectionId: string;
+}
+
+export type NotificationSummary =
+  | StockAdjustmentSummary
+  | CountVarianceSummary
+  | OverReceiptSummary
+  | RejectedOpSummary
+  | ReorderBreachSummary
+  | BatchAlertSummary
+  | QcHoldSummary
+  | ChannelSyncSummary;
+
+/** A raise decoded: the entry's identity, its warehouse and its summary. */
+export interface DecodedRaise {
+  readonly sourceType: NotificationSourceType;
+  readonly sourceId: string;
+  readonly warehouseId: string | null;
+  readonly summary: NotificationSummary;
+}
+
+/**
+ * A resolve decoded: `ignore` is the designed no-op (an under-threshold
+ * count variance resolves, but no raise was ever emitted for it, so it must
+ * leave no row).
+ */
+export type DecodedResolve =
+  | {
+      readonly kind: 'resolve';
+      readonly sourceType: NotificationSourceType;
+      readonly sourceId: string;
+      readonly warehouseId: string | null;
+      readonly resolution: string;
+    }
+  | { readonly kind: 'ignore' };
+
+type Payload = Record<string, unknown>;
+
+/** A string field bounded in length (the summary never carries an essay). */
+const MAX_TEXT = 500;
+
+function uuid(payload: Payload, key: string): string | null {
+  const value = payload[key];
+  return typeof value === 'string' && UUID_RE.test(value) ? value : null;
+}
+
+function text(payload: Payload, key: string): string | null {
+  const value = payload[key];
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_TEXT ? value : null;
+}
+
+function finite(payload: Payload, key: string): number | null {
+  const value = payload[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** An optional warehouse: absent or null is null; anything else must be a uuid. */
+function optionalWarehouse(payload: Payload): string | null | undefined {
+  const value = payload.warehouseId;
+  if (value === undefined || value === null) return null;
+  return typeof value === 'string' && UUID_RE.test(value) ? value : undefined;
+}
+
+/** Milli-units → base units at the edge; a value the converter refuses is malformed. */
+function baseUnits(milli: number): number | null {
+  try {
+    return fromMilli(milli);
+  } catch {
+    return null;
+  }
+}
+
+function oneOf<T extends string>(payload: Payload, key: string, allowed: readonly T[]): T | null {
+  const value = payload[key];
+  return typeof value === 'string' && (allowed as readonly string[]).includes(value) ? (value as T) : null;
+}
+
+/**
+ * Builds a raise (or null when the payload is malformed — the subscriber
+ * acks a malformed publication; no retry can fix a shape).
+ */
+type RaiseDecoder = (payload: Payload) => { sourceId: string; warehouseId: string | null; summary: NotificationSummary } | null;
+
+/** Builds a resolve (null = malformed). */
+type ResolveDecoder = (payload: Payload) => { sourceId: string; warehouseId: string | null; resolution: string } | 'ignore' | null;
+
+interface SourceSpec {
+  readonly raise: { readonly type: string; readonly decode: RaiseDecoder };
+  readonly resolves: readonly { readonly type: string; readonly decode: ResolveDecoder }[];
+}
+
+function withWarehouse<T>(payload: Payload, build: (warehouseId: string | null) => T | null): T | null {
+  const warehouseId = optionalWarehouse(payload);
+  return warehouseId === undefined ? null : build(warehouseId);
+}
+
+/** A resolve whose resolution is fixed by the event type itself. */
+function fixedResolve(idKey: string, resolution: string): ResolveDecoder {
+  return (payload) => {
+    const sourceId = uuid(payload, idKey);
+    if (sourceId === null) return null;
+    return withWarehouse(payload, (warehouseId) => ({ sourceId, warehouseId, resolution }));
+  };
+}
+
+/** A resolve whose resolution is a payload field from a closed list. */
+function fieldResolve(idKey: string, field: string, allowed: readonly string[]): ResolveDecoder {
+  return (payload) => {
+    const sourceId = uuid(payload, idKey);
+    const resolution = oneOf(payload, field, allowed);
+    if (sourceId === null || resolution === null) return null;
+    return withWarehouse(payload, (warehouseId) => ({ sourceId, warehouseId, resolution }));
+  };
+}
+
+export const NOTIFICATION_SOURCES: Readonly<Record<NotificationSourceType, SourceSpec>> = {
+  'stock-adjustment': {
+    raise: {
+      type: 'stock_adjustment.pending_approval',
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'pendingAdjustmentId');
+        const skuId = uuid(payload, 'skuId');
+        const quantityDelta = finite(payload, 'quantityDelta');
+        const reasonCode = text(payload, 'reasonCode');
+        if (sourceId === null || skuId === null || quantityDelta === null || reasonCode === null) return null;
+        return withWarehouse(payload, (warehouseId) => ({
+          sourceId,
+          warehouseId,
+          summary: { skuId, quantityDelta, reasonCode } satisfies StockAdjustmentSummary,
+        }));
+      },
+    },
+    resolves: [
+      { type: 'stock_adjustment.approved', decode: fixedResolve('pendingAdjustmentId', 'approved') },
+      { type: 'stock_adjustment.rejected', decode: fixedResolve('pendingAdjustmentId', 'rejected') },
+    ],
+  },
+  'count-variance': {
+    raise: {
+      type: 'count.variance.threshold_exceeded',
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'varianceId');
+        const skuId = uuid(payload, 'skuId');
+        const delta = finite(payload, 'delta');
+        if (sourceId === null || skuId === null || delta === null) return null;
+        return withWarehouse(payload, (warehouseId) => ({
+          sourceId,
+          warehouseId,
+          summary: { skuId, delta } satisfies CountVarianceSummary,
+        }));
+      },
+    },
+    resolves: [
+      {
+        type: 'count.variance.resolved',
+        decode: (payload) => {
+          // Only an over-threshold variance was raised; an ordinary one's
+          // resolve must leave no row (no raise will ever fill a tombstone).
+          // A payload without the flag (an event committed before 9-2)
+          // resolves as before — at worst one tombstone per in-flight event.
+          if (payload.overThreshold === false) return 'ignore';
+          return fieldResolve('varianceId', 'status', SOURCE_RESOLUTIONS['count-variance'])(payload);
+        },
+      },
+    ],
+  },
+  'over-receipt': {
+    raise: {
+      type: 'over_receipt.requested',
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'overReceiptId');
+        const grnCode = text(payload, 'grnCode');
+        const skuId = uuid(payload, 'skuId');
+        const excessQty = finite(payload, 'excessQty');
+        if (sourceId === null || grnCode === null || skuId === null || excessQty === null) return null;
+        return withWarehouse(payload, (warehouseId) => ({
+          sourceId,
+          warehouseId,
+          summary: { grnCode, skuId, excessQty } satisfies OverReceiptSummary,
+        }));
+      },
+    },
+    resolves: [
+      { type: 'over_receipt.approved', decode: fixedResolve('overReceiptId', 'approved') },
+      { type: 'over_receipt.rejected', decode: fixedResolve('overReceiptId', 'rejected') },
+    ],
+  },
+  'rejected-op': {
+    raise: {
+      type: 'device.rejected_op.raised',
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'rejectedOpId');
+        const opType = text(payload, 'opType');
+        const problemCode = text(payload, 'problemCode');
+        if (sourceId === null || opType === null || problemCode === null) return null;
+        // A device op names no warehouse the panel can trust — none stored.
+        return { sourceId, warehouseId: null, summary: { opType, problemCode } satisfies RejectedOpSummary };
+      },
+    },
+    resolves: [
+      {
+        type: 'device.rejected_op.resolved',
+        decode: (payload) => {
+          const sourceId = uuid(payload, 'rejectedOpId');
+          const resolution = oneOf(payload, 'status', SOURCE_RESOLUTIONS['rejected-op']);
+          if (sourceId === null || resolution === null) return null;
+          return { sourceId, warehouseId: null, resolution };
+        },
+      },
+    ],
+  },
+  'reorder-breach': {
+    raise: {
+      type: 'replenishment.breach_detected',
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'breachId');
+        const skuId = uuid(payload, 'skuId');
+        const atpMilli = finite(payload, 'atpMilli');
+        const pointMilli = finite(payload, 'pointMilli');
+        if (sourceId === null || skuId === null || atpMilli === null || pointMilli === null) return null;
+        const atpQty = baseUnits(atpMilli);
+        const pointQty = baseUnits(pointMilli);
+        if (atpQty === null || pointQty === null) return null;
+        return withWarehouse(payload, (warehouseId) => ({
+          sourceId,
+          warehouseId,
+          summary: { skuId, atpQty, pointQty } satisfies ReorderBreachSummary,
+        }));
+      },
+    },
+    resolves: [
+      {
+        type: 'replenishment.breach_cleared',
+        decode: fieldResolve('breachId', 'reason', SOURCE_RESOLUTIONS['reorder-breach']),
+      },
+    ],
+  },
+  'batch-alert': {
+    raise: {
+      type: 'replenishment.batch_alert_raised',
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'alertId');
+        const kind = oneOf(payload, 'kind', ['expiry_upcoming', 'aged'] as const);
+        const skuId = uuid(payload, 'skuId');
+        const batchCode = text(payload, 'batchCode');
+        if (sourceId === null || kind === null || skuId === null || batchCode === null) return null;
+        let detected: { expiryDate: string } | { ageDays: number };
+        if (kind === 'expiry_upcoming') {
+          const expiryDate = text(payload, 'expiryDate');
+          if (expiryDate === null || Number.isNaN(Date.parse(expiryDate))) return null;
+          detected = { expiryDate };
+        } else {
+          const ageDays = finite(payload, 'ageDays');
+          if (ageDays === null || !Number.isInteger(ageDays) || ageDays < 0) return null;
+          detected = { ageDays };
+        }
+        return withWarehouse(payload, (warehouseId) => ({
+          sourceId,
+          warehouseId,
+          summary: { kind, skuId, batchCode, ...detected } satisfies BatchAlertSummary,
+        }));
+      },
+    },
+    resolves: [
+      {
+        type: 'replenishment.batch_alert_cleared',
+        decode: fieldResolve('alertId', 'reason', SOURCE_RESOLUTIONS['batch-alert']),
+      },
+    ],
+  },
+  'qc-hold': {
+    raise: {
+      type: 'qc_hold.placed',
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'holdId');
+        const skuId = uuid(payload, 'skuId');
+        const reason = text(payload, 'reason');
+        if (sourceId === null || skuId === null || reason === null) return null;
+        return withWarehouse(payload, (warehouseId) => ({
+          sourceId,
+          warehouseId,
+          summary: { skuId, reason } satisfies QcHoldSummary,
+        }));
+      },
+    },
+    resolves: [{ type: 'qc_hold.released', decode: fixedResolve('holdId', 'released') }],
+  },
+  'channel-sync': {
+    raise: {
+      type: 'channel.sync.degraded',
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'episodeId');
+        const connectionId = uuid(payload, 'connectionId');
+        if (sourceId === null || connectionId === null) return null;
+        return { sourceId, warehouseId: null, summary: { connectionId } satisfies ChannelSyncSummary };
+      },
+    },
+    resolves: [
+      {
+        type: 'channel.sync.recovered',
+        decode: (payload) => {
+          const sourceId = uuid(payload, 'episodeId');
+          const resolution = oneOf(payload, 'reason', SOURCE_RESOLUTIONS['channel-sync']);
+          if (sourceId === null || resolution === null || uuid(payload, 'connectionId') === null) return null;
+          return { sourceId, warehouseId: null, resolution };
+        },
+      },
+    ],
+  },
+};
+
+/** Every event type the subscriber listens to → how to read it. */
+export type EventRoute =
+  | { readonly arm: 'raise'; readonly sourceType: NotificationSourceType; readonly decode: RaiseDecoder }
+  | { readonly arm: 'resolve'; readonly sourceType: NotificationSourceType; readonly decode: ResolveDecoder };
+
+export const EVENT_ROUTES: ReadonlyMap<string, EventRoute> = new Map(
+  NOTIFICATION_SOURCE_TYPES.flatMap((sourceType): [string, EventRoute][] => {
+    const spec = NOTIFICATION_SOURCES[sourceType];
+    return [
+      [spec.raise.type, { arm: 'raise', sourceType, decode: spec.raise.decode }],
+      ...spec.resolves.map((resolve): [string, EventRoute] => [
+        resolve.type,
+        { arm: 'resolve', sourceType, decode: resolve.decode },
+      ]),
+    ];
+  }),
+);
+
+/** Decodes one event for its route; null = malformed. */
+export function decodeRaise(route: Extract<EventRoute, { arm: 'raise' }>, payload: unknown): DecodedRaise | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
+  const decoded = route.decode(payload as Payload);
+  return decoded === null ? null : { sourceType: route.sourceType, ...decoded };
+}
+
+export function decodeResolve(route: Extract<EventRoute, { arm: 'resolve' }>, payload: unknown): DecodedResolve | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
+  const decoded = route.decode(payload as Payload);
+  if (decoded === null) return null;
+  if (decoded === 'ignore') return { kind: 'ignore' };
+  return { kind: 'resolve', sourceType: route.sourceType, ...decoded };
+}
+
+// ── routing: who sees what ──────────────────────────────────────────────────
+
+/**
+ * Who can ACT on each source — the capability its resolving command
+ * enforces (never the payloads' `notifyRole` hints, which disagree). The
+ * count variance is special: its over-threshold resolution is owner-only by
+ * the resolve command's frozen-threshold guard (`count.command.ts`), not by
+ * a capability, so the rule is a role.
+ */
+export const SOURCE_AUDIENCE: Readonly<Record<NotificationSourceType, { readonly capability: Capability } | { readonly role: 'owner' }>> = {
+  'stock-adjustment': { capability: 'adjustments.approve' },
+  'count-variance': { role: 'owner' },
+  'over-receipt': { capability: 'review.decide' },
+  'rejected-op': { capability: 'review.decide' },
+  'reorder-breach': { capability: 'replenishment.manage' },
+  'batch-alert': { capability: 'replenishment.manage' },
+  'qc-hold': { capability: 'qc.manage' },
+  'channel-sync': { capability: 'channel.manage' },
+};
+
+/** The source types a role sees — an allowlist; an unknown role sees none. */
+export function visibleSourceTypes(role: UserRole): NotificationSourceType[] {
+  const capabilities = ROLE_CAPABILITIES[role];
+  if (capabilities === undefined) return [];
+  return NOTIFICATION_SOURCE_TYPES.filter((sourceType) => {
+    const audience = SOURCE_AUDIENCE[sourceType];
+    return 'role' in audience ? role === audience.role : capabilities.has(audience.capability);
+  });
+}

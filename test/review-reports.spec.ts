@@ -355,7 +355,7 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
   }
 
   test('the sync report records dropped ops, dedupes the re-posted rows, replays with the same key, and 422s a reused key', async () => {
-    const { tenantId, ownerToken, operator, badgeSession } = await setupReportingTenant();
+    const { tenantId, ownerToken, operator, badgeSession, deviceId } = await setupReportingTenant();
 
     const rowA = transferOpRow();
     // The batch mixes the op sessions: rowB's own sealed attribution is
@@ -375,6 +375,25 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
     // resolve arms) — no device.sync_report.recorded outbox event exists.
     const events = await outboxRows(tenantId);
     expect(events.filter((e) => e.type === 'device.sync_report.recorded')).toHaveLength(0);
+    // Story 9-2 — each row that ENTERED the queue raises its notification:
+    // one `device.rejected_op.raised` per inserted row, ids only.
+    const handle = postgres(process.env.DATABASE_URL!, { max: 1 });
+    const stored = await handle`select id, op_id from rejected_ops where tenant_id = ${tenantId}`.finally(() => handle.end());
+    const idOf = new Map(stored.map((r) => [(r as { op_id: string }).op_id, (r as { id: string }).id]));
+    const raised = () => outboxRows(tenantId).then((all) => all.filter((e) => e.type === 'device.rejected_op.raised'));
+    expect(await raised()).toEqual(
+      [rowA, rowB].map((row) => ({
+        type: 'device.rejected_op.raised',
+        payload: {
+          rejectedOpId: idOf.get(row.opId as string),
+          opId: row.opId,
+          opType: row.opType,
+          problemCode: row.problemCode,
+          deviceId,
+          operatorUserId: operator.userId,
+        },
+      })),
+    );
 
     // The same rows under a FRESH key: the (tenant, op_id) pair absorbs them —
     // the exact at-least-once dedupe, recorded=false per row.
@@ -393,6 +412,9 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
     // A PARTIAL re-post (only one of the two rows) is per-row, not per-report.
     const partial = await uploadReport(tenantId, badgeSession, [rowB], ulid()).expect(201);
     expect(partial.body).toEqual({ received: 1, recorded: 0, duplicates: 1, rows: [{ opId: rowB.opId, recorded: false }] });
+    // Story 9-2 — the absorbed re-posts (fresh key, replay, partial) raised
+    // nothing: still exactly the two the first post's inserts raised.
+    expect(await raised()).toHaveLength(2);
 
     // The queue rows carry the stamped attribution: the server-verified
     // reporting session beside the op's OWN session as the device sealed it.

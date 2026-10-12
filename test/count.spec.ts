@@ -1547,6 +1547,8 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
         countedQuantity: 11,
         delta: 7,
         thresholdQuantity: 5,
+        // Story 9-2 — the submit raised `threshold_exceeded` for v2 (|+7| > 5).
+        overThreshold: true,
         consideredEventSeqs: consulted,
         resolvedBy: ownerUserId,
         recountTaskId: null,
@@ -1656,6 +1658,9 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       const forV3 = (await outboxPayloads('count.variance.resolved')).filter((p) => p.varianceId === v3);
       expect(forV3).toHaveLength(1);
       expect(forV3[0]).toMatchObject({ decision: 'recount', status: 'recounted', recountTaskId: recountId });
+      // Story 9-2 — |+2| ≤ the frozen 5: no raise was emitted, and the
+      // resolve says so (the notification panel leaves no row for it).
+      expect(forV3[0]!.overThreshold).toBe(false);
       // Settle the recount task so later arms can use the bin.
       await submitCount(recountId, {
         lines: [{ skuId: skuIds.get(PLAIN), countedQuantity: 5 }],
