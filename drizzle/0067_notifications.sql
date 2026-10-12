@@ -31,7 +31,7 @@ CREATE TABLE "notifications" (
 --> statement-breakpoint
 ALTER TABLE "integrations" ADD COLUMN "sync_episode_id" uuid;--> statement-breakpoint
 CREATE UNIQUE INDEX "notifications_tenant_source_unique" ON "notifications" USING btree ("tenant_id","source_type","source_id");--> statement-breakpoint
-CREATE INDEX "notifications_tenant_raised_at_id_idx" ON "notifications" USING btree ("tenant_id","raised_at" DESC NULLS LAST,"id" DESC NULLS LAST);;--> statement-breakpoint
+CREATE INDEX "notifications_tenant_raised_at_id_idx" ON "notifications" USING btree ("tenant_id","raised_at" DESC NULLS LAST,"id" DESC NULLS LAST);--> statement-breakpoint
 -- ── hand-amended: the controlled vocabulary (IMPLEMENTATION-GUIDE §4) ─────
 -- Pinned against `NOTIFICATION_SOURCE_TYPES` (modules/notifications) by
 -- test/notifications.spec.ts. `source_type` is NOT NULL, so the bare IN arm

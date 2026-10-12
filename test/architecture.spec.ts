@@ -1463,8 +1463,19 @@ describe('architecture: the notification panel is notifications-module-owned (st
   const RAW_NOTIFICATION_TABLES = 'notifications|notification_reads';
   const notificationsRoot = join(SRC_ROOT, 'modules', 'notifications');
   const notificationFiles = files.filter((file) => file.path.startsWith(notificationsRoot));
-  /** The schema names the module may import: its two tables and types. */
-  const OWN_SCHEMA_NAMES = new Set(['notifications', 'notificationReads', 'NotificationRow', 'UserRole']);
+  /**
+   * The schema names the module may import: its two tables and types, plus
+   * two shared status VOCABULARIES (tuples, never tables) its resolutions
+   * derive from.
+   */
+  const OWN_SCHEMA_NAMES = new Set([
+    'notifications',
+    'notificationReads',
+    'NotificationRow',
+    'UserRole',
+    'COUNT_VARIANCE_STATUSES',
+    'REJECTED_OP_STATUSES',
+  ]);
   const SCHEMA_IMPORT = /import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+'[./]*shared\/db\/schema'/g;
 
   function schemaNames(source: string): string[] {

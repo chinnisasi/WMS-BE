@@ -1,7 +1,7 @@
 import { UUID_RE } from '../../shared/primitives/ids';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { ROLE_CAPABILITIES, type Capability } from '../tenancy/permissions';
-import type { UserRole } from '../../shared/db/schema';
+import { COUNT_VARIANCE_STATUSES, REJECTED_OP_STATUSES, type UserRole } from '../../shared/db/schema';
 
 /**
  * Story 9-2 — the notification panel's sources, as data.
@@ -39,11 +39,22 @@ export type NotificationSourceType = (typeof NOTIFICATION_SOURCE_TYPES)[number];
  * Every resolution a source's resolve events can carry (a closed list per
  * source; a resolve outside it is malformed and acked).
  */
+/** A status vocabulary minus its one open state — the states a resolve lands on. */
+function resolvedStates<const T extends readonly string[]>(statuses: T): readonly Exclude<T[number], 'open'>[] {
+  return statuses.filter((status): status is Exclude<T[number], 'open'> => status !== 'open');
+}
+
+/**
+ * Where the emitter's vocabulary is a shared tuple it is DERIVED here (the
+ * variance and rejected-op statuses, minus `open`); the replenishment and
+ * channel reasons live in their modules' event files, which this module may
+ * not import (AD-6) — `test/notifications.spec.ts` pins those equal.
+ */
 export const SOURCE_RESOLUTIONS = {
   'stock-adjustment': ['approved', 'rejected'],
-  'count-variance': ['adjusted', 'recounted'],
+  'count-variance': resolvedStates(COUNT_VARIANCE_STATUSES),
   'over-receipt': ['approved', 'rejected'],
-  'rejected-op': ['applied', 'recounted', 'discarded'],
+  'rejected-op': resolvedStates(REJECTED_OP_STATUSES),
   'reorder-breach': ['recovered', 'dismissed', 'actioned', 'policy-removed'],
   'batch-alert': ['resolved', 'dismissed'],
   'qc-hold': ['released'],

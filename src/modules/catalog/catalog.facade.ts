@@ -306,6 +306,21 @@ export class CatalogFacade {
   }
 
   /**
+   * Story 9-2 — ONE SKU's tenant-wide reorder point (milli-units; 0 = no
+   * default), on the caller's transaction — null when the SKU is unknown.
+   * The reorder-policy delete reads it to decide whether the scope stays a
+   * sweep candidate without the override.
+   */
+  async getSkuReorderPointInTx(tx: TenantTx, tenantId: string, skuId: string): Promise<number | null> {
+    const rows = await tx
+      .select({ reorderPoint: skus.reorderPoint })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), eq(skus.id, skuId)))
+      .limit(1);
+    return rows[0]?.reorderPoint ?? null;
+  }
+
+  /**
    * The same read on its own transaction (the `getSkuSummaries` wrapper
    * shape) — the standalone entry for a caller that holds no transaction.
    */

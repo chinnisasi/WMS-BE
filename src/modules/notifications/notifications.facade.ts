@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { notificationReads, notifications } from '../../shared/db/schema';
@@ -113,7 +113,10 @@ export class NotificationsFacade {
               : sql`(${notifications.raisedAt}, ${notifications.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
           ),
         )
-        .orderBy(desc(notifications.raisedAt), desc(notifications.id))
+        // `nulls last` on both keys: exactly the 0067 index's order
+        // (`raised_at DESC NULLS LAST, id DESC NULLS LAST`), so the index
+        // serves the page — a bare `desc` means NULLS FIRST and does not match.
+        .orderBy(sql`${notifications.raisedAt} desc nulls last`, sql`${notifications.id} desc nulls last`)
         .limit(pageSize + 1);
       const page = buildPage(
         rows.map((wrapped) => ({

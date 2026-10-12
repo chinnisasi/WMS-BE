@@ -34,5 +34,6 @@ export interface ChannelAvailabilityPublication {
 export const CHANNEL_SYNC_DEGRADED_EVENT = 'channel.sync.degraded';
 export const CHANNEL_SYNC_RECOVERED_EVENT = 'channel.sync.recovered';
 
-/** Why an episode closed. */
-export type ChannelSyncRecoveredReason = 'recovered' | 'disconnected';
+/** Why an episode closed (pinned to the panel's resolutions by test/notifications.spec.ts). */
+export const CHANNEL_SYNC_RECOVERED_REASONS = ['recovered', 'disconnected'] as const;
+export type ChannelSyncRecoveredReason = (typeof CHANNEL_SYNC_RECOVERED_REASONS)[number];

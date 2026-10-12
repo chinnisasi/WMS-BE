@@ -1098,20 +1098,26 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
       .expect(200);
-    // Story 9-2: the deleted policy's open breach is cleared for the panel
-    // (`policy-removed`) in the delete's own transaction — the breach row
-    // itself is left for the next sweep to decide.
+    // Story 9-2 (B1): the SKU default (2000) keeps the scope a sweep
+    // candidate, so the delete leaves the breach — and its panel entry — to
+    // the sweep: NO `policy-removed`, the row still open.
     expect(
       (await outboxPayloads('replenishment.breach_cleared', tenantId)).filter(
         (payload) => payload.breachId === overrideBreach.id,
       ),
-    ).toEqual([{ breachId: overrideBreach.id, warehouseId: w4, skuId: skuIds.get('RP-A'), reason: 'policy-removed' }]);
+    ).toEqual([]);
     expect((await breachRows(tenantId, w4, skuIds.get('RP-A')!))[0]!.status).toBe('open');
     const afterDelete = await replenishment.sweepScope(tenantId, w4);
     expect(afterDelete).toMatchObject({ evaluated: 2, opened: 0, recovered: 1 });
     const rows = await breachRows(tenantId, w4, skuIds.get('RP-A')!);
     expect(rows).toHaveLength(1);
     expect(rows[0]!.status).toBe('recovered');
+    // …and it is the sweep's recovery that clears the entry.
+    expect(
+      (await outboxPayloads('replenishment.breach_cleared', tenantId)).filter(
+        (payload) => payload.breachId === overrideBreach.id,
+      ),
+    ).toEqual([{ breachId: overrideBreach.id, warehouseId: w4, skuId: skuIds.get('RP-A'), reason: 'recovered' }]);
 
     // Direct evidence the default now DECIDES: draw ATP below it — the
     // re-breach freezes at the SKU DEFAULT's 2000, neither the deleted
@@ -1129,6 +1135,42 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
     expect(dW4.breach_id).toBe(reRows[1]!.id);
     expect(dW4.status).toBe('draft');
     expect(Number(dW4.quantity_milli)).toBe(3000);
+
+    // Story 9-2 (B1): RP-B carries NO default point — its override is the
+    // scope's only rule. Deleting it ends the scope's candidacy, so the
+    // delete itself closes the breach (`dismissed`, the deleting owner
+    // stamped, audited) and clears the panel entry (`policy-removed`) in
+    // the same transaction — queue and panel agree, and no sweep revisits it.
+    const rpbPolicy = await putPolicy(tenantId, ownerToken, {
+      warehouseId: w4,
+      skuId: skuIds.get('RP-B'),
+      reorderPoint: 4000,
+      reorderQty: 5000,
+    }).expect(200);
+    const rpbSweep = await replenishment.sweepScope(tenantId, w4);
+    expect(rpbSweep).toMatchObject({ evaluated: 3, opened: 1, recovered: 0 });
+    const rpbBreach = (await breachRows(tenantId, w4, skuIds.get('RP-B')!))[0]!;
+    expect(rpbBreach.status).toBe('open');
+    const deleteKey = ulid();
+    await request(app.getHttpServer())
+      .delete(`${API}/${tenantId}/replenishment/policies/${rpbPolicy.body.policy.id as string}`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, deleteKey)
+      .expect(200);
+    const ownerUserId = (
+      (await sql`select id from users where tenant_id = ${tenantId}::uuid and role = 'owner'`)[0] as { id: string }
+    ).id;
+    const closed = (await breachRows(tenantId, w4, skuIds.get('RP-B')!))[0]!;
+    expect(closed.status).toBe('dismissed');
+    expect(closed.resolved_by).toBe(ownerUserId);
+    expect(
+      (await outboxPayloads('replenishment.breach_cleared', tenantId)).filter((payload) => payload.breachId === rpbBreach.id),
+    ).toEqual([{ breachId: rpbBreach.id, warehouseId: w4, skuId: skuIds.get('RP-B'), reason: 'policy-removed' }]);
+    expect(
+      (await auditRows('replenishment.breach_dismissed', tenantId)).filter((row) => row.target_id === rpbBreach.id),
+    ).toEqual([{ actor_user_id: ownerUserId, target_type: 'reorder_breach', target_id: rpbBreach.id, reference: deleteKey }]);
+    const afterRpb = await replenishment.sweepScope(tenantId, w4);
+    expect(afterRpb).toMatchObject({ evaluated: 2, opened: 0, recovered: 0 });
   });
 
   it('worker tick() against the REAL facades: a policy scope and a defaulted-SKU scope both sweep — policy scopes enumerate first', async () => {

@@ -12,14 +12,28 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { ReplenishmentFacade } from '../src/modules/replenishment/replenishment.facade';
 import { ChannelsPublishService } from '../src/modules/channels/channels.publish';
 import { BREAKER_FAILURE_THRESHOLD } from '../src/modules/channels/channels.view';
-import { CHANNEL_SYNC_DEGRADED_EVENT, CHANNEL_SYNC_RECOVERED_EVENT } from '../src/modules/channels/channels.events';
-import { BATCH_ALERT_CLEARED_EVENT, BREACH_CLEARED_EVENT } from '../src/modules/replenishment/replenishment.events';
+import {
+  CHANNEL_SYNC_DEGRADED_EVENT,
+  CHANNEL_SYNC_RECOVERED_EVENT,
+  CHANNEL_SYNC_RECOVERED_REASONS,
+  type ChannelSyncRecoveredReason,
+} from '../src/modules/channels/channels.events';
+import {
+  BATCH_ALERT_CLEARED_EVENT,
+  BATCH_ALERT_CLEARED_REASONS,
+  BREACH_CLEARED_EVENT,
+  BREACH_CLEARED_REASONS,
+  type BatchAlertClearedReason,
+  type BreachClearedReason,
+} from '../src/modules/replenishment/replenishment.events';
+import { COUNT_VARIANCE_STATUSES, REJECTED_OP_STATUSES } from '../src/shared/db/schema';
 import { REJECTED_OP_RAISED_EVENT } from '../src/modules/tenancy/sync-report.command';
 import { signTenantSession } from '../src/modules/tenancy/jwt-session';
 import { NotificationsDeliveryHandler } from '../src/modules/notifications/notifications.delivery';
 import {
   NOTIFICATION_SOURCES,
   NOTIFICATION_SOURCE_TYPES,
+  SOURCE_RESOLUTIONS,
   visibleSourceTypes,
   type NotificationSourceType,
 } from '../src/modules/notifications/notification-sources';
@@ -39,6 +53,18 @@ delete process.env.REPLENISHMENT_SCHEDULER_POLL_MS;
 delete process.env.COUNT_SCHEDULER_POLL_MS;
 
 const API = '/api/v1/tenants';
+
+/** Compile-time type equality — `true` only when A and B are the same union. */
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+type Resolution<S extends NotificationSourceType> = (typeof SOURCE_RESOLUTIONS)[S][number];
+// A drift in either direction is a TYPECHECK failure (bun run typecheck covers test/).
+const RESOLUTION_TYPE_PINS: [
+  Equal<Resolution<'reorder-breach'>, BreachClearedReason>,
+  Equal<Resolution<'batch-alert'>, BatchAlertClearedReason>,
+  Equal<Resolution<'channel-sync'>, ChannelSyncRecoveredReason>,
+  Equal<Resolution<'rejected-op'>, Exclude<(typeof REJECTED_OP_STATUSES)[number], 'open'>>,
+  Equal<Resolution<'count-variance'>, Exclude<(typeof COUNT_VARIANCE_STATUSES)[number], 'open'>>,
+] = [true, true, true, true, true];
 const KEY_HEADER = 'Idempotency-Key';
 const PASSWORD = 'correct-horse-battery';
 
@@ -355,6 +381,16 @@ describe('notifications (e2e, story 9-2)', () => {
         expect(NOTIFICATION_SOURCES[c.sourceType].raise.type).toBe(c.raise(uuidv7(), uuidv7()).type);
         expect(NOTIFICATION_SOURCES[c.sourceType].resolves.map((r) => r.type)).toContain(c.resolve(uuidv7(), uuidv7()).type);
       }
+    });
+
+    it('each source’s resolutions equal its emitter’s vocabulary (no state the panel cannot store, none it invents)', () => {
+      expect(RESOLUTION_TYPE_PINS).toEqual([true, true, true, true, true]);
+      const sorted = (list: readonly string[]) => [...list].sort();
+      expect(sorted(SOURCE_RESOLUTIONS['reorder-breach'])).toEqual(sorted(BREACH_CLEARED_REASONS));
+      expect(sorted(SOURCE_RESOLUTIONS['batch-alert'])).toEqual(sorted(BATCH_ALERT_CLEARED_REASONS));
+      expect(sorted(SOURCE_RESOLUTIONS['channel-sync'])).toEqual(sorted(CHANNEL_SYNC_RECOVERED_REASONS));
+      expect(sorted(SOURCE_RESOLUTIONS['rejected-op'])).toEqual(sorted(REJECTED_OP_STATUSES.filter((s) => s !== 'open')));
+      expect(sorted(SOURCE_RESOLUTIONS['count-variance'])).toEqual(sorted(COUNT_VARIANCE_STATUSES.filter((s) => s !== 'open')));
     });
 
     it('routes by the capability that acts — never the payloads’ notifyRole hints', () => {

@@ -23,8 +23,12 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 export const BREACH_CLEARED_EVENT = 'replenishment.breach_cleared';
 export const BATCH_ALERT_CLEARED_EVENT = 'replenishment.batch_alert_cleared';
 
-export type BreachClearedReason = 'recovered' | 'dismissed' | 'actioned' | 'policy-removed';
-export type BatchAlertClearedReason = 'resolved' | 'dismissed';
+/** Every reason a breach clears with (pinned to the panel's resolutions by test/notifications.spec.ts). */
+export const BREACH_CLEARED_REASONS = ['recovered', 'dismissed', 'actioned', 'policy-removed'] as const;
+export type BreachClearedReason = (typeof BREACH_CLEARED_REASONS)[number];
+/** Every reason a batch alert clears with (pinned the same way). */
+export const BATCH_ALERT_CLEARED_REASONS = ['resolved', 'dismissed'] as const;
+export type BatchAlertClearedReason = (typeof BATCH_ALERT_CLEARED_REASONS)[number];
 
 export async function appendBreachCleared(
   outbox: OutboxSink,
