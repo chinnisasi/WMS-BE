@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, gt, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, isNull, ne, sql } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, devices, idempotencyKeys, users } from '../../shared/db/schema';
@@ -14,9 +14,9 @@ import { generateSecret, seal, MissingEncryptionKeyError } from '../../shared/cr
 import { hashCommandPayload } from './idempotency-guard';
 import { idempotencyKeyReuse } from './registration.command';
 import { assertPermission, isFloorRole } from './permissions';
-import { getMemberRoleIn } from './tenancy.service';
+import { assertWarehouseInTenant, getMemberRoleIn } from './tenancy.service';
 import { DUMMY_HASH, hashPassword, verifyPassword } from './passwords';
-import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import {
@@ -105,6 +105,27 @@ export interface RevokeDeviceInput {
   readonly actorUserId: string;
   readonly deviceId: string;
 }
+
+/** Story 9-2b — the device's own push registration (PUT). */
+export interface RegisterPushInput {
+  readonly tenantId: string;
+  /** From the device session — never the body. */
+  readonly deviceId: string;
+  /** The badge-in session's operator (never null here — the api shell refuses a bare credential with 401). */
+  readonly operatorUserId: string;
+  readonly token: string;
+  readonly warehouseId: string;
+}
+
+/** Story 9-2b — the device's own push unregistration (DELETE). */
+export interface UnregisterPushInput {
+  readonly tenantId: string;
+  readonly deviceId: string;
+  readonly operatorUserId: string;
+}
+
+/** The Expo push token shape the PUT accepts (the DTO and the command share it). */
+export const EXPO_PUSH_TOKEN_RE = /^Expo(nent)?PushToken\[[^\]]{1,200}\]$/;
 
 export interface SelfTestEchoInput {
   readonly tenantId: string;
@@ -633,6 +654,10 @@ export class EnrollmentCommand {
           revokedAt: nowIso(),
           revokedBy: command.actorUserId,
           wipeFlag: true,
+          // Story 9-2b — a revoked handheld is never pushed to again.
+          pushToken: null,
+          pushWarehouseId: null,
+          pushRegisteredAt: null,
           updatedAt: nowIso(),
         })
         .where(
@@ -681,6 +706,95 @@ export class EnrollmentCommand {
       }
       return body;
     });
+  }
+
+  /**
+   * Story 9-2b — `PUT …/devices/push-registration`: the handheld registers
+   * its Expo push token and the warehouse it works in. A natural upsert
+   * (204, no Idempotency-Key): a retry writes the same values. Inside one
+   * tenant transaction: lock the device row → require it `active` and bound
+   * to THIS session's operator (403 `device-revoked` — a revoked or rebound
+   * device must not register) → the warehouse must be the tenant's (404
+   * `not-found`) → clear the same token from every OTHER device row of the
+   * tenant (a token belongs to at most one device) → write it on this row,
+   * stamping `push_registered_at` (the cross-tenant ownership read's
+   * "latest registration wins"). No audit row and no outbox event — a
+   * registration is transport configuration, not a business state change
+   * (the `notifications/opened` precedent).
+   */
+  async registerPush(command: RegisterPushInput): Promise<void> {
+    if (!EXPO_PUSH_TOKEN_RE.test(command.token)) {
+      // The DTO refuses this first; the command re-asserts the invariant it owns.
+      throw new ProblemException('validation-failed', 400, 'Invalid push token', 'token must be an Expo push token.');
+    }
+    await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      await this.lockOwnBoundDevice(tx, command.tenantId, command.deviceId, command.operatorUserId);
+      await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
+      await tx
+        .update(devices)
+        .set({ pushToken: null, pushWarehouseId: null, pushRegisteredAt: null, updatedAt: nowIso() })
+        .where(
+          and(
+            eq(devices.tenantId, command.tenantId),
+            eq(devices.pushToken, command.token),
+            ne(devices.id, command.deviceId),
+          ),
+        );
+      await tx
+        .update(devices)
+        .set({
+          pushToken: command.token,
+          pushWarehouseId: command.warehouseId,
+          pushRegisteredAt: nowIso(),
+          lastSeenAt: nowIso(),
+          updatedAt: nowIso(),
+        })
+        .where(and(eq(devices.id, command.deviceId), eq(devices.tenantId, command.tenantId)));
+    });
+  }
+
+  /**
+   * Story 9-2b — `DELETE …/devices/push-registration`: the handheld's
+   * permission was withdrawn (or it signs out of pushes). Same guards as the
+   * PUT, then the three push columns are cleared. 204; idempotent.
+   */
+  async unregisterPush(command: UnregisterPushInput): Promise<void> {
+    await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      await this.lockOwnBoundDevice(tx, command.tenantId, command.deviceId, command.operatorUserId);
+      await tx
+        .update(devices)
+        .set({ pushToken: null, pushWarehouseId: null, pushRegisteredAt: null, lastSeenAt: nowIso(), updatedAt: nowIso() })
+        .where(and(eq(devices.id, command.deviceId), eq(devices.tenantId, command.tenantId)));
+    });
+  }
+
+  /**
+   * The push routes' device guard (the `selfTestEcho` model): lock the row,
+   * then require it `active`, enrolled, and bound to the session's operator.
+   * A device revoked — or re-bound to another operator — since the session
+   * was minted is one fail-closed 403 `device-revoked`.
+   */
+  private async lockOwnBoundDevice(
+    tx: TenantTx,
+    tenantId: string,
+    deviceId: string,
+    operatorUserId: string,
+  ): Promise<void> {
+    const rows = await tx
+      .select()
+      .from(devices)
+      .where(and(eq(devices.id, deviceId), eq(devices.tenantId, tenantId)))
+      .for('update')
+      .limit(1);
+    const device = rows[0];
+    if (
+      !device ||
+      device.status !== 'active' ||
+      device.pinHash === null ||
+      device.operatorUserId !== operatorUserId
+    ) {
+      throw deviceRevoked();
+    }
   }
 
   /** The tenant's enrolled devices — a read, open to any tenant member. */

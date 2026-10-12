@@ -1,8 +1,8 @@
 import { forwardRef, Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { bins, tenants, users, warehouses, zones } from '../../shared/db/schema';
+import { bins, devices, tenants, users, warehouses, zones } from '../../shared/db/schema';
 import type { UserRole } from '../../shared/db/schema';
 // Constructor param is a type here but must stay a value import: Nest DI needs
 // the runtime class token for decorator metadata (eslint rule bends for it).
@@ -17,6 +17,7 @@ import { addressFromColumns } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { GSTIN_RE, gstinPrefixProblem, normalizeGstinInput } from '../../shared/primitives/gstin';
+import { FLOOR_ROLES } from './permissions';
 
 /** What other modules get from the tenancy spine (module boundary — AD-6). */
 export interface ActiveWarehouse {
@@ -158,6 +159,155 @@ export async function getMemberPortalFactsIn(
     .where(and(eq(users.id, userId), eq(users.tenantId, tenantId)))
     .limit(1);
   return rows[0] ?? null;
+}
+
+// ── story 9-2b: push targets (tenancy owns every `devices` read and write) ──
+
+/**
+ * One handheld a push can go to: the device, its registered token and
+ * warehouse, and its bound operator's role. Only the BASE-eligible rows are
+ * ever returned (the badge-in rule, `enrollment.command.ts`): the device is
+ * `active` with a non-null `push_token` and `operator_user_id`, and its
+ * operator's `users` row is `active`, has no `client_id`, and holds a floor
+ * role or `accountant`. Each push kind narrows this further by its own
+ * audience (the notifications module's `pushAudienceAllows`).
+ */
+export interface PushTarget {
+  readonly deviceId: string;
+  readonly token: string;
+  /** The warehouse the handheld registered with its token (null on a pre-9-2b row — never a new-work target). */
+  readonly warehouseId: string | null;
+  readonly operatorUserId: string;
+  readonly role: UserRole;
+}
+
+/** The roles that may hold a push target — the badge-in allowlist: floor roles plus `accountant`. */
+const PUSH_TARGET_ROLES: readonly UserRole[] = [...FLOOR_ROLES, 'accountant'];
+
+function pushTargetSelect(tx: TenantTx, tenantId: string, deviceIds: readonly string[] | null) {
+  return tx
+    .select({
+      deviceId: devices.id,
+      token: devices.pushToken,
+      warehouseId: devices.pushWarehouseId,
+      operatorUserId: devices.operatorUserId,
+      role: users.role,
+    })
+    .from(devices)
+    .innerJoin(users, and(eq(users.id, devices.operatorUserId), eq(users.tenantId, devices.tenantId)))
+    .where(
+      and(
+        eq(devices.tenantId, tenantId),
+        deviceIds === null ? undefined : inArray(devices.id, [...deviceIds]),
+        eq(devices.status, 'active'),
+        isNotNull(devices.pushToken),
+        isNotNull(devices.operatorUserId),
+        eq(users.status, 'active'),
+        isNull(users.clientId),
+        inArray(users.role, [...PUSH_TARGET_ROLES]),
+      ),
+    )
+    .orderBy(asc(devices.id));
+}
+
+function toPushTarget(row: {
+  deviceId: string;
+  token: string | null;
+  warehouseId: string | null;
+  operatorUserId: string | null;
+  role: UserRole;
+}): PushTarget {
+  return {
+    deviceId: row.deviceId,
+    token: row.token!,
+    warehouseId: row.warehouseId,
+    operatorUserId: row.operatorUserId!,
+    role: row.role,
+  };
+}
+
+/**
+ * Story 9-2b — every base-eligible push target of the tenant, read inside
+ * the caller's tenant transaction (the push enqueue). Deterministic order.
+ */
+export async function listPushTargets(tx: TenantTx, tenantId: string): Promise<PushTarget[]> {
+  return (await pushTargetSelect(tx, tenantId, null)).map(toPushTarget);
+}
+
+/**
+ * Story 9-2b — the send-time eligibility RE-CHECK: the base-eligible targets
+ * among `deviceIds` (deviceId → target), read inside the sender's claim
+ * transaction. A device revoked, unbound, unregistered, or whose operator was
+ * deactivated / moved to a client / given a non-floor role since the enqueue
+ * is simply absent.
+ */
+export async function getPushTargetsIn(
+  tx: TenantTx,
+  tenantId: string,
+  deviceIds: readonly string[],
+): Promise<Map<string, PushTarget>> {
+  const ids = [...new Set(deviceIds)].filter((id) => UUID_RE.test(id));
+  if (ids.length === 0) return new Map();
+  const rows = await pushTargetSelect(tx, tenantId, ids);
+  return new Map(rows.map((row) => [row.deviceId, toPushTarget(row)]));
+}
+
+/**
+ * Story 9-2b — clears a device's push registration, but ONLY while it still
+ * holds `token` (compare-and-clear): a handheld that re-registered a fresh
+ * token after the stale one was sent keeps the fresh one. Inside the
+ * caller's tenant transaction; returns whether a row was cleared.
+ */
+export async function clearPushTokenIn(
+  tx: TenantTx,
+  tenantId: string,
+  deviceId: string,
+  token: string,
+): Promise<boolean> {
+  const cleared = await tx
+    .update(devices)
+    .set({ pushToken: null, pushWarehouseId: null, pushRegisteredAt: null, updatedAt: sql`now()` })
+    .where(and(eq(devices.tenantId, tenantId), eq(devices.id, deviceId), eq(devices.pushToken, token)))
+    .returning({ id: devices.id });
+  return cleared.length > 0;
+}
+
+/** The device that owns a token: the latest registration across every tenant. */
+export interface PushTokenOwner {
+  readonly tenantId: string;
+  readonly deviceId: string;
+}
+
+/**
+ * Story 9-2b — the send-time token-OWNERSHIP read: for each token, the device
+ * row with the latest `push_registered_at` holding it, ACROSS tenants (a
+ * phone re-enrolled into another tenant leaves the old tenant's row holding
+ * the same token, and no cross-tenant write may clear it). A deliberately
+ * cross-tenant READ on the BYPASSRLS `AUTH_DATABASE` connection (the
+ * outbox relay's sanctioned second use) — never a write; the caller's
+ * resulting clear stays inside its own tenant (`clearPushTokenIn`).
+ */
+export async function pushTokenOwners(authDb: Database, tokens: readonly string[]): Promise<Map<string, PushTokenOwner>> {
+  const distinct = [...new Set(tokens)];
+  if (distinct.length === 0) return new Map();
+  const rows = await authDb
+    .select({
+      tenantId: devices.tenantId,
+      deviceId: devices.id,
+      token: devices.pushToken,
+      registeredAt: devices.pushRegisteredAt,
+    })
+    .from(devices)
+    .where(inArray(devices.pushToken, distinct))
+    // Latest registration first; the id breaks an exact tie deterministically.
+    .orderBy(sql`${devices.pushRegisteredAt} desc nulls last`, desc(devices.id));
+  const owners = new Map<string, PushTokenOwner>();
+  for (const row of rows) {
+    if (row.token !== null && !owners.has(row.token)) {
+      owners.set(row.token, { tenantId: row.tenantId, deviceId: row.deviceId });
+    }
+  }
+  return owners;
 }
 
 export async function getMemberRoleIn(

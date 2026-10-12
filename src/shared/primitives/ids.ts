@@ -74,6 +74,17 @@ export function isUuid(value: string): boolean {
  * instead of a 500. (`isUuid` stays the stricter UUIDv7 identity check —
  * this one only answers "can this string be a uuid at all".)
  */
+/**
+ * The millisecond timestamp a UUIDv7 was minted at (its first 48 bits), or
+ * null when the id is not a version-7 UUID. Story 9-2b: the push enqueue
+ * dates an event by its outbox row id — minted server-side at append — never
+ * by its `occurredAt`, which can be device time.
+ */
+export function uuidv7TimestampMs(id: string): number | null {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) return null;
+  return Number.parseInt(id.slice(0, 8) + id.slice(9, 13), 16);
+}
+
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**

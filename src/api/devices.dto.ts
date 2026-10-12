@@ -1,6 +1,7 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsEmail, IsObject, IsString, Length, Matches } from 'class-validator';
+import { IsEmail, IsObject, IsString, IsUUID, Length, Matches } from 'class-validator';
 import { USER_ROLES } from '../modules/tenancy/tenancy.dto';
+import { EXPO_PUSH_TOKEN_RE } from '../modules/tenancy/enrollment.command';
 
 /**
  * Devices HTTP surface DTOs (Story 3.2). Validation lives at the boundary;
@@ -178,4 +179,23 @@ export class DeviceSelfTestEchoResponse {
 
   @ApiProperty({ description: 'Server receive instant (ISO-8601 UTC)' })
   receivedAt!: string;
+}
+/**
+ * Story 9-2b — `PUT …/devices/push-registration`: the handheld's Expo push
+ * token and the warehouse it works in. The device id and the operator come
+ * from the badge-in session, never the body.
+ */
+export class PushRegistrationDto {
+  @ApiProperty({
+    description: 'The Expo push token (`ExponentPushToken[…]` or `ExpoPushToken[…]`)',
+    example: 'ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]',
+    pattern: EXPO_PUSH_TOKEN_RE.source,
+  })
+  @IsString()
+  @Matches(EXPO_PUSH_TOKEN_RE, { message: 'token must be an Expo push token (ExponentPushToken[…])' })
+  token!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The warehouse this handheld works in (new-work pushes are scoped to it)' })
+  @IsUUID()
+  warehouseId!: string;
 }

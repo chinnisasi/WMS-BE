@@ -14,7 +14,7 @@ import {
 } from '../../shared/db/schema';
 import type { Picklist, PicklistLine, Wave, WavePolicy } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
-import { canonicalInstant, nowIso } from '../../shared/primitives/time';
+import { canonicalInstant, istDateOf, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -87,6 +87,32 @@ export type WaveGrouping = (typeof WAVE_GROUPINGS)[number];
  * timezone, THIS CONSTANT is the single place to change.
  */
 export const WAVE_CUTOFF_TIMEZONE = 'Asia/Kolkata';
+
+/**
+ * Story 9-2b — the event the cutoff sweep raises when a PLANNED wave is
+ * inside the at-risk window of its policy cutoff (once per wave per IST
+ * date). Payload `{waveId, warehouseId, cutoffLocalTime, istDate}`. The
+ * notifications module queues the at-risk push from it.
+ */
+export const WAVE_CUTOFF_AT_RISK_EVENT = 'wave.cutoff_at_risk';
+
+/**
+ * The at-risk window, in minutes before the cutoff — the web's
+ * `AT_RISK_THRESHOLD_MINUTES` (wms-fe `lib/outbound-waves.ts`), so the amber
+ * chip and the push agree: `0 < minutes to cutoff <= 60`.
+ */
+export const CUTOFF_AT_RISK_MINUTES = 60;
+
+/** `HH:MM` → minutes past midnight. */
+function minutesOfDay(hhmm: string): number {
+  return Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.slice(3, 5));
+}
+
+/** What one cutoff sweep did. */
+export interface CutoffSweepResult {
+  /** The waves whose `wave.cutoff_at_risk` was raised by this call. */
+  readonly raised: readonly string[];
+}
 
 /** `HH:MM`, 24-hour — the stored shape of a policy cutoff (DB CHECK mirrors it). */
 const CUTOFF_RE = /^([01][0-9]|2[0-3]):[0-5][0-9]$/;
@@ -823,6 +849,85 @@ export class WaveCommandService {
         snapshot,
       );
       return snapshot;
+    });
+  }
+
+  // ── the cutoff sweep (story 9-2b) ──────────────────────────────────────────
+
+  /**
+   * Raises `wave.cutoff_at_risk` for every PLANNED wave of the tenant whose
+   * policy cutoff is `0 < r <= 60` minutes away in `WAVE_CUTOFF_TIMEZONE`
+   * (read off `WAVE_CLOCK` through `localTimeOfDay` — the release gate's own
+   * clock and wall-clock helper, so the sweep and the gate agree on the
+   * minute), at most once per wave per IST date. One tenant transaction:
+   * select the candidates, then per wave a CONDITIONAL marker write —
+   * `cutoff_risk_alerted_on = <IST date> WHERE status = 'planned' AND
+   * cutoff_risk_alerted_on IS DISTINCT FROM <IST date> RETURNING` — and the
+   * event only when that write returned the row. A concurrent sweep (or a
+   * second tick) finds the marker set and raises nothing; a released or
+   * cancelled wave is never a candidate. A system sweep: no actor, no audit
+   * row, no idempotency key (the replenishment sweep's posture).
+   *
+   * At the cutoff minute itself `r = 0` — release is still allowed, but the
+   * warning would be moot, so nothing is raised; a cutoff that already
+   * passed today (`r < 0`) raises nothing either.
+   */
+  async sweepCutoffRisk(tenantId: string): Promise<CutoffSweepResult> {
+    const now = this.clock.now();
+    const nowMinutes = minutesOfDay(localTimeOfDay(now));
+    const istDate = istDateOf(now.toISOString());
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const candidates = await tx
+        .select({
+          id: waves.id,
+          warehouseId: waves.warehouseId,
+          cutoffLocalTime: wavePolicies.cutoffLocalTime,
+        })
+        .from(waves)
+        .innerJoin(wavePolicies, and(eq(wavePolicies.id, waves.policyId), eq(wavePolicies.tenantId, waves.tenantId)))
+        .where(
+          and(
+            eq(waves.tenantId, tenantId),
+            eq(waves.status, 'planned'),
+            sql`${wavePolicies.cutoffLocalTime} is not null`,
+            sql`${waves.cutoffRiskAlertedOn} is distinct from ${istDate}::date`,
+          ),
+        )
+        .orderBy(asc(waves.id));
+      const raised: string[] = [];
+      for (const candidate of candidates) {
+        const cutoff = candidate.cutoffLocalTime;
+        if (cutoff === null || !CUTOFF_RE.test(cutoff)) continue;
+        const remaining = minutesOfDay(cutoff) - nowMinutes;
+        if (remaining <= 0 || remaining > CUTOFF_AT_RISK_MINUTES) continue;
+        const marked = await tx
+          .update(waves)
+          .set({ cutoffRiskAlertedOn: istDate })
+          .where(
+            and(
+              eq(waves.id, candidate.id),
+              eq(waves.tenantId, tenantId),
+              eq(waves.status, 'planned'),
+              sql`${waves.cutoffRiskAlertedOn} is distinct from ${istDate}::date`,
+            ),
+          )
+          .returning({ id: waves.id });
+        if (marked.length === 0) continue;
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId,
+          type: WAVE_CUTOFF_AT_RISK_EVENT,
+          occurredAt: now.toISOString(),
+          payload: {
+            waveId: candidate.id,
+            warehouseId: candidate.warehouseId,
+            cutoffLocalTime: cutoff,
+            istDate,
+          },
+        });
+        raised.push(candidate.id);
+      }
+      return { raised };
     });
   }
 

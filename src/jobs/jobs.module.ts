@@ -15,6 +15,10 @@ import { ChannelsModule } from '../modules/channels/channels.module';
 import { ChannelsFacade } from '../modules/channels/channels.facade';
 import { BillingModule } from '../modules/billing/billing.module';
 import { BillingFacade } from '../modules/billing/billing.facade';
+import { OutboundModule } from '../modules/outbound/outbound.module';
+import { OutboundFacade } from '../modules/outbound/outbound.facade';
+import { NotificationsModule } from '../modules/notifications/notifications.module';
+import { NotificationsFacade, PUSH_SENDING_STALE_MS } from '../modules/notifications/notifications.facade';
 
 /** The problem code a failed ATP read fails closed with (A8's store split). */
 function codeOf(error: ProblemException): string | null {
@@ -954,8 +958,212 @@ export class StorageSnapshotWorker implements OnApplicationBootstrap, OnApplicat
  * `publishConnectionSnapshot()` directly, plus one plumbing test driving
  * `ReplenishmentSchedulerWorker.tick()` itself).
  */
+/**
+ * A non-negative integer of milliseconds from an env poll variable — unset or
+ * `0` is OFF (tests drive the facades and `tick()` directly); anything else
+ * fails the boot loudly. The sibling parsers' convention, named once for the
+ * two story 9-2b workers.
+ */
+function parsePollMs(name: string, raw: string | undefined): number {
+  if (raw === undefined || raw === '') {
+    return 0;
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer of milliseconds (got "${raw}")`);
+  }
+  return parsed;
+}
+
+/** `PUSH_SENDER_POLL_MS` (story 9-2b): the push sender's poll; unset/`0` = OFF. */
+export function parsePushSenderPollMs(raw: string | undefined): number {
+  return parsePollMs('PUSH_SENDER_POLL_MS', raw);
+}
+
+/** `WAVE_CUTOFF_SWEEP_POLL_MS` (story 9-2b): the wave cutoff sweep's poll; unset/`0` = OFF. */
+export function parseWaveCutoffSweepPollMs(raw: string | undefined): number {
+  return parsePollMs('WAVE_CUTOFF_SWEEP_POLL_MS', raw);
+}
+
+/**
+ * Story 9-2b — the push sender worker. Each tick finds the tenants with due
+ * push rows — `pending` past `next_attempt_at`, or `sending` past the
+ * 5-minute stale bound — cross-tenant on the read-only BYPASSRLS
+ * `AUTH_DATABASE` (the `ReplenishmentSchedulerWorker` precedent; every
+ * write stays in the facade's tenant transactions), and calls
+ * `NotificationsFacade.sendDuePushes(tenantId)` once per tenant (≤ 100 rows,
+ * one gateway call). A failing tenant is logged and retried next tick.
+ * Env-gated OFF when `PUSH_SENDER_POLL_MS` is unset/`0`; single-flight via
+ * `running`; `unref`'d timer; shutdown hook. Two instances are safe: the
+ * claim is `FOR UPDATE SKIP LOCKED` and committed `sending` before the send.
+ */
+@Injectable()
+export class PushSenderWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('PushSenderWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(NotificationsFacade) private readonly notifications: NotificationsFacade,
+  ) {
+    this.pollMs = parsePushSenderPollMs(process.env.PUSH_SENDER_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off
+    }
+    this.logger.log(`Push sender worker started (poll every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /** One cycle; returns the tenants it drove (the plumbing test reads it). */
+  async tick(): Promise<string[]> {
+    if (this.running) {
+      return []; // shed: one cycle at a time in this process
+    }
+    this.running = true;
+    try {
+      // The stale bound is the sender's own constant (code review B5) — a
+      // hardcoded interval here would drift from the sweep it gates.
+      const tenants = (await this.authDb.execute(sql`
+        select distinct tenant_id as "tenantId"
+        from push_deliveries
+        where (status = 'pending' and next_attempt_at <= now())
+           or (status = 'sending' and updated_at < now() - make_interval(secs => ${PUSH_SENDING_STALE_MS / 1000}::double precision))
+        order by tenant_id asc
+      `)) as unknown as { tenantId: string }[];
+      const driven: string[] = [];
+      const configCodes = new Set<string>();
+      for (const { tenantId } of tenants) {
+        try {
+          const summary = await this.notifications.sendDuePushes(tenantId);
+          for (const code of summary.configCodes) configCodes.add(code);
+          driven.push(tenantId);
+        } catch (error) {
+          this.logger.error(
+            `Push sender could not send for tenant ${tenantId} — retried next tick: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      if (configCodes.size > 0) {
+        // ONCE per tick, across every tenant (code review B4): the
+        // deployment's credentials are wrong. Codes only — never a provider
+        // message (it names the token).
+        this.logger.error(
+          `push gateway refused the credentials (${[...configCodes].sort().join(', ')}) — check EXPO_ACCESS_TOKEN; ` +
+            'rows retried without spending an attempt, expired after 30 minutes',
+        );
+      }
+      return driven;
+    } catch (error) {
+      this.logger.error(`Push sender cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
+/**
+ * Story 9-2b — the wave cutoff sweep worker. Each tick finds the tenants with
+ * a PLANNED wave under a policy that has a cutoff (cross-tenant, read-only,
+ * `AUTH_DATABASE`) and calls `OutboundFacade.sweepCutoffRisk(tenantId)` —
+ * which raises `wave.cutoff_at_risk` once per wave per IST date when the
+ * cutoff is 0 < r ≤ 60 minutes away. A failing tenant is logged and retried
+ * next tick. Env-gated OFF when `WAVE_CUTOFF_SWEEP_POLL_MS` is unset/`0`
+ * (`.env.example` 60000 — a poll longer than a minute can skip the first
+ * at-risk minute, never the window); single-flight; `unref`'d timer.
+ */
+@Injectable()
+export class WaveCutoffSweepWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('WaveCutoffSweepWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
+  ) {
+    this.pollMs = parseWaveCutoffSweepPollMs(process.env.WAVE_CUTOFF_SWEEP_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off
+    }
+    this.logger.log(`Wave cutoff sweep worker started (poll every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /** One cycle; returns the tenants it swept. */
+  async tick(): Promise<string[]> {
+    if (this.running) {
+      return [];
+    }
+    this.running = true;
+    try {
+      const tenants = (await this.authDb.execute(sql`
+        select distinct w.tenant_id as "tenantId"
+        from waves w
+        join wave_policies p on p.id = w.policy_id and p.tenant_id = w.tenant_id
+        where w.status = 'planned' and p.cutoff_local_time is not null
+        order by w.tenant_id asc
+      `)) as unknown as { tenantId: string }[];
+      const swept: string[] = [];
+      for (const { tenantId } of tenants) {
+        try {
+          await this.outbound.sweepCutoffRisk(tenantId);
+          swept.push(tenantId);
+        } catch (error) {
+          this.logger.error(
+            `Wave cutoff sweep failed for tenant ${tenantId} — retried next tick: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      return swept;
+    } catch (error) {
+      this.logger.error(`Wave cutoff sweep cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
 @Module({
-  imports: [SharedModule, InventoryModule, MovementsModule, ReplenishmentModule, ChannelsModule, BillingModule],
+  imports: [
+    SharedModule,
+    InventoryModule,
+    MovementsModule,
+    ReplenishmentModule,
+    ChannelsModule,
+    BillingModule,
+    // Story 9-2b — the cutoff sweep (outbound) and the push sender (notifications).
+    OutboundModule,
+    NotificationsModule,
+  ],
   providers: [
     OutboxRelayWorker,
     ReconciliationWorker,
@@ -967,6 +1175,9 @@ export class StorageSnapshotWorker implements OnApplicationBootstrap, OnApplicat
     ChannelsSyncWorker,
     // Story 21-4 — the daily storage snapshots (env-gated OFF by default).
     StorageSnapshotWorker,
+    // Story 9-2b — the push sender and the wave cutoff sweep (both env-gated OFF by default).
+    PushSenderWorker,
+    WaveCutoffSweepWorker,
   ],
   exports: [],
 })

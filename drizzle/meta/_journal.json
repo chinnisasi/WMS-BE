@@ -477,6 +477,13 @@
       "when": 1791782056598,
       "tag": "0067_notifications",
       "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1791794222046,
+      "tag": "0068_mobile_pushes",
+      "breakpoints": true
     }
   ]
 }

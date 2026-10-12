@@ -1459,8 +1459,9 @@ describe('architecture: the notification panel is notifications-module-owned (st
    * into the source modules (the spec's Never list). Siblings reach it only
    * through its facade/module.
    */
-  const NOTIFICATION_TABLES = ['notifications', 'notificationReads'] as const;
-  const RAW_NOTIFICATION_TABLES = 'notifications|notification_reads';
+  // Story 9-2b adds the push queue (`push_deliveries`) to the module's tables.
+  const NOTIFICATION_TABLES = ['notifications', 'notificationReads', 'pushDeliveries'] as const;
+  const RAW_NOTIFICATION_TABLES = 'notifications|notification_reads|push_deliveries';
   const notificationsRoot = join(SRC_ROOT, 'modules', 'notifications');
   const notificationFiles = files.filter((file) => file.path.startsWith(notificationsRoot));
   /**
@@ -1472,6 +1473,8 @@ describe('architecture: the notification panel is notifications-module-owned (st
     'notifications',
     'notificationReads',
     'NotificationRow',
+    'pushDeliveries',
+    'PushDeliveryRow',
     'UserRole',
     'COUNT_VARIANCE_STATUSES',
     'REJECTED_OP_STATUSES',
@@ -1500,6 +1503,27 @@ describe('architecture: the notification panel is notifications-module-owned (st
     expect(drizzleWriteOn('notifications').test(delivery)).toBe(true);
     expect(drizzleWriteOn('notificationReads').test(facade)).toBe(true);
     expect(schemaNames(delivery)).toContain('notifications');
+    // Story 9-2b: the enqueue and the sender really write the push queue.
+    const enqueue = readFileSync(join(notificationsRoot, 'push.enqueue.ts'), 'utf8');
+    const sender = readFileSync(join(notificationsRoot, 'push.sender.ts'), 'utf8');
+    expect(drizzleWriteOn('pushDeliveries').test(enqueue)).toBe(true);
+    expect(drizzleWriteOn('pushDeliveries').test(sender)).toBe(true);
+  });
+
+  it('the push enqueue (an outbox handler) makes no network call and never reaches the gateway (story 9-2b)', () => {
+    // The relay is one serial loop for every tenant: a network call inside a
+    // handler would let a provider outage stall it and quarantine rows the
+    // 9-2 projection shares. Only the sender may hold the gateway.
+    const NETWORK = /from 'node:https?'|from 'https?'|\bfetch\(|PUSH_GATEWAY|PushGateway\b|push-gateway'/;
+    expect(NETWORK.test("import https from 'node:https';")).toBe(true);
+    expect(NETWORK.test("@Inject(PUSH_GATEWAY) private readonly gateway: PushGateway")).toBe(true);
+    const enqueue = readFileSync(join(notificationsRoot, 'push.enqueue.ts'), 'utf8');
+    expect(NETWORK.test(enqueue)).toBe(false);
+    for (const handler of ['notifications.delivery.ts', 'push.enqueue.ts']) {
+      expect(NETWORK.test(readFileSync(join(notificationsRoot, handler), 'utf8'))).toBe(false);
+    }
+    // Meaningful: the sender does hold it.
+    expect(NETWORK.test(readFileSync(join(notificationsRoot, 'push.sender.ts'), 'utf8'))).toBe(true);
   });
 
   it('no notifications-table write happens outside the notifications module', () => {
@@ -1528,7 +1552,7 @@ describe('architecture: the notification panel is notifications-module-owned (st
     expect(offenders).toEqual([]);
   });
 
-  it('no other module reaches into the notifications module past the facade (and only the api shell + root import it)', () => {
+  it('no other module reaches into the notifications module past the facade (and only the api shell, the jobs shell + root import it)', () => {
     const reaching = /(?:modules\/notifications|\.\.\/notifications)\/(?!notifications\.(?:facade|module)['"])/;
     expect(reaching.test("from '../modules/notifications/notifications.delivery'")).toBe(true);
     expect(reaching.test("from '../modules/notifications/notification-sources'")).toBe(true);
@@ -1538,9 +1562,14 @@ describe('architecture: the notification panel is notifications-module-owned (st
     );
     // Meaningful: the api shell does import it.
     expect(importers.some((file) => file.path === join(SRC_ROOT, 'api', 'notifications.controller.ts'))).toBe(true);
+    // Story 9-2b: the jobs shell drives the push sender through the facade.
     const allowedImporter = (path: string): boolean =>
-      path.startsWith(join(SRC_ROOT, 'api')) || path === join(SRC_ROOT, 'app.module.ts');
+      path.startsWith(join(SRC_ROOT, 'api')) ||
+      path === join(SRC_ROOT, 'app.module.ts') ||
+      path === join(SRC_ROOT, 'jobs', 'jobs.module.ts');
     expect(importers.filter((file) => !allowedImporter(file.path)).map((file) => file.path)).toEqual([]);
+    const jobs = files.find((file) => file.path === join(SRC_ROOT, 'jobs', 'jobs.module.ts'))!;
+    expect(reaching.test(jobs.source)).toBe(false);
     // Sibling MODULES may not reach past the facade at all; the api shell's
     // DTOs read the source vocabulary (the summaries' resolution enums).
     const offenders = importers

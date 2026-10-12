@@ -3762,6 +3762,137 @@
         ]
       }
     },
+    "/tenants/{tenantId}/devices/push-registration": {
+      "put": {
+        "description": "Takes NO Idempotency-Key: re-sending the same token and warehouse writes the same values. The token is cleared from every other device of the tenant (a token belongs to one device).",
+        "operationId": "DevicesController_registerPush",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PushRegistrationDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Registered"
+          },
+          "400": {
+            "description": "Malformed body — not an Expo push token, or warehouseId not a uuid (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Token belongs to another tenant (permission-denied), or the device is unknown, revoked or bound to another operator (device-revoked)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Registers the handheld's Expo push token and warehouse (badge-in session) — a natural upsert, no Idempotency-Key",
+        "tags": [
+          "devices"
+        ]
+      },
+      "delete": {
+        "operationId": "DevicesController_unregisterPush",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Cleared (or nothing was registered)"
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Token belongs to another tenant (permission-denied), or the device is unknown, revoked or bound to another operator (device-revoked)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Clears the handheld's push registration (badge-in session) — idempotent, no Idempotency-Key",
+        "tags": [
+          "devices"
+        ]
+      }
+    },
     "/tenants/{tenantId}/devices/sync-reports": {
       "post": {
         "operationId": "DevicesController_recordSyncReport",
@@ -22160,7 +22291,7 @@
     },
     "/tenants/{tenantId}/notifications/opened": {
       "post": {
-        "description": "Sets the caller's last-opened time to now and answers {hasNew: false}. Takes NO Idempotency-Key — the one exception among the mutating routes: setting a time to now is naturally idempotent, and a retry only moves it forward.",
+        "description": "Sets the caller's last-opened time to now and answers {hasNew: false}. Takes NO Idempotency-Key — one of the natural-upsert exceptions among the mutating routes (with the handheld's PUT/DELETE devices/push-registration, story 9-2b): setting a time to now is naturally idempotent, and a retry only moves it forward.",
         "operationId": "NotificationsController_opened",
         "parameters": [
           {
@@ -24850,6 +24981,26 @@
           "operatorUserId",
           "echoed",
           "receivedAt"
+        ]
+      },
+      "PushRegistrationDto": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The Expo push token (`ExponentPushToken[…]` or `ExpoPushToken[…]`)",
+            "example": "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]",
+            "pattern": "^Expo(nent)?PushToken\\[[^\\]]{1,200}\\]$"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse this handheld works in (new-work pushes are scoped to it)"
+          }
+        },
+        "required": [
+          "token",
+          "warehouseId"
         ]
       },
       "SyncReportAttributionDto": {

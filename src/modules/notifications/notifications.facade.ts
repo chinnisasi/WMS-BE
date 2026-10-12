@@ -15,6 +15,12 @@ import {
   type NotificationSourceType,
   type NotificationSummary,
 } from './notification-sources';
+import { PushSender, type PushSendSummary } from './push.sender';
+
+export type { PushSendSummary } from './push.sender';
+// The sender's stale bound rides the facade seam: the jobs shell's due-tenant
+// query must use the same interval as the sweep it gates (code review B5).
+export { PUSH_SENDING_STALE_MS } from './push-rules';
 
 export const DEFAULT_NOTIFICATION_PAGE_SIZE = 25;
 export const MAX_NOTIFICATION_PAGE_SIZE = 100;
@@ -79,7 +85,20 @@ const KNOWN_SOURCE_TYPES: ReadonlySet<string> = new Set(NOTIFICATION_SOURCE_TYPE
  */
 @Injectable()
 export class NotificationsFacade {
-  constructor(@Inject(DATABASE) private readonly db: Database) {}
+  constructor(
+    @Inject(DATABASE) private readonly db: Database,
+    @Inject(PushSender) private readonly pushSender: PushSender,
+  ) {}
+
+  /**
+   * Story 9-2b — sends one batch of this tenant's due mobile pushes (claim →
+   * one gateway call → outcomes; `push.sender.ts`). Driven per tenant by the
+   * jobs shell's `PushSenderWorker`; never called from a request or an
+   * outbox handler.
+   */
+  async sendDuePushes(tenantId: string): Promise<PushSendSummary> {
+    return this.pushSender.sendDue(tenantId);
+  }
 
   /** Visible entries, newest `(raised_at, id)` first, keyset-paged. */
   async list(
@@ -166,8 +185,9 @@ export class NotificationsFacade {
 
   /**
    * The caller opened the panel: `last_opened_at = now()` (upserted). Setting
-   * a time to now is naturally idempotent, so — the one exception among the
-   * mutating routes — it takes no `Idempotency-Key`. Any member may call it
+   * a time to now is naturally idempotent, so — like the handheld's push
+   * registration (9-2b), a natural-upsert exception among the mutating
+   * routes — it takes no `Idempotency-Key`. Any member may call it
    * (a role that sees nothing just records an open).
    */
   async opened(tenantId: string, userId: string): Promise<NotificationStatus> {
