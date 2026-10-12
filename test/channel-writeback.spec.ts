@@ -558,8 +558,6 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
         'batch_on_hand',
         'stock_on_hand',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',

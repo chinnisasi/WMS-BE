@@ -52,7 +52,9 @@ export type LedgerReferenceDoc =
        * Optional and additive, and OMITTED when absent — never `null`: the
        * canonical bytes `JSON.stringify` hashes drop an absent key, so every
        * event without it (all pre-9-3a events, every immediate adjustment)
-       * keeps its bytes. Pinned by `test/ledger.spec.ts`.
+       * keeps its bytes. Pinned by `test/adjustment-approval.spec.ts` (the
+       * immediate path's hash recomputes from the three pre-9-3a keys, and
+       * a `null` key would change it).
        */
       readonly adjustmentPendingId?: string;
       /**

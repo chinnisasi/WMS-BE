@@ -9,7 +9,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { open as openSealed } from '../src/shared/crypto/envelope';
 import { signDeviceToken, tenantSessionSecret } from '../src/modules/tenancy/jwt-session';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
-import { expectAuditRow, seededIdempotencyKey } from './support/audit-guard';
+import { expectAuditRow, noOpIdempotencyKey, seededIdempotencyKey } from './support/audit-guard';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -55,8 +55,6 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM devices WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM users WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM tenants WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -585,7 +583,7 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
     expect(echo.body).toMatchObject({ status: 403, code: 'device-revoked' });
 
     // Idempotent re-revoke: 200 same state, no second audit row / outbox event.
-    const again = await revoke(ownerToken, tenantId, device.deviceId).expect(200);
+    const again = await revoke(ownerToken, tenantId, device.deviceId, noOpIdempotencyKey(tenantId, ulid(), 'devices.revoke:already-revoked')).expect(200);
     expect(again.body).toMatchObject({ status: 'revoked', wipeFlag: true });
     const auditsAfter = await auditRows(tenantId);
     expect(auditsAfter.filter((a) => a.action === 'device.revoked')).toHaveLength(1);
@@ -711,13 +709,14 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
     const { tenantId } = await registerTenant(email);
     const ownerToken = await signIn(email);
 
-    const sharedKey = seededIdempotencyKey(ulid());
+    const foreignTenantId = uuidv7();
+    const sharedKey = seededIdempotencyKey(foreignTenantId, ulid());
     const seeder = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await seeder`
         insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
         values (
-          ${uuidv7()}, ${uuidv7()}, ${sharedKey}, ${'b'.repeat(64)},
+          ${uuidv7()}, ${foreignTenantId}, ${sharedKey}, ${'b'.repeat(64)},
           ${seeder.json({ device: { id: uuidv7(), tenantId: uuidv7(), label: 'someone elses scanner' }, deviceToken: 'not-ours' })}
         )
       `;
@@ -756,5 +755,26 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
       targetId: enrolled.body.device.id as string,
       actorUserId: ops.userId,
     });
+  });
+
+  it('story 9-3a — a code whose mint audit row is missing is refused 400 enrollment-code-invalid (typed, never a 500) and stays redeemable once the row is back', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const { tenantId } = await registerTenant(email);
+    const ownerToken = await signIn(email);
+    const minted = await mintCode(ownerToken, tenantId).expect(201);
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const mintRow = (await sql<Record<string, unknown>[]>`
+        select * from audit_events where tenant_id = ${tenantId} and action = 'device.enrollment_code_minted'`)[0]!;
+      await sql`delete from audit_events where id = ${mintRow.id as string}`;
+      const body = { code: minted.body.code as string, label: 'unattributable', pin: '2468' };
+      const refused = await enroll(tenantId, body).expect(400);
+      expect(refused.body.code).toBe('enrollment-code-invalid');
+      // The rollback un-burned the code: with the row restored it enrolls.
+      await sql`insert into audit_events ${sql(mintRow)}`;
+      await enroll(tenantId, body).expect(201);
+    } finally {
+      await sql.end();
+    }
   });
 });

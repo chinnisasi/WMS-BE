@@ -203,12 +203,6 @@ describe('reconciliation over fractional stock (e2e, story 10.4)', () => {
       await cleaner.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [
         createdTenantIds,
       ]);
-      await cleaner.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [
-        createdTenantIds,
-      ]);
-      await cleaner.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [
-        createdTenantIds,
-      ]);
       await cleaner.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [
         createdTenantIds,
       ]);

@@ -10,6 +10,7 @@ import { ABC_CLASSES } from '../src/shared/primitives/abc-class';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { seededIdempotencyKey } from './support/audit-guard';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions — the same bootstrap
@@ -124,8 +125,6 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
     const cleaner = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await cleaner.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await cleaner.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await cleaner.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       // Children before parents: errors → runs → conversions → skus.
       await cleaner.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM catalog_imports WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -691,6 +690,7 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
       reorderQty: 0,
       uomConversions: [],
     };
+    seededIdempotencyKey(tenantId, legacyKey);
     const seed = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await seed`
@@ -1057,6 +1057,7 @@ describe('sku physical attributes (e2e, story 11-2)', () => {
       reorderQty: 0,
       uomConversions: [],
     };
+    seededIdempotencyKey(tenantId, legacyKey);
     const seed = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await seed`

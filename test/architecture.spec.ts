@@ -2499,3 +2499,37 @@ describe('architecture: AUDIT_TARGET_TYPES is the audit vocabulary (story 9-3a)'
     expect(AUDIT_NEW_ACTIONS.filter(({ action, targetType }) => !pinned(action, targetType)).map(({ action }) => action)).toEqual([]);
   });
 });
+
+describe('architecture: no suite deletes the audit guard\'s evidence before the check runs (story 9-3a)', () => {
+  /**
+   * `assertEveryKeyAudited` runs in `SuiteDatabase.drop()`, AFTER each
+   * suite's `afterAll` cleanup. A cleanup that deletes `idempotency_keys` or
+   * `audit_events` (the shared-DB era's habit) blinds the check — the suite
+   * database is dropped whole anyway. The allowed deletes remove ONE named
+   * row the suite itself put there (`... and key = ...`, `... where id = ...`).
+   */
+  const DELETE = /delete\s+from\s+"?(idempotency_keys|audit_events)\b/i;
+  /** A table-name entry in a cleanup list: alone on its line, or after `[` / `,`. */
+  const LISTED = /^\s*['"](idempotency_keys|audit_events)['"],?\s*$|[[,]\s*['"](idempotency_keys|audit_events)['"]/;
+
+  it('the detectors bite', () => {
+    expect(DELETE.test("await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [ids]);")).toBe(true);
+    expect(LISTED.test("for (const table of ['outbox_messages', 'idempotency_keys', 'skus'])")).toBe(true);
+    expect(LISTED.test("        'audit_events',")).toBe(true);
+    expect(LISTED.test("t('idempotency_keys')")).toBe(false);
+    expect(LISTED.test("await dbCount('idempotency_keys', 'and key = $2', [key])")).toBe(false);
+  });
+
+  it('no spec deletes idempotency_keys or audit_events wholesale (one named row only)', () => {
+    const offenders: string[] = [];
+    for (const path of tsFilesUnder(TEST_ROOT).filter((p) => p.endsWith('.spec.ts') && p !== __filename)) {
+      readFileSync(path, 'utf8')
+        .split('\n')
+        .forEach((line, index) => {
+          const deleting = DELETE.test(line) && !/\b(and key|where id)\s*=/.test(line);
+          if (deleting || LISTED.test(line)) offenders.push(`${path}:${index + 1}`);
+        });
+    }
+    expect(offenders).toEqual([]);
+  });
+});

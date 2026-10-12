@@ -496,7 +496,12 @@ export class EnrollmentCommand {
         )
         .limit(1);
       if (mintRows[0] === undefined) {
-        throw new Error(`device ${pending.id} has no enrollment_code_minted audit row`);
+        // Unreachable through the API (the mint has always written its row in
+        // the same transaction as the pending device). A code nobody can be
+        // named as having minted is refused like any other unusable code —
+        // the one indistinguishable 400, and the rollback un-burns it —
+        // never an untyped 500 and never an enrollment with no actor.
+        throw enrollmentCodeInvalid();
       }
       await tx.insert(auditEvents).values({
         id: uuidv7(),

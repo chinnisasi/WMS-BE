@@ -199,8 +199,6 @@ describe('carrier rate shopping: the read that prices one order against every li
         'batch_on_hand',
         'stock_on_hand',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',

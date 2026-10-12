@@ -4,10 +4,15 @@
  * **The audit rule.** Every committed, non-replay execution of a command that
  * writes `idempotency_keys` also writes at least one `audit_events` row in the
  * same transaction (skeleton step 10, IMPLEMENTATION-GUIDE §1), carrying
- * `reference` = the idempotency key and `occurred_at` = `nowIso()` for the
- * rows 9-3a adds. Two guards hold it: `assertEveryKeyAudited` (the dynamic
- * check every e2e suite runs at its teardown, `test/support/audit-guard.ts`)
- * and the all-files static scan in `test/architecture.spec.ts`. Unkeyed
+ * `reference` = the idempotency key (a few pre-9-3a actions keep a composite
+ * reference that carries it — `COMPOSITE_REFERENCE_ACTIONS` in the guard) and
+ * `occurred_at` = `nowIso()` for the rows 9-3a adds. Two guards hold it:
+ * `assertEveryKeyAudited` (`test/support/audit-guard.ts`), which runs inside
+ * `SuiteDatabase.drop()` — the last step of every e2e suite's `afterAll`,
+ * after its cleanup, which may not delete keys or audit rows (pinned in
+ * `test/architecture.spec.ts`) — and the all-files static scan in
+ * `test/architecture.spec.ts`. Deliberate no-op arms (a key stored, nothing
+ * changed) write no row and are declared by name in the guard. Unkeyed
  * system writers — sweeps, schedulers, sign-in, badge-in, push registration —
  * are outside the rule.
  */

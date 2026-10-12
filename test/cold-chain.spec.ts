@@ -267,8 +267,6 @@ describe('cold-chain trace: the FR-45 reconstruction read (e2e, story 12-6)', ()
         'batch_on_hand',
         'stock_on_hand',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',

@@ -17,6 +17,7 @@ import {
   localTimeOfDay,
 } from '../src/modules/outbound/wave.command';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
@@ -274,8 +275,6 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
         'stock_on_hand',
         'ledger_anchors',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',
@@ -977,14 +976,15 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
 
     // A NEW key on an already-released wave: 200 with the settled snapshot,
     // no second event, no second audit row.
-    const again = (await release(wave.id).expect(200)).body.wave as Wave;
+    const again = (await release(wave.id, opsToken, noOpIdempotencyKey(tenantId, ulid(), 'waves.release:already-released')).expect(200)).body.wave as Wave;
     expect(again.status).toBe('released');
     expect(again.releasedAt).toBe(released.releasedAt);
     expect(await outboxTypes('wave.released', wave.id)).toBe(1);
     expect(await auditCount('wave.released', wave.id)).toBe(1);
 
-    // A replay under the ORIGINAL key re-serves the stored snapshot.
-    const key = ulid();
+    // A replay under the ORIGINAL key re-serves the stored snapshot (the
+    // wave is already released, so this key's first send is the no-op arm).
+    const key = noOpIdempotencyKey(tenantId, ulid(), 'waves.release:already-released');
     const first = await release(wave.id, opsToken, key).expect(200);
     const replay = await release(wave.id, opsToken, key).expect(200);
     expect(replay.body).toEqual(first.body);
@@ -1073,7 +1073,7 @@ describe('waves: generation, picklists, release and cancellation (e2e, story 4.2
     expect(await outboxTypes('wave.cancelled', wave.id)).toBe(1);
 
     // A NEW key on an already-cancelled wave is an idempotent no-op.
-    expect(((await cancelWave(wave.id).expect(200)).body.wave as Wave).status).toBe('cancelled');
+    expect(((await cancelWave(wave.id, opsToken, noOpIdempotencyKey(tenantId, ulid(), 'waves.cancel:already-cancelled')).expect(200)).body.wave as Wave).status).toBe('cancelled');
     expect(await outboxTypes('wave.cancelled', wave.id)).toBe(1);
 
     const refused = await release(wave.id).expect(409);

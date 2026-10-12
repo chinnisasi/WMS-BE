@@ -93,8 +93,6 @@ describe('channel connections, credentials and config (e2e, story 7-1)', () => {
         'channel_mappings',
         'integration_calls',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'users',
         'tenants',
       ]) {

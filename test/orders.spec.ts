@@ -10,6 +10,7 @@ import { ValkeyClient } from '../src/shared/valkey/valkey.client';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { ORDER_LINE_STATUSES, ORDER_SOURCES, ORDER_STATUSES } from '../src/modules/outbound/order.command';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
@@ -202,12 +203,6 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
         createdTenantIds,
       ]);
       await cleaner.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [
-        createdTenantIds,
-      ]);
-      await cleaner.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [
-        createdTenantIds,
-      ]);
-      await cleaner.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [
         createdTenantIds,
       ]);
       await cleaner.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [
@@ -512,7 +507,8 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     };
     const first = await postOrder(opsToken, payload).expect(201);
     expect((first.body.order as { source: string }).source).toBe('ingested');
-    const second = await postOrder(opsToken, payload).expect(201); // NEW key, same payload
+    // NEW key, same payload — the channel-redelivery no-op arm (story 9-3a's audit guard).
+    const second = await postOrder(opsToken, payload, noOpIdempotencyKey(tenantId, ulid(), 'orders.createOrder:channel-redelivery')).expect(201);
     expect(second.body.order.id).toBe(first.body.order.id as string);
     expect((await orderHolds(skuId)).length).toBe(1); // no second reservation
 
@@ -540,9 +536,11 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     // is the race backstop — the loser releases its own grants and resolves
     // to the winner's snapshot.
     const heldBefore = (await orderHolds(skuId)).filter((hold) => hold.state === 'held');
+    // Whichever loses is a no-op arm (dedup loser, or the redelivery pre-check
+    // when the winner committed first); the winner is audited and never checked.
     const [a, b] = (await Promise.all([
-      postOrder(opsToken, payload).expect(201),
-      postOrder(opsToken, payload).expect(201),
+      postOrder(opsToken, payload, noOpIdempotencyKey(tenantId, ulid(), 'orders.createOrder:dedup-loser')).expect(201),
+      postOrder(opsToken, payload, noOpIdempotencyKey(tenantId, ulid(), 'orders.createOrder:dedup-loser')).expect(201),
     ])) as unknown as [{ body: { order: { id: string } } }, { body: { order: { id: string } } }];
     expect(a.body.order.id).toBe(b.body.order.id);
     // Exactly one order line and one NEW live hold survive (the loser's
@@ -610,7 +608,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/outbound/orders/${orderId}/cancel`)
       .set('Authorization', `Bearer ${opsToken}`)
-      .set(KEY_HEADER, ulid())
+      .set(KEY_HEADER, noOpIdempotencyKey(tenantId, ulid(), 'orders.cancelOrder:already-cancelled'))
       .send({})
       .expect(200);
     const outbox = await sql`
@@ -639,7 +637,11 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
         .set('Authorization', `Bearer ${opsToken}`)
         .set(KEY_HEADER, key)
         .send({});
-    const [a, b] = await Promise.all([cancel(ulid()), cancel(ulid())]);
+    // The racing loser is the already-cancelled no-op arm; the winner is audited.
+    const [a, b] = await Promise.all([
+      cancel(noOpIdempotencyKey(tenantId, ulid(), 'orders.cancelOrder:already-cancelled')),
+      cancel(noOpIdempotencyKey(tenantId, ulid(), 'orders.cancelOrder:already-cancelled')),
+    ]);
     expect(a.status).toBe(200);
     expect(b.status).toBe(200);
     expect(await orderRow(orderId)).toMatchObject({ status: 'cancelled' });

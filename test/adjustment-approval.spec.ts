@@ -131,8 +131,6 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
         'stock_on_hand',
         'bin_state_epochs',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',

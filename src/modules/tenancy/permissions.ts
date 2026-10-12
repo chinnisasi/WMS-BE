@@ -280,7 +280,9 @@ export type Capability = (typeof CAPABILITIES)[number];
  * `eway.manage` (Story 8-2b — e-way paperwork is finance work) and
  * `rates.manage` (Story 21-3 — a client's rate card is finance work) and
  * `billing.invoice` (Story 21-5 — client invoices and tax details). Reads stay
- * open to any tenant member.
+ * open to any tenant member, with two gated exceptions: the channel mappings
+ * read (`channel.manage`) and the audit trail (`audit.view`, story 9-3a —
+ * owner-only, so only `owner` holds it below).
  */
 export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability>>> = {
   owner: new Set<Capability>(CAPABILITIES),

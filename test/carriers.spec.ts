@@ -67,8 +67,6 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
       for (const table of [
         'carrier_connections',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'users',
         'tenants',
       ]) {
@@ -862,14 +860,15 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
     // would read another tenant's row — handing back their connection on a
     // payload-hash match, or 422-ing on a key this tenant never used.
     const { tenantId, token } = await freshTenant();
-    const sharedKey = seededIdempotencyKey(ulid());
+    const foreignTenantId = uuidv7();
+    const sharedKey = seededIdempotencyKey(foreignTenantId, ulid());
 
     const seeder = db();
     try {
       await seeder`
         insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
         values (
-          ${uuidv7()}, ${uuidv7()}, ${sharedKey}, ${'b'.repeat(64)},
+          ${uuidv7()}, ${foreignTenantId}, ${sharedKey}, ${'b'.repeat(64)},
           ${seeder.json({ connection: { id: uuidv7(), tenantId: uuidv7(), carrierCode: 'delhivery', accountLabel: 'someone elses account' } })}
         )
       `;

@@ -97,12 +97,6 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [
         createdTenantIds,
       ]);
-      await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [
-        createdTenantIds,
-      ]);
-      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [
-        createdTenantIds,
-      ]);
       await sql.unsafe('DELETE FROM warehouses WHERE tenant_id = ANY($1::uuid[])', [
         createdTenantIds,
       ]);

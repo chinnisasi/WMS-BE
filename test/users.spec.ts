@@ -79,8 +79,6 @@ describe('users, roles, and permission gating (e2e)', () => {
       // The suite's committed outbox rows must not linger (the relay
       // worker is env-gated OFF in tests — nothing drains them here).
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_imports WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM uom_conversions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -751,7 +749,7 @@ describe('users, roles, and permission gating (e2e)', () => {
     const ownerToken = (await signIn(ownerEmail)).token;
 
     // The foreign tenant already holds a row under the shared key.
-    const sharedKey = seededIdempotencyKey(ulid());
+    const sharedKey = seededIdempotencyKey(foreign.tenantId, ulid());
     const seeder = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await seeder`

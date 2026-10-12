@@ -18,6 +18,7 @@ import { ValkeyClient } from '../src/shared/valkey/valkey.client';
 import { ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { testAddress } from './support/shipment-address';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { declareChannelNoOps } from './support/audit-guard';
 
 // The e2e suite talks to the real Postgres + Valkey and signs sessions; the
 // vault needs a real master key (any ≥32-char string).
@@ -489,8 +490,6 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
         'batch_on_hand',
         'ledger_anchors',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',
@@ -525,6 +524,8 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
   it('the same payload redelivered answers the SAME order as replayed (RD-1 eternal dedup)', async () => {
     const res = await postOrder(connId, orderBody(9_000_000_010_001, [{ sku: 'WH-A', quantity: 3 }])).expect(200);
     expect(res.body.outcome).toBe('replayed');
+    // The redelivery stored its (ingest-minted) key with no audit row — the no-op arm.
+    expect(await declareChannelNoOps(tenantId, res.body.orderId as string, 'orders.createOrder:channel-redelivery')).toBe(1);
     expect(res.body.orderId).toBe(
       (await outbound.findOrderByChannelRef(tenantId, connId, '9000000010001'))!.id,
     );
@@ -540,6 +541,8 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     // pre-checks ran before the winner committed — the honest replayed label
     // is pinned by the sequential redelivery test above.
     expect(second.body.orderId).toBe(first.body.orderId);
+    // The loser (dedup race, or the redelivery pre-check) stored a key with no audit row.
+    expect(await declareChannelNoOps(tenantId, first.body.orderId as string, 'orders.createOrder:dedup-loser')).toBe(1);
     for (const label of [first.body.outcome, second.body.outcome]) {
       expect(['accepted', 'backordered', 'replayed']).toContain(label);
     }
@@ -852,6 +855,7 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     // The redelivery under the SAME (surviving) secret still verifies.
     const res = await postOrder(connId, orderBody(9_000_000_010_001, [{ sku: 'WH-A', quantity: 3 }])).expect(200);
     expect(res.body.outcome).toBe('replayed');
+    expect(await declareChannelNoOps(tenantId, res.body.orderId as string, 'orders.createOrder:channel-redelivery')).toBe(1);
   });
 
   it('a mid-delivery rotate: a delivery signed with the STALE secret answers 401 (the blob is re-read)', async () => {
@@ -864,7 +868,9 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
       .expect(200);
     await postOrder(connId, orderBody(9_000_000_010_001, [{ sku: 'WH-A', quantity: 3 }]), SECRET_ONE).expect(401);
     // And the current secret verifies again.
-    await postOrder(connId, orderBody(9_000_000_010_001, [{ sku: 'WH-A', quantity: 3 }]), SECRET_TWO).expect(200);
+    const fresh = await postOrder(connId, orderBody(9_000_000_010_001, [{ sku: 'WH-A', quantity: 3 }]), SECRET_TWO).expect(200);
+    // A redelivery of the known order — the no-op arm (story 9-3a's audit guard).
+    expect(await declareChannelNoOps(tenantId, fresh.body.orderId as string, 'orders.createOrder:channel-redelivery')).toBe(1);
   });
 
   // ── phase I: the two remaining verification postures (review patch P5/P9) ─

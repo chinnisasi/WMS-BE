@@ -344,8 +344,6 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
         'reservations',
         'stock_on_hand',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',

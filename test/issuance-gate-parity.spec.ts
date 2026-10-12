@@ -11,6 +11,7 @@ import { GSTIN_STATE_CODES, isGstinStateCode } from '../src/shared/primitives/gs
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { addressFingerprint, normalizeAddressInput } from '../src/shared/primitives/address';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
@@ -99,8 +100,6 @@ describe('issuance-gate parity: GSTIN prefix at entry and the buyer legal name (
           'orders',
           'reservations',
           'outbox_messages',
-          'idempotency_keys',
-          'audit_events',
           'catalog_import_errors',
           'catalog_imports',
           'skus',
@@ -424,7 +423,10 @@ describe('issuance-gate parity: GSTIN prefix at entry and the buyer legal name (
       ),
     );
     // The same channel event redelivered with the name trimmed differently resolves to the same order…
-    const again = await postOrder({ ...body, consigneeLegalName: 'Mysore Spices Pvt Ltd' }).expect(201);
+    const again = await postOrder(
+      { ...body, consigneeLegalName: 'Mysore Spices Pvt Ltd' },
+      noOpIdempotencyKey(tenantId, ulid(), 'orders.createOrder:channel-redelivery'),
+    ).expect(201);
     expect(again.body.order.id).toBe(created.body.order.id);
     // …and with a different name it is a source conflict.
     const conflict = await postOrder({ ...body, consigneeLegalName: 'Another Name Ltd' });

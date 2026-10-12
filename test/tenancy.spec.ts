@@ -65,8 +65,6 @@ describe('tenancy (e2e)', () => {
       // The suite's committed outbox rows must not linger (the relay
       // worker is env-gated OFF in tests — nothing drains them here).
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       // Children before parents: bins → zones → warehouses (no FKs, but the
       // order keeps the intent legible).
       await sql.unsafe('DELETE FROM bins WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);

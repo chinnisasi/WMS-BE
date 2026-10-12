@@ -96,8 +96,6 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       // The suite's committed outbox rows must not linger (the relay
       // worker is env-gated OFF in tests — nothing drains them here).
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_imports WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM uom_conversions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -863,7 +861,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       release = resolve;
     });
     try {
-      seededIdempotencyKey(key);
+      seededIdempotencyKey(tenantId, key);
       const holding = blocker.begin(async (tx) => {
         await tx`
           insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)

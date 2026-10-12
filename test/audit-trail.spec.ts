@@ -12,7 +12,7 @@ import { escapeLikePrefix, readAuditPageInTx } from '../src/modules/reporting/au
 import { signTenantSession, tenantSessionSecret } from '../src/modules/tenancy/jwt-session';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
-import { unauditedKeys } from './support/audit-guard';
+import { noOpIdempotencyKey, unauditedKeys } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // Story 9-3a — the audit trail read (FR-28): `GET /tenants/{t}/reporting/audit`,
@@ -278,12 +278,16 @@ describe('the audit trail read (e2e, story 9-3a)', () => {
 
   it('a read past its 5 s budget is 503 report-unavailable ("narrow the filters"), never a partial page', async () => {
     try {
+      let armed: string | undefined;
       reporting.auditRead = async (tx) => {
+        // The facade armed the 5 s budget before handing over the read.
+        armed = ((await tx.execute(dsql`select current_setting('statement_timeout') as t`)) as unknown as { t: string }[])[0]!.t;
         await tx.execute(dsql`select set_config('statement_timeout', '50', true)`);
         await tx.execute(dsql`select pg_sleep(2)`);
         throw new Error('unreachable');
       };
       const res = await audit({}).expect(503);
+      expect(armed).toBe('5s');
       expect(res.body.code).toBe('report-unavailable');
       expect(res.body.items).toBeUndefined();
     } finally {
@@ -298,11 +302,33 @@ describe('the audit trail read (e2e, story 9-3a)', () => {
     try {
       const missing = await unauditedKeys(process.env.DATABASE_URL!);
       expect(missing).toEqual([{ tenantId, key, snapshotKeys: 'probe' }]);
-      // A composite reference carrying the key satisfies it (the pre-9-3a
-      // note / before-after / channel references).
+      // Containment counts ONLY for the named composite-reference actions:
+      // an unlisted action carrying the key inside does not satisfy it…
       await sql`insert into audit_events (id, tenant_id, actor_user_id, action, target_type, target_id, reference, occurred_at)
         values (${uuidv7()}, ${tenantId}, ${ownerUserId}, 'probe.case', 'order', ${uuidv7()}, ${`note: x (key ${key})`}, now())`;
+      expect(await unauditedKeys(process.env.DATABASE_URL!)).toEqual([{ tenantId, key, snapshotKeys: 'probe' }]);
+      // …a client-invoice note (a listed composite) does.
+      await sql`insert into audit_events (id, tenant_id, actor_user_id, action, target_type, target_id, reference, occurred_at)
+        values (${uuidv7()}, ${tenantId}, ${ownerUserId}, 'client_invoice.voided', 'client_invoice', ${uuidv7()}, ${`note: x (key ${key})`}, now())`;
       expect(await unauditedKeys(process.env.DATABASE_URL!)).toEqual([]);
+    } finally {
+      await sql`delete from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`;
+    }
+  });
+
+  it('a declared no-op arm is checked against the stored snapshot: a key the arm does not store is still reported', async () => {
+    const key = ulid();
+    await sql`insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+      values (${uuidv7()}, ${tenantId}, ${key}, 'probe', ${sql.json({ order: { id: uuidv7(), status: 'accepted' } })})`;
+    try {
+      // Declared as the already-cancelled arm, but the order is not cancelled.
+      noOpIdempotencyKey(tenantId, key, 'orders.cancelOrder:already-cancelled');
+      const missing = await unauditedKeys(process.env.DATABASE_URL!);
+      expect(missing.map((row) => row.key)).toEqual([key]);
+      expect(missing[0]!.snapshotKeys).toContain('orders.cancelOrder:already-cancelled');
+      // The exemption is per tenant: the same key under another tenant is not exempt by this declaration.
+      noOpIdempotencyKey(uuidv7(), key, 'orders.createOrder:channel-redelivery');
+      expect((await unauditedKeys(process.env.DATABASE_URL!)).map((row) => row.key)).toEqual([key]);
     } finally {
       await sql`delete from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`;
     }

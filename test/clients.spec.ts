@@ -1000,7 +1000,7 @@ describe('story 21-2b: client admin and attribution', () => {
           const redelivered = await sql<{ key: string }[]>`select key from idempotency_keys
             where tenant_id = ${tenantId} and response_snapshot -> 'order' ->> 'id' = ${first.orderId}
             order by created_at desc, id desc limit 1`;
-          noOpIdempotencyKey(redelivered[0]!.key, 'orders.createOrder:channel-redelivery');
+          noOpIdempotencyKey(tenantId, redelivered[0]!.key, 'orders.createOrder:channel-redelivery');
         } finally {
           await sql`update skus set client_id = ${selfClientId} where id = ${sku('CH-2')}`;
         }
@@ -1527,7 +1527,7 @@ describe('story 21-2b: client admin and attribution', () => {
       it('a same-status request is a no-op: 200 with the current client, no write, no audit — but the key IS stored, under the pinned fingerprint (golden)', async () => {
         const before = await sql<{ updated_at: string }[]>`select updated_at::text from clients where id = ${suspId}`;
         const auditBefore = await auditActions(suspId);
-        const key = noOpIdempotencyKey(ulid(), 'clients.updateStatus:same-status');
+        const key = noOpIdempotencyKey(tenantId, ulid(), 'clients.updateStatus:same-status');
         const res = await setStatus(suspId, 'active', ownerToken, key).expect(200);
         expect(res.body.client).toMatchObject({ id: suspId, status: 'active' });
         expect(await sql`select updated_at::text from clients where id = ${suspId}`).toEqual(before);
@@ -1545,7 +1545,7 @@ describe('story 21-2b: client admin and attribution', () => {
 
       it('a late retry of a stored no-op replays its snapshot and never re-applies after someone else changed the status', async () => {
         await setStatus(suspId, 'suspended').expect(200);
-        const k = noOpIdempotencyKey(ulid(), 'clients.updateStatus:same-status');
+        const k = noOpIdempotencyKey(tenantId, ulid(), 'clients.updateStatus:same-status');
         const noop = await setStatus(suspId, 'suspended', ownerToken, k).expect(200);
         expect(noop.body.client.status).toBe('suspended');
         await setStatus(suspId, 'active', ownerToken, ulid()).expect(200);

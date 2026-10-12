@@ -402,8 +402,6 @@ describe('availability sync: publish, deliver, meter, break, retry (e2e, story 7
         'stock_on_hand',
         'batch_on_hand',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',

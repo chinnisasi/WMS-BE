@@ -313,8 +313,6 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
         'batch_on_hand',
         'stock_on_hand',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',
@@ -1903,7 +1901,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
         'utf8',
       )
       .digest('hex');
-    seededIdempotencyKey(key);
+    seededIdempotencyKey(tenantId, key);
     await sql`
       insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
       values (${uuidv7()}, ${tenantId}, ${key}, ${payloadHash}, ${sql.json(legacy)})
@@ -1964,7 +1962,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
         'utf8',
       )
       .digest('hex');
-    seededIdempotencyKey(key);
+    seededIdempotencyKey(tenantId, key);
     await sql`
       insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
       values (${uuidv7()}, ${tenantId}, ${key}, ${legacyMilliHash}, ${sql.json({ pick: { id: uuidv7() } })})
