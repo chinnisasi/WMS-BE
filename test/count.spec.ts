@@ -10,6 +10,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { MovementsFacade, MAX_SCHEDULED_TASKS_PER_TICK, MAX_SNAPSHOT_COUNT_TASKS } from '../src/modules/movements/transfer.facade';
 import { CountSchedulerWorker, parseCountSchedulerPollMs } from '../src/jobs/jobs.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
@@ -53,6 +54,9 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
   let opsToken: string;
   let operatorToken: string;
   let operatorEmail = '';
+  let ownerUserId = '';
+  let opsUserId = '';
+  let operatorUserId = '';
   let deviceOperatorToken: string; // the operator's badge-in (device) session
   let bareDeviceToken: string; // the SAME device's pre-badge-in enrollment credential
   let accountantToken: string;
@@ -86,6 +90,7 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       .send({ name: `Count Co ${ulid()}`, ownerEmail: email, password: 'correct-horse-battery' })
       .expect(201);
     tenantId = registered.body.tenant.id as string;
+    ownerUserId = registered.body.owner.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
       await request(app.getHttpServer())
@@ -206,9 +211,12 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       ).body.accessToken as string;
       return { userId: invited.body.user.id as string, email: memberEmail, token };
     };
-    opsToken = (await mkMember('ops_manager')).token;
+    const ops = await mkMember('ops_manager');
+    opsToken = ops.token;
+    opsUserId = ops.userId;
     const operator = await mkMember('operator');
     operatorToken = operator.token;
+    operatorUserId = operator.userId;
     operatorEmail = operator.email;
     accountantToken = (await mkMember('accountant')).token;
 
@@ -494,7 +502,12 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
   describe('on-demand create', () => {
     it('stores a pending task with frozen per-SKU expectations and the live epoch', async () => {
       const frozenEpoch = await binEpoch(warehouseId, binA);
-      const res = await createCount({ warehouseId, binId: binA }).expect(201);
+      const createKey = ulid();
+      const res = await createCount({ warehouseId, binId: binA }, opsToken, createKey).expect(201);
+      // Story 9-3a — one audit row naming the task and the planner; the
+      // same-key replay writes no second one.
+      await createCount({ warehouseId, binId: binA }, opsToken, createKey).expect(201);
+      await expectAuditRow({ tenantId, key: createKey, action: 'count.created', targetType: 'count_task', targetId: res.body.countTask.id as string, actorUserId: opsUserId });
       const task = res.body.countTask as Record<string, unknown>;
       expect(task.status).toBe('pending');
       expect(task.origin).toBe('on_demand');
@@ -623,6 +636,8 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       // The replay serves the stored snapshot, byte-identical.
       const replay = await submitCount(binATaskId, body, deviceOperatorToken, key).expect(200);
       expect(replay.body).toEqual(res.body);
+      // Story 9-3a — one audit row naming the task and the badged-in operator.
+      await expectAuditRow({ tenantId, key, action: 'count.submitted', targetType: 'count_task', targetId: binATaskId, actorUserId: operatorUserId });
       // …and a different payload on the same key is a reuse (422).
       const drifted = await submitCount(
         binATaskId,
@@ -1021,6 +1036,8 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       ]);
       const replay = await putPolicies(warehouseId, body, ownerToken, key).expect(200);
       expect(replay.body).toEqual(res.body);
+      // Story 9-3a — one audit row whose target is the policy's warehouse.
+      await expectAuditRow({ tenantId, key, action: 'count_policy.updated', targetType: 'warehouse', targetId: warehouseId, actorUserId: ownerUserId });
     });
 
     it('400s an unknown abc_class and a non-positive interval', async () => {
@@ -1535,6 +1552,26 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       expect(Number(added[0]!.quantity_delta)).toBe(7000);
       expect(added[0]!.to_bin_id).toBe(vbin2);
       expect(added[0]!.actor_user_id).toBe(ownerUserId);
+      // Story 9-3a — the variance links to its correction: the response and
+      // the row say so, and the ledger list filtered by the variance id
+      // lists exactly the posted event, whose referenceDoc names it.
+      expect(res.body.variance.ledgerLinked).toBe(true);
+      const eventId = (res.body.stockCorrection as { eventId: string }).eventId;
+      expect((await sql`select ledger_event_id from count_variances where id = ${v2}::uuid`)[0]).toEqual({ ledger_event_id: eventId });
+      const byVariance = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/warehouses/${warehouseId}/inventory/events`)
+        .query({ countVarianceId: v2 })
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      expect(byVariance.body.items.map((event: { id: string }) => event.id)).toEqual([eventId]);
+      expect(byVariance.body.items[0].referenceDoc).toMatchObject({ kind: 'manual-adjustment', reasonCode: 'stock-count', countVarianceId: v2 });
+      // The queue read carries the flag too.
+      const queue = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/movements/variances`)
+        .query({ status: 'adjusted' })
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      expect((queue.body.items as { id: string; ledgerLinked: boolean }[]).find((item) => item.id === v2)!.ledgerLinked).toBe(true);
       // The outbox echo: the consulted seqs and the frozen threshold.
       const resolvedEvents = await outboxPayloads('count.variance.resolved');
       const forV2 = resolvedEvents.filter((payload) => payload.varianceId === v2);
@@ -1623,6 +1660,8 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
     it('the recount arm: a fresh task becomes the expected basis and the delta recomputes in the SAME write', async () => {
       const res = await resolveVariance(v3, { decision: 'recount' }, ownerToken, ulid()).expect(200);
       expect(res.body.variance.status).toBe('recounted');
+      // Story 9-3a — a recount posts nothing, so it links nowhere.
+      expect(res.body.variance.ledgerLinked).toBe(false);
       expect(res.body.variance.recountTaskId).toBeTruthy();
       expect(res.body.stockCorrection).toBeNull();
       expect(res.body.variance.consideredEventSeqs).toBeNull();

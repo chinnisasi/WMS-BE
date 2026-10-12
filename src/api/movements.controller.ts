@@ -592,7 +592,9 @@ export class MovementsController {
       key,
     );
     return {
-      variance: { ...snapshot.variance },
+      // Story 9-3a: a resolve snapshot stored before 9-3a carries no
+      // `ledgerLinked` — such a resolution recorded no event, so it is false.
+      variance: { ...snapshot.variance, ledgerLinked: snapshot.variance.ledgerLinked ?? false },
       stockCorrection:
         snapshot.stockCorrection === null
           ? null

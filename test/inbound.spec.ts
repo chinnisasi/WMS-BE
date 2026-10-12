@@ -6,6 +6,7 @@ import { toMilli } from '../src/shared/primitives/quantity';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
@@ -28,6 +29,7 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
   let ownerToken: string;
   let warehouseId: string;
   let vendorId: string;
+  let ownerUserId: string;
   const skuIds = new Map<string, string>();
 
   let suiteDb: SuiteDatabase;
@@ -167,6 +169,7 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
       .send({ name: `Inbound Co ${ulid()}`, ownerEmail: email, password: 'correct-horse-battery' })
       .expect(201);
     tenantId = registered.body.tenant.id as string;
+    ownerUserId = registered.body.owner.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
       await request(app.getHttpServer())
@@ -728,6 +731,48 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
   // refused po-not-open before any replay could run. A raw holder locks the
   // PO row; two same-key requests park behind it; on release the loser must
   // re-serve the winner's snapshot.
+  it('story 9-3a — vendor create, PO create, amend and close each write one audit row naming the document and the requester; a replay writes none', async () => {
+    const vendorKey = ulid();
+    const vendorBody = { code: `VA-${ulid().slice(10, 16)}`, name: 'Audited Vendor' };
+    const vendor = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/vendors`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, vendorKey)
+      .send(vendorBody)
+      .expect(201);
+    await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/vendors`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, vendorKey)
+      .send(vendorBody)
+      .expect(201);
+    await expectAuditRow({ tenantId, key: vendorKey, action: 'vendor.created', targetType: 'vendor', targetId: vendor.body.vendor.id as string, actorUserId: ownerUserId });
+
+    const body: PoBody = {
+      warehouseId,
+      vendorId,
+      code: `PO-${ulid().slice(10, 18).toUpperCase()}`,
+      lines: [{ skuId: skuIds.get('INB-A')!, orderedQty: 5, unitCostPaise: 1000 }],
+    };
+    const createKey = ulid();
+    const created = await createPo(body, createKey).expect(201);
+    await createPo(body, createKey).expect(201);
+    const po = created.body.purchaseOrder as { id: string; lines: { id: string }[] };
+    await expectAuditRow({ tenantId, key: createKey, action: 'purchase_order.created', targetType: 'purchase_order', targetId: po.id, actorUserId: ownerUserId });
+
+    const amendKey = ulid();
+    const amendLines = [{ id: po.lines[0]!.id, skuId: skuIds.get('INB-A')!, orderedQty: 6, unitCostPaise: 1000 }];
+    await amendPo(po.id, amendLines, amendKey).expect(200);
+    await amendPo(po.id, amendLines, amendKey).expect(200);
+    await expectAuditRow({ tenantId, key: amendKey, action: 'purchase_order.amended', targetType: 'purchase_order', targetId: po.id, actorUserId: ownerUserId });
+
+    const closeKey = ulid();
+    const closeLines = [{ lineId: po.lines[0]!.id, disposition: 'cancelled' as const }];
+    await closePo(po.id, closeLines, closeKey).expect(200);
+    await closePo(po.id, closeLines, closeKey).expect(200);
+    await expectAuditRow({ tenantId, key: closeKey, action: 'purchase_order.closed', targetType: 'purchase_order', targetId: po.id, actorUserId: ownerUserId });
+  });
+
   describe('same-key races: the replay under the PO lock (story 21-11a)', () => {
     const handle = () => postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
     /** A response as 200, or `"<status> <code>"` — so a failed race names the refusal. */

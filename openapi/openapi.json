@@ -4985,6 +4985,56 @@
             }
           },
           {
+            "name": "grnId",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-3a — only events of this goods receipt (`referenceDoc.grnId`): its receipt events AND its putaway placements",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "poId",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-3a — only events naming this purchase order (`referenceDoc.poId`): its RECEIPT events only — a putaway names its GRN, not the PO",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "transferId",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-3a — only events of this transfer order (`referenceDoc.transferId`) on this warehouse — both legs on its chain",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "adjustmentPendingId",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-3a — only the events an approval posted for this pending adjustment (`referenceDoc.adjustmentPendingId`; approvals from 9-3a on)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "countVarianceId",
+            "required": false,
+            "in": "query",
+            "description": "Story 9-3a — only the correction an approve-adjust resolution posted for this count variance (`referenceDoc.countVarianceId`; resolutions from 9-3a on)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -5017,7 +5067,7 @@
             }
           },
           "400": {
-            "description": "Malformed skuId/binId/orderId query, an unregistered type, a from/to that is not an ISO-8601 instant, from not before to, a shortPick other than true/false, a malformed cursor, or an out-of-range limit (validation-failed / invalid-cursor)",
+            "description": "Malformed skuId/binId/orderId/grnId/poId/transferId/adjustmentPendingId/countVarianceId query, an unregistered type, a from/to that is not an ISO-8601 instant, from not before to, a shortPick other than true/false, a malformed cursor, or an out-of-range limit (validation-failed / invalid-cursor)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -18020,6 +18070,212 @@
         ]
       }
     },
+    "/tenants/{tenantId}/reporting/audit": {
+      "get": {
+        "description": "Owner only (`audit.view`). Ordering, paging and the from/to window all use `recordedAt` (the server commit stamp); the window is half-open [from, to). The trail is complete from story 9-3a onward — earlier actions of some commands were never audited and are not reconstructed. One read under a 5 s budget: a broad filter over a very large history can answer 503 — narrow the filters or the dates.",
+        "operationId": "ReportingController_audit",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "actorUserId",
+            "required": false,
+            "in": "query",
+            "description": "Only actions by this user",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "actionPrefix",
+            "required": false,
+            "in": "query",
+            "description": "Only actions starting with this prefix — a lowercase stem (`transfer.`, `stock_adjustment.`). Matched literally: `_` and `%` are never wildcards",
+            "schema": {
+              "pattern": "^[a-z][a-z_.-]{0,63}$",
+              "example": "transfer.",
+              "type": "string"
+            }
+          },
+          {
+            "name": "targetType",
+            "required": false,
+            "in": "query",
+            "description": "Only actions on this kind of target",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "advance_shipment_notice",
+                "batch_alert",
+                "bin",
+                "carrier_connection",
+                "catalog_import",
+                "channel_connection",
+                "client",
+                "client_invoice",
+                "count_task",
+                "count_variance",
+                "count_variance_policy",
+                "device",
+                "eway_bill",
+                "eway_gstin_setting",
+                "eway_state_threshold",
+                "expiry_alert_policy",
+                "goods_receipt",
+                "kit",
+                "ledger_event",
+                "manifest",
+                "order",
+                "over_receipt",
+                "pick",
+                "picklist_line",
+                "product",
+                "purchase_order",
+                "putaway_placement",
+                "qc_hold",
+                "rate_card",
+                "rejected_op",
+                "reorder_breach",
+                "reorder_policy",
+                "sku",
+                "stock_adjustment_pending",
+                "stock_adjustment_policy",
+                "suggested_po",
+                "temperature_excursion",
+                "tenant",
+                "transfer_order",
+                "user",
+                "vendor",
+                "warehouse",
+                "wave",
+                "wave_policy",
+                "zone"
+              ]
+            }
+          },
+          {
+            "name": "targetId",
+            "required": false,
+            "in": "query",
+            "description": "Only actions on this target",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "Only actions RECORDED at or after this instant (`recordedAt` — the server commit stamp, never `occurredAt`). ISO-8601 with a zone designator",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Only actions RECORDED strictly before this instant (exclusive). Must be after `from`",
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditTrailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed actorUserId/targetId, an actionPrefix outside the stem shape (e.g. carrying `%`), an unknown targetType, a from/to that is not an ISO-8601 instant, from not before to, a malformed cursor, or an out-of-range limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied); a role without `audit.view` — every role but the owner (role-denied); or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The read did not finish within its 5 s budget — narrow the filters or the dates (report-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The tenant's audit trail: every state-changing action — who, what, when, and the document it changed — filterable, newest recorded first (keyset cursor pagination)",
+        "tags": [
+          "reporting"
+        ]
+      }
+    },
     "/tenants/{tenantId}/clients": {
       "get": {
         "operationId": "ClientsController_listClients",
@@ -25692,13 +25948,134 @@
           "updatedAt"
         ]
       },
+      "AdjustmentPendingEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantityDelta": {
+            "type": "number",
+            "description": "Signed base-UoM delta frozen at request"
+          },
+          "reasonCode": {
+            "type": "string",
+            "description": "The closed adjustment vocabulary value"
+          },
+          "note": {
+            "type": "string",
+            "description": "The requester's note, carried verbatim"
+          },
+          "batchOverrideReason": {
+            "type": "string",
+            "nullable": true,
+            "description": "The override draw’s FEFO-override reason (present only on override draws; restored into the approved event’s referenceDoc)"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The resolved catalog batch id (null when the request had none)"
+          },
+          "serialIds": {
+            "nullable": true,
+            "description": "The resolved serial ids, request order (null when the request had none)",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "handlingUnitIds": {
+            "nullable": true,
+            "description": "The named handling units (catch-weight arm), request order (null when absent)",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC business time of the requested adjustment"
+          },
+          "requestedBy": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The requester"
+          },
+          "requestedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC request commit time"
+          },
+          "status": {
+            "type": "string",
+            "description": "pending | approved | rejected — 'pending' on the 202, the decided value on the queue after a decision"
+          },
+          "decidedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "decidedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "thresholdQuantityAtRequest": {
+            "type": "number",
+            "description": "The policy threshold (base UoM) as it read at request time — frozen context"
+          },
+          "ledgerLinked": {
+            "type": "boolean",
+            "description": "True only when an approval posted this adjustment from story 9-3a on (the row recorded its first event): its events are listed by `GET …/inventory/events?adjustmentPendingId=`. False while pending, on a reject, and for an approval decided before 9-3a"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "binId",
+          "skuId",
+          "quantityDelta",
+          "reasonCode",
+          "note",
+          "batchOverrideReason",
+          "batchId",
+          "serialIds",
+          "handlingUnitIds",
+          "occurredAt",
+          "requestedBy",
+          "requestedAt",
+          "status",
+          "decidedBy",
+          "decidedAt",
+          "thresholdQuantityAtRequest",
+          "ledgerLinked"
+        ]
+      },
       "AdjustmentPendingListResponse": {
         "type": "object",
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/AdjustmentPendingDto"
+              "$ref": "#/components/schemas/AdjustmentPendingEntryDto"
             }
           },
           "nextCursor": {
@@ -25801,6 +26178,16 @@
             "type": "string",
             "format": "uuid",
             "description": "Story 21-6 — the exact ASN line credited (grn-receipt arm only)"
+          },
+          "adjustmentPendingId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 9-3a — the pending adjustment an approval posted this event for (manual-adjustment arm, approvals only)"
+          },
+          "countVarianceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 9-3a — the count variance an approve-adjust resolution corrected (manual-adjustment arm, resolutions only)"
           }
         },
         "required": [
@@ -32384,6 +32771,10 @@
               "type": "number"
             }
           },
+          "ledgerLinked": {
+            "type": "boolean",
+            "description": "Story 9-3a — true only when an approve-adjust resolution from 9-3a on posted this variance's correction (the row recorded the event): it is listed by `GET …/inventory/events?countVarianceId=`. False while open, on a recount, and for a resolution before 9-3a"
+          },
           "createdAt": {
             "type": "string"
           }
@@ -32405,6 +32796,7 @@
           "resolvedAt",
           "recountTaskId",
           "consideredEventSeqs",
+          "ledgerLinked",
           "createdAt"
         ]
       },
@@ -35504,6 +35896,91 @@
           "dockToStock",
           "pickAccuracy",
           "dispatchTimeliness"
+        ]
+      },
+      "AuditEventDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "recordedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the server recorded the action (`created_at`) — the trail is ordered, paged and windowed on this"
+          },
+          "occurredAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the action itself happened. Server time for most actions; a few writers (putaway, an offline op resolved later, an excursion) stamp the device or command time, which can be hours before `recordedAt`"
+          },
+          "actorUserId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The acting user — or the reserved system actor when `actorKind` is `system`"
+          },
+          "actorKind": {
+            "type": "string",
+            "enum": [
+              "user",
+              "system"
+            ],
+            "description": "`system`: a scheduler or sweep (no user row); `user`: a member of the tenant"
+          },
+          "action": {
+            "type": "string",
+            "example": "transfer.created",
+            "description": "The action, `<subject>.<verb>`"
+          },
+          "targetType": {
+            "type": "string",
+            "example": "transfer_order",
+            "description": "The kind of thing the action changed (one of the `targetType` filter values)"
+          },
+          "targetId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The id of the thing the action changed"
+          }
+        },
+        "required": [
+          "id",
+          "recordedAt",
+          "occurredAt",
+          "actorUserId",
+          "actorKind",
+          "action",
+          "targetType",
+          "targetId"
+        ]
+      },
+      "AuditTrailResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuditEventDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true,
+            "description": "Cursor for the next (older) page; null on the last page"
+          },
+          "systemActorId": {
+            "type": "string",
+            "enum": [
+              "01900000-0000-7000-8000-000000000000"
+            ],
+            "description": "The reserved system actor's id (schedulers and sweeps; `actorKind: system`) — send it as `actorUserId` to list the system's actions. Published here so no client hard-codes it"
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor",
+          "systemActorId"
         ]
       },
       "ClientTaxDetailsDto": {

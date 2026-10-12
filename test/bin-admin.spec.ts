@@ -12,6 +12,7 @@ import { BinCommand } from '../src/modules/tenancy/bin.command';
 import { LOCATION_TYPES } from '../src/shared/primitives/location-type';
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { seededIdempotencyKey } from './support/audit-guard';
 import { importSecureSku } from './support/secure-sku';
 import { testAddress } from './support/shipment-address';
 
@@ -867,6 +868,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     };
     const seed = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
+      seededIdempotencyKey(key);
       await seed`
         insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
         values (${uuidv7()}, ${tenantId}, ${key}, ${payloadHash}, ${seed.json(legacySnapshot)})`;
@@ -1610,6 +1612,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     };
     const seed = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
+      seededIdempotencyKey(key);
       await seed`
         insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
         values (${uuidv7()}, ${tenantId}, ${key}, ${payloadHash}, ${seed.json(legacySnapshot)})`;

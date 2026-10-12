@@ -92,6 +92,12 @@ export interface AdjustmentPendingEntry {
   readonly decidedBy: string | null;
   readonly decidedAt: string | null;
   readonly thresholdQuantityAtRequest: number;
+  /**
+   * Story 9-3a — true only when the row recorded the event its approval
+   * posted (`ledger_event_id`): the web links "View ledger" from it. False
+   * while pending, on a reject, and on every row approved before 9-3a.
+   */
+  readonly ledgerLinked: boolean;
   readonly createdAt: string;
 }
 
@@ -170,6 +176,7 @@ function pendingEntry(row: typeof stockAdjustmentPendings.$inferSelect): Adjustm
     decidedBy: row.decidedBy,
     decidedAt: row.decidedAt === null ? null : canonicalInstant(row.decidedAt),
     thresholdQuantityAtRequest: row.thresholdQuantityAtRequest,
+    ledgerLinked: row.ledgerEventId !== null,
     createdAt: canonicalInstant(row.createdAt),
   };
 }
@@ -376,9 +383,10 @@ export class AdjustmentApprovalCommand {
    * the arm-required parity checks, the serial locks, the handling-unit
    * write-off and `appendMovement` — the approved events carry the DECISION
    * time as their business time and the approver as their actor, with the
-   * referenceDoc byte-identical to what the same request would have produced
-   * immediately (the stored `batch_override_reason` rides
-   * `approvedOverrideReason`).
+   * referenceDoc the same request would have produced immediately (the
+   * stored `batch_override_reason` rides `approvedOverrideReason`) PLUS, since
+   * story 9-3a, `adjustmentPendingId` — so it is no longer byte-identical;
+   * the pending row records the first posted event in `ledger_event_id`.
    *
    * If the re-execution fails any guard (bin retired since, on-hand starved
    * since, a handling unit no longer active, the SKU became a kit) the whole
@@ -453,6 +461,8 @@ export class AdjustmentApprovalCommand {
       const decisionEvent = `stock_adjustment.${status}`;
 
       let events: AdjustmentDecisionSnapshot['events'] = [];
+      // Story 9-3a — the first event an approval posted (null on reject).
+      let ledgerEventId: string | null = null;
       let onHand: AdjustmentDecisionSnapshot['onHand'] = null;
       if (command.decision === 'approve') {
         // The stored arms re-execute through the SAME internals the immediate
@@ -479,9 +489,14 @@ export class AdjustmentApprovalCommand {
           batchRef: row.batchId,
           serialRefs: row.serialIds ?? undefined,
           handlingUnitIds: row.handlingUnitIds ?? undefined,
-          // The override draw's restored referenceDoc field — byte-identical
-          // to what the same request would have produced immediately.
+          // The override draw's restored referenceDoc field (the reason the
+          // immediate path would have recorded).
           approvedOverrideReason: row.batchOverrideReason ?? undefined,
+          // Story 9-3a — the approved events name this pending adjustment, so
+          // it links to them. The approved referenceDoc is therefore NO LONGER
+          // byte-identical to the immediate path's (deliberately — the
+          // invariant 5-2 kept is retired); `fingerprint` is unaffected.
+          adjustmentPendingId: row.id,
         };
         await this.stockAdjustment.assertAdjustableInTx(tx, rebuilt);
         const applied = await this.stockAdjustment.applyAdjustmentInTx(
@@ -493,6 +508,7 @@ export class AdjustmentApprovalCommand {
         );
         events = [applied.snapshot.event];
         onHand = applied.snapshot.onHand;
+        ledgerEventId = applied.firstEventId;
       }
 
       // The terminal transition is CONDITIONAL — a concurrent duplicate (or a
@@ -504,7 +520,7 @@ export class AdjustmentApprovalCommand {
       // `.for('update')` braces.
       const decided = await tx
         .update(stockAdjustmentPendings)
-        .set({ status, decidedBy: command.actorUserId, decidedAt, updatedAt: decidedAt })
+        .set({ status, decidedBy: command.actorUserId, decidedAt, ledgerEventId, updatedAt: decidedAt })
         .where(and(eq(stockAdjustmentPendings.id, row.id), eq(stockAdjustmentPendings.status, 'pending')))
         .returning({ id: stockAdjustmentPendings.id });
       if (decided.length === 0) {
@@ -552,7 +568,7 @@ export class AdjustmentApprovalCommand {
       });
 
       const snapshot: AdjustmentDecisionSnapshot = {
-        pendingAdjustment: pendingEntry({ ...row, status, decidedBy: command.actorUserId, decidedAt }),
+        pendingAdjustment: pendingEntry({ ...row, status, decidedBy: command.actorUserId, decidedAt, ledgerEventId }),
         events,
         onHand,
       };

@@ -206,8 +206,21 @@ export const auditEvents = pgTable(
     occurredAt: timestamp('occurred_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
     ...tenantTimestamps,
   },
+  // Story 9-3a (0069): the audit read pages on `created_at` (the server
+  // stamp), so the old `(tenant_id, occurred_at)` index — which nothing
+  // reads — is replaced by the read's four shapes: the unfiltered page, the
+  // actor filter, the target filter, and the action-prefix `LIKE`
+  // (`text_pattern_ops`, so a prefix match can use the index under any
+  // collation).
   (table) => [
-    index('audit_events_tenant_id_occurred_at_idx').on(table.tenantId, table.occurredAt),
+    index('audit_events_tenant_created_idx').on(table.tenantId, table.createdAt.desc(), table.id.desc()),
+    index('audit_events_tenant_actor_created_idx').on(table.tenantId, table.actorUserId, table.createdAt.desc()),
+    index('audit_events_tenant_target_idx').on(table.tenantId, table.targetType, table.targetId),
+    index('audit_events_tenant_action_created_idx').on(
+      table.tenantId,
+      table.action.op('text_pattern_ops'),
+      table.createdAt.desc(),
+    ),
   ],
 );
 
@@ -3012,6 +3025,12 @@ export const stockAdjustmentPendings = pgTable(
     status: text('status').notNull().default('pending'),
     decidedBy: uuid('decided_by'),
     decidedAt: timestamp('decided_at', { withTimezone: true, mode: 'string' }),
+    /**
+     * Story 9-3a — the first ledger event an APPROVAL posted (its events name
+     * this row in `referenceDoc.adjustmentPendingId`). Null while pending, on
+     * a reject, and on every row decided before 9-3a — those show no link.
+     */
+    ledgerEventId: uuid('ledger_event_id'),
     /** The policy threshold as it read at request time (base units). */
     thresholdQuantityAtRequest: integer('threshold_quantity_at_request').notNull(),
     ...tenantTimestamps,
@@ -3260,6 +3279,12 @@ export const countVariances = pgTable(
     recountTaskId: uuid('recount_task_id'),
     /** The ledger seqs the resolution states it consulted (5-4; null = none stated). */
     consideredEventSeqs: jsonb('considered_event_seqs').$type<number[]>(),
+    /**
+     * Story 9-3a — the correction event an `adjusted` resolution posted (it
+     * names this row in `referenceDoc.countVarianceId`). Null while open, on
+     * a recount, and on every row resolved before 9-3a — those show no link.
+     */
+    ledgerEventId: uuid('ledger_event_id'),
     ...tenantTimestamps,
   },
   (table) => [

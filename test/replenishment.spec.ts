@@ -11,6 +11,7 @@ import { ReplenishmentFacade, MAX_REPLENISHMENT_SCOPES_PER_TICK } from '../src/m
 import { REPLENISHMENT_SCHEDULER_ACTOR_ID, poCodeForDraft, poMintKey } from '../src/modules/replenishment/replenishment.command';
 import { ReplenishmentSchedulerWorker, parseReplenishmentPollMs } from '../src/jobs/jobs.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
@@ -828,6 +829,20 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       .send({ quantityMilli: 5500 })
       .expect(200);
     expect(replayed.body).toEqual(submitted.body);
+
+    // Story 9-3a — the submit writes TWO audit rows: its own
+    // `replenishment.suggested_po_submitted` (above) and the minted PO's
+    // `purchase_order.created` under the inner key, whose actor is the
+    // submitting user — never the system actor. The replay wrote neither again.
+    expect(await auditRows('replenishment.suggested_po_submitted', tenantId)).toHaveLength(1);
+    await expectAuditRow({
+      tenantId,
+      key: poMintKey(dA.id),
+      action: 'purchase_order.created',
+      targetType: 'purchase_order',
+      targetId: po.id,
+      actorUserId: rpA.resolved_by!,
+    });
 
     // Not a draft: a fresh key (any edits) is 409 suggested-po-submitted.
     const refused = await request(app.getHttpServer())

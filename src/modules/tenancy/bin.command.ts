@@ -371,6 +371,18 @@ export class BinCommand {
           capacity: assertWholeUnitCapacity(command.capacity),
         });
 
+        // Story 9-3a — the audit row (skeleton step 10).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'bin.created',
+          targetType: 'bin',
+          targetId: bin.id,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+
         try {
           await tx.insert(idempotencyKeys).values({
             id: uuidv7(),
@@ -543,6 +555,18 @@ export class BinCommand {
             firstCode: codes[0]!,
             lastCode: codes[codes.length - 1]!,
           },
+        });
+
+        // Story 9-3a — the audit row (skeleton step 10).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'bin.grid_generated',
+          targetType: 'zone',
+          targetId: command.zoneId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
         });
 
         try {

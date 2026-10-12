@@ -146,11 +146,22 @@ export interface AdjustStockCommand {
    * arms it has the resolved `batchRef` but no batch object, so it passes the
    * stored reason here instead; `adjustToSnapshot` resolves the referenceDoc
    * field as `command.batch?.overrideReason ?? command.approvedOverrideReason`,
-   * making the approved event's referenceDoc byte-identical to what the same
-   * request would have produced immediately. Always undefined on the HTTP
-   * immediate path.
+   * restoring the referenceDoc field the immediate path would have written.
+   * Always undefined on the HTTP immediate path.
    */
   readonly approvedOverrideReason?: string | undefined;
+  /**
+   * Story 9-3a — the pending adjustment an APPROVAL is posting: rides the
+   * referenceDoc as `adjustmentPendingId` so the document links to its
+   * events. Set only by the approval path; undefined on the HTTP path.
+   */
+  readonly adjustmentPendingId?: string | undefined;
+  /**
+   * Story 9-3a — the count variance an approve-adjust RESOLUTION is
+   * correcting: rides the referenceDoc as `countVarianceId`. Set only by the
+   * count resolution; undefined on the HTTP path.
+   */
+  readonly countVarianceId?: string | undefined;
 }
 
 /**
@@ -1149,8 +1160,14 @@ export class StockAdjustmentCommand {
     // 400-requires it exactly on an override draw); the approval path
     // carries it on `approvedOverrideReason`, restored from the pend row
     // (the pend stores the RESOLVED arms, so the raw batch input does not
-    // survive). Both make the referenceDoc byte-identical — the approved
-    // event shows the timeline exactly what the immediate path would have.
+    // survive). Both carry the same override reason.
+    //
+    // Story 9-3a: the approved referenceDoc is NO LONGER byte-identical to
+    // the immediate path's — deliberately. An approval adds
+    // `adjustmentPendingId` and a count resolution `countVarianceId`, so the
+    // document can link to its events. Both keys are OMITTED when absent
+    // (never null), so an immediate adjustment — and every pre-9-3a event —
+    // hashes exactly as before. The idempotency `fingerprint` is untouched.
     const overrideReason = command.batch?.overrideReason ?? command.approvedOverrideReason;
     const referenceDoc = {
       kind: 'manual-adjustment' as const,
@@ -1160,6 +1177,8 @@ export class StockAdjustmentCommand {
       ...(adjustedHandlingUnitIds === undefined
         ? {}
         : { handlingUnitIds: adjustedHandlingUnitIds }),
+      ...(command.adjustmentPendingId === undefined ? {} : { adjustmentPendingId: command.adjustmentPendingId }),
+      ...(command.countVarianceId === undefined ? {} : { countVarianceId: command.countVarianceId }),
     };
 
     // Zero deltas are rejected upstream (`assertNonZeroDelta`), so `< 0` /

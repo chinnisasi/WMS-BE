@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { idempotencyKeys, products, skus } from '../../shared/db/schema';
+import { auditEvents, idempotencyKeys, products, skus } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
@@ -152,6 +152,18 @@ export class ProductCommand {
           occurredAt: nowIso(),
           payload: { productId: snapshot.id, name: snapshot.name, axes: snapshot.axes },
         });
+        // Story 9-3a — the audit row (skeleton step 10).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'product.created',
+          targetType: 'product',
+          targetId: snapshot.id,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+
         try {
           // 6. The idempotency key is the commit marker — written LAST.
           await tx.insert(idempotencyKeys).values({
@@ -316,6 +328,18 @@ export class ProductCommand {
           occurredAt: nowIso(),
           payload: { productId: row.id, name: row.name, axes: row.axes },
         });
+        // Story 9-3a — the audit row (skeleton step 10).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'product.edited',
+          targetType: 'product',
+          targetId: row.id,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+
         try {
           await tx.insert(idempotencyKeys).values({
             id: uuidv7(),

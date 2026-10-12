@@ -2275,6 +2275,12 @@ describe('architecture: the client portal (story 21-7)', () => {
     expect(offenders).toEqual([]);
   });
 
+  it('story 9-3a: the audit trail is never a portal read — not on PORTAL_READS, not a delegation, never called by the portal controller', () => {
+    expect(PORTAL_READS.flatMap(({ methods }) => methods)).not.toContain('auditTrail');
+    expect(PORTAL_DELEGATIONS.map(({ method, target }) => [method, target]).flat()).not.toContain('auditTrail');
+    expect(readFileSync(PORTAL_CONTROLLER, 'utf8')).not.toMatch(/auditTrail|reporting\/audit/);
+  });
+
   /** A method's whole body, comments dropped and whitespace normalised (null when it cannot be parsed). */
   function delegationStatement(body: string): string | null {
     const inner = /\)\s*(?::\s*[^{]+)?\{([\s\S]*)\}\s*$/.exec(body.trimEnd());
@@ -2361,5 +2367,135 @@ describe('architecture: the client portal (story 21-7)', () => {
     expect(
       portalControllerOffenders('const asn = await this.inbound.announceAsn({ tenantId, clientId: session.clientId, lines }, key);', fields, allowed),
     ).toEqual([]);
+  });
+});
+
+describe('architecture: the audit read is reporting\'s THIRD read-only exception (story 9-3a)', () => {
+  /**
+   * Human decision 2 (2026-10-12): the audit trail read lives in reporting
+   * as its third named exception (IMPLEMENTATION-GUIDE §7a), on the
+   * narrowest terms — it reads `audit_events` and nothing else. The
+   * directory-wide reporting guards above (writes nothing, owns no table,
+   * only the api shell imports it) cover it too; these are its own.
+   */
+  const AUDIT_READ = join(SRC_ROOT, 'modules', 'reporting', 'audit.ts');
+  const source = readFileSync(AUDIT_READ, 'utf8');
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+  /** The names a file imports from the schema module. */
+  function schemaImports(text: string): string[] {
+    return [...text.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+'[./]*shared\/db\/schema'/g)].flatMap((match) =>
+      match[1]!.split(',').map((name) => name.trim()).filter((name) => name.length > 0),
+    );
+  }
+
+  /** Every snake_case table-ish identifier named after FROM/JOIN/INTO/UPDATE in raw SQL. */
+  function rawTableNames(text: string): string[] {
+    return [...text.matchAll(/\b(?:from|join|into|update)\s+"?([a-z_][a-z0-9_]*)"?/gi)].map((match) => match[1]!);
+  }
+
+  it('the detectors bite', () => {
+    expect(schemaImports("import { auditEvents, users } from '../../shared/db/schema';")).toEqual(['auditEvents', 'users']);
+    expect(rawTableNames('sql`select 1 from audit_events a join users u on true`')).toEqual(['audit_events', 'users']);
+  });
+
+  it('imports only `auditEvents` from the schema', () => {
+    expect(schemaImports(source)).toEqual(['auditEvents']);
+  });
+
+  it('names no table but audit_events in raw SQL', () => {
+    // Drizzle builder calls (`.from(auditEvents)`) are covered by the import
+    // pin; this catches a raw `from <table>` / `join <table>` in a template.
+    const sqlTemplates = [...code.matchAll(/sql(?:<[^>]*>)?`([^`]*)`/g)].map((match) => match[1]!);
+    expect(sqlTemplates.length).toBeGreaterThan(0);
+    expect(sqlTemplates.flatMap(rawTableNames).filter((name) => name !== 'audit_events')).toEqual([]);
+  });
+
+  it('contains no join (no second table can enter the read)', () => {
+    expect(/join/i.test(code)).toBe(false);
+  });
+
+  it('the role check is the facade\'s, in its own transaction — never in the read model', () => {
+    expect(code).not.toMatch(/getMemberRoleIn|assertPermission|\busers\b/);
+    const facade = readFileSync(join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), 'utf8');
+    expect(facade).toMatch(/assertPermission\(await getMemberRoleIn\(tx, tenantId, actorUserId\), 'audit\.view'\)/);
+  });
+});
+
+describe('architecture: the audit rule — every keyed command writes its audit row (story 9-3a, static half)', () => {
+  /**
+   * The dynamic half (`assertEveryKeyAudited`, every suite's teardown)
+   * proves it for the paths the suites drive; this scan covers every file
+   * under src/modules, so a keyed writer no suite reaches (invoicing's
+   * manual generate, the client invoices) still cannot drop its audit row.
+   */
+  const KEY_WRITE = /\.insert\(\s*idempotencyKeys\b/;
+  const AUDIT_REF = /\bauditEvents\b/;
+
+  it('the detector bites', () => {
+    expect(KEY_WRITE.test('await tx.insert(idempotencyKeys).values({})')).toBe(true);
+    expect(KEY_WRITE.test('tx.select().from(idempotencyKeys)')).toBe(false);
+  });
+
+  it('every src/modules file that writes idempotencyKeys also references auditEvents', () => {
+    const writers = files.filter((file) => file.path.startsWith(join(SRC_ROOT, 'modules')) && KEY_WRITE.test(file.source));
+    // Meaningful: the keyed writers really are found (40 files when 9-3a landed).
+    expect(writers.length).toBeGreaterThanOrEqual(35);
+    expect(writers.some((file) => file.path.endsWith(join('invoicing', 'command.ts')))).toBe(true);
+    expect(writers.some((file) => file.path.endsWith(join('billing', 'client-invoices.ts')))).toBe(true);
+    expect(writers.filter((file) => !AUDIT_REF.test(file.source)).map((file) => file.path)).toEqual([]);
+  });
+});
+
+describe('architecture: AUDIT_TARGET_TYPES is the audit vocabulary (story 9-3a)', () => {
+  /**
+   * The audit read's `targetType` filter is an enum published in
+   * openapi.json (the web select is generated from it), so it must hold
+   * EVERY target type a writer can store — and nothing no writer uses. Two
+   * writers pick the type dynamically; their possible values are listed here.
+   */
+  const DYNAMIC_WRITERS: Readonly<Record<string, readonly string[]>> = {
+    [join(SRC_ROOT, 'modules', 'outbound', 'pick.command.ts')]: ['picklist_line', 'pick'],
+    [join(SRC_ROOT, 'modules', 'invoicing', 'eway.command.ts')]: ['eway_bill', 'eway_state_threshold', 'eway_gstin_setting'],
+  };
+
+  /** Literal `targetType: '…'` values, plus the e-way `audit(tx, …, '<action>', '<targetType>', …)` helper calls. */
+  function literalTargetTypes(text: string): string[] {
+    return [
+      ...[...text.matchAll(/targetType:\s*'([a-z_]+)'/g)].map((match) => match[1]!),
+      ...[...text.matchAll(/\baudit\(tx,\s*[a-zA-Z]+,\s*(?:'[^']*'|[a-zA-Z]+),\s*'([a-z_]+)'/g)].map((match) => match[1]!),
+    ];
+  }
+
+  it('the detector bites', () => {
+    expect(literalTargetTypes("targetType: 'transfer_order',")).toEqual(['transfer_order']);
+    expect(literalTargetTypes("await audit(tx, command, 'eway.exported', 'eway_bill', id, key);")).toEqual(['eway_bill']);
+  });
+
+  it('holds every literal target type written under src, and none no writer uses', async () => {
+    const { AUDIT_TARGET_TYPES } = await import('../src/shared/primitives/audit');
+    const written = new Set<string>();
+    for (const file of files) {
+      if (file.path.endsWith(join('shared', 'primitives', 'audit.ts'))) continue;
+      for (const type of literalTargetTypes(file.source)) written.add(type);
+    }
+    for (const [path, types] of Object.entries(DYNAMIC_WRITERS)) {
+      expect(files.some((file) => file.path === path)).toBe(true);
+      for (const type of types) written.add(type);
+    }
+    expect([...AUDIT_TARGET_TYPES].sort()).toEqual([...written].sort());
+  });
+
+  it('every AUDIT_NEW_ACTIONS row is pinned by an expectAuditRow assertion in some suite', async () => {
+    const { AUDIT_NEW_ACTIONS } = await import('../src/shared/primitives/audit');
+    const suites = tsFilesUnder(TEST_ROOT)
+      .filter((path) => path.endsWith('.spec.ts'))
+      .map((path) => readFileSync(path, 'utf8'))
+      .filter((text) => text.includes('expectAuditRow('));
+    const pinned = (action: string, targetType: string): boolean =>
+      suites.some((text) =>
+        new RegExp(`expectAuditRow\\(\\{[^}]*action: '${action.replace(/\./g, '\\.')}',[^}]*targetType: '${targetType}'`).test(text),
+      );
+    expect(AUDIT_NEW_ACTIONS.filter(({ action, targetType }) => !pinned(action, targetType)).map(({ action }) => action)).toEqual([]);
   });
 });

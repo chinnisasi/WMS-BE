@@ -614,7 +614,7 @@ export class InventoryController {
     type: LedgerEventListResponse,
     description: "The warehouse's ledger event-timeline page (newest first, keyset cursor)",
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed skuId/binId/orderId query, an unregistered type, a from/to that is not an ISO-8601 instant, from not before to, a shortPick other than true/false, a malformed cursor, or an out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed skuId/binId/orderId/grnId/poId/transferId/adjustmentPendingId/countVarianceId query, an unregistered type, a from/to that is not an ISO-8601 instant, from not before to, a shortPick other than true/false, a malformed cursor, or an out-of-range limit (validation-failed / invalid-cursor)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
@@ -636,6 +636,11 @@ export class InventoryController {
       to: query.to,
       orderId: query.orderId,
       shortPick: query.shortPick,
+      grnId: query.grnId,
+      poId: query.poId,
+      transferId: query.transferId,
+      adjustmentPendingId: query.adjustmentPendingId,
+      countVarianceId: query.countVarianceId,
       cursor: query.cursor,
       limit: query.limit,
     };

@@ -14,6 +14,7 @@ import {
 import type { UserRole } from '../src/shared/db/schema';
 import type { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
@@ -750,7 +751,7 @@ describe('users, roles, and permission gating (e2e)', () => {
     const ownerToken = (await signIn(ownerEmail)).token;
 
     // The foreign tenant already holds a row under the shared key.
-    const sharedKey = ulid();
+    const sharedKey = seededIdempotencyKey(ulid());
     const seeder = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await seeder`
@@ -881,7 +882,10 @@ describe('users, roles, and permission gating (e2e)', () => {
     // everything (the fence keeps owner tokens off portal routes and the
     // command's client re-check refuses a user without a client); never by
     // ops_manager, operator or accountant (they key ASNs via `asn.manage`).
-    expect([...CAPABILITIES]).toHaveLength(41);
+    // Story 9-3a grows it to 42 with `audit.view` — the audit trail read,
+    // OWNER-ONLY (decision 3: the trail names every member's actions).
+    expect([...CAPABILITIES]).toHaveLength(42);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('audit.view'))).toEqual(['owner']);
     expect(CAPABILITIES).toContain('asn.announce');
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('asn.announce'))).toEqual(['owner', 'client']);
     expect([...ROLE_CAPABILITIES.client]).toEqual(['asn.announce']);

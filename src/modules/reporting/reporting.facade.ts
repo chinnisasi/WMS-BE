@@ -5,7 +5,11 @@ import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
+import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
+import { assertPermission } from '../tenancy/permissions';
+import type { Page } from '../../shared/primitives/pagination';
+import { armAuditDeadline, AUDIT_STATEMENT_TIMEOUT_MS, readAuditPageInTx } from './audit';
+import type { AuditTrailEntry, AuditTrailQuery } from './audit';
 import { assertClientInTenantInTx } from '../clients/clients.facade';
 import { TILES, TILE_STATEMENT_TIMEOUT_MS, TILE_TX_DEADLINES } from './kpis';
 import type { OverviewTiles, ReportingScope, TileContext, TileDefinition, TileName } from './kpis';
@@ -47,6 +51,8 @@ export type {
   ServiceReport,
 } from './service';
 export { MAX_SERVICE_REPORT_DAYS, SERVICE_STATEMENT_TIMEOUT_MS, SERVICE_TARGET_HOURS } from './service';
+export type { AuditActorKind, AuditTrailEntry, AuditTrailQuery } from './audit';
+export { AUDIT_ACTION_PREFIX_RE, AUDIT_DEFAULT_LIMIT, AUDIT_MAX_LIMIT, AUDIT_STATEMENT_TIMEOUT_MS } from './audit';
 
 /** Story 21-8 — the service report's query: an inclusive IST date period, optionally one warehouse. */
 export interface ServiceReportQuery {
@@ -239,6 +245,45 @@ export class ReportingFacade {
       dispatchTimeliness: figures.dispatchTimeliness,
     };
   }
+
+  /**
+   * Story 9-3a — the tenant's audit trail (FR-28), reporting's third
+   * read-only exception (`audit.ts`). OWNER-ONLY: the guard reads the
+   * caller's role and asserts `audit.view` in its OWN transaction first (the
+   * `channels.facade` gated-read shape) — 403 `role-denied` before anything
+   * of the trail is read — so the read model itself touches `audit_events`
+   * only. The read then runs in one tenant transaction under a 5 s budget; a
+   * timeout is 503 `report-unavailable` (a broad filter over a very large
+   * history is expected to hit it — narrow the filters or dates).
+   */
+  async auditTrail(tenantId: string, actorUserId: string, query: AuditTrailQuery): Promise<Page<AuditTrailEntry>> {
+    await withTenantTransaction(this.db, tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, tenantId, actorUserId), 'audit.view');
+    });
+    try {
+      return await withTenantTransaction(this.db, tenantId, async (tx) => {
+        await armAuditDeadline(tx);
+        return this.auditRead(tx, tenantId, query);
+      });
+    } catch (err) {
+      if (isStatementTimeout(err)) {
+        throw new ProblemException(
+          'report-unavailable',
+          503,
+          'Report unavailable',
+          `The audit trail did not finish within ${AUDIT_STATEMENT_TIMEOUT_MS / 1000} s — narrow the filters or the dates.`,
+        );
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Story 9-3a — the audit page read, inside the timed transaction. A plain
+   * field so a suite can force a statement timeout without a second
+   * production code path (the `serviceRead` precedent).
+   */
+  auditRead: (tx: TenantTx, tenantId: string, query: AuditTrailQuery) => Promise<Page<AuditTrailEntry>> = readAuditPageInTx;
 
   /** A statement timeout anywhere in the read is 503 `report-unavailable` — never a partial report. */
   private async readService(run: () => Promise<ServiceReport>): Promise<ServiceReport> {

@@ -1,4 +1,5 @@
 import postgres from 'postgres';
+import { assertEveryKeyAudited } from './audit-guard';
 
 /**
  * infra-1: one database per e2e suite.
@@ -65,6 +66,14 @@ export async function useSuiteDatabase(suite: string): Promise<SuiteDatabase> {
   return {
     name,
     async drop() {
+      // Story 9-3a — the audit rule's dynamic guard runs at every suite's
+      // teardown, before the database goes; the drop happens either way.
+      let auditFailure: unknown = null;
+      try {
+        await assertEveryKeyAudited(suiteUrl);
+      } catch (err) {
+        auditFailure = err;
+      }
       process.env.DATABASE_URL = original;
       delete process.env.DATABASE_AUTH_URL;
       const cleaner = adminHandle(original);
@@ -75,6 +84,9 @@ export async function useSuiteDatabase(suite: string): Promise<SuiteDatabase> {
         await cleaner.unsafe(`drop database if exists "${name}"`);
       } finally {
         await cleaner.end();
+      }
+      if (auditFailure !== null) {
+        throw auditFailure;
       }
     },
   };

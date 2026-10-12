@@ -7,6 +7,7 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { expectAuditRow } from './support/audit-guard';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions — the same bootstrap
@@ -48,6 +49,7 @@ describe('product variants (e2e, story 11-3)', () => {
   const createdTenantIds: string[] = [];
 
   let tenantId: string;
+  let ownerUserId: string;
   let ownerToken: string;
   const skuIds = new Map<string, string>();
   const productIds = new Map<string, string>();
@@ -83,6 +85,7 @@ describe('product variants (e2e, story 11-3)', () => {
       .send({ name: `Variants Co ${ulid()}`, ownerEmail: email, password: 'correct-horse-battery' })
       .expect(201);
     tenantId = registered.body.tenant.id as string;
+    ownerUserId = registered.body.owner.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = await request(app.getHttpServer())
       .post(`${API}/sign-in`)
@@ -675,5 +678,32 @@ describe('product variants (e2e, story 11-3)', () => {
         '/tenants/{tenantId}/catalog/products/{productId}',
       ]),
     );
+  });
+
+  it('story 9-3a — product create and edit, SKU edit and a catalog import each write one audit row naming the target and the requester; a replay writes none', async () => {
+    const createKey = ulid();
+    const body = { name: `Audited ${ulid()}`, axes: ['size'] };
+    const created = await createProduct(body, createKey).expect(201);
+    await createProduct(body, createKey).expect(201);
+    const productId = created.body.id as string;
+    await expectAuditRow({ tenantId, key: createKey, action: 'product.created', targetType: 'product', targetId: productId, actorUserId: ownerUserId });
+
+    const editKey = ulid();
+    const edit = { name: `Audited edit ${ulid()}` };
+    await patchProduct(productId, edit, editKey).expect(200);
+    await patchProduct(productId, edit, editKey).expect(200);
+    await expectAuditRow({ tenantId, key: editKey, action: 'product.edited', targetType: 'product', targetId: productId, actorUserId: ownerUserId });
+
+    const skuKey = ulid();
+    const skuId = skuByCode('VAR-PLAIN').id;
+    await patchSku(skuId, { name: 'Audited plain' }, skuKey).expect(200);
+    await patchSku(skuId, { name: 'Audited plain' }, skuKey).expect(200);
+    await expectAuditRow({ tenantId, key: skuKey, action: 'sku.edited', targetType: 'sku', targetId: skuId, actorUserId: ownerUserId });
+
+    const importKey = ulid();
+    const file = csvFile([{ sku_code: 'AUD-IMP', name: 'Audited import', uom: 'pcs', gst_rate: '1800' }], 'sku_code,name,uom,gst_rate,barcode');
+    const imported = await importCsv(file, importKey).expect(201);
+    await importCsv(file, importKey).expect(201);
+    await expectAuditRow({ tenantId, key: importKey, action: 'catalog_import.executed', targetType: 'catalog_import', targetId: imported.body.importId as string, actorUserId: ownerUserId });
   });
 });

@@ -256,6 +256,8 @@ export interface CountVarianceEntry {
   readonly recountTaskId: string | null;
   /** The ledger seqs the resolution stated it consulted; null when none stated. */
   readonly consideredEventSeqs: number[] | null;
+  /** Story 9-3a — the row recorded the correction it posted (see `varianceEntry`). */
+  readonly ledgerLinked: boolean;
   readonly createdAt: string;
 }
 
@@ -382,6 +384,10 @@ export function varianceEntry(row: typeof countVariances.$inferSelect): CountVar
     resolvedAt: row.resolvedAt === null ? null : canonicalInstant(row.resolvedAt),
     recountTaskId: row.recountTaskId,
     consideredEventSeqs: row.consideredEventSeqs ?? null,
+    // Story 9-3a — true only when the row recorded its posted correction
+    // (`adjusted` from 9-3a on); false while open, on a recount, and on every
+    // row resolved before 9-3a.
+    ledgerLinked: row.ledgerEventId !== null,
     // The queue read keys its cursor on the FULL-precision instant beside
     // this; the body keeps the canonical (ms) shape.
     createdAt: canonicalInstant(row.createdAt),
@@ -609,6 +615,18 @@ export class CountService {
             expectedQuantity: fromMilli(line.expectedQuantity),
           })),
         };
+
+        // Story 9-3a — the audit row (skeleton step 10).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'count.created',
+          targetType: 'count_task',
+          targetId: taskId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
 
         try {
           await tx.insert(idempotencyKeys).values({
@@ -1004,6 +1022,20 @@ export class CountService {
           recountTaskId,
         };
 
+        // Story 9-3a — the audit row (skeleton step 10). A submit applied from
+        // a rejected op carries the original operator as its actor (the
+        // sync-report apply passes it); `occurred_at` stays server time.
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'count.submitted',
+          targetType: 'count_task',
+          targetId: command.taskId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+
         try {
           await tx.insert(idempotencyKeys).values({
             id: uuidv7(),
@@ -1298,6 +1330,9 @@ export class CountService {
             // The correction's business time is the DECISION time (the
             // 5-2 approved-events discipline).
             occurredAt: resolvedAt,
+            // Story 9-3a — the correction names this variance, so the
+            // variance links to its event (the row records it below).
+            countVarianceId: variance.id,
           };
           await this.inventory.assertAdjustableInTx(tx, rebuilt);
           const applied = await this.inventory.applyAdjustmentInTx(
@@ -1379,6 +1414,9 @@ export class CountService {
             resolvedAt,
             recountTaskId,
             consideredEventSeqs: statedSeqs.length > 0 ? statedSeqs : null,
+            // Story 9-3a — the posted correction (adjusted only; a recount
+            // posts nothing and stays null).
+            ledgerEventId: stockCorrection?.eventId ?? null,
             updatedAt: resolvedAt,
           })
           .where(
@@ -1606,6 +1644,19 @@ export class CountService {
         const snapshot: CountPoliciesSnapshot = {
           policies: rows.map((row) => ({ abcClass: row.abcClass, intervalDays: row.intervalDays })),
         };
+
+        // Story 9-3a — the audit row (skeleton step 10).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'count_policy.updated',
+          targetType: 'warehouse',
+          targetId: command.warehouseId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+
 
         try {
           await tx.insert(idempotencyKeys).values({

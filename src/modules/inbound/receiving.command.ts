@@ -1134,6 +1134,19 @@ export class ReceivingCommand {
         });
       }
 
+      // Story 9-3a — the audit row (step 10). The actor is the operator the
+      // op was recorded by — on a replayed handheld op, the original one.
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.operatorUserId,
+        action: 'goods_receipt.submitted',
+        targetType: 'goods_receipt',
+        targetId: grnId,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
+
       // ── device heartbeat + idempotency key (the invariant order's tail) ──
       await tx
         .update(devices)

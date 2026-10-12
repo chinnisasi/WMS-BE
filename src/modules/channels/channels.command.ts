@@ -925,6 +925,8 @@ export class ChannelsCommandService {
         action: 'channels.disconnected',
         targetType: 'channel_connection',
         targetId: existing.id,
+        // Story 9-3a — the audit rule: the row names its idempotency key.
+        reference: idempotencyKey,
         occurredAt: nowIso(),
       });
       try {

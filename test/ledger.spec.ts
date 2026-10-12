@@ -9,6 +9,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
@@ -862,6 +863,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       release = resolve;
     });
     try {
+      seededIdempotencyKey(key);
       const holding = blocker.begin(async (tx) => {
         await tx`
           insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)

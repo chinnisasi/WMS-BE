@@ -423,6 +423,12 @@ export class CountVarianceEntryResponseDto {
   @ApiProperty({ nullable: true, type: [Number], description: 'The consulted ledger seqs' })
   consideredEventSeqs!: number[] | null;
 
+  @ApiProperty({
+    description:
+      'Story 9-3a — true only when an approve-adjust resolution from 9-3a on posted this variance\'s correction (the row recorded the event): it is listed by `GET …/inventory/events?countVarianceId=`. False while open, on a recount, and for a resolution before 9-3a',
+  })
+  ledgerLinked!: boolean;
+
   @ApiProperty()
   createdAt!: string;
 }

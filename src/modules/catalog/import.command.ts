@@ -6,6 +6,7 @@ import { Workbook, type CellValue } from 'exceljs';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
+  auditEvents,
   catalogImportErrors,
   catalogImports,
   idempotencyKeys,
@@ -863,6 +864,18 @@ export class ImportCommand {
             skippedRows: snapshot.skippedRows,
           },
         });
+        // Story 9-3a — the audit row (skeleton step 10).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'catalog_import.executed',
+          targetType: 'catalog_import',
+          targetId: importId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+
         try {
           await tx.insert(idempotencyKeys).values({
             id: uuidv7(),

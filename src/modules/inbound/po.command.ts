@@ -3,6 +3,7 @@ import { and, eq, inArray } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
+  auditEvents,
   idempotencyKeys,
   purchaseOrderLines,
   purchaseOrders,
@@ -308,6 +309,10 @@ export class PurchaseOrderCommand {
       payload: { purchaseOrder: snapshot.purchaseOrder },
     });
 
+    // Story 9-3a — the audit row (step 10). On the replenishment submit's
+    // in-tx path the actor is the submitting user (the command carries it),
+    // so that submit writes two rows: this one and its own suggested_po row.
+    await this.auditInTx(tx, command.tenantId, command.actorUserId, 'purchase_order.created', po.id, idempotencyKey);
     await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
     return snapshot;
   }
@@ -472,6 +477,7 @@ export class PurchaseOrderCommand {
         payload: { purchaseOrder: snapshot.purchaseOrder },
       });
 
+      await this.auditInTx(tx, command.tenantId, command.actorUserId, 'purchase_order.amended', po.id, idempotencyKey);
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
       return { snapshot, replayed: false };
     });
@@ -631,6 +637,7 @@ export class PurchaseOrderCommand {
       });
 
       const closeSnapshot: ClosePoSnapshot = { purchaseOrder: closed.purchaseOrder, successor };
+      await this.auditInTx(tx, command.tenantId, command.actorUserId, 'purchase_order.closed', po.id, idempotencyKey);
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, closeSnapshot);
       return { snapshot: closeSnapshot, replayed: false };
     });
@@ -662,6 +669,27 @@ export class PurchaseOrderCommand {
       throw idempotencyKeyReuse();
     }
     return row.responseSnapshot;
+  }
+
+  /** Story 9-3a — one purchase-order audit row, `reference` = the idempotency key, server time. */
+  private async auditInTx(
+    tx: TenantTx,
+    tenantId: string,
+    actorUserId: string,
+    action: 'purchase_order.created' | 'purchase_order.amended' | 'purchase_order.closed',
+    poId: string,
+    idempotencyKey: string,
+  ): Promise<void> {
+    await tx.insert(auditEvents).values({
+      id: uuidv7(),
+      tenantId,
+      actorUserId,
+      action,
+      targetType: 'purchase_order',
+      targetId: poId,
+      reference: idempotencyKey,
+      occurredAt: nowIso(),
+    });
   }
 
   private async writeIdempotencyKey(

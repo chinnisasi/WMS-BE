@@ -9,6 +9,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { open as openSealed } from '../src/shared/crypto/envelope';
 import { signDeviceToken, tenantSessionSecret } from '../src/modules/tenancy/jwt-session';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { expectAuditRow, seededIdempotencyKey } from './support/audit-guard';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -710,7 +711,7 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
     const { tenantId } = await registerTenant(email);
     const ownerToken = await signIn(email);
 
-    const sharedKey = ulid();
+    const sharedKey = seededIdempotencyKey(ulid());
     const seeder = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       await seeder`
@@ -735,5 +736,25 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
     expect(enrolled.body.device.tenantId).toBe(tenantId);
     expect(enrolled.body.device.label).toContain('Shared-key scanner');
     expect(enrolled.body.deviceToken).not.toBe('not-ours');
+  });
+
+  it('story 9-3a — device enroll writes one audit row naming the device, whose actor is the user who MINTED the code (enrollment has no session); a replay writes none', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const { tenantId } = await registerTenant(email);
+    const ownerToken = await signIn(email);
+    const ops = await createMember(ownerToken, tenantId, 'ops_manager');
+    const minted = await mintCode(ops.token, tenantId).expect(201);
+    const key = ulid();
+    const body = { code: minted.body.code as string, label: 'audited device', pin: '2468' };
+    const enrolled = await enroll(tenantId, body, key).expect(201);
+    await enroll(tenantId, body, key).expect(201);
+    await expectAuditRow({
+      tenantId,
+      key,
+      action: 'device.enrolled',
+      targetType: 'device',
+      targetId: enrolled.body.device.id as string,
+      actorUserId: ops.userId,
+    });
   });
 });

@@ -12,6 +12,7 @@ import { SHORT_PICK_REASON_CODES } from '../src/modules/outbound/pick.command';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { getLedgerEventType } from '../src/modules/inventory/ledger-registry';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { seededIdempotencyKey } from './support/audit-guard';
 import { importSecureSku } from './support/secure-sku';
 import { testAddress } from './support/shipment-address';
 
@@ -1902,6 +1903,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
         'utf8',
       )
       .digest('hex');
+    seededIdempotencyKey(key);
     await sql`
       insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
       values (${uuidv7()}, ${tenantId}, ${key}, ${payloadHash}, ${sql.json(legacy)})
@@ -1962,6 +1964,7 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
         'utf8',
       )
       .digest('hex');
+    seededIdempotencyKey(key);
     await sql`
       insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
       values (${uuidv7()}, ${tenantId}, ${key}, ${legacyMilliHash}, ${sql.json({ pick: { id: uuidv7() } })})
