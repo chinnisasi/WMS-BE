@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, eq, inArray, isNotNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { notificationReads, notifications } from '../../shared/db/schema';
@@ -73,6 +73,15 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
 const KNOWN_SOURCE_TYPES: ReadonlySet<string> = new Set(NOTIFICATION_SOURCE_TYPES);
 
 /**
+ * Story 9-3b — the per-user audience: an entry with a recipient is served
+ * only to that member. Every capability-routed source has none, so its rows
+ * pass unchanged.
+ */
+function addressedTo(userId: string) {
+  return or(isNull(notifications.recipientUserId), eq(notifications.recipientUserId, userId));
+}
+
+/**
  * Story 9-2 — the notification panel's reads and the one write a reader
  * makes (its last-opened time). Every method re-reads the caller's role in
  * its own tenant transaction (the role is never taken from the token) and
@@ -127,6 +136,7 @@ export class NotificationsFacade {
             eq(notifications.tenantId, tenantId),
             inArray(notifications.sourceType, visible),
             isNotNull(notifications.summary),
+            addressedTo(userId),
             before === undefined
               ? undefined
               : sql`(${notifications.raisedAt}, ${notifications.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -174,6 +184,7 @@ export class NotificationsFacade {
             eq(notifications.tenantId, tenantId),
             inArray(notifications.sourceType, visible),
             isNotNull(notifications.summary),
+            addressedTo(userId),
             sql`${notifications.resolvedAt} is null`,
             sql`(${notificationReads.lastOpenedAt} is null or ${notifications.surfacedAt} > ${notificationReads.lastOpenedAt})`,
           ),

@@ -15,6 +15,8 @@ import {
   SYNC_HEALTH_STATES,
 } from '../modules/reporting/reporting.facade';
 import type { ServiceReport } from '../modules/reporting/reporting.facade';
+import { AUDIT_EXPORT_FAILURE_REASONS, AUDIT_EXPORT_STATUSES } from '../modules/tenancy/audit-export.command';
+import type { AuditExportSnapshot } from '../modules/tenancy/audit-export.command';
 
 /**
  * Story 9-1 — the Overview's response shape. One flat DTO class per tile
@@ -456,8 +458,13 @@ export function toServiceReportDto(report: ServiceReport): ServiceReportDto {
 
 const AUDIT_ACTOR_KINDS = ['user', 'system'] as const;
 
-/** `GET /tenants/{t}/reporting/audit` — every filter optional, combined with AND. */
-export class AuditTrailQueryDto {
+/**
+ * The audit trail's filters — every one optional, combined with AND. Story
+ * 9-3b split them out of `AuditTrailQueryDto` so the export request (its
+ * body) and the export's stored `filters` are the very same shape as the
+ * paged read's query.
+ */
+export class AuditFilterBaseDto {
   @ApiProperty({ required: false, format: 'uuid', description: 'Only actions by this user' })
   @IsOptional()
   @Matches(UUID_RE, { message: 'actorUserId must be a uuid' })
@@ -508,7 +515,10 @@ export class AuditTrailQueryDto {
   @IsOptional()
   @IsInstant()
   to?: string;
+}
 
+/** `GET /tenants/{t}/reporting/audit` — the filters plus the page. */
+export class AuditTrailQueryDto extends AuditFilterBaseDto {
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()
@@ -566,4 +576,90 @@ export class AuditTrailResponse {
       'The reserved system actor\'s id (schedulers and sweeps; `actorKind: system`) — send it as `actorUserId` to list the system\'s actions. Published here so no client hard-codes it',
   })
   systemActorId!: typeof SYSTEM_ACTOR_ID;
+}
+
+// ── Story 9-3b — the async audit export ──────────────────────────────────────
+
+/**
+ * `POST /tenants/{t}/reporting/audit/exports` — the filters to export (the
+ * web sends the APPLIED filters). An empty body exports the whole trail, up
+ * to the 1,000,000-event cap.
+ */
+export class AuditExportRequestDto extends AuditFilterBaseDto {}
+
+export class AuditExportDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({
+    enum: AUDIT_EXPORT_STATUSES,
+    description:
+      '`queued` → `running` → `ready` or `failed`; a finished export `expired` 7 days after it finished (its file deleted, the row kept as history)',
+  })
+  status!: (typeof AUDIT_EXPORT_STATUSES)[number];
+
+  @ApiProperty({
+    type: AuditFilterBaseDto,
+    description: 'The filters exported — absent keys omitted, `from`/`to` canonical UTC (`to` is exclusive)',
+  })
+  filters!: AuditFilterBaseDto;
+
+  @ApiProperty({ format: 'date-time', description: 'When it was requested — the file holds the trail as of this instant' })
+  requestedAt!: string;
+
+  @ApiProperty({ type: String, format: 'date-time', nullable: true })
+  startedAt!: string | null;
+
+  @ApiProperty({ type: String, format: 'date-time', nullable: true })
+  finishedAt!: string | null;
+
+  @ApiProperty({ type: String, format: 'date-time', nullable: true, description: 'When a finished export expires (7 days after it finished)' })
+  expiresAt!: string | null;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'The events in the file (ready, and kept when it expires)' })
+  rowCount!: number | null;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'The gzipped file size in bytes' })
+  byteSize!: number | null;
+
+  @ApiProperty({ type: String, nullable: true, description: 'sha256 (hex) of the UNCOMPRESSED CSV bytes, BOM included' })
+  sha256!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    enum: [...AUDIT_EXPORT_FAILURE_REASONS, null],
+    description:
+      '`too-many-events`: the filters matched more than 1,000,000 events — narrow the filters or dates; `interrupted`: the worker stopped three times — run it again; `export-error`: something went wrong — run it again',
+  })
+  failureReason!: (typeof AUDIT_EXPORT_FAILURE_REASONS)[number] | null;
+}
+
+export class AuditExportListResponse {
+  @ApiProperty({ type: [AuditExportDto], description: "The caller's own last 20 exports, newest first (unpaged)" })
+  items!: AuditExportDto[];
+}
+
+/** The export onto the wire — key by key, never a spread of the stored row. */
+export function toAuditExportDto(snapshot: AuditExportSnapshot): AuditExportDto {
+  const filters: AuditFilterBaseDto = {};
+  if (snapshot.filters.actorUserId !== undefined) filters.actorUserId = snapshot.filters.actorUserId;
+  if (snapshot.filters.actionPrefix !== undefined) filters.actionPrefix = snapshot.filters.actionPrefix;
+  if (snapshot.filters.targetType !== undefined) filters.targetType = snapshot.filters.targetType as AuditTargetType;
+  if (snapshot.filters.targetId !== undefined) filters.targetId = snapshot.filters.targetId;
+  if (snapshot.filters.from !== undefined) filters.from = snapshot.filters.from;
+  if (snapshot.filters.to !== undefined) filters.to = snapshot.filters.to;
+  return {
+    id: snapshot.id,
+    status: snapshot.status,
+    filters,
+    requestedAt: snapshot.requestedAt,
+    startedAt: snapshot.startedAt,
+    finishedAt: snapshot.finishedAt,
+    expiresAt: snapshot.expiresAt,
+    rowCount: snapshot.rowCount,
+    byteSize: snapshot.byteSize,
+    sha256: snapshot.sha256,
+    failureReason: snapshot.failureReason,
+  };
 }

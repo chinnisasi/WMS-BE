@@ -368,7 +368,10 @@ describe('notifications (e2e, story 9-2)', () => {
       const def = (rows[0] as { def: string }).def;
       const inList = [...def.matchAll(/'([a-z-]+)'::text/g)].map((match) => match[1]);
       expect([...inList].sort()).toEqual([...NOTIFICATION_SOURCE_TYPES].sort());
-      expect(CASES.map((c) => c.sourceType)).toEqual([...NOTIFICATION_SOURCE_TYPES]);
+      // Story 9-3b: CASES are the eight capability-routed 9-2 sources, whose
+      // behaviour this suite pins unchanged; the ninth, the per-user
+      // `audit-export`, is pinned in test/audit-export.spec.ts.
+      expect([...CASES.map((c) => c.sourceType), 'audit-export']).toEqual([...NOTIFICATION_SOURCE_TYPES]);
     });
 
     it('the subscriber listens for exactly the emitters’ event types (the new events pinned to their constants)', () => {
@@ -644,7 +647,9 @@ describe('notifications (e2e, story 9-2)', () => {
     it('a member sees only the sources it can act on: owner all eight, ops manager six, operator and accountant none (and no dot)', async () => {
       const typesOf = async (token: string): Promise<string[]> =>
         (await allEntries(tenant.tenantId, token)).map((item) => item.sourceType as string).sort();
-      expect(await typesOf(tenant.ownerToken)).toEqual([...NOTIFICATION_SOURCE_TYPES].sort());
+      // The owner sees every 9-2 source raised here (9-3b's per-user
+      // `audit-export` is only ever addressed to one requester — none here).
+      expect(await typesOf(tenant.ownerToken)).toEqual(CASES.map((c) => c.sourceType).sort());
       expect(await typesOf(tenant.opsToken)).toEqual(
         ['over-receipt', 'rejected-op', 'reorder-breach', 'batch-alert', 'qc-hold', 'channel-sync'].sort(),
       );

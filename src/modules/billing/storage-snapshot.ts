@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, asc, eq, gte, lte, sql } from 'drizzle-orm';
 import { storageSnapshotProgress, storageSnapshots } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
+import { openSessionsInTx } from '../../shared/db/open-transactions';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { addIsoDays, istDateOf, istMidnightOf } from '../../shared/primitives/time';
 import { assertClientInTenantInTx } from '../clients/clients.facade';
@@ -257,27 +258,13 @@ export class StorageSnapshotService {
   }
 
   /**
-   * (b)'s probe: the oldest `xact_start` among OTHER client backends of this
-   * database with an open transaction, and whether any such backend is
-   * hidden from this role (`<insufficient privilege>` — its transaction
-   * state unreadable).
+   * (b)'s probe — the shared §7d probe (`shared/db/open-transactions.ts`,
+   * moved there in story 9-3b when the audit export became its second
+   * user). Kept as a method so the metering suite can stand in a hidden
+   * session; the behaviour is unchanged.
    */
   private async openSessionsInTx(tx: TenantTx): Promise<{ oldestXactStart: string | null; hidden: boolean; hiddenCount: number }> {
-    const [row] = (await tx.execute(sql`
-      select
-        min(xact_start) filter (where xact_start is not null) as "oldest",
-        count(*) filter (where state is null or query = '<insufficient privilege>')::int as "hidden"
-      from pg_stat_activity
-      where datname = current_database()
-        and backend_type = 'client backend'
-        and pid <> pg_backend_pid()
-    `)) as unknown as { oldest: string | Date | null; hidden: number }[];
-    const hiddenCount = Number(row?.hidden ?? 0);
-    return {
-      oldestXactStart: row?.oldest == null ? null : new Date(row.oldest).toISOString(),
-      hidden: hiddenCount > 0,
-      hiddenCount,
-    };
+    return openSessionsInTx(tx);
   }
 
   /** The drift check, once per IST day per scope — or whenever the watermark advanced. */

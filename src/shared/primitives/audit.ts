@@ -43,6 +43,8 @@ export const SYSTEM_ACTOR_ID = '01900000-0000-7000-8000-000000000000';
  */
 export const AUDIT_TARGET_TYPES = [
   'advance_shipment_notice',
+  // Story 9-3b — the async audit export (`audit_export.requested`).
+  'audit_export',
   'batch_alert',
   'bin',
   'carrier_connection',
@@ -121,4 +123,6 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'count.submitted', targetType: 'count_task' },
   { action: 'count_policy.updated', targetType: 'warehouse' },
   { action: 'device.enrolled', targetType: 'device' },
+  // Story 9-3b — the export request (tenancy's `AuditExportCommand`).
+  { action: 'audit_export.requested', targetType: 'audit_export' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];
