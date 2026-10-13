@@ -6,6 +6,7 @@ import { MAX_QUANTITY_BASE, MAX_QUANTITY_MILLI, fromMilli } from '../src/shared/
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
@@ -157,8 +158,6 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       await sql.unsafe('DELETE FROM purchase_orders WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM vendors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM uom_conversions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_imports WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -1750,5 +1749,20 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       grnBody([{ poLineId: open.lineId, skuId: plainSkuId, batchCode: null, mfgDate: null, qty: 2 }], open.poId),
     ).expect(201);
     expect((res.body.goodsReceipt as { code: string }).code).toMatch(/^GRN-\d+$/);
+  });
+
+  it('story 9-3a — grn.submit writes one audit row naming the GRN and the operator who recorded it; a replay writes none', async () => {
+    const key = ulid();
+    const body = grnBody([{ poLineId: null, skuId: batchSkuId, batchCode: 'LOT-AUD-1', mfgDate: '2026-08-01T00:00:00Z', qty: 1 }]);
+    const res = await submitGrn(body, operatorToken, key).expect(201);
+    await submitGrn(body, operatorToken, key).expect(201);
+    await expectAuditRow({
+      tenantId,
+      key,
+      action: 'goods_receipt.submitted',
+      targetType: 'goods_receipt',
+      targetId: (res.body.goodsReceipt as { id: string }).id,
+      actorUserId: operatorUserId,
+    });
   });
 });

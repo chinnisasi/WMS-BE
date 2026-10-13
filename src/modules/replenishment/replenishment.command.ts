@@ -28,6 +28,7 @@ import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
+import { SYSTEM_ACTOR_ID } from '../../shared/primitives/audit';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InboundFacade } from '../inbound/inbound.facade';
 import type { PurchaseOrderSnapshot } from '../inbound/po.command';
@@ -45,13 +46,11 @@ import { appendBatchAlertCleared, appendBreachCleared } from './replenishment.ev
  */
 
 /**
- * The module-reserved audit actor: `audit_events.actor_user_id` is NOT NULL
- * and no system-actor user row exists, so the sweep's detection audit rows
- * ride this constant. It is NOT sign-in-able — no user row, no session —
- * merely a reserved uuid the audit trail can name (`01900000-…`, a UUIDv7
- * shape minted for the epoch the module was carved out in).
+ * The module-reserved audit actor — since story 9-3a the shared
+ * `SYSTEM_ACTOR_ID` (`shared/primitives/audit.ts`), re-exported under its
+ * original name so the sweep, the expiry scan and their tests are unchanged.
  */
-export const REPLENISHMENT_SCHEDULER_ACTOR_ID = '01900000-0000-7000-8000-000000000000';
+export const REPLENISHMENT_SCHEDULER_ACTOR_ID = SYSTEM_ACTOR_ID;
 
 /** The policy upsert's milli ceiling — the one bound, derived from the scale (the MAX_VARIANCE_THRESHOLD_BASE derivation). */
 export const MAX_REPLENISHMENT_MILLI = MAX_QUANTITY_MILLI;

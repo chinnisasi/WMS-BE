@@ -422,8 +422,6 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
         'batch_on_hand',
         'stock_on_hand',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',

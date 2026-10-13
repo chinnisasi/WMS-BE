@@ -44,6 +44,25 @@ export type LedgerReferenceDoc =
        * whose canonical bytes are therefore unchanged.
        */
       readonly handlingUnitIds?: readonly string[];
+      /**
+       * Story 9-3a — the pending adjustment an approval posted (set ONLY by
+       * `AdjustmentApprovalCommand.decide`'s approve arm), so the adjustment
+       * links to its events (`GET …/inventory/events?adjustmentPendingId=`).
+       *
+       * Optional and additive, and OMITTED when absent — never `null`: the
+       * canonical bytes `JSON.stringify` hashes drop an absent key, so every
+       * event without it (all pre-9-3a events, every immediate adjustment)
+       * keeps its bytes. Pinned by `test/adjustment-approval.spec.ts` (the
+       * immediate path's hash recomputes from the three pre-9-3a keys, and
+       * a `null` key would change it).
+       */
+      readonly adjustmentPendingId?: string;
+      /**
+       * Story 9-3a — the count variance a resolution corrected (set ONLY by
+       * `CountCommandService.resolveCountVariance`'s approve-adjust arm).
+       * Optional, additive and omitted when absent, like `adjustmentPendingId`.
+       */
+      readonly countVarianceId?: string;
     }
   // Story 3.3 — the receipt arm: every `grn.received` movement names the GRN
   // it landed under, and (when received against a purchase order) the PO and

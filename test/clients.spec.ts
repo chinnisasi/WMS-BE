@@ -24,6 +24,7 @@ import { ChannelsIngestCommand } from '../src/modules/channels/channels.ingest.c
 import { CLIENT_STATUS_TARGETS, ClientsCommand } from '../src/modules/clients/clients.command';
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
@@ -743,9 +744,12 @@ describe('story 21-2b: client admin and attribution', () => {
           .set('Authorization', `Bearer ${token}`)
           .set(KEY_HEADER, ulid())
           .send({ clientId });
+      // The SKU's own audit rows (`target_type = 'sku'`): since 9-3a a kit
+      // SKU also carries its `kit.created` row (`target_type = 'kit'`, the
+      // same id), which is not a correction.
       const auditOf = (skuId: string) =>
         sql<{ action: string; target_type: string; reference: string }[]>`
-          select action, target_type, reference from audit_events where tenant_id = ${tenantId} and target_id = ${skuId} order by occurred_at`;
+          select action, target_type, reference from audit_events where tenant_id = ${tenantId} and target_id = ${skuId} and target_type = 'sku' order by occurred_at`;
 
       it('a SKU with no history moves (200, audited from → to); a non-owner is 403; unknown client 404; a no-op writes nothing', async () => {
         await importCsv(['MISFILED,Misfiled,pcs,1800,,,'], { clientId: selfClientId }).expect(201);
@@ -991,6 +995,12 @@ describe('story 21-2b: client admin and attribution', () => {
         try {
           const again = await deliver(ref, ['EXT-CH1', 'EXT-CH2']);
           expect(again).toEqual({ outcome: 'replayed', orderId: first.orderId });
+          // The redelivery's key is minted inside the ingest — find it to
+          // declare the no-op arm (story 9-3a's audit guard).
+          const redelivered = await sql<{ key: string }[]>`select key from idempotency_keys
+            where tenant_id = ${tenantId} and response_snapshot -> 'order' ->> 'id' = ${first.orderId}
+            order by created_at desc, id desc limit 1`;
+          noOpIdempotencyKey(tenantId, redelivered[0]!.key, 'orders.createOrder:channel-redelivery');
         } finally {
           await sql`update skus set client_id = ${selfClientId} where id = ${sku('CH-2')}`;
         }
@@ -1517,7 +1527,7 @@ describe('story 21-2b: client admin and attribution', () => {
       it('a same-status request is a no-op: 200 with the current client, no write, no audit — but the key IS stored, under the pinned fingerprint (golden)', async () => {
         const before = await sql<{ updated_at: string }[]>`select updated_at::text from clients where id = ${suspId}`;
         const auditBefore = await auditActions(suspId);
-        const key = ulid();
+        const key = noOpIdempotencyKey(tenantId, ulid(), 'clients.updateStatus:same-status');
         const res = await setStatus(suspId, 'active', ownerToken, key).expect(200);
         expect(res.body.client).toMatchObject({ id: suspId, status: 'active' });
         expect(await sql`select updated_at::text from clients where id = ${suspId}`).toEqual(before);
@@ -1535,7 +1545,7 @@ describe('story 21-2b: client admin and attribution', () => {
 
       it('a late retry of a stored no-op replays its snapshot and never re-applies after someone else changed the status', async () => {
         await setStatus(suspId, 'suspended').expect(200);
-        const k = ulid();
+        const k = noOpIdempotencyKey(tenantId, ulid(), 'clients.updateStatus:same-status');
         const noop = await setStatus(suspId, 'suspended', ownerToken, k).expect(200);
         expect(noop.body.client.status).toBe('suspended');
         await setStatus(suspId, 'active', ownerToken, ulid()).expect(200);

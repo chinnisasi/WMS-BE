@@ -869,6 +869,9 @@ export class OrderCommandService {
           // channel source — the connection + the channel ref, never a
           // secret — so "where did this order come from" answers from the
           // audit trail alone. A manual order keeps the idempotency key.
+          // Story 9-3a: the ingested reference also names the per-delivery
+          // idempotency key (an additive sibling of `channel`), so the audit
+          // rule's guard can tie every committed key to its row.
           reference:
             command.source === 'ingested' && command.integrationId !== undefined
               ? JSON.stringify({
@@ -876,6 +879,7 @@ export class OrderCommandService {
                     connectionId: command.integrationId,
                     externalEventId: command.externalEventId ?? null,
                   },
+                  key: idempotencyKey,
                 })
               : idempotencyKey,
           occurredAt: nowIso(),

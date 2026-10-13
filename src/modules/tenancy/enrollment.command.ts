@@ -478,6 +478,41 @@ export class EnrollmentCommand {
         expiresInSeconds: DEVICE_SESSION_TTL_SECONDS,
         offlineStoreKeySealed: sealOfflineStoreKey(offlineStoreKey),
       };
+
+      // Story 9-3a — the audit row (step 10). Enrollment is unauthenticated
+      // (the device has no session yet), so the actor is the user who MINTED
+      // the code, read from that device's own `device.enrollment_code_minted`
+      // row (the mint has always written it, in the same transaction as the
+      // pending device row).
+      const mintRows = await tx
+        .select({ actorUserId: auditEvents.actorUserId })
+        .from(auditEvents)
+        .where(
+          and(
+            eq(auditEvents.tenantId, pending.tenantId),
+            eq(auditEvents.action, 'device.enrollment_code_minted'),
+            eq(auditEvents.targetId, pending.id),
+          ),
+        )
+        .limit(1);
+      if (mintRows[0] === undefined) {
+        // Unreachable through the API (the mint has always written its row in
+        // the same transaction as the pending device). A code nobody can be
+        // named as having minted is refused like any other unusable code —
+        // the one indistinguishable 400, and the rollback un-burns it —
+        // never an untyped 500 and never an enrollment with no actor.
+        throw enrollmentCodeInvalid();
+      }
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: pending.tenantId,
+        actorUserId: mintRows[0].actorUserId,
+        action: 'device.enrolled',
+        targetType: 'device',
+        targetId: pending.id,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
       try {
         await tx.insert(idempotencyKeys).values({
           id: uuidv7(),

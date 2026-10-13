@@ -9,6 +9,7 @@ import { ADJUSTMENT_REASON_CODES } from '../src/modules/inventory/adjustment-rea
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { eventHashOf } from '../src/modules/inventory/ledger.service';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
@@ -130,8 +131,6 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
         'stock_on_hand',
         'bin_state_epochs',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',
@@ -534,6 +533,37 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
     expect(mine!.target_type).toBe('ledger_event');
     expect(mine!.target_id).toBe(res.body.event.id);
     expect(mine!.actor_user_id).toBe(opsUserId);
+
+    // Story 9-3a — the omit-not-null rule: an immediate adjustment carries
+    // NEITHER new key (absent, never null), so its canonical bytes are the
+    // pre-9-3a bytes. The stored hash recomputes from exactly the three old
+    // keys, and a `null` key would have changed it.
+    const event = await withSql(async (sql) => (await sql<Record<string, unknown>[]>`
+      select * from ledger_events where tenant_id = ${tenantId} and id = ${res.body.event.id as string}`)[0]!);
+    expect(Object.keys(event.reference_doc as object).sort()).toEqual(['kind', 'note', 'reasonCode']);
+    const hashWith = (referenceDoc: Record<string, unknown>) =>
+      eventHashOf({
+        id: event.id as string,
+        tenantId: event.tenant_id as string,
+        warehouseId: event.warehouse_id as string,
+        seq: Number(event.seq),
+        type: event.type as string,
+        schemaVersion: Number(event.schema_version),
+        skuId: event.sku_id as string,
+        quantityDelta: Number(event.quantity_delta),
+        fromBinId: event.from_bin_id as string | null,
+        toBinId: event.to_bin_id as string | null,
+        batchRef: event.batch_ref as string | null,
+        serialRef: event.serial_ref as string | null,
+        actorUserId: event.actor_user_id as string,
+        occurredAt: new Date(event.occurred_at as string).toISOString(),
+        recordedAt: new Date(event.recorded_at as string).toISOString(),
+        referenceDoc: referenceDoc as never,
+        prevHash: event.prev_hash as string,
+      });
+    const oldShape = { kind: 'manual-adjustment', reasonCode: 'stock-count', note: 'flow disabled until configured' };
+    expect(hashWith(oldShape)).toBe(event.event_hash);
+    expect(hashWith({ ...oldShape, adjustmentPendingId: null, countVarianceId: null })).not.toBe(event.event_hash);
   });
 
   it('GET adjustment-policies before any write is 404 not-found (the flow is disabled)', async () => {
@@ -765,9 +795,25 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
 
     // The queue shows the decision.
     const approved = await listPendings('?status=approved').expect(200);
-    const row = (approved.body.items as { id: string; decidedBy: string }[]).find((r) => r.id === pend.id);
+    const row = (approved.body.items as { id: string; decidedBy: string; ledgerLinked: boolean }[]).find((r) => r.id === pend.id);
     expect(row).toBeDefined();
     expect(row!.decidedBy).toBe(ownerUserId);
+
+    // Story 9-3a — the approval links to its events: the row records the
+    // posted event and reads ledgerLinked, and the ledger list filtered by
+    // the pending id lists exactly that event, whose referenceDoc names it.
+    expect(row!.ledgerLinked).toBe(true);
+    const linked = await withSql(
+      (sql) => sql<{ ledger_event_id: string | null }[]>`select ledger_event_id from stock_adjustment_pendings where id = ${pend.id}`,
+    );
+    expect(linked[0]!.ledger_event_id).toBe(decision.body.events[0].id);
+    const byPending = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/warehouses/${warehouseId}/inventory/events`)
+      .query({ adjustmentPendingId: pend.id })
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    expect(byPending.body.items.map((event: { id: string }) => event.id)).toEqual([decision.body.events[0].id]);
+    expect(byPending.body.items[0].referenceDoc).toMatchObject({ kind: 'manual-adjustment', adjustmentPendingId: pend.id });
     const stillPending = await listPendings('?status=pending&limit=200').expect(200);
     expect((stillPending.body.items as { id: string }[]).some((r) => r.id === pend.id)).toBe(false);
 
@@ -798,6 +844,13 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
     expect(await onHandFor(binA, sku('PLAIN-1'))).toBe(onHandBefore);
 
     expect((await auditRows('stock_adjustment.rejected')).some((row) => row.target_id === pend.id)).toBe(true);
+    // Story 9-3a — a rejected adjustment posted nothing, so it links nowhere.
+    const rejected = await listPendings('?status=rejected&limit=200').expect(200);
+    expect((rejected.body.items as { id: string; ledgerLinked: boolean }[]).find((r) => r.id === pend.id)!.ledgerLinked).toBe(false);
+    const linked = await withSql(
+      (sql) => sql<{ ledger_event_id: string | null }[]>`select ledger_event_id from stock_adjustment_pendings where id = ${pend.id}`,
+    );
+    expect(linked[0]!.ledger_event_id).toBeNull();
     expect(
       (await outboxRows('stock_adjustment.rejected')).some((row) => row.payload.pendingAdjustmentId === pend.id),
     ).toBe(true);

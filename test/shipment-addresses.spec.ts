@@ -8,6 +8,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { noOpIdempotencyKey, seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
@@ -168,12 +169,6 @@ describe('shipment addresses (e2e, story 11-1): destination + origin I/O, the re
         createdTenantIds,
       ]);
       await cleaner.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [
-        createdTenantIds,
-      ]);
-      await cleaner.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [
-        createdTenantIds,
-      ]);
-      await cleaner.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [
         createdTenantIds,
       ]);
       await cleaner.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [
@@ -509,7 +504,8 @@ describe('shipment addresses (e2e, story 11-1): destination + origin I/O, the re
       destination: testAddress(),
     };
     const first = await postOrder(opsToken, payload).expect(201);
-    const second = await postOrder(opsToken, payload).expect(201); // NEW key, same payload
+    // NEW key, same payload — the channel-redelivery no-op arm (story 9-3a's audit guard).
+    const second = await postOrder(opsToken, payload, noOpIdempotencyKey(tenantId, ulid(), 'orders.createOrder:channel-redelivery')).expect(201);
     expect(second.body.order.id).toBe(first.body.order.id as string);
 
     const divergent = await postOrder(opsToken, {
@@ -567,6 +563,7 @@ describe('shipment addresses (e2e, story 11-1): destination + origin I/O, the re
       lines: lines.map((line) => ({ skuId: line.skuId, quantity: line.quantity })),
     });
     const key = ulid();
+    seededIdempotencyKey(tenantId, key);
     await sql`
       insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
       values (${uuidv7()}, ${tenantId}, ${key}, ${legacyPayloadHash}, ${sql.json({
@@ -585,6 +582,7 @@ describe('shipment addresses (e2e, story 11-1): destination + origin I/O, the re
     const code = `SHA9-${ulid().slice(10, 16).toUpperCase()}`;
     const legacyPayloadHash = hashCommandPayload({ tenantId, code, name: 'Legacy Origin WH' });
     const key = ulid();
+    seededIdempotencyKey(tenantId, key);
     await sql`
       insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
       values (${uuidv7()}, ${tenantId}, ${key}, ${legacyPayloadHash}, ${sql.json({

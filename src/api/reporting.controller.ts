@@ -8,11 +8,13 @@ import type { TenantSession } from '../modules/tenancy/jwt-session';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ReportingFacade } from '../modules/reporting/reporting.facade';
 import type { Figure, Overview, SyncConnectionHealth, WindowedFigure } from '../modules/reporting/reporting.facade';
-import { ReportingOverviewResponse, ServiceReportDto, toServiceReportDto } from './reporting.dto';
+import { assertInstantRange } from '../shared/primitives/instant-range';
+import { SYSTEM_ACTOR_ID } from '../shared/primitives/audit';
+import { AuditTrailResponse, ReportingOverviewResponse, ServiceReportDto, toServiceReportDto } from './reporting.dto';
 // The query class is bound to @Query() and read by the ValidationPipe through
 // emitDecoratorMetadata — a type-only import would erase it.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
-import { ServiceReportQuery } from './reporting.dto';
+import { AuditTrailQueryDto, ServiceReportQuery } from './reporting.dto';
 import type { ReportingFigureDto, ReportingWindowedFigureDto, SyncConnectionHealthDto } from './reporting.dto';
 
 /**
@@ -101,6 +103,73 @@ export class ReportingController {
         warehouseId: query.warehouseId ?? null,
       }),
     );
+  }
+
+  /**
+   * Story 9-3a — the tenant's audit trail (FR-28): every state-changing
+   * action with who, what, when and the document it changed, newest
+   * recorded first. OWNER-ONLY (`audit.view`), unlike the member-open
+   * reports above — the facade's guard refuses any other role before the
+   * read. Operator surface only: the session guard fences a client-portal
+   * token, and no portal route serves the trail.
+   */
+  @Get(':tenantId/reporting/audit')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "The tenant's audit trail: every state-changing action — who, what, when, and the document it changed — filterable, newest recorded first (keyset cursor pagination)",
+    description:
+      'Owner only (`audit.view`). Ordering, paging and the from/to window all use `recordedAt` (the server commit stamp); the window is half-open [from, to). The trail is complete from story 9-3a onward — earlier actions of some commands were never audited and are not reconstructed. ' +
+      'One read under a 5 s budget: a broad filter over a very large history can answer 503 — narrow the filters or the dates.',
+  })
+  @ApiOkResponse({ type: AuditTrailResponse })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      'A malformed actorUserId/targetId, an actionPrefix outside the stem shape (e.g. carrying `%`), an unknown targetType, a from/to that is not an ISO-8601 instant, from not before to, a malformed cursor, or an out-of-range limit (validation-failed / invalid-cursor)',
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({
+    status: 403,
+    ...problemJsonResponse(
+      'Session belongs to another tenant (permission-denied); a role without `audit.view` — every role but the owner (role-denied); or a client-portal session — "This is an operator surface." (role-denied)',
+    ),
+  })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The read did not finish within its 5 s budget — narrow the filters or the dates (report-unavailable)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async audit(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: AuditTrailQueryDto,
+  ): Promise<AuditTrailResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertInstantRange(query.from, query.to);
+    const page = await this.reporting.auditTrail(tenantId, session.userId, {
+      actorUserId: query.actorUserId,
+      actionPrefix: query.actionPrefix,
+      targetType: query.targetType,
+      targetId: query.targetId,
+      from: query.from,
+      to: query.to,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return {
+      items: page.items.map((entry) => ({
+        id: entry.id,
+        recordedAt: entry.recordedAt,
+        occurredAt: entry.occurredAt,
+        actorUserId: entry.actorUserId,
+        actorKind: entry.actorKind,
+        action: entry.action,
+        targetType: entry.targetType,
+        targetId: entry.targetId,
+      })),
+      nextCursor: page.nextCursor,
+      systemActorId: SYSTEM_ACTOR_ID,
+    };
   }
 }
 

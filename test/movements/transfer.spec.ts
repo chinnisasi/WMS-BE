@@ -8,6 +8,7 @@ import { AUTH_DATABASE, DATABASE } from '../../src/shared/shared.module';
 import { InventoryFacade } from '../../src/modules/inventory/inventory.facade';
 import { getLedgerEventType } from '../../src/modules/inventory/ledger-registry';
 import { useSuiteDatabase, type SuiteDatabase } from '../support/suite-db';
+import { expectAuditRow } from '../support/audit-guard';
 import type { ProblemException } from '../../src/shared/problem-details/problem.exception';
 import { testAddress } from '../support/shipment-address';
 
@@ -52,6 +53,8 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
   let opsToken: string;
   let operatorToken: string;
   let operatorEmail = '';
+  let opsUserId = '';
+  let operatorUserId = '';
   let deviceOperatorToken: string; // the operator's badge-in (device) session
   let bareDeviceToken: string; // the SAME device's pre-badge-in enrollment credential
   let accountantToken: string;
@@ -205,9 +208,12 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       ).body.accessToken as string;
       return { userId: invited.body.user.id as string, email: memberEmail, token };
     };
-    opsToken = (await mkMember('ops_manager')).token;
+    const ops = await mkMember('ops_manager');
+    opsToken = ops.token;
+    opsUserId = ops.userId;
     const operator = await mkMember('operator');
     operatorToken = operator.token;
+    operatorUserId = operator.userId;
     operatorEmail = operator.email;
     accountantToken = (await mkMember('accountant')).token;
 
@@ -366,8 +372,6 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       await cleaner.unsafe('DELETE FROM bin_state_epochs WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM batches WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await cleaner.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await cleaner.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM catalog_imports WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('DELETE FROM uom_conversions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -1389,4 +1393,51 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       }
     });
   });
+
+  // ── story 9-3a: the audit rows ────────────────────────────────────────────
+  describe('audit rows (story 9-3a)', () => {
+    it('create, outbound confirm, inbound confirm and cancel each write one audit row naming the transfer and the requester; a replay writes none', async () => {
+      const skuId = skuIds.get(PLAIN)!;
+      const body = {
+        sourceWarehouseId,
+        destWarehouseId: sourceWarehouseId,
+        lines: [{ skuId, quantity: 1, fromBinId: binSrc, toBinId: binSameWh }],
+      };
+      const createKey = ulid();
+      const created = await createTransfer(body, opsToken, createKey).expect(201);
+      const transferId = created.body.transfer.id as string;
+      const expectCreated = () =>
+        expectAuditRow({ tenantId, key: createKey, action: 'transfer.created', targetType: 'transfer_order', targetId: transferId, actorUserId: opsUserId });
+      await expectCreated();
+      await createTransfer(body, opsToken, createKey).expect(201);
+      await expectCreated();
+
+      const outKey = ulid();
+      await outboundConfirm(transferId, {}, opsToken, outKey).expect(200);
+      await outboundConfirm(transferId, {}, opsToken, outKey).expect(200);
+      await expectAuditRow({ tenantId, key: outKey, action: 'transfer.outbound_confirmed', targetType: 'transfer_order', targetId: transferId, actorUserId: opsUserId });
+
+      const inKey = ulid();
+      await inboundConfirm(transferId, {}, operatorToken, inKey).expect(200);
+      await inboundConfirm(transferId, {}, operatorToken, inKey).expect(200);
+      await expectAuditRow({ tenantId, key: inKey, action: 'transfer.inbound_confirmed', targetType: 'transfer_order', targetId: transferId, actorUserId: operatorUserId });
+
+      // Story 9-3a — the transferId filter (API-only; no web surface): both
+      // legs of this same-warehouse transfer, and nothing else.
+      const legs = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/warehouses/${sourceWarehouseId}/inventory/events`)
+        .query({ transferId })
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      expect(legs.body.items.map((event: { type: string }) => event.type).sort()).toEqual(['transfer.inbound', 'transfer.outbound']);
+
+      const draft = await createTransfer(body).expect(201);
+      const draftId = draft.body.transfer.id as string;
+      const cancelKey = ulid();
+      await cancelTransfer(draftId, {}, opsToken, cancelKey).expect(200);
+      await cancelTransfer(draftId, {}, opsToken, cancelKey).expect(200);
+      await expectAuditRow({ tenantId, key: cancelKey, action: 'transfer.cancelled', targetType: 'transfer_order', targetId: draftId, actorUserId: opsUserId });
+    });
+  });
+
 });

@@ -8,6 +8,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
@@ -143,6 +144,7 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
   let vendorId: string;
   // The KE1 create key — the replay and divergent-retry tests re-send it.
   let ke1CreateKey: string;
+  let opsUserId: string;
   const skuIds = new Map<string, string>();
 
   let suiteDb: SuiteDatabase;
@@ -188,6 +190,9 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
       return signIn(inviteeEmail, password);
     };
     opsToken = await invite('ops_manager', 'ops-password-123');
+    opsUserId = (
+      await sql<{ id: string }[]>`select id from users where tenant_id = ${tenantId} and role = 'ops_manager' limit 1`
+    )[0]!.id;
     operatorWebToken = await invite('operator', 'floor-password-123');
 
     // ── warehouse → zone → bin ─────────────────────────────────────────────
@@ -339,8 +344,6 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
         'reservations',
         'stock_on_hand',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',
@@ -1711,5 +1714,18 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
       `) as unknown as { code: string }[];
       expect(existing).toHaveLength(0);
     });
+  });
+
+  it('story 9-3a — kit create and replace each write one audit row naming the kit SKU and the requester; a replay writes none', async () => {
+    // The create ran (and was replayed) in "kit create / replace / list" under ke1CreateKey.
+    await expectAuditRow({ tenantId, key: ke1CreateKey, action: 'kit.created', targetType: 'kit', targetId: sku('KIT-KE1'), actorUserId: opsUserId });
+    // Replace KIT-KE1's BOM with what it holds now (a replace always writes).
+    const current = await sql<{ component_sku_id: string; qty: string }[]>`
+      select component_sku_id, qty::text from kit_compositions where tenant_id = ${tenantId} and kit_sku_id = ${sku('KIT-KE1')} order by id`;
+    const components = current.map((row) => ({ skuId: row.component_sku_id, quantity: Number(row.qty) / 1000 }));
+    const putKey = ulid();
+    await putKit(sku('KIT-KE1'), components, putKey).expect(200);
+    await putKit(sku('KIT-KE1'), components, putKey).expect(200);
+    await expectAuditRow({ tenantId, key: putKey, action: 'kit.components_replaced', targetType: 'kit', targetId: sku('KIT-KE1'), actorUserId: opsUserId });
   });
 });

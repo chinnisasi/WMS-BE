@@ -1,7 +1,19 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsOptional, IsString, Matches } from 'class-validator';
+import { Type } from 'class-transformer';
+import { IsIn, IsInt, IsOptional, IsString, Matches, Max, Min } from 'class-validator';
 import { UUID_RE } from '../shared/primitives/ids';
-import { MAX_SERVICE_REPORT_DAYS, SERVICE_TARGET_HOURS, SYNC_HEALTH_REASONS, SYNC_HEALTH_STATES } from '../modules/reporting/reporting.facade';
+import { AUDIT_TARGET_TYPES, SYSTEM_ACTOR_ID } from '../shared/primitives/audit';
+import type { AuditTargetType } from '../shared/primitives/audit';
+import { IsInstant } from '../shared/primitives/instant-range';
+import {
+  AUDIT_ACTION_PREFIX_RE,
+  AUDIT_DEFAULT_LIMIT,
+  AUDIT_MAX_LIMIT,
+  MAX_SERVICE_REPORT_DAYS,
+  SERVICE_TARGET_HOURS,
+  SYNC_HEALTH_REASONS,
+  SYNC_HEALTH_STATES,
+} from '../modules/reporting/reporting.facade';
 import type { ServiceReport } from '../modules/reporting/reporting.facade';
 
 /**
@@ -438,4 +450,120 @@ export function toServiceReportDto(report: ServiceReport): ServiceReportDto {
       lateNotDispatched: report.dispatchTimeliness.lateNotDispatched,
     },
   };
+}
+
+// ── Story 9-3a — the audit trail (FR-28) ─────────────────────────────────────
+
+const AUDIT_ACTOR_KINDS = ['user', 'system'] as const;
+
+/** `GET /tenants/{t}/reporting/audit` — every filter optional, combined with AND. */
+export class AuditTrailQueryDto {
+  @ApiProperty({ required: false, format: 'uuid', description: 'Only actions by this user' })
+  @IsOptional()
+  @Matches(UUID_RE, { message: 'actorUserId must be a uuid' })
+  actorUserId?: string;
+
+  @ApiProperty({
+    required: false,
+    pattern: AUDIT_ACTION_PREFIX_RE.source,
+    example: 'transfer.',
+    description:
+      'Only actions starting with this prefix — a lowercase stem (`transfer.`, `stock_adjustment.`). Matched literally: `_` and `%` are never wildcards',
+  })
+  @IsOptional()
+  @Matches(AUDIT_ACTION_PREFIX_RE, {
+    message: `actionPrefix must be a lowercase action stem matching ${AUDIT_ACTION_PREFIX_RE.source}`,
+  })
+  actionPrefix?: string;
+
+  @ApiProperty({
+    required: false,
+    enum: [...AUDIT_TARGET_TYPES],
+    description: 'Only actions on this kind of target',
+  })
+  @IsOptional()
+  @IsIn([...AUDIT_TARGET_TYPES])
+  targetType?: AuditTargetType;
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Only actions on this target' })
+  @IsOptional()
+  @Matches(UUID_RE, { message: 'targetId must be a uuid' })
+  targetId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'date-time',
+    description:
+      'Only actions RECORDED at or after this instant (`recordedAt` — the server commit stamp, never `occurredAt`). ISO-8601 with a zone designator',
+  })
+  @IsOptional()
+  @IsInstant()
+  from?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'date-time',
+    description: 'Only actions RECORDED strictly before this instant (exclusive). Must be after `from`',
+  })
+  @IsOptional()
+  @IsInstant()
+  to?: string;
+
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: AUDIT_DEFAULT_LIMIT, minimum: 1, maximum: AUDIT_MAX_LIMIT })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(AUDIT_MAX_LIMIT)
+  limit?: number;
+}
+
+export class AuditEventDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'date-time', description: 'When the server recorded the action (`created_at`) — the trail is ordered, paged and windowed on this' })
+  recordedAt!: string;
+
+  @ApiProperty({
+    format: 'date-time',
+    description:
+      'When the action itself happened. Server time for most actions; a few writers (putaway, an offline op resolved later, an excursion) stamp the device or command time, which can be hours before `recordedAt`',
+  })
+  occurredAt!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The acting user — or the reserved system actor when `actorKind` is `system`' })
+  actorUserId!: string;
+
+  @ApiProperty({ enum: AUDIT_ACTOR_KINDS, description: '`system`: a scheduler or sweep (no user row); `user`: a member of the tenant' })
+  actorKind!: (typeof AUDIT_ACTOR_KINDS)[number];
+
+  @ApiProperty({ example: 'transfer.created', description: 'The action, `<subject>.<verb>`' })
+  action!: string;
+
+  @ApiProperty({ example: 'transfer_order', description: 'The kind of thing the action changed (one of the `targetType` filter values)' })
+  targetType!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The id of the thing the action changed' })
+  targetId!: string;
+}
+
+export class AuditTrailResponse {
+  @ApiProperty({ type: [AuditEventDto] })
+  items!: AuditEventDto[];
+
+  @ApiProperty({ type: String, nullable: true, description: 'Cursor for the next (older) page; null on the last page' })
+  nextCursor!: string | null;
+
+  @ApiProperty({
+    enum: [SYSTEM_ACTOR_ID],
+    description:
+      'The reserved system actor\'s id (schedulers and sweeps; `actorKind: system`) — send it as `actorUserId` to list the system\'s actions. Published here so no client hard-codes it',
+  })
+  systemActorId!: typeof SYSTEM_ACTOR_ID;
 }

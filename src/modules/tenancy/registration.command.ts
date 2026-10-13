@@ -3,7 +3,7 @@ import { Injectable } from '@nestjs/common';
 import { eq } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { idempotencyKeys, tenants, users } from '../../shared/db/schema';
+import { auditEvents, idempotencyKeys, tenants, users } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
@@ -158,6 +158,19 @@ export class RegistrationCommand {
         occurredAt: nowIso(),
         payload: { name: tenant.name, ownerEmail: owner.email },
       });
+      // Story 9-3a — the audit row (step 10), under the new tenant's scope;
+      // the actor is the new owner (no session exists yet).
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: tenantId,
+        actorUserId: owner.id,
+        action: 'tenant.registered',
+        targetType: 'tenant',
+        targetId: tenantId,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
+
       await tx.insert(idempotencyKeys).values({
         id: uuidv7(),
         tenantId,

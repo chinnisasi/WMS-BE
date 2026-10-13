@@ -3,6 +3,7 @@ import { and, desc, eq, gt, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
+  auditEvents,
   idempotencyKeys,
   kitCompositions,
   reservations,
@@ -169,6 +170,18 @@ export class KitCommand {
         occurredAt: nowIso(),
         payload: kitEventPayload(snapshot),
       });
+      // Story 9-3a — the audit row (skeleton step 10).
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'kit.created',
+        targetType: 'kit',
+        targetId: kit.id,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
+
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
       return snapshot;
     });
@@ -237,6 +250,18 @@ export class KitCommand {
         occurredAt: nowIso(),
         payload: kitEventPayload(snapshot),
       });
+      // Story 9-3a — the audit row (skeleton step 10).
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'kit.components_replaced',
+        targetType: 'kit',
+        targetId: kit.id,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
+
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
       return snapshot;
     });

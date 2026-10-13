@@ -3,6 +3,7 @@ import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
+  auditEvents,
   batches,
   bins,
   idempotencyKeys,
@@ -730,6 +731,9 @@ export class TransferService {
 
         const snapshot = await this.orderSnapshotInTx(tx, command.tenantId, orderId);
 
+        // Story 9-3a — the audit row (skeleton step 10).
+        await auditTransferInTx(tx, command.tenantId, command.actorUserId, 'transfer.created', orderId, idempotencyKey);
+
         try {
           await tx.insert(idempotencyKeys).values({
             id: uuidv7(),
@@ -1124,6 +1128,16 @@ export class TransferService {
           },
           events,
         };
+
+        // Story 9-3a — the audit row (skeleton step 10).
+        await auditTransferInTx(
+          tx,
+          command.tenantId,
+          command.actorUserId,
+          'transfer.outbound_confirmed',
+          command.transferId,
+          idempotencyKey,
+        );
 
         try {
           await tx.insert(idempotencyKeys).values({
@@ -1532,6 +1546,16 @@ export class TransferService {
           events,
         };
 
+        // Story 9-3a — the audit row (skeleton step 10).
+        await auditTransferInTx(
+          tx,
+          command.tenantId,
+          command.actorUserId,
+          'transfer.inbound_confirmed',
+          command.transferId,
+          idempotencyKey,
+        );
+
         try {
           await tx.insert(idempotencyKeys).values({
             id: uuidv7(),
@@ -1629,6 +1653,16 @@ export class TransferService {
         });
 
         const snapshot = await this.orderSnapshotInTx(tx, command.tenantId, command.transferId);
+
+        // Story 9-3a — the audit row (skeleton step 10).
+        await auditTransferInTx(
+          tx,
+          command.tenantId,
+          command.actorUserId,
+          'transfer.cancelled',
+          command.transferId,
+          idempotencyKey,
+        );
 
         try {
           await tx.insert(idempotencyKeys).values({
@@ -1743,3 +1777,24 @@ export class TransferService {
 
 /** Re-exported for the facade's detail read (the legs' event shape). */
 export { transferLegEventsInTx };
+
+/** Story 9-3a — one transfer audit row, `reference` = the idempotency key, server time. */
+async function auditTransferInTx(
+  tx: TenantTx,
+  tenantId: string,
+  actorUserId: string,
+  action: 'transfer.created' | 'transfer.outbound_confirmed' | 'transfer.inbound_confirmed' | 'transfer.cancelled',
+  transferId: string,
+  idempotencyKey: string,
+): Promise<void> {
+  await tx.insert(auditEvents).values({
+    id: uuidv7(),
+    tenantId,
+    actorUserId,
+    action,
+    targetType: 'transfer_order',
+    targetId: transferId,
+    reference: idempotencyKey,
+    occurredAt: nowIso(),
+  });
+}

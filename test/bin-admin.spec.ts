@@ -12,6 +12,7 @@ import { BinCommand } from '../src/modules/tenancy/bin.command';
 import { LOCATION_TYPES } from '../src/shared/primitives/location-type';
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { seededIdempotencyKey } from './support/audit-guard';
 import { importSecureSku } from './support/secure-sku';
 import { testAddress } from './support/shipment-address';
 
@@ -219,8 +220,6 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       await sql.unsafe('DELETE FROM stock_on_hand WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM batches WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM uom_conversions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_imports WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -867,6 +866,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     };
     const seed = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
+      seededIdempotencyKey(tenantId, key);
       await seed`
         insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
         values (${uuidv7()}, ${tenantId}, ${key}, ${payloadHash}, ${seed.json(legacySnapshot)})`;
@@ -1610,6 +1610,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     };
     const seed = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
+      seededIdempotencyKey(tenantId, key);
       await seed`
         insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
         values (${uuidv7()}, ${tenantId}, ${key}, ${payloadHash}, ${seed.json(legacySnapshot)})`;

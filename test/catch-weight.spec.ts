@@ -13,6 +13,7 @@ import {
   assertCatchWeightGrams,
 } from '../src/modules/catalog/handling-unit';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
@@ -360,8 +361,6 @@ describe('catch weight and handling units (e2e, story 10.3)', () => {
         'stock_on_hand',
         'bin_state_epochs',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',
@@ -1132,6 +1131,7 @@ describe('catch weight and handling units (e2e, story 10.3)', () => {
         'utf8',
       )
       .digest('hex');
+    seededIdempotencyKey(tenantId, key);
     await sql`
       insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
       values (${uuidv7()}, ${tenantId}, ${key}, ${payloadHash}, ${sql.json(legacySnapshot)})

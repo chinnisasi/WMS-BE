@@ -9,6 +9,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
@@ -95,8 +96,6 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       // The suite's committed outbox rows must not linger (the relay
       // worker is env-gated OFF in tests — nothing drains them here).
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_imports WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM uom_conversions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -862,6 +861,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       release = resolve;
     });
     try {
+      seededIdempotencyKey(tenantId, key);
       const holding = blocker.begin(async (tx) => {
         await tx`
           insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)

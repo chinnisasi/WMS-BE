@@ -11,6 +11,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { signTenantSession } from '../src/modules/tenancy/jwt-session';
 import { TenancyService } from '../src/modules/tenancy/tenancy.service';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
@@ -64,8 +65,6 @@ describe('tenancy (e2e)', () => {
       // The suite's committed outbox rows must not linger (the relay
       // worker is env-gated OFF in tests — nothing drains them here).
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       // Children before parents: bins → zones → warehouses (no FKs, but the
       // order keeps the intent legible).
       await sql.unsafe('DELETE FROM bins WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -1209,5 +1208,50 @@ describe('tenancy (e2e)', () => {
 
   test('uuidv7 primitive keeps producing valid v7 ids (test-support sanity)', () => {
     expect(uuidv7()).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  });
+
+  test('story 9-3a — registration, warehouse, zone, bin and grid each write one audit row naming the target and the actor; a replay writes none', async () => {
+    const email = `owner-${ulid().toLowerCase()}@example.com`;
+    const registerKey = ulid();
+    const registered = await registerTenant(email, registerKey).expect(201);
+    await registerTenant(email, registerKey).expect(201);
+    const tenantId = registered.body.tenant.id as string;
+    const ownerId = registered.body.owner.id as string;
+    createdTenantIds.push(tenantId);
+    // The new tenant is its own target; the actor is the new owner (no session yet).
+    await expectAuditRow({ tenantId, key: registerKey, action: 'tenant.registered', targetType: 'tenant', targetId: tenantId, actorUserId: ownerId });
+    const token = await signIn(email);
+
+    const warehouseKey = ulid();
+    const body = warehouseBody(`AUD-${ulid().slice(10, 16).toUpperCase()}`);
+    const sendWarehouse = () =>
+      request(app.getHttpServer())
+        .post(`${IDENTITY_URL}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', warehouseKey)
+        .send(body);
+    const warehouse = await sendWarehouse().expect(201);
+    await sendWarehouse().expect(201);
+    const warehouseId = warehouse.body.id as string;
+    await expectAuditRow({ tenantId, key: warehouseKey, action: 'warehouse.created', targetType: 'warehouse', targetId: warehouseId, actorUserId: ownerId });
+
+    const zoneKey = ulid();
+    const zone = await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }, zoneKey).expect(201);
+    await createZone(token, tenantId, warehouseId, { code: 'A', name: 'Zone A' }, zoneKey).expect(201);
+    const zoneId = zone.body.id as string;
+    await expectAuditRow({ tenantId, key: zoneKey, action: 'zone.created', targetType: 'zone', targetId: zoneId, actorUserId: ownerId });
+
+    const binKey = ulid();
+    const binBody = { code: 'A-01-01', capacity: 50, type: 'shelf' };
+    const bin = await createBin(token, tenantId, warehouseId, zoneId, binBody, binKey).expect(201);
+    await createBin(token, tenantId, warehouseId, zoneId, binBody, binKey).expect(201);
+    await expectAuditRow({ tenantId, key: binKey, action: 'bin.created', targetType: 'bin', targetId: bin.body.id as string, actorUserId: ownerId });
+
+    const gridKey = ulid();
+    const grid = { aisleFrom: 'C', aisleTo: 'C', baysPerAisle: 1, levelsPerBay: 2, capacity: 100, type: 'pallet' };
+    await generateBins(token, tenantId, warehouseId, zoneId, grid, gridKey).expect(201);
+    await generateBins(token, tenantId, warehouseId, zoneId, grid, gridKey).expect(201);
+    // The grid's target is the zone it filled (one row per run, not per bin).
+    await expectAuditRow({ tenantId, key: gridKey, action: 'bin.grid_generated', targetType: 'zone', targetId: zoneId, actorUserId: ownerId });
   });
 });

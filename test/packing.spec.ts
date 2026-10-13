@@ -245,8 +245,6 @@ describe('packing: pack-station verification (e2e, story 4.5)', () => {
         'batch_on_hand',
         'stock_on_hand',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',

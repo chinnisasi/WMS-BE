@@ -4,8 +4,11 @@ import { SECURE_STORAGE_CLASS } from '../../shared/primitives/storage-class';
 
 /**
  * Capabilities (Story 1.5) — the machine names mutations are gated on. Reads
- * are never gated (any tenant member may list warehouses, SKUs, the checklist
- * …); only command services consult this map, at entry.
+ * are member-open by default (any tenant member may list warehouses, SKUs,
+ * the checklist …) and command services consult this map at entry. Two
+ * READS are gated, each by a facade guard in its own transaction: the
+ * channel mappings read (`channel.manage`, 7-2) and the audit trail
+ * (`audit.view`, 9-3a — owner-only).
  */
 export const CAPABILITIES = [
   'warehouse.create',
@@ -253,6 +256,14 @@ export const CAPABILITIES = [
   // an ASN through `asn.manage`. Mirrored into wms-fe `src/lib/users.ts`
   // (CAPABILITIES + OPS_EXCLUDED_CAPABILITIES + the client grant).
   'asn.announce',
+  // Story 9-3a — FR-28: read the tenant's audit trail (who did what, when, to
+  // which document) through `GET …/reporting/audit`. A READ capability,
+  // enforced by `ReportingFacade.auditTrail`'s guard in its own transaction
+  // before the read starts. OWNER-ONLY (human decision 3, 2026-10-12): the
+  // trail names every member's actions, the user-management rationale.
+  // Never held by ops_manager, operator, accountant or client. Mirrored into
+  // wms-fe `src/lib/users.ts` (CAPABILITIES + OWNER_ONLY_CAPABILITIES).
+  'audit.view',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -269,7 +280,9 @@ export type Capability = (typeof CAPABILITIES)[number];
  * `eway.manage` (Story 8-2b — e-way paperwork is finance work) and
  * `rates.manage` (Story 21-3 — a client's rate card is finance work) and
  * `billing.invoice` (Story 21-5 — client invoices and tax details). Reads stay
- * open to any tenant member.
+ * open to any tenant member, with two gated exceptions: the channel mappings
+ * read (`channel.manage`) and the audit trail (`audit.view`, story 9-3a —
+ * owner-only, so only `owner` holds it below).
  */
 export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability>>> = {
   owner: new Set<Capability>(CAPABILITIES),

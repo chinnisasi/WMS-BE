@@ -176,8 +176,6 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       await sql.unsafe('DELETE FROM stock_on_hand WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM batches WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM idempotency_keys WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM audit_events WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM uom_conversions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_imports WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -2375,6 +2373,97 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       await owner('post', `/receiving/over-receipts/${await pendingOf(grn.grnId)}/reject`).expect(200);
       expect(await tasksOf(grn.lineId)).toEqual([]);
       await placeAll(grn.grnId, grn.lineId, 2).expect(400);
+    });
+  });
+
+  describe('story 9-3a — the ledger document filters: a GRN and its PO reach their events in one list read', () => {
+    const nowZ = () => new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+    const owner = (method: 'get' | 'post', path: string) =>
+      request(app.getHttpServer())[method](`${API}/${tenantId}${path}`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid());
+
+    it('grnId lists the GRN\'s receipts AND putaways in its own warehouse; poId lists the receipts only; another GRN\'s events never leak in', async () => {
+      // A second warehouse (WH-B) — the GRN's own, not the suite's default.
+      const whB = (
+        await owner('post', '/warehouses')
+          .send({ origin: testAddress(), code: `DF-${ulid().slice(10, 16).toUpperCase()}`, name: `Doc Filter WH ${ulid()}` })
+          .expect(201)
+      ).body.id as string;
+      const zone = (await owner('post', `/warehouses/${whB}/zones`).send({ code: 'D', name: 'Doc' }).expect(201)).body.id as string;
+      const bin = (await owner('post', `/warehouses/${whB}/zones/${zone}/bins`).send({ code: 'D-01', capacity: 1000, type: 'shelf' }).expect(201)).body
+        .id as string;
+      const vendor = (await owner('post', '/vendors').send({ code: `V-DF-${ulid().slice(18)}`, name: 'Doc Vendor' }).expect(201)).body.vendor.id as string;
+      const po = (
+        await owner('post', '/inbound/purchase-orders')
+          .send({
+            warehouseId: whB,
+            vendorId: vendor,
+            code: `PO-DF-${ulid().slice(14)}`,
+            lines: [
+              { skuId: plainSkuId, orderedQty: 3, unitCostPaise: 100 },
+              { skuId: batchSkuId, orderedQty: 3, unitCostPaise: 100 },
+            ],
+          })
+          .expect(201)
+      ).body.purchaseOrder as { id: string; lines: { id: string; skuId: string }[] };
+      const lineOf = (skuId: string) => po.lines.find((line) => line.skuId === skuId)!.id;
+      const receive = async (qty: number) =>
+        (
+          await request(app.getHttpServer())
+            .post(`${API}/${tenantId}/receiving/goods-receipts`)
+            .set('Authorization', `Bearer ${operatorToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({
+              warehouseId: whB,
+              poId: po.id,
+              blindReasonCode: null,
+              occurredAt: nowZ(),
+              lines: [
+                { poLineId: lineOf(plainSkuId), skuId: plainSkuId, batchCode: null, mfgDate: null, qty },
+                { poLineId: lineOf(batchSkuId), skuId: batchSkuId, batchCode: `LOT-DF-${ulid().slice(18)}`, mfgDate: '2026-08-01T00:00:00Z', qty },
+              ],
+            })
+            .expect(201)
+        ).body.goodsReceipt as { id: string; lines: { id: string; skuId: string; batchId: string | null; qty: number }[] };
+      const grn = await receive(1);
+      const other = await receive(1); // a second GRN on the same PO, same warehouse
+      for (const line of grn.lines) {
+        await place({ warehouseId: whB, grnId: grn.id, grnLineId: line.id, skuId: line.skuId, batchId: line.batchId, qty: line.qty, toBinId: bin, reasonCode: null, occurredAt: nowZ() }).expect(201);
+      }
+
+      const events = async (query: Record<string, string>, warehouse = whB) => {
+        const res = await owner('get', `/warehouses/${warehouse}/inventory/events`).query(query).expect(200);
+        return res.body.items as { type: string; referenceDoc: { grnId?: string; poId?: string } }[];
+      };
+      const byGrn = await events({ grnId: grn.id });
+      expect(byGrn.map((event) => event.type).sort()).toEqual(['grn.received', 'grn.received', 'putaway.placed', 'putaway.placed']);
+      expect(byGrn.every((event) => event.referenceDoc.grnId === grn.id)).toBe(true);
+      // An uppercase id matches (the reference doc stores lowercase ids).
+      expect(await events({ grnId: grn.id.toUpperCase() })).toHaveLength(4);
+      // The suite's default warehouse holds none of them.
+      expect(await events({ grnId: grn.id }, warehouseId)).toEqual([]);
+
+      const byPo = await events({ poId: po.id });
+      expect(byPo.map((event) => event.type)).toEqual(['grn.received', 'grn.received', 'grn.received', 'grn.received']);
+      expect(new Set(byPo.map((event) => event.referenceDoc.grnId))).toEqual(new Set([grn.id, other.id]));
+
+      expect(await events({ grnId: uuidv7() })).toEqual([]);
+      expect((await owner('get', `/warehouses/${whB}/inventory/events`).query({ grnId: 'nope' }).expect(400)).body.code).toBe('validation-failed');
+    });
+
+    it('the grnId filter is served by its 0069 partial index (the query states the `?` predicate the index needs)', async () => {
+      const probe = postgres(process.env.DATABASE_URL!, { max: 1 });
+      try {
+        const plan = await probe.begin(async (tx) => {
+          await tx`set local enable_seqscan = off`;
+          return tx.unsafe(
+            `explain select id from ledger_events where tenant_id = '${tenantId}' and warehouse_id = '${warehouseId}'
+               and (reference_doc ? 'grnId' and reference_doc ->> 'grnId' = '${uuidv7()}')`,
+          );
+        });
+        expect(JSON.stringify(plan)).toContain('ledger_events_grn_ref_idx');
+      } finally {
+        await probe.end();
+      }
     });
   });
 });

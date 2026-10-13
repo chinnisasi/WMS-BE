@@ -8,6 +8,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { openCredential } from '../src/modules/carriers/carrier-credentials';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { seededIdempotencyKey } from './support/audit-guard';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -66,8 +67,6 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
       for (const table of [
         'carrier_connections',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'users',
         'tenants',
       ]) {
@@ -861,14 +860,15 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
     // would read another tenant's row — handing back their connection on a
     // payload-hash match, or 422-ing on a key this tenant never used.
     const { tenantId, token } = await freshTenant();
-    const sharedKey = ulid();
+    const foreignTenantId = uuidv7();
+    const sharedKey = seededIdempotencyKey(foreignTenantId, ulid());
 
     const seeder = db();
     try {
       await seeder`
         insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
         values (
-          ${uuidv7()}, ${uuidv7()}, ${sharedKey}, ${'b'.repeat(64)},
+          ${uuidv7()}, ${foreignTenantId}, ${sharedKey}, ${'b'.repeat(64)},
           ${seeder.json({ connection: { id: uuidv7(), tenantId: uuidv7(), carrierCode: 'delhivery', accountLabel: 'someone elses account' } })}
         )
       `;

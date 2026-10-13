@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { idempotencyKeys, warehouses } from '../../shared/db/schema';
+import { auditEvents, idempotencyKeys, warehouses } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
@@ -195,6 +195,18 @@ export class WarehouseCommand {
             code: warehouse.code,
             name: warehouse.name,
           },
+        });
+
+        // Story 9-3a — the audit row (skeleton step 10).
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'warehouse.created',
+          targetType: 'warehouse',
+          targetId: warehouse.id,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
         });
 
         try {

@@ -241,7 +241,7 @@ describe('invoicing: the HSN summary (e2e, story 8-2a)', () => {
       await cleaner.unsafe('DELETE FROM ledger_anchors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await cleaner.unsafe('set session_replication_role = DEFAULT');
       for (const table of [
-        'reservations', 'stock_on_hand', 'outbox_messages', 'idempotency_keys', 'audit_events', 'catalog_import_errors',
+        'reservations', 'stock_on_hand', 'outbox_messages', 'catalog_import_errors',
         'catalog_imports', 'uom_conversions', 'skus', 'devices', 'bins', 'zones', 'warehouses', 'users', 'tenants',
       ]) {
         await cleaner.unsafe(`DELETE FROM ${table} WHERE tenant_id = ANY($1::uuid[])`, [createdTenantIds]);

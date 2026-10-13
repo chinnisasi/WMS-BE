@@ -165,11 +165,27 @@ export interface LedgerTimelineQuery {
   readonly orderId?: string | undefined;
   /** Story 9-1 — the reference doc's `shortPick` flag is (not) set. */
   readonly shortPick?: boolean | undefined;
+  /**
+   * Story 9-3a — the document filters: `reference_doc ->> key` equals the id
+   * (lowercased). `grnId` matches receipts AND putaways; `poId` receipts only.
+   */
+  readonly grnId?: string | undefined;
+  readonly poId?: string | undefined;
+  readonly transferId?: string | undefined;
+  readonly adjustmentPendingId?: string | undefined;
+  readonly countVarianceId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
 
 export const DEFAULT_TIMELINE_PAGE_SIZE = 50;
+
+/**
+ * Story 9-3a — the reference-doc keys the ledger list filters on, each with
+ * its own 0069 partial index. A closed list of literals: `sql.raw` inlines
+ * them, so nothing else may ever enter it.
+ */
+export const LEDGER_DOCUMENT_KEYS = ['grnId', 'poId', 'transferId', 'adjustmentPendingId', 'countVarianceId'] as const;
 
 /** One per-batch on-hand row (Story 2.4 — the batch-arm sibling of on-hand). */
 export interface BatchOnHandEntry {
@@ -517,6 +533,18 @@ export class InventoryFacade {
             query.orderId === undefined
               ? undefined
               : sql`${ledgerEvents.referenceDoc} ->> 'orderId' = ${query.orderId.toLowerCase()}`,
+            // Story 9-3a — the document filters. Each carries the `?` key
+            // predicate beside the equality: the 0069 index for the key is
+            // PARTIAL (`WHERE reference_doc ? '<key>'`), and the planner can
+            // only use it when the query states that predicate itself (an
+            // `->>` equality does not imply it to the planner). Text compare
+            // against the lowercased id, as for `orderId`.
+            ...LEDGER_DOCUMENT_KEYS.map((key) => {
+              const id = query[key];
+              return id === undefined
+                ? undefined
+                : sql`(${ledgerEvents.referenceDoc} ? ${sql.raw(`'${key}'`)} and ${ledgerEvents.referenceDoc} ->> ${sql.raw(`'${key}'`)} = ${id.toLowerCase()})`;
+            }),
             // Text comparison, never a `::boolean` cast — a non-boolean stored
             // value must read as "not a short pick", not 500 the read.
             query.shortPick === undefined

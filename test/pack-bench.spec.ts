@@ -214,8 +214,6 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
         'batch_on_hand',
         'stock_on_hand',
         'outbox_messages',
-        'idempotency_keys',
-        'audit_events',
         'catalog_import_errors',
         'catalog_imports',
         'uom_conversions',

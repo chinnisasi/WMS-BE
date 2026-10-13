@@ -308,6 +308,58 @@ export class LedgerEventsQuery {
   @IsBoolean()
   shortPick?: boolean;
 
+  // ── Story 9-3a — the document filters (≤ 2 navigations, FR-28) ───────────
+  // Each matches `referenceDoc.<key>` exactly (lowercased, like `orderId`) and
+  // is served by its own 0069 partial index.
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: "Story 9-3a — only events of this goods receipt (`referenceDoc.grnId`): its receipt events AND its putaway placements",
+  })
+  @IsOptional()
+  @IsUUID()
+  grnId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      'Story 9-3a — only events naming this purchase order (`referenceDoc.poId`): its RECEIPT events only — a putaway names its GRN, not the PO',
+  })
+  @IsOptional()
+  @IsUUID()
+  poId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'Story 9-3a — only events of this transfer order (`referenceDoc.transferId`) on this warehouse — both legs on its chain',
+  })
+  @IsOptional()
+  @IsUUID()
+  transferId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      'Story 9-3a — only the events an approval posted for this pending adjustment (`referenceDoc.adjustmentPendingId`; approvals from 9-3a on)',
+  })
+  @IsOptional()
+  @IsUUID()
+  adjustmentPendingId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      "Story 9-3a — only the correction an approve-adjust resolution posted for this count variance (`referenceDoc.countVarianceId`; resolutions from 9-3a on)",
+  })
+  @IsOptional()
+  @IsUUID()
+  countVarianceId?: string;
+
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()
@@ -443,6 +495,22 @@ export class LedgerReferenceDocDto {
     description: 'Story 21-6 — the exact ASN line credited (grn-receipt arm only)',
   })
   asnLineId?: string;
+
+  // ── Story 9-3a (additive, omitted when absent) ────────────────────────────
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'Story 9-3a — the pending adjustment an approval posted this event for (manual-adjustment arm, approvals only)',
+  })
+  adjustmentPendingId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'Story 9-3a — the count variance an approve-adjust resolution corrected (manual-adjustment arm, resolutions only)',
+  })
+  countVarianceId?: string;
 }
 
 /** One event-timeline row. */
@@ -901,10 +969,24 @@ export class AdjustmentPendingsQuery {
   limit?: number;
 }
 
+/**
+ * Story 9-3a — one row of the adjustment-pendings queue: the pend plus
+ * whether it links to ledger events. A subclass rather than a new field on
+ * `AdjustmentPendingDto`, which is also the 202's stored idempotency snapshot
+ * — a pre-9-3a key would replay without it.
+ */
+export class AdjustmentPendingEntryDto extends AdjustmentPendingDto {
+  @ApiProperty({
+    description:
+      'True only when an approval posted this adjustment from story 9-3a on (the row recorded its first event): its events are listed by `GET …/inventory/events?adjustmentPendingId=`. False while pending, on a reject, and for an approval decided before 9-3a',
+  })
+  ledgerLinked!: boolean;
+}
+
 /** GET …/inventory/adjustment-pendings response. */
 export class AdjustmentPendingListResponse {
-  @ApiProperty({ type: [AdjustmentPendingDto] })
-  items!: readonly AdjustmentPendingDto[];
+  @ApiProperty({ type: [AdjustmentPendingEntryDto] })
+  items!: readonly AdjustmentPendingEntryDto[];
 
   @ApiProperty({ type: String, nullable: true, required: false })
   nextCursor?: string | null;
