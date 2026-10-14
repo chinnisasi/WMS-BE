@@ -1247,6 +1247,148 @@ export class AuditExportWorker implements OnApplicationBootstrap, OnApplicationS
   }
 }
 
+/** `LEDGER_INTEGRITY_POLL_MS` (story 9-3c): the ledger integrity worker's poll; unset/`0` = OFF (recommended `3600000`). */
+export function parseLedgerIntegrityPollMs(raw: string | undefined): number {
+  return parsePollMs('LEDGER_INTEGRITY_POLL_MS', raw);
+}
+
+/** Per-tick scope bound (story 9-3c): a tick runs at most this many warehouses (a rotating window past that). */
+export const DEFAULT_MAX_LEDGER_INTEGRITY_SCOPES_PER_TICK = 50;
+
+/** `MAX_LEDGER_INTEGRITY_SCOPES_PER_TICK` — a positive integer; default 50; anything else fails the boot. */
+export function parseMaxLedgerIntegrityScopesPerTick(raw: string | undefined): number {
+  if (raw === undefined || raw === '') return DEFAULT_MAX_LEDGER_INTEGRITY_SCOPES_PER_TICK;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`MAX_LEDGER_INTEGRITY_SCOPES_PER_TICK must be a positive integer (got "${raw}")`);
+  }
+  return parsed;
+}
+
+/** The facade surface the worker drives — a seam so the window and the per-scope catch are testable with a fake. */
+export type LedgerIntegrityDriver = Pick<InventoryFacade, 'ledgerIntegrityScopesOf' | 'runLedgerIntegrity'>;
+
+/**
+ * Story 9-3c — the ledger integrity worker (AD-16; the `StorageSnapshotWorker`
+ * shape). Each tick: discovers every tenant cross-tenant on the read-only
+ * BYPASSRLS `AUTH_DATABASE` (the enumeration is read-only; every write stays
+ * in inventory's tenant transactions), lists each tenant's warehouses through
+ * `InventoryFacade.ledgerIntegrityScopesOf`, and runs one
+ * `InventoryFacade.runLedgerIntegrity(tenantId, warehouseId)` per scope —
+ * baseline once, anchor the tail in bounded chunks, re-verify one anchored
+ * range, copy anchors to WORM. The scope set is capped per tick at
+ * `MAX_LEDGER_INTEGRITY_SCOPES_PER_TICK` (default 50) with a ROTATING window,
+ * and a failing tenant or scope is logged and retried next tick, never
+ * starving the rest. Single-flight in-process (`running`); two instances are
+ * safe — the baseline and every anchor take the warehouse advisory lock, a
+ * break row is unique, a WORM copy row is `ON CONFLICT DO NOTHING`.
+ * Env-gated OFF when `LEDGER_INTEGRITY_POLL_MS` is unset/`0` — the web then
+ * reads "Not yet checked". `unref`'d timer; shutdown hook.
+ */
+@Injectable()
+export class LedgerIntegrityWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('LedgerIntegrityWorker');
+  private readonly pollMs: number;
+  /** The per-tick cap — a plain field so a suite can shrink it. */
+  maxScopesPerTick: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+  /** The truncating ticks' rotating-window offset. */
+  private tickOffset = 0;
+
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(InventoryFacade) private readonly inventory: LedgerIntegrityDriver,
+  ) {
+    this.pollMs = parseLedgerIntegrityPollMs(process.env.LEDGER_INTEGRITY_POLL_MS);
+    this.maxScopesPerTick = parseMaxLedgerIntegrityScopesPerTick(process.env.MAX_LEDGER_INTEGRITY_SCOPES_PER_TICK);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off (tests, or a deployment that does not check its chain)
+    }
+    this.logger.log(`Ledger integrity worker started (poll every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /** One cycle. Returns how many scopes it carried and how many exist. */
+  async tick(): Promise<{ carried: number; total: number }> {
+    if (this.running) {
+      return { carried: 0, total: 0 }; // shed: one cycle at a time in this process
+    }
+    this.running = true;
+    try {
+      const tenants = (await this.authDb.execute(sql`
+        select id as "tenantId" from tenants order by id asc
+      `)) as unknown as { tenantId: string }[];
+      const scopes: { tenantId: string; warehouseId: string }[] = [];
+      for (const { tenantId } of tenants) {
+        try {
+          scopes.push(...(await this.inventory.ledgerIntegrityScopesOf(tenantId)));
+        } catch (error) {
+          this.logger.error(
+            `Ledger integrity worker could not list the warehouses of tenant ${tenantId} — skipped this cycle: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      const carried =
+        scopes.length <= this.maxScopesPerTick ? scopes : this.rotatingWindow(scopes, this.maxScopesPerTick);
+      if (scopes.length > carried.length) {
+        this.logger.warn(
+          `Ledger integrity worker carried ${carried.length} of ${scopes.length} warehouse(s) this tick ` +
+            `— the rotating window advances each tick until every warehouse is checked`,
+        );
+      }
+      for (const scope of carried) {
+        try {
+          const summary = await this.inventory.runLedgerIntegrity(scope.tenantId, scope.warehouseId);
+          if (summary.anchored > 0 || summary.wormCopied > 0 || summary.baselined) {
+            this.logger.log(
+              `ledger integrity (tenant ${scope.tenantId}, warehouse ${scope.warehouseId}): ` +
+                `${summary.baselined ? `baselined B=${summary.legacyThroughSeq}, ` : ''}${summary.anchored} anchor(s), ${summary.wormCopied} WORM cop(ies)`,
+            );
+          }
+        } catch (error) {
+          this.logger.error(
+            `Ledger integrity worker failed for warehouse ${scope.warehouseId} (tenant ${scope.tenantId}) ` +
+              `— retried next tick: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      return { carried: carried.length, total: scopes.length };
+    } catch (error) {
+      this.logger.error(`Ledger integrity cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      return { carried: 0, total: 0 };
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /** `cap` scopes from the tick offset, wrapping; the offset advances by the number CARRIED (the storage worker's window). */
+  private rotatingWindow<T>(ordered: readonly T[], cap: number): T[] {
+    const start = this.tickOffset % ordered.length;
+    const window: T[] = [];
+    for (let i = 0; i < cap && i < ordered.length; i += 1) {
+      const scope = ordered[(start + i) % ordered.length];
+      if (scope !== undefined) {
+        window.push(scope);
+      }
+    }
+    this.tickOffset = (start + window.length) % ordered.length;
+    return window;
+  }
+}
+
 @Module({
   imports: [
     SharedModule,
@@ -1277,6 +1419,8 @@ export class AuditExportWorker implements OnApplicationBootstrap, OnApplicationS
     WaveCutoffSweepWorker,
     // Story 9-3b — the async audit export (env-gated OFF by default).
     AuditExportWorker,
+    // Story 9-3c — the ledger integrity check (env-gated OFF by default).
+    LedgerIntegrityWorker,
   ],
   exports: [],
 })

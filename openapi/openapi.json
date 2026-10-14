@@ -5118,6 +5118,396 @@
         ]
       }
     },
+    "/tenants/{tenantId}/inventory/ledger/integrity": {
+      "get": {
+        "operationId": "InventoryController_ledgerIntegrity",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LedgerIntegrityResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks audit.view (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The tenant's ledger integrity status, one row per warehouse (audit.view — owner-only): the verified position, the pre-0026 count, the last anchor and its WORM copy, the anchors waiting for WORM, and the breaks (open and acknowledged, newest first, at most 10). UNPAGED — bounded by the warehouse count",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/inventory/ledger/anchors": {
+      "get": {
+        "operationId": "InventoryController_ledgerAnchors",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "description": "Page size, default 50",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LedgerAnchorListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed warehouseId (validation-failed), a malformed cursor (invalid-cursor), or an out-of-range limit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks audit.view (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists one warehouse's ledger anchors, newest range first (audit.view — owner-only; keyset cursor on to_seq)",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/inventory/ledger/anchors/{anchorId}/proof": {
+      "get": {
+        "operationId": "InventoryController_ledgerProof",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "anchorId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LedgerProofResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed warehouseId or anchorId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks audit.view (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No anchor with this id in this warehouse (anchor-not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The verifiable proof of one anchored range (audit.view — owner-only): its 'seq:eventHash' lines, the digest recomputed from them, the anchor with its WORM reference, and how to recompute it. Bounded by LEDGER_ANCHOR_MAX_RANGE",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/inventory/ledger/breaks/{breakId}/acknowledge": {
+      "post": {
+        "operationId": "InventoryController_acknowledgeChainBreak",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "breakId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChainBreakDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed warehouseId/breakId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks ledger.acknowledge (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No chain break with this id in this warehouse (chain-break-not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already acknowledged (chain-break-acknowledged), or a concurrent request on the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Acknowledges a ledger chain break (ledger.acknowledge — owner-only): resolves its panel entry; audited. Acknowledging repairs nothing — the break stays recorded and a broken tail still refuses to anchor",
+        "tags": [
+          "inventory"
+        ]
+      }
+    },
     "/tenants/{tenantId}/warehouses/{warehouseId}/inventory/stock": {
       "get": {
         "operationId": "InventoryController_listStock",
@@ -18133,6 +18523,7 @@
                 "expiry_alert_policy",
                 "goods_receipt",
                 "kit",
+                "ledger_chain_break",
                 "ledger_event",
                 "manifest",
                 "order",
@@ -26565,6 +26956,327 @@
         },
         "required": [
           "items"
+        ]
+      },
+      "LedgerAnchorWormDto": {
+        "type": "object",
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "objectKey": {
+            "type": "string"
+          },
+          "versionId": {
+            "type": "string",
+            "description": "The S3 object version the copy step wrote"
+          },
+          "retainUntil": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The Object Lock (COMPLIANCE) retain-until date"
+          },
+          "copiedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "bucket",
+          "objectKey",
+          "versionId",
+          "retainUntil",
+          "copiedAt"
+        ]
+      },
+      "LedgerAnchorDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "verified",
+              "legacy"
+            ],
+            "description": "`verified` — verified in the current form; `legacy` — the baseline’s pre-0026 prefix, verified with quantity_delta / 1000"
+          },
+          "fromSeq": {
+            "type": "number"
+          },
+          "toSeq": {
+            "type": "number"
+          },
+          "digest": {
+            "type": "string",
+            "description": "sha256 over the range's 'seq:eventHash' lines, seq ascending, '\\n'-joined"
+          },
+          "anchoredAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "worm": {
+            "nullable": true,
+            "description": "Null until the anchor is copied to WORM storage (or when none is configured)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LedgerAnchorWormDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "fromSeq",
+          "toSeq",
+          "digest",
+          "anchoredAt",
+          "worm"
+        ]
+      },
+      "ChainBreakDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "chain",
+              "worm"
+            ],
+            "description": "`chain` — the ledger itself; `worm` — the WORM copy of an anchor is missing or differs"
+          },
+          "firstSeq": {
+            "type": "number",
+            "description": "The lowest broken seq (a worm break: the anchor’s first seq)"
+          },
+          "anchorId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The anchor — a worm break only"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "detectedBy": {
+            "type": "string",
+            "enum": [
+              "anchor",
+              "reverify",
+              "verify"
+            ]
+          },
+          "detectedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "acknowledgedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "acknowledgedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "firstSeq",
+          "anchorId",
+          "reason",
+          "detectedBy",
+          "detectedAt",
+          "acknowledgedBy",
+          "acknowledgedAt"
+        ]
+      },
+      "WarehouseLedgerIntegrityDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseCode": {
+            "type": "string"
+          },
+          "baselined": {
+            "type": "boolean",
+            "description": "False until the integrity worker has run once on this warehouse"
+          },
+          "legacyThroughSeq": {
+            "type": "number",
+            "description": "Events 1..N verified in the pre-0026 form (0: none)"
+          },
+          "verifiedThroughSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "The chain is anchored and verified through this seq"
+          },
+          "verifiedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "lastRunAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "brokenAtSeq": {
+            "type": "number",
+            "nullable": true,
+            "description": "The lowest break seq ever detected — never cleared (detection never auto-heals)"
+          },
+          "brokenDetectedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time"
+          },
+          "lastAnchor": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/LedgerAnchorDto"
+              }
+            ]
+          },
+          "wormPending": {
+            "type": "number",
+            "description": "Anchors not yet copied to WORM storage"
+          },
+          "breaks": {
+            "description": "Open and acknowledged breaks, newest first, at most 10",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ChainBreakDto"
+            }
+          },
+          "openBreakCount": {
+            "type": "number",
+            "description": "Every unacknowledged break of the warehouse (not only the listed 10) — 0 means every break is acknowledged"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "warehouseCode",
+          "baselined",
+          "legacyThroughSeq",
+          "verifiedThroughSeq",
+          "verifiedAt",
+          "lastRunAt",
+          "brokenAtSeq",
+          "brokenDetectedAt",
+          "lastAnchor",
+          "wormPending",
+          "breaks",
+          "openBreakCount"
+        ]
+      },
+      "LedgerIntegrityResponse": {
+        "type": "object",
+        "properties": {
+          "wormStore": {
+            "type": "string",
+            "enum": [
+              "none",
+              "s3"
+            ],
+            "description": "The configured WORM store (`LEDGER_ANCHOR_WORM`)"
+          },
+          "warehouses": {
+            "description": "One row per warehouse of the tenant, by code — unpaged (bounded by the warehouse count)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WarehouseLedgerIntegrityDto"
+            }
+          }
+        },
+        "required": [
+          "wormStore",
+          "warehouses"
+        ]
+      },
+      "LedgerAnchorListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "Newest range first (to_seq descending)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LedgerAnchorDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "LedgerProofResponse": {
+        "type": "object",
+        "properties": {
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "anchor": {
+            "$ref": "#/components/schemas/LedgerAnchorDto"
+          },
+          "algorithm": {
+            "type": "string",
+            "description": "How to recompute the digest from `lines`"
+          },
+          "legacyForm": {
+            "type": "string",
+            "nullable": true,
+            "description": "For a legacy anchor: the pre-0026 (÷1000) rule; null otherwise"
+          },
+          "lines": {
+            "description": "'seq:eventHash', seq ascending — exactly the digest's input",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "recomputedDigest": {
+            "type": "string"
+          },
+          "matches": {
+            "type": "boolean",
+            "description": "The recomputed digest equals the anchor’s"
+          }
+        },
+        "required": [
+          "tenantId",
+          "warehouseId",
+          "anchor",
+          "algorithm",
+          "legacyForm",
+          "lines",
+          "recomputedDigest",
+          "matches"
         ]
       },
       "StockEntryDto": {
@@ -36286,6 +36998,7 @@
               "expiry_alert_policy",
               "goods_receipt",
               "kit",
+              "ledger_chain_break",
               "ledger_event",
               "manifest",
               "order",
@@ -36369,6 +37082,7 @@
               "expiry_alert_policy",
               "goods_receipt",
               "kit",
+              "ledger_chain_break",
               "ledger_event",
               "manifest",
               "order",
@@ -40252,6 +40966,98 @@
           "resolution"
         ]
       },
+      "LedgerChainBreakSummaryDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "chain",
+              "worm"
+            ],
+            "description": "`chain` — the ledger itself; `worm` — the WORM copy of an anchor is missing or differs"
+          },
+          "firstSeq": {
+            "type": "number",
+            "description": "The lowest broken seq (a worm break: the anchor’s first seq)"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "detectedBy": {
+            "type": "string",
+            "enum": [
+              "anchor",
+              "reverify",
+              "verify"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "firstSeq",
+          "reason",
+          "detectedBy"
+        ]
+      },
+      "LedgerChainBreakNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "ledger-chain-break"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/LedgerChainBreakSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "acknowledged",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
       "NotificationListResponse": {
         "type": "object",
         "properties": {
@@ -40286,6 +41092,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/AuditExportNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/LedgerChainBreakNotificationDto"
                 }
               ],
               "discriminator": {
@@ -40299,7 +41108,8 @@
                   "batch-alert": "#/components/schemas/BatchAlertNotificationDto",
                   "qc-hold": "#/components/schemas/QcHoldNotificationDto",
                   "channel-sync": "#/components/schemas/ChannelSyncNotificationDto",
-                  "audit-export": "#/components/schemas/AuditExportNotificationDto"
+                  "audit-export": "#/components/schemas/AuditExportNotificationDto",
+                  "ledger-chain-break": "#/components/schemas/LedgerChainBreakNotificationDto"
                 }
               }
             }

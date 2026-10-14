@@ -62,6 +62,8 @@ export const AUDIT_TARGET_TYPES = [
   'expiry_alert_policy',
   'goods_receipt',
   'kit',
+  // Story 9-3c — a ledger chain break (`ledger_chain_break.acknowledged`).
+  'ledger_chain_break',
   'ledger_event',
   'manifest',
   'order',
@@ -125,4 +127,6 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'device.enrolled', targetType: 'device' },
   // Story 9-3b — the export request (tenancy's `AuditExportCommand`).
   { action: 'audit_export.requested', targetType: 'audit_export' },
+  // Story 9-3c — the owner acknowledges a chain break (inventory's `LedgerBreakCommand`).
+  { action: 'ledger_chain_break.acknowledged', targetType: 'ledger_chain_break' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

@@ -4,7 +4,16 @@ import { and, asc, desc, eq, gte, inArray, lte, or, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { batchOnHand, binStateEpochs, ledgerEvents, skus, stockOnHand } from '../../shared/db/schema';
+import {
+  batchOnHand,
+  binStateEpochs,
+  ledgerChainBreaks,
+  ledgerEvents,
+  ledgerIntegrityState,
+  skus,
+  stockOnHand,
+} from '../../shared/db/schema';
+import type { LedgerAnchorKind, LedgerChainBreakDetector, LedgerChainBreakKind } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { assertExactQuantity, fromMilli } from '../../shared/primitives/quantity';
@@ -97,6 +106,51 @@ export interface ChainBreakReport {
   readonly fromSeq: number;
   readonly toSeq: number;
   readonly reason: string;
+  /**
+   * Story 9-3c — the first seq that is actually broken, when it differs from
+   * `fromSeq`: a gap report keeps `fromSeq` = the range start (its existing
+   * contract) and names the first MISSING seq here. Absent → `fromSeq`.
+   */
+  readonly firstSeq?: number;
+}
+
+/**
+ * Story 9-3c — `anchorChain`'s typed no-op: nothing to anchor (the warehouse
+ * has no events) or nothing new (already anchored through the head or
+ * `uptoSeq`). Before 9-3c both were a 422; the worker's bounded loop calls
+ * it every tick, so a no-op is a value, not an error.
+ */
+export interface AnchorNothing {
+  readonly nothing: true;
+  readonly tenantId: string;
+  readonly warehouseId: string;
+  /** The chain is anchored through this seq (0: no anchor yet). */
+  readonly anchoredThroughSeq: number;
+}
+
+/** Story 9-3c — the two ledger integrity outbox event types (pinned by notifications' own literals). */
+export const LEDGER_CHAIN_BROKEN_EVENT = 'ledger.chain_broken' as const;
+export const LEDGER_CHAIN_BREAK_ACKNOWLEDGED_EVENT = 'ledger.chain_break_acknowledged' as const;
+
+/** Story 9-3c — one detected break, as the single recording path takes it. */
+export interface ChainBreakInput {
+  readonly warehouseId: string;
+  readonly kind: LedgerChainBreakKind;
+  /** The report's range start (the alert payload's `fromSeq`, unchanged contract). */
+  readonly fromSeq: number;
+  readonly toSeq: number;
+  /** The lowest broken seq — the break row's identity with `kind`. */
+  readonly firstSeq: number;
+  /** Set exactly for a `worm` break. */
+  readonly anchorId: string | null;
+  readonly reason: string;
+  readonly detectedBy: LedgerChainBreakDetector;
+}
+
+/** Story 9-3c — what recording a break did: the row's id, and whether THIS call inserted it. */
+export interface RecordedChainBreak {
+  readonly breakId: string;
+  readonly isNew: boolean;
 }
 
 export interface ChainVerifyReport {
@@ -171,6 +225,10 @@ export interface DigestExport {
 
 /** The anchor artifact: a committed chain head over a seq range. */
 export interface ChainAnchor {
+  /** Story 9-3c — the anchor row's id. */
+  readonly id: string;
+  /** Story 9-3c — `verified` from `anchorChain`; `legacy` only from the baseline. */
+  readonly kind: LedgerAnchorKind;
   readonly tenantId: string;
   readonly warehouseId: string;
   readonly fromSeq: number;
@@ -242,6 +300,69 @@ export { canonicalInstant } from '../../shared/primitives/time';
  */
 export function eventHashOf(event: Parameters<typeof canonicalEventBytes>[0]): string {
   return sha256Hex(canonicalEventBytes(event));
+}
+
+/** The canonical event shape both hash forms read. */
+export type CanonicalEvent = Parameters<typeof canonicalEventBytes>[0];
+
+/**
+ * Story 9-3c (human decision 1, 2026-10-14) — the event's hash in its
+ * PRE-0026 form. Migration 0026 multiplied every older event's
+ * `quantity_delta` by 1000 (base units → milli-units) without rehashing, and
+ * changed nothing else that is hashed, so an event written before it
+ * reproduces its stored hash exactly when `quantityDelta / 1000` is hashed.
+ * Applies only when the stored delta is a whole multiple of 1000 (anything
+ * else cannot be a scaled pre-0026 delta): `null` = no legacy form. A
+ * zero-delta event hashes identically in both forms.
+ *
+ * Accepted ONLY at or below the warehouse's baseline boundary B
+ * (`ledger_integrity_state.legacy_through_seq`) — never above it.
+ */
+export function legacyEventHashOf(event: CanonicalEvent): string | null {
+  if (event.quantityDelta % 1000 !== 0) {
+    return null;
+  }
+  return eventHashOf({ ...event, quantityDelta: event.quantityDelta / 1000 });
+}
+
+/** A `ledger_events` row → the canonical shape the hash reads. */
+export function canonicalEventOf(row: LedgerEventRow): CanonicalEvent {
+  return {
+    id: row.id,
+    tenantId: row.tenantId,
+    warehouseId: row.warehouseId,
+    seq: row.seq,
+    type: row.type,
+    schemaVersion: row.schemaVersion,
+    skuId: row.skuId,
+    quantityDelta: row.quantityDelta,
+    fromBinId: row.fromBinId,
+    toBinId: row.toBinId,
+    batchRef: row.batchRef,
+    serialRef: row.serialRef,
+    actorUserId: row.actorUserId,
+    occurredAt: row.occurredAt,
+    recordedAt: row.recordedAt,
+    referenceDoc: row.referenceDoc as LedgerReferenceDoc,
+    prevHash: row.prevHash,
+  };
+}
+
+type LedgerEventRow = typeof ledgerEvents.$inferSelect;
+
+/**
+ * Story 9-3c — the warehouse's pre-0026 boundary B, in the caller's
+ * transaction: 0 when the warehouse has not been baselined (so an
+ * un-baselined warehouse still reads its pre-0026 events as broken —
+ * `fractional-quantity.spec.ts` keeps its pin).
+ */
+export async function legacyThroughSeqInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<number> {
+  const rows = await tx
+    .select({ legacyThroughSeq: ledgerIntegrityState.legacyThroughSeq })
+    .from(ledgerIntegrityState)
+    .where(and(eq(ledgerIntegrityState.tenantId, tenantId), eq(ledgerIntegrityState.warehouseId, warehouseId)))
+    .limit(1);
+  return rows[0]?.legacyThroughSeq ?? 0;
 }
 
 function sha256Hex(bytes: string): string {
@@ -881,6 +1002,14 @@ export class LedgerService {
    * predecessor linkage. Any break surfaces as a severity-1 alert (error
    * log + `ledger.chain_broken` alert event) naming the scope and the seq
    * range — detection only, never auto-heal.
+   *
+   * Story 9-3c: the range is validated first (PENDING a14) — `fromSeq ≥ 1`,
+   * integers, `toSeq ≥ fromSeq` when given; anything else is 400
+   * `validation-failed` and records no break (bad input must never write a
+   * permanent alert) — a `toSeq` beyond the head too (it would record a
+   * permanent gap break). Events at or below the warehouse's baseline B
+   * verify ONLY in the pre-0026 form (`legacyEventHashOf`), and a break goes through the
+   * ONE recording path (`recordChainBreak`, `detectedBy: 'verify'`).
    */
   async verifyChain(
     tenantId: string,
@@ -888,32 +1017,31 @@ export class LedgerService {
     fromSeq = 1,
     toSeq?: number,
   ): Promise<ChainVerifyReport | ChainBreakReport> {
-    const report = await withTenantTransaction(this.db, tenantId, (tx) =>
-      verifyChainInTx(tx, tenantId, warehouseId, fromSeq, toSeq),
-    );
+    assertVerifyRange(fromSeq, toSeq);
+    const report = await withTenantTransaction(this.db, tenantId, async (tx) => {
+      if (toSeq !== undefined) {
+        const head = await tx
+          .select({ seq: ledgerEvents.seq })
+          .from(ledgerEvents)
+          .where(and(eq(ledgerEvents.tenantId, tenantId), eq(ledgerEvents.warehouseId, warehouseId)))
+          .orderBy(desc(ledgerEvents.seq))
+          .limit(1);
+        const headSeq = head[0]?.seq ?? 0;
+        if (toSeq > headSeq) {
+          throw new ProblemException(
+            'validation-failed',
+            400,
+            'Invalid verify range',
+            `toSeq ${toSeq} is beyond the warehouse's ledger head (seq ${headSeq}).`,
+          );
+        }
+      }
+      return verifyChainInTx(tx, tenantId, warehouseId, fromSeq, toSeq, await legacyThroughSeqInTx(tx, tenantId, warehouseId));
+    });
     if (report.ok === false) {
-      this.logger.error(
-        `SEVERITY-1 ledger chain break: tenant=${report.tenantId} ` +
-          `warehouse=${report.warehouseId} seq=${report.fromSeq}..${report.toSeq} — ${report.reason}`,
-      );
-      // The severity-1 alert rides the transactional outbox like every other
-      // event: it has no domain write of its own to piggyback on, so it gets
-      // its own small tenant transaction (story outbox-relay). A failure here
-      // propagates — a lost chain-break alert must fail loudly, not silently.
-      await withTenantTransaction(this.db, tenantId, (tx) =>
-        this.outbox.append(tx, {
-          messageId: uuidv7(),
-          tenantId,
-          type: 'ledger.chain_broken',
-          occurredAt: nowIso(),
-          payload: {
-            warehouseId: report.warehouseId,
-            fromSeq: report.fromSeq,
-            toSeq: report.toSeq,
-            reason: report.reason,
-          },
-        }),
-      );
+      // A failure here propagates — a lost chain-break alert must fail
+      // loudly, not silently.
+      await this.recordChainBreak(tenantId, breakInputOf(report, 'verify'));
     }
     return report;
   }
@@ -927,15 +1055,22 @@ export class LedgerService {
    * transaction before anything is committed — an anchor is only ever
    * committed over a chain that still verifies. On a break the method
    * RETURNS the `ChainBreakReport` (no anchor row, no digest committed) and
-   * the existing severity-1 alert path fires after it, exactly as
-   * `verifyChain` reports a break.
+   * the break is recorded after it (`recordChainBreak`, `detectedBy:
+   * 'anchor'`), exactly as `verifyChain` records one.
+   *
+   * Story 9-3c: "nothing to anchor" (no events) and "nothing new" (already
+   * anchored through the head or `uptoSeq`) are a typed `AnchorNothing`, no
+   * longer a 422 — the worker's bounded loop meets them every tick. A seq GAP
+   * in the range (an out-of-band deletion) is a `ChainBreakReport` naming
+   * the first missing seq, no longer a 422: a 422 there would have hidden a
+   * deleted event behind the same answer as "nothing new", forever.
    */
   async anchorChain(
     tenantId: string,
     warehouseId: string,
     uptoSeq?: number,
-  ): Promise<ChainAnchor | ChainBreakReport> {
-    const result = await withTenantTransaction<ChainAnchor | ChainBreakReport>(
+  ): Promise<ChainAnchor | ChainBreakReport | AnchorNothing> {
+    const result = await withTenantTransaction<ChainAnchor | ChainBreakReport | AnchorNothing>(
       this.db,
       tenantId,
       async (tx) => {
@@ -955,25 +1090,17 @@ export class LedgerService {
         .orderBy(desc(ledgerEvents.seq))
         .limit(1);
       const headSeq = headRows[0]?.seq;
-      if (headSeq === undefined) {
-        throw new ProblemException(
-          'validation-failed',
-          422,
-          'Nothing to anchor',
-          'This warehouse has no ledger events yet — anchors cover at least one event.',
-        );
-      }
-      const toSeq = Math.min(uptoSeq ?? headSeq, headSeq);
       const last = await this.anchorStore.latest({ tenantId, warehouseId }, tx);
       const lastToSeq = last?.toSeq ?? 0;
+      if (headSeq === undefined) {
+        // Nothing to anchor: the warehouse has no ledger events yet.
+        return { nothing: true, tenantId, warehouseId, anchoredThroughSeq: lastToSeq };
+      }
+      const toSeq = Math.min(uptoSeq ?? headSeq, headSeq);
       const fromSeq = lastToSeq + 1;
       if (fromSeq > toSeq) {
-        throw new ProblemException(
-          'validation-failed',
-          422,
-          'Nothing new to anchor',
-          `The chain is already anchored through seq ${lastToSeq}.`,
-        );
+        // Nothing new to anchor: already anchored through `lastToSeq`.
+        return { nothing: true, tenantId, warehouseId, anchoredThroughSeq: lastToSeq };
       }
       const rangeRows = await tx
         .select({ seq: ledgerEvents.seq, eventHash: ledgerEvents.eventHash })
@@ -987,53 +1114,139 @@ export class LedgerService {
           ),
         )
         .orderBy(asc(ledgerEvents.seq));
-      // Contiguity: a gapped range would silently anchor a partial digest.
-      if (rangeRows.length !== toSeq - fromSeq + 1) {
-        throw new ProblemException(
-          'validation-failed',
-          422,
-          'Seq gap in anchor range',
-          `Expected ${toSeq - fromSeq + 1} events in seq ${fromSeq}..${toSeq} but found ${rangeRows.length} — the range is gapped.`,
-        );
+      // Contiguity: a gapped range would silently anchor a partial digest —
+      // and a gap is a deleted event, which is a BREAK (story 9-3c), naming
+      // the first missing seq.
+      const gap = gapReport(tenantId, warehouseId, fromSeq, toSeq, rangeRows);
+      if (gap !== null) {
+        return gap; // refuse: the transaction commits nothing.
       }
       // Verify-before-anchor: walk the range's chain inside the anchor
-      // transaction — a tampered (or gapped, or predecessor-missing) range
-      // must never get a digest committed over it.
-      const chainReport = await verifyChainInTx(tx, tenantId, warehouseId, fromSeq, toSeq);
+      // transaction — a tampered (or predecessor-missing) range must never
+      // get a digest committed over it.
+      const legacyThroughSeq = await legacyThroughSeqInTx(tx, tenantId, warehouseId);
+      const chainReport = await verifyChainInTx(tx, tenantId, warehouseId, fromSeq, toSeq, legacyThroughSeq);
       if (chainReport.ok === false) {
         return chainReport; // refuse: the transaction commits nothing.
       }
       const digest = digestOverRange(rangeRows);
       const anchoredAt = nowIso();
-      await this.anchorStore.anchor({ tenantId, warehouseId, fromSeq, toSeq, digest, anchoredAt }, tx);
-      return { tenantId, warehouseId, fromSeq, toSeq, digest, anchoredAt };
+      const kind = 'verified' as const;
+      const { id } = await this.anchorStore.anchor({ tenantId, warehouseId, fromSeq, toSeq, digest, anchoredAt, kind }, tx);
+      return { id, kind, tenantId, warehouseId, fromSeq, toSeq, digest, anchoredAt };
     });
     if ('reason' in result) {
-      // The severity-1 alert rides the transactional outbox like every other
-      // event: its own small tenant transaction (the `verifyChain`
-      // precedent) — the anchor transaction committed nothing, so the alert
-      // must not ride it. A failure here propagates: a lost chain-break
-      // alert must fail loudly, not silently.
-      this.logger.error(
-        `SEVERITY-1 ledger chain break: tenant=${result.tenantId} ` +
-          `warehouse=${result.warehouseId} seq=${result.fromSeq}..${result.toSeq} — ${result.reason}`,
-      );
-      await withTenantTransaction(this.db, tenantId, (tx) =>
-        this.outbox.append(tx, {
-          messageId: uuidv7(),
-          tenantId,
-          type: 'ledger.chain_broken',
-          occurredAt: nowIso(),
-          payload: {
-            warehouseId: result.warehouseId,
-            fromSeq: result.fromSeq,
-            toSeq: result.toSeq,
-            reason: result.reason,
-          },
-        }),
-      );
+      // The anchor transaction committed nothing, so the alert must not ride
+      // it — the recording path opens its own small tenant transaction (the
+      // `verifyChain` precedent). A failure here propagates: a lost
+      // chain-break alert must fail loudly, not silently.
+      await this.recordChainBreak(tenantId, breakInputOf(result, 'anchor'));
     }
     return result;
+  }
+
+  /**
+   * Story 9-3c — the ONE path every detector records a break through
+   * (`verifyChain`, `anchorChain`, the integrity worker's re-verify and WORM
+   * read-back). In one tenant transaction:
+   *
+   *  1. insert the `ledger_chain_breaks` row `ON CONFLICT DO NOTHING` on
+   *     `(tenant, warehouse, kind, first_seq)`, and lower
+   *     `ledger_integrity_state.broken_at_seq` to `least(existing,
+   *     first_seq)` (stamping `broken_detected_at` when it changes; never
+   *     cleared — detection never auto-heals; a warehouse not yet baselined
+   *     has no state row, and the baseline seeds it from the break rows);
+   *  2. ONLY when the row is new: append `ledger.chain_broken` (the existing
+   *     keys `{warehouseId, fromSeq, toSeq, reason}` plus `{breakId, kind,
+   *     detectedBy, firstSeq}`) and, after the commit, log SEVERITY-1. A
+   *     re-detection on a later tick appends nothing and logs WARN.
+   *
+   * The append failure propagates (the transaction rolls back with it, so
+   * the row is not left behind without its alert).
+   */
+  async recordChainBreak(tenantId: string, rawInput: ChainBreakInput): Promise<RecordedChainBreak> {
+    // A reason may quote untrusted bytes (a WORM object's digest): bound it
+    // so the panel's summary (≤ 500 chars) never drops the raise.
+    const input: ChainBreakInput = { ...rawInput, reason: truncateReason(rawInput.reason) };
+    const recorded = await withTenantTransaction(this.db, tenantId, async (tx) => {
+      const detectedAt = nowIso();
+      const inserted = await tx
+        .insert(ledgerChainBreaks)
+        .values({
+          id: uuidv7(),
+          tenantId,
+          warehouseId: input.warehouseId,
+          kind: input.kind,
+          firstSeq: input.firstSeq,
+          anchorId: input.anchorId,
+          reason: input.reason,
+          detectedBy: input.detectedBy,
+          detectedAt,
+        })
+        .onConflictDoNothing({
+          target: [ledgerChainBreaks.tenantId, ledgerChainBreaks.warehouseId, ledgerChainBreaks.kind, ledgerChainBreaks.firstSeq],
+        })
+        .returning({ id: ledgerChainBreaks.id });
+      let breakId = inserted[0]?.id;
+      const isNew = breakId !== undefined;
+      if (breakId === undefined) {
+        const existing = await tx
+          .select({ id: ledgerChainBreaks.id })
+          .from(ledgerChainBreaks)
+          .where(
+            and(
+              eq(ledgerChainBreaks.tenantId, tenantId),
+              eq(ledgerChainBreaks.warehouseId, input.warehouseId),
+              eq(ledgerChainBreaks.kind, input.kind),
+              eq(ledgerChainBreaks.firstSeq, input.firstSeq),
+            ),
+          )
+          .limit(1);
+        breakId = existing[0]!.id;
+      }
+      await tx
+        .update(ledgerIntegrityState)
+        .set({
+          brokenAtSeq: sql`least(coalesce(${ledgerIntegrityState.brokenAtSeq}, ${input.firstSeq}::int), ${input.firstSeq}::int)`,
+          brokenDetectedAt: sql`case when ${ledgerIntegrityState.brokenAtSeq} is null or ${input.firstSeq}::int < ${ledgerIntegrityState.brokenAtSeq} then ${detectedAt}::timestamptz else ${ledgerIntegrityState.brokenDetectedAt} end`,
+          updatedAt: detectedAt,
+        })
+        .where(
+          and(
+            eq(ledgerIntegrityState.tenantId, tenantId),
+            eq(ledgerIntegrityState.warehouseId, input.warehouseId),
+          ),
+        );
+      if (isNew) {
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId,
+          type: LEDGER_CHAIN_BROKEN_EVENT,
+          occurredAt: detectedAt,
+          payload: {
+            warehouseId: input.warehouseId,
+            fromSeq: input.fromSeq,
+            toSeq: input.toSeq,
+            reason: input.reason,
+            breakId,
+            kind: input.kind,
+            detectedBy: input.detectedBy,
+            firstSeq: input.firstSeq,
+          },
+        });
+      }
+      return { breakId, isNew };
+    });
+    const line =
+      `ledger chain break: tenant=${tenantId} ` +
+      `warehouse=${input.warehouseId} seq=${input.fromSeq}..${input.toSeq} — ${input.reason} ` +
+      `(kind=${input.kind}, detectedBy=${input.detectedBy}, break=${recorded.breakId})`;
+    if (recorded.isNew) {
+      this.logger.error(`SEVERITY-1 ${line}`);
+    } else {
+      this.logger.warn(`re-detected (already recorded, no new alert) ${line}`);
+    }
+    return recorded;
   }
 
   /**
@@ -1707,6 +1920,13 @@ async function rebuildBatchArmInTx(
  * over its canonical bytes and checks the predecessor linkage in seq
  * order. A mid-chain start verifies against the actual predecessor row, so
  * a deleted/inserted row inside the range is caught by the linkage check.
+ *
+ * Story 9-3c: `legacyThroughSeq` (default 0) is the warehouse's baseline B.
+ * An event with `seq ≤ legacyThroughSeq` passes ONLY when the pre-0026
+ * form (`legacyEventHashOf`) reproduces its stored hash (amended after code
+ * review E1); above B only the current form counts. A zero-delta event
+ * hashes identically in both. Linkage (`prev_hash`) is checked for every
+ * event exactly as before; a skipped seq is reported as the missing seq.
  */
 export async function verifyChainInTx(
   tx: TenantTx,
@@ -1714,6 +1934,7 @@ export async function verifyChainInTx(
   warehouseId: string,
   fromSeq = 1,
   toSeq?: number,
+  legacyThroughSeq = 0,
 ): Promise<ChainVerifyReport | ChainBreakReport> {
   const rangeConditions: SQL[] = [
     eq(ledgerEvents.tenantId, tenantId),
@@ -1732,16 +1953,29 @@ export async function verifyChainInTx(
   // An out-of-band deletion (the replication-role bypass the append-only
   // trigger does not cover) shows up as a short range, not a hash break —
   // report it naming the gap instead of walking a silently short chain.
-  if (toSeq !== undefined && rows.length !== toSeq - fromSeq + 1) {
-    return {
-      ok: false,
-      tenantId,
-      warehouseId,
-      fromSeq,
-      toSeq,
-      reason: `missing events in seq range ${fromSeq}..${toSeq}: found ${rows.length} of ${toSeq - fromSeq + 1}`,
-    };
+  if (toSeq !== undefined) {
+    const gap = gapReport(tenantId, warehouseId, fromSeq, toSeq, rows);
+    if (gap !== null) {
+      return gap;
+    }
   }
+  return walkChain(tx, tenantId, warehouseId, fromSeq, toSeq, rows, legacyThroughSeq);
+}
+
+/**
+ * Story 9-3c — the walk itself over rows the caller already read in seq
+ * order (`verifyChainInTx`'s body; the integrity worker's chunked re-verify
+ * reads its rows in bounded chunks and calls it per chunk).
+ */
+export async function walkChain(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  fromSeq: number,
+  toSeq: number | undefined,
+  rows: readonly LedgerEventRow[],
+  legacyThroughSeq = 0,
+): Promise<ChainVerifyReport | ChainBreakReport> {
   const lastSeq = rows[rows.length - 1]?.seq ?? fromSeq - 1;
 
   let expectedPrev: string | undefined;
@@ -1768,32 +2002,37 @@ export async function verifyChainInTx(
         fromSeq,
         toSeq: toSeq ?? fromSeq,
         reason: `predecessor event at seq ${fromSeq - 1} is missing`,
+        // The missing predecessor is the broken seq.
+        firstSeq: fromSeq - 1,
       };
     }
   }
 
+  let expectedSeq = fromSeq;
   for (const row of rows) {
-    let recomputed: string;
+    if (row.seq !== expectedSeq) {
+      // A deleted event (the replication-role bypass): report the MISSING
+      // seq — the same break row the contiguity check (`gapReport`) would
+      // record for it — never the next present seq's linkage failure.
+      return {
+        ok: false,
+        tenantId,
+        warehouseId,
+        fromSeq: expectedSeq,
+        toSeq: lastSeq,
+        reason: `missing events in seq range ${expectedSeq}..${lastSeq}: seq ${expectedSeq} is missing (first missing seq ${expectedSeq})`,
+        firstSeq: expectedSeq,
+      };
+    }
+    expectedSeq += 1;
+    // At or below B ONLY the pre-0026 form counts (human amendment after
+    // code review E1): accepting either form would let an edit that divides
+    // a legacy event's quantity by 1000 verify in the current form. A
+    // zero-delta event hashes identically in both forms.
+    let expectedHash: string | null;
     try {
-      recomputed = eventHashOf({
-        id: row.id,
-        tenantId: row.tenantId,
-        warehouseId: row.warehouseId,
-        seq: row.seq,
-        type: row.type,
-        schemaVersion: row.schemaVersion,
-        skuId: row.skuId,
-        quantityDelta: row.quantityDelta,
-        fromBinId: row.fromBinId,
-        toBinId: row.toBinId,
-        batchRef: row.batchRef,
-        serialRef: row.serialRef,
-        actorUserId: row.actorUserId,
-        occurredAt: row.occurredAt,
-        recordedAt: row.recordedAt,
-        referenceDoc: row.referenceDoc as LedgerReferenceDoc,
-        prevHash: row.prevHash,
-      });
+      const canonical = canonicalEventOf(row);
+      expectedHash = row.seq <= legacyThroughSeq ? legacyEventHashOf(canonical) : eventHashOf(canonical);
     } catch {
       return {
         ok: false,
@@ -1814,7 +2053,7 @@ export async function verifyChainInTx(
         reason: `chain break at seq ${row.seq}: stored prev_hash does not match the predecessor's event_hash`,
       };
     }
-    if (row.eventHash !== recomputed) {
+    if (row.eventHash !== expectedHash) {
       return {
         ok: false,
         tenantId,
@@ -1834,5 +2073,80 @@ export async function verifyChainInTx(
     fromSeq,
     toSeq: rows[rows.length - 1]?.seq ?? fromSeq - 1,
     eventCount: rows.length,
+  };
+}
+
+/**
+ * Story 9-3c — a seq range's contiguity check: null when `rows` hold every
+ * seq of `[fromSeq..toSeq]`, else the gap report (its `fromSeq`/`toSeq` the
+ * range — the pre-9-3c contract — and `firstSeq` the first MISSING seq).
+ */
+export function gapReport(
+  tenantId: string,
+  warehouseId: string,
+  fromSeq: number,
+  toSeq: number,
+  rows: readonly { seq: number }[],
+): ChainBreakReport | null {
+  const expected = toSeq - fromSeq + 1;
+  if (rows.length === expected) {
+    return null;
+  }
+  let firstMissing = fromSeq + rows.length;
+  for (let index = 0; index < rows.length; index += 1) {
+    if (rows[index]!.seq !== fromSeq + index) {
+      firstMissing = fromSeq + index;
+      break;
+    }
+  }
+  return {
+    ok: false,
+    tenantId,
+    warehouseId,
+    fromSeq,
+    toSeq,
+    reason: `missing events in seq range ${fromSeq}..${toSeq}: found ${rows.length} of ${expected} (first missing seq ${firstMissing})`,
+    firstSeq: firstMissing,
+  };
+}
+
+/**
+ * Story 9-3c (PENDING a14) — `verifyChain`'s range, validated before
+ * anything is read: integers, `fromSeq ≥ 1`, `toSeq ≥ fromSeq` when given.
+ * A refusal is 400 `validation-failed` and records no break.
+ */
+export function assertVerifyRange(fromSeq: number, toSeq: number | undefined): void {
+  if (
+    !Number.isInteger(fromSeq) ||
+    fromSeq < 1 ||
+    (toSeq !== undefined && (!Number.isInteger(toSeq) || toSeq < fromSeq))
+  ) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      'Invalid verify range',
+      `The seq range must be integers with 1 <= fromSeq <= toSeq (got ${String(fromSeq)}..${toSeq === undefined ? 'head' : String(toSeq)}).`,
+    );
+  }
+}
+
+/** Story 9-3c — the most a recorded break reason may carry. */
+export const MAX_BREAK_REASON_LENGTH = 200;
+
+export function truncateReason(reason: string): string {
+  return reason.length <= MAX_BREAK_REASON_LENGTH ? reason : `${reason.slice(0, MAX_BREAK_REASON_LENGTH - 1)}…`;
+}
+
+/** Story 9-3c — a `chain` break report → the recording path's input. */
+export function breakInputOf(report: ChainBreakReport, detectedBy: LedgerChainBreakDetector): ChainBreakInput {
+  return {
+    warehouseId: report.warehouseId,
+    kind: 'chain',
+    fromSeq: report.fromSeq,
+    toSeq: report.toSeq,
+    firstSeq: Math.max(1, report.firstSeq ?? report.fromSeq),
+    anchorId: null,
+    reason: report.reason,
+    detectedBy,
   };
 }

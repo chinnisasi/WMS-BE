@@ -31,7 +31,12 @@ import {
   BatchListQuery,
   BatchListItemDto,
   BatchListResponse,
+  ChainBreakDto,
+  LedgerAnchorListResponse,
+  LedgerAnchorsQuery,
   LedgerEventListResponse,
+  LedgerIntegrityResponse,
+  LedgerProofResponse,
   LedgerEventsQuery,
   SerialDetailResponse,
   StockAdjustmentDto,
@@ -648,6 +653,124 @@ export class InventoryController {
     return { items: page.items, nextCursor: page.nextCursor };
   }
 
+  // ── Story 9-3c — ledger integrity (AD-16) ──────────────────────────────────
+  // Three `audit.view`-gated reads (owner-only — the facade asserts the
+  // capability in its OWN transaction before anything is read, the 9-3a
+  // gated-read shape) and one keyed owner-only command. The routes sit under
+  // the inventory prefix: the ledger is inventory's.
+
+  @Get(':tenantId/inventory/ledger/integrity')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "The tenant's ledger integrity status, one row per warehouse (audit.view — owner-only): the verified position, the pre-0026 count, the last anchor and its WORM copy, the anchors waiting for WORM, and the breaks (open and acknowledged, newest first, at most 10). UNPAGED — bounded by the warehouse count",
+  })
+  @ApiOkResponse({ type: LedgerIntegrityResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks audit.view (role-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async ledgerIntegrity(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<LedgerIntegrityResponse> {
+    assertOwnTenant(session, tenantId);
+    const view = await this.inventoryFacade.ledgerIntegrity(tenantId, session.userId);
+    return { wormStore: view.wormStore, warehouses: view.warehouses.map((row) => ({ ...row, breaks: [...row.breaks] })) };
+  }
+
+  @Get(':tenantId/warehouses/:warehouseId/inventory/ledger/anchors')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: "Lists one warehouse's ledger anchors, newest range first (audit.view — owner-only; keyset cursor on to_seq)",
+  })
+  @ApiOkResponse({ type: LedgerAnchorListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed warehouseId (validation-failed), a malformed cursor (invalid-cursor), or an out-of-range limit (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks audit.view (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async ledgerAnchors(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: LedgerAnchorsQuery,
+  ): Promise<LedgerAnchorListResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    const page = await this.inventoryFacade.ledgerAnchors(tenantId, session.userId, warehouseId, {
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: [...page.items], nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/warehouses/:warehouseId/inventory/ledger/anchors/:anchorId/proof')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "The verifiable proof of one anchored range (audit.view — owner-only): its 'seq:eventHash' lines, the digest recomputed from them, the anchor with its WORM reference, and how to recompute it. Bounded by LEDGER_ANCHOR_MAX_RANGE",
+  })
+  @ApiOkResponse({ type: LedgerProofResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed warehouseId or anchorId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks audit.view (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No anchor with this id in this warehouse (anchor-not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  @ApiParam({ name: 'anchorId', format: 'uuid' })
+  async ledgerProof(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('anchorId') anchorId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<LedgerProofResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    assertUuidParam(anchorId, 'anchorId');
+    const proof = await this.inventoryFacade.ledgerProof(tenantId, session.userId, warehouseId, anchorId);
+    return { ...proof, lines: [...proof.lines] };
+  }
+
+  @Post(':tenantId/warehouses/:warehouseId/inventory/ledger/breaks/:breakId/acknowledge')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Acknowledges a ledger chain break (ledger.acknowledge — owner-only): resolves its panel entry; audited. Acknowledging repairs nothing — the break stays recorded and a broken tail still refuses to anchor',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: ChainBreakDto })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed warehouseId/breakId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks ledger.acknowledge (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No chain break with this id in this warehouse (chain-break-not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Already acknowledged (chain-break-acknowledged), or a concurrent request on the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  @ApiParam({ name: 'breakId', format: 'uuid' })
+  async acknowledgeChainBreak(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('breakId') breakId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ChainBreakDto> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    assertUuidParam(breakId, 'breakId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return this.inventoryFacade.acknowledgeChainBreak(
+      { tenantId, warehouseId, breakId, actorUserId: session.userId },
+      key,
+    );
+  }
+
   @Get(':tenantId/warehouses/:warehouseId/inventory/stock')
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
@@ -890,7 +1013,7 @@ function assertOwnTenant(session: TenantSession, tenantId: string): void {
 }
 
 /** Story 5-2 — the decision routes' path-param guard (the receiving controller's shape, per-file). */
-function assertUuidParam(value: string, name: 'pendingId'): void {
+function assertUuidParam(value: string, name: 'pendingId' | 'warehouseId' | 'anchorId' | 'breakId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

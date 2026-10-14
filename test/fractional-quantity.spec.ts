@@ -198,6 +198,10 @@ describe('story 10.1: fractional quantities are scaled integers in milli-units',
 
       afterState = await captureSchema();
       chainAfter = await verifyPreMigrationChain();
+      // Story 9-3c: the same migrated chain, read with the whole prefix in
+      // the pre-0026 form (B = every seq) — the human decision's load-bearing
+      // claim, proved against the repo's own 0026 rather than a replica.
+      chainAfterLegacyForm = await verifyPreMigrationChain(Number.MAX_SAFE_INTEGER);
     }, 60_000);
 
     interface SchemaState {
@@ -211,6 +215,7 @@ describe('story 10.1: fractional quantities are scaled integers in milli-units',
     let seededEventHashes: string[];
     let chainBefore: ChainVerifyReport | ChainBreakReport;
     let chainAfter: ChainVerifyReport | ChainBreakReport;
+    let chainAfterLegacyForm: ChainVerifyReport | ChainBreakReport;
 
     async function captureSchema(): Promise<SchemaState> {
       // No `data_type in (...)` filter: filtering to the two types the
@@ -230,11 +235,11 @@ describe('story 10.1: fractional quantities are scaled integers in milli-units',
       };
     }
 
-    async function verifyPreMigrationChain(): Promise<ChainVerifyReport | ChainBreakReport> {
+    async function verifyPreMigrationChain(legacyThroughSeq = 0): Promise<ChainVerifyReport | ChainBreakReport> {
       const db = createDatabase(preUrl);
       try {
         return await withTenantTransaction(db, tenantId, (tx) =>
-          verifyChainInTx(tx, tenantId, warehouseId, 1),
+          verifyChainInTx(tx, tenantId, warehouseId, 1, undefined, legacyThroughSeq),
         );
       } finally {
         await (db as unknown as { $client: { end(): Promise<void> } }).$client.end();
@@ -408,6 +413,14 @@ describe('story 10.1: fractional quantities are scaled integers in milli-units',
       expect(chainBefore.ok).toBe(true);
       expect(chainAfter.ok).toBe(false);
       expect((chainAfter as ChainBreakReport).reason).toContain('hash mismatch at seq 1');
+    });
+
+    it('story 9-3c: every migrated event verifies in the pre-0026 form (quantity_delta / 1000) — 0026 changed nothing else that is hashed', () => {
+      // The pin above stays: read with B = 0 (an un-baselined warehouse) the
+      // chain is broken. Read with the whole prefix at or below B, every
+      // event reproduces its stored hash through `legacyEventHashOf`.
+      expect(chainAfterLegacyForm.ok).toBe(true);
+      expect((chainAfterLegacyForm as ChainVerifyReport).eventCount).toBe(seededEventHashes.length);
     });
 
     it('replay reproduces every balance exactly after the migration — zero divergences', async () => {

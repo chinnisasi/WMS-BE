@@ -88,6 +88,7 @@ export { BUFFER_OWNER_TYPE } from './reservation.service';
 // above).
 export type { AdjustStockCommand, StockAdjustmentSnapshot } from './inventory.command';
 import type {
+  AnchorNothing,
   ChainAnchor,
   ChainBreakReport,
   ChainVerifyReport,
@@ -109,6 +110,38 @@ import type {
 } from './adjustment-approval.command';
 import { ReconciliationService } from './reconcile';
 import type { ReconcileReport } from './reconcile';
+import { LedgerIntegrityService } from './ledger-integrity';
+import type {
+  ChainBreakView,
+  LedgerAnchorPage,
+  LedgerIntegrityRunSummary,
+  LedgerIntegrityView,
+  LedgerProof,
+} from './ledger-integrity';
+import { LedgerBreakCommand } from './ledger-break.command';
+import type { AcknowledgeChainBreakCommand } from './ledger-break.command';
+// Story 9-3c — the ledger integrity shapes cross the seam here (the api
+// shell's DTOs and the jobs shell's worker read them; nobody reaches into
+// `ledger-integrity`).
+export type {
+  ChainBreakView,
+  LedgerAnchorPage,
+  LedgerAnchorView,
+  LedgerAnchorWormView,
+  LedgerIntegrityRunSummary,
+  LedgerIntegrityView,
+  LedgerProof,
+  WarehouseIntegrityView,
+} from './ledger-integrity';
+export type { AcknowledgeChainBreakCommand } from './ledger-break.command';
+export {
+  DEFAULT_ANCHOR_PAGE_SIZE,
+  MAX_ANCHOR_PAGE_SIZE,
+  MAX_BREAKS_PER_WAREHOUSE,
+} from './ledger-integrity';
+export { LEDGER_CHAIN_BREAK_ACKNOWLEDGED_EVENT, LEDGER_CHAIN_BROKEN_EVENT } from './ledger.service';
+export type { AnchorNothing } from './ledger.service';
+export { LEDGER_ANCHOR_WORM_MODES } from './ledger-anchor-worm';
 import { ReservationService } from './reservation.service';
 import type {
   AtpSnapshot,
@@ -336,6 +369,10 @@ export class InventoryFacade {
     // sellable stock; consumed here (reads become HTTP in 2.5, order wiring
     // in Epic 4).
     @Inject(ReservationService) private readonly reservations: ReservationService,
+    // Story 9-3c — the scheduled integrity check, its reads and the
+    // break acknowledgement.
+    @Inject(LedgerIntegrityService) private readonly integrity: LedgerIntegrityService,
+    @Inject(LedgerBreakCommand) private readonly ledgerBreaks: LedgerBreakCommand,
   ) {}
 
   /** `stock.adjustment` — the first movement producer (Story 2.1); Story 5-2 adds the `pending` outcome (the over-threshold 202). */
@@ -711,8 +748,56 @@ export class InventoryFacade {
     tenantId: string,
     warehouseId: string,
     uptoSeq?: number,
-  ): Promise<ChainAnchor | ChainBreakReport> {
+  ): Promise<ChainAnchor | ChainBreakReport | AnchorNothing> {
     return this.ledger.anchorChain(tenantId, warehouseId, uptoSeq);
+  }
+
+  /**
+   * Story 9-3c — the warehouses the `LedgerIntegrityWorker` runs over for
+   * one tenant (every warehouse, `id` order — an empty one is baselined
+   * with B = 0 and costs one indexed read per tick).
+   */
+  async ledgerIntegrityScopesOf(tenantId: string): Promise<{ tenantId: string; warehouseId: string }[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = (await tx.execute(sql`
+        select id from warehouses where tenant_id = ${tenantId}::uuid order by id asc
+      `)) as unknown as { id: string }[];
+      return rows.map((row) => ({ tenantId, warehouseId: row.id }));
+    });
+  }
+
+  /**
+   * Story 9-3c — one integrity run over one warehouse: baseline (once),
+   * anchor the tail (bounded), re-verify one anchored range, copy anchors
+   * to WORM. The jobs shell's `LedgerIntegrityWorker` calls it per scope.
+   */
+  async runLedgerIntegrity(tenantId: string, warehouseId: string): Promise<LedgerIntegrityRunSummary> {
+    return this.integrity.run(tenantId, warehouseId);
+  }
+
+  /** Story 9-3c — `GET …/inventory/ledger/integrity` (`audit.view`; unpaged, bounded by the warehouse count). */
+  async ledgerIntegrity(tenantId: string, actorUserId: string): Promise<LedgerIntegrityView> {
+    return this.integrity.integrity(tenantId, actorUserId);
+  }
+
+  /** Story 9-3c — `GET …/warehouses/{w}/inventory/ledger/anchors` (`audit.view`). */
+  async ledgerAnchors(
+    tenantId: string,
+    actorUserId: string,
+    warehouseId: string,
+    query: { readonly cursor?: string | undefined; readonly limit?: number | undefined },
+  ): Promise<LedgerAnchorPage> {
+    return this.integrity.anchors(tenantId, actorUserId, warehouseId, query);
+  }
+
+  /** Story 9-3c — `GET …/anchors/{anchorId}/proof` (`audit.view`). */
+  async ledgerProof(tenantId: string, actorUserId: string, warehouseId: string, anchorId: string): Promise<LedgerProof> {
+    return this.integrity.proof(tenantId, actorUserId, warehouseId, anchorId);
+  }
+
+  /** Story 9-3c — `POST …/ledger/breaks/{breakId}/acknowledge` (`ledger.acknowledge`, keyed). */
+  async acknowledgeChainBreak(command: AcknowledgeChainBreakCommand, idempotencyKey: string): Promise<ChainBreakView> {
+    return this.ledgerBreaks.acknowledge(command, idempotencyKey);
   }
 
   /** Verifiable digest export over an event range (on-demand artifact). */

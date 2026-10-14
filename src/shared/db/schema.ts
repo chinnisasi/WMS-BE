@@ -1285,6 +1285,15 @@ export const ledgerAnchors = pgTable(
     toSeq: integer('to_seq').notNull(),
     digest: text('digest').notNull(),
     anchoredAt: timestamp('anchored_at', { withTimezone: true, mode: 'string' }).notNull(),
+    /**
+     * Story 9-3c — how the range was verified before it was anchored:
+     * `verified` (the current canonical form — every anchor before 9-3c) or
+     * `legacy` (the pre-0026 form: `quantity_delta / 1000` hashed, the
+     * baseline's prefix `[1..B]`). CHECK `ledger_anchors_kind_check` in
+     * migration 0071 only; a constant default (PG11+ fast default — no
+     * rewrite, and the append-only row trigger is not fired by ADD COLUMN).
+     */
+    kind: text('kind').notNull().default('verified'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -1299,6 +1308,110 @@ export const ledgerAnchors = pgTable(
 );
 
 export type LedgerAnchor = typeof ledgerAnchors.$inferSelect;
+
+/** Story 9-3c — the anchor kinds (`ledger_anchors_kind_check`, migration 0071). */
+export const LEDGER_ANCHOR_KINDS = ['verified', 'legacy'] as const;
+export type LedgerAnchorKind = (typeof LEDGER_ANCHOR_KINDS)[number];
+
+/**
+ * Story 9-3c — one row per (tenant, warehouse): the scheduled integrity
+ * check's state (inventory module, module-exclusive writes). Written by the
+ * baseline (once — `legacy_through_seq` is the pre-0026 prefix boundary B,
+ * fixed for the warehouse's life), the anchoring step (`verified_*`,
+ * `last_run_at`), the re-verify rotation (`reverify_after_seq`) and the break
+ * recorder (`broken_at_seq` / `broken_detected_at` — the LOWEST break seq
+ * detected; set on detection and NEVER cleared: detection never auto-heals).
+ * RLS in migration 0071 only.
+ */
+export const ledgerIntegrityState = pgTable(
+  'ledger_integrity_state',
+  {
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    legacyThroughSeq: integer('legacy_through_seq').notNull(),
+    baselinedAt: timestamp('baselined_at', { withTimezone: true, mode: 'string' }).notNull(),
+    verifiedThroughSeq: integer('verified_through_seq'),
+    verifiedAt: timestamp('verified_at', { withTimezone: true, mode: 'string' }),
+    brokenAtSeq: integer('broken_at_seq'),
+    brokenDetectedAt: timestamp('broken_detected_at', { withTimezone: true, mode: 'string' }),
+    reverifyAfterSeq: integer('reverify_after_seq').notNull().default(0),
+    lastRunAt: timestamp('last_run_at', { withTimezone: true, mode: 'string' }),
+    ...tenantTimestamps,
+  },
+  (table) => [primaryKey({ columns: [table.tenantId, table.warehouseId] })],
+);
+
+export type LedgerIntegrityState = typeof ledgerIntegrityState.$inferSelect;
+
+/** Story 9-3c — what broke (`ledger_chain_breaks_kind_check`). */
+export const LEDGER_CHAIN_BREAK_KINDS = ['chain', 'worm'] as const;
+export type LedgerChainBreakKind = (typeof LEDGER_CHAIN_BREAK_KINDS)[number];
+/** Story 9-3c — which detector found it (`ledger_chain_breaks_detected_by_check`). */
+export const LEDGER_CHAIN_BREAK_DETECTORS = ['anchor', 'reverify', 'verify'] as const;
+export type LedgerChainBreakDetector = (typeof LEDGER_CHAIN_BREAK_DETECTORS)[number];
+
+/**
+ * Story 9-3c — one row per detected break (inventory module, module-exclusive
+ * writes): `chain` (a recomputed hash, a linkage, a gap or an anchor digest
+ * no longer matches) or `worm` (the WORM copy of an anchor is missing or
+ * carries another digest — `anchor_id` set exactly then). Unique on
+ * `(tenant, warehouse, kind, first_seq)`, so a re-detection on a later tick
+ * inserts nothing and raises nothing. An owner acknowledges it (both
+ * acknowledgement columns set together) — acknowledging repairs nothing.
+ * CHECKs and RLS in migration 0071 only.
+ */
+export const ledgerChainBreaks = pgTable(
+  'ledger_chain_breaks',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    kind: text('kind').notNull(),
+    firstSeq: integer('first_seq').notNull(),
+    anchorId: uuid('anchor_id'),
+    reason: text('reason').notNull(),
+    detectedBy: text('detected_by').notNull(),
+    detectedAt: timestamp('detected_at', { withTimezone: true, mode: 'string' }).notNull(),
+    acknowledgedBy: uuid('acknowledged_by'),
+    acknowledgedAt: timestamp('acknowledged_at', { withTimezone: true, mode: 'string' }),
+  },
+  (table) => [
+    uniqueIndex('ledger_chain_breaks_tenant_warehouse_kind_seq_unique').on(
+      table.tenantId,
+      table.warehouseId,
+      table.kind,
+      table.firstSeq,
+    ),
+    index('ledger_chain_breaks_tenant_warehouse_detected_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.detectedAt.desc(),
+    ),
+  ],
+);
+
+export type LedgerChainBreak = typeof ledgerChainBreaks.$inferSelect;
+
+/**
+ * Story 9-3c — the WORM copy of one anchor (inventory module): the S3 object
+ * the copy step wrote (Object Lock, COMPLIANCE) and its version. Append-only
+ * (the 0006 trigger pattern, UPDATE/DELETE and TRUNCATE, in migration 0071);
+ * the PK on `anchor_id` makes the first committed copy win a race between two
+ * instances (`ON CONFLICT DO NOTHING`). No FK (house convention).
+ */
+export const ledgerAnchorWormCopies = pgTable('ledger_anchor_worm_copies', {
+  anchorId: uuid('anchor_id').primaryKey(),
+  tenantId: uuid('tenant_id').notNull(),
+  bucket: text('bucket').notNull(),
+  objectKey: text('object_key').notNull(),
+  versionId: text('version_id').notNull(),
+  retainUntil: timestamp('retain_until', { withTimezone: true, mode: 'string' }).notNull(),
+  copiedAt: timestamp('copied_at', { withTimezone: true, mode: 'string' }).notNull(),
+});
+
+export type LedgerAnchorWormCopy = typeof ledgerAnchorWormCopies.$inferSelect;
 
 /**
  * Transactional outbox (story outbox-relay, AD-7): one pending row per domain

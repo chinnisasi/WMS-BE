@@ -894,6 +894,13 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
       fromSeq: 1,
       toSeq: 1,
       reason: expect.stringContaining('hash mismatch at seq 1'),
+      // Story 9-3c — added keys only (the four above are unchanged): the
+      // break row the alert raises a panel entry for, what broke, which
+      // detector found it, and the first broken seq.
+      breakId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      kind: 'chain',
+      detectedBy: 'anchor',
+      firstSeq: 1,
     });
     errorSpy.mockRestore();
   });

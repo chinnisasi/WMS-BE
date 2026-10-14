@@ -22,7 +22,12 @@ import {
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
-import { ADJUSTMENT_PENDING_STATUSES } from '../../shared/db/schema';
+import {
+  ADJUSTMENT_PENDING_STATUSES,
+  LEDGER_ANCHOR_KINDS,
+  LEDGER_CHAIN_BREAK_DETECTORS,
+  LEDGER_CHAIN_BREAK_KINDS,
+} from '../../shared/db/schema';
 import { ADJUSTMENT_REASON_CODES } from './adjustment-reason';
 import { IsInstant, BooleanFlag, RepeatableParam } from '../../shared/primitives/instant-range';
 import { isRegisteredLedgerEventType, registeredLedgerEventTypes } from './ledger-registry';
@@ -1022,4 +1027,95 @@ export class AdjustmentDecisionResponse {
     description: 'The settled on-hand (approve arm only; null on reject)',
   })
   onHand!: OnHandSnapshotDto | null;
+}
+// ── Story 9-3c — ledger integrity (AD-16) ────────────────────────────────────
+
+/** The WORM copy of one anchor: the S3 object version under Object Lock. */
+export class LedgerAnchorWormDto {
+  @ApiProperty() bucket!: string;
+  @ApiProperty() objectKey!: string;
+  @ApiProperty({ description: 'The S3 object version the copy step wrote' }) versionId!: string;
+  @ApiProperty({ format: 'date-time', description: 'The Object Lock (COMPLIANCE) retain-until date' }) retainUntil!: string;
+  @ApiProperty({ format: 'date-time' }) copiedAt!: string;
+}
+
+export class LedgerAnchorDto {
+  @ApiProperty({ format: 'uuid' }) id!: string;
+  @ApiProperty({
+    enum: LEDGER_ANCHOR_KINDS,
+    description: '`verified` — verified in the current form; `legacy` — the baseline’s pre-0026 prefix, verified with quantity_delta / 1000',
+  })
+  kind!: (typeof LEDGER_ANCHOR_KINDS)[number];
+  @ApiProperty() fromSeq!: number;
+  @ApiProperty() toSeq!: number;
+  @ApiProperty({ description: "sha256 over the range's 'seq:eventHash' lines, seq ascending, '\\n'-joined" }) digest!: string;
+  @ApiProperty({ format: 'date-time' }) anchoredAt!: string;
+  @ApiProperty({ type: LedgerAnchorWormDto, nullable: true, description: 'Null until the anchor is copied to WORM storage (or when none is configured)' })
+  worm!: LedgerAnchorWormDto | null;
+}
+
+export class ChainBreakDto {
+  @ApiProperty({ format: 'uuid' }) id!: string;
+  @ApiProperty({ enum: LEDGER_CHAIN_BREAK_KINDS, description: '`chain` — the ledger itself; `worm` — the WORM copy of an anchor is missing or differs' })
+  kind!: (typeof LEDGER_CHAIN_BREAK_KINDS)[number];
+  @ApiProperty({ description: 'The lowest broken seq (a worm break: the anchor’s first seq)' }) firstSeq!: number;
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The anchor — a worm break only' }) anchorId!: string | null;
+  @ApiProperty() reason!: string;
+  @ApiProperty({ enum: LEDGER_CHAIN_BREAK_DETECTORS }) detectedBy!: (typeof LEDGER_CHAIN_BREAK_DETECTORS)[number];
+  @ApiProperty({ format: 'date-time' }) detectedAt!: string;
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' }) acknowledgedBy!: string | null;
+  @ApiProperty({ type: String, nullable: true, format: 'date-time' }) acknowledgedAt!: string | null;
+}
+
+export class WarehouseLedgerIntegrityDto {
+  @ApiProperty({ format: 'uuid' }) warehouseId!: string;
+  @ApiProperty() warehouseCode!: string;
+  @ApiProperty({ description: 'False until the integrity worker has run once on this warehouse' }) baselined!: boolean;
+  @ApiProperty({ description: 'Events 1..N verified in the pre-0026 form (0: none)' }) legacyThroughSeq!: number;
+  @ApiProperty({ type: Number, nullable: true, description: 'The chain is anchored and verified through this seq' }) verifiedThroughSeq!: number | null;
+  @ApiProperty({ type: String, nullable: true, format: 'date-time' }) verifiedAt!: string | null;
+  @ApiProperty({ type: String, nullable: true, format: 'date-time' }) lastRunAt!: string | null;
+  @ApiProperty({ type: Number, nullable: true, description: 'The lowest break seq ever detected — never cleared (detection never auto-heals)' }) brokenAtSeq!: number | null;
+  @ApiProperty({ type: String, nullable: true, format: 'date-time' }) brokenDetectedAt!: string | null;
+  @ApiProperty({ type: LedgerAnchorDto, nullable: true }) lastAnchor!: LedgerAnchorDto | null;
+  @ApiProperty({ description: 'Anchors not yet copied to WORM storage' }) wormPending!: number;
+  @ApiProperty({ type: [ChainBreakDto], description: 'Open and acknowledged breaks, newest first, at most 10' }) breaks!: ChainBreakDto[];
+  @ApiProperty({ description: 'Every unacknowledged break of the warehouse (not only the listed 10) — 0 means every break is acknowledged' }) openBreakCount!: number;
+}
+
+export class LedgerIntegrityResponse {
+  @ApiProperty({ enum: ['none', 's3'], description: 'The configured WORM store (`LEDGER_ANCHOR_WORM`)' }) wormStore!: 'none' | 's3';
+  @ApiProperty({ type: [WarehouseLedgerIntegrityDto], description: 'One row per warehouse of the tenant, by code — unpaged (bounded by the warehouse count)' })
+  warehouses!: WarehouseLedgerIntegrityDto[];
+}
+
+export class LedgerAnchorsQuery {
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200, description: 'Page size, default 50' })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
+export class LedgerAnchorListResponse {
+  @ApiProperty({ type: [LedgerAnchorDto], description: 'Newest range first (to_seq descending)' }) items!: LedgerAnchorDto[];
+  @ApiProperty({ type: String, nullable: true }) nextCursor!: string | null;
+}
+
+export class LedgerProofResponse {
+  @ApiProperty({ format: 'uuid' }) tenantId!: string;
+  @ApiProperty({ format: 'uuid' }) warehouseId!: string;
+  @ApiProperty({ type: LedgerAnchorDto }) anchor!: LedgerAnchorDto;
+  @ApiProperty({ description: 'How to recompute the digest from `lines`' }) algorithm!: string;
+  @ApiProperty({ type: String, nullable: true, description: 'For a legacy anchor: the pre-0026 (÷1000) rule; null otherwise' }) legacyForm!: string | null;
+  @ApiProperty({ type: [String], description: "'seq:eventHash', seq ascending — exactly the digest's input" }) lines!: string[];
+  @ApiProperty() recomputedDigest!: string;
+  @ApiProperty({ description: 'The recomputed digest equals the anchor’s' }) matches!: boolean;
 }
