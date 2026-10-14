@@ -1,5 +1,17 @@
-import { Controller, Get, Inject, Param, Query, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiExtraModels, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Query, Res, UseGuards } from '@nestjs/common';
+import {
+  ApiBearerAuth,
+  ApiBody,
+  ApiExtraModels,
+  ApiHeaders,
+  ApiOkResponse,
+  ApiOperation,
+  ApiParam,
+  ApiProduces,
+  ApiResponse,
+  ApiTags,
+} from '@nestjs/swagger';
+import type { Response } from 'express';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
@@ -7,15 +19,41 @@ import { TenantSessionGuard, CurrentSession } from '../modules/tenancy/tenant-se
 import type { TenantSession } from '../modules/tenancy/jwt-session';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ReportingFacade } from '../modules/reporting/reporting.facade';
+import { TenancyService } from '../modules/tenancy/tenancy.service';
+import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
+import { IST_OFFSET_MS } from '../shared/primitives/time';
 import type { Figure, Overview, SyncConnectionHealth, WindowedFigure } from '../modules/reporting/reporting.facade';
 import { assertInstantRange } from '../shared/primitives/instant-range';
 import { SYSTEM_ACTOR_ID } from '../shared/primitives/audit';
-import { AuditTrailResponse, ReportingOverviewResponse, ServiceReportDto, toServiceReportDto } from './reporting.dto';
+import {
+  AuditExportDto,
+  AuditExportListResponse,
+  AuditTrailResponse,
+  ReportingOverviewResponse,
+  ServiceReportDto,
+  toAuditExportDto,
+  toServiceReportDto,
+} from './reporting.dto';
 // The query class is bound to @Query() and read by the ValidationPipe through
 // emitDecoratorMetadata — a type-only import would erase it.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
-import { AuditTrailQueryDto, ServiceReportQuery } from './reporting.dto';
+import { AuditExportRequestDto, AuditTrailQueryDto, ServiceReportQuery } from './reporting.dto';
 import type { ReportingFigureDto, ReportingWindowedFigureDto, SyncConnectionHealthDto } from './reporting.dto';
+
+const IDEMPOTENCY_HEADER = [
+  {
+    name: 'Idempotency-Key',
+    required: true,
+    description: 'Client-generated ULID key; replays return the original response',
+    schema: { type: 'string', minLength: 26, maxLength: 26, pattern: '^[0-9A-HJKMNP-TV-Z]{26}$' },
+  },
+];
+
+/** `audit-export-<IST yyyyMMdd-HHmm>.csv` from the export's request instant. */
+export function auditExportFilename(requestedAt: string): string {
+  const ist = new Date(Date.parse(requestedAt) + IST_OFFSET_MS).toISOString();
+  return `audit-export-${ist.slice(0, 4)}${ist.slice(5, 7)}${ist.slice(8, 10)}-${ist.slice(11, 13)}${ist.slice(14, 16)}.csv`;
+}
 
 /**
  * Story 9-1 — the reporting surface: the per-warehouse Overview (FR-27).
@@ -27,7 +65,13 @@ import type { ReportingFigureDto, ReportingWindowedFigureDto, SyncConnectionHeal
 @ApiExtraModels(ProblemDetailsDto)
 @Controller('tenants')
 export class ReportingController {
-  constructor(@Inject(ReportingFacade) private readonly reporting: ReportingFacade) {}
+  constructor(
+    @Inject(ReportingFacade) private readonly reporting: ReportingFacade,
+    // Story 9-3b — the audit EXPORT is tenancy's (it owns `audit_events`,
+    // `users` and the export tables); reporting stays read-only and gains no
+    // code. The routes sit here, beside the trail they export.
+    @Inject(TenancyService) private readonly tenancy: TenancyService,
+  ) {}
 
   @Get(':tenantId/warehouses/:warehouseId/reporting/overview')
   @UseGuards(TenantSessionGuard)
@@ -171,6 +215,149 @@ export class ReportingController {
       systemActorId: SYSTEM_ACTOR_ID,
     };
   }
+
+  /**
+   * Story 9-3b — queues an export of the audit trail under the given
+   * filters (FR-28: an export of 100k events completes asynchronously and
+   * notifies on completion). Owner-only, keyed and audited; ALWAYS 202 —
+   * a replay re-serves the original `queued` snapshot whatever the export
+   * has become since.
+   */
+  @Post(':tenantId/reporting/audit/exports')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Queues an export of the audit trail under the given filters to a gzipped CSV (owner only, one active export per member)',
+    description:
+      'The file holds the trail as of the request (events recorded before it), newest first, up to 1,000,000 events — more fails `too-many-events`. ' +
+      'A worker writes it (`AUDIT_EXPORT_POLL_MS`); completion or failure raises a notification for the requester only. A finished export is kept 7 days, then expires.',
+  })
+  @ApiBody({ type: AuditExportRequestDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.ACCEPTED, type: AuditExportDto, description: 'The queued export (a matching Idempotency-Key replays the original snapshot)' })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      'Missing or malformed Idempotency-Key; a malformed actorUserId/targetId, an actionPrefix outside the stem shape, an unknown targetType, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed)',
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({
+    status: 403,
+    ...problemJsonResponse(
+      'Session belongs to another tenant (permission-denied); a role without `audit.view` (role-denied); or a client-portal session — "This is an operator surface." (role-denied)',
+    ),
+  })
+  @ApiResponse({ status: 409, ...problemJsonResponse('You already have an export queued or running (export-in-progress), or a concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async requestAuditExport(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: AuditExportRequestDto,
+  ): Promise<AuditExportDto> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    assertInstantRange(dto.from, dto.to);
+    const snapshot = await this.tenancy.requestAuditExport(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        filters: {
+          actorUserId: dto.actorUserId,
+          actionPrefix: dto.actionPrefix,
+          targetType: dto.targetType,
+          targetId: dto.targetId,
+          from: dto.from,
+          to: dto.to,
+        },
+      },
+      key,
+    );
+    return toAuditExportDto(snapshot);
+  }
+
+  /**
+   * Story 9-3b — the caller's own last 20 exports, newest first. Unpaged: a
+   * named exception to cursor paging (API-SURFACE). Owner-only.
+   */
+  @Get(':tenantId/reporting/audit/exports')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: "Lists the caller's own audit exports — the last 20, newest first (unpaged)" })
+  @ApiOkResponse({ type: AuditExportListResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({
+    status: 403,
+    ...problemJsonResponse(
+      'Session belongs to another tenant (permission-denied); a role without `audit.view` (role-denied); or a client-portal session (role-denied)',
+    ),
+  })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async listAuditExports(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<AuditExportListResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    return { items: (await this.tenancy.listAuditExports(tenantId, session.userId)).map(toAuditExportDto) };
+  }
+
+  /**
+   * Story 9-3b — a ready export's file: the stored gzipped CSV, sent as-is
+   * with `Content-Encoding: gzip` (the browser's fetch inflates it). Sent
+   * through `@Res()` and `res.end(buffer)` — the `openapi.controller`
+   * precedent; `res.end` sets no ETag. Only the requester may download; a
+   * download writes nothing.
+   */
+  @Get(':tenantId/reporting/audit/exports/:exportId/file')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Downloads a ready audit export (yours only): RFC 4180 CSV, UTF-8 with a BOM, instants in IST — sent gzip-encoded',
+    description:
+      'Columns: recorded_at, occurred_at, actor_kind, actor_user_id, actor_email, action, target_type, target_id. `Content-Length` is the gzipped size (the export\'s `byteSize`); `sha256` is over the uncompressed bytes. ' +
+      'The `Content-Disposition` filename is not readable cross-origin — a client names the file from `requestedAt`.',
+  })
+  @ApiProduces('text/csv')
+  @ApiResponse({
+    status: 200,
+    description: 'The CSV file (Content-Encoding: gzip)',
+    content: { 'text/csv': { schema: { type: 'string', format: 'binary' } } },
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed exportId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({
+    status: 403,
+    ...problemJsonResponse(
+      'Session belongs to another tenant (permission-denied); a role without `audit.view` (role-denied); or a client-portal session (role-denied)',
+    ),
+  })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No export of yours has this id — another member\'s export answers the same (export-not-found)') })
+  @ApiResponse({
+    status: 409,
+    ...problemJsonResponse('The export is queued, running or failed (export-not-ready), or it expired and its file was deleted (export-expired)'),
+  })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'exportId', format: 'uuid' })
+  async downloadAuditExport(
+    @Param('tenantId') tenantId: string,
+    @Param('exportId') exportId: string,
+    @CurrentSession() session: TenantSession,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(exportId, 'exportId');
+    const file = await this.tenancy.openAuditExportFile(tenantId, session.userId, exportId);
+    res.status(200);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Encoding', 'gzip');
+    res.setHeader('Content-Length', String(file.gzipped.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${auditExportFilename(file.export.requestedAt)}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(file.gzipped);
+  }
 }
 
 function toFigureDto(figure: Figure): ReportingFigureDto {
@@ -267,7 +454,7 @@ function assertOwnTenantToken(tokenTenantId: string, tenantId: string): void {
 }
 
 /** A uuid path param fails 400 (never a 500 from the `::uuid` cast) — the outbound controller's shape. */
-function assertUuidParam(value: string, name: 'warehouseId' | 'clientId'): void {
+function assertUuidParam(value: string, name: 'warehouseId' | 'clientId' | 'exportId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

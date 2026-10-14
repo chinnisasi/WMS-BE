@@ -52,3 +52,10 @@ bun run openapi:export  # write openapi/openapi.json — the API contract
 ## Environment
 
 Copy `.env.example` → `.env`: `PORT`, `DATABASE_URL`, `JWT_SECRET` (session signing, length-validated), `DATABASE_AUTH_URL` (optional BYPASSRLS connection, falls back to `DATABASE_URL`), and `CORS_ORIGIN` (browser-client origin allow-list, comma-separated — default `http://localhost:3001`, the web dev server).
+
+### Background workers
+
+Every jobs-shell worker is env-gated OFF unless its poll variable is set (milliseconds; unset or `0` = off). `.env.example` documents each one. Among them:
+
+- `OUTBOX_RELAY_POLL_MS` — the outbox relay. Without it every outbox-driven flow (invoices, e-way bills, channel writeback, the notification panel) silently stalls.
+- `AUDIT_EXPORT_POLL_MS` (story 9-3b) — writes the owner's requested audit exports (gzipped CSV, up to 1,000,000 events) and expires finished ones after 7 days. Off, a requested export stays `queued` and the web reads "Preparing…". The worker proves its snapshot with `pg_stat_activity` (IMPLEMENTATION-GUIDE §7d), so its database role must see every app session — keep all app connections on one role, or grant `pg_read_all_stats`.

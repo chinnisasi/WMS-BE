@@ -1,9 +1,9 @@
-import { and, desc, eq, sql } from 'drizzle-orm';
-import type { SQL } from 'drizzle-orm';
+import { and, desc, sql } from 'drizzle-orm';
 import { auditEvents } from '../../shared/db/schema';
+import { auditFilterSql } from '../../shared/db/audit-filter';
+import type { AuditFilters } from '../../shared/db/audit-filter';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { SYSTEM_ACTOR_ID } from '../../shared/primitives/audit';
-import type { AuditTargetType } from '../../shared/primitives/audit';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import type { Page } from '../../shared/primitives/pagination';
@@ -38,18 +38,12 @@ export const AUDIT_MAX_LIMIT = 200;
 /** The whole read's budget: past it the route answers 503 `report-unavailable` (the 21-8 pattern). */
 export const AUDIT_STATEMENT_TIMEOUT_MS = 5000;
 
-/** `actionPrefix`'s shape — a lowercase dotted action stem (the DTO enforces it; the read re-checks). */
-export const AUDIT_ACTION_PREFIX_RE = /^[a-z][a-z_.-]{0,63}$/;
+// Story 9-3b: the filter moved to `shared/db/audit-filter.ts` (the export
+// reads the same rows); re-exported so existing importers are unchanged.
+export { AUDIT_ACTION_PREFIX_RE, escapeLikePrefix } from '../../shared/db/audit-filter';
+export type { AuditFilters } from '../../shared/db/audit-filter';
 
-export interface AuditTrailQuery {
-  readonly actorUserId?: string | undefined;
-  readonly actionPrefix?: string | undefined;
-  readonly targetType?: AuditTargetType | undefined;
-  readonly targetId?: string | undefined;
-  /** `created_at >= from` (inclusive). */
-  readonly from?: string | undefined;
-  /** `created_at < to` (exclusive — the half-open window, §7a). */
-  readonly to?: string | undefined;
+export interface AuditTrailQuery extends AuditFilters {
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -68,15 +62,6 @@ export interface AuditTrailEntry {
   readonly action: string;
   readonly targetType: string;
   readonly targetId: string;
-}
-
-/**
- * `LIKE` metacharacters escaped with `\` (the ESCAPE character itself first),
- * so a prefix of `stock_adjustment.` matches only that literal stem — never
- * `stockXadjustment.y`.
- */
-export function escapeLikePrefix(prefix: string): string {
-  return prefix.replace(/[\\%_]/g, (char) => `\\${char}`);
 }
 
 function invalidCursor(): ProblemException {
@@ -111,20 +96,8 @@ export async function readAuditPageInTx(
 ): Promise<Page<AuditTrailEntry>> {
   const limit = Math.min(Math.max(query.limit ?? AUDIT_DEFAULT_LIMIT, 1), AUDIT_MAX_LIMIT);
   const before = query.cursor === undefined ? undefined : decodeAuditCursor(query.cursor);
-  const prefix = query.actionPrefix;
-  if (prefix !== undefined && !AUDIT_ACTION_PREFIX_RE.test(prefix)) {
-    // Unreachable through the route (the DTO refuses it first) — a caller
-    // reaching the read another way still never builds an unescaped pattern.
-    throw new ProblemException('validation-failed', 400, 'Invalid actionPrefix', `actionPrefix must match ${AUDIT_ACTION_PREFIX_RE.source}.`);
-  }
-  const filters: (SQL | undefined)[] = [
-    eq(auditEvents.tenantId, tenantId),
-    query.actorUserId === undefined ? undefined : eq(auditEvents.actorUserId, query.actorUserId),
-    prefix === undefined ? undefined : sql`${auditEvents.action} like ${escapeLikePrefix(prefix)} || '%' escape '\\'`,
-    query.targetType === undefined ? undefined : eq(auditEvents.targetType, query.targetType),
-    query.targetId === undefined ? undefined : eq(auditEvents.targetId, query.targetId),
-    query.from === undefined ? undefined : sql`${auditEvents.createdAt} >= ${query.from}::timestamptz`,
-    query.to === undefined ? undefined : sql`${auditEvents.createdAt} < ${query.to}::timestamptz`,
+  const filters = [
+    ...auditFilterSql(tenantId, query),
     before === undefined
       ? undefined
       : sql`(${auditEvents.createdAt}, ${auditEvents.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,

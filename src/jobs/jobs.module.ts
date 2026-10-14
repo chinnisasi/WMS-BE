@@ -19,6 +19,9 @@ import { OutboundModule } from '../modules/outbound/outbound.module';
 import { OutboundFacade } from '../modules/outbound/outbound.facade';
 import { NotificationsModule } from '../modules/notifications/notifications.module';
 import { NotificationsFacade, PUSH_SENDING_STALE_MS } from '../modules/notifications/notifications.facade';
+import { TenancyModule } from '../modules/tenancy/tenancy.module';
+import { TenancyService } from '../modules/tenancy/tenancy.service';
+import { AUDIT_EXPORT_STALE_MINUTES } from '../modules/tenancy/audit-export.runner';
 
 /** The problem code a failed ATP read fails closed with (A8's store split). */
 function codeOf(error: ProblemException): string | null {
@@ -1152,6 +1155,98 @@ export class WaveCutoffSweepWorker implements OnApplicationBootstrap, OnApplicat
   }
 }
 
+/** `AUDIT_EXPORT_POLL_MS` (story 9-3b): the audit export worker's poll; unset/`0` = OFF. */
+export function parseAuditExportPollMs(raw: string | undefined): number {
+  return parsePollMs('AUDIT_EXPORT_POLL_MS', raw);
+}
+
+/**
+ * Story 9-3b — the async audit export worker (the `PushSenderWorker` shape).
+ * Each tick finds the tenants with export work — a `queued` row, a `running`
+ * row whose heartbeat is stale (15 minutes — the runner's own constant), or
+ * a `ready`/`failed` row past its expiry — cross-tenant on the read-only
+ * BYPASSRLS `AUTH_DATABASE` (every write stays in the runner's tenant
+ * transactions), and calls `TenancyService.runDueAuditExports(tenantId)`
+ * once per tenant (reclaim, expire, prove the snapshot, claim at most one
+ * export, write it, finish). A failing tenant is logged and retried next
+ * tick. Env-gated OFF when `AUDIT_EXPORT_POLL_MS` is unset/`0` — rows then
+ * stay `queued` and the web reads "Preparing…". Single-flight via
+ * `running`; `unref`'d timer; shutdown hook. Two instances are safe: the
+ * claim is `FOR UPDATE SKIP LOCKED`, and a finish is conditional on the
+ * claimed attempt.
+ */
+@Injectable()
+export class AuditExportWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('AuditExportWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(TenancyService) private readonly tenancy: TenancyService,
+  ) {
+    this.pollMs = parseAuditExportPollMs(process.env.AUDIT_EXPORT_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off
+    }
+    this.logger.log(`Audit export worker started (poll every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /** One cycle; returns the tenants it drove. */
+  async tick(): Promise<string[]> {
+    if (this.running) {
+      return []; // shed: one cycle at a time in this process
+    }
+    this.running = true;
+    try {
+      const tenants = (await this.authDb.execute(sql`
+        select distinct tenant_id as "tenantId"
+        from audit_exports
+        where status = 'queued'
+           or (status = 'running' and heartbeat_at < now() - make_interval(mins => ${AUDIT_EXPORT_STALE_MINUTES}))
+           or (status in ('ready', 'failed') and expires_at < now())
+        order by tenant_id asc
+      `)) as unknown as { tenantId: string }[];
+      const driven: string[] = [];
+      for (const { tenantId } of tenants) {
+        try {
+          const summary = await this.tenancy.runDueAuditExports(tenantId);
+          if (summary.claimed !== null) {
+            this.logger.log(`audit export ${summary.claimed} (tenant ${tenantId}): ${summary.outcome}`);
+          } else if (summary.waiting !== null && summary.waiting !== 'grace') {
+            this.logger.log(`audit export (tenant ${tenantId}) waiting: ${summary.waiting}`);
+          }
+          driven.push(tenantId);
+        } catch (error) {
+          this.logger.error(
+            `Audit export worker failed for tenant ${tenantId} — retried next tick: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      return driven;
+    } catch (error) {
+      this.logger.error(`Audit export cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
 @Module({
   imports: [
     SharedModule,
@@ -1163,6 +1258,8 @@ export class WaveCutoffSweepWorker implements OnApplicationBootstrap, OnApplicat
     // Story 9-2b — the cutoff sweep (outbound) and the push sender (notifications).
     OutboundModule,
     NotificationsModule,
+    // Story 9-3b — the audit export runner (tenancy).
+    TenancyModule,
   ],
   providers: [
     OutboxRelayWorker,
@@ -1178,6 +1275,8 @@ export class WaveCutoffSweepWorker implements OnApplicationBootstrap, OnApplicat
     // Story 9-2b — the push sender and the wave cutoff sweep (both env-gated OFF by default).
     PushSenderWorker,
     WaveCutoffSweepWorker,
+    // Story 9-3b — the async audit export (env-gated OFF by default).
+    AuditExportWorker,
   ],
   exports: [],
 })

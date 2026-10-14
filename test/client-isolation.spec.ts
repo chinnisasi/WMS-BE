@@ -951,12 +951,16 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // inherit through the parent); 0067 (story 9-2) added two more —
       // notifications and notification_reads (the plain tenant policy:
       // operator-only surfaces, never read by the portal); 0068 (story 9-2b)
-      // added one more — push_deliveries (the same plain tenant policy). None
+      // added one more — push_deliveries (the same plain tenant policy); 0070
+      // (story 9-3b) added two more — audit_exports and audit_export_files
+      // (the plain tenant policy: owner-only, never read by the portal). None
       // lost.
-      expect(policies).toHaveLength(102);
-      expect(policies.find((row) => row.policyname === 'push_deliveries_tenant_isolation')!.qual).toBe(
-        "(tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::uuid)",
-      );
+      expect(policies).toHaveLength(104);
+      for (const name of ['push_deliveries_tenant_isolation', 'audit_exports_tenant_isolation', 'audit_export_files_tenant_isolation']) {
+        expect(policies.find((row) => row.policyname === name)!.qual).toBe(
+          "(tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::uuid)",
+        );
+      }
       const asnPolicy = policies.find((row) => row.policyname === 'advance_shipment_notices_tenant_isolation')!;
       expect(asnPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(asnPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

@@ -2,7 +2,7 @@ import { forwardRef, Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { bins, devices, tenants, users, warehouses, zones } from '../../shared/db/schema';
+import { auditExports, bins, devices, tenants, users, warehouses, zones } from '../../shared/db/schema';
 import type { UserRole } from '../../shared/db/schema';
 // Constructor param is a type here but must stay a value import: Nest DI needs
 // the runtime class token for decorator metadata (eslint rule bends for it).
@@ -17,7 +17,29 @@ import { addressFromColumns } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { GSTIN_RE, gstinPrefixProblem, normalizeGstinInput } from '../../shared/primitives/gstin';
-import { FLOOR_ROLES } from './permissions';
+import { FLOOR_ROLES, assertPermission } from './permissions';
+import {
+  AuditExportCommand,
+  toAuditExportSnapshot,
+  type AuditExportSnapshot,
+  type RequestAuditExportCommand,
+} from './audit-export.command';
+import { AuditExportRunner, type AuditExportRunSummary } from './audit-export.runner';
+import { AUDIT_EXPORT_STORE, type AuditExportStore } from './audit-export.store';
+
+/** Story 9-3b — the "Your exports" list: the caller's own newest exports, unpaged (a named exception to cursor paging). */
+export const AUDIT_EXPORT_LIST_LIMIT = 20;
+
+/** Story 9-3b — a ready export's file, as the download route serves it. */
+export interface AuditExportFile {
+  readonly export: AuditExportSnapshot;
+  /** The stored gzipped CSV bytes (served as-is with `Content-Encoding: gzip`). */
+  readonly gzipped: Buffer;
+}
+
+function exportNotFound(): ProblemException {
+  return new ProblemException('export-not-found', 404, 'Export not found', 'No audit export of yours has this id.');
+}
 
 /** What other modules get from the tenancy spine (module boundary — AD-6). */
 export interface ActiveWarehouse {
@@ -573,7 +595,97 @@ export class TenancyService {
     // CatalogFacade — the first two-way spine module dependency.
     @Inject(forwardRef(() => CatalogFacade))
     private readonly catalogFacade: CatalogFacade,
+    // forwardRef: the export command and runner import `getMemberRoleIn`
+    // from this file (a module-level cycle), so their class tokens are read
+    // lazily.
+    @Inject(forwardRef(() => AuditExportCommand))
+    private readonly auditExportCommand: AuditExportCommand,
+    @Inject(forwardRef(() => AuditExportRunner))
+    private readonly auditExportRunner: AuditExportRunner,
+    @Inject(AUDIT_EXPORT_STORE)
+    private readonly auditExportStore: AuditExportStore,
   ) {}
+
+  /**
+   * Story 9-3b — queues an export of the audit trail under the given filters
+   * (owner-only, keyed and audited; `AuditExportCommand.request`).
+   */
+  async requestAuditExport(command: RequestAuditExportCommand, idempotencyKey: string): Promise<AuditExportSnapshot> {
+    return this.auditExportCommand.request(command, idempotencyKey);
+  }
+
+  /**
+   * Story 9-3b — one worker pass over a tenant's exports (reclaim, expire,
+   * prove the snapshot, claim, write, finish). Called only by the jobs
+   * shell's `AuditExportWorker` (and the suites).
+   */
+  async runDueAuditExports(tenantId: string): Promise<AuditExportRunSummary> {
+    return this.auditExportRunner.runDue(tenantId);
+  }
+
+  /**
+   * Story 9-3b — the caller's OWN last 20 exports, newest first (unpaged —
+   * a named exception to cursor paging). `audit.view`-gated: an export is
+   * owner-only, and nobody sees another member's.
+   */
+  async listAuditExports(tenantId: string, userId: string): Promise<AuditExportSnapshot[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, tenantId, userId), 'audit.view');
+      const rows = await tx
+        .select()
+        .from(auditExports)
+        .where(and(eq(auditExports.tenantId, tenantId), eq(auditExports.requestedBy, userId)))
+        .orderBy(desc(auditExports.createdAt), desc(auditExports.id))
+        .limit(AUDIT_EXPORT_LIST_LIMIT);
+      return rows.map(toAuditExportSnapshot);
+    });
+  }
+
+  /**
+   * Story 9-3b — a ready export's file, for its requester only. Another
+   * member's export and an unknown id are the SAME 404 (never confirm
+   * another member's export exists); queued/running/failed → 409
+   * `export-not-ready`; expired → 409 `export-expired`. A download writes
+   * nothing (no download audit — PENDING).
+   */
+  async openAuditExportFile(tenantId: string, userId: string, exportId: string): Promise<AuditExportFile> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, tenantId, userId), 'audit.view');
+      const [row] = await tx
+        .select()
+        .from(auditExports)
+        .where(and(eq(auditExports.tenantId, tenantId), eq(auditExports.id, exportId), eq(auditExports.requestedBy, userId)))
+        .limit(1);
+      if (row === undefined) throw exportNotFound();
+      const snapshot = toAuditExportSnapshot(row);
+      switch (snapshot.status) {
+        case 'ready':
+          break;
+        case 'expired':
+          throw new ProblemException('export-expired', 409, 'Export expired', 'This audit export has expired and its file was deleted — export again.');
+        case 'queued':
+        case 'running':
+        case 'failed':
+          throw new ProblemException(
+            'export-not-ready',
+            409,
+            'Export not ready',
+            `This audit export is ${snapshot.status} — only a ready export can be downloaded.`,
+          );
+        default: {
+          const unknown: never = snapshot.status;
+          throw new Error(`audit export ${row.id} has an unknown status ${String(unknown)}`);
+        }
+      }
+      const gzipped = await this.auditExportStore.open(tx, tenantId, row.id);
+      if (gzipped === null) {
+        // A ready row always has its file (the finish writes both in one
+        // transaction); a missing one is a fault, never a 200 with no body.
+        throw new Error(`audit export ${row.id} is ready but has no stored file`);
+      }
+      return { export: snapshot, gzipped };
+    });
+  }
 
   /**
    * Role lookup for other modules' command services (Story 1.5 — the

@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { bigint, boolean, date, index, integer, jsonb, numeric, pgEnum, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import { bigint, boolean, customType, date, index, integer, jsonb, numeric, pgEnum, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
 import { uuidv7 } from '../primitives/ids';
 
 /**
@@ -223,6 +223,70 @@ export const auditEvents = pgTable(
     ),
   ],
 );
+
+/** A Postgres `bytea` column — the driver reads and writes it as a Node `Buffer`. */
+const bytea = customType<{ data: Buffer; driverData: Buffer }>({
+  dataType: () => 'bytea',
+});
+
+/**
+ * Story 9-3b — the async audit exports (tenancy-owned, module-exclusive
+ * writes): one row per requested export of the audit trail. The request
+ * command inserts it `queued` with `filters` (the validated body, absent keys
+ * omitted, instants canonical UTC) and `snapshot_at` (the request
+ * transaction's `now()` — equal to `created_at`); the worker
+ * (`audit-export.runner.ts`) claims it `running`, writes the gzipped CSV
+ * through the `AuditExportStore` port and finishes it `ready` or `failed`;
+ * after 7 days its file is removed and the row stays as history, `expired`.
+ * The vocabulary CHECKs, the per-status shape CHECK, the partial unique
+ * "one active export per requester" index and RLS live only in
+ * `drizzle/0070_async_audit_export.sql`. No foreign keys (the house rule).
+ */
+export const auditExports = pgTable(
+  'audit_exports',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    requestedBy: uuid('requested_by').notNull(),
+    filters: jsonb('filters').$type<Record<string, string>>().notNull(),
+    snapshotAt: timestamp('snapshot_at', { withTimezone: true, mode: 'string' }).notNull(),
+    status: text('status').notNull(),
+    attempts: integer('attempts').notNull().default(0),
+    startedAt: timestamp('started_at', { withTimezone: true, mode: 'string' }),
+    heartbeatAt: timestamp('heartbeat_at', { withTimezone: true, mode: 'string' }),
+    finishedAt: timestamp('finished_at', { withTimezone: true, mode: 'string' }),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }),
+    rowCount: integer('row_count'),
+    byteSize: integer('byte_size'),
+    sha256: text('sha256'),
+    failureReason: text('failure_reason'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    index('audit_exports_tenant_requester_created_idx').on(table.tenantId, table.requestedBy, table.createdAt.desc()),
+    uniqueIndex('audit_exports_active_unique')
+      .on(table.tenantId, table.requestedBy)
+      .where(sql`${table.status} in ('queued', 'running')`),
+  ],
+);
+
+export type AuditExportRow = typeof auditExports.$inferSelect;
+
+/**
+ * Story 9-3b — an audit export's file: the gzipped CSV bytes, in their own
+ * table so listing exports never reads them. Written and removed only
+ * through the `AuditExportStore` port's Postgres implementation
+ * (`tenancy/audit-export.store.ts`); 9-3c's object storage can replace it.
+ * RLS lives only in the 0070 migration. No foreign key — expiry removes the
+ * file explicitly.
+ */
+export const auditExportFiles = pgTable('audit_export_files', {
+  exportId: uuid('export_id').primaryKey(),
+  tenantId: uuid('tenant_id').notNull(),
+  content: bytea('content').notNull(),
+});
 
 export type AuditEvent = typeof auditEvents.$inferSelect;
 
@@ -4689,6 +4753,14 @@ export const notifications = pgTable(
     surfacedAt: timestamp('surfaced_at', { withTimezone: true, mode: 'string' }),
     resolvedAt: timestamp('resolved_at', { withTimezone: true, mode: 'string' }),
     resolution: text('resolution'),
+    /**
+     * Story 9-3b — the first per-user audience: set exactly for a source
+     * addressed to one member (`audit-export` — the requester), null for
+     * every capability-routed source. The reads add `recipient_user_id IS
+     * NULL OR recipient_user_id = $me`. The two-way pairing CHECK lives in
+     * `drizzle/0070_async_audit_export.sql`.
+     */
+    recipientUserId: uuid('recipient_user_id'),
     ...tenantTimestamps,
   },
   (table) => [

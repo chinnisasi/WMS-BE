@@ -2377,14 +2377,23 @@ describe('architecture: the audit read is reporting\'s THIRD read-only exception
    * narrowest terms — it reads `audit_events` and nothing else. The
    * directory-wide reporting guards above (writes nothing, owns no table,
    * only the api shell imports it) cover it too; these are its own.
+   *
+   * Story 9-3b moved its FILTER to `shared/db/audit-filter.ts` (the export
+   * reads the same rows, and tenancy may not import reporting): that file is
+   * held to the same rules — only `auditEvents`, no other table, no join, no
+   * role read.
    */
   const AUDIT_READ = join(SRC_ROOT, 'modules', 'reporting', 'audit.ts');
-  const source = readFileSync(AUDIT_READ, 'utf8');
-  const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const AUDIT_FILTER = join(SRC_ROOT, 'shared', 'db', 'audit-filter.ts');
+  const strip = (text: string): string => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const READ_MODELS = [AUDIT_READ, AUDIT_FILTER].map((path) => {
+    const source = readFileSync(path, 'utf8');
+    return { path, source, code: strip(source) };
+  });
 
-  /** The names a file imports from the schema module. */
+  /** The names a file imports from the schema module (`./schema` is the shared filter's own spelling). */
   function schemaImports(text: string): string[] {
-    return [...text.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+'[./]*shared\/db\/schema'/g)].flatMap((match) =>
+    return [...text.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+'(?:[./]*shared\/db\/schema|\.\/schema)'/g)].flatMap((match) =>
       match[1]!.split(',').map((name) => name.trim()).filter((name) => name.length > 0),
     );
   }
@@ -2396,30 +2405,106 @@ describe('architecture: the audit read is reporting\'s THIRD read-only exception
 
   it('the detectors bite', () => {
     expect(schemaImports("import { auditEvents, users } from '../../shared/db/schema';")).toEqual(['auditEvents', 'users']);
+    expect(schemaImports("import { auditEvents, users } from './schema';")).toEqual(['auditEvents', 'users']);
     expect(rawTableNames('sql`select 1 from audit_events a join users u on true`')).toEqual(['audit_events', 'users']);
   });
 
-  it('imports only `auditEvents` from the schema', () => {
-    expect(schemaImports(source)).toEqual(['auditEvents']);
+  it('the read imports the shared filter (9-3b: one definition of the filter, never a copy)', () => {
+    expect(READ_MODELS[0]!.code).toMatch(/import \{ auditFilterSql \} from '\.\.\/\.\.\/shared\/db\/audit-filter'/);
+    expect(READ_MODELS[0]!.code).toMatch(/\.\.\.auditFilterSql\(tenantId, query\)/);
   });
 
-  it('names no table but audit_events in raw SQL', () => {
-    // Drizzle builder calls (`.from(auditEvents)`) are covered by the import
-    // pin; this catches a raw `from <table>` / `join <table>` in a template.
-    const sqlTemplates = [...code.matchAll(/sql(?:<[^>]*>)?`([^`]*)`/g)].map((match) => match[1]!);
-    expect(sqlTemplates.length).toBeGreaterThan(0);
-    expect(sqlTemplates.flatMap(rawTableNames).filter((name) => name !== 'audit_events')).toEqual([]);
-  });
+  it.each(READ_MODELS.map((model) => [model.path.slice(SRC_ROOT.length + 1), model] as const))(
+    '%s imports only `auditEvents` from the schema',
+    (_name, model) => {
+      expect(schemaImports(model.source)).toEqual(['auditEvents']);
+    },
+  );
 
-  it('contains no join (no second table can enter the read)', () => {
-    expect(/join/i.test(code)).toBe(false);
-  });
+  it.each(READ_MODELS.map((model) => [model.path.slice(SRC_ROOT.length + 1), model] as const))(
+    '%s names no table but audit_events in raw SQL',
+    (_name, model) => {
+      // Drizzle builder calls (`.from(auditEvents)`) are covered by the import
+      // pin; this catches a raw `from <table>` / `join <table>` in a template.
+      const sqlTemplates = [...model.code.matchAll(/sql(?:<[^>]*>)?`([^`]*)`/g)].map((match) => match[1]!);
+      expect(sqlTemplates.length).toBeGreaterThan(0);
+      expect(sqlTemplates.flatMap(rawTableNames).filter((name) => name !== 'audit_events')).toEqual([]);
+    },
+  );
 
-  it('the role check is the facade\'s, in its own transaction — never in the read model', () => {
-    expect(code).not.toMatch(/getMemberRoleIn|assertPermission|\busers\b/);
+  it.each(READ_MODELS.map((model) => [model.path.slice(SRC_ROOT.length + 1), model] as const))(
+    '%s contains no join (no second table can enter the read)',
+    (_name, model) => {
+      expect(/join/i.test(model.code)).toBe(false);
+    },
+  );
+
+  it.each(READ_MODELS.map((model) => [model.path.slice(SRC_ROOT.length + 1), model] as const))(
+    '%s never reads a role (the role check is the facade\'s, in its own transaction)',
+    (_name, model) => {
+      expect(model.code).not.toMatch(/getMemberRoleIn|assertPermission|\busers\b/);
+    },
+  );
+
+  it('the facade carries the guard line verbatim', () => {
     const facade = readFileSync(join(SRC_ROOT, 'modules', 'reporting', 'reporting.facade.ts'), 'utf8');
     expect(facade).toMatch(/assertPermission\(await getMemberRoleIn\(tx, tenantId, actorUserId\), 'audit\.view'\)/);
   });
+});
+
+describe('architecture: the audit exports are tenancy-owned (story 9-3b)', () => {
+  /**
+   * Story 9-3b: `audit_exports` and `audit_export_files` are written ONLY by
+   * the tenancy module (the request command, the worker's runner, the
+   * Postgres file store) — the 9-2 notifications block's shape. Reporting
+   * stays read-only and gains no export code; the routes sit in the api
+   * shell's `ReportingController`, which calls `TenancyService`.
+   */
+  const EXPORT_TABLES = ['auditExports', 'auditExportFiles'] as const;
+  const RAW_EXPORT_TABLES = 'audit_exports|audit_export_files';
+  const tenancyRoot = join(SRC_ROOT, 'modules', 'tenancy');
+  const reportingRoot = join(SRC_ROOT, 'modules', 'reporting');
+
+  it('the detectors bite (the test is meaningful): the command, the runner and the store really write', () => {
+    const command = readFileSync(join(tenancyRoot, 'audit-export.command.ts'), 'utf8');
+    const runner = readFileSync(join(tenancyRoot, 'audit-export.runner.ts'), 'utf8');
+    const store = readFileSync(join(tenancyRoot, 'audit-export.store.ts'), 'utf8');
+    expect(drizzleWriteOn('auditExports').test(command)).toBe(true);
+    expect(drizzleWriteOn('auditExports').test(runner)).toBe(true);
+    expect(drizzleWriteOn('auditExportFiles').test(store)).toBe(true);
+    expect(new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_EXPORT_TABLES})\\b`, 'i').test('sql`delete from audit_export_files`')).toBe(true);
+  });
+
+  it('no export-table write happens outside the tenancy module', () => {
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => !f.path.startsWith(tenancyRoot))) {
+      for (const pattern of [
+        ...EXPORT_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_EXPORT_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('reporting holds no export code (it never names the export tables or the runner)', () => {
+    const offenders = files
+      .filter((file) => file.path.startsWith(reportingRoot))
+      .filter((file) => /\bauditExports?\b|auditExportFiles|audit_exports?\b|audit_export_files|AuditExport/.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+  });
+
+  it('the worker-written lifecycle events are outbox events only — the runner writes no audit row', () => {
+    const runner = strip(readFileSync(join(tenancyRoot, 'audit-export.runner.ts'), 'utf8'));
+    expect(drizzleWriteOn('auditEvents').test(runner)).toBe(false);
+    expect(runner).toMatch(/this\.outbox\.append\(/);
+  });
+
+  function strip(text: string): string {
+    return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  }
 });
 
 describe('architecture: the audit rule — every keyed command writes its audit row (story 9-3a, static half)', () => {

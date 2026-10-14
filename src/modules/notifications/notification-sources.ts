@@ -29,6 +29,9 @@ export const NOTIFICATION_SOURCE_TYPES = [
   'batch-alert',
   'qc-hold',
   'channel-sync',
+  // Story 9-3b — the first PER-USER source: a finished audit export,
+  // addressed to its requester only (`recipient_user_id`).
+  'audit-export',
 ] as const;
 
 export type NotificationSourceType = (typeof NOTIFICATION_SOURCE_TYPES)[number];
@@ -59,6 +62,9 @@ export const SOURCE_RESOLUTIONS = {
   'batch-alert': ['resolved', 'dismissed'],
   'qc-hold': ['released'],
   'channel-sync': ['recovered', 'disconnected'],
+  // Story 9-3b — an export's entry stays open until its file expires;
+  // downloading does not resolve it (the spec's decision).
+  'audit-export': ['expired'],
 } as const satisfies Record<NotificationSourceType, readonly string[]>;
 
 // ── the summaries — a per-source allowlist, built key by key ────────────────
@@ -108,6 +114,24 @@ export interface ChannelSyncSummary {
   readonly connectionId: string;
 }
 
+/**
+ * Story 9-3b — why an export failed: the tenancy module's
+ * `AUDIT_EXPORT_FAILURE_REASONS`, repeated as a literal (this module may
+ * import no sibling's internals — AD-6) and pinned equal by
+ * `test/audit-export.spec.ts`.
+ */
+export const AUDIT_EXPORT_FAILURE_REASONS = ['too-many-events', 'interrupted', 'export-error'] as const;
+export type AuditExportFailureReason = (typeof AUDIT_EXPORT_FAILURE_REASONS)[number];
+
+/** Story 9-3b — one summary arm for both raises (the `BatchAlertSummary` shape). */
+export interface AuditExportSummary {
+  readonly status: 'ready' | 'failed';
+  /** The failed arm only. */
+  readonly reason?: AuditExportFailureReason;
+  /** The ready arm only — the events in the file. */
+  readonly rowCount?: number;
+}
+
 export type NotificationSummary =
   | StockAdjustmentSummary
   | CountVarianceSummary
@@ -116,14 +140,21 @@ export type NotificationSummary =
   | ReorderBreachSummary
   | BatchAlertSummary
   | QcHoldSummary
-  | ChannelSyncSummary;
+  | ChannelSyncSummary
+  | AuditExportSummary;
 
-/** A raise decoded: the entry's identity, its warehouse and its summary. */
+/** A raise decoded: the entry's identity, its warehouse, its summary and (9-3b) its recipient. */
 export interface DecodedRaise {
   readonly sourceType: NotificationSourceType;
   readonly sourceId: string;
   readonly warehouseId: string | null;
   readonly summary: NotificationSummary;
+  /**
+   * Story 9-3b — the one member the entry is addressed to; null for every
+   * capability-routed source. Carried by the resolve too, so a tombstone
+   * (a resolve that arrived first) is never written without it.
+   */
+  readonly recipientUserId: string | null;
 }
 
 /**
@@ -138,6 +169,8 @@ export type DecodedResolve =
       readonly sourceId: string;
       readonly warehouseId: string | null;
       readonly resolution: string;
+      /** Story 9-3b — see `DecodedRaise.recipientUserId`. */
+      readonly recipientUserId: string | null;
     }
   | { readonly kind: 'ignore' };
 
@@ -186,13 +219,22 @@ function oneOf<T extends string>(payload: Payload, key: string, allowed: readonl
  * Builds a raise (or null when the payload is malformed — the subscriber
  * acks a malformed publication; no retry can fix a shape).
  */
-type RaiseDecoder = (payload: Payload) => { sourceId: string; warehouseId: string | null; summary: NotificationSummary } | null;
+type RaiseDecoder = (
+  payload: Payload,
+) => { sourceId: string; warehouseId: string | null; summary: NotificationSummary; recipientUserId?: string } | null;
 
 /** Builds a resolve (null = malformed). */
-type ResolveDecoder = (payload: Payload) => { sourceId: string; warehouseId: string | null; resolution: string } | 'ignore' | null;
+type ResolveDecoder = (
+  payload: Payload,
+) => { sourceId: string; warehouseId: string | null; resolution: string; recipientUserId?: string } | 'ignore' | null;
 
 interface SourceSpec {
   readonly raise: { readonly type: string; readonly decode: RaiseDecoder };
+  /**
+   * Story 9-3b — further raise events of the SAME entry (an export raises on
+   * `ready` OR on `failed`, never both: the runner's finish is conditional).
+   */
+  readonly moreRaises?: readonly { readonly type: string; readonly decode: RaiseDecoder }[];
   readonly resolves: readonly { readonly type: string; readonly decode: ResolveDecoder }[];
 }
 
@@ -414,6 +456,43 @@ export const NOTIFICATION_SOURCES: Readonly<Record<NotificationSourceType, Sourc
       },
     ],
   },
+  'audit-export': {
+    // Story 9-3b (tenancy's runner). The entry is the export's own id,
+    // addressed to `requestedBy`; it stores no warehouse.
+    raise: {
+      type: 'audit_export.ready',
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'exportId');
+        const recipientUserId = uuid(payload, 'requestedBy');
+        const rowCount = finite(payload, 'rowCount');
+        if (sourceId === null || recipientUserId === null || rowCount === null || !Number.isInteger(rowCount) || rowCount < 0) return null;
+        return { sourceId, warehouseId: null, recipientUserId, summary: { status: 'ready', rowCount } satisfies AuditExportSummary };
+      },
+    },
+    moreRaises: [
+      {
+        type: 'audit_export.failed',
+        decode: (payload) => {
+          const sourceId = uuid(payload, 'exportId');
+          const recipientUserId = uuid(payload, 'requestedBy');
+          const reason = oneOf(payload, 'reason', AUDIT_EXPORT_FAILURE_REASONS);
+          if (sourceId === null || recipientUserId === null || reason === null) return null;
+          return { sourceId, warehouseId: null, recipientUserId, summary: { status: 'failed', reason } satisfies AuditExportSummary };
+        },
+      },
+    ],
+    resolves: [
+      {
+        type: 'audit_export.expired',
+        decode: (payload) => {
+          const sourceId = uuid(payload, 'exportId');
+          const recipientUserId = uuid(payload, 'requestedBy');
+          if (sourceId === null || recipientUserId === null) return null;
+          return { sourceId, warehouseId: null, recipientUserId, resolution: 'expired' };
+        },
+      },
+    ],
+  },
 };
 
 /** Every event type the subscriber listens to → how to read it. */
@@ -426,6 +505,10 @@ export const EVENT_ROUTES: ReadonlyMap<string, EventRoute> = new Map(
     const spec = NOTIFICATION_SOURCES[sourceType];
     return [
       [spec.raise.type, { arm: 'raise', sourceType, decode: spec.raise.decode }],
+      ...(spec.moreRaises ?? []).map((raise): [string, EventRoute] => [
+        raise.type,
+        { arm: 'raise', sourceType, decode: raise.decode },
+      ]),
       ...spec.resolves.map((resolve): [string, EventRoute] => [
         resolve.type,
         { arm: 'resolve', sourceType, decode: resolve.decode },
@@ -438,7 +521,14 @@ export const EVENT_ROUTES: ReadonlyMap<string, EventRoute> = new Map(
 export function decodeRaise(route: Extract<EventRoute, { arm: 'raise' }>, payload: unknown): DecodedRaise | null {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
   const decoded = route.decode(payload as Payload);
-  return decoded === null ? null : { sourceType: route.sourceType, ...decoded };
+  if (decoded === null) return null;
+  return {
+    sourceType: route.sourceType,
+    sourceId: decoded.sourceId,
+    warehouseId: decoded.warehouseId,
+    summary: decoded.summary,
+    recipientUserId: decoded.recipientUserId ?? null,
+  };
 }
 
 export function decodeResolve(route: Extract<EventRoute, { arm: 'resolve' }>, payload: unknown): DecodedResolve | null {
@@ -446,7 +536,14 @@ export function decodeResolve(route: Extract<EventRoute, { arm: 'resolve' }>, pa
   const decoded = route.decode(payload as Payload);
   if (decoded === null) return null;
   if (decoded === 'ignore') return { kind: 'ignore' };
-  return { kind: 'resolve', sourceType: route.sourceType, ...decoded };
+  return {
+    kind: 'resolve',
+    sourceType: route.sourceType,
+    sourceId: decoded.sourceId,
+    warehouseId: decoded.warehouseId,
+    resolution: decoded.resolution,
+    recipientUserId: decoded.recipientUserId ?? null,
+  };
 }
 
 // ── routing: who sees what ──────────────────────────────────────────────────
@@ -457,8 +554,18 @@ export function decodeResolve(route: Extract<EventRoute, { arm: 'resolve' }>, pa
  * count variance is special: its over-threshold resolution is owner-only by
  * the resolve command's frozen-threshold guard (`count.command.ts`), not by
  * a capability, so the rule is a role.
+ *
+ * Story 9-3b — the first PER-USER audience: `{capability, recipient: true}`
+ * means the role must hold the capability AND the entry is served only to
+ * its `recipient_user_id` (the reads add `recipient_user_id IS NULL OR
+ * recipient_user_id = $me`, so every capability-routed source is unchanged).
  */
-export const SOURCE_AUDIENCE: Readonly<Record<NotificationSourceType, { readonly capability: Capability } | { readonly role: 'owner' }>> = {
+export type SourceAudience =
+  | { readonly capability: Capability; readonly recipient?: undefined }
+  | { readonly capability: Capability; readonly recipient: true }
+  | { readonly role: 'owner' };
+
+export const SOURCE_AUDIENCE: Readonly<Record<NotificationSourceType, SourceAudience>> = {
   'stock-adjustment': { capability: 'adjustments.approve' },
   'count-variance': { role: 'owner' },
   'over-receipt': { capability: 'review.decide' },
@@ -467,6 +574,7 @@ export const SOURCE_AUDIENCE: Readonly<Record<NotificationSourceType, { readonly
   'batch-alert': { capability: 'replenishment.manage' },
   'qc-hold': { capability: 'qc.manage' },
   'channel-sync': { capability: 'channel.manage' },
+  'audit-export': { capability: 'audit.view', recipient: true },
 };
 
 /** The source types a role sees — an allowlist; an unknown role sees none. */

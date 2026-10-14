@@ -110,6 +110,9 @@ export class NotificationsDeliveryHandler implements OnModuleInit {
           sourceType: resolve.sourceType,
           sourceId: resolve.sourceId,
           warehouseId: resolve.warehouseId,
+          // Story 9-3b: a tombstone of a per-user source carries its
+          // recipient from the start — never a window with none.
+          recipientUserId: resolve.recipientUserId,
           summary: null,
           raisedAt: null,
           surfacedAt: null,
@@ -139,6 +142,7 @@ export class NotificationsDeliveryHandler implements OnModuleInit {
           sourceType: raise.sourceType,
           sourceId: raise.sourceId,
           warehouseId: raise.warehouseId,
+          recipientUserId: raise.recipientUserId,
           summary: { ...raise.summary },
           raisedAt: occurredAt,
           surfacedAt: sql`now()`,
@@ -149,6 +153,7 @@ export class NotificationsDeliveryHandler implements OnModuleInit {
           // `resolution` stay — the entry reads resolved and lights no dot.
           set: {
             warehouseId: raise.warehouseId,
+            recipientUserId: raise.recipientUserId,
             summary: { ...raise.summary },
             raisedAt: occurredAt,
             surfacedAt: sql`now()`,

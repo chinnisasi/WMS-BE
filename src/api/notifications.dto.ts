@@ -6,7 +6,7 @@ import {
   DEFAULT_NOTIFICATION_PAGE_SIZE,
   type NotificationEntry,
 } from '../modules/notifications/notifications.facade';
-import { SOURCE_RESOLUTIONS } from '../modules/notifications/notification-sources';
+import { AUDIT_EXPORT_FAILURE_REASONS, SOURCE_RESOLUTIONS } from '../modules/notifications/notification-sources';
 
 /**
  * Story 9-2 — the notification panel's wire shapes. Each entry is one arm of
@@ -77,6 +77,13 @@ export class ChannelSyncSummaryDto {
   @ApiProperty({ format: 'uuid' }) connectionId!: string;
 }
 
+/** Story 9-3b — a finished audit export (one summary arm for ready and failed). */
+export class AuditExportSummaryDto {
+  @ApiProperty({ enum: ['ready', 'failed'] }) status!: 'ready' | 'failed';
+  @ApiProperty({ required: false, enum: AUDIT_EXPORT_FAILURE_REASONS, description: 'Why it failed — the failed arm only' }) reason?: (typeof AUDIT_EXPORT_FAILURE_REASONS)[number];
+  @ApiProperty({ required: false, description: 'The events in the file — the ready arm only' }) rowCount?: number;
+}
+
 // ── entries ──────────────────────────────────────────────────────────────────
 
 abstract class NotificationEntryBaseDto {
@@ -135,6 +142,13 @@ export class ChannelSyncNotificationDto extends NotificationEntryBaseDto {
   @ApiProperty({ type: String, nullable: true, enum: [...SOURCE_RESOLUTIONS['channel-sync'], null] }) resolution!: (typeof SOURCE_RESOLUTIONS)['channel-sync'][number] | null;
 }
 
+/** Story 9-3b — addressed to the export's requester only; open until the file expires. */
+export class AuditExportNotificationDto extends NotificationEntryBaseDto {
+  @ApiProperty({ enum: ['audit-export'] }) sourceType!: 'audit-export';
+  @ApiProperty({ type: AuditExportSummaryDto }) summary!: AuditExportSummaryDto;
+  @ApiProperty({ type: String, nullable: true, enum: [...SOURCE_RESOLUTIONS['audit-export'], null] }) resolution!: (typeof SOURCE_RESOLUTIONS)['audit-export'][number] | null;
+}
+
 export const NOTIFICATION_ENTRY_DTOS = [
   StockAdjustmentNotificationDto,
   CountVarianceNotificationDto,
@@ -144,6 +158,7 @@ export const NOTIFICATION_ENTRY_DTOS = [
   BatchAlertNotificationDto,
   QcHoldNotificationDto,
   ChannelSyncNotificationDto,
+  AuditExportNotificationDto,
 ] as const;
 
 export type NotificationEntryDto = InstanceType<(typeof NOTIFICATION_ENTRY_DTOS)[number]>;
@@ -165,6 +180,7 @@ export class NotificationListResponse {
           'batch-alert': getSchemaPath(BatchAlertNotificationDto),
           'qc-hold': getSchemaPath(QcHoldNotificationDto),
           'channel-sync': getSchemaPath(ChannelSyncNotificationDto),
+          'audit-export': getSchemaPath(AuditExportNotificationDto),
         },
       },
     },

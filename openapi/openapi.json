@@ -18115,6 +18115,7 @@
               "type": "string",
               "enum": [
                 "advance_shipment_notice",
+                "audit_export",
                 "batch_alert",
                 "bin",
                 "carrier_connection",
@@ -18271,6 +18272,272 @@
           }
         ],
         "summary": "The tenant's audit trail: every state-changing action — who, what, when, and the document it changed — filterable, newest recorded first (keyset cursor pagination)",
+        "tags": [
+          "reporting"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/reporting/audit/exports": {
+      "post": {
+        "description": "The file holds the trail as of the request (events recorded before it), newest first, up to 1,000,000 events — more fails `too-many-events`. A worker writes it (`AUDIT_EXPORT_POLL_MS`); completion or failure raises a notification for the requester only. A finished export is kept 7 days, then expires.",
+        "operationId": "ReportingController_requestAuditExport",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuditExportRequestDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "The queued export (a matching Idempotency-Key replays the original snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditExportDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key; a malformed actorUserId/targetId, an actionPrefix outside the stem shape, an unknown targetType, a from/to that is not an ISO-8601 instant, or from not before to (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied); a role without `audit.view` (role-denied); or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "You already have an export queued or running (export-in-progress), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Queues an export of the audit trail under the given filters to a gzipped CSV (owner only, one active export per member)",
+        "tags": [
+          "reporting"
+        ]
+      },
+      "get": {
+        "operationId": "ReportingController_listAuditExports",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditExportListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied); a role without `audit.view` (role-denied); or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the caller's own audit exports — the last 20, newest first (unpaged)",
+        "tags": [
+          "reporting"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/reporting/audit/exports/{exportId}/file": {
+      "get": {
+        "description": "Columns: recorded_at, occurred_at, actor_kind, actor_user_id, actor_email, action, target_type, target_id. `Content-Length` is the gzipped size (the export's `byteSize`); `sha256` is over the uncompressed bytes. The `Content-Disposition` filename is not readable cross-origin — a client names the file from `requestedAt`.",
+        "operationId": "ReportingController_downloadAuditExport",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "exportId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The CSV file (Content-Encoding: gzip)",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed exportId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied); a role without `audit.view` (role-denied); or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No export of yours has this id — another member's export answers the same (export-not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The export is queued, running or failed (export-not-ready), or it expired and its file was deleted (export-expired)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Downloads a ready audit export (yours only): RFC 4180 CSV, UTF-8 with a BOM, instants in IST — sent gzip-encoded",
         "tags": [
           "reporting"
         ]
@@ -35983,6 +36250,275 @@
           "systemActorId"
         ]
       },
+      "AuditExportRequestDto": {
+        "type": "object",
+        "properties": {
+          "actorUserId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Only actions by this user"
+          },
+          "actionPrefix": {
+            "type": "string",
+            "pattern": "^[a-z][a-z_.-]{0,63}$",
+            "example": "transfer.",
+            "description": "Only actions starting with this prefix — a lowercase stem (`transfer.`, `stock_adjustment.`). Matched literally: `_` and `%` are never wildcards"
+          },
+          "targetType": {
+            "type": "string",
+            "enum": [
+              "advance_shipment_notice",
+              "audit_export",
+              "batch_alert",
+              "bin",
+              "carrier_connection",
+              "catalog_import",
+              "channel_connection",
+              "client",
+              "client_invoice",
+              "count_task",
+              "count_variance",
+              "count_variance_policy",
+              "device",
+              "eway_bill",
+              "eway_gstin_setting",
+              "eway_state_threshold",
+              "expiry_alert_policy",
+              "goods_receipt",
+              "kit",
+              "ledger_event",
+              "manifest",
+              "order",
+              "over_receipt",
+              "pick",
+              "picklist_line",
+              "product",
+              "purchase_order",
+              "putaway_placement",
+              "qc_hold",
+              "rate_card",
+              "rejected_op",
+              "reorder_breach",
+              "reorder_policy",
+              "sku",
+              "stock_adjustment_pending",
+              "stock_adjustment_policy",
+              "suggested_po",
+              "temperature_excursion",
+              "tenant",
+              "transfer_order",
+              "user",
+              "vendor",
+              "warehouse",
+              "wave",
+              "wave_policy",
+              "zone"
+            ],
+            "description": "Only actions on this kind of target"
+          },
+          "targetId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Only actions on this target"
+          },
+          "from": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Only actions RECORDED at or after this instant (`recordedAt` — the server commit stamp, never `occurredAt`). ISO-8601 with a zone designator"
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Only actions RECORDED strictly before this instant (exclusive). Must be after `from`"
+          }
+        }
+      },
+      "AuditFilterBaseDto": {
+        "type": "object",
+        "properties": {
+          "actorUserId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Only actions by this user"
+          },
+          "actionPrefix": {
+            "type": "string",
+            "pattern": "^[a-z][a-z_.-]{0,63}$",
+            "example": "transfer.",
+            "description": "Only actions starting with this prefix — a lowercase stem (`transfer.`, `stock_adjustment.`). Matched literally: `_` and `%` are never wildcards"
+          },
+          "targetType": {
+            "type": "string",
+            "enum": [
+              "advance_shipment_notice",
+              "audit_export",
+              "batch_alert",
+              "bin",
+              "carrier_connection",
+              "catalog_import",
+              "channel_connection",
+              "client",
+              "client_invoice",
+              "count_task",
+              "count_variance",
+              "count_variance_policy",
+              "device",
+              "eway_bill",
+              "eway_gstin_setting",
+              "eway_state_threshold",
+              "expiry_alert_policy",
+              "goods_receipt",
+              "kit",
+              "ledger_event",
+              "manifest",
+              "order",
+              "over_receipt",
+              "pick",
+              "picklist_line",
+              "product",
+              "purchase_order",
+              "putaway_placement",
+              "qc_hold",
+              "rate_card",
+              "rejected_op",
+              "reorder_breach",
+              "reorder_policy",
+              "sku",
+              "stock_adjustment_pending",
+              "stock_adjustment_policy",
+              "suggested_po",
+              "temperature_excursion",
+              "tenant",
+              "transfer_order",
+              "user",
+              "vendor",
+              "warehouse",
+              "wave",
+              "wave_policy",
+              "zone"
+            ],
+            "description": "Only actions on this kind of target"
+          },
+          "targetId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Only actions on this target"
+          },
+          "from": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Only actions RECORDED at or after this instant (`recordedAt` — the server commit stamp, never `occurredAt`). ISO-8601 with a zone designator"
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Only actions RECORDED strictly before this instant (exclusive). Must be after `from`"
+          }
+        }
+      },
+      "AuditExportDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "ready",
+              "failed",
+              "expired"
+            ],
+            "description": "`queued` → `running` → `ready` or `failed`; a finished export `expired` 7 days after it finished (its file deleted, the row kept as history)"
+          },
+          "filters": {
+            "description": "The filters exported — absent keys omitted, `from`/`to` canonical UTC (`to` is exclusive)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AuditFilterBaseDto"
+              }
+            ]
+          },
+          "requestedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it was requested — the file holds the trail as of this instant"
+          },
+          "startedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "finishedAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true,
+            "description": "When a finished export expires (7 days after it finished)"
+          },
+          "rowCount": {
+            "type": "number",
+            "nullable": true,
+            "description": "The events in the file (ready, and kept when it expires)"
+          },
+          "byteSize": {
+            "type": "number",
+            "nullable": true,
+            "description": "The gzipped file size in bytes"
+          },
+          "sha256": {
+            "type": "string",
+            "nullable": true,
+            "description": "sha256 (hex) of the UNCOMPRESSED CSV bytes, BOM included"
+          },
+          "failureReason": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "too-many-events",
+              "interrupted",
+              "export-error",
+              null
+            ],
+            "description": "`too-many-events`: the filters matched more than 1,000,000 events — narrow the filters or dates; `interrupted`: the worker stopped three times — run it again; `export-error`: something went wrong — run it again"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "filters",
+          "requestedAt",
+          "startedAt",
+          "finishedAt",
+          "expiresAt",
+          "rowCount",
+          "byteSize",
+          "sha256",
+          "failureReason"
+        ]
+      },
+      "AuditExportListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "The caller's own last 20 exports, newest first (unpaged)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuditExportDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
       "ClientTaxDetailsDto": {
         "type": "object",
         "properties": {
@@ -39630,6 +40166,92 @@
           "resolution"
         ]
       },
+      "AuditExportSummaryDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "failed"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "too-many-events",
+              "interrupted",
+              "export-error"
+            ],
+            "description": "Why it failed — the failed arm only"
+          },
+          "rowCount": {
+            "type": "number",
+            "description": "The events in the file — the ready arm only"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "AuditExportNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "audit-export"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/AuditExportSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "expired",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
       "NotificationListResponse": {
         "type": "object",
         "properties": {
@@ -39661,6 +40283,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/ChannelSyncNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/AuditExportNotificationDto"
                 }
               ],
               "discriminator": {
@@ -39673,7 +40298,8 @@
                   "reorder-breach": "#/components/schemas/ReorderBreachNotificationDto",
                   "batch-alert": "#/components/schemas/BatchAlertNotificationDto",
                   "qc-hold": "#/components/schemas/QcHoldNotificationDto",
-                  "channel-sync": "#/components/schemas/ChannelSyncNotificationDto"
+                  "channel-sync": "#/components/schemas/ChannelSyncNotificationDto",
+                  "audit-export": "#/components/schemas/AuditExportNotificationDto"
                 }
               }
             }
