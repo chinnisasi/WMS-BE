@@ -370,8 +370,10 @@ describe('notifications (e2e, story 9-2)', () => {
       expect([...inList].sort()).toEqual([...NOTIFICATION_SOURCE_TYPES].sort());
       // Story 9-3b: CASES are the eight capability-routed 9-2 sources, whose
       // behaviour this suite pins unchanged; the ninth, the per-user
-      // `audit-export`, is pinned in test/audit-export.spec.ts.
-      expect([...CASES.map((c) => c.sourceType), 'audit-export']).toEqual([...NOTIFICATION_SOURCE_TYPES]);
+      // `audit-export`, is pinned in test/audit-export.spec.ts; the tenth
+      // (story 9-3c), the owner-only `ledger-chain-break`, in
+      // test/ledger-integrity.spec.ts.
+      expect([...CASES.map((c) => c.sourceType), 'audit-export', 'ledger-chain-break']).toEqual([...NOTIFICATION_SOURCE_TYPES]);
     });
 
     it('the subscriber listens for exactly the emitters’ event types (the new events pinned to their constants)', () => {

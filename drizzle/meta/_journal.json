@@ -498,6 +498,13 @@
       "when": 1791915519693,
       "tag": "0070_async_audit_export",
       "breakpoints": true
+    },
+    {
+      "idx": 71,
+      "version": "7",
+      "when": 1791998131764,
+      "tag": "0071_ledger_anchoring_and_chain_alerts",
+      "breakpoints": true
     }
   ]
 }

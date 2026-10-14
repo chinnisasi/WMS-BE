@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { and, desc, eq } from 'drizzle-orm';
-import type { LedgerAnchor } from '../../shared/db/schema';
+import type { LedgerAnchor, LedgerAnchorKind } from '../../shared/db/schema';
 import { ledgerAnchors } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { uuidv7 } from '../../shared/primitives/ids';
@@ -14,6 +14,12 @@ export interface LedgerAnchorInput {
   /** sha256 over the range's `seq:eventHash` lines, in seq order. */
   readonly digest: string;
   readonly anchoredAt: string;
+  /**
+   * Story 9-3c — `verified` (the range verified in the current canonical
+   * form — `anchorChain`) or `legacy` (the baseline's pre-0026 prefix,
+   * verified in the pre-0026 form).
+   */
+  readonly kind: LedgerAnchorKind;
 }
 
 /** Scope key naming one warehouse's chain. */
@@ -32,8 +38,8 @@ export interface LedgerAnchorScope {
  * commits (or rolls back) with the chain walk it belongs to.
  */
 export interface LedgerAnchorStore {
-  /** Commits one anchor row — append-only; anchors are never revised. */
-  anchor(input: LedgerAnchorInput, tx: TenantTx): Promise<void>;
+  /** Commits one anchor row — append-only; anchors are never revised. Returns the row's id. */
+  anchor(input: LedgerAnchorInput, tx: TenantTx): Promise<{ id: string }>;
   /** The highest anchored seq for the scope, if any, inside `tx`. */
   latest(scope: LedgerAnchorScope, tx: TenantTx): Promise<LedgerAnchor | null>;
 }
@@ -49,16 +55,19 @@ export const LEDGER_ANCHOR_STORE = 'LEDGER_ANCHOR_STORE' as const;
  */
 @Injectable()
 export class PostgresLedgerAnchorStore implements LedgerAnchorStore {
-  async anchor(input: LedgerAnchorInput, tx: TenantTx): Promise<void> {
+  async anchor(input: LedgerAnchorInput, tx: TenantTx): Promise<{ id: string }> {
+    const id = uuidv7();
     await tx.insert(ledgerAnchors).values({
-      id: uuidv7(),
+      id,
       tenantId: input.tenantId,
       warehouseId: input.warehouseId,
       fromSeq: input.fromSeq,
       toSeq: input.toSeq,
       digest: input.digest,
       anchoredAt: input.anchoredAt,
+      kind: input.kind,
     });
+    return { id };
   }
 
   async latest(scope: LedgerAnchorScope, tx: TenantTx): Promise<LedgerAnchor | null> {

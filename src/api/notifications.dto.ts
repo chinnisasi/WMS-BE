@@ -6,7 +6,12 @@ import {
   DEFAULT_NOTIFICATION_PAGE_SIZE,
   type NotificationEntry,
 } from '../modules/notifications/notifications.facade';
-import { AUDIT_EXPORT_FAILURE_REASONS, SOURCE_RESOLUTIONS } from '../modules/notifications/notification-sources';
+import {
+  AUDIT_EXPORT_FAILURE_REASONS,
+  CHAIN_BREAK_DETECTORS,
+  CHAIN_BREAK_KINDS,
+  SOURCE_RESOLUTIONS,
+} from '../modules/notifications/notification-sources';
 
 /**
  * Story 9-2 — the notification panel's wire shapes. Each entry is one arm of
@@ -84,6 +89,14 @@ export class AuditExportSummaryDto {
   @ApiProperty({ required: false, description: 'The events in the file — the ready arm only' }) rowCount?: number;
 }
 
+/** Story 9-3c — one ledger chain break (owner-only; resolved by an acknowledgement). */
+export class LedgerChainBreakSummaryDto {
+  @ApiProperty({ enum: CHAIN_BREAK_KINDS, description: '`chain` — the ledger itself; `worm` — the WORM copy of an anchor is missing or differs' }) kind!: (typeof CHAIN_BREAK_KINDS)[number];
+  @ApiProperty({ description: 'The lowest broken seq (a worm break: the anchor’s first seq)' }) firstSeq!: number;
+  @ApiProperty() reason!: string;
+  @ApiProperty({ enum: CHAIN_BREAK_DETECTORS }) detectedBy!: (typeof CHAIN_BREAK_DETECTORS)[number];
+}
+
 // ── entries ──────────────────────────────────────────────────────────────────
 
 abstract class NotificationEntryBaseDto {
@@ -149,6 +162,13 @@ export class AuditExportNotificationDto extends NotificationEntryBaseDto {
   @ApiProperty({ type: String, nullable: true, enum: [...SOURCE_RESOLUTIONS['audit-export'], null] }) resolution!: (typeof SOURCE_RESOLUTIONS)['audit-export'][number] | null;
 }
 
+/** Story 9-3c — open until an owner acknowledges it; never pushed. */
+export class LedgerChainBreakNotificationDto extends NotificationEntryBaseDto {
+  @ApiProperty({ enum: ['ledger-chain-break'] }) sourceType!: 'ledger-chain-break';
+  @ApiProperty({ type: LedgerChainBreakSummaryDto }) summary!: LedgerChainBreakSummaryDto;
+  @ApiProperty({ type: String, nullable: true, enum: [...SOURCE_RESOLUTIONS['ledger-chain-break'], null] }) resolution!: (typeof SOURCE_RESOLUTIONS)['ledger-chain-break'][number] | null;
+}
+
 export const NOTIFICATION_ENTRY_DTOS = [
   StockAdjustmentNotificationDto,
   CountVarianceNotificationDto,
@@ -159,6 +179,7 @@ export const NOTIFICATION_ENTRY_DTOS = [
   QcHoldNotificationDto,
   ChannelSyncNotificationDto,
   AuditExportNotificationDto,
+  LedgerChainBreakNotificationDto,
 ] as const;
 
 export type NotificationEntryDto = InstanceType<(typeof NOTIFICATION_ENTRY_DTOS)[number]>;
@@ -181,6 +202,7 @@ export class NotificationListResponse {
           'qc-hold': getSchemaPath(QcHoldNotificationDto),
           'channel-sync': getSchemaPath(ChannelSyncNotificationDto),
           'audit-export': getSchemaPath(AuditExportNotificationDto),
+          'ledger-chain-break': getSchemaPath(LedgerChainBreakNotificationDto),
         },
       },
     },

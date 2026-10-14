@@ -2507,6 +2507,66 @@ describe('architecture: the audit exports are tenancy-owned (story 9-3b)', () =>
   }
 });
 
+describe('architecture: the ledger integrity tables are inventory-owned (story 9-3c)', () => {
+  /**
+   * Story 9-3c: `ledger_integrity_state`, `ledger_chain_breaks` and
+   * `ledger_anchor_worm_copies` are written ONLY by the inventory module —
+   * the ledger is inventory's, and so is the record of its integrity. Within
+   * the module the writers are named: the break recorder
+   * (`ledger.service.ts` — the ONE path every detector records through), the
+   * integrity check (`ledger-integrity.ts` — baseline, run stamps, the
+   * rotation cursor, the WORM copy rows) and the acknowledgement
+   * (`ledger-break.command.ts`). The routes reach them through
+   * `InventoryFacade` only.
+   */
+  const INTEGRITY_TABLES = ['ledgerIntegrityState', 'ledgerChainBreaks', 'ledgerAnchorWormCopies'] as const;
+  const RAW_INTEGRITY_TABLES = 'ledger_integrity_state|ledger_chain_breaks|ledger_anchor_worm_copies';
+  const inventoryRoot = join(SRC_ROOT, 'modules', 'inventory');
+  const WRITERS: Readonly<Record<(typeof INTEGRITY_TABLES)[number], readonly string[]>> = {
+    ledgerIntegrityState: [join(inventoryRoot, 'ledger.service.ts'), join(inventoryRoot, 'ledger-integrity.ts')],
+    ledgerChainBreaks: [join(inventoryRoot, 'ledger.service.ts'), join(inventoryRoot, 'ledger-break.command.ts')],
+    ledgerAnchorWormCopies: [join(inventoryRoot, 'ledger-integrity.ts')],
+  };
+
+  it('the detectors bite (the test is meaningful): each named writer really writes its table', () => {
+    for (const [table, writers] of Object.entries(WRITERS)) {
+      for (const path of writers) {
+        expect(drizzleWriteOn(table).test(readFileSync(path, 'utf8'))).toBe(true);
+      }
+    }
+    expect(new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_INTEGRITY_TABLES})\\b`, 'i').test('sql`update ledger_chain_breaks set`')).toBe(true);
+  });
+
+  it('no integrity-table write happens outside its named inventory writers', () => {
+    const offenders: string[] = [];
+    for (const file of files) {
+      for (const table of INTEGRITY_TABLES) {
+        if (drizzleWriteOn(table).test(file.source) && !WRITERS[table].includes(file.path)) {
+          offenders.push(`${file.path}: ${table}`);
+        }
+      }
+      if (new RegExp(`\\b(insert into|update|delete from)\\s+(${RAW_INTEGRITY_TABLES})\\b`, 'i').test(file.source)) {
+        offenders.push(`${file.path}: raw write`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the WORM copy rows are append-only in code too (never updated or deleted)', () => {
+    const offenders = files
+      .filter((file) => /\.(update|delete)\(\s*ledgerAnchorWormCopies\b/.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+  });
+
+  it('the api shell reaches the integrity surface through the facade only', () => {
+    const controller = readFileSync(join(SRC_ROOT, 'api', 'inventory.controller.ts'), 'utf8');
+    expect(controller).toMatch(/this\.inventoryFacade\.ledgerIntegrity\(/);
+    expect(controller).toMatch(/this\.inventoryFacade\.acknowledgeChainBreak\(/);
+    expect(controller).not.toMatch(/ledger-integrity|ledger-break\.command|LedgerIntegrityService|LedgerBreakCommand/);
+  });
+});
+
 describe('architecture: the audit rule — every keyed command writes its audit row (story 9-3a, static half)', () => {
   /**
    * The dynamic half (`assertEveryKeyAudited`, every suite's teardown)

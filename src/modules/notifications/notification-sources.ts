@@ -32,6 +32,9 @@ export const NOTIFICATION_SOURCE_TYPES = [
   // Story 9-3b — the first PER-USER source: a finished audit export,
   // addressed to its requester only (`recipient_user_id`).
   'audit-export',
+  // Story 9-3c — a ledger chain break (inventory's integrity check). Owner
+  // only (`ledger.acknowledge`), one entry per break, never pushed.
+  'ledger-chain-break',
 ] as const;
 
 export type NotificationSourceType = (typeof NOTIFICATION_SOURCE_TYPES)[number];
@@ -65,6 +68,9 @@ export const SOURCE_RESOLUTIONS = {
   // Story 9-3b — an export's entry stays open until its file expires;
   // downloading does not resolve it (the spec's decision).
   'audit-export': ['expired'],
+  // Story 9-3c — open until an owner acknowledges it; detection never
+  // auto-heals, so nothing else resolves it.
+  'ledger-chain-break': ['acknowledged'],
 } as const satisfies Record<NotificationSourceType, readonly string[]>;
 
 // ── the summaries — a per-source allowlist, built key by key ────────────────
@@ -132,6 +138,27 @@ export interface AuditExportSummary {
   readonly rowCount?: number;
 }
 
+/**
+ * Story 9-3c — the two ledger integrity event types (inventory's
+ * `LEDGER_CHAIN_BROKEN_EVENT` / `LEDGER_CHAIN_BREAK_ACKNOWLEDGED_EVENT`),
+ * repeated as literals (AD-6) and pinned equal by
+ * `test/ledger-integrity.spec.ts`.
+ */
+export const LEDGER_CHAIN_BROKEN_EVENT_TYPE = 'ledger.chain_broken';
+export const LEDGER_CHAIN_BREAK_ACKNOWLEDGED_EVENT_TYPE = 'ledger.chain_break_acknowledged';
+/** Story 9-3c — inventory's break kinds and detectors, repeated here (AD-6) and pinned equal. */
+export const CHAIN_BREAK_KINDS = ['chain', 'worm'] as const;
+export const CHAIN_BREAK_DETECTORS = ['anchor', 'reverify', 'verify'] as const;
+
+/** Story 9-3c — one ledger chain break. */
+export interface LedgerChainBreakSummary {
+  readonly kind: (typeof CHAIN_BREAK_KINDS)[number];
+  /** The lowest broken seq (a `worm` break: the anchor's first seq). */
+  readonly firstSeq: number;
+  readonly reason: string;
+  readonly detectedBy: (typeof CHAIN_BREAK_DETECTORS)[number];
+}
+
 export type NotificationSummary =
   | StockAdjustmentSummary
   | CountVarianceSummary
@@ -141,7 +168,8 @@ export type NotificationSummary =
   | BatchAlertSummary
   | QcHoldSummary
   | ChannelSyncSummary
-  | AuditExportSummary;
+  | AuditExportSummary
+  | LedgerChainBreakSummary;
 
 /** A raise decoded: the entry's identity, its warehouse, its summary and (9-3b) its recipient. */
 export interface DecodedRaise {
@@ -493,6 +521,29 @@ export const NOTIFICATION_SOURCES: Readonly<Record<NotificationSourceType, Sourc
       },
     ],
   },
+  'ledger-chain-break': {
+    // Story 9-3c (inventory's break recorder). The entry is the break row's
+    // own id; one per break (a re-detection appends no event). The reason
+    // is bounded like every summary text (the recorder's reasons are short).
+    raise: {
+      type: LEDGER_CHAIN_BROKEN_EVENT_TYPE,
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'breakId');
+        const kind = oneOf(payload, 'kind', CHAIN_BREAK_KINDS);
+        const detectedBy = oneOf(payload, 'detectedBy', CHAIN_BREAK_DETECTORS);
+        const firstSeq = finite(payload, 'firstSeq');
+        const reason = text(payload, 'reason');
+        if (sourceId === null || kind === null || detectedBy === null || reason === null) return null;
+        if (firstSeq === null || !Number.isInteger(firstSeq) || firstSeq < 1) return null;
+        return withWarehouse(payload, (warehouseId) => ({
+          sourceId,
+          warehouseId,
+          summary: { kind, firstSeq, reason, detectedBy } satisfies LedgerChainBreakSummary,
+        }));
+      },
+    },
+    resolves: [{ type: LEDGER_CHAIN_BREAK_ACKNOWLEDGED_EVENT_TYPE, decode: fixedResolve('breakId', 'acknowledged') }],
+  },
 };
 
 /** Every event type the subscriber listens to → how to read it. */
@@ -575,6 +626,9 @@ export const SOURCE_AUDIENCE: Readonly<Record<NotificationSourceType, SourceAudi
   'qc-hold': { capability: 'qc.manage' },
   'channel-sync': { capability: 'channel.manage' },
   'audit-export': { capability: 'audit.view', recipient: true },
+  // Story 9-3c — the capability of the command that resolves it (the
+  // acknowledge): owner-only.
+  'ledger-chain-break': { capability: 'ledger.acknowledge' },
 };
 
 /** The source types a role sees — an allowlist; an unknown role sees none. */

@@ -8,6 +8,9 @@ import { StockAdjustmentCommand } from './inventory.command';
 import { AdjustmentApprovalCommand } from './adjustment-approval.command';
 import { ReconciliationService } from './reconcile';
 import { ReservationService } from './reservation.service';
+import { LedgerIntegrityService } from './ledger-integrity';
+import { LedgerBreakCommand } from './ledger-break.command';
+import { LEDGER_ANCHOR_WORM_STORE, ledgerAnchorWormFromEnv } from './ledger-anchor-worm';
 
 /**
  * Inventory module — the append-only ledger core and its derived
@@ -53,6 +56,13 @@ import { ReservationService } from './reservation.service';
     // the pre-declared-keys Valkey scripts, journalled to Postgres; consumed
     // through the facade (reads become HTTP in 2.5, order wiring in Epic 4).
     ReservationService,
+    // Story 9-3c — the WORM port (env-switched: `LEDGER_ANCHOR_WORM=none|s3`,
+    // the `pushGatewayFromEnv` precedent — a bad s3 configuration fails the
+    // boot), the scheduled integrity check + its reads, and the break
+    // acknowledgement.
+    { provide: LEDGER_ANCHOR_WORM_STORE, useFactory: () => ledgerAnchorWormFromEnv() },
+    LedgerIntegrityService,
+    LedgerBreakCommand,
     InventoryFacade,
   ],
   exports: [InventoryFacade],

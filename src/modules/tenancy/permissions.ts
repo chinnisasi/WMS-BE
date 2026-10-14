@@ -7,8 +7,9 @@ import { SECURE_STORAGE_CLASS } from '../../shared/primitives/storage-class';
  * are member-open by default (any tenant member may list warehouses, SKUs,
  * the checklist …) and command services consult this map at entry. Two
  * READS are gated, each by a facade guard in its own transaction: the
- * channel mappings read (`channel.manage`, 7-2) and the audit trail
- * (`audit.view`, 9-3a — owner-only).
+ * channel mappings read (`channel.manage`, 7-2), the audit trail
+ * (`audit.view`, 9-3a — owner-only) and, since 9-3c, the three ledger
+ * integrity reads (`audit.view` too — the status, the anchors, a proof).
  */
 export const CAPABILITIES = [
   'warehouse.create',
@@ -264,6 +265,15 @@ export const CAPABILITIES = [
   // Never held by ops_manager, operator, accountant or client. Mirrored into
   // wms-fe `src/lib/users.ts` (CAPABILITIES + OWNER_ONLY_CAPABILITIES).
   'audit.view',
+  // Story 9-3c — AD-16: acknowledge a ledger chain break (`POST …/inventory/
+  // ledger/breaks/{breakId}/acknowledge`), which resolves the owner panel's
+  // `ledger-chain-break` entry. OWNER-ONLY (the `audit.view` holder set: the
+  // person who reads the trail is the person who answers for its integrity).
+  // Acknowledging repairs nothing — the break stays recorded and a broken
+  // tail still refuses to anchor. Never held by ops_manager, operator,
+  // accountant or client. Mirrored into wms-fe `src/lib/users.ts`
+  // (CAPABILITIES + OWNER_ONLY_CAPABILITIES).
+  'ledger.acknowledge',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];

@@ -7,7 +7,6 @@ import { MAX_QUANTITY_BASE, fromMilli } from '../src/shared/primitives/quantity'
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
-import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
@@ -583,17 +582,13 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
     expect(anchor.toSeq).toBe(last);
     expect(anchor.digest).toMatch(/^[0-9a-f]{64}$/);
 
-    // Re-anchoring with nothing new is a loud 422 ProblemException, not a
-    // duplicate anchor row.
-    const again = facade.anchorChain(tenantId, warehouseId);
-    let caught: unknown;
-    try {
-      await again;
-    } catch (error) {
-      caught = error;
-    }
-    expect(caught).toBeInstanceOf(ProblemException);
-    expect((caught as ProblemException).getStatus()).toBe(422);
+    // Re-anchoring with nothing new commits no duplicate anchor row. Before
+    // story 9-3c this was a loud 422; the integrity worker meets it every
+    // tick, so it is now the typed no-op `{nothing: true}` naming how far
+    // the chain is anchored (the old behaviour is gone by design — spec
+    // 9-3c, "anchorChain now returns a typed { nothing: true }").
+    const again = await facade.anchorChain(tenantId, warehouseId);
+    expect(again).toEqual({ nothing: true, tenantId, warehouseId, anchoredThroughSeq: last });
 
     const digest = await facade.exportDigest(tenantId, warehouseId, 1, last);
     expect(digest.eventCount).toBe(last);

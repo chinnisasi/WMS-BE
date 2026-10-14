@@ -953,10 +953,20 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // operator-only surfaces, never read by the portal); 0068 (story 9-2b)
       // added one more — push_deliveries (the same plain tenant policy); 0070
       // (story 9-3b) added two more — audit_exports and audit_export_files
-      // (the plain tenant policy: owner-only, never read by the portal). None
+      // (the plain tenant policy: owner-only, never read by the portal); 0071
+      // (story 9-3c) added three more — ledger_integrity_state,
+      // ledger_chain_breaks and ledger_anchor_worm_copies (the plain tenant
+      // policy: inventory-owned, owner-read, never read by the portal). None
       // lost.
-      expect(policies).toHaveLength(104);
-      for (const name of ['push_deliveries_tenant_isolation', 'audit_exports_tenant_isolation', 'audit_export_files_tenant_isolation']) {
+      expect(policies).toHaveLength(107);
+      for (const name of [
+        'push_deliveries_tenant_isolation',
+        'audit_exports_tenant_isolation',
+        'audit_export_files_tenant_isolation',
+        'ledger_integrity_state_tenant_isolation',
+        'ledger_chain_breaks_tenant_isolation',
+        'ledger_anchor_worm_copies_tenant_isolation',
+      ]) {
         expect(policies.find((row) => row.policyname === name)!.qual).toBe(
           "(tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::uuid)",
         );
