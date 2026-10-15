@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, asc, eq, gte, lte, sql } from 'drizzle-orm';
 import { storageSnapshotProgress, storageSnapshots } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
-import { openSessionsInTx } from '../../shared/db/open-transactions';
+import { openSessionsInTx, sessionVisibilityAdviceInTx } from '../../shared/db/open-transactions';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { addIsoDays, istDateOf, istMidnightOf } from '../../shared/primitives/time';
 import { assertClientInTenantInTx } from '../clients/clients.facade';
@@ -32,8 +32,9 @@ import { InventoryFacade, type ClientWarehouseScope } from '../inventory/invento
  * committed (or rolled back) — with or without an xid yet — and the handling
  * counts too. If this role cannot SEE another session's transaction (an
  * `<insufficient privilege>` row), the job refuses to write and logs an
- * error; it never guesses. A deploy keeps every app connection on one role,
- * or grants the job's role `pg_read_all_stats`.
+ * error; it never guesses. The app role must hold `pg_read_all_stats`;
+ * `scripts/provision-roles.sql` grants it (the refusal log prints the exact
+ * GRANT for `current_user`).
  *
  * Rows are written once (`ON CONFLICT DO NOTHING`) and the job never
  * rewrites them. A DRIFT CHECK — a re-fold of the last 7 written days plus a
@@ -189,8 +190,7 @@ export class StorageSnapshotService {
       this.logger.error(
         `STORAGE SNAPSHOT REFUSED — client ${clientId}, warehouse ${warehouseId} (tenant ${tenantId}): this database role ` +
           `cannot see ${sessions.hiddenCount} other session(s) in pg_stat_activity, so it cannot prove that every transaction ` +
-          `which began before a day's end has finished. Keep every app connection on one role, or grant the job's role ` +
-          `pg_read_all_stats. Nothing was written.`,
+          `which began before a day's end has finished; ${await sessionVisibilityAdviceInTx(tx)}. Nothing was written.`,
       );
       return { ...idle, lastDay: progressBefore?.lastDay ?? null, waiting: 'session-visibility' };
     }
