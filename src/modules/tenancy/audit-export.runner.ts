@@ -4,7 +4,7 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, auditExports, users } from '../../shared/db/schema';
 import { auditFilterSql } from '../../shared/db/audit-filter';
-import { openSessionsInTx } from '../../shared/db/open-transactions';
+import { openSessionsInTx, sessionVisibilityAdviceInTx } from '../../shared/db/open-transactions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK, type OutboxSink } from '../../shared/events/outbox.seam';
 import { uuidv7 } from '../../shared/primitives/ids';
@@ -238,7 +238,7 @@ export class AuditExportRunner {
       if (sessions.hidden) {
         this.logger.error(
           `AUDIT EXPORT WAITING ${oldest.id} (tenant ${tenantId}): ${sessions.hiddenCount} session(s) hidden from this role — ` +
-            'the snapshot cannot be proven; keep all app connections on one role or grant pg_read_all_stats',
+            `the snapshot cannot be proven; ${await sessionVisibilityAdviceInTx(tx)}`,
         );
         return { waiting: 'session-visibility' as const };
       }

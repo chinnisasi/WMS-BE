@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger, Module, type OnApplicationBootstrap, type OnApplicationShutdown } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
-import { SharedModule, AUTH_DATABASE } from '../shared/shared.module';
+import { SharedModule, AUTH_DATABASE, DATABASE } from '../shared/shared.module';
+import { checkSessionVisibility } from '../shared/db/open-transactions';
 import type { Database } from '../shared/db/db';
 import { OUTBOX_RELAY } from '../shared/events/outbox.seam';
 import type { OutboxRelay } from '../shared/events/outbox.seam';
@@ -850,6 +851,8 @@ export class StorageSnapshotWorker implements OnApplicationBootstrap, OnApplicat
   constructor(
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
     @Inject(BillingFacade) private readonly billing: BillingFacade,
+    /** The app role — checked once at boot for `pg_read_all_stats` (§7d). */
+    @Inject(DATABASE) private readonly db?: Database,
   ) {
     this.pollMs = parseStorageSnapshotPollMs(process.env.STORAGE_SNAPSHOT_POLL_MS);
   }
@@ -859,6 +862,7 @@ export class StorageSnapshotWorker implements OnApplicationBootstrap, OnApplicat
       return; // env-gated off (tests, or a deployment that bills nobody)
     }
     this.logger.log(`Storage snapshot worker started (poll every ${this.pollMs}ms)`);
+    if (this.db !== undefined) void checkSessionVisibility(this.db, this.logger, 'Storage snapshot worker');
     this.timer = setInterval(() => void this.tick(), this.pollMs);
     this.timer.unref?.();
   }
@@ -1185,6 +1189,8 @@ export class AuditExportWorker implements OnApplicationBootstrap, OnApplicationS
   constructor(
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
     @Inject(TenancyService) private readonly tenancy: TenancyService,
+    /** The app role — checked once at boot for `pg_read_all_stats` (§7d). */
+    @Inject(DATABASE) private readonly db?: Database,
   ) {
     this.pollMs = parseAuditExportPollMs(process.env.AUDIT_EXPORT_POLL_MS);
   }
@@ -1194,6 +1200,7 @@ export class AuditExportWorker implements OnApplicationBootstrap, OnApplicationS
       return; // env-gated off
     }
     this.logger.log(`Audit export worker started (poll every ${this.pollMs}ms)`);
+    if (this.db !== undefined) void checkSessionVisibility(this.db, this.logger, 'Audit export worker');
     this.timer = setInterval(() => void this.tick(), this.pollMs);
     this.timer.unref?.();
   }
