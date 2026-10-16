@@ -1,3 +1,4 @@
+import { assertNotReservedLocationCode } from './receiving-bin';
 import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, eq, gt, inArray } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
@@ -488,6 +489,8 @@ export class BinCommand {
         // Story 12-4: bulk assets are unique, never gridded — same
         // behind-the-replay position, refused before the collision pre-check.
         refuseBulkAssetGrid(command.type);
+        // Story 13-2: a generated code may not take the system returns bin's.
+        for (const code of codes) assertNotReservedLocationCode(code, 'bin');
 
         // Collision pre-check in the same transaction: any generated code that
         // already exists in this warehouse (any zone — codes are unique per
@@ -1748,6 +1751,8 @@ async function insertBin(
 ): Promise<BinSnapshot['bin']> {
   // Zone must exist and belong to the warehouse before any bin write.
   await assertZoneInWarehouse(tx, command.zoneId, command.warehouseId);
+  // Story 13-2: `RETURNS` is the system returns bin's code.
+  assertNotReservedLocationCode(command.code, 'bin');
   try {
     const rows = await tx
       .insert(bins)

@@ -285,3 +285,143 @@ export async function ensureInTransitBinInTx(
   }
   return { zoneId: zone.id, binId: bin.id };
 }
+
+/**
+ * The system RETURNS bin (story 13-2): every warehouse owns exactly one,
+ * lazily ensured by the first return receipt — the fourth copy of the
+ * IN-TRANSIT shape (zone + bin code `RETURNS`, `system_owned`, `staging`, the
+ * 1M sentinel). It IS the epic's "received, awaiting disposition" state: a
+ * place the projections already sum, so ATP subtracts it as one term
+ * (`returnsAwaitingUnits`, keyed on code + system-owned — the `qcHeldUnits`
+ * identity) and replay-reconciliation reproduces it for free. Only the
+ * returns module moves stock INTO it (`return.received`); only 13-3's
+ * disposition moves stock out. Count, transfer, merge, pick, replan and
+ * putaway already exclude system-owned bins; the adjustment and the QC-hold
+ * origin refuse it by code.
+ */
+export const RETURNS_ZONE_CODE = 'RETURNS';
+export const RETURNS_BIN_CODE = 'RETURNS';
+export const RETURNS_BIN_TYPE = 'staging';
+/** Effectively unbounded: receiving a return is never capacity-gated (milli-units). */
+export const RETURNS_BIN_CAPACITY = 1_000_000 * QUANTITY_SCALE;
+
+/**
+ * Story 13-2 (review) — the zone and bin codes reserved for the system
+ * RETURNS pair. A user zone or bin coded `RETURNS` is refused at CREATE
+ * (409 `reserved-location-code`), so nothing can occupy the code before the
+ * warehouse's first return receipt ensures it. A collision created before
+ * this rule still answers `returns-bin-conflict` at receipt.
+ */
+export function assertNotReservedLocationCode(code: string, what: 'zone' | 'bin'): void {
+  if (code === RETURNS_ZONE_CODE || code === RETURNS_BIN_CODE) {
+    throw new ProblemException(
+      'reserved-location-code',
+      409,
+      'Location code is reserved',
+      `${what === 'zone' ? 'Zone' : 'Bin'} code "${code}" is reserved for the system returns ${what} — choose another code.`,
+      { code },
+    );
+  }
+}
+
+/** 409 `returns-bin-conflict` — a user zone or bin occupies the `RETURNS` code. */
+export function returnsBinConflict(warehouseId: string, what: 'zone' | 'bin'): ProblemException {
+  return new ProblemException(
+    'returns-bin-conflict',
+    409,
+    `A user ${what} named RETURNS exists`,
+    `Warehouse "${warehouseId}" already holds a user ${what} coded "RETURNS" — the system returns bin cannot be ensured. Rename or retire that ${what}, then receive the return again.`,
+    { warehouseId },
+  );
+}
+
+/**
+ * `ensureReturnsBinInTx` — the IN-TRANSIT ensure's mirror (story 13-2), with
+ * one tightening: a user ZONE named `RETURNS` is refused too, never adopted.
+ * Zones carry no system flag, so the system zone is recognised by what the
+ * ensure itself creates: this call inserted it, or it already held the
+ * system-owned `RETURNS` bin before this call (written in the same
+ * transaction as the zone by whichever first receipt created it — a
+ * concurrent loser's zone insert waits on the winner's uncommitted row and
+ * then finds both). A pre-existing zone that did not already hold the system
+ * `RETURNS` bin is a user's zone: 409. A user BIN coded
+ * `RETURNS` anywhere in the warehouse is the IN-TRANSIT precedent's 409.
+ */
+export async function ensureReturnsBinInTx(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+): Promise<ReceivingBinRef> {
+  // The bin first: once ensured it is the identity, whatever its zone is
+  // called now (a renamed system zone must not breed a stray RETURNS zone and
+  // a wrong zoneId). A user bin holding the code is the 409.
+  const existing = await tx
+    .select({ id: bins.id, zoneId: bins.zoneId, systemOwned: bins.systemOwned })
+    .from(bins)
+    .where(and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId), eq(bins.code, RETURNS_BIN_CODE)))
+    .limit(1);
+  if (existing[0] !== undefined) {
+    if (!existing[0].systemOwned) throw returnsBinConflict(warehouseId, 'bin');
+    return { zoneId: existing[0].zoneId, binId: existing[0].id };
+  }
+  const insertedZone = await tx
+    .insert(zones)
+    .values({
+      id: uuidv7(),
+      tenantId,
+      warehouseId,
+      code: RETURNS_ZONE_CODE,
+      name: 'Returns',
+    })
+    .onConflictDoNothing({ target: [zones.warehouseId, zones.code] })
+    .returning({ id: zones.id });
+  const zoneRows = await tx
+    .select({ id: zones.id })
+    .from(zones)
+    .where(and(eq(zones.tenantId, tenantId), eq(zones.warehouseId, warehouseId), eq(zones.code, RETURNS_ZONE_CODE)))
+    .limit(1);
+  const zone = zoneRows[0];
+  if (zone === undefined) {
+    // Unreachable short of an RLS/scope bug — fail loudly rather than
+    // guess an id.
+    throw new Error(`returns zone missing after ensure: ${tenantId}/${warehouseId}`);
+  }
+
+  const insertedBin = await tx
+    .insert(bins)
+    .values({
+      id: uuidv7(),
+      tenantId,
+      warehouseId,
+      zoneId: zone.id,
+      code: RETURNS_BIN_CODE,
+      capacity: RETURNS_BIN_CAPACITY,
+      type: RETURNS_BIN_TYPE,
+      systemOwned: true,
+    })
+    .onConflictDoNothing({ target: [bins.warehouseId, bins.code] })
+    .returning({ id: bins.id });
+  const binRows = await tx
+    .select({ id: bins.id, zoneId: bins.zoneId, systemOwned: bins.systemOwned })
+    .from(bins)
+    .where(and(eq(bins.tenantId, tenantId), eq(bins.warehouseId, warehouseId), eq(bins.code, RETURNS_BIN_CODE)))
+    .limit(1);
+  const bin = binRows[0];
+  if (bin === undefined) {
+    throw new Error(`returns bin missing after ensure: ${tenantId}/${warehouseId}`);
+  }
+  // The identity that feeds `returnsAwaitingUnits` is code + system-owned: a
+  // user-created bin named `RETURNS` is not the returns bin — adopting it
+  // would park returned units where the ATP hook counts zero, i.e. sellable.
+  if (!bin.systemOwned) {
+    throw returnsBinConflict(warehouseId, 'bin');
+  }
+  // A zone this call did not create must ALREADY have held the system bin
+  // (written with it by the receipt that created it) — a pre-existing zone
+  // into which this call just inserted the bin is a user's zone named
+  // RETURNS, never adopted (the throw rolls the insert back).
+  if (insertedZone.length === 0 && (insertedBin.length > 0 || bin.zoneId !== zone.id)) {
+    throw returnsBinConflict(warehouseId, 'zone');
+  }
+  return { zoneId: zone.id, binId: bin.id };
+}

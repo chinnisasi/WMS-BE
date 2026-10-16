@@ -959,9 +959,11 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // policy: inventory-owned, owner-read, never read by the portal); 0072
       // (story 13-1) added two more — return_authorizations (the
       // advance_shipment_notices shape, both arms bound to the client) and
-      // return_authorization_lines (both arms inherit through the parent).
-      // None lost.
-      expect(policies).toHaveLength(109);
+      // return_authorization_lines (both arms inherit through the parent);
+      // 0073 (story 13-2) added two more — return_receipts (the same
+      // client-bound shape) and return_receipt_lines (inheriting through
+      // the parent). None lost.
+      expect(policies).toHaveLength(111);
       for (const name of [
         'push_deliveries_tenant_isolation',
         'audit_exports_tenant_isolation',
@@ -983,6 +985,12 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       const rmaLinePolicy = policies.find((row) => row.policyname === 'return_authorization_lines_tenant_isolation')!;
       expect(rmaLinePolicy.qual).toContain('return_authorizations');
       expect(rmaLinePolicy.with_check).toContain('return_authorizations');
+      const receiptPolicy = policies.find((row) => row.policyname === 'return_receipts_tenant_isolation')!;
+      expect(receiptPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      expect(receiptPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      const receiptLinePolicy = policies.find((row) => row.policyname === 'return_receipt_lines_tenant_isolation')!;
+      expect(receiptLinePolicy.qual).toContain('return_receipts');
+      expect(receiptLinePolicy.with_check).toContain('return_receipts');
       const asnLinePolicy = policies.find((row) => row.policyname === 'asn_lines_tenant_isolation')!;
       expect(asnLinePolicy.qual).toContain('advance_shipment_notices');
       expect(asnLinePolicy.with_check).toContain('advance_shipment_notices');

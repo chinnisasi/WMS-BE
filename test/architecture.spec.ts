@@ -1833,22 +1833,37 @@ describe('architecture: return authorizations are returns-module-owned (story 13
    * ledger and the catalog come through `OutboundFacade`, `InventoryFacade`
    * and `CatalogFacade` only. Siblings reach it only through its facade
    * (only the api shell and the root composition import it).
+   *
+   * Story 13-2 (design review #13) amends it: the module also owns
+   * `return_receipts` and `return_receipt_lines` (only it writes them), and
+   * it reaches tenancy's devices, users, bins and review queue only through
+   * tenancy's exported in-transaction helpers (`assertDeviceOperatorInTx`,
+   * `ensureReturnsBinInTx`, `recordServerRejectedOpInTx`, `userEmailsInTx`) —
+   * never their tables; `handling_units` stays catalog's (written only
+   * through `CatalogFacade`). Returns imports tenancy; tenancy never imports
+   * returns.
    */
   const returnsRoot = join(SRC_ROOT, 'modules', 'returns');
   const returnsFiles = files.filter((file) => file.path.startsWith(returnsRoot));
-  const RETURNS_TABLES = ['returnAuthorizations', 'returnAuthorizationLines'] as const;
-  const RAW_RETURNS_WRITE = /\b(insert into|update|delete from)\s+"?(return_authorizations|return_authorization_lines)\b/i;
+  const RETURNS_TABLES = ['returnAuthorizations', 'returnAuthorizationLines', 'returnReceipts', 'returnReceiptLines'] as const;
+  const RAW_RETURNS_WRITE =
+    /\b(insert into|update|delete from)\s+"?(return_authorizations|return_authorization_lines|return_receipts|return_receipt_lines)\b/i;
   const OWN_SCHEMA_NAMES = new Set([
     'returnAuthorizations',
     'returnAuthorizationLines',
     'ReturnAuthorizationRow',
     'ReturnAuthorizationLineRow',
+    'returnReceipts',
+    'returnReceiptLines',
+    'ReturnReceiptRow',
+    'ReturnReceiptLineRow',
     'idempotencyKeys',
     'auditEvents',
   ]);
   const SCHEMA_IMPORT = /import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+'[./]*shared\/db\/schema'/g;
-  /** A raw-SQL mention of a sibling table the module may only reach through a facade. */
-  const FOREIGN_RAW_TABLE = /\b(orders|order_lines|picks|ledger_events|serials|skus|handling_units)\b/;
+  /** A raw-SQL mention of a sibling table the module may only reach through a facade (13-2: or tenancy's helpers). */
+  const FOREIGN_RAW_TABLE =
+    /\b(orders|order_lines|picks|ledger_events|serials|skus|handling_units|devices|users|bins|zones|rejected_ops|stock_on_hand)\b/;
   /** The bodies of every `sql\`…\`` template in a source (the raw SQL the module runs). */
   function sqlTemplates(source: string): string[] {
     return [...source.matchAll(/\bsql(?:<[^>]*>)?`([^`]*)`/g)].map((match) => match[1]!);
@@ -1877,6 +1892,12 @@ describe('architecture: return authorizations are returns-module-owned (story 13
     const command = readFileSync(join(returnsRoot, 'return-authorization.command.ts'), 'utf8');
     expect(drizzleWriteOn('returnAuthorizations').test(command)).toBe(true);
     expect(drizzleWriteOn('returnAuthorizationLines').test(command)).toBe(true);
+    // Story 13-2 — the receipt command writes its two tables.
+    const receipt = readFileSync(join(returnsRoot, 'return-receipt.command.ts'), 'utf8');
+    expect(drizzleWriteOn('returnReceipts').test(receipt)).toBe(true);
+    expect(drizzleWriteOn('returnReceiptLines').test(receipt)).toBe(true);
+    expect(RAW_RETURNS_WRITE.test('sql`insert into return_receipt_lines values (1)`')).toBe(true);
+    expect(FOREIGN_RAW_TABLE.test('select role from users where id = $1')).toBe(true);
     expect(RAW_RETURNS_WRITE.test('sql`update return_authorizations set status = 1`')).toBe(true);
     // Meaningful: the module really does run raw SQL the scan reads.
     expect(sqlTemplates(command).length).toBeGreaterThan(0);
@@ -1918,6 +1939,44 @@ describe('architecture: return authorizations are returns-module-owned (story 13
     expect(importers.filter((file) => reaching.test(file.source)).map((file) => file.path)).toEqual([]);
     const moduleSource = readFileSync(join(returnsRoot, 'returns.module.ts'), 'utf8');
     expect(moduleSource).toMatch(/exports:\s*\[ReturnsFacade\]/);
+  });
+
+  it('story 13-2: returns reaches tenancy only through its exported helpers, imports no devices/users/bins/rejected_ops table, and tenancy never imports returns', () => {
+    const tenancyRoot = join(SRC_ROOT, 'modules', 'tenancy');
+    // Tenancy → returns would be a cycle (and the apply arm has no
+    // return.receive case — Discard only).
+    const tenancyImportsReturns = files
+      .filter((file) => file.path.startsWith(tenancyRoot))
+      .filter((file) => /(?:modules\/returns|\.\.\/returns)\//.test(file.source))
+      .map((file) => file.path);
+    expect(tenancyImportsReturns).toEqual([]);
+    // The tenancy files returns may import — the helper files, plus the
+    // pre-13-1 permission / idempotency / role imports every command uses.
+    const ALLOWED_TENANCY = new Set([
+      'device-operator',
+      'receiving-bin',
+      'server-rejected-op',
+      'tenancy.service',
+      'permissions',
+      'idempotency-guard',
+      'registration.command',
+    ]);
+    const offenders: string[] = [];
+    for (const file of returnsFiles) {
+      for (const match of file.source.matchAll(/from '\.\.\/tenancy\/([a-z.-]+)'/g)) {
+        if (!ALLOWED_TENANCY.has(match[1]!)) offenders.push(`${file.path}: imports tenancy/${match[1]!}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningful: the receipt really uses the three helpers.
+    const receipt = readFileSync(join(returnsRoot, 'return-receipt.command.ts'), 'utf8');
+    for (const helper of ['assertDeviceOperatorInTx', 'ensureReturnsBinInTx', 'recordServerRejectedOpInTx']) {
+      expect(receipt).toContain(helper);
+    }
+    // handling_units is catalog's: returns creates a returned case only
+    // through the catalog facade.
+    expect(drizzleWriteOn('handlingUnits').test(receipt)).toBe(false);
+    expect(receipt).toContain('this.catalog.createHandlingUnits(');
   });
 });
 
@@ -2701,6 +2760,8 @@ describe('architecture: AUDIT_TARGET_TYPES is the audit vocabulary (story 9-3a)'
   const DYNAMIC_WRITERS: Readonly<Record<string, readonly string[]>> = {
     [join(SRC_ROOT, 'modules', 'outbound', 'pick.command.ts')]: ['picklist_line', 'pick'],
     [join(SRC_ROOT, 'modules', 'invoicing', 'eway.command.ts')]: ['eway_bill', 'eway_state_threshold', 'eway_gstin_setting'],
+    // Story 13-2 — the receipt targets the receipt, or (nothing applied) the RMA.
+    [join(SRC_ROOT, 'modules', 'returns', 'return-receipt.command.ts')]: ['return_receipt', 'return_authorization'],
   };
 
   /** Literal `targetType: '…'` values, plus the e-way `audit(tx, …, '<action>', '<targetType>', …)` helper calls. */

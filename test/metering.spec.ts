@@ -639,6 +639,8 @@ describe('story 21-4: metering and storage snapshots', () => {
         'transfer.outbound': ['both'],
         // same-warehouse relocation; cross-warehouse source draw; destination intake
         'transfer.inbound': ['both', 'from', 'to'],
+        // Story 13-2 — a returned unit's intake into the RETURNS bin.
+        'return.received': ['to'],
       };
 
       it('every registered type is classified, and each arm folds as the replay rule says', async () => {

@@ -516,6 +516,17 @@ export class LedgerReferenceDocDto {
     description: 'Story 9-3a — the count variance an approve-adjust resolution corrected (manual-adjustment arm, resolutions only)',
   })
   countVarianceId?: string;
+
+  // ── Story 13-2: the return-receipt arm (additive) ─────────────────────────
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Story 13-2 — the return receipt the units landed under (return-receipt arm only)' })
+  returnReceiptId?: string;
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Story 13-2 — the return authorization received against (return-receipt arm only)' })
+  rmaId?: string;
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Story 13-2 — the authorization line credited (return-receipt arm only)' })
+  rmaLineId?: string;
 }
 
 /** One event-timeline row. */

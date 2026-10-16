@@ -10,7 +10,7 @@ import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
-import { ensureQcHoldBinInTx, QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
+import { ensureQcHoldBinInTx, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { assertPermission, assertSecureBinAuthority } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -326,6 +326,15 @@ export class QcCommand {
     if (originBin.systemOwned && originBin.code === QC_HOLD_BIN_CODE) {
       throw qcValidation(
         'The system QC-hold bin cannot be a hold origin — its contents are already quarantined.',
+      );
+    }
+    // Story 13-2: neither can the system RETURNS bin — its contents are
+    // returned units awaiting disposition (already outside ATP); only 13-3's
+    // disposition moves them, and a QC hold drawing them out would strand a
+    // returned unit with no disposition record.
+    if (originBin.systemOwned && originBin.code === RETURNS_BIN_CODE) {
+      throw qcValidation(
+        'The system RETURNS bin cannot be a hold origin — its contents are returned units awaiting disposition.',
       );
     }
     // ── story 12-3: the secure-bin authority gate (FR-42) — on the locked

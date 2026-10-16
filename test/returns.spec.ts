@@ -452,7 +452,11 @@ describe('return authorizations (e2e, story 13-1)', () => {
 
     // Get reads the same document; the list carries it.
     const got = await http().get(`${API}/${tenantId}/returns/${rma.id}`).set('Authorization', `Bearer ${memberOperatorToken}`).expect(200);
-    expect(got.body).toEqual(rma);
+    // Story 13-2: the detail read is the same document PLUS its receipts
+    // (detail-only; none yet). The create response — a stored snapshot —
+    // carries no `receipts` key at all.
+    expect(rma).not.toHaveProperty('receipts');
+    expect(got.body).toEqual({ ...rma, receipts: [] });
 
     // Over-authorize after the earlier RMA: 2 more of line A when 1 is left.
     const over = await createRma({ orderId, lines: [{ orderLineId: lineA.orderLineId, qty: 2, reasonCode: 'defective' }] }).expect(409);
@@ -985,7 +989,11 @@ describe('return authorizations (e2e, story 13-1)', () => {
       const line = (qty: number, reasonCode: string, note: string | null, lineNo = 1) =>
         sql`insert into return_authorization_lines (id, tenant_id, rma_id, line_no, order_line_id, sku_id, authorized_qty, reason_code, reason_note)
             values (${uuidv7()}, ${t}, ${t}, ${lineNo}, ${uuidv7()}, ${t}, ${qty}, ${reasonCode}, ${note})`;
-      await refused(header('received'), 'return_authorizations_status_check');
+      // What this pins: the status CHECK refuses a status outside the
+      // vocabulary. 13-1 probed with `received`; story 13-2 made `received`
+      // a real status (0073 widened the CHECK), so the probe now names one
+      // no story has designed yet.
+      await refused(header('dispositioned'), 'return_authorizations_status_check');
       await refused(header('cancelled'), 'return_authorizations_cancel_shape');
       await refused(header('open', { reason: 'x' }), 'return_authorizations_cancel_shape');
       await refused(header('cancelled', { cancelled: true, reason: ' padded' }), 'return_authorizations_cancel_reason_length');

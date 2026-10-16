@@ -8,7 +8,7 @@ import { bins, inventoryQuarantines, reservations, stockOnHand } from '../../sha
 import type { Reservation } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
-import { IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
+import { IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
 import { nowIso } from '../../shared/primitives/time';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { isUniqueViolationOn, ProblemException } from '../../shared/problem-details/problem.exception';
@@ -143,6 +143,43 @@ export async function inTransitUnits(
 }
 
 /**
+ * The returns hook (Story 13-2, FR-47): the quantity sitting in the
+ * warehouse's system RETURNS bin — returned units "received, awaiting
+ * disposition". The `qcHeldUnits` / `inTransitUnits` shape verbatim: it reads
+ * `stock_on_hand` joined to the system `RETURNS` bin (code + system-owned
+ * identity, no returns-table read), so the exclusion is structural over the
+ * ledger's own projection and replay-reconciliation reproduces it for free.
+ * Subtracted in BOTH `atp` and `committedCeiling`: a returned unit is not
+ * sellable until 13-3 restocks it, and a grant must not consume it.
+ * `::bigint` never `::int`, `Number(...)` at the boundary.
+ */
+export async function returnsAwaitingUnits(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  skuId: string,
+): Promise<number> {
+  const rows = await tx
+    .select({ awaiting: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint` })
+    .from(stockOnHand)
+    .innerJoin(bins, eq(bins.id, stockOnHand.binId))
+    .where(
+      and(
+        eq(stockOnHand.tenantId, tenantId),
+        eq(stockOnHand.warehouseId, warehouseId),
+        eq(stockOnHand.skuId, skuId),
+        // The returns bin is system master data (tenancy-owned) read here
+        // only to locate the stock scope — no write, ever.
+        eq(bins.tenantId, tenantId),
+        eq(bins.warehouseId, warehouseId),
+        eq(bins.code, RETURNS_BIN_CODE),
+        eq(bins.systemOwned, true),
+      ),
+    );
+  return Number(rows[0]?.awaiting ?? 0);
+}
+
+/**
  * The standing-buffer owner type (story 7.1, AD-13): the ONE owner family
  * whose holds are standing (no TTL, `expires_at` null — the 0050 CHECK
  * admits NULL expiry for `buffer` rows only; the reaper's
@@ -230,6 +267,11 @@ export interface AtpSnapshot {
    */
   readonly inTransit: number;
   /**
+   * Story 13-2: the returned units in the warehouse's system RETURNS bin —
+   * received, awaiting disposition (the QC-held figure's mirror).
+   */
+  readonly returnsAwaiting: number;
+  /**
    * Story 7.1 (AD-13): the scope's standing channel-buffer total (the journal
    * sum over `held` `owner_type: 'buffer'` rows) — transparency only. The
    * subtraction itself lives ONCE, in `reserved` (the mirror; RN-1): a
@@ -237,7 +279,7 @@ export interface AtpSnapshot {
    * separate term in the `atp` arithmetic would subtract it twice.
    */
   readonly buffer: number;
-  /** `max(0, onHand − reserved − qcHeld − inTransit)` — never oversells (the buffer IS part of `reserved`). */
+  /** `max(0, onHand − reserved − qcHeld − inTransit − returnsAwaiting)` — never oversells (the buffer IS part of `reserved`). */
   readonly atp: number;
 }
 
@@ -302,6 +344,7 @@ function bufferOverCeiling(
     `SKU ${command.skuId} has ${fromMilli(probe.ceiling)} sellable unit(s) in warehouse ${command.warehouseId}` +
       (probe.qcHeld > 0 ? ` (of which ${fromMilli(probe.qcHeld)} are QC-held)` : '') +
       (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
+      (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
       `, holding ${fromMilli(probe.reserved)} already — the buffer of ${fromMilli(command.targetMilli)} ` +
       `cannot be reserved.`,
   );
@@ -314,6 +357,7 @@ interface StandingBufferProbe {
   readonly ceiling: number;
   readonly qcHeld: number;
   readonly inTransit: number;
+  readonly returnsAwaiting: number;
 }
 
 /** A standing buffer command — one integer target per (integration, warehouse, sku). */
@@ -343,6 +387,8 @@ export interface ChannelVisibleSnapshot {
   readonly reserved: number;
   readonly qcHeld: number;
   readonly inTransit: number;
+  /** Story 13-2: returns awaiting disposition (the RETURNS bin) — outside the pool. */
+  readonly returnsAwaiting: number;
   /** The pool ATP (every holder included). */
   readonly poolAtp: number;
   /** THIS channel's own standing buffer (milli-units). */
@@ -540,6 +586,8 @@ export class ReservationService implements OnModuleInit {
       // Story 5-1: the in-transit units lower the ceiling the same way — a
       // refused grant names them too.
       inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
+      // Story 13-2: so do returns awaiting disposition.
+      returnsAwaiting: await returnsAwaitingUnits(tx, tenantId, warehouseId, skuId),
     }));
     if (probe.existing !== undefined) {
       return this.idempotentHit(probe.existing, command);
@@ -560,6 +608,7 @@ export class ReservationService implements OnModuleInit {
         `SKU ${skuId} has ${fromMilli(probe.ceiling)} sellable unit(s) in warehouse ${warehouseId}` +
           (probe.qcHeld > 0 ? ` (of which ${fromMilli(probe.qcHeld)} are QC-held)` : '') +
           (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
+          (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
           ` — the request for ${fromMilli(command.quantity)} cannot be reserved.`,
       );
     }
@@ -818,11 +867,15 @@ export class ReservationService implements OnModuleInit {
         // parked in the warehouse's system IN-TRANSIT bin (same committed-read
         // tx).
         inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
+        // Story 13-2: the returns hook reads its real source — the stock
+        // received into the warehouse's system RETURNS bin, awaiting
+        // disposition (same committed-read tx).
+        returnsAwaiting: await returnsAwaitingUnits(tx, tenantId, warehouseId, skuId),
         // Story 7.1: the standing-buffer figure is a journal read (AD-13) —
         // transparency only, ALREADY inside `reserved` (see the formula note).
         buffer: await bufferUnits(tx, tenantId, warehouseId, skuId),
       }));
-    let { onHand, qcHeld, inTransit, buffer } = await readInputs();
+    let { onHand, qcHeld, inTransit, returnsAwaiting, buffer } = await readInputs();
     const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
     const readyKey = reservationReadyKey(tenantId, warehouseId);
 
@@ -849,7 +902,7 @@ export class ReservationService implements OnModuleInit {
       // Re-read the Postgres inputs AFTER the repair, so on-hand and the
       // counter come from the same side of the rebuild (never pre-rebuild
       // on-hand against a post-rebuild reserved figure).
-      ({ onHand, qcHeld, inTransit, buffer } = await readInputs());
+      ({ onHand, qcHeld, inTransit, returnsAwaiting, buffer } = await readInputs());
     }
     let reserved: number;
     try {
@@ -879,11 +932,14 @@ export class ReservationService implements OnModuleInit {
       // Story 5-1 — the in-transit figure beside the QC-held one (additive to
       // the wire shape; the subtraction is what changes ATP).
       inTransit,
+      // Story 13-2 — returns awaiting disposition, beside the in-transit
+      // figure (the subtraction is what keeps ATP unchanged by a receipt).
+      returnsAwaiting,
       // Story 7.1 — the standing-buffer total, transparency only: a buffer IS
       // a held reservation and is already inside `reserved`. Subtracting it
       // again here would double-carve it (RN-1).
       buffer,
-      atp: Math.max(0, onHand - reserved - qcHeld - inTransit),
+      atp: Math.max(0, onHand - reserved - qcHeld - inTransit - returnsAwaiting),
     };
   }
 
@@ -1381,13 +1437,17 @@ export class ReservationService implements OnModuleInit {
     // rides beside it; the in-transit stock is unpromisable exactly like
     // quarantined stock.)
     const inTransit = await inTransitUnits(tx, tenantId, warehouseId, skuId);
+    // Story 13-2: the returns hook is a ceiling term too — a returned unit
+    // awaiting disposition in the RETURNS bin is on-hand but never
+    // promiseable until 13-3 restocks it (moves it out of RETURNS).
+    const returnsAwaiting = await returnsAwaitingUnits(tx, tenantId, warehouseId, skuId);
     // Story 7.1 (RN-1): NO standalone buffer term. A channel's Safety Buffer
     // is a `held` reservations row since 0050 — it reaches every ceiling and
     // ATP read inside `reserved` through the counter mirror (the journalling
     // grant paths subtract Postgres-side, the script arbitrates counter-
     // side); a second subtraction here would carve every buffer off the
     // pool twice.
-    return Math.max(0, onHand - qcHeld - inTransit);
+    return Math.max(0, onHand - qcHeld - inTransit - returnsAwaiting);
   }
 
   /** Committed on-hand, excluding every open-quarantined (sku, bin) scope. */
@@ -1552,6 +1612,14 @@ export class ReservationService implements OnModuleInit {
     // lock-ordering audit against the QC and quarantine commands (they take
     // these locks in the opposite order) — deferred to epic 5, where the
     // quarantine and variance work lives.
+    //
+    // Story 13-2's returns hook adds NO new residual: a `return.received`
+    // intake raises the RETURNS bin's on-hand and `returnsAwaitingUnits` by
+    // the same quantity, so the ceiling is unchanged by a receipt whether or
+    // not the RETURNS row existed (or was locked) at this read. Only 13-3's
+    // disposition moves stock OUT of RETURNS, and that move updates these
+    // same scope rows (the ledger's own fold), so it serializes here.
+
     await tx
       .select({ binId: stockOnHand.binId })
       .from(stockOnHand)
@@ -1960,6 +2028,7 @@ export class ReservationService implements OnModuleInit {
       ceiling: await this.committedCeiling(tx, tenantId, warehouseId, skuId),
       qcHeld: await qcHeldUnits(tx, tenantId, warehouseId, skuId),
       inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
+      returnsAwaiting: await returnsAwaitingUnits(tx, tenantId, warehouseId, skuId),
     }));
     const previousMilli = probe.existing?.quantity ?? 0;
 
@@ -2023,6 +2092,7 @@ export class ReservationService implements OnModuleInit {
             `SKU ${skuId} has ${fromMilli(lockedCeiling)} sellable unit(s) in warehouse ${warehouseId}` +
               (probe.qcHeld > 0 ? ` (of which ${fromMilli(probe.qcHeld)} are QC-held)` : '') +
               (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
+              (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
               `, holding ${fromMilli(lockedReserved)} already — the buffer of ${fromMilli(targetMilli)} ` +
               `cannot be reserved.`,
           );
@@ -2216,7 +2286,7 @@ export class ReservationService implements OnModuleInit {
    * The sync's per-channel visible quantity (story 7-1, RN-6): the POOL's
    * ATP read (fail-closed — a store-down ATP throws the 503 the sync
    * branches on) MINUS the channel's OWN standing buffer, clamped at zero —
-   * `V(c) = max(0, onHand − qcHeld − inTransit − Σheld − buffer(c))` = the
+   * `V(c) = max(0, onHand − qcHeld − inTransit − returnsAwaiting − Σheld − buffer(c))` = the
    * channel's share of the shared pool minus its own staleness margin. The
    * pool's `atp` already includes `buffer(c)` inside `reserved` (RN-1's
    * single-subtraction layout), so the margin is subtracted once more for
@@ -2250,6 +2320,7 @@ export class ReservationService implements OnModuleInit {
       reserved: pool.reserved,
       qcHeld: pool.qcHeld,
       inTransit: pool.inTransit,
+      returnsAwaiting: pool.returnsAwaiting,
       poolAtp: pool.atp,
       buffer: own,
       visibleMilli: Math.max(0, pool.atp - own),

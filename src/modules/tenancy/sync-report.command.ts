@@ -30,6 +30,8 @@ import { idempotencyKeyReuse } from './registration.command';
 import { assertPermission, isFloorRole } from './permissions';
 import { deviceRevoked } from './enrollment.command';
 import { assertWarehouseInTenant, getMemberRoleIn } from './tenancy.service';
+import { REJECTED_OP_RAISED_EVENT, recordServerRejectedOpInTx } from './server-rejected-op';
+import type { ServerRejectedOpInput } from './server-rejected-op';
 // Story 5-6 — the cross-module re-execution seams (the owning commands, never
 // their tables): the seven op types' own guarded commands, reached through
 // their facades (the movements seam is `transfer.facade` — the aggregate's
@@ -84,7 +86,10 @@ export type RejectedOpType =
   | 'pack.execute'
   | 'excursion.record'
   | 'transfer.confirm'
-  | 'count.submit';
+  | 'count.submit'
+  // Story 13-2 — a return receipt's refused entries (server-raised) or a
+  // whole-op refusal (device-uploaded). Discard ONLY (human decision 4).
+  | 'return.receive';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -94,6 +99,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'excursion.record',
   'transfer.confirm',
   'count.submit',
+  'return.receive',
 ];
 
 /**
@@ -102,6 +108,36 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
  */
 export const REJECTED_OP_DECISIONS = ['apply', 'recount', 'discard'] as const;
 export type RejectedOpDecision = (typeof REJECTED_OP_DECISIONS)[number];
+
+/**
+ * Story 13-2 — the decisions each op type admits (the per-type rule the web's
+ * buttons follow; `RejectedOpEntry.decisions` serves it per row). Every
+ * pre-13-2 type keeps all three (recount still answers 400 for a bin-less
+ * payload — the arm the web hides). `return.receive` admits ONLY `discard`
+ * (human decision 4): an authorization cannot be amended, so re-applying the
+ * stored request could never match — "create a return authorization for
+ * these units, then receive them again" is the remedy, and Discard records
+ * that the reviewer dealt with them; it books nothing. Apply and recount
+ * answer 409 `decision-not-available`, and `applyArm` has no case for it, so
+ * tenancy never imports returns.
+ */
+export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, readonly RejectedOpDecision[]>> = {
+  'grn.submit': REJECTED_OP_DECISIONS,
+  'putaway.place': REJECTED_OP_DECISIONS,
+  'pick.record': REJECTED_OP_DECISIONS,
+  'pack.execute': REJECTED_OP_DECISIONS,
+  'excursion.record': REJECTED_OP_DECISIONS,
+  'transfer.confirm': REJECTED_OP_DECISIONS,
+  'count.submit': REJECTED_OP_DECISIONS,
+  'return.receive': ['discard'],
+};
+
+/** The op types the apply arm can re-execute (every type admitting `apply`). */
+type ApplicableOpType = Exclude<RejectedOpType, 'return.receive'>;
+
+function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
+  return REJECTED_OP_DECISIONS_BY_TYPE[opType].includes('apply');
+}
 
 /** The client-minted op id's ULID shape (the idempotency-key alphabet). */
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
@@ -175,6 +211,12 @@ export interface RejectedOpEntry {
   readonly resolvedOutcome: Record<string, unknown> | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /**
+   * Story 13-2 — the decisions this row's op type admits
+   * (`REJECTED_OP_DECISIONS_BY_TYPE`). Optional: a resolve snapshot stored
+   * before 13-2 replays without it.
+   */
+  readonly decisions?: readonly RejectedOpDecision[];
 }
 
 /** The resolve command (story 5-6, `review.decide`): the per-row decision. */
@@ -246,15 +288,26 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['taskId', 'uuid'],
     ['lines', 'array'],
   ],
+  // Story 13-2 — a device-uploaded whole-op refusal carries the full op
+  // payload (no `refusals`, no `rmaCode`); the server-raised row carries the
+  // refused entries beside `refusals` and the RMA's code.
+  'return.receive': [
+    ['warehouseId', 'uuid-or-null'],
+    ['rmaId', 'uuid'],
+    ['rmaCode', 'string-or-null'],
+    ['entries', 'array'],
+    ['refusals', 'array-or-absent'],
+  ],
 };
 
 const REJECTED_OP_DECISION_SET: ReadonlySet<string> = new Set<string>(REJECTED_OP_DECISIONS);
 /**
  * Story 9-2 — a dropped device op entered the Conflicts & Reviews queue: the
  * notification panel's rejected-op raise. Its resolve is the existing
- * `device.rejected_op.resolved`, keyed by the same `rejectedOpId`.
+ * `device.rejected_op.resolved`, keyed by the same `rejectedOpId`. Declared
+ * in `server-rejected-op.ts` (story 13-2), re-exported here.
  */
-export const REJECTED_OP_RAISED_EVENT = 'device.rejected_op.raised';
+export { REJECTED_OP_RAISED_EVENT };
 
 const REJECTED_OP_STATUS_SET: ReadonlySet<string> = new Set<string>(REJECTED_OP_STATUSES);
 
@@ -323,6 +376,7 @@ export function rejectedOpEntry(row: RejectedOp): RejectedOpEntry {
     resolvedOutcome: (row.resolvedOutcome ?? null) as Record<string, unknown> | null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+    decisions: REJECTED_OP_DECISIONS_BY_TYPE[row.opType as RejectedOpType] ?? ['discard'],
   };
 }
 
@@ -469,7 +523,10 @@ function assertOpPayloadShape(
                 ? Array.isArray(value) &&
                   value.length > 0 &&
                   value.every((entry) => typeof entry === 'object' && entry !== null)
-                : typeof value === 'string';
+                : kind === 'array-or-absent'
+                  ? value === undefined ||
+                    (Array.isArray(value) && value.every((entry) => typeof entry === 'object' && entry !== null))
+                  : typeof value === 'string';
     if (!ok) {
       throw refuse(field, kind);
     }
@@ -490,6 +547,15 @@ export class SyncReportCommand {
     // The recount arm's advisory lock (the warehouse scope, taken LAST).
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
   ) {}
+
+  /**
+   * Story 13-2 — a server-raised review row, written in the CALLER's
+   * transaction (see `recordServerRejectedOpInTx`, which a module that does
+   * not inject this command — returns — calls directly with its own outbox).
+   */
+  async recordServerRejectedOpInTx(tx: TenantTx, input: ServerRejectedOpInput): Promise<string | null> {
+    return recordServerRejectedOpInTx(tx, this.outbox, input);
+  }
 
   // ── recordSyncReport (device session, badge-in required) ────────────────
 
@@ -891,6 +957,23 @@ export class SyncReportCommand {
           );
         }
 
+        // Story 13-2 — the per-type decision rule, on the locked open row:
+        // a decision the op type does not admit is a 409 naming the ones it
+        // does (a `return.receive` row is Discard only — decision 4).
+        const admitted = REJECTED_OP_DECISIONS_BY_TYPE[row.opType as RejectedOpType] ?? ['discard'];
+        if (!admitted.includes(command.decision)) {
+          throw new ProblemException(
+            'decision-not-available',
+            409,
+            'Decision not available for this op type',
+            `A ${row.opType} row admits only ${admitted.map((d) => `"${d}"`).join(' | ')} — "${command.decision}" is not available.` +
+              (row.opType === 'return.receive'
+                ? ' Create a return authorization for these units, then receive them again.'
+                : ''),
+            { decisions: [...admitted] },
+          );
+        }
+
         const resolvedAt = occurredAt;
         const payload = (row.payload ?? {}) as Record<string, unknown>;
         this.assertPayloadShape(row.opType as RejectedOpType, payload, row.opId);
@@ -965,8 +1048,14 @@ export class SyncReportCommand {
           // commands open their OWN transactions (the command skeletons');
           // a refusal propagates and rolls this whole transaction back —
           // the row stays open and the refusal surfaces verbatim.
+          const opType = row.opType as RejectedOpType;
+          if (!isApplicableOpType(opType)) {
+            // Unreachable behind the decision rule above — the backstop.
+            throw new Error(`apply reached a ${opType} row, which admits no apply`);
+          }
           status = 'applied';
           const applied = await this.applyArm(
+            opType,
             command.tenantId,
             row,
             // The op's own ULID is the re-execution's idempotency key — the
@@ -1114,12 +1203,12 @@ export class SyncReportCommand {
    * `REJECTED_OP_TYPES`; the upload refuses it).
    */
   private async applyArm(
+    opType: ApplicableOpType,
     tenantId: string,
     row: RejectedOp,
     idempotencyKey: string,
     payload: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    const opType = row.opType as RejectedOpType;
     const deviceId = row.deviceId;
     const operatorUserId = row.operatorUserId;
     // The op's business time, normalized once: the payload's own instant when

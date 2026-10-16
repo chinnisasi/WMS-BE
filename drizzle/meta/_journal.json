@@ -512,6 +512,13 @@
       "when": 1792127355718,
       "tag": "0072_return_authorizations",
       "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1792172139199,
+      "tag": "0073_return_receipts",
+      "breakpoints": true
     }
   ]
 }

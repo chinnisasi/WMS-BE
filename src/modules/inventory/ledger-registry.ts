@@ -254,6 +254,17 @@ export type LedgerReferenceDoc =
       readonly transferId: string;
       /** Absent on a ZERO-line transfer (which cannot exist today — ≥1 line). */
       readonly lineId?: string;
+    }
+  // Story 13-2 — the return-receipt arm: every `return.received` movement
+  // names the return receipt it landed under, the return authorization it was
+  // received against and the exact authorization line credited. All three are
+  // always present (a receipt books only entries that matched a line). NEW
+  // union arm — the earlier kinds are never reshaped.
+  | {
+      readonly kind: 'return-receipt';
+      readonly returnReceiptId: string;
+      readonly rmaId: string;
+      readonly rmaLineId: string;
     };
 // Later stories extend this union with NEW kinds — never by reshaping an
 // existing arm.
@@ -521,6 +532,33 @@ registerLedgerEventType({
   type: 'transfer.inbound',
   sinceVersion: 1,
   referenceKinds: ['transfer'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 13-2 — the return receipt (FR-47): one POSITIVE INTAKE per
+ * applied entry, landing the returned units in the warehouse's system
+ * RETURNS bin from no bin (`fromBinId` null, `toBinId` = RETURNS — never a
+ * sign-flipped `grn.received`, never a reversal of the dispatch: receiving
+ * analytics and inbound KPIs stay clean, the ledger stays append-only). The
+ * units are then "received, awaiting disposition": on-hand, but excluded
+ * from ATP by `returnsAwaitingUnits` until 13-3 dispositions them. The event
+ * time is the op's device `occurredAt`; the client is the SKU's (21-2b).
+ *
+ * BOTH identity arms are OPEN: a batch-tracked unit carries the batch it was
+ * picked from (re-used, never created — the serial's own pick `batchRef` for
+ * a batch-and-serial SKU), and a serial-tracked unit carries its serial —
+ * one event per serial unit, magnitude 1. The serial guard admits the intake
+ * because the serial's latest event is its `pick.picked` DRAW (`toBinId`
+ * null): out of stock, free to re-enter. Reconcile and metering fold it by
+ * its bin arms with no change. Registers sinceVersion 1 — no new grammar
+ * version; the reference-doc union appends only.
+ */
+registerLedgerEventType({
+  type: 'return.received',
+  sinceVersion: 1,
+  referenceKinds: ['return-receipt'],
   allowsBatchArm: true,
   allowsSerialArm: true,
 });

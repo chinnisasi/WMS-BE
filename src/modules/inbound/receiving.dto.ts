@@ -839,6 +839,63 @@ export class CatalogCountTaskDto {
   lines!: readonly CatalogCountTaskLineDto[];
 }
 
+/**
+ * Story 13-2 — one authorized serial of an open return's line, as the device
+ * snapshot carries it. Declared here (beside the snapshot) rather than
+ * imported: only the api shell may import the returns module, which composes
+ * the arm through `ReturnsFacade.getOpenReturns`.
+ */
+export class CatalogOpenReturnSerialDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty()
+  serialNumber!: string;
+
+  @ApiProperty({ description: 'Already received against this authorization' })
+  received!: boolean;
+
+  @ApiProperty({ type: String, nullable: true, description: "The batch the serial was picked from (batch-and-serial SKUs); null otherwise" })
+  batchCode!: string | null;
+}
+
+export class CatalogOpenReturnLineDto {
+  @ApiProperty({ format: 'uuid', description: 'The return authorization line (an entry\'s rmaLineId)' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ description: 'Units authorized, base UoM' })
+  authorizedQty!: number;
+
+  @ApiProperty({ description: 'Units received so far, base UoM' })
+  receivedQty!: number;
+
+  @ApiProperty({ description: 'authorized − received, base UoM' })
+  openQty!: number;
+
+  @ApiProperty({ type: [String], description: 'Batch-tracked SKUs: the batches the order line was picked from (a receipt names one of them); empty otherwise' })
+  batchCodes!: readonly string[];
+
+  @ApiProperty({ type: [CatalogOpenReturnSerialDto], description: 'Serial-tracked lines: every authorized serial, sorted by number; empty otherwise' })
+  serials!: readonly CatalogOpenReturnSerialDto[];
+}
+
+export class CatalogOpenReturnDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: 'RMA-0001' })
+  code!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: "The order's channel reference; null for a manual order" })
+  orderReference!: string | null;
+
+  @ApiProperty({ type: [CatalogOpenReturnLineDto] })
+  lines!: readonly CatalogOpenReturnLineDto[];
+}
+
 export class CatalogSnapshotResponse {
   @ApiProperty({ description: 'ISO-8601 UTC capture time' })
   generatedAt!: string;
@@ -883,4 +940,11 @@ export class CatalogSnapshotResponse {
       'Story 5-3 (additive): the STORED pending count tasks of this warehouse — the Count inbox tasks whose submit the operator executes (every task line must be counted; 0 is a valid explicit count). The expectations were FROZEN at task start and are read here, never recomputed',
   })
   countTasks!: readonly CatalogCountTaskDto[];
+
+  @ApiProperty({
+    type: [CatalogOpenReturnDto],
+    description:
+      'Story 13-2 (additive): the warehouse\'s return authorizations that can still receive (open or partially received) — the handheld receives returned units against them offline, grading each unit; units not on an authorization are queued for review, never refused on the device',
+  })
+  openReturns!: readonly CatalogOpenReturnDto[];
 }

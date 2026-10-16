@@ -42,7 +42,7 @@ import type { HandlingUnitStatus } from './handling-unit';
 
 /**
  * Rows per INSERT statement. Postgres binds at most 65,535 parameters per
- * statement and each unit tuple carries nine columns, so a single-statement
+ * statement and each unit tuple carries ten columns (13-2), so a single-statement
  * insert dies with an untyped 500 somewhere past ~7,280 units. Chunked at the
  * catalog import's own 2,000, which leaves the same headroom it does.
  */
@@ -58,28 +58,50 @@ export interface HandlingUnitIdentity {
   readonly warehouseId: string;
   readonly skuId: string;
   readonly batchId: string | null;
-  readonly grnLineId: string;
+  /** The GRN line that produced this unit — null on a RETURNED case (story 13-2). */
+  readonly grnLineId: string | null;
+  /** Story 13-2 — the return-receipt line that booked a returned case; null otherwise. */
+  readonly returnReceiptLineId: string | null;
   /** Integer grams, captured at receipt — immutable. Never a quantity. */
   readonly weightGrams: number;
   readonly status: HandlingUnitStatus;
   readonly packedOrderLineId: string | null;
 }
 
-/** One unit to create at receipt — the only moment a weight is ever captured. */
-export interface CreateHandlingUnitInput {
-  readonly warehouseId: string;
-  readonly skuId: string;
-  readonly batchId: string | null;
-  readonly grnLineId: string;
-  readonly weightGrams: number;
-  /**
-   * `active` for the slice of the receipt the PO's open quantity covers;
-   * `pending_approval` for the excess, which becomes `active` or `rejected`
-   * when the over-receipt is decided. Never anything else — a unit is not
-   * born packed or rejected.
-   */
-  readonly status: Extract<HandlingUnitStatus, 'active' | 'pending_approval'>;
-}
+/**
+ * One unit to create at receipt — the only moment a weight is ever captured.
+ * Story 13-2: EITHER provenance — a GRN line (a supplier receipt: `active` or
+ * `pending_approval`) or a return-receipt line (a customer return: always
+ * `returned`). The union makes the pairing a compile-time rule, and 0073's
+ * `handling_units_provenance` CHECK is the backstop.
+ */
+export type CreateHandlingUnitInput =
+  | {
+      readonly warehouseId: string;
+      readonly skuId: string;
+      readonly batchId: string | null;
+      readonly grnLineId: string;
+      readonly returnReceiptLineId?: undefined;
+      readonly weightGrams: number;
+      /**
+       * `active` for the slice of the receipt the PO's open quantity covers;
+       * `pending_approval` for the excess, which becomes `active` or `rejected`
+       * when the over-receipt is decided. Never anything else — a unit is not
+       * born packed or rejected.
+       */
+      readonly status: Extract<HandlingUnitStatus, 'active' | 'pending_approval'>;
+    }
+  | {
+      readonly warehouseId: string;
+      readonly skuId: string;
+      readonly batchId: string | null;
+      readonly grnLineId?: undefined;
+      /** Story 13-2 — the return-receipt line that booked the returned case. */
+      readonly returnReceiptLineId: string;
+      readonly weightGrams: number;
+      /** A returned case awaits disposition — never live, never packable. */
+      readonly status: Extract<HandlingUnitStatus, 'returned'>;
+    };
 
 /** One unit consumed into an order line at the bench (the set-once link). */
 export interface HandlingUnitPackAssignment {
@@ -118,7 +140,8 @@ export async function createHandlingUnitsInTx(
     warehouseId: input.warehouseId,
     skuId: input.skuId,
     batchId: input.batchId,
-    grnLineId: input.grnLineId,
+    grnLineId: input.grnLineId ?? null,
+    returnReceiptLineId: input.returnReceiptLineId ?? null,
     weightGrams: input.weightGrams,
     status: input.status,
     packedOrderLineId: null,
@@ -132,6 +155,7 @@ export async function createHandlingUnitsInTx(
     skuId: row.skuId,
     batchId: row.batchId,
     grnLineId: row.grnLineId,
+    returnReceiptLineId: row.returnReceiptLineId,
     weightGrams: row.weightGrams,
     status: row.status as HandlingUnitStatus,
     packedOrderLineId: null,
@@ -291,7 +315,32 @@ export async function lockHandlingUnitsInTx(
 }
 
 /**
- * How many units of this SKU are still LIVE — `active` or `pending_approval`.
+ * Story 13-2 — a plain read of a set of units by id (no lock): the return
+ * receipt's detail read shows each returned case's captured weight. Unknown
+ * or foreign ids are simply absent.
+ */
+export async function handlingUnitsByIdsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  ids: readonly string[],
+): Promise<HandlingUnitIdentity[]> {
+  const distinct = [...new Set(ids)];
+  if (distinct.length === 0) {
+    return [];
+  }
+  const rows = await tx
+    .select()
+    .from(handlingUnits)
+    .where(and(eq(handlingUnits.tenantId, tenantId), inArray(handlingUnits.id, distinct)))
+    .orderBy(handlingUnits.id);
+  return rows.map(toHandlingUnitIdentity);
+}
+
+/**
+ * How many units of this SKU are still LIVE — `active`, `pending_approval` or
+ * (story 13-2) `returned`: a returned case backs on-hand in the RETURNS bin
+ * exactly as an active one backs storage stock, so flipping the flag under it
+ * strands it the same way.
  *
  * The one question `SkuCommand.edit` has to ask before it lets
  * `catch_weight_tracked` move: turning it OFF strands live units, whose stock
@@ -311,7 +360,7 @@ export async function countLiveHandlingUnitsInTx(
       and(
         eq(handlingUnits.tenantId, tenantId),
         eq(handlingUnits.skuId, skuId),
-        inArray(handlingUnits.status, ['active', 'pending_approval']),
+        inArray(handlingUnits.status, ['active', 'pending_approval', 'returned']),
       ),
     );
   return rows[0]?.n ?? 0;
@@ -325,6 +374,7 @@ function toHandlingUnitIdentity(row: HandlingUnit): HandlingUnitIdentity {
     skuId: row.skuId,
     batchId: row.batchId,
     grnLineId: row.grnLineId,
+    returnReceiptLineId: row.returnReceiptLineId,
     weightGrams: row.weightGrams,
     status: row.status as HandlingUnitStatus,
     packedOrderLineId: row.packedOrderLineId,
