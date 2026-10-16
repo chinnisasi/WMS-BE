@@ -243,6 +243,14 @@ export interface OrderInvoiceFacts {
    * MISSING — a data fault, never read as "a client brand".
    */
   readonly clientSystemOwned: boolean | null;
+  /**
+   * Story 13-1 (additive) — the order's client (`orders.client_id`, derived
+   * from its SKUs at acceptance, §7b) and its channel reference
+   * (`external_event_id`; null on a manual order). The return authorization
+   * reads both off this one facts read rather than a third order query.
+   */
+  readonly clientId: string;
+  readonly externalEventId: string | null;
   readonly lines: readonly OrderInvoiceLineFact[];
 }
 
@@ -537,6 +545,7 @@ export class OutboundFacade {
         destinationPincode: orders.destinationPincode,
         createdAt: orders.createdAt,
         clientId: orders.clientId,
+        externalEventId: orders.externalEventId,
       })
       .from(orders)
       .where(and(eq(orders.id, orderId), eq(orders.tenantId, tenantId)))
@@ -595,6 +604,8 @@ export class OutboundFacade {
       // `null` — the generator reports it as a data fault, distinct from the
       // designed client-brand skip.
       clientSystemOwned: (await getClientsInTx(tx, tenantId, [order.clientId])).get(order.clientId)?.systemOwned ?? null,
+      clientId: order.clientId,
+      externalEventId: order.externalEventId,
       lines: lines.map((line) => ({
         orderLineId: line.orderLineId,
         parentLineId: line.parentLineId,

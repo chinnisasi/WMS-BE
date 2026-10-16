@@ -8,6 +8,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { dispatchedOrderFixtures } from './support/dispatched-order';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -24,31 +25,6 @@ const API = '/api/v1/tenants';
 const KEY_HEADER = 'Idempotency-Key';
 
 jest.setTimeout(60_000);
-
-interface PickLine {
-  id: string;
-  picklistId: string;
-  orderId: string;
-  orderLineId: string;
-  skuId: string;
-  binId: string | null;
-  qty: number;
-  status: string;
-}
-
-interface Picklist {
-  id: string;
-  waveId: string;
-  orderId: string | null;
-  status: string;
-  lines: PickLine[];
-}
-
-interface Wave {
-  id: string;
-  status: string;
-  picklists: Picklist[];
-}
 
 interface ChainEvent {
   seq: number;
@@ -383,93 +359,16 @@ describe('cold-chain trace: the FR-45 reconstruction read (e2e, story 12-6)', ()
     return row.id;
   }
 
-  async function createOrder(lines: { skuId: string; quantity: number }[], wh = warehouseId): Promise<string> {
-    const res = await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/outbound/orders`)
-      .set('Authorization', `Bearer ${opsToken}`)
-      .set(KEY_HEADER, ulid())
-      .send({ warehouseId: wh, lines, destination: testAddress() })
-      .expect(201);
-    return res.body.order.id as string;
-  }
-
-  async function releasedWave(lines: { skuId: string; quantity: number }[]): Promise<{ waveId: string; orderId: string; picklist: Picklist }> {
-    const orderId = await createOrder(lines);
-    const policyId = (
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/outbound/wave-policies`)
-        .set('Authorization', `Bearer ${opsToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ warehouseId, name: `cc-${ulid().slice(10, 18)}`, grouping: 'single' })
-        .expect(201)
-    ).body.policy.id as string;
-    const waveId = (
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/outbound/waves`)
-        .set('Authorization', `Bearer ${opsToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ warehouseId, policyId, orderIds: [orderId] })
-        .expect(201)
-    ).body.wave.id as string;
-    await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/outbound/waves/${waveId}/release`)
-      .set('Authorization', `Bearer ${opsToken}`)
-      .set(KEY_HEADER, ulid())
-      .send({})
-      .expect(200);
-    const wave = (
-      await request(app.getHttpServer())
-        .get(`${API}/${tenantId}/outbound/waves/${waveId}`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .expect(200)
-    ).body.wave as Wave;
-    const picklist = wave.picklists[0];
-    if (picklist === undefined) throw new Error('fixture produced no picklist');
-    return { waveId, orderId, picklist };
-  }
-
-  async function pickAllLines(
-    picklist: Picklist,
-    occurredAt?: string,
-    serialsByLine?: Map<string, string[]>,
-  ): Promise<void> {
-    for (const line of picklist.lines) {
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/outbound/picks`)
-        .set('Authorization', `Bearer ${operatorToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({
-          warehouseId,
-          picklistId: line.picklistId,
-          picklistLineId: line.id,
-          skuId: line.skuId,
-          binId: line.binId!,
-          qty: line.qty,
-          occurredAt: occurredAt ?? at(0),
-          ...(serialsByLine === undefined ? {} : { serials: serialsByLine.get(line.id) }),
-        })
-        .expect(201);
-    }
-  }
-
-  async function packAndDispatch(
-    orderId: string,
-    scanned: { skuId: string; qty: number }[],
-    dispatchBody: Record<string, unknown> = {},
-  ): Promise<void> {
-    await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/outbound/orders/${orderId}/pack`)
-      .set('Authorization', `Bearer ${opsToken}`)
-      .set(KEY_HEADER, ulid())
-      .send({ scanned })
-      .expect(201);
-    await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/outbound/orders/${orderId}/dispatch`)
-      .set('Authorization', `Bearer ${opsToken}`)
-      .set(KEY_HEADER, ulid())
-      .send(dispatchBody)
-      .expect(201);
-  }
+  // Story 13-1 — the dispatched-order seeding fixtures live in
+  // test/support/dispatched-order.ts (shared with test/returns.spec.ts).
+  const { createOrder, releasedWave, pickAllLines, packAndDispatch } = dispatchedOrderFixtures(() => ({
+    app,
+    tenantId,
+    warehouseId,
+    opsToken,
+    ownerToken,
+    operatorToken,
+  }));
 
   async function submitGrn(
     skuId: string,

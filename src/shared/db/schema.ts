@@ -4935,3 +4935,92 @@ export const pushDeliveries = pgTable(
 );
 
 export type PushDeliveryRow = typeof pushDeliveries.$inferSelect;
+
+/**
+ * Story 13-1 — a return authorization (RMA): an operator authorizes part of a
+ * DISPATCHED order for return (returns module, module-exclusive writes —
+ * pinned by `test/architecture.spec.ts`). `client_id` and `warehouse_id` are
+ * the order's (an order's client cannot drift from its SKUs', §7b);
+ * `order_reference` snapshots the order's `external_event_id` at create;
+ * `order_dispatched_at` is the earliest `dispatch.dispatched` event of the
+ * order. `code` (`RMA-0001`) is server-allocated, unique per tenant;
+ * `external_reference` is a channel's or customer's RMA number, deliberately
+ * NOT unique. `status` is `open | cancelled` in 13-1 (13-2/13-3 widen it);
+ * the cancel columns are set exactly when cancelled. No stock moves — an
+ * authorization writes no ledger event. The status / shape CHECKs and the
+ * RLS policy (the tenant + client clause) live only in
+ * `drizzle/0072_return_authorizations.sql`.
+ */
+export const returnAuthorizations = pgTable(
+  'return_authorizations',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    orderId: uuid('order_id').notNull(),
+    orderReference: text('order_reference'),
+    code: text('code').notNull(),
+    externalReference: text('external_reference'),
+    status: text('status').notNull().default('open'),
+    orderDispatchedAt: timestamp('order_dispatched_at', { withTimezone: true, mode: 'string' }).notNull(),
+    createdBy: uuid('created_by').notNull(),
+    cancelledBy: uuid('cancelled_by'),
+    cancelledAt: timestamp('cancelled_at', { withTimezone: true, mode: 'string' }),
+    cancelReason: text('cancel_reason'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('return_authorizations_tenant_code_unique').on(table.tenantId, table.code),
+    // The per-order returnable read (Σ authorized over the order's open RMAs).
+    index('return_authorizations_tenant_order_idx').on(table.tenantId, table.orderId),
+    // The tenant-wide list's keyset (no warehouse filter).
+    index('return_authorizations_tenant_created_at_id_idx').on(table.tenantId, table.createdAt, table.id),
+    // The warehouse-scoped list's keyset.
+    index('return_authorizations_tenant_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+  ],
+);
+
+export type ReturnAuthorizationRow = typeof returnAuthorizations.$inferSelect;
+
+/**
+ * Story 13-1 — one authorized line of an RMA: one order line, `authorized_qty`
+ * > 0 in milli-units, `received_qty` (13-2 writes it; 0 until then), a reason
+ * from the fixed list (`other` requires a note) and, for a serial-tracked SKU,
+ * the catalog serial ids (the ledger's `serial_ref` form). One line per order
+ * line per RMA. Visibility rides the parent's RLS (0072).
+ */
+export const returnAuthorizationLines = pgTable(
+  'return_authorization_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    rmaId: uuid('rma_id').notNull(),
+    /** 1..n in REQUEST order — the read order (never inferred from uuidv7 ids). */
+    lineNo: integer('line_no').notNull(),
+    orderLineId: uuid('order_line_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** Milli-units — base UoM × 10³. */
+    authorizedQty: bigint('authorized_qty', { mode: 'number' }).notNull(),
+    receivedQty: bigint('received_qty', { mode: 'number' }).notNull().default(0),
+    reasonCode: text('reason_code').notNull(),
+    reasonNote: text('reason_note'),
+    serialIds: uuid('serial_ids').array().notNull().default(sql`'{}'::uuid[]`),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('return_authorization_lines_rma_order_line_unique').on(table.rmaId, table.orderLineId),
+    uniqueIndex('return_authorization_lines_rma_line_no_unique').on(table.rmaId, table.lineNo),
+  ],
+);
+
+export type ReturnAuthorizationLineRow = typeof returnAuthorizationLines.$inferSelect;

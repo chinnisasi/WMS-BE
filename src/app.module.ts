@@ -16,6 +16,7 @@ import { OutboundModule } from './modules/outbound/outbound.module';
 import { PutawayModule } from './modules/putaway/putaway.module';
 import { ReplenishmentModule } from './modules/replenishment/replenishment.module';
 import { ReportingModule } from './modules/reporting/reporting.module';
+import { ReturnsModule } from './modules/returns/returns.module';
 import { TenancyModule } from './modules/tenancy/tenancy.module';
 import { JobsModule } from './jobs/jobs.module';
 
@@ -47,6 +48,8 @@ import { JobsModule } from './jobs/jobs.module';
     CarriersModule,
     NotificationsModule,
     ReportingModule,
+    // Story 13-1 — return authorizations (Epic 13's first module).
+    ReturnsModule,
     JobsModule,
     ApiModule,
   ],

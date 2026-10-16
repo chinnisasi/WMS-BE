@@ -41,6 +41,8 @@ import { BillingModule } from '../modules/billing/billing.module';
 import { PortalController } from './portal.controller';
 import { NotificationsController } from './notifications.controller';
 import { NotificationsModule } from '../modules/notifications/notifications.module';
+import { ReturnsController } from './returns.controller';
+import { ReturnsModule } from '../modules/returns/returns.module';
 import { SharedModule } from '../shared/shared.module';
 
 /**
@@ -81,7 +83,7 @@ import { SharedModule } from '../shared/shared.module';
   // Story 21-7 — SharedModule: Nest instantiates a route guard in the
   // CONTROLLER's module, so `PortalSessionGuard`'s DATABASE dependency must
   // resolve here too.
-  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule],
+  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule],
   controllers: [
     HealthController,
     EchoController,
@@ -141,6 +143,9 @@ import { SharedModule } from '../shared/shared.module';
     // Story 9-2 — the notification panel (list, the bell's status, the
     // opened mark): `NotificationsModule` exports `NotificationsFacade` only.
     NotificationsController,
+    // Story 13-1 — return authorizations (create, cancel, the returnable
+    // read, list, detail): `ReturnsModule` exports `ReturnsFacade` only.
+    ReturnsController,
     // Story 7-2 — the channel webhook surface (guardless by construction:
     // the provider's AUTHORITY is its signature, not a session). The
     // last-siblings convention keeps NotFoundController LAST (registered

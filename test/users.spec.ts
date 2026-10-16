@@ -884,7 +884,11 @@ describe('users, roles, and permission gating (e2e)', () => {
     // OWNER-ONLY (decision 3: the trail names every member's actions).
     // Story 9-3c grows it to 43 with `ledger.acknowledge` — acknowledge a
     // ledger chain break, OWNER-ONLY (the `audit.view` holder set).
-    expect([...CAPABILITIES]).toHaveLength(43);
+    // Story 13-1 grows it to 44 with `returns.manage` — authorize and cancel
+    // return authorizations: owner + ops_manager (decision 1 — operators
+    // only, never a client-held capability).
+    expect([...CAPABILITIES]).toHaveLength(44);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('returns.manage'))).toEqual(['owner', 'ops_manager']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('ledger.acknowledge'))).toEqual(['owner']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('audit.view'))).toEqual(['owner']);
     expect(CAPABILITIES).toContain('asn.announce');
