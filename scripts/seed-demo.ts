@@ -866,11 +866,19 @@ async function main(): Promise<void> {
     const binId = bin(BLR(), need(homeBin.get('TURMERIC-200G'), 'turmeric bin'));
     const res = await as('ops_manager', 'POST', '/movements/counts', { warehouseId: BLR().id, binId });
     const task = res.body.task ?? res.body.countTask ?? res.body;
-    const lines = (task.lines ?? []) as Json[];
-    const counted = lines.map((l) => ({ skuId: l.skuId, countedQuantity: Math.max(0, Number(l.expectedQuantity) - (l.skuId === sku('TURMERIC-200G') ? 4 : 0)) }));
-    if (counted.length === 0) counted.push({ skuId: sku('TURMERIC-200G'), countedQuantity: 0 });
+    // The count is blind — the task carries no expected quantities — so read
+    // the bin's on-hand from the stock projection and count every SKU in it,
+    // turmeric 4 short. (Submitting 0 here recorded a −297 variance.)
+    const stock = await as('ops_manager', 'GET', `/warehouses/${BLR().id}/inventory/stock?binId=${binId}&limit=200`);
+    const onHand = ((stock.body.items ?? []) as Json[]).filter((e) => Number(e.quantity) > 0);
+    const turmeric = onHand.find((e) => e.skuId === sku('TURMERIC-200G'));
+    if (turmeric === undefined) throw new Error('no turmeric on hand in its bin to count');
+    const counted = onHand.map((e) => ({
+      skuId: e.skuId,
+      countedQuantity: Math.max(0, Number(e.quantity) - (e.skuId === sku('TURMERIC-200G') ? 4 : 0)),
+    }));
     await device('POST', `/movements/counts/${task.id}/submit`, { lines: counted });
-    return 'turmeric counted 4 short';
+    return `turmeric counted ${Number(turmeric.quantity) - 4} of ${Number(turmeric.quantity)} (4 short)`;
   });
   await step('Count task on the bottle bin, left open for the handheld', async () => {
     await as('ops_manager', 'POST', '/movements/counts', { warehouseId: BLR().id, binId: bin(BLR(), need(homeBin.get('BOTTLE-STEEL-1L'), 'bottle bin')) });
