@@ -35,6 +35,37 @@ bun run db:migrate   # apply pending migrations (needs DATABASE_URL)
 bun run openapi:export  # write openapi/openapi.json — the API contract
 ```
 
+## Demo data
+
+`bun run seed:demo` creates one fresh, fully populated demo tenant, so the web app (and a paired handheld) shows every built feature with realistic data. It drives the **real HTTP API** of a running backend — every record goes through the command layer, ledger, idempotency, audit and outbox; nothing is written to the database directly. Each run registers a new tenant with timestamp-suffixed emails, so it is safe to re-run.
+
+**Prerequisites**
+
+1. `docker compose up -d` — Postgres (`:55432`) and Valkey (`:56379`).
+2. `bun run db:migrate`.
+3. `.env` from `.env.example`, with real values for `JWT_SECRET`, `DEVICE_ENCRYPTION_KEY` (device enrollment) and `CARRIER_ENCRYPTION_KEY` (the sandbox carrier connection), plus these workers on — each one turns part of the seed into visible state:
+
+   | Variable | Demo value | What it makes visible |
+   |---|---|---|
+   | `OUTBOX_RELAY_POLL_MS` | `2000` | GST invoices and e-way bills (raised on dispatch), the notification panel |
+   | `EWAY_GATEWAY` | `sandbox` | the e-way bill is *generated* (12-digit EWB number); unset, it stays queued with Part B |
+   | `REPLENISHMENT_SCHEDULER_POLL_MS` | `15000` | reorder breaches and the near-expiry batch alert (the seed waits up to 90 s for them) |
+   | `AUDIT_EXPORT_POLL_MS` | `10000` | the owner's audit export reaches `ready` |
+   | `LEDGER_INTEGRITY_POLL_MS` | `60000` | Ledger integrity reads anchored/verified instead of "Not yet checked" |
+   | `RESERVATION_REAPER_POLL_MS`, `OUTBOX_RECONCILE_POLL_MS` | `2000` | normal hold expiry and reconciliation |
+   | `STORAGE_SNAPSHOT_POLL_MS` | `300000` | the 3PL client's storage usage (from the next IST day) |
+
+**Start order:** backend first (`bun run start` on `:3000`), then the seed, then the web app (wms-fe on `:3001`):
+
+```sh
+bun run seed:demo
+bun run seed:demo -- --base-url http://localhost:3000/api/v1 --web-url http://localhost:3001
+```
+
+**What you get:** two warehouses (Bengaluru DC with ambient, dry and chilled zones; Mumbai FC); a 16-SKU catalog via the CSV import (kg, batch-tracked, serial-tracked, catch-weight, a variant product, a kit, a hazard class, HSN/GST, reorder points); a PO received on an enrolled handheld (batches, a short line, an over-receipt pending review), a blind catch-weight receipt, putaway and a QC hold; an immediate adjustment and two left pending owner approval; a submitted count with an open variance and an open count task; one transfer received and one in transit; a temperature excursion; orders at every stage (dispatched, labelled and manifested; ready to dispatch; picked; in a planned wave; accepted; backordered); GST invoices (incl. the kit order priced by hand — kits always park `awaiting-data`, see PENDING) and a generated e-way bill; an RMA received on the handheld with condition grades and one refused entry in the review queue, plus an open RMA; a 3PL client brand (GlowCo) with tax details, its own SKUs, an active rate card, a partly received ASN, a dispatched order and a client-portal login; and an audit export request.
+
+**What it prints:** a per-step `OK` / `SKIPPED` line as it goes (a failing step never aborts the run — dependants skip with the reason), then a summary: the web URL, the tenant name and id, the warehouses, every login (owner, ops manager, operator, accountant, GlowCo portal — all with password `Demo@12345`), the enrolled demo device (badge-in PIN `2468`), and a fresh one-time **enrollment code** for pairing a real handheld (15-minute TTL — mint another in web Settings → Devices if it lapses; you choose your own PIN at enrollment and badge in with the operator's email).
+
 ## Conventions (AD-9)
 
 - UUIDv7 ids (`src/shared/primitives/ids.ts`), ISO-8601 UTC timestamps, integer base-UoM quantities, integer paise, GST basis points.
