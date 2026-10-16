@@ -26,7 +26,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
-import { IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE } from '../tenancy/receiving-bin';
+import { IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { uomPrecision } from '../catalog/uom';
 import { LedgerService } from './ledger.service';
@@ -960,6 +960,20 @@ export class StockAdjustmentCommand {
         400,
         'The system QC-hold bin is not adjustable',
         'The system QC-hold bin is moved only by QC hold and release commands — stock adjustments cannot touch it.',
+      );
+    }
+    // Story 13-2: the system RETURNS bin is the returns module's — only a
+    // return receipt moves stock into it and only 13-3's disposition moves
+    // stock out. An adjustment there would book or scrap a returned unit
+    // with no disposition record (and an adjustment INTO it would strand
+    // units ATP-excluded with nothing to disposition). Its own machine code
+    // (the QC code is unchanged).
+    if (bin.systemOwned && bin.code === RETURNS_BIN_CODE) {
+      throw new ProblemException(
+        'returns-bin-not-adjustable',
+        400,
+        'The system RETURNS bin is not adjustable',
+        'The system RETURNS bin holds returned units awaiting disposition — only a return receipt moves stock in and only a return disposition moves it out; stock adjustments cannot touch it.',
       );
     }
     return bin;

@@ -14,7 +14,6 @@ import {
   purchaseOrderLines,
   purchaseOrders,
   skus,
-  users,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import {
@@ -35,10 +34,10 @@ import { assertUtcIso, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
-import { deviceRevoked } from '../tenancy/enrollment.command';
+import { assertDeviceOperatorInTx } from '../tenancy/device-operator';
 import { ensureReceivingBinInTx } from '../tenancy/receiving-bin';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
-import { assertPermission, isFloorRole } from '../tenancy/permissions';
+import { assertPermission } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -407,33 +406,10 @@ export class ReceivingCommand {
 
     return withTenantTransaction(this.db, command.tenantId, async (tx) => {
       // ── device re-authorization (fail-closed, the selfTestEcho mirror) ──
-      const deviceRows = await tx
-        .select()
-        .from(devices)
-        .where(and(eq(devices.id, command.deviceId), eq(devices.tenantId, command.tenantId)))
-        .for('update')
-        .limit(1);
-      const device = deviceRows[0];
-      if (!device || device.status !== 'active' || device.pinHash === null) {
-        throw deviceRevoked();
-      }
-
-      // Role re-read from the DB per command — floor devices are operator
-      // surfaces; a demoted-to-accountant operator is denied per command.
-      const roleRows = await tx
-        .select({ role: users.role })
-        .from(users)
-        .where(and(eq(users.id, command.operatorUserId), eq(users.tenantId, command.tenantId)))
-        .limit(1);
-      const role = roleRows[0]?.role;
-      if (!isFloorRole(role)) {
-        throw new ProblemException(
-          'role-denied',
-          403,
-          'Role lacks the required capability',
-          `Role "${role ?? 'none'}" cannot operate a floor device.`,
-        );
-      }
+      // The device row (locked, active, badge-bound) and the operator's
+      // CURRENT floor role — tenancy's exported guard (story 13-2 moved the
+      // body there, unchanged, so the returns module runs the same one).
+      await assertDeviceOperatorInTx(tx, command.tenantId, command.deviceId, command.operatorUserId);
 
       // ── idempotency replay (before any write) ───────────────────────────
       const existing = await tx
@@ -947,9 +923,12 @@ export class ReceivingCommand {
       );
       const handlingUnitIdsByLine = new Map<string, string[]>();
       for (const unit of createdUnits) {
-        const list = handlingUnitIdsByLine.get(unit.grnLineId) ?? [];
+        // Every unit created here carries GRN provenance (story 13-2 made the
+        // column nullable for RETURNED cases only).
+        const grnLineId = unit.grnLineId!;
+        const list = handlingUnitIdsByLine.get(grnLineId) ?? [];
         list.push(unit.id);
-        handlingUnitIdsByLine.set(unit.grnLineId, list);
+        handlingUnitIdsByLine.set(grnLineId, list);
       }
 
       // Ledger events: one per applied line — the batch arm rides on

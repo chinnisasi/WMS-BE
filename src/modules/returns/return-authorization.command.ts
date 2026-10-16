@@ -27,18 +27,31 @@ import { OutboundFacade } from '../outbound/outbound.facade';
 import type { OrderInvoiceFacts } from '../outbound/outbound.facade';
 import { RETURN_AUTHORIZATION_CANCELLED_EVENT, RETURN_AUTHORIZATION_CREATED_EVENT } from './events';
 import type { ReturnAuthorizationEventPayload } from './events';
+import type { ReturnReceiptView } from './return-receipt.command';
 
 // ── vocabularies ─────────────────────────────────────────────────────────────
 
 /**
  * Story 13-1 — the RMA lifecycle. Mirrored by
- * `return_authorizations_status_check` (0072) and pinned against it by
- * `test/returns.spec.ts`. 13-1 holds only `open | cancelled`; 13-2 (receipt)
- * and 13-3 (disposition) widen it — no state is reserved before it is
+ * `return_authorizations_status_check` (0072, widened by 0073) and pinned
+ * against it by `test/returns.spec.ts`. 13-1 held only `open | cancelled`;
+ * story 13-2 (receipt) adds `partially_received` (some units received, some
+ * still open) and `received` (every line fully received). 13-3
+ * (disposition) widens it again — no state is reserved before it is
  * designed.
  */
-export const RMA_STATUSES = ['open', 'cancelled'] as const;
+export const RMA_STATUSES = ['open', 'partially_received', 'received', 'cancelled'] as const;
 export type RmaStatus = (typeof RMA_STATUSES)[number];
+
+/**
+ * Story 13-2 — the statuses whose authorized units are SPOKEN FOR: an open
+ * RMA's are expected, a partially received or received one's arrived (or are
+ * arriving). Every one of them counts against what an order line can still
+ * be authorized for (`returnableFactsInTx`); only a cancelled RMA releases
+ * its units. Before 13-2 the sums read `status = 'open'`, so a received
+ * RMA's units would have become authorizable again (design review #1).
+ */
+export const RMA_COMMITTED_STATUSES: readonly RmaStatus[] = ['open', 'partially_received', 'received'];
 
 /**
  * Decision 3 (human, 2026-10-16) — the per-line reason: a fixed list plus a
@@ -152,6 +165,13 @@ export interface RmaDetail {
   readonly cancelledBy: string | null;
   readonly cancelReason: string | null;
   readonly lines: readonly RmaLineSnapshot[];
+  /**
+   * Story 13-2 — the receipts against it, oldest first. Present ONLY on the
+   * detail read (`ReturnsFacade.get`): never on the list, never on a
+   * command's stored snapshot — optional, so every pre-13-2 snapshot still
+   * serves (IMPLEMENTATION-GUIDE §9).
+   */
+  readonly receipts?: readonly ReturnReceiptView[];
 }
 
 /** One order line of the returnable read. Quantities in base units. */
@@ -165,7 +185,7 @@ export interface ReturnableLine {
   readonly authorizedQty: number;
   readonly returnableQty: number;
   readonly serialTracked: boolean;
-  /** Serial-tracked lines: the dispatched serials not on an open authorization. */
+  /** Serial-tracked lines: the dispatched serials not on an uncancelled authorization. */
   readonly returnableSerials: readonly RmaSerial[];
 }
 
@@ -233,7 +253,7 @@ function exceedsReturnable(index: number, orderLineId: string, asked: number, re
     'exceeds-returnable',
     409,
     'More than can be returned',
-    `lines[${index}]: ${asked} asked for order line "${orderLineId}", but only ${returnable} can still be returned (dispatched minus what open authorizations already name).`,
+    `lines[${index}]: ${asked} asked for order line "${orderLineId}", but only ${returnable} can still be returned (dispatched minus what uncancelled authorizations already name).`,
     { orderLineId, returnableQty: returnable },
   );
 }
@@ -253,7 +273,7 @@ function serialAlreadyAuthorized(index: number, orderLineId: string, serialNumbe
     'serial-already-authorized',
     409,
     'Serial is already on a return',
-    `lines[${index}]: serial "${serialNumber}" of order line "${orderLineId}" is already on an open return authorization.`,
+    `lines[${index}]: serial "${serialNumber}" of order line "${orderLineId}" is already on an uncancelled return authorization.`,
     { orderLineId, serialNumber },
   );
 }
@@ -444,7 +464,7 @@ interface ReturnableLineFacts {
   readonly returnableMilli: number;
   /** Dispatched serial ids of this line (the ledger's `serial_ref`s). */
   readonly dispatchedSerialIds: readonly string[];
-  /** Serial ids already on an open authorization of this line. */
+  /** Serial ids already on an uncancelled authorization of this line. */
   readonly authorizedSerialIds: ReadonlySet<string>;
 }
 
@@ -456,11 +476,12 @@ interface ReturnableLineFacts {
  *   definition, reused): dispatch is all-or-nothing and terminal, and picks
  *   are never reversed. An order that is not `dispatched` has dispatched
  *   nothing yet, whatever it picked;
- * - `authorized` is Σ `authorized_qty` over this line on OPEN authorizations;
+ * - `authorized` is Σ `authorized_qty` over this line on every authorization
+ *   that is not cancelled (`RMA_COMMITTED_STATUSES` — story 13-2);
  * - `returnable` is `max(0, dispatched − authorized)`;
  * - the dispatched serials of a line are its `pick.picked` events'
  *   `serial_ref`s (one per serial unit, `orderLineId` in the reference doc),
- *   less those on an open authorization.
+ *   less those on a non-cancelled authorization.
  *
  * Null when the order is unknown. Run on create UNDER the order lock, so the
  * computed bound is safe against a concurrent create.
@@ -500,7 +521,9 @@ export async function returnableFactsInTx(
     }
   }
 
-  // Σ authorized and the serials named, per order line, over OPEN authorizations.
+  // Σ authorized and the serials named, per order line, over every
+  // authorization that still speaks for its units — open, partially received
+  // or received (story 13-2; only a cancelled one releases them).
   const authorizedRows = await tx
     .select({
       orderLineId: returnAuthorizationLines.orderLineId,
@@ -519,7 +542,7 @@ export async function returnableFactsInTx(
       and(
         eq(returnAuthorizations.tenantId, tenantId),
         eq(returnAuthorizations.orderId, orderId),
-        eq(returnAuthorizations.status, 'open'),
+        inArray(returnAuthorizations.status, [...RMA_COMMITTED_STATUSES]),
       ),
     );
   const authorizedMilli = new Map<string, number>();

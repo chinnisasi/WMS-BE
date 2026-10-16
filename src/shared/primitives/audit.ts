@@ -80,6 +80,9 @@ export const AUDIT_TARGET_TYPES = [
   'reorder_policy',
   // Story 13-1 — a return authorization (`return_authorization.created | .cancelled`).
   'return_authorization',
+  // Story 13-2 — a return receipt (`return_receipt.recorded`; an all-refused
+  // receipt targets its `return_authorization` instead).
+  'return_receipt',
   'sku',
   'stock_adjustment_pending',
   'stock_adjustment_policy',
@@ -134,4 +137,7 @@ export const AUDIT_NEW_ACTIONS = [
   // Story 13-1 — the returns module's two commands (`ReturnAuthorizationCommand`).
   { action: 'return_authorization.created', targetType: 'return_authorization' },
   { action: 'return_authorization.cancelled', targetType: 'return_authorization' },
+  // Story 13-2 — the handheld's return receipt (`ReturnReceiptCommand`); its
+  // all-refused arm targets the authorization (pinned in the same suite).
+  { action: 'return_receipt.recorded', targetType: 'return_receipt' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

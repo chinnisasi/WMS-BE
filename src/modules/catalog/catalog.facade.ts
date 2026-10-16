@@ -21,6 +21,7 @@ import { uomPrecision } from './uom';
 // imports one module, not two.
 import {
   createHandlingUnitsInTx,
+  handlingUnitsByIdsInTx,
   lockHandlingUnitsInTx,
   markHandlingUnitsAdjustedInTx,
   markHandlingUnitsPackedInTx,
@@ -104,6 +105,8 @@ export interface SerialIdentity {
  * precision (the Epic 10 rule a quantity is checked against).
  */
 export interface SkuFacts {
+  /** Story 13-2 — the return receipt binds a batch-tracked unit to its picked batch. */
+  readonly batchTracked: boolean;
   readonly serialTracked: boolean;
   readonly catchWeightTracked: boolean;
   readonly uom: string;
@@ -613,6 +616,7 @@ export class CatalogFacade {
       .select({
         id: skus.id,
         uom: skus.uom,
+        batchTracked: skus.batchTracked,
         serialTracked: skus.serialTracked,
         catchWeightTracked: skus.catchWeightTracked,
       })
@@ -622,6 +626,7 @@ export class CatalogFacade {
       rows.map((row) => [
         row.id,
         {
+          batchTracked: row.batchTracked,
           serialTracked: row.serialTracked,
           catchWeightTracked: row.catchWeightTracked,
           uom: row.uom,
@@ -857,6 +862,15 @@ export class CatalogFacade {
     assignments: readonly HandlingUnitPackAssignment[],
   ): Promise<HandlingUnitIdentity[]> {
     return markHandlingUnitsPackedInTx(tx, tenantId, assignments);
+  }
+
+  /** See `handlingUnitsByIdsInTx` — story 13-2's unlocked read (a returned case's weight). */
+  async handlingUnitsByIdsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    ids: readonly string[],
+  ): Promise<HandlingUnitIdentity[]> {
+    return handlingUnitsByIdsInTx(tx, tenantId, ids);
   }
 
   /** See `lockHandlingUnitsInTx` — the guarded read every consuming path takes. */

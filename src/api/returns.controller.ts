@@ -4,17 +4,20 @@ import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
 import { TenantSessionGuard, CurrentSession } from '../modules/tenancy/tenant-session.guard';
-import type { TenantSession } from '../modules/tenancy/jwt-session';
+import { DeviceSessionGuard, CurrentDeviceSession } from '../modules/tenancy/device-session.guard';
+import type { DeviceSession, TenantSession } from '../modules/tenancy/jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { ReturnsFacade } from '../modules/returns/returns.facade';
-import type { ReturnableOrder, RmaDetail } from '../modules/returns/returns.facade';
+import type { ReturnableOrder, ReturnReceiptResult, RmaDetail } from '../modules/returns/returns.facade';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
   CancelReturnAuthorizationDto,
   CreateReturnAuthorizationDto,
+  ReceiveReturnDto,
+  ReturnReceiptResultDto,
   ReturnableOrderDto,
   ReturnableQuery,
   ReturnAuthorizationDto,
@@ -48,6 +51,10 @@ const READ_403 = 'Session belongs to another tenant (permission-denied), or a cl
  * `GET returns/returnable` is declared BEFORE `GET returns/:rmaId`, or Express
  * would hand `returnable` to the param route as an rmaId and answer 400.
  * Pinned by `test/returns.spec.ts` (behaviour and method order).
+ *
+ * Story 13-2 adds `POST returns/receipts` — `return.receive`, the handheld op
+ * under `DeviceSessionGuard` (the badge-in session; `grn.submit`'s shape) —
+ * and the detail read's receipts.
  */
 @ApiTags('returns')
 @ApiExtraModels(ProblemDetailsDto)
@@ -112,6 +119,83 @@ export class ReturnsController {
     return toRmaDto(rma);
   }
 
+  /**
+   * Story 13-2 — `return.receive`, the handheld op (badge-in device session;
+   * the `Idempotency-Key` is the op's ULID). A literal segment beside
+   * `POST returns/:rmaId/cancel` — different depth, so no route-order hazard.
+   */
+  @Post(':tenantId/returns/receipts')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(DeviceSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'return.receive — receives returned units against a return authorization exactly once (badge-in session required): each entry that matches its line books a return.received ledger event into the warehouse\'s system RETURNS bin (awaiting disposition — outside ATP) with its condition grade; every other entry is refused and lands in ONE review-queue row (Discard only)',
+  })
+  @ApiBody({ type: ReceiveReturnDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: ReturnReceiptResultDto,
+    description:
+      'Recorded: the receipt (null when every entry was refused), the authorization\'s new status, and per entry applied or refused with its reason (the idempotency snapshot)',
+  })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      'Missing or malformed Idempotency-Key, or an invalid body — no entries or over 150, a malformed id, a non-positive qty, an unknown condition, a note over 200 characters, a serial or weight entry whose qty is not 1, both a serial and a weight, a non-UTC occurredAt, or a quantity finer than its unit (validation-failed)',
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or the operator is not a floor role (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The return authorization does not exist in this tenant (not-found)') })
+  @ApiResponse({
+    status: 409,
+    ...problemJsonResponse(
+      "The authorization belongs to another warehouse (document-warehouse-mismatch — checked before its status), it is not open or partially received (rma-not-receivable), a user zone or bin named RETURNS blocks the system returns bin (returns-bin-conflict), or a concurrent idempotent request (conflict)",
+    ),
+  })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
+  async receive(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentDeviceSession() session: DeviceSession,
+    @Body() dto: ReceiveReturnDto,
+  ): Promise<ReturnReceiptResultDto> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    if (session.userId === null) {
+      // A bare enrollment credential has no operator — badge-in first.
+      throw new ProblemException('unauthenticated', 401, 'Badge-in required', 'This endpoint requires an operator badge-in session.');
+    }
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const result = await this.returns.receive(
+      {
+        tenantId,
+        deviceId: session.deviceId,
+        operatorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        rmaId: dto.rmaId,
+        occurredAt: dto.occurredAt,
+        // BASE units cross this edge; the command scales them behind its
+        // replay lookup (story 10.2). Optional keys pass through — the
+        // command normalises them (`?? null`) before hashing.
+        entries: dto.entries.map((entry) => ({
+          rmaLineId: entry.rmaLineId ?? null,
+          skuId: entry.skuId,
+          qty: entry.qty,
+          condition: entry.condition,
+          note: entry.note ?? null,
+          batchCode: entry.batchCode ?? null,
+          serialNumber: entry.serialNumber ?? null,
+          weightGrams: entry.weightGrams ?? null,
+        })),
+      },
+      key,
+    );
+    return toReceiptDto(result);
+  }
+
   // Declared BEFORE `:rmaId` — see the class comment.
   @Get(':tenantId/returns/returnable')
   @UseGuards(TenantSessionGuard)
@@ -166,7 +250,7 @@ export class ReturnsController {
   @Get(':tenantId/returns/:rmaId')
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'One return authorization with its lines, reasons and serials' })
+  @ApiOperation({ summary: 'One return authorization with its lines, reasons and serials — and (story 13-2) its receipts: each received line\'s condition, note, batch, serial and case weight, and the receiving operator\'s email' })
   @ApiOkResponse({ type: ReturnAuthorizationDto })
   @ApiResponse({ status: 400, ...problemJsonResponse('A malformed rmaId (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
@@ -247,9 +331,22 @@ function assertUuidParam(value: string, name: 'rmaId'): void {
 
 /** A fresh object per response (the shell never hands out the snapshot itself). */
 function toRmaDto(rma: RmaDetail): ReturnAuthorizationDto {
+  const { receipts, ...rest } = rma;
   return {
-    ...rma,
+    ...rest,
     lines: rma.lines.map((line) => ({ ...line, serials: line.serials.map((serial) => ({ ...serial })) })),
+    // Story 13-2 — only the detail read carries receipts.
+    ...(receipts === undefined
+      ? {}
+      : { receipts: receipts.map((receipt) => ({ ...receipt, lines: receipt.lines.map((line) => ({ ...line })) })) }),
+  };
+}
+
+function toReceiptDto(result: ReturnReceiptResult): ReturnReceiptResultDto {
+  return {
+    ...result,
+    applied: result.applied.map((item) => ({ ...item })),
+    refused: result.refused.map((item) => ({ ...item })),
   };
 }
 

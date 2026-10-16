@@ -27,6 +27,8 @@ import type {
   RmaDetail,
   RmaStatus,
 } from './return-authorization.command';
+import { ReturnReceiptCommand, openReturnsInTx, receiptsOfRmaInTx } from './return-receipt.command';
+import type { OpenReturn, ReceiveReturnCommand, ReturnReceiptResult } from './return-receipt.command';
 
 export {
   MAX_RMA_EXTERNAL_REFERENCE,
@@ -49,7 +51,23 @@ export type {
   RmaSerial,
   RmaStatus,
 } from './return-authorization.command';
-export { RETURN_AUTHORIZATION_CANCELLED_EVENT, RETURN_AUTHORIZATION_CREATED_EVENT } from './events';
+export { RETURN_AUTHORIZATION_CANCELLED_EVENT, RETURN_AUTHORIZATION_CREATED_EVENT, RETURN_RECEIPT_RECORDED_EVENT } from './events';
+export {
+  MAX_RETURN_NOTE,
+  MAX_RETURN_RECEIPT_ENTRIES,
+  RETURN_CONDITIONS,
+  RETURN_ENTRY_REFUSALS,
+} from './return-receipt.command';
+export type {
+  OpenReturn,
+  OpenReturnLine,
+  ReceiveReturnCommand,
+  ReturnCondition,
+  ReturnEntryInput,
+  ReturnEntryRefusal,
+  ReturnReceiptResult,
+  ReturnReceiptView,
+} from './return-receipt.command';
 
 /** The list's page size: 1–100, default 50 (the house list bounds). */
 export const DEFAULT_RMA_PAGE_SIZE = 50;
@@ -92,13 +110,17 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
  * - `list` — newest first, keyset `(created_at, id)` DESC on the
  *   full-precision instant, optionally one warehouse (tenant-wide without
  *   it), one status, one order;
- * - `get` — one authorization, null when absent.
+ * - `get` — one authorization with its receipts (13-2), null when absent.
+ *
+ * Story 13-2 adds `receive` (the device's `return.receive`, delegated to
+ * `ReturnReceiptCommand`) and `getOpenReturns` (the catalog snapshot arm).
  */
 @Injectable()
 export class ReturnsFacade {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(ReturnAuthorizationCommand) private readonly command: ReturnAuthorizationCommand,
+    @Inject(ReturnReceiptCommand) private readonly receipts: ReturnReceiptCommand,
     @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
@@ -110,6 +132,23 @@ export class ReturnsFacade {
 
   cancel(command: CancelRmaCommand, idempotencyKey: string): Promise<RmaDetail> {
     return this.command.cancel(command, idempotencyKey);
+  }
+
+  /** Story 13-2 — `return.receive`, the device op (see `ReturnReceiptCommand`). */
+  receive(command: ReceiveReturnCommand, idempotencyKey: string): Promise<ReturnReceiptResult> {
+    return this.receipts.receive(command, idempotencyKey);
+  }
+
+  /**
+   * Story 13-2 — the device catalog snapshot's `openReturns` arm: the
+   * warehouse's RMAs in `open` / `partially_received`, in their own tenant
+   * transaction (a plain facade call the api shell composes beside the task
+   * lists — never nested inside another facade's transaction).
+   */
+  async getOpenReturns(tenantId: string, warehouseId: string): Promise<OpenReturn[]> {
+    return withTenantTransaction(this.db, tenantId, (tx) =>
+      openReturnsInTx(tx, { catalog: this.catalog, inventory: this.inventory }, tenantId, canonicalUuid(warehouseId)),
+    );
   }
 
   /** One order's returnable read; 404 `not-found` when the order is unknown. */
@@ -158,7 +197,19 @@ export class ReturnsFacade {
     });
   }
 
+  /**
+   * One authorization — story 13-2: WITH its receipts (each line's grade,
+   * note, batch, serial and case weight, the operator's email). Receipts
+   * ride only here, never on the list (design review #20), and never on a
+   * command's stored snapshot — `receipts` is optional on `RmaDetail`, so a
+   * pre-13-2 snapshot still serves.
+   */
   async get(tenantId: string, rmaId: string): Promise<RmaDetail | null> {
-    return withTenantTransaction(this.db, tenantId, (tx) => rmaDetailInTx(tx, this.catalog, tenantId, canonicalUuid(rmaId)));
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const id = canonicalUuid(rmaId);
+      const detail = await rmaDetailInTx(tx, this.catalog, tenantId, id);
+      if (detail === null) return null;
+      return { ...detail, receipts: await receiptsOfRmaInTx(tx, this.catalog, tenantId, id) };
+    });
   }
 }

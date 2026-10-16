@@ -33,7 +33,7 @@ export class SyncReportRowDto {
   @Length(26, 26)
   opId!: string;
 
-  @ApiProperty({ enum: ['grn.submit', 'putaway.place', 'pick.record', 'pack.execute', 'excursion.record', 'transfer.confirm', 'count.submit'] })
+  @ApiProperty({ enum: [...REJECTED_OP_TYPES] })
   @IsIn(REJECTED_OP_TYPES)
   opType!: (typeof REJECTED_OP_TYPES)[number];
 
@@ -124,7 +124,7 @@ export class RejectedOpResponse {
   @ApiProperty({ description: "The mobile op's ULID" })
   opId!: string;
 
-  @ApiProperty({ enum: ['grn.submit', 'putaway.place', 'pick.record', 'pack.execute', 'excursion.record', 'transfer.confirm', 'count.submit'] })
+  @ApiProperty({ enum: [...REJECTED_OP_TYPES] })
   opType!: string;
 
   @ApiProperty({ enum: ['rejected', 'quarantined'] })
@@ -165,6 +165,15 @@ export class RejectedOpResponse {
 
   @ApiProperty()
   updatedAt!: string;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    enum: [...REJECTED_OP_DECISIONS],
+    description:
+      "Story 13-2 — the decisions this row's op type admits (the per-type rule; a return.receive row is ['discard'] only). Always present on the list; absent only on a resolve response stored before 13-2",
+  })
+  decisions?: (typeof REJECTED_OP_DECISIONS)[number][];
 }
 
 export class RejectedOpListQuery {

@@ -1248,6 +1248,43 @@ export class InventoryFacade {
   }
 
   /**
+   * Story 13-2 — which of a set of serials are CURRENTLY ON-HAND (any bin,
+   * any warehouse), in the CALLER's transaction: the serial's latest event is
+   * an intake (`to_bin_id` set). Answers `serialId → binId` for those only.
+   * The serial guard's own definition (`assertSerialArmLegal`'s "latest
+   * event" read, tenant-wide, `seq` descending), asked up front so the return
+   * receipt can REFUSE such a unit per entry (`serial-in-stock`) rather than
+   * have the intake's guard throw for the whole receipt. Call it under the
+   * serial advisory locks (`lockSerialsInTx`) so the answer cannot move
+   * before the append.
+   */
+  async serialsInStockInTx(
+    tx: TenantTx,
+    tenantId: string,
+    serialIds: readonly string[],
+  ): Promise<ReadonlyMap<string, string>> {
+    const distinct = [...new Set(serialIds)];
+    if (distinct.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .selectDistinctOn([ledgerEvents.serialRef], {
+        serialRef: ledgerEvents.serialRef,
+        toBinId: ledgerEvents.toBinId,
+      })
+      .from(ledgerEvents)
+      .where(and(eq(ledgerEvents.tenantId, tenantId), inArray(ledgerEvents.serialRef, distinct)))
+      .orderBy(ledgerEvents.serialRef, desc(ledgerEvents.seq));
+    const inStock = new Map<string, string>();
+    for (const row of rows) {
+      if (row.serialRef !== null && row.toBinId !== null) {
+        inStock.set(row.serialRef, row.toBinId);
+      }
+    }
+    return inStock;
+  }
+
+  /**
    * The full ledger history of a set of batch/serial scopes (story 12-6,
    * FR-45): every event whose `batch_ref` or `serial_ref` matches, seq-ordered,
    * in the CALLER's transaction — the `(tenant,batch_ref,seq)` /

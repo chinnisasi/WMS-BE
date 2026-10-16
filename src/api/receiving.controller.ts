@@ -12,6 +12,7 @@ import { ReceivingFacade } from '../modules/inbound/receiving.facade';
 import { OutboundFacade } from '../modules/outbound/outbound.facade';
 import { QcFacade } from '../modules/inbound/qc.facade';
 import { MovementsFacade } from '../modules/movements/transfer.facade';
+import { ReturnsFacade } from '../modules/returns/returns.facade';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -66,6 +67,9 @@ export class ReceivingController {
     // Story 5-1: the snapshot's `transferTasks` arm — the same composition
     // (the transfer aggregate is movements-exclusive).
     @Inject(MovementsFacade) private readonly movements: MovementsFacade,
+    // Story 13-2: the snapshot's `openReturns` arm — the same composition
+    // (the returns module is imported only by the api shell).
+    @Inject(ReturnsFacade) private readonly returns: ReturnsFacade,
   ) {}
 
   @Post(':tenantId/receiving/goods-receipts')
@@ -196,6 +200,10 @@ export class ReceivingController {
     // stored task feed; every other arm derives on read). Same sequential
     // composition.
     const countTasks = await this.movements.getCountTasks(tenantId, query.warehouseId);
+    // Story 13-2: the return-receipt arm — the warehouse's open and
+    // partially received RMAs. A plain facade call in its own transaction,
+    // composed beside the task lists (never nested).
+    const openReturns = await this.returns.getOpenReturns(tenantId, query.warehouseId);
     return {
       ...snapshot,
       pickTasks: pickTasks.map((task) => ({ ...task })),
@@ -203,6 +211,10 @@ export class ReceivingController {
       handlingUnits: packWork.handlingUnits.map((unit) => ({ ...unit })),
       transferTasks: transferTasks.map((task) => ({ ...task, lines: task.lines.map((line) => ({ ...line })) })),
       countTasks: countTasks.map((task) => ({ ...task, lines: task.lines.map((line) => ({ ...line })) })),
+      openReturns: openReturns.map((rma) => ({
+        ...rma,
+        lines: rma.lines.map((line) => ({ ...line, batchCodes: [...line.batchCodes], serials: line.serials.map((serial) => ({ ...serial })) })),
+      })),
     };
   }
 

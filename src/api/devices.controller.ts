@@ -438,7 +438,7 @@ export class DevicesController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks review.decide (role-denied), or the apply re-execution\'s own guards refused (device-revoked, verbatim)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Rejected op does not exist in this tenant (not-found), or a recounted bin does not') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Row already resolved (rejected-op-resolved), a pending count task on the bin (count-task-open), or the re-executed command\'s own conflict (verbatim)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Row already resolved (rejected-op-resolved), a decision the op type does not admit — story 13-2: a return.receive row is Discard only (decision-not-available, member decisions), a pending count task on the bin (count-task-open), or the re-executed command\'s own conflict (verbatim)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'rejectedOpId', format: 'uuid' })
@@ -507,6 +507,9 @@ function toRejectedOpResponse(entry: RejectedOpEntry): RejectedOpResponse {
     resolvedOutcome: entry.resolvedOutcome,
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
+    // Story 13-2 — the per-type decision rule, per row (absent only on a
+    // resolve snapshot stored before 13-2).
+    ...(entry.decisions === undefined ? {} : { decisions: [...entry.decisions] }),
   };
 }
 

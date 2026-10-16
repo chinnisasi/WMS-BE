@@ -138,7 +138,8 @@ export function dispatchedOrderFixtures(context: () => DispatchedOrderContext) {
 
   async function packAndDispatch(
     orderId: string,
-    scanned: { skuId: string; qty: number }[],
+    // Story 13-2: a catch-weight line's scan names the cases it packs.
+    scanned: { skuId: string; qty: number; handlingUnitIds?: string[] }[],
     dispatchBody: Record<string, unknown> = {},
   ): Promise<void> {
     const ctx = context();
@@ -156,5 +157,67 @@ export function dispatchedOrderFixtures(context: () => DispatchedOrderContext) {
       .expect(201);
   }
 
-  return { createOrder, releasedWave, pickAllLines, packAndDispatch };
+  /**
+   * Story 13-2 — batch-tracked (and batch-and-serial) stock in `binId`: one
+   * adjustment intake of `quantity` under batch `batchCode` (serial-tracked
+   * SKUs name one serial per unit). The wave's pick then draws it FEFO, so a
+   * dispatched order's `pick.picked` events carry the batch arm.
+   */
+  async function seedBatchStock(
+    skuId: string,
+    binId: string,
+    quantity: number,
+    batchCode: string,
+    serials?: string[],
+  ): Promise<void> {
+    const ctx = context();
+    await request(ctx.app.getHttpServer())
+      .post(`${API}/${ctx.tenantId}/inventory/adjustments`)
+      .set('Authorization', `Bearer ${ctx.opsToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        warehouseId: ctx.warehouseId,
+        skuId,
+        binId,
+        quantityDelta: quantity,
+        reasonCode: 'stock-count',
+        note: 'dispatched-order fixture: batch seed',
+        batch: { code: batchCode },
+        ...(serials === undefined ? {} : { serials }),
+      })
+      .expect(201);
+  }
+
+  /**
+   * Story 13-2 — catch-weight cases in `binId`: a blind receipt of one case
+   * per weight (the badge-in device), then a putaway into `binId` so the wave
+   * can pick them. Answers the cases' handling-unit ids (weight order) — a
+   * catch-weight pack names them.
+   */
+  async function seedCatchWeightCases(skuId: string, binId: string, weights: number[]): Promise<string[]> {
+    const ctx = context();
+    const received = await request(ctx.app.getHttpServer())
+      .post(`${API}/${ctx.tenantId}/receiving/goods-receipts`)
+      .set('Authorization', `Bearer ${ctx.operatorToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        warehouseId: ctx.warehouseId,
+        poId: null,
+        blindReasonCode: 'unannounced-delivery',
+        occurredAt: now(),
+        lines: [{ poLineId: null, skuId, batchCode: null, mfgDate: null, qty: weights.length, weightsGrams: weights }],
+      })
+      .expect(201);
+    const grn = received.body.goodsReceipt as { id: string; lines: { id: string; handlingUnitIds: string[] }[] };
+    const line = grn.lines[0]!;
+    await request(ctx.app.getHttpServer())
+      .post(`${API}/${ctx.tenantId}/putaway/placements`)
+      .set('Authorization', `Bearer ${ctx.operatorToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ warehouseId: ctx.warehouseId, grnId: grn.id, grnLineId: line.id, skuId, toBinId: binId, qty: weights.length, occurredAt: now() })
+      .expect(201);
+    return line.handlingUnitIds;
+  }
+
+  return { createOrder, releasedWave, pickAllLines, packAndDispatch, seedBatchStock, seedCatchWeightCases };
 }

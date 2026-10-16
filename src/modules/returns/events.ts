@@ -21,3 +21,28 @@ export interface ReturnAuthorizationEventPayload {
   readonly warehouseId: string;
   readonly clientId: string;
 }
+
+/**
+ * Story 13-2 — a `return.receive` op was recorded: the authorized units it
+ * carried were booked into RETURNS (awaiting disposition) and any others were
+ * sent to the review queue. Appended in the command's own transaction even
+ * when nothing applied (`returnReceiptId: null`). Nothing subscribes in 13-2
+ * (the refused part raises its own `device.rejected_op.raised`). The action
+ * string doubles as the audit action (`AUDIT_NEW_ACTIONS`).
+ */
+export const RETURN_RECEIPT_RECORDED_EVENT = 'return_receipt.recorded';
+
+/** `return_receipt.recorded`'s payload — flat ids and counts only. */
+export interface ReturnReceiptRecordedPayload {
+  /** Null when every entry was refused (no receipt row is written). */
+  readonly returnReceiptId: string | null;
+  /** The receipt's code (`RRN-0001`); null when nothing applied. */
+  readonly code: string | null;
+  readonly rmaId: string;
+  readonly rmaCode: string;
+  /** The RMA's client (a 3PL consumer filters by brand). */
+  readonly clientId: string;
+  readonly warehouseId: string;
+  readonly appliedCount: number;
+  readonly refusedCount: number;
+}

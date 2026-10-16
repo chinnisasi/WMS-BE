@@ -432,7 +432,7 @@
             }
           },
           "409": {
-            "description": "Zone code already exists in this warehouse (duplicate-zone-code names the code)",
+            "description": "Zone code already exists in this warehouse (duplicate-zone-code names the code), or the code is RETURNS — reserved for the system returns zone (reserved-location-code, story 13-2)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -675,7 +675,7 @@
             }
           },
           "409": {
-            "description": "Bin code already exists in this warehouse (duplicate-bin-code names the code)",
+            "description": "Bin code already exists in this warehouse (duplicate-bin-code names the code), or the code is RETURNS — reserved for the system returns bin (reserved-location-code, story 13-2)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -927,7 +927,7 @@
             }
           },
           "409": {
-            "description": "A generated code collides (duplicate-bin-code names the first conflicting code; nothing committed)",
+            "description": "A generated code collides (duplicate-bin-code names the first conflicting code; nothing committed), or a generated code is RETURNS (reserved-location-code, story 13-2)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4203,7 +4203,7 @@
             }
           },
           "409": {
-            "description": "Row already resolved (rejected-op-resolved), a pending count task on the bin (count-task-open), or the re-executed command's own conflict (verbatim)",
+            "description": "Row already resolved (rejected-op-resolved), a decision the op type does not admit — story 13-2: a return.receive row is Discard only (decision-not-available, member decisions), a pending count task on the bin (count-task-open), or the re-executed command's own conflict (verbatim)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4940,7 +4940,8 @@
                   "dispatch.dispatched",
                   "excursion.recorded",
                   "transfer.outbound",
-                  "transfer.inbound"
+                  "transfer.inbound",
+                  "return.received"
                 ]
               }
             }
@@ -18539,6 +18540,7 @@
                 "reorder_breach",
                 "reorder_policy",
                 "return_authorization",
+                "return_receipt",
                 "sku",
                 "stock_adjustment_pending",
                 "stock_adjustment_policy",
@@ -23414,6 +23416,8 @@
               "type": "string",
               "enum": [
                 "open",
+                "partially_received",
+                "received",
                 "cancelled"
               ]
             }
@@ -23497,6 +23501,126 @@
           }
         ],
         "summary": "Lists return authorizations newest first (keyset on createdAt, id), optionally one warehouse’s (tenant-wide without it), one status’s, one order’s — each with its lines",
+        "tags": [
+          "returns"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/returns/receipts": {
+      "post": {
+        "operationId": "ReturnsController_receive",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReceiveReturnDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Recorded: the receipt (null when every entry was refused), the authorization's new status, and per entry applied or refused with its reason (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReturnReceiptResultDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — no entries or over 150, a malformed id, a non-positive qty, an unknown condition, a note over 200 characters, a serial or weight entry whose qty is not 1, both a serial and a weight, a non-UTC occurredAt, or a quantity finer than its unit (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown or revoked device (device-revoked), or the operator is not a floor role (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The return authorization does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The authorization belongs to another warehouse (document-warehouse-mismatch — checked before its status), it is not open or partially received (rma-not-receivable), a user zone or bin named RETURNS blocks the system returns bin (returns-bin-conflict), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "return.receive — receives returned units against a return authorization exactly once (badge-in session required): each entry that matches its line books a return.received ledger event into the warehouse's system RETURNS bin (awaiting disposition — outside ATP) with its condition grade; every other entry is refused and lands in ONE review-queue row (Discard only)",
         "tags": [
           "returns"
         ]
@@ -23671,7 +23795,7 @@
             "bearer": []
           }
         ],
-        "summary": "One return authorization with its lines, reasons and serials",
+        "summary": "One return authorization with its lines, reasons and serials — and (story 13-2) its receipts: each received line's condition, note, batch, serial and case weight, and the receiving operator's email",
         "tags": [
           "returns"
         ]
@@ -26490,7 +26614,8 @@
               "pack.execute",
               "excursion.record",
               "transfer.confirm",
-              "count.submit"
+              "count.submit",
+              "return.receive"
             ]
           },
           "classification": {
@@ -26637,7 +26762,8 @@
               "pack.execute",
               "excursion.record",
               "transfer.confirm",
-              "count.submit"
+              "count.submit",
+              "return.receive"
             ]
           },
           "classification": {
@@ -26696,6 +26822,18 @@
           },
           "updatedAt": {
             "type": "string"
+          },
+          "decisions": {
+            "type": "array",
+            "description": "Story 13-2 — the decisions this row's op type admits (the per-type rule; a return.receive row is ['discard'] only). Always present on the list; absent only on a resolve response stored before 13-2",
+            "items": {
+              "type": "string",
+              "enum": [
+                "apply",
+                "recount",
+                "discard"
+              ]
+            }
           }
         },
         "required": [
@@ -27390,6 +27528,21 @@
             "type": "string",
             "format": "uuid",
             "description": "Story 9-3a — the count variance an approve-adjust resolution corrected (manual-adjustment arm, resolutions only)"
+          },
+          "returnReceiptId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 13-2 — the return receipt the units landed under (return-receipt arm only)"
+          },
+          "rmaId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 13-2 — the return authorization received against (return-receipt arm only)"
+          },
+          "rmaLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 13-2 — the authorization line credited (return-receipt arm only)"
           }
         },
         "required": [
@@ -32255,6 +32408,112 @@
           "lines"
         ]
       },
+      "CatalogOpenReturnSerialDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "serialNumber": {
+            "type": "string"
+          },
+          "received": {
+            "type": "boolean",
+            "description": "Already received against this authorization"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The batch the serial was picked from (batch-and-serial SKUs); null otherwise"
+          }
+        },
+        "required": [
+          "id",
+          "serialNumber",
+          "received",
+          "batchCode"
+        ]
+      },
+      "CatalogOpenReturnLineDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The return authorization line (an entry's rmaLineId)"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "authorizedQty": {
+            "type": "number",
+            "description": "Units authorized, base UoM"
+          },
+          "receivedQty": {
+            "type": "number",
+            "description": "Units received so far, base UoM"
+          },
+          "openQty": {
+            "type": "number",
+            "description": "authorized − received, base UoM"
+          },
+          "batchCodes": {
+            "description": "Batch-tracked SKUs: the batches the order line was picked from (a receipt names one of them); empty otherwise",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "serials": {
+            "description": "Serial-tracked lines: every authorized serial, sorted by number; empty otherwise",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogOpenReturnSerialDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "skuId",
+          "authorizedQty",
+          "receivedQty",
+          "openQty",
+          "batchCodes",
+          "serials"
+        ]
+      },
+      "CatalogOpenReturnDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "RMA-0001"
+          },
+          "orderReference": {
+            "type": "string",
+            "nullable": true,
+            "description": "The order's channel reference; null for a manual order"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogOpenReturnLineDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "orderReference",
+          "lines"
+        ]
+      },
       "CatalogSnapshotResponse": {
         "type": "object",
         "properties": {
@@ -32334,6 +32593,13 @@
             "items": {
               "$ref": "#/components/schemas/CatalogCountTaskDto"
             }
+          },
+          "openReturns": {
+            "description": "Story 13-2 (additive): the warehouse's return authorizations that can still receive (open or partially received) — the handheld receives returned units against them offline, grading each unit; units not on an authorization are queued for review, never refused on the device",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogOpenReturnDto"
+            }
           }
         },
         "required": [
@@ -32348,7 +32614,8 @@
           "packTasks",
           "handlingUnits",
           "transferTasks",
-          "countTasks"
+          "countTasks",
+          "openReturns"
         ]
       },
       "GoodsReceiptEntryDto": {
@@ -37558,6 +37825,7 @@
               "reorder_breach",
               "reorder_policy",
               "return_authorization",
+              "return_receipt",
               "sku",
               "stock_adjustment_pending",
               "stock_adjustment_policy",
@@ -37643,6 +37911,7 @@
               "reorder_breach",
               "reorder_policy",
               "return_authorization",
+              "return_receipt",
               "sku",
               "stock_adjustment_pending",
               "stock_adjustment_policy",
@@ -41692,7 +41961,7 @@
           },
           "qty": {
             "type": "number",
-            "description": "Units authorized for return. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded. At most what is still returnable (dispatched minus what open authorizations already name).",
+            "description": "Units authorized for return. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded. At most what is still returnable (dispatched minus what uncancelled authorizations already name).",
             "minimum": 0.001,
             "maximum": 9007199254740
           },
@@ -41716,7 +41985,7 @@
           },
           "serialNumbers": {
             "maxItems": 500,
-            "description": "Serial-tracked SKUs only, and then required: the serial number of every unit returned (count = qty), each dispatched on this line and not on an open authorization. At most 500 per line and 500 per request",
+            "description": "Serial-tracked SKUs only, and then required: the serial number of every unit returned (count = qty), each dispatched on this line and not on an uncancelled authorization. At most 500 per line and 500 per request",
             "type": "array",
             "items": {
               "type": "string"
@@ -41835,6 +42104,94 @@
           "serials"
         ]
       },
+      "ReturnReceiptLineViewDto": {
+        "type": "object",
+        "properties": {
+          "rmaLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units received, base UoM"
+          },
+          "condition": {
+            "type": "string",
+            "enum": [
+              "resaleable",
+              "opened",
+              "damaged",
+              "missing-parts"
+            ]
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "serialNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "A returned case's captured weight, grams"
+          }
+        },
+        "required": [
+          "rmaLineId",
+          "skuId",
+          "qty",
+          "condition",
+          "note",
+          "batchCode",
+          "serialNumber",
+          "weightGrams"
+        ]
+      },
+      "ReturnReceiptViewDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "RRN-0001"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time of the receipt (ISO-8601 UTC)"
+          },
+          "operatorEmail": {
+            "type": "string",
+            "nullable": true,
+            "description": "The receiving operator's email (null when the user no longer exists)"
+          },
+          "lines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReturnReceiptLineViewDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "occurredAt",
+          "operatorEmail",
+          "lines"
+        ]
+      },
       "ReturnAuthorizationDto": {
         "type": "object",
         "properties": {
@@ -41850,6 +42207,8 @@
             "type": "string",
             "enum": [
               "open",
+              "partially_received",
+              "received",
               "cancelled"
             ]
           },
@@ -41912,6 +42271,13 @@
             "items": {
               "$ref": "#/components/schemas/ReturnAuthorizationLineDto"
             }
+          },
+          "receipts": {
+            "description": "Story 13-2 — the receipts against this authorization, oldest first. Present ONLY on GET /returns/{rmaId}; absent on the list and on the create/cancel responses",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReturnReceiptViewDto"
+            }
           }
         },
         "required": [
@@ -41930,6 +42296,204 @@
           "cancelledBy",
           "cancelReason",
           "lines"
+        ]
+      },
+      "ReturnReceiptEntryDto": {
+        "type": "object",
+        "properties": {
+          "rmaLineId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The authorization line it is received against — null for a unit that is on no line (it is refused not-on-authorization and sent to review)"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units received, base UoM. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded. A serial entry is exactly 1 unit; a catch-weight entry is exactly 1 case.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
+          },
+          "condition": {
+            "type": "string",
+            "enum": [
+              "resaleable",
+              "opened",
+              "damaged",
+              "missing-parts"
+            ],
+            "description": "The inspection grade (human decision 1) — it suggests a disposition; it decides nothing"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "description": "An inspection note — trimmed, blank means absent, at most 200 characters",
+            "maxLength": 400
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Batch-tracked SKUs: the unit's batch — one the order line was picked from",
+            "maxLength": 128
+          },
+          "serialNumber": {
+            "type": "string",
+            "nullable": true,
+            "description": "Serial-tracked SKUs: the unit's serial number — one the line authorizes (qty 1)",
+            "maxLength": 400
+          },
+          "weightGrams": {
+            "type": "number",
+            "nullable": true,
+            "description": "Catch-weight SKUs: the case's weight in whole grams (qty 1), at most 1000000",
+            "minimum": 1,
+            "maximum": 1000000
+          }
+        },
+        "required": [
+          "rmaLineId",
+          "skuId",
+          "qty",
+          "condition"
+        ]
+      },
+      "ReceiveReturnDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse receiving — must be the authorization's (409 document-warehouse-mismatch otherwise)"
+          },
+          "rmaId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The return authorization received against (open or partially received)"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time (ISO-8601 UTC, Z-suffixed) — the ledger events' business time"
+          },
+          "entries": {
+            "minItems": 1,
+            "maxItems": 150,
+            "description": "1–150 entries, one per unit or case (an untracked run may carry several units) — the device splits a larger receipt into several ops",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReturnReceiptEntryDto"
+            }
+          }
+        },
+        "required": [
+          "warehouseId",
+          "rmaId",
+          "occurredAt",
+          "entries"
+        ]
+      },
+      "ReturnEntryAppliedDto": {
+        "type": "object",
+        "properties": {
+          "entryIndex": {
+            "type": "number",
+            "description": "The entry's place in the op (0-based)"
+          },
+          "rmaLineId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Units booked into RETURNS, base UoM"
+          }
+        },
+        "required": [
+          "entryIndex",
+          "rmaLineId",
+          "qty"
+        ]
+      },
+      "ReturnEntryRefusedDto": {
+        "type": "object",
+        "properties": {
+          "entryIndex": {
+            "type": "number",
+            "description": "The entry's place in the op (0-based)"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "not-on-authorization",
+              "exceeds-authorized",
+              "serial-not-authorized",
+              "serial-in-stock",
+              "batch-not-dispatched",
+              "missing-capture",
+              "unexpected-capture",
+              "weight-out-of-range",
+              "qty-precision"
+            ],
+            "description": "Why it was not booked — the entry is in the review queue"
+          }
+        },
+        "required": [
+          "entryIndex",
+          "reason"
+        ]
+      },
+      "ReturnReceiptResultDto": {
+        "type": "object",
+        "properties": {
+          "returnReceiptId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The receipt; null when every entry was refused"
+          },
+          "code": {
+            "type": "string",
+            "nullable": true,
+            "description": "RRN-0001; null when every entry was refused"
+          },
+          "rmaStatus": {
+            "type": "string",
+            "enum": [
+              "open",
+              "partially_received",
+              "received",
+              "cancelled"
+            ],
+            "description": "The authorization's status after this receipt (unchanged when nothing applied)"
+          },
+          "applied": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReturnEntryAppliedDto"
+            }
+          },
+          "refused": {
+            "description": "The refused entries — all of them sit in ONE review-queue row (Discard only)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReturnEntryRefusedDto"
+            }
+          },
+          "reviewOpId": {
+            "type": "string",
+            "nullable": true,
+            "description": "The review row's op id when entries were refused (derived from the key, never equal to it); null otherwise"
+          }
+        },
+        "required": [
+          "returnReceiptId",
+          "code",
+          "rmaStatus",
+          "applied",
+          "refused",
+          "reviewOpId"
         ]
       },
       "ReturnableLineDto": {
@@ -41959,7 +42523,7 @@
           },
           "authorizedQty": {
             "type": "number",
-            "description": "Units already on open authorizations, in base UoM"
+            "description": "Units already on uncancelled authorizations (open, partially received or received), in base UoM"
           },
           "returnableQty": {
             "type": "number",
@@ -41970,7 +42534,7 @@
             "description": "Whether the SKU is serial-tracked (then a return names its serial numbers)"
           },
           "returnableSerials": {
-            "description": "Serial-tracked lines: the dispatched serials not on an open authorization, sorted by number",
+            "description": "Serial-tracked lines: the dispatched serials not on an uncancelled authorization, sorted by number",
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ReturnSerialDto"

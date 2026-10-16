@@ -885,7 +885,7 @@ export type Serial = typeof serials.$inferSelect;
  * UPDATE would leave `verifyChain` green). Say "no writer changes it", not
  * "it cannot change".
  *
- * `status` ∈ `active | pending_approval | rejected | packed` and
+ * `status` ∈ `active | pending_approval | rejected | packed | returned` (13-2) and
  * `weight_grams > 0 AND <= MAX_HANDLING_UNIT_WEIGHT_GRAMS` are CHECKs in the
  * migration DDL (repo convention — never in this file), as is the RLS policy,
  * which is single-dimension on `tenant_id` alone like every other one.
@@ -904,8 +904,14 @@ export const handlingUnits = pgTable(
     skuId: uuid('sku_id').notNull(),
     /** Set when the SKU is batch-tracked — a unit's batch, recoverable from its own row. */
     batchId: uuid('batch_id'),
-    /** Provenance: the receipt line that produced this unit. */
-    grnLineId: uuid('grn_line_id').notNull(),
+    /**
+     * Provenance: the receipt line that produced this unit. Story 13-2 — null
+     * on a RETURNED case, which carries `return_receipt_line_id` instead
+     * (0073's CHECK: exactly one of the two is set).
+     */
+    grnLineId: uuid('grn_line_id'),
+    /** Story 13-2 — provenance of a returned case: the return-receipt line that booked it. */
+    returnReceiptLineId: uuid('return_receipt_line_id'),
     /** Integer GRAMS, captured once at receipt. Immutable. Never a quantity. */
     weightGrams: integer('weight_grams').notNull(),
     status: text('status').notNull().default('active'),
@@ -916,6 +922,7 @@ export const handlingUnits = pgTable(
   (table) => [
     index('handling_units_tenant_sku_status_idx').on(table.tenantId, table.skuId, table.status),
     index('handling_units_tenant_grn_line_idx').on(table.tenantId, table.grnLineId),
+    index('handling_units_tenant_return_receipt_line_idx').on(table.tenantId, table.returnReceiptLineId),
     index('handling_units_tenant_id_idx').on(table.tenantId),
   ],
 );
@@ -5024,3 +5031,84 @@ export const returnAuthorizationLines = pgTable(
 );
 
 export type ReturnAuthorizationLineRow = typeof returnAuthorizationLines.$inferSelect;
+
+/**
+ * Story 13-2 — a return receipt: the floor received returned units against a
+ * return authorization (returns module, module-exclusive writes — pinned by
+ * `test/architecture.spec.ts`). One row per `return.receive` op that applied
+ * at least one entry; an op whose every entry was refused writes none.
+ * `client_id` and `warehouse_id` are the RMA's; `code` (`RRN-0001`) is
+ * allocated per tenant under the `:rrn-seq` advisory lock; `device_id` /
+ * `received_by` are the badge-in session; `idempotency_key` is the op's ULID;
+ * `occurred_at` is device time (the ledger events' business time). RLS (the
+ * client-scoped document pattern) lives only in
+ * `drizzle/0073_return_receipts.sql`.
+ */
+export const returnReceipts = pgTable(
+  'return_receipts',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    rmaId: uuid('rma_id').notNull(),
+    code: text('code').notNull(),
+    deviceId: uuid('device_id').notNull(),
+    receivedBy: uuid('received_by').notNull(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    occurredAt: timestamp('occurred_at', { withTimezone: true, mode: 'string' }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('return_receipts_tenant_code_unique').on(table.tenantId, table.code),
+    // The detail read's receipts of one RMA.
+    index('return_receipts_tenant_rma_idx').on(table.tenantId, table.rmaId),
+  ],
+);
+
+export type ReturnReceiptRow = typeof returnReceipts.$inferSelect;
+
+/**
+ * Story 13-2 — one received unit (or a run of units of one line, SKU,
+ * condition and batch) of a return receipt: the RMA line it applied to,
+ * `qty` in milli-units (> 0), the inspection grade (`condition`, the four
+ * grades — 0073's CHECK) and an optional note (1–200, trimmed), the batch /
+ * serial / handling unit it carried, and the `return.received` ledger event
+ * that booked it into RETURNS. At most one of `serial_id` and
+ * `handling_unit_id`; a serial line is exactly 1 unit; one serial is received
+ * at most once per RMA line (the partial unique index).
+ */
+export const returnReceiptLines = pgTable(
+  'return_receipt_lines',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    returnReceiptId: uuid('return_receipt_id').notNull(),
+    rmaLineId: uuid('rma_line_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    /** 1..n in REQUEST order (the applied entries') — the read order. */
+    lineNo: integer('line_no').notNull(),
+    /** Milli-units — base UoM × 10³. */
+    qty: bigint('qty', { mode: 'number' }).notNull(),
+    condition: text('condition').notNull(),
+    note: text('note'),
+    batchId: uuid('batch_id'),
+    serialId: uuid('serial_id'),
+    handlingUnitId: uuid('handling_unit_id'),
+    ledgerEventId: uuid('ledger_event_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('return_receipt_lines_receipt_line_no_unique').on(table.returnReceiptId, table.lineNo),
+    uniqueIndex('return_receipt_lines_rma_line_serial_unique')
+      .on(table.rmaLineId, table.serialId)
+      .where(sql`${table.serialId} IS NOT NULL`),
+    index('return_receipt_lines_tenant_rma_line_idx').on(table.tenantId, table.rmaLineId),
+  ],
+);
+
+export type ReturnReceiptLineRow = typeof returnReceiptLines.$inferSelect;

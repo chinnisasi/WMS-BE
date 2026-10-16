@@ -1,3 +1,4 @@
+import { assertNotReservedLocationCode } from './receiving-bin';
 import { Inject, Injectable } from '@nestjs/common';
 import { and, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
@@ -95,6 +96,8 @@ export class ZoneCommand {
         // write (spec 1.3 Design Notes). RLS already scopes to the tenant;
         // this catches a foreign/nonexistent warehouse as 404.
         await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
+        // Story 13-2: `RETURNS` is the system returns zone's code.
+        assertNotReservedLocationCode(command.code, 'zone');
 
         let zone: ZoneSnapshot['zone'];
         try {

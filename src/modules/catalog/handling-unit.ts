@@ -33,6 +33,11 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
  * - `rejected` — the over-receipt was refused, or the unit was named in a
  *   write-off adjustment. Terminal
  * - `packed` — consumed into an order line at the bench. Terminal
+ * - `returned` — story 13-2: a case a customer RETURNED, received against a
+ *   return authorization into the RETURNS bin and awaiting disposition. NOT
+ *   packable (pack admits only `active`), so a returned case cannot ship on
+ *   another order; 13-3 changes the status when it restocks or scraps it.
+ *   Its provenance is `return_receipt_line_id`, never `grn_line_id`
  *
  * The set is an ALLOW-LIST everywhere it is read: a status arm nobody thought
  * about must be refused, never fall through to "close enough to active".
@@ -42,6 +47,7 @@ export const HANDLING_UNIT_STATUSES = [
   'pending_approval',
   'rejected',
   'packed',
+  'returned',
 ] as const;
 
 export type HandlingUnitStatus = (typeof HANDLING_UNIT_STATUSES)[number];
