@@ -505,6 +505,13 @@
       "when": 1791998131764,
       "tag": "0071_ledger_anchoring_and_chain_alerts",
       "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1792127355718,
+      "tag": "0072_return_authorizations",
+      "breakpoints": true
     }
   ]
 }

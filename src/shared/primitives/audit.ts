@@ -78,6 +78,8 @@ export const AUDIT_TARGET_TYPES = [
   'rejected_op',
   'reorder_breach',
   'reorder_policy',
+  // Story 13-1 — a return authorization (`return_authorization.created | .cancelled`).
+  'return_authorization',
   'sku',
   'stock_adjustment_pending',
   'stock_adjustment_policy',
@@ -129,4 +131,7 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'audit_export.requested', targetType: 'audit_export' },
   // Story 9-3c — the owner acknowledges a chain break (inventory's `LedgerBreakCommand`).
   { action: 'ledger_chain_break.acknowledged', targetType: 'ledger_chain_break' },
+  // Story 13-1 — the returns module's two commands (`ReturnAuthorizationCommand`).
+  { action: 'return_authorization.created', targetType: 'return_authorization' },
+  { action: 'return_authorization.cancelled', targetType: 'return_authorization' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

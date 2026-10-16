@@ -274,6 +274,15 @@ export const CAPABILITIES = [
   // accountant or client. Mirrored into wms-fe `src/lib/users.ts`
   // (CAPABILITIES + OWNER_ONLY_CAPABILITIES).
   'ledger.acknowledge',
+  // Story 13-1 — FR-46: authorize a dispatched order's units for return (an
+  // RMA naming the expected units and a reason) and cancel an authorization.
+  // Owner + Ops Manager (decision 1, human, 2026-10-16: operators only — a
+  // client-portal RMA request is a later story, never a client-held
+  // capability). Operator and Accountant absent: authorizing a return is a
+  // planner act, not a floor verb and not finance work. Every member READS
+  // returns (reads are never gated). Mirrored into wms-fe `src/lib/users.ts`
+  // (CAPABILITIES only — ops_manager is derived there).
+  'returns.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -353,6 +362,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'invoice.generate',
     // Story 8-2b — the e-way paperwork (not its configuration, owner-only).
     'eway.manage',
+    // Story 13-1 — return authorizations (decision 1: owner + ops manager).
+    'returns.manage',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',

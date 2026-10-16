@@ -98,6 +98,18 @@ export interface SerialIdentity {
   readonly status: string;
 }
 
+/**
+ * Story 13-1 — what a return authorization needs of a SKU: whether its units
+ * carry serial identity, whether it is catch-weight, and its unit's declared
+ * precision (the Epic 10 rule a quantity is checked against).
+ */
+export interface SkuFacts {
+  readonly serialTracked: boolean;
+  readonly catchWeightTracked: boolean;
+  readonly uom: string;
+  readonly uomPrecision: number;
+}
+
 /** One composition row as the explosion consumes it (Story 11.4) — milli-units in. */
 export type { KitCompositionLine } from './kit.store';
 
@@ -578,6 +590,78 @@ export class CatalogFacade {
         .limit(1);
       return rows[0] ?? null;
     });
+  }
+
+  /**
+   * Story 13-1 — the per-SKU facts the return authorization validates a line
+   * against, inside the CALLER's transaction (the RMA create composes order
+   * facts, these, the ledger and its own writes on ONE connection). Keyed by
+   * SKU id; an id the catalog does not know is simply absent (the caller
+   * read it off an order line, so absence is a data fault it refuses).
+   * `uomPrecision` is a property of the unit, looked up here rather than
+   * selected (the `getSkuSummariesInTx` shape).
+   */
+  async skuFactsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuIds: readonly string[],
+  ): Promise<ReadonlyMap<string, SkuFacts>> {
+    if (skuIds.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .select({
+        id: skus.id,
+        uom: skus.uom,
+        serialTracked: skus.serialTracked,
+        catchWeightTracked: skus.catchWeightTracked,
+      })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, [...new Set(skuIds)])));
+    return new Map(
+      rows.map((row) => [
+        row.id,
+        {
+          serialTracked: row.serialTracked,
+          catchWeightTracked: row.catchWeightTracked,
+          uom: row.uom,
+          uomPrecision: uomPrecision(row.uom),
+        },
+      ]),
+    );
+  }
+
+  /**
+   * Story 13-1 — serial identities of ONE SKU, resolved in either direction
+   * inside the CALLER's transaction: by serial number (what people and
+   * scanners speak) or by catalog id (the ledger's `serial_ref`). `findSerial`
+   * reads one id in its own transaction, which neither direction can use.
+   * Only matches come back — an unknown number or id is absent, and the
+   * caller decides what that means. Sorted by serial number (a stable order
+   * for the read surfaces).
+   */
+  async serialIdentitiesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuId: string,
+    by: { readonly numbers: readonly string[] } | { readonly ids: readonly string[] },
+  ): Promise<readonly SerialIdentity[]> {
+    const values = 'numbers' in by ? by.numbers : by.ids;
+    if (values.length === 0) {
+      return [];
+    }
+    const distinct = [...new Set(values)];
+    return tx
+      .select({ id: serials.id, serialNumber: serials.serialNumber, status: serials.status })
+      .from(serials)
+      .where(
+        and(
+          eq(serials.tenantId, tenantId),
+          eq(serials.skuId, skuId),
+          'numbers' in by ? inArray(serials.serialNumber, distinct) : inArray(serials.id, distinct),
+        ),
+      )
+      .orderBy(serials.serialNumber);
   }
 
   /**

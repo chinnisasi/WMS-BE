@@ -956,9 +956,12 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // (the plain tenant policy: owner-only, never read by the portal); 0071
       // (story 9-3c) added three more — ledger_integrity_state,
       // ledger_chain_breaks and ledger_anchor_worm_copies (the plain tenant
-      // policy: inventory-owned, owner-read, never read by the portal). None
-      // lost.
-      expect(policies).toHaveLength(107);
+      // policy: inventory-owned, owner-read, never read by the portal); 0072
+      // (story 13-1) added two more — return_authorizations (the
+      // advance_shipment_notices shape, both arms bound to the client) and
+      // return_authorization_lines (both arms inherit through the parent).
+      // None lost.
+      expect(policies).toHaveLength(109);
       for (const name of [
         'push_deliveries_tenant_isolation',
         'audit_exports_tenant_isolation',
@@ -974,6 +977,12 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       const asnPolicy = policies.find((row) => row.policyname === 'advance_shipment_notices_tenant_isolation')!;
       expect(asnPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(asnPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      const rmaPolicy = policies.find((row) => row.policyname === 'return_authorizations_tenant_isolation')!;
+      expect(rmaPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      expect(rmaPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      const rmaLinePolicy = policies.find((row) => row.policyname === 'return_authorization_lines_tenant_isolation')!;
+      expect(rmaLinePolicy.qual).toContain('return_authorizations');
+      expect(rmaLinePolicy.with_check).toContain('return_authorizations');
       const asnLinePolicy = policies.find((row) => row.policyname === 'asn_lines_tenant_isolation')!;
       expect(asnLinePolicy.qual).toContain('advance_shipment_notices');
       expect(asnLinePolicy.with_check).toContain('advance_shipment_notices');

@@ -1822,6 +1822,105 @@ describe('architecture: advance shipment notices are inbound-module-owned (story
   });
 });
 
+describe('architecture: return authorizations are returns-module-owned (story 13-1)', () => {
+  /**
+   * Story 13-1 stands up the returns module (Epic 13). `return_authorizations`
+   * and `return_authorization_lines` are written ONLY under
+   * `src/modules/returns`, and the module READS no sibling's table: it imports
+   * from the schema only its own two tables, `idempotencyKeys` and
+   * `auditEvents` (the keyed-command tail), and no raw `sql` names an order,
+   * pick, ledger, serial, SKU or handling-unit table — the order facts, the
+   * ledger and the catalog come through `OutboundFacade`, `InventoryFacade`
+   * and `CatalogFacade` only. Siblings reach it only through its facade
+   * (only the api shell and the root composition import it).
+   */
+  const returnsRoot = join(SRC_ROOT, 'modules', 'returns');
+  const returnsFiles = files.filter((file) => file.path.startsWith(returnsRoot));
+  const RETURNS_TABLES = ['returnAuthorizations', 'returnAuthorizationLines'] as const;
+  const RAW_RETURNS_WRITE = /\b(insert into|update|delete from)\s+"?(return_authorizations|return_authorization_lines)\b/i;
+  const OWN_SCHEMA_NAMES = new Set([
+    'returnAuthorizations',
+    'returnAuthorizationLines',
+    'ReturnAuthorizationRow',
+    'ReturnAuthorizationLineRow',
+    'idempotencyKeys',
+    'auditEvents',
+  ]);
+  const SCHEMA_IMPORT = /import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+'[./]*shared\/db\/schema'/g;
+  /** A raw-SQL mention of a sibling table the module may only reach through a facade. */
+  const FOREIGN_RAW_TABLE = /\b(orders|order_lines|picks|ledger_events|serials|skus|handling_units)\b/;
+  /** The bodies of every `sql\`…\`` template in a source (the raw SQL the module runs). */
+  function sqlTemplates(source: string): string[] {
+    return [...source.matchAll(/\bsql(?:<[^>]*>)?`([^`]*)`/g)].map((match) => match[1]!);
+  }
+  function schemaNames(source: string): string[] {
+    return [...source.matchAll(SCHEMA_IMPORT)].flatMap((match) =>
+      match[1]!
+        .split(',')
+        .map((name) => name.replace(/^\s*type\s+/, '').trim())
+        .filter((name) => name.length > 0),
+    );
+  }
+
+  it('the detectors bite (the test is meaningful)', () => {
+    expect(returnsFiles.length).toBeGreaterThanOrEqual(5);
+    // The schema-import reader.
+    expect(schemaNames("import { returnAuthorizations, orders } from '../../shared/db/schema';")).toEqual(['returnAuthorizations', 'orders']);
+    expect(schemaNames("import type { ReturnAuthorizationRow } from '../../shared/db/schema';")).toEqual(['ReturnAuthorizationRow']);
+    // The raw-SQL reader and the foreign-table detector.
+    const raw = sqlTemplates('await tx.execute(sql`select sum(qty) from picks where order_line_id = ${id}`);');
+    expect(raw).toHaveLength(1);
+    expect(FOREIGN_RAW_TABLE.test(raw[0]!)).toBe(true);
+    expect(sqlTemplates('sql<number>`select 1 from ledger_events`').some((text) => FOREIGN_RAW_TABLE.test(text))).toBe(true);
+    expect(FOREIGN_RAW_TABLE.test('select pg_advisory_xact_lock(hashtextextended(${key}, 0))')).toBe(false);
+    // The write detectors, against the module's own command.
+    const command = readFileSync(join(returnsRoot, 'return-authorization.command.ts'), 'utf8');
+    expect(drizzleWriteOn('returnAuthorizations').test(command)).toBe(true);
+    expect(drizzleWriteOn('returnAuthorizationLines').test(command)).toBe(true);
+    expect(RAW_RETURNS_WRITE.test('sql`update return_authorizations set status = 1`')).toBe(true);
+    // Meaningful: the module really does run raw SQL the scan reads.
+    expect(sqlTemplates(command).length).toBeGreaterThan(0);
+  });
+
+  it('no return-authorization write happens outside the returns module', () => {
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => !f.path.startsWith(returnsRoot))) {
+      for (const pattern of [...RETURNS_TABLES.map((table) => drizzleWriteOn(table)), RAW_RETURNS_WRITE]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('the returns module reads no sibling table: only its own tables, idempotencyKeys and auditEvents from the schema; no raw SQL names an order, pick, ledger, serial, SKU or handling-unit table', () => {
+    const offenders: string[] = [];
+    for (const file of returnsFiles) {
+      for (const name of schemaNames(file.source)) {
+        if (!OWN_SCHEMA_NAMES.has(name)) offenders.push(`${file.path}: imports ${name}`);
+      }
+      for (const text of sqlTemplates(file.source)) {
+        if (FOREIGN_RAW_TABLE.test(text)) offenders.push(`${file.path}: raw SQL names a sibling table: ${text.trim().slice(0, 80)}`);
+      }
+      if (/sql\.raw\(/.test(file.source)) offenders.push(`${file.path}: sql.raw`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no other module reaches into the returns module (only the api shell and the root import it, through the facade/module)', () => {
+    const importsReturns = /(?:modules\/returns|\.\.\/returns)\//;
+    const reaching = /(?:modules\/returns|\.\.\/returns)\/(?!returns\.(?:facade|module|dto)['"])/;
+    expect(reaching.test("from '../modules/returns/return-authorization.command'")).toBe(true);
+    expect(reaching.test("from '../modules/returns/returns.facade'")).toBe(false);
+    const importers = files.filter((file) => !file.path.startsWith(returnsRoot) && importsReturns.test(file.source));
+    expect(importers.some((file) => file.path === join(SRC_ROOT, 'api', 'returns.controller.ts'))).toBe(true);
+    const allowed = (path: string): boolean => path.startsWith(join(SRC_ROOT, 'api')) || path === join(SRC_ROOT, 'app.module.ts');
+    expect(importers.filter((file) => !allowed(file.path)).map((file) => file.path)).toEqual([]);
+    expect(importers.filter((file) => reaching.test(file.source)).map((file) => file.path)).toEqual([]);
+    const moduleSource = readFileSync(join(returnsRoot, 'returns.module.ts'), 'utf8');
+    expect(moduleSource).toMatch(/exports:\s*\[ReturnsFacade\]/);
+  });
+});
+
 describe('architecture: the client portal (story 21-7)', () => {
   /**
    * `users.client_id` is written ONLY by the invite insert and never
