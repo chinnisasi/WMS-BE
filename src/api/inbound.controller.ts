@@ -1,5 +1,11 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, Query, Res, UploadedFile, UseFilters, UseGuards, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+// Pulls in @types/multer's `Express.Multer.File` namespace augmentation.
+import type {} from 'multer';
+import type { Response } from 'express';
+import { ApiBearerAuth, ApiBody, ApiConsumes, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { MAX_SHEET_UPLOAD_BYTES } from '../shared/import/sheet-reader';
+import { SheetUploadFilter } from '../shared/import/upload-filter';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
@@ -19,8 +25,10 @@ import {
   AsnListQuery,
   AsnListResponse,
   AsnNoteDto,
+  AsnImportResponseDto,
   AsnResponse,
   CreateAsnDto,
+  ImportAsnsDto,
   ClosePurchaseOrderDto,
   CreatePurchaseOrderDto,
   CreateVendorDto,
@@ -360,7 +368,7 @@ export class InboundController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse(ASN_WRITE_403) })
   @ApiResponse({ status: 404, ...problemJsonResponse("The warehouse, the client, or a line's SKU does not exist in this tenant (not-found)") })
-  @ApiResponse({ status: 409, ...problemJsonResponse("The lines span clients (mixed-client), their client is not clientId (sku-client-mismatch), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse("The lines span clients (mixed-client), their client is not clientId (sku-client-mismatch), a line names a kit SKU, which can never be received (kit-cannot-hold-stock, naming it), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)") })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async createAsn(
@@ -386,6 +394,97 @@ export class InboundController {
       key,
     );
     return { asn: toAsnDto(snapshot.asn) };
+  }
+
+  /**
+   * The ASN import (2026-10-17): many ASNs from one CSV/XLSX file, one row
+   * per ASN line. `dryRun=true` is Check file (200, nothing written, no key);
+   * otherwise Import (201, one Idempotency-Key per import). The literal
+   * `asn-imports` segment shares no prefix with `asns/:asnId`.
+   */
+  @Post(':tenantId/inbound/asn-imports')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @UseFilters(SheetUploadFilter)
+  @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_SHEET_UPLOAD_BYTES } }))
+  @ApiBearerAuth()
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({
+    summary:
+      'Imports advance shipment notices from a CSV/XLSX file (asn.manage) — one row per ASN line (asn_code, client, warehouse, expected_at, sku, quantity), grouped by client + asn_code. dryRun=true checks the file and writes nothing; otherwise every valid ASN is created exactly as the announce form would, and an ASN with any bad row is refused whole (≤ 5,000 rows, ≤ 500 ASNs, ≤ 5 MB)',
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        file: {
+          type: 'string',
+          format: 'binary',
+          description: 'CSV or XLSX — header row required (asn_code, sku, quantity; optional client, warehouse, expected_at; other columns ignored)',
+        },
+        warehouseId: { type: 'string', format: 'uuid', description: 'The warehouse every ASN is announced into' },
+        dryRun: { type: 'string', enum: ['true', 'false'], description: '`true`: Check file — nothing written, no Idempotency-Key needed' },
+      },
+      required: ['file', 'warehouseId'],
+    },
+  })
+  @ApiHeaders([
+    {
+      name: 'Idempotency-Key',
+      required: false,
+      description: 'Client-generated ULID key — required for an import, ignored on a dry run; a replay returns the original response',
+      schema: { type: 'string', minLength: 26, maxLength: 26, pattern: '^[0-9A-HJKMNP-TV-Z]{26}$' },
+    },
+  ])
+  @ApiResponse({ status: HttpStatus.CREATED, type: AsnImportResponseDto, description: 'Import: the created ASNs and every refused row (a 201 can carry refusals) — the idempotency snapshot' })
+  @ApiResponse({ status: HttpStatus.OK, type: AsnImportResponseDto, description: 'Check file (dryRun=true): what would be created and every refused row — nothing written' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key on an import, no file, a malformed warehouseId or dryRun (validation-failed), a file that cannot be read (file-unreadable), or a header without asn_code, sku or quantity (missing-columns, naming each)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(ASN_WRITE_403) })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent import with the same Idempotency-Key (conflict) — retry to read the settled result') })
+  @ApiResponse({ status: 415, ...problemJsonResponse('Not a .csv/.xlsx file (unsupported-file-type)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('More than 5 MB, 5,000 data rows or 500 ASNs (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async importAsns(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Body() dto: ImportAsnsDto,
+    // Check file answers 200 (nothing created), an import 201.
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<AsnImportResponseDto> {
+    assertOwnTenant(session, tenantId);
+    const dryRun = dto.dryRun === true;
+    // A dry run takes no key: it writes nothing and replays nothing.
+    const key = dryRun ? null : parseRequiredIdempotencyKey(idempotencyKey);
+    if (!file) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Import file is required',
+        'Attach a .csv or .xlsx file in the "file" multipart field.',
+      );
+    }
+    const response = await this.inbound.importAsns(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        dryRun,
+        file: { name: file.originalname, mimetype: file.mimetype, buffer: file.buffer, size: file.size },
+      },
+      key,
+    );
+    if (dryRun) {
+      res.status(HttpStatus.OK);
+    }
+    return {
+      ...response,
+      asns: response.asns.map((asn) => ({ ...asn })),
+      errors: response.errors.map((error) => ({ ...error })),
+    };
   }
 
   @Get(':tenantId/warehouses/:warehouseId/inbound/asns')
@@ -464,7 +563,7 @@ export class InboundController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse(ASN_WRITE_403) })
   @ApiResponse({ status: 404, ...problemJsonResponse("The ASN, a referenced line id, or a line's SKU does not exist in this tenant (not-found)") })
-  @ApiResponse({ status: 409, ...problemJsonResponse("The ASN is received, closed or cancelled (asn-not-open), a line that has received stock would be removed, change SKU or announce less than it received (asn-line-received), a SKU of another client (sku-client-mismatch), or a concurrent idempotent request (conflict)") })
+  @ApiResponse({ status: 409, ...problemJsonResponse("The ASN is received, closed or cancelled (asn-not-open), a line that has received stock would be removed, change SKU or announce less than it received (asn-line-received), a SKU of another client (sku-client-mismatch), a line names a kit SKU (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)") })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'asnId', format: 'uuid' })

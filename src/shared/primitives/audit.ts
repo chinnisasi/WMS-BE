@@ -43,6 +43,9 @@ export const SYSTEM_ACTOR_ID = '01900000-0000-7000-8000-000000000000';
  */
 export const AUDIT_TARGET_TYPES = [
   'advance_shipment_notice',
+  // The ASN import (2026-10-17) — one file's run (`asn_import.executed`;
+  // each ASN it created also writes its own `asn.created` row).
+  'asn_import',
   // Story 9-3b — the async audit export (`audit_export.requested`).
   'audit_export',
   'batch_alert',
@@ -140,4 +143,7 @@ export const AUDIT_NEW_ACTIONS = [
   // Story 13-2 — the handheld's return receipt (`ReturnReceiptCommand`); its
   // all-refused arm targets the authorization (pinned in the same suite).
   { action: 'return_receipt.recorded', targetType: 'return_receipt' },
+  // The ASN import (2026-10-17) — one row per import run, beside each created
+  // ASN's own `asn.created` (all under the import's one key).
+  { action: 'asn_import.executed', targetType: 'asn_import' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

@@ -25,6 +25,8 @@ import {
   MAX_ASN_NOTE_CODE_POINTS,
   type AsnStatus,
 } from './asn.command';
+import { ASN_IMPORT_ROW_ERROR_CODES, type AsnImportRowErrorCode } from './asn-import.parse';
+import { BooleanFlag } from '../../shared/primitives/instant-range';
 
 /** Trim at the validation boundary (the tenancy DTO pattern). */
 function Trim() {
@@ -582,4 +584,100 @@ export class AsnListResponse {
 
   @ApiProperty({ type: String, nullable: true, required: false })
   nextCursor?: string | null;
+}
+
+// ── The ASN import (2026-10-17) ─────────────────────────────────────────────
+
+/**
+ * The multipart fields beside `file` on `POST …/inbound/asn-imports`. Shape
+ * checks only (400 above the transaction): the warehouse's existence is the
+ * command's 404.
+ */
+export class ImportAsnsDto {
+  @ApiProperty({ format: 'uuid', description: 'The warehouse every ASN of the file is announced into (the ASN card’s selected warehouse)' })
+  @Transform(({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value))
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({
+    required: false,
+    enum: ['true', 'false'],
+    description: '`true`: Check file — validate and report, write nothing (no Idempotency-Key needed). Omitted or `false`: Import',
+  })
+  @IsOptional()
+  @BooleanFlag()
+  @IsBoolean()
+  dryRun?: boolean;
+}
+
+/** One refused row of an ASN import. */
+export class AsnImportRowErrorDto {
+  @ApiProperty({ example: 7, description: 'The spreadsheet row — the header is row 1' })
+  rowNumber!: number;
+
+  @ApiProperty({ type: String, nullable: true, example: 'GLOW-ASN-9', description: 'The row’s asn_code; null when blank' })
+  asnCode!: string | null;
+
+  @ApiProperty({
+    enum: [...ASN_IMPORT_ROW_ERROR_CODES],
+    description: 'Why the row (and with it its whole ASN) was refused',
+  })
+  code!: AsnImportRowErrorCode;
+
+  @ApiProperty({ example: 'No SKU with code "GLOW-SERUM-X" exists in this tenant.' })
+  detail!: string;
+}
+
+/** One ASN an import created — or, on a dry run, would create. */
+export class AsnImportAsnDto {
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'The created ASN; null on a dry run' })
+  asnId!: string | null;
+
+  @ApiProperty({ example: 'GLOW-ASN-7' })
+  asnCode!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  clientId!: string;
+
+  @ApiProperty({ example: 'GLOWCO', description: 'The client as people read it (the tenant’s own: "<name> (your company)")' })
+  clientLabel!: string;
+
+  @ApiProperty({ example: 4 })
+  lineCount!: number;
+
+  @ApiProperty({ example: 2, description: 'The spreadsheet row of the ASN’s first line' })
+  firstRow!: number;
+}
+
+/** `POST …/inbound/asn-imports` — the result (and, for an import, the idempotency snapshot). */
+export class AsnImportResponseDto {
+  @ApiProperty({ type: String, format: 'uuid', nullable: true, description: 'The import (its audit row’s target); null on a dry run' })
+  importId!: string | null;
+
+  @ApiProperty()
+  dryRun!: boolean;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ description: 'SHA-256 of the uploaded file (hex) — with the warehouse, the import’s idempotency fingerprint' })
+  fileSha256!: string;
+
+  @ApiProperty({ description: 'Data rows read (blank rows not counted)' })
+  rowCount!: number;
+
+  @ApiProperty({ description: 'ASNs the file describes' })
+  asnCount!: number;
+
+  @ApiProperty({ description: 'ASNs created — on a dry run, ready to create' })
+  acceptedCount!: number;
+
+  @ApiProperty({ description: 'ASNs refused whole (an ASN with any bad row)' })
+  refusedCount!: number;
+
+  @ApiProperty({ type: [AsnImportAsnDto] })
+  asns!: AsnImportAsnDto[];
+
+  @ApiProperty({ type: [AsnImportRowErrorDto], description: 'Every refused row, in sheet order' })
+  errors!: AsnImportRowErrorDto[];
 }

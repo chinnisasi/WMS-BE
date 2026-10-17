@@ -6786,7 +6786,7 @@
             }
           },
           "409": {
-            "description": "The lines span clients (mixed-client), their client is not clientId (sku-client-mismatch), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)",
+            "description": "The lines span clients (mixed-client), their client is not clientId (sku-client-mismatch), a line names a kit SKU, which can never be received (kit-cannot-hold-stock, naming it), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6812,6 +6812,170 @@
           }
         ],
         "summary": "Announces an inbound shipment — an advance shipment notice (asn.manage): one client's SKUs, one warehouse, code unique per client; receiving books against it exactly as against a PO",
+        "tags": [
+          "inbound"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/inbound/asn-imports": {
+      "post": {
+        "operationId": "InboundController_importAsns",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key — required for an import, ignored on a dry run; a replay returns the original response",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "CSV or XLSX — header row required (asn_code, sku, quantity; optional client, warehouse, expected_at; other columns ignored)"
+                  },
+                  "warehouseId": {
+                    "type": "string",
+                    "format": "uuid",
+                    "description": "The warehouse every ASN is announced into"
+                  },
+                  "dryRun": {
+                    "type": "string",
+                    "enum": [
+                      "true",
+                      "false"
+                    ],
+                    "description": "`true`: Check file — nothing written, no Idempotency-Key needed"
+                  }
+                },
+                "required": [
+                  "file",
+                  "warehouseId"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Check file (dryRun=true): what would be created and every refused row — nothing written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsnImportResponseDto"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Import: the created ASNs and every refused row (a 201 can carry refusals) — the idempotency snapshot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AsnImportResponseDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key on an import, no file, a malformed warehouseId or dryRun (validation-failed), a file that cannot be read (file-unreadable), or a header without asn_code, sku or quantity (missing-columns, naming each)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks asn.manage (role-denied), or a client-portal session (role-denied — 21-7 opens the portal)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent import with the same Idempotency-Key (conflict) — retry to read the settled result",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Not a .csv/.xlsx file (unsupported-file-type)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "More than 5 MB, 5,000 data rows or 500 ASNs (import-too-large), or the Idempotency-Key reused with a different file or warehouse (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Imports advance shipment notices from a CSV/XLSX file (asn.manage) — one row per ASN line (asn_code, client, warehouse, expected_at, sku, quantity), grouped by client + asn_code. dryRun=true checks the file and writes nothing; otherwise every valid ASN is created exactly as the announce form would, and an ASN with any bad row is refused whole (≤ 5,000 rows, ≤ 500 ASNs, ≤ 5 MB)",
         "tags": [
           "inbound"
         ]
@@ -7133,7 +7297,7 @@
             }
           },
           "409": {
-            "description": "The ASN is received, closed or cancelled (asn-not-open), a line that has received stock would be removed, change SKU or announce less than it received (asn-line-received), a SKU of another client (sku-client-mismatch), or a concurrent idempotent request (conflict)",
+            "description": "The ASN is received, closed or cancelled (asn-not-open), a line that has received stock would be removed, change SKU or announce less than it received (asn-line-received), a SKU of another client (sku-client-mismatch), a line names a kit SKU (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -18527,6 +18691,7 @@
               "type": "string",
               "enum": [
                 "advance_shipment_notice",
+                "asn_import",
                 "audit_export",
                 "batch_alert",
                 "bin",
@@ -28986,6 +29151,158 @@
           "asn"
         ]
       },
+      "AsnImportAsnDto": {
+        "type": "object",
+        "properties": {
+          "asnId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The created ASN; null on a dry run"
+          },
+          "asnCode": {
+            "type": "string",
+            "example": "GLOW-ASN-7"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientLabel": {
+            "type": "string",
+            "example": "GLOWCO",
+            "description": "The client as people read it (the tenant’s own: \"<name> (your company)\")"
+          },
+          "lineCount": {
+            "type": "number",
+            "example": 4
+          },
+          "firstRow": {
+            "type": "number",
+            "example": 2,
+            "description": "The spreadsheet row of the ASN’s first line"
+          }
+        },
+        "required": [
+          "asnId",
+          "asnCode",
+          "clientId",
+          "clientLabel",
+          "lineCount",
+          "firstRow"
+        ]
+      },
+      "AsnImportRowErrorDto": {
+        "type": "object",
+        "properties": {
+          "rowNumber": {
+            "type": "number",
+            "example": 7,
+            "description": "The spreadsheet row — the header is row 1"
+          },
+          "asnCode": {
+            "type": "string",
+            "nullable": true,
+            "example": "GLOW-ASN-9",
+            "description": "The row’s asn_code; null when blank"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "unknown-client",
+              "unknown-warehouse",
+              "wrong-warehouse",
+              "unknown-sku",
+              "sku-client-mismatch",
+              "mixed-client",
+              "kit-cannot-hold-stock",
+              "duplicate-asn-code",
+              "invalid-asn-code",
+              "too-many-lines",
+              "asn-rows-disagree",
+              "duplicate-sku-in-asn",
+              "invalid-quantity",
+              "quantity-precision",
+              "invalid-expected-at",
+              "missing-value"
+            ],
+            "description": "Why the row (and with it its whole ASN) was refused"
+          },
+          "detail": {
+            "type": "string",
+            "example": "No SKU with code \"GLOW-SERUM-X\" exists in this tenant."
+          }
+        },
+        "required": [
+          "rowNumber",
+          "asnCode",
+          "code",
+          "detail"
+        ]
+      },
+      "AsnImportResponseDto": {
+        "type": "object",
+        "properties": {
+          "importId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "The import (its audit row’s target); null on a dry run"
+          },
+          "dryRun": {
+            "type": "boolean"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "fileSha256": {
+            "type": "string",
+            "description": "SHA-256 of the uploaded file (hex) — with the warehouse, the import’s idempotency fingerprint"
+          },
+          "rowCount": {
+            "type": "number",
+            "description": "Data rows read (blank rows not counted)"
+          },
+          "asnCount": {
+            "type": "number",
+            "description": "ASNs the file describes"
+          },
+          "acceptedCount": {
+            "type": "number",
+            "description": "ASNs created — on a dry run, ready to create"
+          },
+          "refusedCount": {
+            "type": "number",
+            "description": "ASNs refused whole (an ASN with any bad row)"
+          },
+          "asns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AsnImportAsnDto"
+            }
+          },
+          "errors": {
+            "description": "Every refused row, in sheet order",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AsnImportRowErrorDto"
+            }
+          }
+        },
+        "required": [
+          "importId",
+          "dryRun",
+          "warehouseId",
+          "fileSha256",
+          "rowCount",
+          "asnCount",
+          "acceptedCount",
+          "refusedCount",
+          "asns",
+          "errors"
+        ]
+      },
       "AsnEntryDto": {
         "type": "object",
         "properties": {
@@ -37820,6 +38137,7 @@
             "type": "string",
             "enum": [
               "advance_shipment_notice",
+              "asn_import",
               "audit_export",
               "batch_alert",
               "bin",
@@ -37906,6 +38224,7 @@
             "type": "string",
             "enum": [
               "advance_shipment_notice",
+              "asn_import",
               "audit_export",
               "batch_alert",
               "bin",

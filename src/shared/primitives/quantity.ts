@@ -315,7 +315,12 @@ export type RecordableQuantityCheck =
       readonly detail: string;
     };
 
-export type QuantitySign = 'signed' | 'non-negative';
+/**
+ * `positive` (the ASN import, 2026-10-17): an announced quantity — the
+ * import edge of a field whose HTTP twin is `@Min(0.001)` — must be above
+ * zero; zero and below take the sign arm.
+ */
+export type QuantitySign = 'signed' | 'non-negative' | 'positive';
 
 const RECORDABLE_QUANTITY_ARM_TITLES: Record<
   'ceiling' | 'sign' | 'precision' | 'vanish',
@@ -346,6 +351,13 @@ export function validateRecordableQuantity(
       ok: false,
       arm: 'sign',
       detail: `${field} must be a non-negative quantity (got ${String(value)}).`,
+    };
+  }
+  if (sign === 'positive' && value <= 0) {
+    return {
+      ok: false,
+      arm: 'sign',
+      detail: `${field} must be a positive quantity (got ${String(value)}).`,
     };
   }
   if (!isAtPrecision(value, precision)) {

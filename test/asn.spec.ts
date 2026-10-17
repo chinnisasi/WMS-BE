@@ -506,6 +506,24 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
       expect(dup.body.code).toBe('duplicate-asn-code');
     });
 
+    it('a kit line is refused 409 kit-cannot-hold-stock on create AND amend (the ASN import story closed the PENDING gap) — after the client checks', async () => {
+      await importCsv(['ACME-KIT,Acme Kit,pcs,1800,,,ACME-1:1'], acme);
+      const skus = await http().get(`${API}/${tenantId}/catalog/skus?limit=200`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+      const kit = (skus.body.items as { code: string; id: string }[]).find((s) => s.code === 'ACME-KIT')!.id;
+
+      const created = await createAsn({ clientId: acme, warehouseId: wh1, asnCode: 'KIT-1', lines: [{ skuId: acme1, announcedQty: 1 }, { skuId: kit, announcedQty: 2 }] }).expect(409);
+      expect(created.body.code).toBe('kit-cannot-hold-stock');
+      expect(created.body.detail).toContain('"ACME-KIT"');
+      // The client rule runs first: a kit of the right client on another client's ASN is a mismatch.
+      expect((await createAsn({ clientId: beta, warehouseId: wh1, asnCode: 'KIT-2', lines: [{ skuId: kit, announcedQty: 1 }] }).expect(409)).body.code).toBe('sku-client-mismatch');
+
+      const asn = await newAsn([{ skuId: acme1, announcedQty: 3 }]);
+      const amended = await amendAsn(asn.id, { lines: [{ id: asn.lines[0]!.id, skuId: acme1, announcedQty: 3 }, { skuId: kit, announcedQty: 1 }] }).expect(409);
+      expect(amended.body.code).toBe('kit-cannot-hold-stock');
+      expect(amended.body.detail).toContain('"ACME-KIT"');
+      expect((await getAsn(asn.id).expect(200)).body.asn.lines).toHaveLength(1);
+    });
+
     it('asn.manage gates every write; a client-portal session is refused on reads AND writes (403)', async () => {
       const asn = await newAsn([{ skuId: acme1, announcedQty: 1 }]);
       expect((await createAsn({ clientId: acme, warehouseId: wh1, asnCode: 'OP', lines: [{ skuId: acme1, announcedQty: 1 }] }, operatorMemberToken).expect(403)).body.code).toBe('role-denied');

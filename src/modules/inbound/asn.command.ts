@@ -247,7 +247,8 @@ export function skuClientMismatch(subject: string, documentClient: string, skuCl
   );
 }
 
-function duplicateAsnCode(code: string, clientLabel: string): ProblemException {
+/** 409 `duplicate-asn-code` — exported: the ASN import refuses a used code with the same words. */
+export function duplicateAsnCode(code: string, clientLabel: string): ProblemException {
   return new ProblemException(
     'duplicate-asn-code',
     409,
@@ -424,20 +425,224 @@ export function normalizedAsnNote(note: string): string {
   return trimmed;
 }
 
-/** The code, counted in CODE POINTS — the unit of 0064's `char_length` CHECK (400 otherwise). */
-function assertAsnCodeShape(asnCode: string): void {
+/**
+ * The code, counted in CODE POINTS — the unit of 0064's `char_length` CHECK
+ * (400 otherwise). Exported: the ASN import runs the same check per group.
+ */
+export function assertAsnCodeShape(asnCode: string): void {
   const codePoints = [...asnCode].length;
   if (codePoints === 0 || codePoints > MAX_ASN_CODE_LENGTH) {
     throw asnValidation(`asnCode must be 1–${MAX_ASN_CODE_LENGTH} characters (got ${codePoints}).`);
   }
 }
 
-function assertLineShape(lines: readonly AsnLineInput[]): void {
+/** 1–200 lines (400 otherwise). Exported: the ASN import runs the same check per group. */
+export function assertLineShape(lines: readonly unknown[]): void {
   if (lines.length === 0) {
     throw asnValidation('An advance shipment notice needs at least one line.');
   }
   if (lines.length > MAX_ASN_LINES) {
     throw asnValidation(`An advance shipment notice carries at most ${MAX_ASN_LINES} lines (got ${lines.length}).`);
+  }
+}
+
+/** `asn.manage` (fresh DB role read), then the portal refusal — both before replay. */
+export async function assertAsnAuthorityInTx(tx: TenantTx, tenantId: string, actorUserId: string): Promise<void> {
+  assertPermission(await getMemberRoleIn(tx, tenantId, actorUserId), 'asn.manage');
+  if ((await getMemberClientIdIn(tx, tenantId, actorUserId)) !== null) {
+    throw asnPortalRefused();
+  }
+}
+
+/**
+ * The operator create's client rule over the lines' SKUs: one client
+ * (`assertSingleClientInTx`, 409 `mixed-client`), and it must be the ASN's
+ * (409 `sku-client-mismatch`). Exported: the ASN import runs it per group.
+ */
+export async function assertAsnClientInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientId: string,
+  asnCode: string,
+  skuClientIds: readonly string[],
+): Promise<void> {
+  const derived = await assertSingleClientInTx(tx, tenantId, skuClientIds, `Advance shipment notice "${asnCode}"`);
+  if (derived !== clientId) {
+    const labels = await getClientLabelsInTx(tx, tenantId, [clientId, derived]);
+    throw skuClientMismatch(`Advance shipment notice "${asnCode}"`, labels.get(clientId) ?? clientId, [labels.get(derived) ?? derived]);
+  }
+}
+
+/**
+ * FR-38 — a kit never holds stock, and receiving refuses a kit line, so an
+ * ASN line naming a kit could never be received: 409 `kit-cannot-hold-stock`
+ * naming the codes. Runs after the client checks and before the scale, on
+ * every write that sets lines — create, amend, the portal announce and (per
+ * group) the ASN import.
+ */
+export async function assertNoKitLinesInTx(
+  catalog: CatalogFacade,
+  tx: TenantTx,
+  tenantId: string,
+  skuIds: readonly string[],
+  codeOf: (skuId: string) => string,
+): Promise<void> {
+  const kitSkuIds = await catalog.getKitSkuIdsInTx(tx, tenantId, skuIds);
+  if (kitSkuIds.length > 0) {
+    throw kitCannotHoldStock('Advance shipment notice line', [...new Set(kitSkuIds)].map(codeOf));
+  }
+}
+
+/** Base → milli with the precision refusal, behind the replay lookup (story 10.2). */
+export function scaleAsnLines<T extends AsnLineInput>(lines: readonly T[], skuFacts: ReadonlyMap<string, { uom: string }>): T[] {
+  return lines.map((line) => {
+    const uom = skuFacts.get(line.skuId)!.uom;
+    return {
+      ...line,
+      announcedQty: assertRecordableQuantity(line.announcedQty, 'announcedQty', uom, uomPrecision(uom)),
+    };
+  });
+}
+
+/** One ASN to insert — lines already in MILLI-units. */
+export interface AsnInsert {
+  readonly tenantId: string;
+  readonly clientId: string;
+  readonly clientCode: string;
+  readonly warehouseId: string;
+  readonly asnCode: string;
+  readonly expectedAt: string | null;
+  readonly lines: readonly AsnLineInput[];
+}
+
+/**
+ * The one insert path (create, announce and the ASN import): the header — a
+ * duplicate code for the client is 409 `duplicate-asn-code` (the unique index
+ * is the arbiter) — then its lines (milli-units, nothing received). The
+ * violation aborts the transaction (or, under the import, that ASN's
+ * savepoint), so the refusal's label is read BEFORE the insert.
+ */
+export async function insertAsnInTx(tx: TenantTx, asn: AsnInsert): Promise<string> {
+  const clientLabels = await getClientLabelsInTx(tx, asn.tenantId, [asn.clientId]);
+  const asnId = uuidv7();
+  try {
+    await tx.insert(advanceShipmentNotices).values({
+      id: asnId,
+      tenantId: asn.tenantId,
+      clientId: asn.clientId,
+      warehouseId: asn.warehouseId,
+      asnCode: asn.asnCode,
+      status: 'announced',
+      expectedAt: asn.expectedAt,
+      statusNote: null,
+    });
+  } catch (err) {
+    if (isUniqueViolationOn(err, ASN_TENANT_CLIENT_CODE)) {
+      throw duplicateAsnCode(asn.asnCode, clientLabels.get(asn.clientId) ?? asn.clientCode);
+    }
+    throw err;
+  }
+  await tx.insert(asnLines).values(
+    asn.lines.map((line) => ({
+      id: uuidv7(),
+      tenantId: asn.tenantId,
+      asnId,
+      skuId: line.skuId,
+      announcedQty: line.announcedQty,
+      receivedQty: 0,
+    })),
+  );
+  return asnId;
+}
+
+export type AsnEvent = 'asn.created' | 'asn.amended' | 'asn.closed' | 'asn.cancelled';
+
+/**
+ * The skeleton's outbox and audit steps for one ASN (the ASN import story
+ * split them out of `finish`, whose key write moved to the callers — the
+ * import writes ONE key for many ASNs): the read-back, the outbox event
+ * (payload ALWAYS the operator `{asn}`, whoever raised it) and the audit row
+ * (`target_type 'advance_shipment_notice'`, `reference` = the bare key).
+ * Returns the read-back.
+ */
+export async function emitAsnEvent(
+  tx: TenantTx,
+  outbox: OutboxSink,
+  event: { readonly tenantId: string; readonly actorUserId: string; readonly asnId: string; readonly type: AsnEvent; readonly reference: string },
+): Promise<AsnDetail> {
+  const asn = (await readAsnInTx(tx, event.tenantId, event.asnId))!;
+  const at = nowIso();
+  await outbox.append(tx, {
+    messageId: uuidv7(),
+    tenantId: event.tenantId,
+    type: event.type,
+    occurredAt: at,
+    payload: { asn },
+  });
+  await tx.insert(auditEvents).values({
+    id: uuidv7(),
+    tenantId: event.tenantId,
+    actorUserId: event.actorUserId,
+    action: event.type,
+    targetType: 'advance_shipment_notice',
+    targetId: event.asnId,
+    reference: event.reference,
+    occurredAt: at,
+  });
+  return asn;
+}
+
+/**
+ * The replay lookup: null when the key is unused, the stored snapshot when
+ * it committed with this fingerprint, 422 `idempotency-key-reuse` otherwise.
+ */
+export async function replayAsnKeyInTx(
+  tx: TenantTx,
+  tenantId: string,
+  idempotencyKey: string,
+  payloadHash: string,
+): Promise<unknown | null> {
+  const rows = await tx
+    .select()
+    .from(idempotencyKeys)
+    .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+    .limit(1);
+  const row = rows[0];
+  if (row === undefined) {
+    return null;
+  }
+  if (row.payloadHash !== payloadHash) {
+    throw idempotencyKeyReuse();
+  }
+  return row.responseSnapshot;
+}
+
+/** The key, LAST — a concurrent insert of the same key is 409 `conflict`. */
+export async function writeAsnKeyInTx(
+  tx: TenantTx,
+  tenantId: string,
+  idempotencyKey: string,
+  payloadHash: string,
+  snapshot: unknown,
+): Promise<void> {
+  try {
+    await tx.insert(idempotencyKeys).values({
+      id: uuidv7(),
+      tenantId,
+      key: idempotencyKey,
+      payloadHash,
+      responseSnapshot: snapshot,
+    });
+  } catch (err) {
+    if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Concurrent idempotent request',
+        'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
+      );
+    }
+    throw err;
   }
 }
 
@@ -499,23 +704,26 @@ export class AsnCommand {
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
       const client = await assertClientInTenantInTx(tx, command.tenantId, command.clientId);
       const skuFacts = await this.readSkus(tx, command.tenantId, command.lines.map((line) => line.skuId));
-      const derived = await assertSingleClientInTx(
+      await assertAsnClientInTx(
         tx,
         command.tenantId,
+        command.clientId,
+        asnCode,
         [...skuFacts.values()].map((sku) => sku.clientId),
-        `Advance shipment notice "${asnCode}"`,
       );
-      if (derived !== command.clientId) {
-        const labels = await getClientLabelsInTx(tx, command.tenantId, [command.clientId, derived]);
-        throw skuClientMismatch(
-          `Advance shipment notice "${asnCode}"`,
-          labels.get(command.clientId) ?? command.clientId,
-          [labels.get(derived) ?? derived],
-        );
-      }
-      const lines = this.scaleLines(command.lines, skuFacts);
+      // The ASN import story closed the PENDING kit gap: the operator create
+      // refuses a kit line too (after the client checks, before the scale —
+      // the portal announce's position).
+      await assertNoKitLinesInTx(
+        this.catalog,
+        tx,
+        command.tenantId,
+        command.lines.map((line) => line.skuId),
+        (skuId) => skuFacts.get(skuId)!.code,
+      );
+      const lines = scaleAsnLines(command.lines, skuFacts);
 
-      const asnId = await this.insertAsn(tx, {
+      const asnId = await insertAsnInTx(tx, {
         tenantId: command.tenantId,
         clientId: command.clientId,
         clientCode: client.code,
@@ -621,20 +829,16 @@ export class AsnCommand {
         );
         // FR-38: receiving refuses a kit line, so a kit announced here could
         // never be received (`portal/skus` never lists one either).
-        const kitSkuIds = await this.catalog.getKitSkuIdsInTx(
+        await assertNoKitLinesInTx(
+          this.catalog,
           tx,
           command.tenantId,
           command.lines.map((line) => line.skuId),
+          (skuId) => skuFacts.get(skuId)!.code,
         );
-        if (kitSkuIds.length > 0) {
-          throw kitCannotHoldStock(
-            'Advance shipment notice line',
-            [...new Set(kitSkuIds)].map((skuId) => skuFacts.get(skuId)!.code),
-          );
-        }
-        const lines = this.scaleLines(command.lines, skuFacts);
+        const lines = scaleAsnLines(command.lines, skuFacts);
 
-        const asnId = await this.insertAsn(tx, {
+        const asnId = await insertAsnInTx(tx, {
           tenantId: command.tenantId,
           clientId: command.clientId,
           clientCode: client.code,
@@ -724,7 +928,16 @@ export class AsnCommand {
           foreign.map((clientId) => labels.get(clientId) ?? clientId),
         );
       }
-      const lines = this.scaleLines(command.lines, skuFacts);
+      // The ASN import story: amend refuses a kit line too (after the client
+      // check, before the scale), so an amend cannot add what create refuses.
+      await assertNoKitLinesInTx(
+        this.catalog,
+        tx,
+        command.tenantId,
+        command.lines.map((line) => line.skuId),
+        (skuId) => skuFacts.get(skuId)!.code,
+      );
+      const lines = scaleAsnLines(command.lines, skuFacts);
 
       // A line that has received anything keeps its history: it may not be
       // deleted, change SKU, or announce less than it already received.
@@ -865,53 +1078,30 @@ export class AsnCommand {
 
   // ── shared pieces ─────────────────────────────────────────────────────────
 
-  /** `asn.manage` (fresh DB role read), then the portal refusal — both before replay. */
   private async assertAuthority(tx: TenantTx, tenantId: string, actorUserId: string): Promise<void> {
-    assertPermission(await getMemberRoleIn(tx, tenantId, actorUserId), 'asn.manage');
-    if ((await getMemberClientIdIn(tx, tenantId, actorUserId)) !== null) {
-      throw asnPortalRefused();
-    }
+    await assertAsnAuthorityInTx(tx, tenantId, actorUserId);
   }
 
   /**
-   * Snapshot → outbox → audit → idempotency key (the skeleton's tail). The
-   * outbox payload is ALWAYS the operator `{asn}` (one event shape whoever
-   * raised the ASN); `snapshotOf` builds the surface's own response — the
-   * stored idempotency snapshot — on the same transaction: `{asn}` for the
-   * operator commands (`operatorSnapshot`), the `PortalAsnDetail` for the
-   * portal announce.
+   * The skeleton's tail for one ASN command: `emitAsnEvent` (read-back →
+   * outbox → audit, reference = the key), then the surface's own snapshot
+   * built on the same transaction (`{asn}` for the operator commands via
+   * `operatorSnapshot`, the `PortalAsnDetail` for the portal announce), then
+   * the idempotency key LAST.
    */
   private async finish<S>(
     tx: TenantTx,
     tenantId: string,
     actorUserId: string,
     asnId: string,
-    event: 'asn.created' | 'asn.amended' | 'asn.closed' | 'asn.cancelled',
+    event: AsnEvent,
     idempotencyKey: string,
     payloadHash: string,
     snapshotOf: (tx: TenantTx, asn: AsnDetail) => S | Promise<S>,
   ): Promise<S> {
-    const asn = (await readAsnInTx(tx, tenantId, asnId))!;
+    const asn = await emitAsnEvent(tx, this.outbox, { tenantId, actorUserId, asnId, type: event, reference: idempotencyKey });
     const snapshot = await snapshotOf(tx, asn);
-    const at = nowIso();
-    await this.outbox.append(tx, {
-      messageId: uuidv7(),
-      tenantId,
-      type: event,
-      occurredAt: at,
-      payload: { asn },
-    });
-    await tx.insert(auditEvents).values({
-      id: uuidv7(),
-      tenantId,
-      actorUserId,
-      action: event,
-      targetType: 'advance_shipment_notice',
-      targetId: asnId,
-      reference: idempotencyKey,
-      occurredAt: at,
-    });
-    await this.writeIdempotencyKey(tx, tenantId, idempotencyKey, payloadHash, snapshot);
+    await writeAsnKeyInTx(tx, tenantId, idempotencyKey, payloadHash, snapshot);
     return snapshot;
   }
 
@@ -929,18 +1119,18 @@ export class AsnCommand {
     return asn;
   }
 
-  /** Every line's SKU in the tenant (404 naming the unknown id) — unit and client; NO lock. */
+  /** Every line's SKU in the tenant (404 naming the unknown id) — unit, client and code; NO lock. */
   private async readSkus(
     tx: TenantTx,
     tenantId: string,
     skuIds: readonly string[],
-  ): Promise<Map<string, { uom: string; clientId: string }>> {
+  ): Promise<Map<string, { uom: string; clientId: string; code: string }>> {
     const distinct = [...new Set(skuIds)];
     const rows = await tx
-      .select({ id: skus.id, uom: skus.uom, clientId: skus.clientId })
+      .select({ id: skus.id, uom: skus.uom, clientId: skus.clientId, code: skus.code })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)));
-    const byId = new Map(rows.map((row) => [row.id, { uom: row.uom, clientId: row.clientId }]));
+    const byId = new Map(rows.map((row) => [row.id, { uom: row.uom, clientId: row.clientId, code: row.code }]));
     for (const skuId of distinct) {
       if (!byId.has(skuId)) {
         throw new ProblemException('not-found', 404, 'SKU not found', `No SKU with id "${skuId}" exists in this tenant.`);
@@ -976,117 +1166,12 @@ export class AsnCommand {
     return byId;
   }
 
-  /**
-   * The one insert path (create and announce): the header — a duplicate
-   * code for the client is 409 `duplicate-asn-code` (the unique index is
-   * the arbiter) — then its lines (milli-units, nothing received).
-   */
-  private async insertAsn(
-    tx: TenantTx,
-    asn: {
-      readonly tenantId: string;
-      readonly clientId: string;
-      readonly clientCode: string;
-      readonly warehouseId: string;
-      readonly asnCode: string;
-      readonly expectedAt: string | null;
-      readonly lines: readonly AsnLineInput[];
-    },
-  ): Promise<string> {
-    // Read before the insert: a unique violation aborts the transaction,
-    // so the refusal's label cannot be fetched after it.
-    const clientLabels = await getClientLabelsInTx(tx, asn.tenantId, [asn.clientId]);
-    const asnId = uuidv7();
-    try {
-      await tx.insert(advanceShipmentNotices).values({
-        id: asnId,
-        tenantId: asn.tenantId,
-        clientId: asn.clientId,
-        warehouseId: asn.warehouseId,
-        asnCode: asn.asnCode,
-        status: 'announced',
-        expectedAt: asn.expectedAt,
-        statusNote: null,
-      });
-    } catch (err) {
-      if (isUniqueViolationOn(err, ASN_TENANT_CLIENT_CODE)) {
-        throw duplicateAsnCode(asn.asnCode, clientLabels.get(asn.clientId) ?? asn.clientCode);
-      }
-      throw err;
-    }
-    await tx.insert(asnLines).values(
-      asn.lines.map((line) => ({
-        id: uuidv7(),
-        tenantId: asn.tenantId,
-        asnId,
-        skuId: line.skuId,
-        announcedQty: line.announcedQty,
-        receivedQty: 0,
-      })),
-    );
-    return asnId;
-  }
-
-  /** Base → milli with the precision refusal, behind the replay lookup (story 10.2). */
-  private scaleLines<T extends AsnLineInput>(
-    lines: readonly T[],
-    skuFacts: ReadonlyMap<string, { uom: string }>,
-  ): T[] {
-    return lines.map((line) => {
-      const uom = skuFacts.get(line.skuId)!.uom;
-      return {
-        ...line,
-        announcedQty: assertRecordableQuantity(line.announcedQty, 'announcedQty', uom, uomPrecision(uom)),
-      };
-    });
-  }
-
   private async replay(
     tx: TenantTx,
     tenantId: string,
     idempotencyKey: string,
     payloadHash: string,
   ): Promise<unknown | null> {
-    const rows = await tx
-      .select()
-      .from(idempotencyKeys)
-      .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
-      .limit(1);
-    const row = rows[0];
-    if (row === undefined) {
-      return null;
-    }
-    if (row.payloadHash !== payloadHash) {
-      throw idempotencyKeyReuse();
-    }
-    return row.responseSnapshot;
-  }
-
-  private async writeIdempotencyKey(
-    tx: TenantTx,
-    tenantId: string,
-    idempotencyKey: string,
-    payloadHash: string,
-    snapshot: unknown,
-  ): Promise<void> {
-    try {
-      await tx.insert(idempotencyKeys).values({
-        id: uuidv7(),
-        tenantId,
-        key: idempotencyKey,
-        payloadHash,
-        responseSnapshot: snapshot,
-      });
-    } catch (err) {
-      if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
-        throw new ProblemException(
-          'conflict',
-          409,
-          'Concurrent idempotent request',
-          'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
-        );
-      }
-      throw err;
-    }
+    return replayAsnKeyInTx(tx, tenantId, idempotencyKey, payloadHash);
   }
 }
