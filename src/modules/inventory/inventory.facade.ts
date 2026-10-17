@@ -267,6 +267,10 @@ export interface StockOnHandEntry {
   readonly binId: string;
   readonly quantity: number;
   readonly createdAt: string;
+  /** Inventory-screen — present only under `order: 'location'`. */
+  readonly binCode?: string;
+  /** Inventory-screen — present only under `order: 'location'`. */
+  readonly binSystemOwned?: boolean;
 }
 
 /** Query of the Story 2.5 stock-list read (keyset cursor pagination). */
@@ -275,6 +279,10 @@ export interface StockListQuery {
   readonly binId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
+  /** Inventory-screen — absent: `createdAt DESC, id DESC`; `location`: bin by bin. */
+  readonly order?: 'location' | undefined;
+  /** Inventory-screen — `true`: only `quantity > 0` rows. */
+  readonly nonZero?: boolean | undefined;
 }
 
 /** One ledger event of a serial's movement history (oldest first). */
@@ -331,19 +339,79 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
   try {
     const decoded = decodeCursor(cursor);
     const malformedCursor =
-      !UUID_RE.test(decoded.id) || !CURSOR_INSTANT_RE.test(decoded.createdAt);
+      !UUID_RE.test(decoded.id) ||
+      !CURSOR_INSTANT_RE.test(decoded.createdAt) ||
+      // Inventory-screen: a stock-list `order=location` cursor is tagged `o`;
+      // it is never a `{createdAt, id}` keyset position.
+      Object.prototype.hasOwnProperty.call(decoded, 'o');
     if (malformedCursor) {
       throw new Error('malformed cursor payload');
     }
     return decoded;
   } catch {
-    throw new ProblemException(
-      'invalid-cursor',
-      400,
-      'Malformed pagination cursor',
-      'The cursor parameter is not a valid opaque page cursor.',
-    );
+    throw invalidCursor();
   }
+}
+
+/**
+ * Inventory-screen — the stock list's `order=location` keyset position. A
+ * separate payload from `CursorPayload` (which is `{createdAt, id}`), tagged
+ * `o: 'location'`, so a cursor minted under one order and sent with the other
+ * is refused by both validators — `decodeCursorSafe` needs a `createdAt` and
+ * no `o`; this one needs `o: 'location'` — never silently reinterpreted.
+ */
+interface LocationCursor {
+  readonly o: 'location';
+  /** `bins.system_owned` — storage bins (false) sort before system bins. */
+  readonly sys: boolean;
+  /** `bins.code`, compared under `COLLATE "C"`. */
+  readonly binCode: string;
+  readonly skuId: string;
+  readonly id: string;
+}
+
+/** Generous bound on a cursor's bin code (the value reaches a SQL parameter). */
+const MAX_CURSOR_BIN_CODE_LENGTH = 200;
+
+function encodeLocationCursor(cursor: LocationCursor): string {
+  // Fixed key order — the cursor is opaque, but stable bytes are cheaper to debug.
+  return Buffer.from(
+    JSON.stringify({ o: cursor.o, sys: cursor.sys, binCode: cursor.binCode, skuId: cursor.skuId, id: cursor.id }),
+    'utf8',
+  ).toString('base64url');
+}
+
+function decodeLocationCursorSafe(cursor: string): LocationCursor {
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    if (typeof parsed !== 'object' || parsed === null) throw new Error('not an object');
+    const c = parsed as Record<string, unknown>;
+    if (
+      c.o !== 'location' ||
+      typeof c.sys !== 'boolean' ||
+      typeof c.binCode !== 'string' ||
+      c.binCode.length === 0 ||
+      c.binCode.length > MAX_CURSOR_BIN_CODE_LENGTH ||
+      typeof c.skuId !== 'string' ||
+      !UUID_RE.test(c.skuId) ||
+      typeof c.id !== 'string' ||
+      !UUID_RE.test(c.id)
+    ) {
+      throw new Error('malformed location cursor payload');
+    }
+    return { o: 'location', sys: c.sys, binCode: c.binCode, skuId: c.skuId, id: c.id };
+  } catch {
+    throw invalidCursor();
+  }
+}
+
+function invalidCursor(): ProblemException {
+  return new ProblemException(
+    'invalid-cursor',
+    400,
+    'Malformed pagination cursor',
+    'The cursor parameter is not a valid opaque page cursor.',
+  );
 }
 
 /**
@@ -678,6 +746,9 @@ export class InventoryFacade {
     // straight through; clamping here would silently rewrite a bad
     // request instead of rejecting it.
     const pageSize = query.limit ?? DEFAULT_TIMELINE_PAGE_SIZE;
+    if (query.order === 'location') {
+      return this.listStockByLocation(tenantId, warehouseId, query, pageSize);
+    }
     const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       await assertWarehouseInTenant(tx, tenantId, warehouseId);
@@ -689,6 +760,11 @@ export class InventoryFacade {
           binId: stockOnHand.binId,
           quantity: stockOnHand.quantity,
           createdAt: stockOnHand.createdAt,
+          // Inventory-screen: the cursor carries the raw `::text` instant —
+          // rows folded in one transaction share one `now()` to the
+          // microsecond, and a ms-truncated cursor's strict `<` skipped the
+          // tail of that tie group (the `listEvents` fix, `fullPrecisionInstant`).
+          createdAtText: sql<string>`${stockOnHand.createdAt}::text`,
         })
         .from(stockOnHand)
         .where(
@@ -697,6 +773,8 @@ export class InventoryFacade {
             eq(stockOnHand.warehouseId, warehouseId),
             query.skuId === undefined ? undefined : eq(stockOnHand.skuId, query.skuId),
             query.binId === undefined ? undefined : eq(stockOnHand.binId, query.binId),
+            // `quantity >= 0` is a CHECK (0026), so `> 0` is exactly "non-zero".
+            query.nonZero === true ? sql`${stockOnHand.quantity} > 0` : undefined,
             before === undefined
               ? undefined
               : sql`(${stockOnHand.createdAt}, ${stockOnHand.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -704,13 +782,96 @@ export class InventoryFacade {
         )
         .orderBy(desc(stockOnHand.createdAt), desc(stockOnHand.id))
         .limit(pageSize + 1);
-      const items = rows.map((row) => ({
-        ...row,
-        // Read model — base units at the edge (see `listEvents`).
-        quantity: fromMilli(row.quantity),
-        createdAt: canonicalInstant(row.createdAt),
-      }));
-      return buildPage(items, pageSize);
+      const page = buildPage(
+        rows.map(({ createdAtText, ...row }) => ({
+          createdAt: fullPrecisionInstant(createdAtText),
+          id: row.id,
+          entry: {
+            ...row,
+            // Read model — base units at the edge (see `listEvents`).
+            quantity: fromMilli(row.quantity),
+            createdAt: canonicalInstant(row.createdAt),
+          },
+        })),
+        pageSize,
+      );
+      return { items: page.items.map((wrapped) => wrapped.entry), nextCursor: page.nextCursor };
+    });
+  }
+
+  /**
+   * Inventory-screen — the stock list bin by bin (`order=location`): storage
+   * bins first, then system bins (`bins.system_owned`), each by bin code
+   * under `COLLATE "C"` (lexical: `D-01-10` before `D-01-2`; the database
+   * default `en_US.utf8` treats `-` differently), then SKU id, then row id.
+   * The keyset comparison uses the same collation. The join is scoped to the
+   * warehouse (`bins.warehouse_id`), so a same-code bin elsewhere never joins.
+   * No index serves the sort: each page sorts the warehouse's rows (PENDING).
+   */
+  private async listStockByLocation(
+    tenantId: string,
+    warehouseId: string,
+    query: StockListQuery,
+    pageSize: number,
+  ): Promise<Page<StockOnHandEntry>> {
+    const after = query.cursor === undefined ? undefined : decodeLocationCursorSafe(query.cursor);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      const binCodeC = sql`${bins.code} collate "C"`;
+      const rows = await tx
+        .select({
+          id: stockOnHand.id,
+          warehouseId: stockOnHand.warehouseId,
+          skuId: stockOnHand.skuId,
+          binId: stockOnHand.binId,
+          quantity: stockOnHand.quantity,
+          createdAt: stockOnHand.createdAt,
+          binCode: bins.code,
+          binSystemOwned: bins.systemOwned,
+        })
+        .from(stockOnHand)
+        .innerJoin(
+          bins,
+          and(
+            eq(bins.id, stockOnHand.binId),
+            eq(bins.tenantId, tenantId),
+            eq(bins.warehouseId, warehouseId),
+          ),
+        )
+        .where(
+          and(
+            eq(stockOnHand.tenantId, tenantId),
+            eq(stockOnHand.warehouseId, warehouseId),
+            query.skuId === undefined ? undefined : eq(stockOnHand.skuId, query.skuId),
+            query.binId === undefined ? undefined : eq(stockOnHand.binId, query.binId),
+            query.nonZero === true ? sql`${stockOnHand.quantity} > 0` : undefined,
+            after === undefined
+              ? undefined
+              : sql`(${bins.systemOwned}, ${binCodeC}, ${stockOnHand.skuId}, ${stockOnHand.id}) > (${after.sys}::boolean, ${after.binCode}::text collate "C", ${after.skuId}::uuid, ${after.id}::uuid)`,
+          ),
+        )
+        .orderBy(asc(bins.systemOwned), asc(binCodeC), asc(stockOnHand.skuId), asc(stockOnHand.id))
+        .limit(pageSize + 1);
+      const hasMore = rows.length > pageSize;
+      const pageRows = hasMore ? rows.slice(0, pageSize) : rows;
+      const last = pageRows.at(-1);
+      return {
+        items: pageRows.map((row) => ({
+          ...row,
+          quantity: fromMilli(row.quantity),
+          createdAt: canonicalInstant(row.createdAt),
+        })),
+        nextCursor:
+          hasMore && last !== undefined
+            ? encodeLocationCursor({
+                o: 'location',
+                sys: last.binSystemOwned,
+                binCode: last.binCode,
+                skuId: last.skuId,
+                id: last.id,
+              })
+            : null,
+      };
     });
   }
 

@@ -782,7 +782,7 @@ export class InventoryController {
     description:
       "The warehouse's on-hand page (keyset cursor) — plain stock truth for tracked and untracked SKUs alike, no batch fields",
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed skuId/binId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed skuId/binId query, unknown order, non-boolean nonZero or out-of-range limit (validation-failed); a malformed cursor, or one minted under the other order (invalid-cursor)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
@@ -800,6 +800,8 @@ export class InventoryController {
       binId: query.binId,
       cursor: query.cursor,
       limit: query.limit,
+      order: query.order,
+      nonZero: query.nonZero,
     });
     return { items: page.items, nextCursor: page.nextCursor };
   }

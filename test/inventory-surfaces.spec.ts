@@ -567,4 +567,260 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
       await sql.end();
     }
   });
+  // ── Inventory-screen: `order=location`, `nonZero`, the full-precision cursor ──
+  //
+  // A separate warehouse (W2) so the rows above keep their counts. Bins are
+  // made over HTTP; the one system bin is inserted by hand (system bins are
+  // only ever ensured lazily by the flows that use them), and the stock goes
+  // in through the real adjustment path.
+  describe('stock list by location (inventory-screen)', () => {
+    let w2: string;
+    let w3: string;
+    const w2Bins = new Map<string, string>();
+    let w3SameCodeBin: string;
+    let plainSku: string;
+    let plain2Sku: string;
+
+    async function makeWarehouse(prefix: string): Promise<{ warehouseId: string; zoneId: string }> {
+      const created = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `${prefix}-${ulid().slice(10, 16).toUpperCase()}`, name: `${prefix} ${ulid()}` })
+        .expect(201);
+      const id = created.body.id as string;
+      const zone = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${id}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'D', name: 'Zone D' })
+        .expect(201);
+      return { warehouseId: id, zoneId: zone.body.id as string };
+    }
+
+    async function makeBin(whId: string, zoneId: string, code: string): Promise<string> {
+      return (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${whId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ capacity: 100000, type: 'shelf', code })
+          .expect(201)
+      ).body.id as string;
+    }
+
+    function stockIn(whId: string, skuId: string, binId: string, quantityDelta: number): SupertestTest {
+      return adjust({ warehouseId: whId, skuId, binId, quantityDelta, reasonCode: 'stock-count', note: 'location order' });
+    }
+
+    function listW2(query: string): SupertestTest {
+      return get(`/warehouses/${w2}/inventory/stock?${query}`);
+    }
+
+    interface LocRow { id: string; skuId: string; binId: string; binCode: string; binSystemOwned: boolean; quantity: number }
+
+    async function walk(query: string): Promise<LocRow[]> {
+      const seen: LocRow[] = [];
+      let cursor: string | null = null;
+      let guard = 0;
+      do {
+        const res = await listW2(`${query}${cursor === null ? '' : `&cursor=${encodeURIComponent(cursor)}`}`).expect(200);
+        seen.push(...(res.body.items as LocRow[]));
+        cursor = res.body.nextCursor as string | null;
+        guard += 1;
+      } while (cursor !== null && guard < 100);
+      expect(cursor).toBeNull();
+      return seen;
+    }
+
+    beforeAll(async () => {
+      plainSku = skuIds.get('PLAIN-1')!;
+      // Two untracked SKUs are needed for the tie inside one bin: PLAIN-1
+      // plus a fresh flagless SKU.
+      const csv = [
+        'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,reorder_point,reorder_qty,barcode',
+        'PLAIN-2,Flagless Two,pcs,,1800,,false,false,,,',
+      ].join('\n');
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/catalog/imports`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .field('mode', 'initial')
+        .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+        .expect(201);
+      const skus = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/catalog/skus?limit=100`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      plain2Sku = (skus.body.items as { code: string; id: string }[]).find((item) => item.code === 'PLAIN-2')!.id;
+      expect(plain2Sku).toBeDefined();
+
+      const a = await makeWarehouse('LOC');
+      w2 = a.warehouseId;
+      // Lexical codes: `D-01-10` sorts before `D-01-2`, and `D-02` before `D01`
+      // (`-` is 0x2D, below every digit).
+      for (const code of ['D01', 'D-01-2', 'D-02', 'D-01-10', 'D-01-01']) {
+        w2Bins.set(code, await makeBin(w2, a.zoneId, code));
+      }
+      // The system RECEIVING bin, inserted the way `ensureReceivingBinInTx`
+      // would (code + system_owned is the identity).
+      const receivingId = uuidv7();
+      const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+      try {
+        await sql`
+          insert into bins (id, tenant_id, warehouse_id, zone_id, code, capacity, type, system_owned)
+          values (${receivingId}, ${tenantId}, ${w2}, ${a.zoneId}, 'RECEIVING', 1000000000, 'staging', true)
+        `;
+      } finally {
+        await sql.end();
+      }
+      w2Bins.set('RECEIVING', receivingId);
+
+      // A same-code bin in another warehouse, with stock — never joined to W2.
+      const b = await makeWarehouse('OTH');
+      w3 = b.warehouseId;
+      w3SameCodeBin = await makeBin(w3, b.zoneId, 'D-01-01');
+      await stockIn(w3, plainSku, w3SameCodeBin, 9).expect(201);
+
+      // W2 stock. RECEIVING is seeded FIRST so the default (newest-first)
+      // order could never accidentally put it last.
+      await stockIn(w2, plainSku, receivingId, 4).expect(201);
+      await stockIn(w2, plainSku, w2Bins.get('D01')!, 1).expect(201);
+      await stockIn(w2, plain2Sku, w2Bins.get('D-01-01')!, 2).expect(201);
+      await stockIn(w2, plainSku, w2Bins.get('D-01-01')!, 3).expect(201);
+      await stockIn(w2, plainSku, w2Bins.get('D-02')!, 5).expect(201);
+      await stockIn(w2, plainSku, w2Bins.get('D-01-10')!, 6).expect(201);
+      await stockIn(w2, plainSku, w2Bins.get('D-01-2')!, 7).expect(201);
+      // Drained to zero: the row stays in stock_on_hand at 0.
+      await stockIn(w2, plain2Sku, w2Bins.get('D-01-2')!, 2).expect(201);
+      await stockIn(w2, plain2Sku, w2Bins.get('D-01-2')!, -2).expect(201);
+    });
+
+    it('order=location: storage bins by code (lexical, COLLATE "C"), then system bins; ties by SKU id across a page boundary', async () => {
+      const rows = await walk('order=location&limit=1');
+      const order = rows.map((row) => row.binCode);
+      expect(order).toEqual(['D-01-01', 'D-01-01', 'D-01-10', 'D-01-2', 'D-01-2', 'D-02', 'D01', 'RECEIVING']);
+      // The tied bin code over two SKUs is split across pages (limit 1) and
+      // ordered by SKU id, then row id — nothing duplicated or missed.
+      const tie = rows.filter((row) => row.binCode === 'D-01-01').map((row) => row.skuId);
+      expect(tie).toEqual([plainSku, plain2Sku].sort());
+      const tie2 = rows.filter((row) => row.binCode === 'D-01-2').map((row) => row.skuId);
+      expect(tie2).toEqual([plainSku, plain2Sku].sort());
+      expect(new Set(rows.map((row) => row.id)).size).toBe(rows.length);
+      // The location items carry the bin's code and system flag.
+      const receiving = rows.at(-1)!;
+      expect(receiving.binSystemOwned).toBe(true);
+      expect(receiving.binId).toBe(w2Bins.get('RECEIVING'));
+      expect(receiving.quantity).toBe(4);
+      expect(rows.slice(0, -1).every((row) => row.binSystemOwned === false)).toBe(true);
+      expect(Object.keys(rows[0]!).sort()).toEqual(
+        ['binCode', 'binId', 'binSystemOwned', 'createdAt', 'id', 'quantity', 'skuId', 'warehouseId'],
+      );
+    });
+
+    it('nonZero=true drops the drained row, also when combined with a cursor and order=location', async () => {
+      const all = await walk('order=location&limit=200');
+      const zero = all.filter((row) => row.quantity === 0);
+      expect(zero).toHaveLength(1);
+      expect(zero[0]!.binCode).toBe('D-01-2');
+
+      const nonZero = await walk('order=location&nonZero=true&limit=1');
+      expect(nonZero.every((row) => row.quantity > 0)).toBe(true);
+      expect(nonZero.map((row) => row.id)).toEqual(all.filter((row) => row.quantity > 0).map((row) => row.id));
+
+      // The default order honours it too.
+      const plain = await listW2('nonZero=true&limit=200').expect(200);
+      const plainItems = plain.body.items as { quantity: number }[];
+      expect(plainItems).toHaveLength(all.length - 1);
+      expect(plainItems.every((row) => row.quantity > 0)).toBe(true);
+      // An unparseable flag is refused by name.
+      const yes = await listW2('nonZero=yes').expect(400);
+      expect(yes.body).toMatchObject({ status: 400, code: 'validation-failed' });
+      // `nonZero=false` behaves exactly like the flag absent.
+      const off = await walk('order=location&nonZero=false&limit=200');
+      expect(off.map((row) => row.id)).toEqual(all.map((row) => row.id));
+    });
+
+    it('order=location with skuId (the SKU search) lists only that SKU, one row per non-zero bin, across pages', async () => {
+      const rows = await walk(`order=location&nonZero=true&skuId=${plainSku}&limit=1`);
+      expect(rows.length).toBeGreaterThan(1);
+      expect(rows.every((row) => row.skuId === plainSku)).toBe(true);
+      expect(rows.map((row) => row.binCode)).toEqual(['D-01-01', 'D-01-10', 'D-01-2', 'D-02', 'D01', 'RECEIVING']);
+      // plain2Sku's rows (D-01-01, and the drained D-01-2) never appear.
+      const other = await walk(`order=location&nonZero=true&skuId=${plain2Sku}&limit=1`);
+      expect(other.map((row) => row.binCode)).toEqual(['D-01-01']);
+    });
+
+    it('a same-code bin in another warehouse is never joined', async () => {
+      const rows = await walk('order=location&limit=200');
+      expect(rows.some((row) => row.binId === w3SameCodeBin)).toBe(false);
+      expect(rows.every((row) => row.binId === w2Bins.get(row.binCode))).toBe(true);
+      // Filtering W2 by W3's bin id yields nothing; W3 lists its own row.
+      const foreign = await listW2(`order=location&binId=${w3SameCodeBin}`).expect(200);
+      expect(foreign.body.items).toEqual([]);
+      const own = await get(`/warehouses/${w3}/inventory/stock?order=location`).expect(200);
+      expect((own.body.items as LocRow[]).map((row) => [row.binCode, row.quantity])).toEqual([['D-01-01', 9]]);
+    });
+
+    it('a cursor minted under one order is a 400 invalid-cursor under the other, in both directions; an unknown order is a 400', async () => {
+      const location = await listW2('order=location&limit=1').expect(200);
+      const locationCursor = location.body.nextCursor as string;
+      expect(locationCursor).toBeTruthy();
+      const plain = await listW2('limit=1').expect(200);
+      const plainCursor = plain.body.nextCursor as string;
+      expect(plainCursor).toBeTruthy();
+
+      const wrongWay = await listW2(`limit=1&cursor=${encodeURIComponent(locationCursor)}`).expect(400);
+      expect(wrongWay.body).toMatchObject({ status: 400, code: 'invalid-cursor' });
+      const otherWay = await listW2(`order=location&limit=1&cursor=${encodeURIComponent(plainCursor)}`).expect(400);
+      expect(otherWay.body).toMatchObject({ status: 400, code: 'invalid-cursor' });
+
+      // A crafted location cursor with a bad id is a 400, never a 500.
+      const crafted = Buffer.from(
+        JSON.stringify({ o: 'location', sys: false, binCode: 'D-01-01', skuId: 'nope', id: uuidv7() }),
+      ).toString('base64url');
+      const craftedRes = await listW2(`order=location&cursor=${encodeURIComponent(crafted)}`).expect(400);
+      expect(craftedRes.body).toMatchObject({ status: 400, code: 'invalid-cursor' });
+
+      const unknown = await listW2('order=created').expect(400);
+      expect(unknown.body).toMatchObject({ status: 400, code: 'validation-failed' });
+    });
+
+    it('the default order pages a tie group within one microsecond without a miss (full-precision cursor)', async () => {
+      // Stamp every W2 row with ONE microsecond-precise instant: a cursor
+      // truncated to milliseconds (`…00.123Z`) sorts below `…00.123456`, so
+      // its strict `<` would skip the whole tie group after page one. The
+      // original stamps are restored afterwards, so no later test inherits them.
+      const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+      let original: { id: string; created_at: string }[] = [];
+      try {
+        original = (await sql`
+          select id, created_at::text as created_at from stock_on_hand
+          where tenant_id = ${tenantId} and warehouse_id = ${w2}
+        `) as unknown as { id: string; created_at: string }[];
+        await sql`
+          update stock_on_hand set created_at = '2026-01-01 00:00:00.123456+00'
+          where tenant_id = ${tenantId} and warehouse_id = ${w2}
+        `;
+        const total = original.length;
+        expect(total).toBeGreaterThan(2);
+        const seen: string[] = [];
+        let cursor: string | null = null;
+        let guard = 0;
+        do {
+          const res = await listW2(`limit=1${cursor === null ? '' : `&cursor=${encodeURIComponent(cursor)}`}`).expect(200);
+          seen.push(...(res.body.items as { id: string }[]).map((row) => row.id));
+          cursor = res.body.nextCursor as string | null;
+          guard += 1;
+        } while (cursor !== null && guard < 100);
+        expect(seen).toHaveLength(total);
+        expect(new Set(seen).size).toBe(total);
+      } finally {
+        for (const row of original) {
+          await sql`update stock_on_hand set created_at = ${row.created_at}::timestamptz where id = ${row.id}`;
+        }
+        await sql.end();
+      }
+    });
+  });
 });

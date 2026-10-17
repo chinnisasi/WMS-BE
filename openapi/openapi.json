@@ -5571,6 +5571,27 @@
               "example": 50,
               "type": "number"
             }
+          },
+          {
+            "name": "order",
+            "required": false,
+            "in": "query",
+            "description": "Inventory-screen — `location`: storage bins first, then system bins, each by bin code (lexical, `COLLATE \"C\"`), then SKU id, then row id; the items then carry `binCode` and `binSystemOwned`. Absent: newest projection row first (the original order). A cursor minted under one order is refused (400 invalid-cursor) under the other",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "location"
+              ]
+            }
+          },
+          {
+            "name": "nonZero",
+            "required": false,
+            "in": "query",
+            "description": "Inventory-screen — `true`: only rows with a quantity above zero. Exactly 'true' or 'false'",
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -5585,7 +5606,7 @@
             }
           },
           "400": {
-            "description": "Malformed skuId/binId query, cursor, or out-of-range limit (validation-failed / invalid-cursor)",
+            "description": "Malformed skuId/binId query, unknown order, non-boolean nonZero or out-of-range limit (validation-failed); a malformed cursor, or one minted under the other order (invalid-cursor)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -28004,6 +28025,14 @@
           "createdAt": {
             "type": "string",
             "description": "ISO-8601 UTC projection-row commit time (the cursor sort key)"
+          },
+          "binCode": {
+            "type": "string",
+            "description": "The bin's code — present only under `order=location`"
+          },
+          "binSystemOwned": {
+            "type": "boolean",
+            "description": "Whether the bin is a system bin (RECEIVING, QC-HOLD, RETURNS, IN-TRANSIT) — present only under `order=location`"
           }
         },
         "required": [
