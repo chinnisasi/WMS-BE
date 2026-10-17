@@ -734,7 +734,21 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
       expect(plainItems).toHaveLength(all.length - 1);
       expect(plainItems.every((row) => row.quantity > 0)).toBe(true);
       // An unparseable flag is refused by name.
-      await listW2('nonZero=yes').expect(400);
+      const yes = await listW2('nonZero=yes').expect(400);
+      expect(yes.body).toMatchObject({ status: 400, code: 'validation-failed' });
+      // `nonZero=false` behaves exactly like the flag absent.
+      const off = await walk('order=location&nonZero=false&limit=200');
+      expect(off.map((row) => row.id)).toEqual(all.map((row) => row.id));
+    });
+
+    it('order=location with skuId (the SKU search) lists only that SKU, one row per non-zero bin, across pages', async () => {
+      const rows = await walk(`order=location&nonZero=true&skuId=${plainSku}&limit=1`);
+      expect(rows.length).toBeGreaterThan(1);
+      expect(rows.every((row) => row.skuId === plainSku)).toBe(true);
+      expect(rows.map((row) => row.binCode)).toEqual(['D-01-01', 'D-01-10', 'D-01-2', 'D-02', 'D01', 'RECEIVING']);
+      // plain2Sku's rows (D-01-01, and the drained D-01-2) never appear.
+      const other = await walk(`order=location&nonZero=true&skuId=${plain2Sku}&limit=1`);
+      expect(other.map((row) => row.binCode)).toEqual(['D-01-01']);
     });
 
     it('a same-code bin in another warehouse is never joined', async () => {
@@ -765,7 +779,8 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
       const crafted = Buffer.from(
         JSON.stringify({ o: 'location', sys: false, binCode: 'D-01-01', skuId: 'nope', id: uuidv7() }),
       ).toString('base64url');
-      await listW2(`order=location&cursor=${encodeURIComponent(crafted)}`).expect(400);
+      const craftedRes = await listW2(`order=location&cursor=${encodeURIComponent(crafted)}`).expect(400);
+      expect(craftedRes.body).toMatchObject({ status: 400, code: 'invalid-cursor' });
 
       const unknown = await listW2('order=created').expect(400);
       expect(unknown.body).toMatchObject({ status: 400, code: 'validation-failed' });
@@ -774,28 +789,38 @@ describe('inventory read surfaces (e2e, story 2.5)', () => {
     it('the default order pages a tie group within one microsecond without a miss (full-precision cursor)', async () => {
       // Stamp every W2 row with ONE microsecond-precise instant: a cursor
       // truncated to milliseconds (`…00.123Z`) sorts below `…00.123456`, so
-      // its strict `<` would skip the whole tie group after page one.
+      // its strict `<` would skip the whole tie group after page one. The
+      // original stamps are restored afterwards, so no later test inherits them.
       const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+      let original: { id: string; created_at: string }[] = [];
       try {
+        original = (await sql`
+          select id, created_at::text as created_at from stock_on_hand
+          where tenant_id = ${tenantId} and warehouse_id = ${w2}
+        `) as unknown as { id: string; created_at: string }[];
         await sql`
           update stock_on_hand set created_at = '2026-01-01 00:00:00.123456+00'
           where tenant_id = ${tenantId} and warehouse_id = ${w2}
         `;
+        const total = original.length;
+        expect(total).toBeGreaterThan(2);
+        const seen: string[] = [];
+        let cursor: string | null = null;
+        let guard = 0;
+        do {
+          const res = await listW2(`limit=1${cursor === null ? '' : `&cursor=${encodeURIComponent(cursor)}`}`).expect(200);
+          seen.push(...(res.body.items as { id: string }[]).map((row) => row.id));
+          cursor = res.body.nextCursor as string | null;
+          guard += 1;
+        } while (cursor !== null && guard < 100);
+        expect(seen).toHaveLength(total);
+        expect(new Set(seen).size).toBe(total);
       } finally {
+        for (const row of original) {
+          await sql`update stock_on_hand set created_at = ${row.created_at}::timestamptz where id = ${row.id}`;
+        }
         await sql.end();
       }
-      const total = (await walk('order=location&limit=200')).length;
-      const seen: string[] = [];
-      let cursor: string | null = null;
-      let guard = 0;
-      do {
-        const res = await listW2(`limit=1${cursor === null ? '' : `&cursor=${encodeURIComponent(cursor)}`}`).expect(200);
-        seen.push(...(res.body.items as { id: string }[]).map((row) => row.id));
-        cursor = res.body.nextCursor as string | null;
-        guard += 1;
-      } while (cursor !== null && guard < 100);
-      expect(seen).toHaveLength(total);
-      expect(new Set(seen).size).toBe(total);
     });
   });
 });

@@ -349,12 +349,7 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
     }
     return decoded;
   } catch {
-    throw new ProblemException(
-      'invalid-cursor',
-      400,
-      'Malformed pagination cursor',
-      'The cursor parameter is not a valid opaque page cursor.',
-    );
+    throw invalidCursor();
   }
 }
 
