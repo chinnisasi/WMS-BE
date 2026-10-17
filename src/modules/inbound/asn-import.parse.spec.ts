@@ -7,11 +7,11 @@ import {
   MAX_ASN_IMPORT_ROWS,
   assertAsnImportCount,
   groupAsnImportRows,
-  mergeGroups,
   parseExpectedAt,
   quantityToMilli,
   readAsnImportRows,
   repeatedSkus,
+  resolveAsnGroups,
   rowDisagreements,
 } from './asn-import.parse';
 
@@ -100,6 +100,28 @@ describe('the ASN import file contract (shared reader, ASN options)', () => {
     expect(parseExpectedAt(rows[1]!.values['expected_at']!)).toEqual({ ok: true, instant: '2026-10-19T18:30:00.000Z' });
   });
 
+  it('a quoted cell holding a newline is still ONE spreadsheet row; cells past the header are dropped when columns are ignored', async () => {
+    const rows = await readSheet(
+      csv('asn_code,sku,quantity,notes\nA-1,S-1,1,"line one\nline two"\nA-1,S-2,2,plain,extra,cells\n'),
+      ASN_OPTIONS,
+    );
+    expect(rows).toEqual([
+      { rowNumber: 2, values: { asn_code: 'A-1', sku: 'S-1', quantity: '1' } },
+      { rowNumber: 3, values: { asn_code: 'A-1', sku: 'S-2', quantity: '2' } },
+    ]);
+  });
+
+  it('an XLSX time-only cell reads as its clock text (refused, never 1899); a float formula result reads as Excel shows it', async () => {
+    const file = await xlsx([
+      ['asn_code', 'sku', 'quantity', 'expected_at'],
+      ['A-1', 'KG-1', 0.1 + 0.2, new Date(Date.UTC(1899, 11, 30, 14, 30))],
+    ]);
+    const rows = await readSheet(file, { ...ASN_OPTIONS, numberCells: 'excel-display' as const });
+    expect(rows[0]!.values).toEqual({ asn_code: 'A-1', sku: 'KG-1', quantity: '0.3', expected_at: '14:30' });
+    expect(parseExpectedAt('14:30').ok).toBe(false);
+    expect(quantityToMilli(rows[0]!.values['quantity']!, 'kg', 3)).toEqual({ ok: true, milli: 300 });
+  });
+
   it('the catalog defaults are untouched: an unknown column still refuses the file, rows are data-indexed', async () => {
     const options = { knownColumns: new Set(['a', 'b']), requiredColumns: ['a'], maxRows: 10 };
     await expect(readSheet(csv('a,b,c\n1,2,3\n'), options)).rejects.toMatchObject({
@@ -151,6 +173,8 @@ describe('quantity text', () => {
     expect(quantityToMilli('1.5', 'each', 0)).toMatchObject({ ok: false, code: 'quantity-precision' });
     expect(quantityToMilli('0.0001', 'kg', 3)).toMatchObject({ ok: false, code: 'quantity-precision' });
     expect(quantityToMilli('1.0000000000000000001', 'kg', 3)).toMatchObject({ ok: false, code: 'quantity-precision' });
+    // Typed as TEXT it is what the person wrote; an XLSX formula result
+    // arrives at Excel's display precision instead (the reader test above).
     expect(quantityToMilli('0.30000000000000004', 'kg', 3)).toMatchObject({ ok: false, code: 'quantity-precision' });
   });
 
@@ -199,19 +223,32 @@ describe('rows and groups', () => {
     ]);
   });
 
-  it('merges a blank-client group into the explicit group of the same code and client — and its rows then disagree on client', () => {
+  it('a blank client is the SKUs\' client: it joins the ASN naming that client and agrees; another client\'s SKU disagrees', () => {
     const { rows } = readAsnImportRows([
-      sheetRow(2, { ...base, asn_code: 'ASN-1', client: 'GLOWCO', sku: 'G1', quantity: '1' }),
-      sheetRow(3, { ...base, asn_code: 'ASN-1', client: '', sku: 'G2', quantity: '1' }),
-      sheetRow(4, { ...base, asn_code: 'ASN-9', client: '', sku: 'X', quantity: '1' }),
+      sheetRow(2, { ...base, asn_code: 'MIX', client: 'GLOWCO', sku: 'G1', quantity: '1' }),
+      sheetRow(3, { ...base, asn_code: 'MIX', client: '', sku: 'G2', quantity: '1' }),
+      sheetRow(4, { ...base, asn_code: 'BAD', client: 'GLOWCO', sku: 'G1', quantity: '1' }),
+      sheetRow(5, { ...base, asn_code: 'BAD', client: '', sku: 'A1', quantity: '1' }),
+      sheetRow(6, { ...base, asn_code: 'SOLO', client: '', sku: 'G1', quantity: '1' }),
+      sheetRow(7, { ...base, asn_code: 'SPAN', client: '', sku: 'G1', quantity: '1' }),
+      sheetRow(8, { ...base, asn_code: 'SPAN', client: '', sku: 'A1', quantity: '1' }),
     ]);
-    const merged = mergeGroups(groupAsnImportRows(rows), (group) => (group.asnCode === 'ASN-1' ? 'glowco-id' : null));
-    expect(merged.map((m) => [m.group.asnCode, m.clientId, m.group.rows.map((r) => r.rowNumber)])).toEqual([
-      ['ASN-1', 'glowco-id', [2, 3]],
-      ['ASN-9', null, [4]],
+    const skuClient: Record<string, string> = { G1: 'glowco-id', G2: 'glowco-id', A1: 'acme-id' };
+    const { groups, errors } = resolveAsnGroups(
+      groupAsnImportRows(rows),
+      (cell) => (cell.toUpperCase() === 'GLOWCO' ? 'glowco-id' : null),
+      (row) => skuClient[row.sku],
+    );
+    // One ASN per (client, code): MIX is ONE ASN, never two.
+    expect(groups.map((g) => [g.group.asnCode, g.clientId, g.group.rows.map((r) => r.rowNumber)])).toEqual([
+      ['MIX', 'glowco-id', [2, 3]],
+      ['BAD', 'glowco-id', [4, 5]],
+      ['SOLO', 'glowco-id', [6]],
+      ['SPAN', null, [7, 8]],
     ]);
-    expect(rowDisagreements(merged[0]!.group).map((e) => [e.rowNumber, e.code])).toEqual([[3, 'asn-rows-disagree']]);
-    expect(rowDisagreements(merged[0]!.group)[0]!.detail).toContain("Row 3's client is blank but row 2's is \"GLOWCO\"");
+    expect(errors.map((e) => [e.rowNumber, e.asnCode, e.code])).toEqual([[5, 'BAD', 'asn-rows-disagree']]);
+    expect(errors[0]!.detail).toContain('row 4\'s "GLOWCO"');
+    expect(rowDisagreements(groups[0]!.group)).toEqual([]);
   });
 
   it('rows of one ASN must agree on client, warehouse and expected_at after normalising; a blank and a filled cell disagree', () => {
@@ -223,7 +260,7 @@ describe('rows and groups', () => {
 
     const split = readAsnImportRows([
       sheetRow(2, { asn_code: 'A', client: '', warehouse: 'BLR-DC', expected_at: '2026-10-20', sku: 'S1', quantity: '1' }),
-      sheetRow(3, { asn_code: 'A', client: '', warehouse: 'MUM-DC', expected_at: '', sku: 'S2', quantity: '1' }),
+      sheetRow(3, { asn_code: 'A', client: '', warehouse: '', expected_at: '', sku: 'S2', quantity: '1' }),
     ]);
     const errors = rowDisagreements(groupAsnImportRows(split.rows)[0]!);
     expect(errors.map((e) => [e.rowNumber, e.code])).toEqual([

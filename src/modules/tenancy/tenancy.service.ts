@@ -111,14 +111,8 @@ export async function assertWarehouseInTenant(
   tenantId: string,
   warehouseId: string,
 ): Promise<void> {
-  const rows = await tx
-    .select({ id: warehouses.id })
-    .from(warehouses)
-    .where(and(eq(warehouses.id, warehouseId), eq(warehouses.tenantId, tenantId)))
-    .limit(1);
-  if (rows.length === 0) {
-    throw warehouseNotFound();
-  }
+  // One query with `getWarehouseCodeInTx` (the ASN import), so the two cannot drift.
+  await getWarehouseCodeInTx(tx, tenantId, warehouseId);
 }
 
 function warehouseNotFound(): ProblemException {
@@ -130,22 +124,6 @@ function warehouseNotFound(): ProblemException {
   );
 }
 
-/**
- * The role of one tenant member, read **inside the caller's tenant
- * transaction** when `tx` is given (the command-service-entry pattern of
- * Story 1.5 — the DB read *is* the epoch, so a role change applies to the
- * user's next command without re-login). Without `tx`, its own tenant-scoped
- * transaction is opened. Catalog and other foreign modules call the
- * `TenancyService.getMemberRole` facade; they never touch tenancy tables.
- *
- * A missing member row fails closed: the caller has no role and no
- * capabilities (`role-denied` names it).
- */
-/**
- * Story 21-4 — the member's client (AD-23 persona arm): null for the
- * tenant's own staff, set for a client-portal user. Null for an unknown
- * user too (the caller's role read refuses those).
- */
 /**
  * The ASN import (2026-10-17) — one warehouse's code (404 when it is not in
  * the tenant: `assertWarehouseInTenant`'s refusal), so a file's `warehouse`
@@ -185,6 +163,22 @@ export async function existingWarehouseCodesInTx(
   return new Set(rows.map((row) => row.code.toUpperCase()));
 }
 
+/**
+ * The role of one tenant member, read **inside the caller's tenant
+ * transaction** when `tx` is given (the command-service-entry pattern of
+ * Story 1.5 — the DB read *is* the epoch, so a role change applies to the
+ * user's next command without re-login). Without `tx`, its own tenant-scoped
+ * transaction is opened. Catalog and other foreign modules call the
+ * `TenancyService.getMemberRole` facade; they never touch tenancy tables.
+ *
+ * A missing member row fails closed: the caller has no role and no
+ * capabilities (`role-denied` names it).
+ */
+/**
+ * Story 21-4 — the member's client (AD-23 persona arm): null for the
+ * tenant's own staff, set for a client-portal user. Null for an unknown
+ * user too (the caller's role read refuses those).
+ */
 export async function getMemberClientIdIn(tx: TenantTx, tenantId: string, userId: string): Promise<string | null> {
   const rows = await tx
     .select({ clientId: users.clientId })

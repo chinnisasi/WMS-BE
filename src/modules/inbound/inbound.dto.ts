@@ -626,6 +626,11 @@ export class AsnImportRowErrorDto {
 
   @ApiProperty({ example: 'No SKU with code "GLOW-SERUM-X" exists in this tenant.' })
   detail!: string;
+  @ApiProperty({ type: String, nullable: true, example: 'GLOW-SERUM-X', description: 'The row’s sku cell as written; null when blank' })
+  sku!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, example: '12', description: 'The row’s quantity cell as written; null when blank' })
+  quantity!: string | null;
 }
 
 /** One ASN an import created — or, on a dry run, would create. */

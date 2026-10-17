@@ -38,7 +38,7 @@ interface ImportBody {
   acceptedCount: number;
   refusedCount: number;
   asns: { asnId: string | null; asnCode: string; clientId: string; clientLabel: string; lineCount: number; firstRow: number }[];
-  errors: { rowNumber: number; asnCode: string | null; code: string; detail: string }[];
+  errors: { rowNumber: number; asnCode: string | null; code: string; detail: string; sku: string | null; quantity: string | null }[];
 }
 
 interface UploadFile {
@@ -264,6 +264,10 @@ describe('ASN import (e2e, 2026-10-17)', () => {
     ]);
 
     const before = await counts();
+    // What the web sends: Check file with NO Idempotency-Key.
+    const bare = (await upload(file, { dryRun: true, key: null }).expect(200)).body as ImportBody;
+    expect(bare).toMatchObject({ importId: null, dryRun: true, asnCount: 3, acceptedCount: 3 });
+    expect(await counts()).toEqual(before);
     const key = ulid();
     const dry = await upload(file, { dryRun: true, key }).expect(200);
     const check = dry.body as ImportBody;
@@ -348,7 +352,10 @@ describe('ASN import (e2e, 2026-10-17)', () => {
     );
     expect(body.asns.map((a) => a.asnCode)).toEqual([`OK-${t}`, `OK2-${t}`]);
     expect(body).toMatchObject({ asnCount: 3, acceptedCount: 2, refusedCount: 1 });
-    expect(body.errors).toEqual([{ rowNumber: 5, asnCode: `BAD-${t}`, code: 'unknown-sku', detail: 'No SKU with code "NO-SUCH-SKU" exists in this tenant.' }]);
+    // Each error carries its row's own sku and quantity cells, so the report identifies the line.
+    expect(body.errors).toEqual([
+      { rowNumber: 5, asnCode: `BAD-${t}`, code: 'unknown-sku', detail: 'No SKU with code "NO-SUCH-SKU" exists in this tenant.', sku: 'NO-SUCH-SKU', quantity: '1' },
+    ]);
     const bad = await sql`select 1 from advance_shipment_notices where tenant_id = ${tenantId} and asn_code = ${`BAD-${t}`}`;
     expect(bad).toHaveLength(0);
   });
@@ -442,6 +449,28 @@ describe('ASN import (e2e, 2026-10-17)', () => {
     ]);
   });
 
+  it('a blank client is the SKUs\' client: rows naming the same client and blank rows are ONE ASN; a blank row of another client\'s SKU refuses the whole ASN', async () => {
+    const t = unique();
+    const body = await imported(csvFile([`MIX-${t},GLOWCO,,,GLOW-1,1`, `MIX-${t},,,,GLOW-2,1`]));
+    expect(body).toMatchObject({ asnCount: 1, acceptedCount: 1, refusedCount: 0, errors: [] });
+    expect(body.asns.map((a) => [a.asnCode, a.clientId, a.lineCount])).toEqual([[`MIX-${t}`, acme, 2]]);
+    const mixed = await sql`select 1 from advance_shipment_notices where tenant_id = ${tenantId} and asn_code = ${`MIX-${t}`}`;
+    expect(mixed).toHaveLength(1);
+
+    const bad = await imported(csvFile([`DIS2-${t},GLOWCO,,,GLOW-1,1`, `DIS2-${t},,,,ACME-1,1`]));
+    expect(bad).toMatchObject({ asnCount: 1, acceptedCount: 0, refusedCount: 1 });
+    expect(codes(bad)).toContainEqual([3, `DIS2-${t}`, 'asn-rows-disagree']);
+    const none = await sql`select 1 from advance_shipment_notices where tenant_id = ${tenantId} and asn_code = ${`DIS2-${t}`}`;
+    expect(none).toHaveLength(0);
+  });
+
+  it('a blank-client ASN refused for a used code names the client by its code, never a uuid', async () => {
+    const t = unique();
+    await imported(csvFile([`USED2-${t},,,,GLOW-1,1`]));
+    const again = await upload(csvFile([`USED2-${t},,,,GLOW-2,1`]), { dryRun: true, key: null }).expect(200);
+    expect((again.body as ImportBody).errors[0]!.detail).toBe(`Client GLOWCO already has an advance shipment notice "USED2-${t}".`);
+  });
+
   it('the same code for two clients is two ASNs', async () => {
     const t = unique();
     const body = await imported(csvFile([`TWIN-${t},GLOWCO,,,GLOW-1,1`, `TWIN-${t},ACME,,,ACME-1,1`]));
@@ -508,6 +537,8 @@ describe('ASN import (e2e, 2026-10-17)', () => {
     const portalToken = (await http().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200)).body.accessToken as string;
     const portal = await upload(file, { token: portalToken }).expect(403);
     expect(portal.body).toMatchObject({ code: 'role-denied', detail: 'This is an operator surface.' });
+    const portalCheck = await upload(file, { token: portalToken, dryRun: true, key: null }).expect(403);
+    expect(portalCheck.body).toMatchObject({ code: 'role-denied', detail: 'This is an operator surface.' });
     // The owner may import too (asn.manage).
     await upload(csvFile([`OWN-${unique()},GLOWCO,,,GLOW-1,1`]), { token: ownerToken }).expect(201);
   });
@@ -561,6 +592,64 @@ describe('ASN import (e2e, 2026-10-17)', () => {
       expect(audits).toHaveLength(0);
     } finally {
       await Promise.allSettled([pending]);
+      await holder.end();
+      await probe.end();
+    }
+  });
+
+  it('two imports with the same key at once: one creates, the other answers 409 conflict and leaves nothing; a retry replays', async () => {
+    const t = unique();
+    const key = ulid();
+    const file = csvFile([`SAME-${t},GLOWCO,,,GLOW-1,1`]);
+    const holder = postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+    const probe = postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+    let first: Promise<request.Response> | undefined;
+    let second: Promise<request.Response> | undefined;
+    try {
+      // A held, never-committed row of the same code parks BOTH imports past
+      // their replay lookup; rolling it back releases them into each other.
+      await holder
+        .begin(async (tx) => {
+          await tx`insert into advance_shipment_notices (id, tenant_id, client_id, warehouse_id, asn_code, status)
+            values (${uuidv7()}, ${tenantId}, ${acme}, ${wh1}, ${`SAME-${t}`}, 'announced')`;
+          const [{ pid }] = (await tx`select pg_backend_pid() as pid`) as unknown as [{ pid: number }];
+          first = (async () => upload(file, { key }))();
+          second = (async () => upload(file, { key }))();
+          const deadline = Date.now() + 15_000;
+          for (;;) {
+            const waiting = (await probe`
+              select a.pid, pg_blocking_pids(a.pid) as blockers from pg_stat_activity a where a.wait_event_type = 'Lock'`) as unknown as {
+              pid: number;
+              blockers: number[];
+            }[];
+            const chain = new Set<number>([pid]);
+            for (let grew = true; grew; ) {
+              grew = false;
+              for (const row of waiting) {
+                if (!chain.has(row.pid) && row.blockers.some((b) => chain.has(b))) {
+                  chain.add(row.pid);
+                  grew = true;
+                }
+              }
+            }
+            if (chain.size - 1 >= 2) break;
+            if (Date.now() > deadline) throw new Error('the imports never parked');
+            await new Promise((r) => setTimeout(r, 25));
+          }
+          throw new Error('rollback');
+        })
+        .catch((err: Error) => expect(err.message).toBe('rollback'));
+      const results = await Promise.all([first!, second!]);
+      expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
+      const winner = results.find((r) => r.status === 201)!;
+      expect(results.find((r) => r.status === 409)!.body.code).toBe('conflict');
+      const keys = await sql`select 1 from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`;
+      expect(keys).toHaveLength(1);
+      const asns = await sql`select 1 from advance_shipment_notices where tenant_id = ${tenantId} and asn_code = ${`SAME-${t}`}`;
+      expect(asns).toHaveLength(1);
+      expect((await upload(file, { key }).expect(201)).body).toEqual(winner.body);
+    } finally {
+      await Promise.allSettled([first, second]);
       await holder.end();
       await probe.end();
     }

@@ -13,7 +13,12 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
 import { MAX_SHEET_UPLOAD_BYTES, importTooLarge, readSheet, type SheetFile } from '../../shared/import/sheet-reader';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { existingWarehouseCodesInTx, getWarehouseCodeInTx } from '../tenancy/tenancy.service';
-import { assertSingleClientInTx, getClientLabelsInTx, getClientsByCodesInTx } from '../clients/clients.facade';
+import {
+  assertSingleClientInTx,
+  getClientLabelsInTx,
+  getClientsByCodesInTx,
+  getClientsInTx,
+} from '../clients/clients.facade';
 import { CatalogFacade, type SkuByCode } from '../catalog/catalog.facade';
 import { kitCannotHoldStock } from '../catalog/kit.store';
 import {
@@ -33,10 +38,10 @@ import {
   MAX_ASN_IMPORT_ROWS,
   assertAsnImportCount,
   groupAsnImportRows,
-  mergeGroups,
   quantityToMilli,
   readAsnImportRows,
   repeatedSkus,
+  resolveAsnGroups,
   rowDisagreements,
   rowError,
   type AsnImportGroup,
@@ -84,8 +89,8 @@ export interface AsnImportResponse {
   /** ASNs refused whole. */
   readonly refusedCount: number;
   readonly asns: readonly AsnImportAsn[];
-  /** Every refused row, in sheet order. */
-  readonly errors: readonly AsnImportRowError[];
+  /** Every refused row, in sheet order, with its own `sku` and `quantity` cells. */
+  readonly errors: readonly (AsnImportRowError & { readonly sku: string | null; readonly quantity: string | null })[];
 }
 
 const KNOWN_COLUMNS: ReadonlySet<string> = new Set(ASN_IMPORT_COLUMNS);
@@ -165,6 +170,7 @@ export class AsnImportCommand {
         rowNumbers: 'sheet',
         missingColumns: 'all',
         dateCells: 'ist-wall-clock',
+        numberCells: 'excel-display',
       });
       const warehouseCode = await getWarehouseCodeInTx(tx, command.tenantId, command.warehouseId);
 
@@ -195,20 +201,18 @@ export class AsnImportCommand {
         rows.map((row) => row.warehouse).filter((code) => code.toUpperCase() !== selectedWarehouse),
       );
 
-      // ── group: (code, client cell), then merge a blank-client group with
-      //    the explicit group its SKUs' client names ─────────────────────
-      const skuClientIds = (group: AsnImportGroup): string[] => [
-        ...new Set(group.rows.map((row) => skus.get(row.sku)?.clientId).filter((id): id is string => id !== undefined)),
-      ];
-      const clientOf = (group: AsnImportGroup): string | null => {
-        const cell = group.rows[0]!.client;
-        if (cell !== '') {
-          return clients.get(cell.toUpperCase())?.id ?? null;
-        }
-        const derived = skuClientIds(group);
-        return derived.length === 1 ? derived[0]! : null;
-      };
-      const groups = mergeGroups(groupAsnImportRows(rows), clientOf);
+      // ── group: (code, client cell), then settle each ASN's client — a
+      //    blank client is the SKUs' client, so it joins that ASN ───────
+      const resolution = resolveAsnGroups(
+        groupAsnImportRows(rows),
+        (cell) => clients.get(cell.toUpperCase())?.id ?? null,
+        (row) => skus.get(row.sku)?.clientId,
+      );
+      for (const error of resolution.errors) {
+        errors.push(error);
+        refusedRows.add(error.rowNumber);
+      }
+      const groups = resolution.groups;
       assertAsnImportCount(groups.length);
 
       // The codes already used by each client (the `(tenant, client, code)`
@@ -220,6 +224,9 @@ export class AsnImportCommand {
       );
       const clientIdsInPlay = [...new Set(groups.map((entry) => entry.clientId).filter((id): id is string => id !== null))];
       const labels = await getClientLabelsInTx(tx, command.tenantId, clientIdsInPlay);
+      // Every client in play by id — a blank-client ASN's client is named by
+      // no cell, and its code must never fall back to a uuid.
+      const clientFacts = await getClientsInTx(tx, command.tenantId, clientIdsInPlay);
 
       // ── validate each group with the operator create's rules ───────────
       const accepted: AcceptedGroup[] = [];
@@ -323,11 +330,10 @@ export class AsnImportCommand {
         errors.push(...groupErrors);
         const clean = groupErrors.length === 0 && group.rows.every((row) => !refusedRows.has(row.rowNumber));
         if (clean && clientId !== null) {
-          const client = [...clients.values()].find((candidate) => candidate.id === clientId);
           accepted.push({
             group,
             clientId,
-            clientCode: client?.code ?? clientId,
+            clientCode: clientFacts.get(clientId)!.code,
             clientLabel: labels.get(clientId) ?? clientId,
             expectedAt: firstRow.expectedAt ?? null,
             lines,
@@ -335,11 +341,18 @@ export class AsnImportCommand {
         }
       }
 
+      // The refused row's own sku and quantity cells ride each error, so the
+      // report identifies the line (null when the cell was blank).
+      const cellsOf = new Map(sheet.map((row) => [row.rowNumber, row.values]));
+      const cell = (rowNumber: number, column: string): string | null => {
+        const value = (cellsOf.get(rowNumber)?.[column] ?? '').trim();
+        return value === '' ? null : value;
+      };
       const respond = (importId: string | null, asns: AsnImportAsn[], extra: readonly AsnImportRowError[]): AsnImportResponse => {
         const all = [...errors, ...extra]
           .map((error, index) => ({ error, index }))
           .sort((a, b) => a.error.rowNumber - b.error.rowNumber || a.index - b.index)
-          .map(({ error }) => error);
+          .map(({ error }) => ({ ...error, sku: cell(error.rowNumber, 'sku'), quantity: cell(error.rowNumber, 'quantity') }));
         return {
           importId,
           dryRun: command.dryRun,

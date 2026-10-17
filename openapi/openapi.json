@@ -29231,13 +29231,27 @@
           "detail": {
             "type": "string",
             "example": "No SKU with code \"GLOW-SERUM-X\" exists in this tenant."
+          },
+          "sku": {
+            "type": "string",
+            "nullable": true,
+            "example": "GLOW-SERUM-X",
+            "description": "The row’s sku cell as written; null when blank"
+          },
+          "quantity": {
+            "type": "string",
+            "nullable": true,
+            "example": "12",
+            "description": "The row’s quantity cell as written; null when blank"
           }
         },
         "required": [
           "rowNumber",
           "asnCode",
           "code",
-          "detail"
+          "detail",
+          "sku",
+          "quantity"
         ]
       },
       "AsnImportResponseDto": {

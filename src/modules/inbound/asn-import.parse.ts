@@ -286,12 +286,10 @@ export interface AsnImportGroup {
 }
 
 /**
- * Groups rows into ASNs by (`asn_code`, the `client` cell, case-insensitive)
- * in first-appearance order — `ASN-1` for GLOWCO and `ASN-1` for ACME are two
- * ASNs. A blank client is its own key here; the command derives its client
- * from the SKUs and then merges it with an explicit group of the same code
- * and client (`mergeGroups`), so one ASN is never split by how its rows
- * spelled the client — and the merged rows then disagree on `client`.
+ * Groups rows by (`asn_code`, the `client` cell, case-insensitive) in
+ * first-appearance order — `ASN-1` for GLOWCO and `ASN-1` for ACME are two
+ * ASNs. A blank client is its own key here; `resolveAsnGroups` then decides
+ * which ASN a blank-client group belongs to.
  */
 export function groupAsnImportRows(rows: readonly AsnImportRow[]): AsnImportGroup[] {
   const groups = new Map<string, { asnCode: string; rows: AsnImportRow[] }>();
@@ -307,32 +305,67 @@ export function groupAsnImportRows(rows: readonly AsnImportRow[]): AsnImportGrou
   return [...groups.values()];
 }
 
+/** One ASN of the file with the client it is for (null when that cannot be resolved). */
+export interface ResolvedAsnGroup {
+  readonly group: AsnImportGroup;
+  readonly clientId: string | null;
+}
+
 /**
- * Merges groups that turned out to be the same ASN — the same code for the
- * same resolved client. `clientOf` answers a group's client id (null when it
- * cannot be resolved; such a group is never merged). Rows stay in file order;
- * the merged group takes the first group's position.
+ * Settles each ASN's client, so every (client, code) is ONE ASN.
+ *
+ * - An explicit `client` cell names the client (`clientIdOf`; null when unknown).
+ * - Blank-client rows of a code that ALSO has explicit rows join that ASN
+ *   (the explicit group whose client their SKUs belong to, else the first):
+ *   blank means "the SKUs' client", so a blank row agrees when its SKU's
+ *   client is the ASN's, and is refused `asn-rows-disagree` when it is
+ *   another client's (the whole ASN then refused).
+ * - Blank-client rows of a code with no explicit rows are one ASN for the
+ *   client their SKUs name (null when they name none, or several — the
+ *   command refuses that `mixed-client`, never splitting the ASN).
+ *
+ * Rows stay in file order; ASNs in the order of their first row.
  */
-export function mergeGroups(
+export function resolveAsnGroups(
   groups: readonly AsnImportGroup[],
-  clientOf: (group: AsnImportGroup) => string | null,
-): { readonly group: AsnImportGroup; readonly clientId: string | null }[] {
-  const merged: { group: { asnCode: string; rows: AsnImportRow[] }; clientId: string | null }[] = [];
-  const byKey = new Map<string, { group: { asnCode: string; rows: AsnImportRow[] }; clientId: string | null }>();
-  for (const group of groups) {
-    const clientId = clientOf(group);
-    const key = clientId === null ? null : `${group.asnCode}\u0000${clientId}`;
-    const existing = key === null ? undefined : byKey.get(key);
-    if (existing !== undefined) {
-      existing.group.rows.push(...group.rows);
-      existing.group.rows.sort((a, b) => a.rowNumber - b.rowNumber);
+  clientIdOf: (cell: string) => string | null,
+  skuClientOf: (row: AsnImportRow) => string | undefined,
+): { readonly groups: ResolvedAsnGroup[]; readonly errors: AsnImportRowError[] } {
+  const errors: AsnImportRowError[] = [];
+  const explicit = groups
+    .filter((group) => group.rows[0]!.client !== '')
+    .map((group) => ({ group: { asnCode: group.asnCode, rows: [...group.rows] }, clientId: clientIdOf(group.rows[0]!.client) }));
+  const resolved: { group: { asnCode: string; rows: AsnImportRow[] }; clientId: string | null }[] = [...explicit];
+  for (const blank of groups.filter((group) => group.rows[0]!.client === '')) {
+    const derived = [...new Set(blank.rows.map(skuClientOf).filter((id): id is string => id !== undefined))];
+    const candidates = explicit.filter((entry) => entry.group.asnCode === blank.asnCode);
+    if (candidates.length === 0) {
+      resolved.push({ group: { asnCode: blank.asnCode, rows: [...blank.rows] }, clientId: derived.length === 1 ? derived[0]! : null });
       continue;
     }
-    const entry = { group: { asnCode: group.asnCode, rows: [...group.rows] }, clientId };
-    merged.push(entry);
-    if (key !== null) byKey.set(key, entry);
+    const target =
+      candidates.find((entry) => entry.clientId !== null && derived.length === 1 && entry.clientId === derived[0]) ?? candidates[0]!;
+    target.group.rows.push(...blank.rows);
+    target.group.rows.sort((a, b) => a.rowNumber - b.rowNumber);
+    if (target.clientId === null) continue; // an unknown client: the ASN is refused for that already
+    const named = target.group.rows.find((row) => row.client !== '')!;
+    for (const row of blank.rows) {
+      const client = skuClientOf(row);
+      if (client !== undefined && client !== target.clientId) {
+        errors.push(
+          rowError(
+            row.rowNumber,
+            blank.asnCode,
+            'asn-rows-disagree',
+            `Row ${row.rowNumber}'s client is blank, so it is the client of SKU "${row.sku}" — not row ${named.rowNumber}'s "${named.client}". ` +
+              `Every row of ASN "${blank.asnCode}" must be for the same client.`,
+          ),
+        );
+      }
+    }
   }
-  return merged;
+  resolved.sort((a, b) => a.group.rows[0]!.rowNumber - b.group.rows[0]!.rowNumber);
+  return { groups: resolved, errors };
 }
 
 /** 422 `import-too-large` past `MAX_ASN_IMPORT_ASNS` ASNs. */
@@ -350,8 +383,9 @@ const CONSISTENT_COLUMNS = ['client', 'warehouse', 'expected_at'] as const;
  * Every row of one ASN must agree on `client`, `warehouse` and
  * `expected_at` — compared after normalising (client and warehouse
  * case-insensitively, `expected_at` as the instant it names, so
- * `2026-10-20` and `2026-10-20 00:00` agree). A blank cell and a filled one
- * DISAGREE. A row whose `expected_at` was refused is left out of the date
+ * `2026-10-20` and `2026-10-20 00:00` agree). A blank warehouse or date
+ * and a filled one DISAGREE; a blank client is checked by
+ * `resolveAsnGroups` instead (blank = the SKUs' client). A row whose `expected_at` was refused is left out of the date
  * comparison (it carries its own refusal). The first disagreeing row per
  * column is refused `asn-rows-disagree`, naming the column and the row it
  * differs from.
@@ -368,7 +402,10 @@ export function rowDisagreements(group: AsnImportGroup): AsnImportRowError[] {
     return text === '' ? 'blank' : `"${text}"`;
   };
   for (const column of CONSISTENT_COLUMNS) {
-    const comparable = group.rows.filter((row) => normal(row, column) !== undefined);
+    // A blank client means "the SKUs' client" — `resolveAsnGroups` checks it.
+    const comparable = group.rows.filter(
+      (row) => normal(row, column) !== undefined && !(column === 'client' && row.client === ''),
+    );
     const first = comparable[0];
     if (first === undefined) continue;
     const other = comparable.find((row) => normal(row, column) !== normal(first, column));

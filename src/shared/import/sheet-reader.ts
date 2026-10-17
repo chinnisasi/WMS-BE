@@ -8,7 +8,7 @@ import { ProblemException } from '../problem-details/problem.exception';
  * `exceljs`, a required header row, and the single-worksheet rule. Two
  * importers read files with it — the catalog import (its behaviour is
  * unchanged: its options are the defaults below, and its tests pass
- * unedited) and the ASN import, which opts into three differences:
+ * unedited) and the ASN import, which opts into five differences:
  *
  * - `unknownColumns: 'ignore'` — an extra column (notes, descriptions) is
  *   dropped instead of refusing the file;
@@ -20,7 +20,15 @@ import { ProblemException } from '../problem-details/problem.exception';
  * - `dateCells: 'ist-wall-clock'` — an XLSX date cell is read as the
  *   wall-clock time the sheet shows, in IST, BEFORE any `toISOString()`
  *   (exceljs hands a date cell over as a `Date` whose UTC fields are that wall
- *   clock; the catalog's default renders it as that UTC instant).
+ *   clock; the catalog's default renders it as that UTC instant). A
+ *   time-only cell (serial < 1, year 1899) is not a date: it reads as its
+ *   `HH:mm` text, so the importer refuses it instead of storing 1899;
+ * - `numberCells: 'excel-display'` — an XLSX number is rendered at Excel's
+ *   15 significant digits, so a formula result like 0.30000000000000004
+ *   reads as the 0.3 the sheet shows.
+ *
+ * With `unknownColumns: 'ignore'`, a CSV row's cells past the header are
+ * dropped too (an XLSX reads only the header's columns anyway).
  *
  * It decides nothing about the rows' meaning: every value comes back as the
  * cell's TEXT. An XLSX number is its shortest round-tripping decimal string
@@ -65,6 +73,8 @@ export interface SheetReaderOptions {
   readonly missingColumns?: 'first' | 'all';
   /** `utc-iso` (default): a date cell's `toISOString()`. `ist-wall-clock`: its wall clock, as `…+05:30`. */
   readonly dateCells?: 'utc-iso' | 'ist-wall-clock';
+  /** `shortest` (default): `String(n)`. `excel-display`: at 15 significant digits, as Excel shows it. */
+  readonly numberCells?: 'shortest' | 'excel-display';
 }
 
 // ── file-level refusals (shared by both importers) ──────────────────────────
@@ -168,7 +178,9 @@ function readCsvSheet(buffer: Buffer, options: SheetReaderOptions): SheetRow[] {
       },
       // `sheet` numbering keeps the blank lines as (blank) records, so a
       // record's index is its spreadsheet row minus the header; they are
-      // dropped as blank rows below.
+      // dropped as blank rows below. A quoted cell holding a newline is
+      // still ONE record — one spreadsheet row, as Excel opens the file —
+      // so the record index, not the text line, is the row number.
       skip_empty_lines: !sheetNumbers,
       relax_column_count: true,
       trim: false,
@@ -183,7 +195,7 @@ function readCsvSheet(buffer: Buffer, options: SheetReaderOptions): SheetRow[] {
     // relax_column_count keeps parsing past a row carrying more fields than
     // the header but parks the excess in __parsed_extra — silent data loss;
     // reject instead.
-    if (Array.isArray((record as Record<string, unknown>)['__parsed_extra'])) {
+    if (!ignoreUnknown && Array.isArray((record as Record<string, unknown>)['__parsed_extra'])) {
       throw fileUnreadable('A data row has more fields than the header — every row must match the documented column set.');
     }
     const values: Record<string, string> = {};
@@ -216,7 +228,8 @@ async function readXlsxSheet(buffer: Buffer, options: SheetReaderOptions): Promi
   if (workbook.worksheets.length > 1) {
     throw fileUnreadable('The workbook must contain exactly one worksheet — remove the extra sheets and try again.');
   }
-  const text = (value: CellValue): string => cellText(value, options.dateCells ?? 'utc-iso');
+  const text = (value: CellValue): string =>
+    cellText(value, options.dateCells ?? 'utc-iso', options.numberCells ?? 'shortest');
   const columns = new Map<number, string>();
   const seenNames = new Set<string>();
   sheet.getRow(1).eachCell({ includeEmpty: false }, (cell, colNumber) => {
@@ -280,11 +293,20 @@ function finalizeRows(
 const pad = (n: number, width = 2): string => String(n).padStart(width, '0');
 
 /** ExcelJS cell values: formulas ({result}), rich text, dates, booleans. */
-function cellText(value: CellValue, dates: 'utc-iso' | 'ist-wall-clock'): string {
+function cellText(
+  value: CellValue,
+  dates: 'utc-iso' | 'ist-wall-clock',
+  numbers: 'shortest' | 'excel-display',
+): string {
   if (value === null || value === undefined) return '';
+  if (typeof value === 'number' && numbers === 'excel-display' && Number.isFinite(value)) {
+    return String(Number(value.toPrecision(15)));
+  }
   if (value instanceof Date) {
     if (dates === 'utc-iso') return value.toISOString();
     if (Number.isNaN(value.getTime())) return '';
+    // A time-only cell (serial < 1) lands in 1899: not a date — its clock text.
+    if (value.getUTCFullYear() < 1900) return `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}`;
     // exceljs builds a date cell's Date from the sheet's zone-less serial, so
     // its UTC fields ARE the wall clock the sheet shows. Read them as IST.
     return (
@@ -294,8 +316,8 @@ function cellText(value: CellValue, dates: 'utc-iso' | 'ist-wall-clock'): string
     );
   }
   if (typeof value === 'object') {
-    if ('result' in value) return cellText((value as { result: CellValue }).result, dates);
-    if ('text' in value) return cellText((value as { text: CellValue }).text, dates);
+    if ('result' in value) return cellText((value as { result: CellValue }).result, dates, numbers);
+    if ('text' in value) return cellText((value as { text: CellValue }).text, dates, numbers);
     if ('richText' in value) {
       return (value as { richText: { text: string }[] }).richText.map((part) => part.text).join('');
     }

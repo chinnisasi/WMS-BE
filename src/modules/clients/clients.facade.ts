@@ -223,12 +223,6 @@ export async function getClientsInTx(
 }
 
 /**
- * Bulk id → the label a refusal prints (story 21-2b): another client by its
- * code; the tenant's own client as "<tenant name> (your company)" — never
- * the internal `self` code, which means nothing to an operator. (The self
- * client's name mirrors the tenant name.) Unknown ids are absent.
- */
-/**
  * The ASN import (2026-10-17) — clients named BY CODE in a file, in bulk, in
  * the caller's transaction. Matched case-insensitively on `upper(code)`:
  * codes are stored upper-case except the tenant's own `self`, and `SELF` is
@@ -257,6 +251,12 @@ export async function getClientsByCodesInTx(
   );
 }
 
+/**
+ * Bulk id → the label a refusal prints (story 21-2b): another client by its
+ * code; the tenant's own client as "<tenant name> (your company)" — never
+ * the internal `self` code, which means nothing to an operator. (The self
+ * client's name mirrors the tenant name.) Unknown ids are absent.
+ */
 export async function getClientLabelsInTx(
   tx: TenantTx,
   tenantId: string,
