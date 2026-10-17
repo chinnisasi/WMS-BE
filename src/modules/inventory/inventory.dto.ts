@@ -601,6 +601,15 @@ export class LedgerEventListResponse {
 
 // ── Story 2.5: the inventory read surfaces (stock, batches, serials) ──────
 
+/**
+ * Inventory-screen — the stock list's named sort orders. Absent = the
+ * original `createdAt DESC, id DESC` keyset; `location` = storage bins
+ * first, then system bins, each by bin code (`COLLATE "C"`, lexical), then
+ * SKU id, then the row id. A cursor carries the order it was minted under.
+ */
+export const STOCK_LIST_ORDERS = ['location'] as const;
+export type StockListOrder = (typeof STOCK_LIST_ORDERS)[number];
+
 /** Query of the stock-list read (keyset cursor pagination). */
 export class StockListQuery {
   @ApiProperty({ required: false, format: 'uuid', description: 'Only rows of one SKU' })
@@ -625,6 +634,26 @@ export class StockListQuery {
   @Min(1)
   @Max(200)
   limit?: number;
+
+  @ApiProperty({
+    required: false,
+    enum: [...STOCK_LIST_ORDERS],
+    description:
+      "Inventory-screen — `location`: storage bins first, then system bins, each by bin code (lexical, `COLLATE \"C\"`), then SKU id, then row id; the items then carry `binCode` and `binSystemOwned`. Absent: newest projection row first (the original order). A cursor minted under one order is refused (400 invalid-cursor) under the other",
+  })
+  @IsOptional()
+  @IsIn(STOCK_LIST_ORDERS)
+  order?: StockListOrder;
+
+  @ApiProperty({
+    required: false,
+    type: Boolean,
+    description: "Inventory-screen — `true`: only rows with a quantity above zero. Exactly 'true' or 'false'",
+  })
+  @IsOptional()
+  @BooleanFlag()
+  @IsBoolean()
+  nonZero?: boolean;
 }
 
 /** One on-hand projection row of the stock list (no batch fields — plain stock truth). */
@@ -646,6 +675,15 @@ export class StockEntryDto {
 
   @ApiProperty({ description: 'ISO-8601 UTC projection-row commit time (the cursor sort key)' })
   createdAt!: string;
+
+  @ApiProperty({ required: false, description: 'The bin\'s code — present only under `order=location`' })
+  binCode?: string;
+
+  @ApiProperty({
+    required: false,
+    description: 'Whether the bin is a system bin (RECEIVING, QC-HOLD, RETURNS, IN-TRANSIT) — present only under `order=location`',
+  })
+  binSystemOwned?: boolean;
 }
 
 /** GET …/warehouses/{warehouseId}/inventory/stock response. */
