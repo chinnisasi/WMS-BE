@@ -383,18 +383,21 @@ const CONSISTENT_COLUMNS = ['client', 'warehouse', 'expected_at'] as const;
  * Every row of one ASN must agree on `client`, `warehouse` and
  * `expected_at` — compared after normalising (client and warehouse
  * case-insensitively, `expected_at` as the instant it names, so
- * `2026-10-20` and `2026-10-20 00:00` agree). A blank warehouse or date
- * and a filled one DISAGREE; a blank client is checked by
- * `resolveAsnGroups` instead (blank = the SKUs' client). A row whose `expected_at` was refused is left out of the date
+ * `2026-10-20` and `2026-10-20 00:00` agree). A blank date and a filled
+ * one DISAGREE (the spec's rule). A blank warehouse IS the import's
+ * warehouse (`selectedWarehouse`), so it agrees with a row naming that
+ * code — a row naming another code is refused `wrong-warehouse` by the
+ * command anyway. A blank client is checked by `resolveAsnGroups` instead
+ * (blank = the SKUs' client). A row whose `expected_at` was refused is left out of the date
  * comparison (it carries its own refusal). The first disagreeing row per
  * column is refused `asn-rows-disagree`, naming the column and the row it
  * differs from.
  */
-export function rowDisagreements(group: AsnImportGroup): AsnImportRowError[] {
+export function rowDisagreements(group: AsnImportGroup, selectedWarehouse?: string): AsnImportRowError[] {
   const errors: AsnImportRowError[] = [];
   const normal = (row: AsnImportRow, column: (typeof CONSISTENT_COLUMNS)[number]): string | null | undefined => {
     if (column === 'client') return row.client.toUpperCase();
-    if (column === 'warehouse') return row.warehouse.toUpperCase();
+    if (column === 'warehouse') return (row.warehouse === '' ? (selectedWarehouse ?? '') : row.warehouse).toUpperCase();
     return row.expectedAt;
   };
   const shown = (row: AsnImportRow, column: (typeof CONSISTENT_COLUMNS)[number]): string => {

@@ -271,6 +271,18 @@ describe('rows and groups', () => {
     expect(errors[1]!.detail).toContain('expected_at');
   });
 
+  it('a blank warehouse is the import\'s warehouse: it agrees with a row naming that code (any case), not with another code', () => {
+    const { rows } = readAsnImportRows([
+      sheetRow(2, { ...base, asn_code: 'X', client: 'GLOWCO', warehouse: 'BLR-DC', sku: 'S1', quantity: '1' }),
+      sheetRow(3, { ...base, asn_code: 'X', client: 'GLOWCO', warehouse: '', sku: 'S2', quantity: '1' }),
+    ]);
+    const group = groupAsnImportRows(rows)[0]!;
+    expect(rowDisagreements(group, 'blr-dc')).toEqual([]);
+    // Without the import's warehouse the cells are compared as written.
+    expect(rowDisagreements(group).map((e) => [e.rowNumber, e.code])).toEqual([[3, 'asn-rows-disagree']]);
+    expect(rowDisagreements(group, 'MUM-DC').map((e) => [e.rowNumber, e.code])).toEqual([[3, 'asn-rows-disagree']]);
+  });
+
   it('a SKU repeated inside one ASN is refused on its repeat, never summed', () => {
     const { rows } = readAsnImportRows([
       sheetRow(2, { ...base, asn_code: 'A', sku: 'S1', quantity: '1' }),

@@ -471,6 +471,13 @@ describe('ASN import (e2e, 2026-10-17)', () => {
     expect((again.body as ImportBody).errors[0]!.detail).toBe(`Client GLOWCO already has an advance shipment notice "USED2-${t}".`);
   });
 
+  it('a blank warehouse is the selected warehouse: a row naming it and a blank row are ONE ASN with two lines', async () => {
+    const t = unique();
+    const body = await imported(csvFile([`WH-${t},GLOWCO,${wh1Code},,GLOW-1,1`, `WH-${t},,,,GLOW-2,2`]));
+    expect(body).toMatchObject({ asnCount: 1, acceptedCount: 1, refusedCount: 0, errors: [] });
+    expect(body.asns.map((a) => [a.asnCode, a.clientId, a.lineCount])).toEqual([[`WH-${t}`, acme, 2]]);
+  });
+
   it('the same code for two clients is two ASNs', async () => {
     const t = unique();
     const body = await imported(csvFile([`TWIN-${t},GLOWCO,,,GLOW-1,1`, `TWIN-${t},ACME,,,ACME-1,1`]));

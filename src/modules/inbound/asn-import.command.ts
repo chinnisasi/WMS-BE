@@ -283,7 +283,7 @@ export class AsnImportCommand {
         } catch (error) {
           groupErrors.push(rowError(firstRow.rowNumber, group.asnCode, 'too-many-lines', this.detailOf(error)));
         }
-        groupErrors.push(...rowDisagreements(group), ...repeatedSkus(group));
+        groupErrors.push(...rowDisagreements(group, warehouseCode), ...repeatedSkus(group));
 
         // Client attribution over the SKUs that resolved — the create's rule.
         const known = group.rows
