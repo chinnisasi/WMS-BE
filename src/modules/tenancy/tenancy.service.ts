@@ -111,14 +111,8 @@ export async function assertWarehouseInTenant(
   tenantId: string,
   warehouseId: string,
 ): Promise<void> {
-  const rows = await tx
-    .select({ id: warehouses.id })
-    .from(warehouses)
-    .where(and(eq(warehouses.id, warehouseId), eq(warehouses.tenantId, tenantId)))
-    .limit(1);
-  if (rows.length === 0) {
-    throw warehouseNotFound();
-  }
+  // One query with `getWarehouseCodeInTx` (the ASN import), so the two cannot drift.
+  await getWarehouseCodeInTx(tx, tenantId, warehouseId);
 }
 
 function warehouseNotFound(): ProblemException {
@@ -128,6 +122,45 @@ function warehouseNotFound(): ProblemException {
     'Warehouse not found',
     'No warehouse with this id exists in this tenant.',
   );
+}
+
+/**
+ * The ASN import (2026-10-17) — one warehouse's code (404 when it is not in
+ * the tenant: `assertWarehouseInTenant`'s refusal), so a file's `warehouse`
+ * column can be compared with the warehouse the import targets.
+ */
+export async function getWarehouseCodeInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<string> {
+  const rows = await tx
+    .select({ code: warehouses.code })
+    .from(warehouses)
+    .where(and(eq(warehouses.id, warehouseId), eq(warehouses.tenantId, tenantId)))
+    .limit(1);
+  if (rows.length === 0) {
+    throw warehouseNotFound();
+  }
+  return rows[0]!.code;
+}
+
+/**
+ * The ASN import (2026-10-17) — which of a file's warehouse codes name a
+ * warehouse of this tenant, in bulk: the set of UPPER-CASED codes that exist
+ * (matched case-insensitively). Tells "another warehouse" from "no such
+ * warehouse" when a row names a warehouse other than the import's.
+ */
+export async function existingWarehouseCodesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  codes: readonly string[],
+): Promise<Set<string>> {
+  const upper = [...new Set(codes.map((code) => code.trim().toUpperCase()).filter((code) => code !== ''))];
+  if (upper.length === 0) {
+    return new Set();
+  }
+  const rows = await tx
+    .select({ code: warehouses.code })
+    .from(warehouses)
+    .where(and(eq(warehouses.tenantId, tenantId), inArray(sql`upper(${warehouses.code})`, upper)));
+  return new Set(rows.map((row) => row.code.toUpperCase()));
 }
 
 /**

@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -220,6 +220,35 @@ export async function getClientsInTx(
     .from(clients)
     .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, distinct)));
   return new Map(rows.map((row) => [row.id, row]));
+}
+
+/**
+ * The ASN import (2026-10-17) — clients named BY CODE in a file, in bulk, in
+ * the caller's transaction. Matched case-insensitively on `upper(code)`:
+ * codes are stored upper-case except the tenant's own `self`, and `SELF` is
+ * reserved for it (`clients_self_code_reserved`), so the upper-cased match
+ * is unambiguous and also lets a file name the tenant's own goods `self`.
+ * The map is keyed by the UPPER-CASED code; an unknown code is absent.
+ */
+export async function getClientsByCodesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  codes: readonly string[],
+): Promise<Map<string, ClientFacts & { readonly label: string }>> {
+  const upper = [...new Set(codes.map((code) => code.trim().toUpperCase()).filter((code) => code !== ''))];
+  if (upper.length === 0) {
+    return new Map();
+  }
+  const rows = await tx
+    .select({ id: clients.id, code: clients.code, name: clients.name, systemOwned: clients.systemOwned })
+    .from(clients)
+    .where(and(eq(clients.tenantId, tenantId), inArray(sql`upper(${clients.code})`, upper)));
+  return new Map(
+    rows.map((row) => [
+      row.code.toUpperCase(),
+      { id: row.id, code: row.code, systemOwned: row.systemOwned, label: clientLabel(row) },
+    ]),
+  );
 }
 
 /**

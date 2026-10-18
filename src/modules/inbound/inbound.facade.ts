@@ -35,6 +35,8 @@ import type {
   CreateAsnCommand,
   TransitionAsnCommand,
 } from './asn.command';
+import { AsnImportCommand } from './asn-import.command';
+import type { AsnImportResponse, ImportAsnsCommand } from './asn-import.command';
 import { VendorCommand } from './vendors.command';
 import type { CreateVendorCommand, VendorSnapshot } from './vendors.command';
 import { PurchaseOrderCommand, lineSnapshot } from './po.command';
@@ -149,6 +151,8 @@ export class InboundFacade {
     @Inject(VendorCommand) private readonly vendorCommand: VendorCommand,
     @Inject(PurchaseOrderCommand) private readonly poCommand: PurchaseOrderCommand,
     @Inject(AsnCommand) private readonly asnCommand: AsnCommand,
+    // The ASN import (2026-10-17) — many ASNs from one CSV/XLSX file.
+    @Inject(AsnImportCommand) private readonly asnImportCommand: AsnImportCommand,
   ) {}
 
   // ── story 21-7: the client portal's inbound reads ─────────────────────────
@@ -199,6 +203,15 @@ export class InboundFacade {
 
   async createAsn(command: CreateAsnCommand, idempotencyKey: string): Promise<AsnSnapshot> {
     return this.asnCommand.create(command, idempotencyKey);
+  }
+
+  /**
+   * The ASN import (2026-10-17): Check file (`dryRun`, no key) or Import
+   * (keyed). Every valid ASN of the file is created exactly as `createAsn`
+   * would; an ASN with any bad row is refused whole and reported.
+   */
+  async importAsns(command: ImportAsnsCommand, idempotencyKey: string | null): Promise<AsnImportResponse> {
+    return this.asnImportCommand.execute(command, idempotencyKey);
   }
 
   /**

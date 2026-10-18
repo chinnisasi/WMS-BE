@@ -1,8 +1,6 @@
 import { createHash } from 'node:crypto';
 import { forwardRef, Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, gt, inArray } from 'drizzle-orm';
-import { parse as parseCsv } from 'csv-parse/sync';
-import { Workbook, type CellValue } from 'exceljs';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -18,6 +16,7 @@ import {
   uomConversions,
 } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
+import { MAX_SHEET_UPLOAD_BYTES, importTooLarge, readSheet } from '../../shared/import/sheet-reader';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
@@ -64,7 +63,7 @@ export type ImportMode = (typeof IMPORT_MODES)[number];
 
 /** Import caps (spec 1.4): ≤ 10,000 data rows and ≤ 5 MB per file. */
 export const MAX_IMPORT_ROWS = 10_000;
-export const MAX_IMPORT_BYTES = 5 * 1024 * 1024;
+export const MAX_IMPORT_BYTES = MAX_SHEET_UPLOAD_BYTES;
 
 export const SKU_CODE_MAX = 64;
 export const NAME_MAX = 200;
@@ -228,9 +227,6 @@ interface ValidRow {
 }
 
 type FieldResult<T> = { ok: true; value: T } | { ok: false; error: CatalogImportErrorDto };
-
-/** exceljs' legacy Buffer interface (its xlsx.load parameter type). */
-type ExcelBuffer = Parameters<Workbook['xlsx']['load']>[0];
 
 /**
  * Catalog import (Story 1.4): a synchronous multipart CSV/XLSX import that
@@ -938,32 +934,9 @@ export function duplicateSkuCode(code: string): ProblemException {
   );
 }
 
-export function importTooLarge(detail: string): ProblemException {
-  return new ProblemException(
-    'import-too-large',
-    422,
-    'Import exceeds the row or size cap',
-    detail,
-  );
-}
-
-export function unsupportedFileType(name: string): ProblemException {
-  return new ProblemException(
-    'unsupported-file-type',
-    415,
-    'Unsupported import file type',
-    `Only .csv and .xlsx files can be imported (got "${name}").`,
-  );
-}
-
-export function fileUnreadable(detail: string): ProblemException {
-  return new ProblemException(
-    'file-unreadable',
-    400,
-    'Import file could not be read',
-    detail,
-  );
-}
+// The file-level refusals (`import-too-large`, `unsupported-file-type`,
+// `file-unreadable`) moved to `shared/import/sheet-reader.ts` with the reader
+// (the ASN import story) — both spreadsheet imports share one copy.
 
 /** Existing SKUs in this tenant colliding with the file's codes/barcodes. */
 async function findTenantConflicts(
@@ -995,175 +968,18 @@ async function findTenantConflicts(
 }
 
 /**
- * Sheet parsing. Both formats share the header contract: a required header
- * row whose columns come from the documented fixed set; unknown columns and
- * missing required columns make the file unreadable (400), as does a file
- * with no data rows.
+ * Sheet parsing — the shared reader (`shared/import/sheet-reader.ts`,
+ * extracted from this file by the ASN import story) with the catalog's
+ * options, which are the reader's defaults: an unknown column refuses the
+ * file, the first missing required column is named, rows carry the gap-free
+ * 1-based data-row index, and a date cell reads as its UTC ISO instant.
  */
-async function parseSheetAsync(file: ImportCatalogCommand['file']): Promise<RawRow[]> {
-  const name = file.name.toLowerCase();
-  const mime = file.mimetype.toLowerCase();
-  if (name.endsWith('.csv') || mime.includes('csv')) {
-    return parseCsvSheet(file.buffer);
-  }
-  if (name.endsWith('.xlsx') || mime.includes('spreadsheetml')) {
-    return parseXlsxSheet(file.buffer);
-  }
-  throw unsupportedFileType(file.name || 'unnamed file');
-}
-
-function parseCsvSheet(buffer: Buffer): RawRow[] {
-  // The columns callback sees the raw header row: validate the shared header
-  // contract there (unknown, duplicate, and missing-required columns are all
-  // 400 file-unreadable — a duplicate would otherwise let the last
-  // occurrence's values silently win). The problem is captured rather than
-  // thrown so we never depend on how csv-parse propagates callback errors.
-  let headerProblem: string | null = null;
-  let records: Record<string, string | string[]>[];
-  try {
-    records = parseCsv(new Uint8Array(buffer), {
-      bom: true,
-      columns: (header: string[]) => {
-        const seen = new Set<string>();
-        for (const raw of header) {
-          const name = raw.trim().toLowerCase();
-          if (name === '') continue;
-          if (!KNOWN_COLUMNS.has(name)) {
-            headerProblem = `Unknown column "${raw.trim()}" — the header must use the documented column names.`;
-            break;
-          }
-          if (seen.has(name)) {
-            headerProblem = `Duplicate column "${name}" in the header row.`;
-            break;
-          }
-          seen.add(name);
-        }
-        if (headerProblem === null) {
-          for (const required of REQUIRED_COLUMNS) {
-            if (!seen.has(required)) {
-              headerProblem = `Missing required column "${required}" in the header row.`;
-              break;
-            }
-          }
-        }
-        return header.map((raw) => raw.trim().toLowerCase());
-      },
-      skip_empty_lines: true,
-      relax_column_count: true,
-      trim: false,
-    });
-  } catch (error) {
-    throw fileUnreadable(`The CSV could not be parsed: ${(error as Error).message}`);
-  }
-  if (headerProblem !== null) {
-    throw fileUnreadable(headerProblem);
-  }
-  const rows = records.map((record, index) => {
-    // relax_column_count keeps parsing past a row carrying more fields than
-    // the header but parks the excess in __parsed_extra — silent data loss;
-    // reject instead.
-    if (Array.isArray((record as Record<string, unknown>)['__parsed_extra'])) {
-      throw fileUnreadable('A data row has more fields than the header — every row must match the documented column set.');
-    }
-    const values: Record<string, string> = {};
-    for (const [key, value] of Object.entries(record)) {
-      const name = key.trim().toLowerCase();
-      if (!KNOWN_COLUMNS.has(name)) continue;
-      values[name] = Array.isArray(value) ? value.join(',') : (value ?? '');
-    }
-    return { rowNumber: index + 1, values };
+function parseSheetAsync(file: ImportCatalogCommand['file']): Promise<RawRow[]> {
+  return readSheet(file, {
+    knownColumns: KNOWN_COLUMNS,
+    requiredColumns: REQUIRED_COLUMNS,
+    maxRows: MAX_IMPORT_ROWS,
   });
-  return finalizeRows(rows);
-}
-
-async function parseXlsxSheet(buffer: Buffer): Promise<RawRow[]> {
-  const workbook = new Workbook();
-  try {
-    // exceljs types the argument as its own legacy Buffer interface.
-    await workbook.xlsx.load(buffer as unknown as ExcelBuffer);
-  } catch (error) {
-    throw fileUnreadable(`The XLSX could not be parsed: ${(error as Error).message}`);
-  }
-  const sheet = workbook.worksheets[0];
-  if (!sheet) {
-    throw fileUnreadable('The workbook has no worksheets.');
-  }
-  // Only the first sheet would silently win — make the extra sheets a parse
-  // failure instead.
-  if (workbook.worksheets.length > 1) {
-    throw fileUnreadable('The workbook must contain exactly one worksheet — remove the extra sheets and try again.');
-  }
-  const columns = new Map<number, string>();
-  const seenNames = new Set<string>();
-  sheet.getRow(1).eachCell({ includeEmpty: false }, (cell, colNumber) => {
-    const header = cellText(cell.value).trim();
-    if (header === '') return;
-    const name = header.toLowerCase();
-    if (!KNOWN_COLUMNS.has(name)) {
-      throw fileUnreadable(`Unknown column "${header}" — the header must use the documented column names.`);
-    }
-    if (seenNames.has(name)) {
-      throw fileUnreadable(`Duplicate column "${header}" in the header row — the last occurrence would silently win.`);
-    }
-    seenNames.add(name);
-    columns.set(colNumber, name);
-  });
-  for (const required of REQUIRED_COLUMNS) {
-    if (![...columns.values()].includes(required)) {
-      throw fileUnreadable(`Missing required column "${required}" in the header row.`);
-    }
-  }
-  const rows: { rowNumber: number; values: Record<string, string> }[] = [];
-  sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-    if (rowNumber === 1) return;
-    const values: Record<string, string> = {};
-    for (const [colNumber, name] of columns) {
-      values[name] = cellText(row.getCell(colNumber).value);
-    }
-    // Styled-but-blank trailing rows are not data rows.
-    if (Object.values(values).some((value) => value.trim() !== '')) {
-      rows.push({ rowNumber: rowNumber - 1, values });
-    }
-  });
-  return finalizeRows(rows);
-}
-
-/**
- * Blank-row filtering + the row cap, shared by both formats. Row numbers are
- * renumbered sequentially here so the documented `rowNumber` (1-based
- * data-row index, header excluded) is gap-free and identical across formats:
- * CSV's skip_empty_lines already compresses blanks, while XLSX rows carry
- * sheet-row gaps that would otherwise leak through.
- */
-function finalizeRows(
-  rows: readonly { rowNumber: number; values: Record<string, string> }[],
-): RawRow[] {
-  const nonBlank = rows.filter((row) =>
-    Object.values(row.values).some((value) => (value ?? '').trim() !== ''),
-  );
-  if (nonBlank.length === 0) {
-    throw fileUnreadable('The file has a header row but no data rows.');
-  }
-  if (nonBlank.length > MAX_IMPORT_ROWS) {
-    throw importTooLarge(`The file has ${nonBlank.length} data rows — the cap is ${MAX_IMPORT_ROWS}.`);
-  }
-  return nonBlank.map((row, index) => ({ rowNumber: index + 1, values: row.values }));
-}
-
-/** ExcelJS cell values: formulas ({result}), rich text, dates, booleans. */
-function cellText(value: CellValue): string {
-  if (value === null || value === undefined) return '';
-  if (value instanceof Date) return value.toISOString();
-  if (typeof value === 'object') {
-    if ('result' in value) return cellText((value as { result: CellValue }).result);
-    if ('text' in value) return cellText((value as { text: CellValue }).text);
-    if ('richText' in value) {
-      return (value as { richText: { text: string }[] }).richText.map((part) => part.text).join('');
-    }
-    return String(value);
-  }
-  if (typeof value === 'boolean') return value ? 'true' : 'false';
-  return String(value);
 }
 
 function parseTracked(raw: string, column: string, rowNumber: number): FieldResult<boolean> {

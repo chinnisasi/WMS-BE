@@ -6,6 +6,7 @@ import { PutawayModule } from '../putaway/putaway.module';
 import { VendorCommand } from './vendors.command';
 import { PurchaseOrderCommand } from './po.command';
 import { AsnCommand } from './asn.command';
+import { AsnImportCommand } from './asn-import.command';
 import { InboundFacade } from './inbound.facade';
 import { ReceivingCommand } from './receiving.command';
 import { ReceivingFacade } from './receiving.facade';
@@ -53,6 +54,8 @@ import { QcFacade } from './qc.facade';
     PurchaseOrderCommand,
     // Story 21-6 — the advance shipment notice lifecycle.
     AsnCommand,
+    // The ASN import (2026-10-17) — the shared ASN checks, per group of a file.
+    AsnImportCommand,
     InboundFacade,
     ReceivingCommand,
     ReceivingFacade,

@@ -215,6 +215,16 @@ export interface SkuSummary {
   readonly storageClass: string;
 }
 
+/** One SKU as `getSkusByCodesInTx` returns it (the ASN import's resolution). */
+export interface SkuByCode {
+  readonly id: string;
+  readonly code: string;
+  readonly clientId: string;
+  readonly uom: string;
+  readonly uomPrecision: number;
+  readonly isKit: boolean;
+}
+
 @Injectable()
 export class CatalogFacade {
   constructor(@Inject(DATABASE) private readonly db: Database) {}
@@ -543,6 +553,44 @@ export class CatalogFacade {
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.code, [...new Set(codes)])));
     return new Map(rows.map((row) => [row.code, row.hsn]));
+  }
+
+  /**
+   * The ASN import (2026-10-17) — SKUs named BY CODE in a file, in bulk, in
+   * the caller's transaction, beside `getSkuHsnByCodesInTx`: each code's id,
+   * client, base unit with its declared precision, and whether it is a kit
+   * (the `getKitSkuIdsInTx` answer — kit-ness is the presence of composition
+   * rows, never a flag). Codes match exactly, as every SKU code read does;
+   * an unknown code is absent from the map. No lock (the ASN create reads its
+   * SKUs unlocked).
+   */
+  async getSkusByCodesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    codes: readonly string[],
+  ): Promise<ReadonlyMap<string, SkuByCode>> {
+    const distinct = [...new Set(codes)].filter((code) => code !== '');
+    if (distinct.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .select({ id: skus.id, code: skus.code, clientId: skus.clientId, uom: skus.uom })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.code, distinct)));
+    const kits = new Set(await getKitSkuIdsInTx(tx, tenantId, rows.map((row) => row.id)));
+    return new Map(
+      rows.map((row) => [
+        row.code,
+        {
+          id: row.id,
+          code: row.code,
+          clientId: row.clientId,
+          uom: row.uom,
+          uomPrecision: uomPrecision(row.uom),
+          isKit: kits.has(row.id),
+        },
+      ]),
+    );
   }
 
   /**

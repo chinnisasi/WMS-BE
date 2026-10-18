@@ -1,5 +1,4 @@
-import { Body, Catch, Controller, Get, HttpCode, HttpStatus, Param, Patch, PayloadTooLargeException, Post, Put, Query, UploadedFile, UseFilters, UseGuards, UseInterceptors } from '@nestjs/common';
-import type { ExceptionFilter } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, Patch, Post, Put, Query, UploadedFile, UseFilters, UseGuards, UseInterceptors } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 // Pulls in @types/multer's `Express.Multer.File` namespace augmentation.
 import type {} from 'multer';
@@ -22,6 +21,8 @@ import { ProblemDetailsDto } from '../../shared/problem-details/problem-details.
 import { problemJsonResponse } from '../../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { UUID_RE } from '../../shared/primitives/ids';
+// The ASN import story moved the upload filter to `shared` (one copy for both imports).
+import { SheetUploadFilter } from '../../shared/import/upload-filter';
 import { CurrentSession } from '../tenancy/tenant-session.guard';
 import { TenantSessionGuard } from '../tenancy/tenant-session.guard';
 import type { TenantSession } from '../tenancy/jwt-session';
@@ -124,28 +125,6 @@ const IDEMPOTENCY_HEADER = [
 ];
 
 /**
- * Multer's own middleware errors never reach this filter as MulterError —
- * platform-express' FileInterceptor transforms LIMIT_FILE_SIZE into a plain
- * 413 PayloadTooLargeException first. This route-scoped filter intercepts
- * that shape and translates it: an oversized upload surfaces as 422
- * `import-too-large` problem-details, not a bare 413. Anything else is
- * rethrown for the global problem-details filter.
- */
-@Catch(PayloadTooLargeException)
-export class CatalogUploadFilter implements ExceptionFilter {
-  // The 413's own body is multer's internal message — the translated problem
-  // details carry the documented cap wording instead.
-  catch(): void {
-    throw new ProblemException(
-      'import-too-large',
-      422,
-      'Import exceeds the row or size cap',
-      `The file exceeds the ${MAX_IMPORT_BYTES}-byte (${MAX_IMPORT_BYTES / (1024 * 1024)} MB) cap.`,
-    );
-  }
-}
-
-/**
  * Catalog HTTP surface (Story 1.4): the synchronous multipart CSV/XLSX import
  * with partial commit, the SKU list, and the individual SKU edit. Same
  * patterns as the tenancy controller: ValidationPipe-enforced DTOs, the
@@ -167,7 +146,7 @@ export class CatalogController {
   @Post(':tenantId/catalog/imports')
   @HttpCode(HttpStatus.CREATED)
   @UseGuards(TenantSessionGuard)
-  @UseFilters(CatalogUploadFilter)
+  @UseFilters(SheetUploadFilter)
   @UseInterceptors(FileInterceptor('file', { limits: { fileSize: MAX_IMPORT_BYTES } }))
   @ApiBearerAuth()
   @ApiConsumes('multipart/form-data')
