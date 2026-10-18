@@ -94,7 +94,12 @@ export type RejectedOpType =
   // line whose SKU belongs to another client — `sku-client-mismatch`).
   // SERVER-RAISED only (the device never uploads it: the op settled 201);
   // Discard ONLY — re-receive the units on the right client.
-  | 'grn.lines-refused';
+  | 'grn.lines-refused'
+  // Story 1-2b (decision 5) — a goods receipt's SHORT-DATED lines
+  // (`shelf-life-short`), refused per line into their own row.
+  // SERVER-RAISED only. Apply (with a mandatory note) re-runs exactly those
+  // lines with the shelf-life rule waived for that receipt only; or Discard.
+  | 'grn.shelf-life-refused';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -106,6 +111,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'count.submit',
   'return.receive',
   'grn.lines-refused',
+  'grn.shelf-life-refused',
 ];
 
 /**
@@ -113,7 +119,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
  * refused part, §7g). A device upload naming one is refused like
  * `self-test.echo`: nothing on the device produces it.
  */
-const SERVER_RAISED_ONLY_OP_TYPES: readonly RejectedOpType[] = ['grn.lines-refused'];
+const SERVER_RAISED_ONLY_OP_TYPES: readonly RejectedOpType[] = ['grn.lines-refused', 'grn.shelf-life-refused'];
 
 /**
  * The resolve arms (the spec's human-judgment vocabulary — the DB statuses
@@ -148,7 +154,14 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   // the remedy is to receive the units again under the right client; Discard
   // records that the reviewer dealt with them and books nothing.
   'grn.lines-refused': ['discard'],
+  // Story 1-2b (decision 5) — the short-dated lines: Apply re-runs them with
+  // the shelf-life rule waived (needs a note — 400 without one), or Discard.
+  // No recount: the refusal is about the goods' dates, not a bin.
+  'grn.shelf-life-refused': ['apply', 'discard'],
 };
+
+/** Story 1-2b — the resolve note's ceiling (code points), trimmed. */
+export const RESOLVE_NOTE_MAX = 500;
 
 /** The op types the apply arm can re-execute (every type admitting `apply`). */
 type ApplicableOpType = Exclude<RejectedOpType, 'return.receive' | 'grn.lines-refused'>;
@@ -246,6 +259,12 @@ export interface ResolveRejectedOpCommand {
   /** The arm: re-execute, re-plan the bin via the count core, or discard. */
   readonly decision: RejectedOpDecision;
   readonly occurredAt?: string | undefined;
+  /**
+   * Story 1-2b — the reviewer's note. REQUIRED to apply a
+   * `grn.shelf-life-refused` row (400 without one — the row stays open);
+   * accepted and recorded on every other decision. Hashed only when present.
+   */
+  readonly note?: string | undefined;
 }
 
 export interface ResolveRejectedOpSnapshot {
@@ -315,6 +334,16 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['rmaCode', 'string-or-null'],
     ['entries', 'array'],
     ['refusals', 'array-or-absent'],
+  ],
+  // Story 1-2b — server-raised: the ORIGINAL receipt's header (what Apply
+  // re-runs) plus only the short-dated lines, aligned with `refusals`.
+  'grn.shelf-life-refused': [
+    ['warehouseId', 'uuid'],
+    ['poId', 'uuid-or-null'],
+    ['asnId', 'uuid-or-null'],
+    ['blindReasonCode', 'string-or-null'],
+    ['lines', 'array'],
+    ['refusals', 'array'],
   ],
   // Story 1-1 — server-raised: the receipt, its client and the refused lines
   // aligned with `refusals`.
@@ -872,10 +901,14 @@ export class SyncReportCommand {
   // ── resolveRejectedOp (review.decide — owner + ops_manager) ─────────────
 
   resolveRejectedOpFingerprint(command: ResolveRejectedOpCommand): string {
+    const note = normalizeResolveNote(command.note);
     return hashCommandPayload({
       rejectedOpId: command.rejectedOpId,
       decision: command.decision,
       occurredAt: command.occurredAt,
+      // Story 1-2b — the 8-1d conditional key: present only when a note was
+      // given (trimmed, blank = absent), so every older resolve hashes as before.
+      ...(note === undefined ? {} : { note }),
     });
   }
 
@@ -927,6 +960,15 @@ export class SyncReportCommand {
           `occurredAt must be a Z-suffixed ISO-8601 UTC timestamp (got "${command.occurredAt}").`,
         );
       }
+    }
+    const note = normalizeResolveNote(command.note);
+    if (note !== undefined && [...note].length > RESOLVE_NOTE_MAX) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'The note is too long',
+        `note is at most ${RESOLVE_NOTE_MAX} characters (got ${[...note].length}).`,
+      );
     }
     if (!REJECTED_OP_DECISION_SET.has(command.decision)) {
       throw new ProblemException(
@@ -1004,8 +1046,22 @@ export class SyncReportCommand {
                 ? ' Create a return authorization for these units, then receive them again.'
                 : row.opType === 'grn.lines-refused'
                   ? " Receive these units again on a receipt for their own client."
-                  : ''),
+                  : row.opType === 'grn.shelf-life-refused'
+                    ? ' Accept the short-dated lines anyway (with a note), or discard them.'
+                    : ''),
             { decisions: [...admitted] },
+          );
+        }
+
+        // Story 1-2b (decision 5) — accepting short-dated goods is a
+        // recorded judgment: Apply on a shelf-life row needs a note. 400
+        // here rolls back — the row stays open.
+        if (row.opType === 'grn.shelf-life-refused' && command.decision === 'apply' && note === undefined) {
+          throw new ProblemException(
+            'validation-failed',
+            400,
+            'A note is required',
+            'Accepting short-dated goods needs a note saying why (note) — the row stays open.',
           );
         }
 
@@ -1021,7 +1077,7 @@ export class SyncReportCommand {
           // reporter attribution to the audit trail (the audit row + outbox
           // event below).
           status = 'discarded';
-          resolvedOutcome = { kind: 'discard' };
+          resolvedOutcome = { kind: 'discard', ...(note === undefined ? {} : { note }) };
         } else if (command.decision === 'recount') {
           // The movement recount core: the bin the payload names (a pick's
           // `binId`, or a placement's `toBinId` — payload-carried, the server
@@ -1098,8 +1154,16 @@ export class SyncReportCommand {
             // mid-arm replay the settled apply rather than re-write it.
             row.opId,
             payload,
+            { actorUserId: command.actorUserId, note },
           );
-          resolvedOutcome = { kind: 'applied', command: row.opType, snapshot: applied };
+          resolvedOutcome = {
+            kind: 'applied',
+            command: row.opType,
+            snapshot: applied,
+            // Story 1-2b — the reviewer's note rides the outcome (audit_events
+            // has no payload column), present only when given.
+            ...(note === undefined ? {} : { note }),
+          };
         }
 
         // The terminal transition is CONDITIONAL (the resolveCountVariance
@@ -1243,6 +1307,7 @@ export class SyncReportCommand {
     row: RejectedOp,
     idempotencyKey: string,
     payload: Record<string, unknown>,
+    resolver: { readonly actorUserId: string; readonly note: string | undefined },
   ): Promise<Record<string, unknown>> {
     const deviceId = row.deviceId;
     const operatorUserId = row.operatorUserId;
@@ -1295,6 +1360,30 @@ export class SyncReportCommand {
             // opOccurredAt stamp (the device-sealed instant).
             occurredAt: opTime,
             lines: payload.lines as unknown as GrnCommand['lines'],
+          },
+          idempotencyKey,
+        )) as unknown as Record<string, unknown>;
+      }
+      case 'grn.shelf-life-refused': {
+        // Story 1-2b (decision 5) — re-run ONLY the short-dated lines of the
+        // original receipt (its stored header), with the shelf-life rule
+        // waived for this receipt only; departed, tolerance, QC, the
+        // document state and late receipts apply as on any receipt. The
+        // waiver is set HERE and nowhere else (never on the HTTP DTO); the
+        // key is the row's own op id, so a re-apply after a crash replays.
+        return (await this.receiving.submitGoodsReceipt(
+          {
+            tenantId,
+            deviceId,
+            operatorUserId,
+            warehouseId: payload.warehouseId as string,
+            poId: (payload.poId ?? null) as string | null,
+            ...(typeof payload.asnId === 'string' ? { asnId: payload.asnId } : {}),
+            blindReasonCode: (payload.blindReasonCode ?? null) as string | null,
+            ...(typeof payload.clientId === 'string' ? { clientId: payload.clientId } : {}),
+            occurredAt: opTime,
+            lines: payload.lines as unknown as GrnCommand['lines'],
+            shelfLifeWaiver: { byUserId: resolver.actorUserId, note: resolver.note ?? '' },
           },
           idempotencyKey,
         )) as unknown as Record<string, unknown>;
@@ -1423,3 +1512,10 @@ export class SyncReportCommand {
 type GrnCommand = Parameters<ReceivingFacade['submitGoodsReceipt']>[0];
 type PackCommand = Parameters<OutboundFacade['packOrder']>[0];
 type CountSubmitCommand = Parameters<MovementsFacade['submitCount']>[0];
+
+/** Story 1-2b — a resolve note, trimmed; blank or absent = undefined. */
+function normalizeResolveNote(note: string | undefined): string | undefined {
+  if (typeof note !== 'string') return undefined;
+  const trimmed = note.trim();
+  return trimmed === '' ? undefined : trimmed;
+}

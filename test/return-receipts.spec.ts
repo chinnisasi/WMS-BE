@@ -859,10 +859,20 @@ describe('return receipts (e2e, story 13-2)', () => {
   // Story 1-1 adds a second Discard-only type, the server-raised
   // `grn.lines-refused` (a blind receipt's line of another client); every
   // pre-13-2 type still keeps all three — the property this pins.
-  it('the per-type decision rule: every pre-13-2 op type keeps all three decisions; return.receive and grn.lines-refused only discard', () => {
+  // Story 1-2b adds a third server-raised type with its OWN rule, the
+  // `grn.shelf-life-refused` row: apply (with a note) and discard, no recount.
+  // The property this test pins — every pre-13-2 type keeps all three — is
+  // unchanged; the new type is named here explicitly rather than folded in.
+  it('the per-type decision rule: every pre-13-2 op type keeps all three decisions; return.receive and grn.lines-refused only discard; grn.shelf-life-refused apply + discard', () => {
     const discardOnly = new Set(['return.receive', 'grn.lines-refused']);
     for (const type of REJECTED_OP_TYPES) {
-      expect(REJECTED_OP_DECISIONS_BY_TYPE[type]).toEqual(discardOnly.has(type) ? ['discard'] : ['apply', 'recount', 'discard']);
+      const expected =
+        type === 'grn.shelf-life-refused'
+          ? ['apply', 'discard']
+          : discardOnly.has(type)
+            ? ['discard']
+            : ['apply', 'recount', 'discard'];
+      expect(REJECTED_OP_DECISIONS_BY_TYPE[type]).toEqual(expected);
     }
   });
 

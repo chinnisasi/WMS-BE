@@ -33,6 +33,59 @@ export interface ClientSnapshot {
   readonly registeredAddress: ClientRegisteredAddress | null;
   /** Story 1-2a — the return-to address, in the shipment shape (null when unset). */
   readonly returnAddress: AddressSnapshot | null;
+  /**
+   * Story 1-2b — the client's receiving policy. OPTIONAL on the type: a
+   * `ClientMutationSnapshot` stored in an idempotency key before 1-2b replays
+   * without it (every fresh read carries it).
+   */
+  readonly receivingPolicy?: ClientReceivingPolicy;
+}
+
+/**
+ * Story 1-2b — how a client's goods are received: the over-receipt
+ * tolerance (basis points of the ordered / announced quantity that book at
+ * once), QC on receipt, expiry required on batch-tracked lines and the
+ * minimum remaining shelf life (IST calendar days, only beside
+ * `expiryRequired`). The defaults reproduce the pre-1-2b receipt exactly.
+ */
+export interface ClientReceivingPolicy {
+  readonly receivingToleranceBps: number;
+  readonly qcOnReceipt: boolean;
+  readonly expiryRequired: boolean;
+  readonly minShelfLifeDays: number | null;
+}
+
+/** Story 1-2b — the policy every client starts with: the pre-1-2b receipt. */
+export const DEFAULT_RECEIVING_POLICY: ClientReceivingPolicy = {
+  receivingToleranceBps: 0,
+  qcOnReceipt: false,
+  expiryRequired: false,
+  minShelfLifeDays: null,
+};
+
+/** Story 1-2b — the policy columns of a client row. */
+export function receivingPolicyOf(row: {
+  readonly receivingToleranceBps: number;
+  readonly qcOnReceipt: boolean;
+  readonly expiryRequired: boolean;
+  readonly minShelfLifeDays: number | null;
+}): ClientReceivingPolicy {
+  return {
+    receivingToleranceBps: row.receivingToleranceBps,
+    qcOnReceipt: row.qcOnReceipt,
+    expiryRequired: row.expiryRequired,
+    minShelfLifeDays: row.minShelfLifeDays,
+  };
+}
+
+/** Story 1-2b — true when the policy is exactly the pre-1-2b receipt. */
+export function isDefaultReceivingPolicy(policy: ClientReceivingPolicy): boolean {
+  return (
+    policy.receivingToleranceBps === 0 &&
+    !policy.qcOnReceipt &&
+    !policy.expiryRequired &&
+    policy.minShelfLifeDays === null
+  );
 }
 
 /** Story 1-2a — a client's registered address (the billing columns' shapes). */
@@ -135,6 +188,7 @@ export function toClientSnapshot(row: typeof clients.$inferSelect): ClientSnapsh
       state: row.returnState,
       pincode: row.returnPincode,
     }),
+    receivingPolicy: receivingPolicyOf(row),
   };
 }
 
@@ -168,7 +222,7 @@ export class ClientsFacade {
   async snapshotClients(
     tenantId: string,
     clientIds: readonly string[],
-  ): Promise<{ id: string; code: string; name: string; active: boolean }[]> {
+  ): Promise<{ id: string; code: string; name: string; active: boolean; receivingPolicy: ClientReceivingPolicy }[]> {
     const wanted = [...new Set(clientIds)];
     if (wanted.length === 0) {
       return [];
@@ -177,12 +231,29 @@ export class ClientsFacade {
     // would lose clients past `MAX_CLIENT_LIST`.
     const rows = await withTenantTransaction(this.db, tenantId, (tx) =>
       tx
-        .select({ id: clients.id, code: clients.code, name: clients.name, status: clients.status })
+        .select({
+          id: clients.id,
+          code: clients.code,
+          name: clients.name,
+          status: clients.status,
+          // Story 1-2b — the receiving policy rides to the handheld so it can
+          // WARN (never block) at the dock; the server decides on replay.
+          receivingToleranceBps: clients.receivingToleranceBps,
+          qcOnReceipt: clients.qcOnReceipt,
+          expiryRequired: clients.expiryRequired,
+          minShelfLifeDays: clients.minShelfLifeDays,
+        })
         .from(clients)
         .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, wanted)))
         .orderBy(desc(clients.systemOwned), asc(clients.code)),
     );
-    return rows.map((client) => ({ id: client.id, code: client.code, name: client.name, active: client.status === 'active' }));
+    return rows.map((client) => ({
+      id: client.id,
+      code: client.code,
+      name: client.name,
+      active: client.status === 'active',
+      receivingPolicy: receivingPolicyOf(client),
+    }));
   }
 
   /**
@@ -199,6 +270,30 @@ export class ClientsFacade {
         .where(and(eq(clientContacts.tenantId, tenantId), eq(clientContacts.clientId, clientId)))
         .orderBy(desc(clientContacts.isPrimary), asc(clientContacts.name), asc(clientContacts.id));
       return rows.map(toClientContactSnapshot);
+    });
+  }
+
+  /**
+   * Story 1-2b — one client's receiving policy, 404 when the client is not
+   * this tenant's. A staff read (any operator session — never the portal).
+   */
+  async getReceivingPolicy(tenantId: string, clientId: string): Promise<ClientReceivingPolicy> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({
+          receivingToleranceBps: clients.receivingToleranceBps,
+          qcOnReceipt: clients.qcOnReceipt,
+          expiryRequired: clients.expiryRequired,
+          minShelfLifeDays: clients.minShelfLifeDays,
+        })
+        .from(clients)
+        .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
+        .limit(1);
+      const row = rows[0];
+      if (row === undefined) {
+        throw clientNotFound(clientId);
+      }
+      return receivingPolicyOf(row);
     });
   }
 
@@ -359,6 +454,35 @@ export async function departedClientsInTx(
     .orderBy(asc(clients.id))
     .for('key share');
   return new Map(rows.filter((row) => row.status === 'departed').map((row) => [row.id, clientLabel(row)]));
+}
+
+/**
+ * Story 1-2b — the receiving policies of `clientIds` (id → policy; an unknown
+ * id is absent). A plain read on the caller's transaction: a receipt reads
+ * the policy committed when it reads it — there is no serialisation against
+ * a policy edit (spec, read semantics). The receipt reads it ONCE, beside
+ * `departedClientsInTx`, before any document lock.
+ */
+export async function receivingPoliciesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientIds: readonly string[],
+): Promise<Map<string, ClientReceivingPolicy>> {
+  const distinct = [...new Set(clientIds)];
+  if (distinct.length === 0) {
+    return new Map();
+  }
+  const rows = await tx
+    .select({
+      id: clients.id,
+      receivingToleranceBps: clients.receivingToleranceBps,
+      qcOnReceipt: clients.qcOnReceipt,
+      expiryRequired: clients.expiryRequired,
+      minShelfLifeDays: clients.minShelfLifeDays,
+    })
+    .from(clients)
+    .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, distinct)));
+  return new Map(rows.map((row) => [row.id, receivingPolicyOf(row)]));
 }
 
 /**

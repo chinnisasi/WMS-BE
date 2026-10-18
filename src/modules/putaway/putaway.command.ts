@@ -11,8 +11,10 @@ import {
   goodsReceiptLines,
   goodsReceiptNotes,
   idempotencyKeys,
+  ledgerEvents,
   overReceipts,
   putawayPlacements,
+  qcHolds,
   serials,
   skus,
   stockOnHand,
@@ -354,10 +356,16 @@ export class PutawayCommand {
       // Story 21-9 (decision 4): the line's putaway quantity is its applied
       // slice PLUS every approved over-receipt excess of it — the task list
       // (`PutawayFacade.getPutawayTasksInTx`) derives work by the same rule.
-      const putawayQty = line.appliedQty + (await approvedExcessOfLineInTx(tx, command.tenantId, command.grnLineId));
+      // Story 1-2b (§7f amended): minus the units still on an open receipt
+      // QC hold of the line — they sit in the QC-HOLD bin, not Receiving.
+      const heldQty = await openReceiptHoldQtyOfLineInTx(tx, command.tenantId, command.grnLineId);
+      const putawayQty =
+        line.appliedQty + (await approvedExcessOfLineInTx(tx, command.tenantId, command.grnLineId)) - heldQty;
       if (putawayQty <= 0) {
         throw putawayValidation(
-          `GRN line "${command.grnLineId}" applied 0 units and has no approved over-receipt — nothing was put into the Receiving bin to place.`,
+          heldQty > 0
+            ? `GRN line "${command.grnLineId}" is on a QC-on-receipt hold — release the hold before placing its units.`
+            : `GRN line "${command.grnLineId}" applied 0 units and has no approved over-receipt — nothing was put into the Receiving bin to place.`,
         );
       }
       const skuRows = await tx
@@ -1717,6 +1725,70 @@ export function approvedExcessByLine(tx: TenantTx, tenantId: string, warehouseId
     )
     .groupBy(overReceipts.grnLineId)
     .as('approved_excess');
+}
+
+/**
+ * Story 1-2b — the units of each GRN line still on an OPEN receipt QC hold
+ * (QC on receipt), milli-units: the sum of each open `receipt` hold's own
+ * `qc.held` events, grouped by its GRN line — ONE grouped subquery per
+ * warehouse, left-joined beside the lines (the `approvedExcessByLine`
+ * shape). Held units sit in the QC-HOLD bin, so they are not putaway work:
+ * every derivation of work subtracts them (§7f as amended) — the task list,
+ * the placement bound and the Overview "awaiting putaway" tile. A manual
+ * hold never names a line and is not counted (it moved whatever it swept
+ * out of a storage bin, or out of Receiving — the on-hand bound covers it).
+ */
+export function openReceiptHoldQtyByLine(tx: TenantTx, tenantId: string, warehouseId: string) {
+  return tx
+    .select({
+      grnLineId: qcHolds.grnLineId,
+      heldQty: sql<string>`sum(abs(${ledgerEvents.quantityDelta}))::bigint`.as('receipt_held_qty'),
+    })
+    .from(qcHolds)
+    .innerJoin(
+      ledgerEvents,
+      and(
+        eq(ledgerEvents.tenantId, qcHolds.tenantId),
+        eq(ledgerEvents.warehouseId, qcHolds.warehouseId),
+        eq(ledgerEvents.type, 'qc.held'),
+        sql`${ledgerEvents.referenceDoc}->>'holdId' = ${qcHolds.id}::text`,
+      ),
+    )
+    .where(
+      and(
+        eq(qcHolds.tenantId, tenantId),
+        eq(qcHolds.warehouseId, warehouseId),
+        eq(qcHolds.kind, 'receipt'),
+        eq(qcHolds.status, 'open'),
+      ),
+    )
+    .groupBy(qcHolds.grnLineId)
+    .as('receipt_held');
+}
+
+/** Story 1-2b — the open receipt-hold units of ONE GRN line, milli-units (0 when none) — the placement's half. */
+export async function openReceiptHoldQtyOfLineInTx(tx: TenantTx, tenantId: string, grnLineId: string): Promise<number> {
+  const rows = await tx
+    .select({ heldQty: sql<string | null>`sum(abs(${ledgerEvents.quantityDelta}))::bigint` })
+    .from(qcHolds)
+    .innerJoin(
+      ledgerEvents,
+      and(
+        eq(ledgerEvents.tenantId, qcHolds.tenantId),
+        eq(ledgerEvents.warehouseId, qcHolds.warehouseId),
+        eq(ledgerEvents.type, 'qc.held'),
+        sql`${ledgerEvents.referenceDoc}->>'holdId' = ${qcHolds.id}::text`,
+      ),
+    )
+    .where(
+      and(
+        eq(qcHolds.tenantId, tenantId),
+        eq(qcHolds.grnLineId, grnLineId),
+        eq(qcHolds.kind, 'receipt'),
+        eq(qcHolds.status, 'open'),
+      ),
+    );
+  return Number(rows[0]?.heldQty ?? 0);
 }
 
 /**

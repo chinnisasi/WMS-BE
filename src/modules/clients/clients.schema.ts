@@ -37,3 +37,12 @@ export const MAX_CLIENT_LIST = 500;
 export const MAX_CLIENT_CONTACTS = 20;
 /** Story 1-2a — the contact name ceiling (the 0077 CHECK). */
 export const CLIENT_CONTACT_NAME_MAX = 120;
+/**
+ * Story 1-2b — the receiving policy's ranges, mirrored by the migration 0078
+ * CHECKs (`clients_receiving_tolerance_range`, `clients_min_shelf_life_range`)
+ * and the command's own named 400s. The tolerance is in BASIS POINTS
+ * (10000 = 100 %); the minimum remaining life in IST calendar days.
+ */
+export const RECEIVING_TOLERANCE_BPS_MAX = 10_000;
+export const MIN_SHELF_LIFE_DAYS_MIN = 1;
+export const MIN_SHELF_LIFE_DAYS_MAX = 3650;

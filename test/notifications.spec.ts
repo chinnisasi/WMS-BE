@@ -370,8 +370,9 @@ describe('notifications (e2e, story 9-2)', () => {
       // behaviour this suite pins unchanged; the ninth, the per-user
       // `audit-export`, is pinned in test/audit-export.spec.ts; the tenth
       // (story 9-3c), the owner-only `ledger-chain-break`, in
-      // test/ledger-integrity.spec.ts.
-      expect([...CASES.map((c) => c.sourceType), 'audit-export', 'ledger-chain-break']).toEqual([...NOTIFICATION_SOURCE_TYPES]);
+      // test/ledger-integrity.spec.ts; the eleventh (story 1-2b), the
+      // qc.manage-routed `qc-receipt`, in test/client-receiving-policy.spec.ts.
+      expect([...CASES.map((c) => c.sourceType), 'audit-export', 'ledger-chain-break', 'qc-receipt']).toEqual([...NOTIFICATION_SOURCE_TYPES]);
     });
 
     it('the subscriber listens for exactly the emitters’ event types (the new events pinned to their constants)', () => {
@@ -398,7 +399,8 @@ describe('notifications (e2e, story 9-2)', () => {
 
     it('routes by the capability that acts — never the payloads’ notifyRole hints', () => {
       expect(visibleSourceTypes('owner')).toEqual([...NOTIFICATION_SOURCE_TYPES]);
-      expect(visibleSourceTypes('ops_manager')).toEqual(['over-receipt', 'rejected-op', 'reorder-breach', 'batch-alert', 'qc-hold', 'channel-sync']);
+      // Story 1-2b — `qc-receipt` is routed by `qc.manage`, which the Ops Manager holds.
+      expect(visibleSourceTypes('ops_manager')).toEqual(['over-receipt', 'rejected-op', 'reorder-breach', 'batch-alert', 'qc-hold', 'channel-sync', 'qc-receipt']);
       expect(visibleSourceTypes('operator')).toEqual([]);
       expect(visibleSourceTypes('accountant')).toEqual([]);
       expect(visibleSourceTypes('client')).toEqual([]);

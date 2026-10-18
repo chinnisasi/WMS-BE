@@ -218,6 +218,16 @@ export class ResolveRejectedOpDto {
   @IsOptional()
   @IsString()
   occurredAt?: string;
+
+  @ApiProperty({
+    required: false,
+    maxLength: 500,
+    description:
+      "Story 1-2b — the reviewer's note (trimmed, at most 500 characters). REQUIRED to apply a `grn.shelf-life-refused` row — accepting short-dated goods (400 without one; the row stays open); recorded in the outcome on any decision",
+  })
+  @IsOptional()
+  @IsString()
+  note?: string;
 }
 
 export class RejectedOpResolveResponse {

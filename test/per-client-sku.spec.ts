@@ -765,10 +765,13 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
       const po = (res.body.openPurchaseOrders as { id: string; clientId: string }[]).find((p) => p.id === poId);
       expect(po?.clientId).toBe(beta);
       const clients = res.body.clients as { id: string; code: string; name: string; active: boolean }[];
+      // Story 1-2b added each client's receiving policy (additive; the
+      // defaults here) — the 1-1 fields are pinned unchanged beside it.
+      const defaults = { receivingToleranceBps: 0, qcOnReceipt: false, expiryRequired: false, minShelfLifeDays: null };
       expect(clients).toEqual(
         expect.arrayContaining([
-          { id: acme, code: 'ACME', name: 'Acme Apparel', active: true },
-          { id: beta, code: 'BETA', name: 'Beta Brands', active: true },
+          { id: acme, code: 'ACME', name: 'Acme Apparel', active: true, receivingPolicy: defaults },
+          { id: beta, code: 'BETA', name: 'Beta Brands', active: true, receivingPolicy: defaults },
         ]),
       );
       // Only referenced clients: the self client holds no SKU and no document here.

@@ -257,6 +257,81 @@ export class CatalogFacade {
     );
   }
 
+  /**
+   * Story 1-2b — how many of a client's SKUs are NOT batch-tracked (kits
+   * excluded — a kit never receives): the expiry rules of the client's
+   * receiving policy cover batch-tracked SKUs only, so the policy panel says
+   * how many it does not reach. A read in its own transaction; the api shell
+   * composes it beside the clients read (the clients module never imports
+   * catalog).
+   */
+  async countUntrackedSkus(tenantId: string, clientId: string): Promise<number> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const rows = await tx
+        .select({ n: sql<string>`count(*)::bigint` })
+        .from(skus)
+        .where(
+          and(
+            eq(skus.tenantId, tenantId),
+            eq(skus.clientId, clientId),
+            eq(skus.batchTracked, false),
+            sql`not exists (select 1 from kit_compositions k where k.tenant_id = ${skus.tenantId} and k.kit_sku_id = ${skus.id})`,
+          ),
+        );
+      return Number(rows[0]?.n ?? 0);
+    });
+  }
+
+  /**
+   * Story 1-2b — the existing batches named by `(skuId, code)` pairs, in the
+   * caller's transaction (an unknown pair is absent): the receipt reads each
+   * line's batch BEFORE the ensure, so an expiry rule decides against the
+   * batch's own expiry. Keyed `${skuId}:${code}`.
+   */
+  async batchesByCodesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    pairs: readonly { readonly skuId: string; readonly code: string }[],
+  ): Promise<Map<string, BatchIdentity>> {
+    const skuIds = [...new Set(pairs.map((pair) => pair.skuId))];
+    const codes = [...new Set(pairs.map((pair) => pair.code))];
+    if (skuIds.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .select({
+        id: batches.id,
+        skuId: batches.skuId,
+        code: batches.code,
+        mfgDate: batches.mfgDate,
+        expiryDate: batches.expiryDate,
+        status: batches.status,
+      })
+      .from(batches)
+      .where(and(eq(batches.tenantId, tenantId), inArray(batches.skuId, skuIds), inArray(batches.code, codes)));
+    const wanted = new Set(pairs.map((pair) => `${pair.skuId}:${pair.code}`));
+    const result = new Map<string, BatchIdentity>();
+    for (const row of rows) {
+      const key = `${row.skuId}:${row.code}`;
+      if (wanted.has(key)) {
+        result.set(key, { id: row.id, code: row.code, mfgDate: row.mfgDate, expiryDate: row.expiryDate, status: row.status });
+      }
+    }
+    return result;
+  }
+
+  /** Story 1-2b — batch id → code for a set of ids, in the caller's transaction (unknown ids absent). */
+  async batchCodesByIdsInTx(tx: TenantTx, tenantId: string, batchIds: readonly string[]): Promise<Map<string, string>> {
+    if (batchIds.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .select({ id: batches.id, code: batches.code })
+      .from(batches)
+      .where(and(eq(batches.tenantId, tenantId), inArray(batches.id, [...batchIds])));
+    return new Map(rows.map((row) => [row.id, row.code]));
+  }
+
   async getImportSummary(tenantId: string): Promise<CatalogImportSummary> {
     return withTenantTransaction(this.db, tenantId, async (tx) => {
       const skuRows = await tx
@@ -777,12 +852,23 @@ export class CatalogFacade {
     );
   }
 
-  /** The in-transaction body of `ensureBatches` (see above for the contract). */
+  /**
+   * The in-transaction body of `ensureBatches` (see above for the contract).
+   *
+   * Story 1-2b — `fillNullExpiry` (opt-in, used ONLY by receiving; manual
+   * movements are unchanged): an EXISTING batch whose expiry is null takes
+   * the input's expiry, by a conditional `UPDATE … WHERE expiry_date IS
+   * NULL`, and the re-select reads what won. This amends "ensure is
+   * creation, never edit" to *fill a null, never overwrite*: a non-null
+   * expiry is never rewritten, so a concurrent writer that filled it first
+   * keeps its value — the caller compares the resolved expiry with its own.
+   */
   async ensureBatchesInTx(
     tx: TenantTx,
     tenantId: string,
     skuId: string,
     inputs: readonly EnsureBatchInput[],
+    options: { readonly fillNullExpiry?: boolean } = {},
   ): Promise<BatchIdentity[]> {
     await this.assertSkuTracked(tx, tenantId, skuId, 'batchTracked', 'batch');
     const codes = [...new Set(inputs.map((input) => input.code))];
@@ -809,6 +895,26 @@ export class CatalogFacade {
         .onConflictDoNothing({
           target: [batches.tenantId, batches.skuId, batches.code],
         });
+      if (options.fillNullExpiry === true) {
+        for (const code of codes) {
+          const expiryDate = inputs.find((candidate) => candidate.code === code && candidate.expiryDate !== undefined)?.expiryDate;
+          if (expiryDate === undefined) {
+            continue;
+          }
+          // Fill a null, never overwrite: the predicate is the guarantee.
+          await tx
+            .update(batches)
+            .set({ expiryDate, updatedAt: sql`now()` })
+            .where(
+              and(
+                eq(batches.tenantId, tenantId),
+                eq(batches.skuId, skuId),
+                eq(batches.code, code),
+                sql`${batches.expiryDate} is null`,
+              ),
+            );
+        }
+      }
     }
     const rows =
       codes.length === 0

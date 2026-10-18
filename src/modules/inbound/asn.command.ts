@@ -363,7 +363,8 @@ export function asnLineSnapshot(row: AsnLine): AsnLineSnapshot {
     skuId: row.skuId,
     announcedQty: fromMilli(row.announcedQty),
     receivedQty: fromMilli(row.receivedQty),
-    openQty: fromMilli(row.announcedQty - row.receivedQty),
+    // Story 1-2b — clamped at 0 for display (see the PO line's).
+    openQty: fromMilli(Math.max(0, row.announcedQty - row.receivedQty)),
   };
 }
 

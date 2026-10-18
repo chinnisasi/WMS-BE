@@ -81,6 +81,8 @@ export const AUDIT_NO_OP_ARMS = {
   'clients.contactEdit:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'contact'),
   /** Story 1-2a — `ClientsCommand.updateAddresses` with nothing changed (stores the key). */
   'clients.addresses:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'client'),
+  /** Story 1-2b — `ClientsCommand.updateReceivingPolicy` with nothing changed (stores the key). */
+  'clients.receivingPolicy:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'client'),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&
@@ -223,6 +225,18 @@ export interface ExpectedAuditRow {
   readonly targetType: string;
   readonly targetId: string;
   readonly actorUserId: string;
+  /**
+   * Story 1-2b — the OTHER rows the same command writes under the key (a
+   * receipt placed on QC holds writes `goods_receipt.submitted` AND
+   * `qc_hold.receipt_placed`): the key's rows must be exactly the expected
+   * row plus these, each once. Absent = the expected row alone (9-3a).
+   */
+  readonly alongside?: readonly {
+    readonly action: string;
+    readonly targetType: string;
+    readonly targetId: string;
+    readonly actorUserId: string;
+  }[];
 }
 
 /**
@@ -230,7 +244,8 @@ export interface ExpectedAuditRow {
  * row under the key, with the action, the target and the actor, and an
  * `occurred_at` that is server time (within a minute of `created_at`). Call it
  * after the command, and again after replaying the same key: a replay writes
- * nothing, so the count stays one.
+ * nothing, so the count stays one. Story 1-2b: `alongside` names the other
+ * rows one command writes under the same key.
  */
 export async function expectAuditRow(expected: ExpectedAuditRow): Promise<void> {
   const sql = postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
@@ -242,22 +257,29 @@ export async function expectAuditRow(expected: ExpectedAuditRow): Promise<void> 
              abs(extract(epoch from (occurred_at - created_at)) * 1000)::float8 as drift_ms
       from audit_events
       where tenant_id = ${expected.tenantId} and reference = ${expected.key}`;
+    const byAction = (a: { action: string }, b: { action: string }): number => (a.action < b.action ? -1 : a.action > b.action ? 1 : 0);
     expect(
-      rows.map((row) => ({
-        action: row.action,
-        target_type: row.target_type,
-        target_id: row.target_id,
-        actor_user_id: row.actor_user_id,
-      })),
-    ).toEqual([
-      {
-        action: expected.action,
-        target_type: expected.targetType,
-        target_id: expected.targetId,
-        actor_user_id: expected.actorUserId,
-      },
-    ]);
-    expect(rows[0]!.drift_ms).toBeLessThan(60_000);
+      rows
+        .map((row) => ({
+          action: row.action,
+          target_type: row.target_type,
+          target_id: row.target_id,
+          actor_user_id: row.actor_user_id,
+        }))
+        .sort(byAction),
+    ).toEqual(
+      [expected, ...(expected.alongside ?? [])]
+        .map((row) => ({
+          action: row.action,
+          target_type: row.targetType,
+          target_id: row.targetId,
+          actor_user_id: row.actorUserId,
+        }))
+        .sort(byAction),
+    );
+    for (const row of rows) {
+      expect(row.drift_ms).toBeLessThan(60_000);
+    }
   } finally {
     await sql.end();
   }

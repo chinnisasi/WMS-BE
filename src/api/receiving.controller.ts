@@ -34,6 +34,8 @@ import {
   QcHoldListQuery,
   QcHoldListResponse,
   QcHoldResponse,
+  ReleaseReceiptHoldsDto,
+  ReleaseReceiptHoldsResponse,
 } from '../modules/inbound/qc.dto';
 import { assertInstantRange } from '../shared/primitives/instant-range';
 const IDEMPOTENCY_HEADER = [
@@ -131,6 +133,9 @@ export class ReceivingController {
           skuId: line.skuId,
           batchCode: line.batchCode ?? null,
           mfgDate: line.mfgDate ?? null,
+          // Story 1-2b: the label's expiry (an IST date). Absent and null
+          // hash identically (the command folds it `?? undefined`).
+          ...(line.expiryDate === undefined || line.expiryDate === null ? {} : { expiryDate: line.expiryDate }),
           // Story 10.2: BASE units cross this edge. The receiving command
           // scales each line behind its replay lookup, once it has read the
           // line's SKU and therefore the unit's declared precision.
@@ -464,6 +469,39 @@ export class ReceivingController {
     return { qcHold: { ...snapshot.qcHold } };
   }
 
+  @Post(':tenantId/receiving/qc-holds/release-receipt')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 1-2b — releases EVERY open QC-on-receipt hold of one goods receipt in one transaction (qc.manage) — each hold's own qc.released arms return its units to the Receiving bin, where they become putaway work; one audit row; the receipt's notification resolves",
+  })
+  @ApiBody({ type: ReleaseReceiptHoldsDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ReleaseReceiptHoldsResponse, description: 'The released holds (a matching Idempotency-Key replays it)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed grnId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No goods receipt with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The receipt has no open QC-on-receipt hold (qc-hold-released), a hold\'s origin bin is gone (qc-hold-origin-bin-gone), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async releaseReceiptHolds(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: ReleaseReceiptHoldsDto,
+  ): Promise<ReleaseReceiptHoldsResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.qc.releaseReceiptHolds(
+      { tenantId, actorUserId: session.userId, grnId: dto.grnId },
+      key,
+    );
+    return { grnId: snapshot.grnId, grnCode: snapshot.grnCode, qcHolds: snapshot.qcHolds.map((hold) => ({ ...hold })) };
+  }
+
   @Get(':tenantId/receiving/qc-holds')
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
@@ -491,6 +529,7 @@ export class ReceivingController {
     const page = await this.qc.listQcHolds(tenantId, {
       warehouseId: query.warehouseId,
       status: query.status,
+      grnId: query.grnId,
       cursor: query.cursor,
       limit: query.limit,
     });

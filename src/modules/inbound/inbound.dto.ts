@@ -283,7 +283,8 @@ export class PurchaseOrderLineDto {
   receivedQty!: number;
 
   @ApiProperty({
-    description: 'Derived: orderedQty − receivedQty (may go negative after an approved over-receipt — Story 3.3 relaxes the 3.1 `minimum: 0` bound)',
+    description: 'Derived: orderedQty − receivedQty, clamped at 0 for display (story 1-2b — received may pass ordered after an approved over-receipt or a within-tolerance receipt)',
+    minimum: 0,
   })
   openQty!: number;
 
@@ -518,7 +519,7 @@ export class AsnLineDto {
   @ApiProperty({ description: 'Received to date in base UoM', minimum: 0 })
   receivedQty!: number;
 
-  @ApiProperty({ description: 'Derived: announcedQty − receivedQty (negative after an approved over-receipt)' })
+  @ApiProperty({ description: 'Derived: announcedQty − receivedQty, clamped at 0 for display (story 1-2b — received may pass announced after an approved over-receipt or a within-tolerance receipt)', minimum: 0 })
   openQty!: number;
 }
 

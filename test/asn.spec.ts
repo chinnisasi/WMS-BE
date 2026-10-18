@@ -570,7 +570,8 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
       expect(approved.body.overReceipt).toMatchObject({ status: 'approved', asnId: asn.id, asnLineId: lineId, asnCode: asn.code });
       const final = (await getAsn(asn.id).expect(200)).body.asn;
       expect(final).toMatchObject({ status: 'received', receivedTotal: 110 });
-      expect(final.lines[0]).toMatchObject({ receivedQty: 110, openQty: -10 });
+      // Story 1-2b — openQty is clamped at 0 for display (it was −10 here).
+      expect(final.lines[0]).toMatchObject({ receivedQty: 110, openQty: 0 });
 
       // Every grn.received names the ASN and its line — submit AND approve.
       const grnIds = [first.body, second.body].map((b) => (b.goodsReceipt as { id: string }).id);

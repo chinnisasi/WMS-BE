@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, Put, UseGuards } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -23,18 +23,21 @@ import {
   ClientContactListResponse,
   ClientContactResponse,
   ClientListResponse,
+  ClientReceivingPolicyResponse,
   ClientResponse,
   CreateClientContactDto,
   CreateClientDto,
   RenameClientDto,
   UpdateClientAddressesDto,
   UpdateClientContactDto,
+  UpdateClientReceivingPolicyDto,
   UpdateClientStatusDto,
   UpdateClientTaxDetailsDto,
 } from './clients.dto';
 import type { ClientContactDto, ClientDto } from './clients.dto';
 import type { ClientContactSnapshot } from '../modules/clients/clients.facade';
 import { toAddressDto } from '../modules/tenancy/tenancy.dto';
+import { CatalogFacade } from '../modules/catalog/catalog.facade';
 
 const IDEMPOTENCY_HEADER = [
   {
@@ -58,6 +61,9 @@ export class ClientsController {
   constructor(
     @Inject(ClientsCommand) private readonly command: ClientsCommand,
     @Inject(ClientsFacade) private readonly facade: ClientsFacade,
+    // Story 1-2b — the policy read's `untrackedSkuCount` is composed HERE
+    // (the api shell): the clients module must not import catalog.
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
   ) {}
 
   @Get(':tenantId/clients')
@@ -290,6 +296,78 @@ export class ClientsController {
         clientId,
         registered: dto.registered,
         returnAddress: dto.return,
+      },
+      key,
+    );
+    return { client: toClientDto(snapshot.client) };
+  }
+
+  // ── Story 1-2b — the receiving policy (literal segment under :clientId) ──
+
+  @Get(':tenantId/clients/:clientId/receiving-policy')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Reads a client's receiving policy — tolerance (basis points), QC on receipt, expiry required, minimum remaining shelf life — plus how many of its SKUs are untracked (any staff session; never the portal)",
+  })
+  @ApiOkResponse({ type: ClientReceivingPolicyResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed clientId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async getReceivingPolicy(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ClientReceivingPolicyResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    const policy = await this.facade.getReceivingPolicy(tenantId, clientId);
+    const untrackedSkuCount = await this.catalog.countUntrackedSkus(tenantId, clientId);
+    return { clientId, ...policy, untrackedSkuCount };
+  }
+
+  @Put(':tenantId/clients/:clientId/receiving-policy')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Replaces a client's receiving policy whole (owner-only, clients.manage). Allowed on the self client and on a departed one. An unchanged policy is a no-op (nothing written or audited; the key is stored)",
+  })
+  @ApiBody({ type: UpdateClientReceivingPolicyDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ClientResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed clientId, or a field that breaks its rule — a tolerance outside 0-10000 basis points, a minimum shelf life outside 1-3650 days or without expiryRequired (validation-failed, naming the field)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage — owner only (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async updateReceivingPolicy(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UpdateClientReceivingPolicyDto,
+  ): Promise<ClientResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.updateReceivingPolicy(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        clientId,
+        receivingToleranceBps: dto.receivingToleranceBps,
+        qcOnReceipt: dto.qcOnReceipt,
+        expiryRequired: dto.expiryRequired,
+        minShelfLifeDays: dto.minShelfLifeDays ?? null,
       },
       key,
     );

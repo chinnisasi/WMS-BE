@@ -580,11 +580,12 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       .get(`${API}/${tenantId}/inbound/purchase-orders/${first.poId}`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .expect(200);
-    // received = 100 applied at submit + 20 approved = 120 → open −20
-    // (derived, negative — the relaxed OpenAPI bound).
+    // received = 100 applied at submit + 20 approved = 120. Story 1-2b
+    // changed the display deliberately (spec: "the PO and ASN reads clamp
+    // openQty at 0"): it was −20 here; received past ordered now reads 0.
     expect((detail.body.purchaseOrder as { lines: { receivedQty: number; openQty: number }[] }).lines[0]).toMatchObject({
       receivedQty: 120,
-      openQty: -20,
+      openQty: 0,
     });
 
     // A second decision is a deterministic 409 (already decided).

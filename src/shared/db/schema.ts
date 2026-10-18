@@ -354,6 +354,29 @@ export const clients = pgTable(
     returnCity: text('return_city'),
     returnState: text('return_state'),
     returnPincode: text('return_pincode'),
+    /**
+     * Story 1-2b — the client's RECEIVING policy, enforced by the one receipt
+     * command (`grn.submit`) for web, handheld and offline replay alike. The
+     * defaults reproduce the pre-1-2b receipt exactly. The CHECKs
+     * (`clients_receiving_tolerance_range`, `clients_min_shelf_life_range`,
+     * `clients_min_shelf_life_needs_expiry`) live ONLY in
+     * `drizzle/0078_client_receiving_policy.sql`. Written only by
+     * `ClientsCommand.updateReceivingPolicy` (`clients.manage`).
+     *
+     * `receiving_tolerance_bps`: an over-receipt within this many basis
+     * points of the ordered/announced quantity books at once (0–10000).
+     */
+    receivingToleranceBps: integer('receiving_tolerance_bps').notNull().default(0),
+    /** Story 1-2b — every booked line is put on a receipt-scoped QC hold. */
+    qcOnReceipt: boolean('qc_on_receipt').notNull().default(false),
+    /** Story 1-2b — a batch-tracked line must carry (or find) an expiry date. */
+    expiryRequired: boolean('expiry_required').notNull().default(false),
+    /**
+     * Story 1-2b — the minimum remaining shelf life, in IST calendar days from
+     * the receipt's business date to the expiry date (1–3650; only beside
+     * `expiry_required`).
+     */
+    minShelfLifeDays: integer('min_shelf_life_days'),
   },
   (table) => [
     uniqueIndex('clients_tenant_id_code_unique').on(table.tenantId, table.code),
@@ -2206,6 +2229,13 @@ export const goodsReceiptLines = pgTable(
     /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */
     qty: bigint('qty', { mode: 'number' }).notNull(),
     appliedQty: bigint('applied_qty', { mode: 'number' }).notNull().default(0),
+    /**
+     * Story 1-2b — the part of `applied_qty` that exceeded the open
+     * ordered/announced quantity but sat within the client's receiving
+     * tolerance, so it booked at once (no `over_receipts` row). Milli-units;
+     * 0 ≤ tolerance_qty ≤ applied_qty (CHECK in migration 0078 only).
+     */
+    toleranceQty: bigint('tolerance_qty', { mode: 'number' }).notNull().default(0),
     ...tenantTimestamps,
   },
   (table) => [
@@ -2393,14 +2423,29 @@ export const qcHolds = pgTable(
     heldAt: timestamp('held_at', { withTimezone: true, mode: 'string' }).notNull(),
     releasedBy: uuid('released_by'),
     releasedAt: timestamp('released_at', { withTimezone: true, mode: 'string' }),
+    /**
+     * Story 1-2b — `manual` (an Ops Manager's or an excursion's scope hold)
+     * or `receipt` (QC on receipt: one hold per booked GRN line, placed by
+     * the receipt itself). `kind = 'receipt'` ⇔ `grn_line_id IS NOT NULL`
+     * (CHECK `qc_holds_kind_pairing`, migration 0078 only).
+     */
+    kind: text('kind').notNull().default('manual'),
+    /** Story 1-2b — the GRN line a receipt hold holds (null on a manual hold). */
+    grnLineId: uuid('grn_line_id'),
+    /** Story 1-2b — set when the receipt hold holds an APPROVED over-receipt's excess. */
+    overReceiptId: uuid('over_receipt_id'),
     ...tenantTimestamps,
   },
   (table) => [
-    // One open hold per (tenant, warehouse, sku, bin) scope — the DB backstop
-    // (the command's 409 `qc-hold-open` checks first; the index catches races).
+    // One open MANUAL hold per (tenant, warehouse, sku, bin) scope — the DB
+    // backstop (the command's 409 `qc-hold-open` checks first; the index
+    // catches races). Story 1-2b: receipt holds are line-scoped and never
+    // take part in the one-per-scope rule.
     uniqueIndex('qc_holds_open_scope_unique')
       .on(table.tenantId, table.warehouseId, table.skuId, table.binId)
-      .where(sql`status = 'open'`),
+      .where(sql`status = 'open' AND kind = 'manual'`),
+    // Story 1-2b — a GRN line's receipt holds (putaway work, release-receipt).
+    index('qc_holds_tenant_grn_line_idx').on(table.tenantId, table.grnLineId),
     // The holds-list read (status filter first).
     index('qc_holds_tenant_status_created_at_id_idx').on(
       table.tenantId,

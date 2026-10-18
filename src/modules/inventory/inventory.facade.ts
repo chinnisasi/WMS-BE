@@ -2093,6 +2093,45 @@ export class InventoryFacade {
   }
 
   /**
+   * Story 1-2b — per hold, the quantity its OWN `qc.held` events moved into
+   * QC (milli-units) and the distinct batch refs they carried — the holds
+   * list's "held quantity" and batch columns, one grouped read over the
+   * page's hold ids (never per row). An id with no events is absent.
+   */
+  async qcHeldTotalsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    holdIds: readonly string[],
+  ): Promise<Map<string, { readonly quantity: number; readonly batchRefs: readonly (string | null)[] }>> {
+    if (holdIds.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .select({
+        holdId: sql<string>`${ledgerEvents.referenceDoc}->>'holdId'`,
+        batchRef: ledgerEvents.batchRef,
+        quantity: sql<string>`sum(abs(${ledgerEvents.quantityDelta}))::bigint`,
+      })
+      .from(ledgerEvents)
+      .where(
+        and(
+          eq(ledgerEvents.tenantId, tenantId),
+          eq(ledgerEvents.type, 'qc.held'),
+          inArray(sql`${ledgerEvents.referenceDoc}->>'holdId'`, [...holdIds]),
+        ),
+      )
+      .groupBy(sql`${ledgerEvents.referenceDoc}->>'holdId'`, ledgerEvents.batchRef);
+    const totals = new Map<string, { quantity: number; batchRefs: (string | null)[] }>();
+    for (const row of rows) {
+      const entry = totals.get(row.holdId) ?? { quantity: 0, batchRefs: [] };
+      entry.quantity += Number(row.quantity);
+      entry.batchRefs.push(row.batchRef);
+      totals.set(row.holdId, entry);
+    }
+    return totals;
+  }
+
+  /**
    * A hold's own `qc.held` arms (Story 3.4): the events the hold placed,
    * oldest first — the release replays exactly these (same batch refs, same
    * magnitudes) so a concurrent hold of the same SKU from another origin bin

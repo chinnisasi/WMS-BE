@@ -172,4 +172,12 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'client.contact_added', targetType: 'client' },
   { action: 'client.contact_edited', targetType: 'client' },
   { action: 'client.contact_removed', targetType: 'client' },
+  // Story 1-2b — the receiving policy (`ClientsCommand.updateReceivingPolicy`),
+  // a shelf-life refusal accepted from review (the re-run receipt, actor the
+  // reviewer), and QC on receipt: ONE row per receipt (or approved excess)
+  // placed on holds and ONE per receipt released — each targeting the GRN.
+  { action: 'client.receiving_policy_updated', targetType: 'client' },
+  { action: 'goods_receipt.shelf_life_waived', targetType: 'goods_receipt' },
+  { action: 'qc_hold.receipt_placed', targetType: 'goods_receipt' },
+  { action: 'qc_hold.receipt_released', targetType: 'goods_receipt' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

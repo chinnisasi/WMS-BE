@@ -30,7 +30,7 @@ import type {
   PutawayPlacementSnapshot,
   PlacePutawayCommand,
 } from './putaway.command';
-import { approvedExcessByLine, binCandidatesInTx, candidateFitsSku } from './putaway.command';
+import { approvedExcessByLine, binCandidatesInTx, candidateFitsSku, openReceiptHoldQtyByLine } from './putaway.command';
 import { fromMilli } from '../../shared/primitives/quantity';
 
 export const DEFAULT_PUTAWAY_PAGE_SIZE = 50;
@@ -256,7 +256,13 @@ export class PutawayFacade {
     // `grn.received`, and GRN lines stay immutable, so the approval rows are
     // summed beside them (one aggregate for the warehouse, never per line).
     const approvedExcess = approvedExcessByLine(tx, tenantId, warehouseId);
-    const putawayQty = sql<string>`(${goodsReceiptLines.appliedQty} + coalesce(${approvedExcess.excessQty}, 0))::bigint`;
+    // Story 1-2b (§7f amended): minus the units of the line still on an OPEN
+    // receipt QC hold — they sit in the QC-HOLD bin, not Receiving, and
+    // become work again when the hold is released. A pooled (sku, batch)
+    // held line therefore shows no task while an earlier unheld line of the
+    // same (sku, batch) keeps its own.
+    const receiptHeld = openReceiptHoldQtyByLine(tx, tenantId, warehouseId);
+    const putawayQty = sql<string>`(${goodsReceiptLines.appliedQty} + coalesce(${approvedExcess.excessQty}, 0) - coalesce(${receiptHeld.heldQty}, 0))::bigint`;
     const lineRows = (
       await tx
         .select({
@@ -271,6 +277,7 @@ export class PutawayFacade {
         .from(goodsReceiptLines)
         .innerJoin(goodsReceiptNotes, eq(goodsReceiptNotes.id, goodsReceiptLines.grnId))
         .leftJoin(approvedExcess, eq(approvedExcess.grnLineId, goodsReceiptLines.id))
+        .leftJoin(receiptHeld, eq(receiptHeld.grnLineId, goodsReceiptLines.id))
         .where(
           and(
             eq(goodsReceiptNotes.tenantId, tenantId),

@@ -78,6 +78,13 @@ export class QcHoldSummaryDto {
   @ApiProperty() reason!: string;
 }
 
+/** Story 1-2b — one receipt (or approved excess) placed on QC-on-receipt holds. */
+export class QcReceiptSummaryDto {
+  @ApiProperty({ format: 'uuid' }) grnId!: string;
+  @ApiProperty({ description: 'The goods receipt code' }) grnCode!: string;
+  @ApiProperty({ minimum: 1, description: 'How many lines were held' }) count!: number;
+}
+
 export class ChannelSyncSummaryDto {
   @ApiProperty({ format: 'uuid' }) connectionId!: string;
 }
@@ -169,6 +176,13 @@ export class LedgerChainBreakNotificationDto extends NotificationEntryBaseDto {
   @ApiProperty({ type: String, nullable: true, enum: [...SOURCE_RESOLUTIONS['ledger-chain-break'], null] }) resolution!: (typeof SOURCE_RESOLUTIONS)['ledger-chain-break'][number] | null;
 }
 
+/** Story 1-2b — open until every hold of the receipt (or the approved excess) is released. */
+export class QcReceiptNotificationDto extends NotificationEntryBaseDto {
+  @ApiProperty({ enum: ['qc-receipt'] }) sourceType!: 'qc-receipt';
+  @ApiProperty({ type: QcReceiptSummaryDto }) summary!: QcReceiptSummaryDto;
+  @ApiProperty({ type: String, nullable: true, enum: [...SOURCE_RESOLUTIONS['qc-receipt'], null] }) resolution!: (typeof SOURCE_RESOLUTIONS)['qc-receipt'][number] | null;
+}
+
 export const NOTIFICATION_ENTRY_DTOS = [
   StockAdjustmentNotificationDto,
   CountVarianceNotificationDto,
@@ -180,6 +194,7 @@ export const NOTIFICATION_ENTRY_DTOS = [
   ChannelSyncNotificationDto,
   AuditExportNotificationDto,
   LedgerChainBreakNotificationDto,
+  QcReceiptNotificationDto,
 ] as const;
 
 export type NotificationEntryDto = InstanceType<(typeof NOTIFICATION_ENTRY_DTOS)[number]>;
@@ -203,6 +218,7 @@ export class NotificationListResponse {
           'channel-sync': getSchemaPath(ChannelSyncNotificationDto),
           'audit-export': getSchemaPath(AuditExportNotificationDto),
           'ledger-chain-break': getSchemaPath(LedgerChainBreakNotificationDto),
+          'qc-receipt': getSchemaPath(QcReceiptNotificationDto),
         },
       },
     },
