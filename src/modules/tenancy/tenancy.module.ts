@@ -15,6 +15,7 @@ import { DeviceSessionGuard } from './device-session.guard';
 import { EnrollmentCommand } from './enrollment.command';
 import { RegistrationCommand } from './registration.command';
 import { SignInCommand } from './sign-in.command';
+import { SessionCommand } from './session.command';
 import { SyncReportCommand } from './sync-report.command';
 import { TenancyController } from './tenancy.controller';
 import { TenancyService } from './tenancy.service';
@@ -66,6 +67,7 @@ import { ZoneCommand } from './zone.command';
   providers: [
     RegistrationCommand,
     SignInCommand,
+    SessionCommand,
     WarehouseCommand,
     ZoneCommand,
     BinCommand,

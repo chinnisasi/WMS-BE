@@ -1,14 +1,11 @@
 import type { CanActivate, ExecutionContext } from '@nestjs/common';
-import { createParamDecorator, Injectable } from '@nestjs/common';
+import { createParamDecorator, Inject, Injectable } from '@nestjs/common';
+import { DATABASE } from '../../shared/db/tokens';
+import type { Database } from '../../shared/db/db';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import {
-  tenantSessionSecret,
-  verifyDeviceSession,
-  verifyTenantSession,
-  type DeviceSession,
-  type TenantSession,
-} from './jwt-session';
-import { operatorSurfaceRefused } from './tenant-session.guard';
+import type { DeviceSession, TenantSession } from './jwt-session';
+import { verifyDeviceRequest } from './device-session.guard';
+import { verifyWebRequest } from './tenant-session.guard';
 
 export interface AnySessionRequest {
   headers: Record<string, unknown>;
@@ -56,27 +53,20 @@ function tokenCarriesDeviceClaim(token: string): boolean {
 
 @Injectable()
 export class AnySessionGuard implements CanActivate {
-  canActivate(context: ExecutionContext): boolean {
+  constructor(@Inject(DATABASE) private readonly db: Database) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<AnySessionRequest>();
     const header = request.headers.authorization;
     const match = typeof header === 'string' ? BEARER_RE.exec(header) : null;
     if (match === null) {
       throw unauthenticated('A Bearer session token is required (web or device).');
     }
-    const token = match[1]!.trim();
-    const secret = tenantSessionSecret();
-    const session: AnySession | null = tokenCarriesDeviceClaim(token)
-      ? mapNullable('device', verifyDeviceSession(token, secret))
-      : mapNullable('web', verifyTenantSession(token, secret));
-    if (session === null) {
-      throw unauthenticated('The session token is invalid or expired.');
-    }
-    // Story 21-7 — the fence on the web arm (the device verifier already
-    // rejects any token carrying `client_id`).
-    if (session.family === 'web' && session.session.clientId !== null) {
-      throw operatorSurfaceRefused();
-    }
-    request.anySession = session;
+    // Story 6-1a — each arm runs its family's full check, server-side session
+    // included; the web arm keeps the 21-7 operator fence.
+    request.anySession = tokenCarriesDeviceClaim(match[1]!.trim())
+      ? { family: 'device', session: await verifyDeviceRequest(this.db, request.headers) }
+      : { family: 'web', session: await verifyWebRequest(this.db, request.headers, 'web') };
     return true;
   }
 }
@@ -95,13 +85,4 @@ export const CurrentAnySession = createParamDecorator(
 
 function unauthenticated(detail: string): ProblemException {
   return new ProblemException('unauthenticated', 401, 'Authentication required', detail);
-}
-
-/** Lifts a verifier's nullable result into the tagged union — null stays null. */
-function mapNullable<F extends 'device' | 'web'>(
-  family: F,
-  session: F extends 'device' ? DeviceSession | null : TenantSession | null,
-): AnySession | null {
-  if (session === null) return null;
-  return { family, session } as AnySession;
 }

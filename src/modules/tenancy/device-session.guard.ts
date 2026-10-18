@@ -1,11 +1,16 @@
 import type { CanActivate, ExecutionContext } from '@nestjs/common';
-import { createParamDecorator, Injectable } from '@nestjs/common';
+import { createParamDecorator, Inject, Injectable } from '@nestjs/common';
+import { DATABASE } from '../../shared/db/tokens';
+import type { Database } from '../../shared/db/db';
+import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import {
-  verifyDeviceSession,
+  verifyDeviceSessionDetailed,
   tenantSessionSecret,
   type DeviceSession,
 } from './jwt-session';
+import { deviceSessionEnded } from './session-cookie';
+import { checkSessionInTx } from './sessions';
 
 export interface DeviceSessionRequest {
   headers: Record<string, unknown>;
@@ -31,20 +36,53 @@ export const CurrentDeviceSession = createParamDecorator(
  */
 @Injectable()
 export class DeviceSessionGuard implements CanActivate {
-  canActivate(context: ExecutionContext): boolean {
+  constructor(@Inject(DATABASE) private readonly db: Database) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<DeviceSessionRequest>();
-    const header = request.headers.authorization;
-    const match = typeof header === 'string' ? /^bearer\s+(.+)$/i.exec(header) : null;
-    if (match === null) {
-      throw unauthenticated('A Bearer device token is required.');
-    }
-    const session = verifyDeviceSession(match[1]!.trim(), tenantSessionSecret());
-    if (!session) {
-      throw unauthenticated('The device token is invalid or expired.');
-    }
-    request.deviceSession = session;
+    request.deviceSession = await verifyDeviceRequest(this.db, request.headers);
     return true;
   }
+}
+
+/**
+ * Story 6-1a — the device-family check shared with `AnySessionGuard`. A
+ * device credential (`kind: device`, or the pre-6-1a no-`kind` shape) has no
+ * session — its authority is the device row the command re-reads. A badge
+ * token's server-side session is re-read here (revoked / released / user
+ * deactivated / the 12 h shift → 401). Every 401 keeps the code
+ * `unauthenticated` — handhelds in the field keep their queue only on that
+ * code — and carries a `reason`.
+ */
+export async function verifyDeviceRequest(db: Database, headers: Record<string, unknown>): Promise<DeviceSession> {
+  const header = headers.authorization;
+  const match = typeof header === 'string' ? /^bearer\s+(.+)$/i.exec(header) : null;
+  if (match === null) {
+    throw unauthenticated('A Bearer device token is required.');
+  }
+  const verified = verifyDeviceSessionDetailed(match[1]!.trim(), tenantSessionSecret());
+  if (!verified.ok) {
+    if (verified.failure === 'expired') throw deviceSessionEnded('expired');
+    if (verified.failure === 'legacy') throw deviceSessionEnded('legacy');
+    throw unauthenticated('The device token is invalid.');
+  }
+  const session = verified.session;
+  if (session.kind === 'badge') {
+    const check = await withTenantTransaction(db, session.tenantId, (tx) =>
+      checkSessionInTx(tx, {
+        tenantId: session.tenantId,
+        sessionId: session.sessionId!,
+        userId: session.userId!,
+        kind: 'badge',
+        deviceId: session.deviceId,
+      }),
+    );
+    if (!check.ok) {
+      if (check.reason === 'invalid') throw unauthenticated('The device token is invalid.');
+      throw deviceSessionEnded(check.reason);
+    }
+  }
+  return session;
 }
 
 export function requireDeviceSession(request: DeviceSessionRequest): DeviceSession {

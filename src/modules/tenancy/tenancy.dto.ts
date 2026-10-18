@@ -256,7 +256,8 @@ export type UserRoleDto = (typeof USER_ROLES)[number];
 export const ASSIGNABLE_ROLES = ['owner', 'ops_manager', 'operator', 'accountant'] as const;
 export type AssignableRoleDto = (typeof ASSIGNABLE_ROLES)[number];
 
-export const USER_STATUSES = ['invited', 'active'] as const;
+/** Story 6-1a: `deactivated` added — mirrors `USER_STATUSES` in shared/db/schema.ts (pinned by test/sessions.spec.ts). */
+export const USER_STATUSES = ['invited', 'active', 'deactivated'] as const;
 
 export class UserResponse {
   @ApiProperty({ format: 'uuid' })
@@ -364,6 +365,21 @@ export class SessionClientResponse {
   name!: string;
 }
 
+/** Story 6-1a — `POST /tenants/session/refresh`: a new access token (the rotated refresh token rides the cookie). */
+export class RefreshResponse {
+  @ApiProperty()
+  accessToken!: string;
+
+  @ApiProperty({ example: 'Bearer' })
+  tokenType!: string;
+
+  @ApiProperty({ example: 900 })
+  expiresInSeconds!: number;
+
+  @ApiProperty({ example: 43200, description: "Seconds until the session's absolute end." })
+  refreshExpiresInSeconds!: number;
+}
+
 export class SignInResponse {
   @ApiProperty({
     description:
@@ -376,6 +392,13 @@ export class SignInResponse {
 
   @ApiProperty({ example: 900 })
   expiresInSeconds!: number;
+
+  @ApiProperty({
+    example: 43200,
+    description:
+      'Story 6-1a — seconds until the session can no longer be refreshed (its absolute end). The refresh token itself rides an httpOnly cookie; the client stores this to tell a refreshable session from an ended one.',
+  })
+  refreshExpiresInSeconds!: number;
 
   @ApiProperty({ type: TenantResponse })
   tenant!: TenantResponse;
