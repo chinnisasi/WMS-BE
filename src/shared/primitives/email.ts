@@ -16,10 +16,23 @@ export function normalizeEmailAddress(raw: string): string {
   return raw.trim().toLowerCase();
 }
 
-/** Whether a NORMALIZED value is an email address this system stores. */
+/**
+ * Whether a NORMALIZED value is an email address this system stores: ASCII
+ * only (no UTF-8 local part, no internationalised domain). JavaScript's
+ * `toLowerCase` and Postgres's `lower()` disagree on some non-ASCII letters,
+ * so a non-ASCII address could pass here and then fail the
+ * `client_contacts_email_format` CHECK as an unmapped 500; ASCII lower-cases
+ * identically on both sides.
+ */
 export function isEmailAddress(value: string): boolean {
-  return value.length <= EMAIL_MAX_LENGTH && isEmail(value);
+  return (
+    value.length <= EMAIL_MAX_LENGTH &&
+    ASCII_ONLY.test(value) &&
+    isEmail(value, { allow_utf8_local_part: false })
+  );
 }
+
+const ASCII_ONLY = /^[\x21-\x7e]+$/;
 
 /** The DTO face of `isEmailAddress` (apply after a trim + lower-case transform). */
 export function IsEmailAddress(options?: ValidationOptions): PropertyDecorator {

@@ -306,8 +306,15 @@ export async function lockClientInTx(
  * a departure and a creation serialise, and a creation arriving behind a
  * committing departure re-reads `departed` (READ COMMITTED). 404 when
  * absent; 409 `client-departed` when departed. A SUSPENDED client still
- * takes work (decision 5 — suspension cuts only the portal). Run it FIRST in
- * the transaction, before any document or advisory lock.
+ * takes work (decision 5 — suspension cuts only the portal).
+ *
+ * Where to call it: anywhere in the transaction BEFORE ITS FIRST WRITE (the
+ * gate must hold the key share across the write). Its position relative to
+ * the caller's other locks is free: the departure locks ONLY the client row
+ * (`FOR UPDATE`) and its wind-down reads take no row locks, so no lock this
+ * caller already holds can be waited on by a departure — no cycle, whatever
+ * the order (callers take it after SKU, product, connection or advisory
+ * locks today).
  */
 export async function assertClientTakesWorkInTx(
   tx: TenantTx,

@@ -925,7 +925,7 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
    * never `modules/clients`, nor a command file that imports the clients
    * facade) — the dependency stays one-way, with no import cycle.
    */
-  const WIND_DOWN_FILES = ['inventory', 'inbound', 'outbound', 'returns', 'tenancy', 'billing'].map((module) =>
+  const WIND_DOWN_FILES = ['inventory', 'inbound', 'outbound', 'returns', 'tenancy', 'billing', 'channels'].map((module) =>
     join(SRC_ROOT, 'modules', module, 'client-wind-down.ts'),
   );
 
@@ -942,7 +942,7 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
     expect(offenders).toEqual([]);
     // Meaningful: the status command composes all six.
     const command = readFileSync(join(clientsRoot, 'clients.command.ts'), 'utf8');
-    for (const module of ['inventory', 'inbound', 'outbound', 'returns', 'tenancy', 'billing']) {
+    for (const module of ['inventory', 'inbound', 'outbound', 'returns', 'tenancy', 'billing', 'channels']) {
       expect(command).toContain(`from '../${module}/client-wind-down'`);
     }
   });
@@ -1343,8 +1343,10 @@ describe('architecture: channel connections are channels-module-owned (story 7-1
     // command/registry/errors/events/view imports, and allow only the
     // facade/module/dto forms, so it is pinned against a detector typo the
     // same way the carriers block is.
+    // Story 1-2a: `client-wind-down` is the declared file-level seam the
+    // clients status command composes (it imports only shared/).
     const guard = new RegExp(
-      '(?:modules/channels|\\.\\./channels)/(?!(?:channels\\.facade|channels\\.module|channels\\.dto)[\'"])',
+      '(?:modules/channels|\\.\\./channels)/(?!(?:channels\\.facade|channels\\.module|channels\\.dto|client-wind-down)[\'"])',
     );
     for (const reaching of [
       "from '../channels/channels.command'",

@@ -4,12 +4,12 @@ import { windDownBlockerInTx, type WindDownBlocker } from '../../shared/primitiv
 
 /**
  * Story 1-2a — the billing-owned wind-down blocker of one client: client
- * invoices still `draft` or `disputed` (an issued or settled invoice, and a
- * void one, are done). `codes` names each by its number, else its period
+ * invoices not yet settled — `draft`, `issued` or `disputed` (decision 8: an
+ * issued invoice still awaits payment); only `settled` and `void` clear. `codes` names each by its number, else its period
  * (`YYYY-MM`, a draft has no number). A file-level read that imports nothing
  * from `modules/clients` (pinned by `test/architecture.spec.ts`).
  */
-export const CLIENT_INVOICE_UNSETTLED_STATUSES = ['draft', 'disputed'] as const;
+export const CLIENT_INVOICE_UNSETTLED_STATUSES = ['draft', 'issued', 'disputed'] as const;
 
 export async function clientWindDownBlockersInTx(
   tx: TenantTx,

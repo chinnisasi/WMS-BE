@@ -3,13 +3,14 @@ import { createHash } from 'node:crypto';
 import postgres from 'postgres';
 import request, { type Test as SupertestTest } from 'supertest';
 import { ulid, uuidv7 } from '../src/shared/primitives/ids';
+import { sql as dsql } from 'drizzle-orm';
 import { createApp } from '../src/app.factory';
 import { withTenantTransaction } from '../src/shared/db/tenant-scope';
 import type { Database } from '../src/shared/db/db';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { CLIENT_CONTACT_ROLES, ADJUSTMENT_PENDING_STATUSES, COUNT_TASK_STATUSES, COUNT_VARIANCE_STATUSES, REJECTED_OP_STATUSES } from '../src/shared/db/schema';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
-import { lockClientInTx } from '../src/modules/clients/clients.facade';
+import { assertClientTakesWorkInTx, lockClientInTx } from '../src/modules/clients/clients.facade';
 import { ChannelsIngestCommand } from '../src/modules/channels/channels.ingest.command';
 import { ReplenishmentSweep } from '../src/modules/replenishment/replenishment.sweep';
 import { ORDER_STATUSES } from '../src/modules/outbound/order.command';
@@ -21,7 +22,8 @@ import { ORDER_OPEN_STATUSES } from '../src/modules/outbound/client-wind-down';
 import { ASN_OPEN_STATUSES, OVER_RECEIPT_PENDING_STATUSES, PO_OPEN_STATUSES } from '../src/modules/inbound/client-wind-down';
 import { RMA_OPEN_STATUSES } from '../src/modules/returns/client-wind-down';
 import { CLIENT_INVOICE_UNSETTLED_STATUSES } from '../src/modules/billing/client-wind-down';
-import { REJECTED_OP_OPEN_STATUSES } from '../src/modules/tenancy/client-wind-down';
+import { REJECTED_OP_OPEN_STATUSES, SKU_NAMING_OP_TYPES } from '../src/modules/tenancy/client-wind-down';
+import { REJECTED_OP_DECISIONS_BY_TYPE } from '../src/modules/tenancy/sync-report.command';
 import {
   ADJUSTMENT_PENDING_OPEN_STATUSES,
   COUNT_TASK_OPEN_STATUSES,
@@ -256,6 +258,16 @@ describe('story 1-2a: the client master record', () => {
 
   const handle = () => postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
 
+  /** The tenant's one shopify connection (one per provider per tenant), made on first use. */
+  async function shopifyIntegration(): Promise<string> {
+    const existing = await sql<{ id: string }[]>`select id from integrations where tenant_id = ${tenantId} and provider = 'shopify'`;
+    if (existing[0] !== undefined) return existing[0].id;
+    const id = uuidv7();
+    await sql`insert into integrations (id, tenant_id, provider, status, connected_by, ingest_warehouse_id)
+      values (${id}, ${tenantId}, 'shopify', 'connected', ${ownerUserId}, ${warehouseId})`;
+    return id;
+  }
+
   /** Wait until `min` sessions are parked on a `clients` row lock (the 21-10 waiter shape). */
   async function waitParkedOnClients(lockClause: string, min: number): Promise<void> {
     const probe = handle();
@@ -388,6 +400,15 @@ describe('story 1-2a: the client master record', () => {
       expect(COUNT_VARIANCE_OPEN_STATUSES.every((status) => (COUNT_VARIANCE_STATUSES as readonly string[]).includes(status))).toBe(true);
       expect(REJECTED_OP_OPEN_STATUSES.every((status) => (REJECTED_OP_STATUSES as readonly string[]).includes(status))).toBe(true);
       expect(OVER_RECEIPT_PENDING_STATUSES).toEqual(['pending']);
+      // Decision 8 — an issued invoice not yet settled also blocks departure.
+      expect([...CLIENT_INVOICE_UNSETTLED_STATUSES]).toEqual(['draft', 'issued', 'disputed']);
+      // The review-item read covers every SKU-naming op type the queue holds.
+      const opTypes = Object.keys(REJECTED_OP_DECISIONS_BY_TYPE);
+      expect(SKU_NAMING_OP_TYPES.every((type) => opTypes.includes(type))).toBe(true);
+      expect(opTypes.filter((type) => !(SKU_NAMING_OP_TYPES as readonly string[]).includes(type)).sort()).toEqual([
+        'excursion.record',
+        'transfer.confirm',
+      ]);
     });
 
     it('the refusal vocabularies carry client-departed', () => {
@@ -734,6 +755,9 @@ describe('story 1-2a: the client master record', () => {
       await sql`insert into client_invoices (id, tenant_id, client_id, status, period_start, period_end, subtotal_paise, cgst_paise, sgst_paise, igst_paise,
                                              tax_paise, total_paise, round_off_paise, payable_paise, gaps, warnings, party, content_hash, created_by)
         values (${uuidv7()}, ${tenantId}, ${windId}, 'draft', '2026-09-01', '2026-09-30', 0, 0, 0, 0, 0, 0, 0, 0, '[]', '[]', '{}', 'x', ${ownerUserId})`;
+      // Decision 9 — a channel mapping of its SKU.
+      await sql`insert into channel_mappings (id, tenant_id, integration_id, external_ref, sku_id)
+        values (${uuidv7()}, ${tenantId}, ${await shopifyIntegration()}, 'EXT-WIND', ${sku('WIND-A')})`;
 
       const res = await setStatus(windId, 'departed');
       expectProblem(res, 409, 'client-not-wound-down');
@@ -745,6 +769,7 @@ describe('story 1-2a: the client master record', () => {
       expect(blockers.find((b) => b.kind === 'unsettled-invoices')).toEqual({ kind: 'unsettled-invoices', count: 1, codes: ['2026-09'] });
       expect(blockers.find((b) => b.kind === 'open-counts')).toEqual({ kind: 'open-counts', count: 1 });
       expect(blockers.find((b) => b.kind === 'open-review-items')).toEqual({ kind: 'open-review-items', count: 1 });
+      expect(blockers.find((b) => b.kind === 'channel-mappings')).toEqual({ kind: 'channel-mappings', count: 1, codes: ['EXT-WIND'] });
       expect(blockers.find((b) => b.kind === 'pending-over-receipts')?.count).toBe(1);
       expect(res.body.detail).toMatch(/Client "WIND" cannot depart while work remains/);
     });
@@ -831,9 +856,7 @@ describe('story 1-2a: the client master record', () => {
           409,
           'client-departed',
         );
-        const integrationId = uuidv7();
-        await sql`insert into integrations (id, tenant_id, provider, status, connected_by, ingest_warehouse_id)
-          values (${integrationId}, ${tenantId}, 'shopify', 'connected', ${ownerUserId}, ${warehouseId})`;
+        const integrationId = await shopifyIntegration();
         expectProblem(
           await http()
             .put(`${API}/${tenantId}/channels/connections/${integrationId}/mappings`)
@@ -880,8 +903,7 @@ describe('story 1-2a: the client master record', () => {
       });
 
       it('a channel order for its SKUs is 422 validation-failed, metered validation-failed', async () => {
-        // The connection the mappings test made (one per provider per tenant).
-        const integrationId = (await sql<{ id: string }[]>`select id from integrations where tenant_id = ${tenantId} and provider = 'shopify'`)[0]!.id;
+        const integrationId = await shopifyIntegration();
         await sql`insert into channel_mappings (id, tenant_id, integration_id, external_ref, sku_id)
           values (${uuidv7()}, ${tenantId}, ${integrationId}, 'EXT-GONE', ${sku('GONE-A')})`;
         const ingest = app.get(ChannelsIngestCommand).ingestOrderDelivery({
@@ -906,17 +928,27 @@ describe('story 1-2a: the client master record', () => {
         expectProblem(res, 409, 'client-departed');
       });
 
-      it('receipts: a blind receipt naming it is 409 client-not-active; its lines on any receipt are refused per line; the rest settles', async () => {
-        expectProblem(
-          await receive({ poId: null, blindReasonCode: 'other', clientId: goneId, lines: [grnLine(sku('GONE-A'), 1)] }),
-          409,
-          'client-not-active',
-        );
+      it('receipts: its lines on any receipt — a blind one naming it included — are refused per line; the rest settles', async () => {
+        const reviewOf = async (opId: string) =>
+          sql<{ op_type: string; problem_code: string }[]>`
+            select op_type, problem_code from rejected_ops where tenant_id = ${tenantId} and op_id = ${opId}`;
+        // Decision 7 — a blind receipt NAMING it is no longer refused whole:
+        // its line is refused per line, and with every line refused the
+        // receipt takes the goodsReceipt:null arm.
+        const named = await receive({ poId: null, blindReasonCode: 'other', clientId: goneId, lines: [grnLine(sku('GONE-A'), 1)] }).expect(201);
+        expect(named.body.goodsReceipt).toBeNull();
+        expect(named.body.refusedReceipt).toMatchObject({ clientId: goneId, rejectedLines: [expect.objectContaining({ code: 'client-departed' })] });
+        expect(await reviewOf(named.body.refusedReceipt.reviewOpId as string)).toEqual([
+          { op_type: 'grn.lines-refused', problem_code: 'client-departed' },
+        ]);
         // A blind receipt from an older build (no clientId): its line refused, the ACME line settles.
         const mixed = await receive({ poId: null, blindReasonCode: 'other', lines: [grnLine(sku('GONE-A'), 2), grnLine(sku('ACME-A'), 1)] }).expect(201);
         expect(mixed.body.goodsReceipt.lines).toHaveLength(1);
         expect(mixed.body.goodsReceipt.rejectedLines).toEqual([
           expect.objectContaining({ skuId: sku('GONE-A'), qty: 2, code: 'client-departed' }),
+        ]);
+        expect(await reviewOf(mixed.body.goodsReceipt.reviewOpId as string)).toEqual([
+          { op_type: 'grn.lines-refused', problem_code: 'client-departed' },
         ]);
         // Its SKU on another client's PO: refused per line too.
         const po = await createPo([{ skuId: sku('ACME-A'), orderedQty: 5 }]).expect(201);
@@ -928,13 +960,16 @@ describe('story 1-2a: the client master record', () => {
         expect((onPo.body.goodsReceipt.rejectedLines as { code: string; skuId: string }[]).map((line) => [line.skuId, line.code])).toEqual([
           [sku('GONE-B'), 'client-departed'],
         ]);
+        expect(await reviewOf(onPo.body.goodsReceipt.reviewOpId as string)).toEqual([
+          { op_type: 'grn.lines-refused', problem_code: 'client-departed' },
+        ]);
         // Every line refused: no receipt, goodsReceipt null, one review row (Discard only).
         const all = await receive({ poId: null, blindReasonCode: 'other', lines: [grnLine(sku('GONE-A'), 1)] }).expect(201);
         expect(all.body.goodsReceipt).toBeNull();
         expect(all.body.refusedReceipt).toMatchObject({ clientId: goneId, rejectedLines: [expect.objectContaining({ code: 'client-departed' })] });
-        const review = await sql<{ op_type: string; problem_code: string }[]>`
-          select op_type, problem_code from rejected_ops where tenant_id = ${tenantId} and op_id = ${all.body.refusedReceipt.reviewOpId as string}`;
-        expect(review).toEqual([{ op_type: 'grn.lines-refused', problem_code: 'client-departed' }]);
+        expect(await reviewOf(all.body.refusedReceipt.reviewOpId as string)).toEqual([
+          { op_type: 'grn.lines-refused', problem_code: 'client-departed' },
+        ]);
         // Nothing of its stock was booked.
         expect(await sql`select 1 from stock_on_hand where tenant_id = ${tenantId} and sku_id in ${sql([sku('GONE-A'), sku('GONE-B')])} and quantity <> 0`).toHaveLength(0);
       });
@@ -1007,6 +1042,73 @@ describe('story 1-2a: the client master record', () => {
       const res = await setStatus(firstId, 'departed');
       expectProblem(res, 409, 'client-not-wound-down');
       expect(res.body.blockers).toEqual([{ kind: 'open-orders', count: 1, codes: [order.slice(-8)] }]);
+    });
+
+    it('the gate serialises a creation against a departure: a departure parked behind a creator\'s key share sees its document', async () => {
+      const gateId = await createClient('GATEC');
+      await importCsv(['GATE-A,Gate A,pcs,1800,,,'], gateId).expect(201);
+      await refreshSkus();
+      const db = app.get<Database>(DATABASE);
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let gated!: () => void;
+      const gateHeld = new Promise<void>((resolve) => {
+        gated = resolve;
+      });
+      // A creator: the gate (FOR KEY SHARE), then — after the departure has
+      // parked — its open document, committed.
+      const creator = withTenantTransaction(db, tenantId, async (tx) => {
+        await assertClientTakesWorkInTx(tx, tenantId, gateId);
+        gated();
+        await gate;
+        await tx.execute(dsql`insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code, status)
+          values (${uuidv7()}, ${tenantId}, ${gateId}, ${warehouseId}, ${vendorId}, 'PO-GATE-1', 'open')`);
+      });
+      await gateHeld;
+      try {
+        const departing = setStatus(gateId, 'departed').then((res) => res);
+        await waitParkedOnClients('for update', 1);
+        release();
+        await creator;
+        const departure = await departing;
+        expectProblem(departure, 409, 'client-not-wound-down');
+        expect(departure.body.blockers).toEqual([{ kind: 'open-purchase-orders', count: 1, codes: ['PO-GATE-1'] }]);
+      } finally {
+        release();
+        await creator.catch(() => undefined);
+      }
+    });
+
+    it('an open count variance alone (no open task) blocks the departure', async () => {
+      const varId = await createClient('VARC');
+      await importCsv(['VAR-A,Var A,pcs,1800,,,'], varId).expect(201);
+      await refreshSkus();
+      const taskId = uuidv7();
+      await sql`insert into count_tasks (id, tenant_id, warehouse_id, bin_id, origin, status) values (${taskId}, ${tenantId}, ${warehouseId}, ${binA}, 'on_demand', 'completed')`;
+      await sql`insert into count_variances (id, tenant_id, task_id, warehouse_id, bin_id, sku_id, expected_quantity_milli, counted_quantity_milli, delta_milli, status)
+        values (${uuidv7()}, ${tenantId}, ${taskId}, ${warehouseId}, ${binA}, ${sku('VAR-A')}, 0, 1000, 1000, 'open')`;
+      const res = await setStatus(varId, 'departed');
+      expectProblem(res, 409, 'client-not-wound-down');
+      expect(res.body.blockers).toEqual([{ kind: 'open-counts', count: 1 }]);
+    });
+
+    it('a breach open at departure is recovered by the next sweep, and no new one opens', async () => {
+      const replId = await createClient('REPLC');
+      await importCsv(['REPL-A,Repl A,pcs,1800,,,'], replId).expect(201);
+      await refreshSkus();
+      await sql`update skus set reorder_point = 5000 where id = ${sku('REPL-A')}`;
+      const sweep = app.get(ReplenishmentSweep);
+      await sweep.sweepScope(tenantId, warehouseId);
+      const breachesOf = () =>
+        sql<{ status: string }[]>`select status from reorder_breaches where tenant_id = ${tenantId} and sku_id = ${sku('REPL-A')} order by created_at`;
+      expect((await breachesOf()).map((row) => row.status)).toEqual(['open']);
+      await setStatus(replId, 'departed').expect(200);
+      await sweep.sweepScope(tenantId, warehouseId);
+      expect((await breachesOf()).map((row) => row.status)).toEqual(['recovered']);
+      await sweep.sweepScope(tenantId, warehouseId);
+      expect((await breachesOf()).map((row) => row.status)).toEqual(['recovered']);
     });
 
     it('lock modes: a long-held invoice-prepare lock does not block an order create, but a departure waits for it', async () => {

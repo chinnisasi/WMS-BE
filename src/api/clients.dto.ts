@@ -244,13 +244,14 @@ const LowerTrimmed = () =>
 
 /** Story 1-2a — add a contact. */
 export class CreateClientContactDto {
-  @ApiProperty({ example: 'Asha Rao', minLength: 1, maxLength: CLIENT_CONTACT_NAME_MAX })
+  // The 1-120 rule counts CODE POINTS — the command's (`assertContactFields`)
+  // is the one gate; a DTO `@Length` would count UTF-16 units and disagree.
+  @ApiProperty({ example: 'Asha Rao', minLength: 1, maxLength: CLIENT_CONTACT_NAME_MAX, description: '1-120 characters (code points) once trimmed' })
   @Trimmed()
   @IsString()
-  @Length(1, CLIENT_CONTACT_NAME_MAX)
   name!: string;
 
-  @ApiProperty({ example: 'asha@acme.example', maxLength: EMAIL_MAX_LENGTH, description: 'Stored trimmed and lower-cased; unique per client' })
+  @ApiProperty({ example: 'asha@acme.example', maxLength: EMAIL_MAX_LENGTH, description: 'An ASCII address, stored trimmed and lower-cased; unique per client' })
   @LowerTrimmed()
   @IsString()
   @IsEmailAddress()
@@ -274,11 +275,10 @@ export class CreateClientContactDto {
 
 /** Story 1-2a — edit a contact: an absent field is unchanged; `isPrimary: true` makes it the primary. */
 export class UpdateClientContactDto {
-  @ApiProperty({ required: false, minLength: 1, maxLength: CLIENT_CONTACT_NAME_MAX })
+  @ApiProperty({ required: false, minLength: 1, maxLength: CLIENT_CONTACT_NAME_MAX, description: '1-120 characters (code points) once trimmed — checked by the command' })
   @Trimmed()
   @IsOptional()
   @IsString()
-  @Length(1, CLIENT_CONTACT_NAME_MAX)
   name?: string;
 
   @ApiProperty({ required: false, maxLength: EMAIL_MAX_LENGTH })

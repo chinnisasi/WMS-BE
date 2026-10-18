@@ -556,8 +556,7 @@ export class ReceivingCommand {
       );
 
       // ── story 1-1: a BLIND receipt that names its client ────────────────
-      // The client must exist (404) and be active (409 `client-not-active`,
-      // read under `FOR SHARE` so a suspend cannot commit in between). A line
+      // The client must exist (404; story 1-2a: any status — see below). A line
       // whose SKU belongs to another client is refused PER LINE
       // (`sku-client-mismatch`, §7g): it is split off HERE, before every
       // per-line rule below (kit, catch weight, precision, batch identity),
@@ -568,15 +567,12 @@ export class ReceivingCommand {
       let namedBlindClientId: string | null = null;
       let clientLabels = new Map<string, string>();
       if (blindReasonCode !== null && requestedClientId !== null) {
-        const client = await shareLockClientInTx(tx, command.tenantId, requestedClientId);
-        if (client.status !== 'active') {
-          throw new ProblemException(
-            'client-not-active',
-            409,
-            'The client is not active',
-            `Client ${client.code} is ${client.status} — a blind receipt cannot be booked to it.`,
-          );
-        }
+        // The named client must exist (404), read under FOR SHARE. Story
+        // 1-2a: its status no longer refuses the receipt whole — a SUSPENDED
+        // client still ships and receives (decision 5), and a DEPARTED one's
+        // lines are refused per line below (`client-departed`, decision 7;
+        // every line refused → the `goodsReceipt: null` arm).
+        await shareLockClientInTx(tx, command.tenantId, requestedClientId);
         namedBlindClientId = requestedClientId;
       }
       // ── story 1-2a (decision 7): a DEPARTED client's lines, any receipt ──

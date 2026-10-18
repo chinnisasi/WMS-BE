@@ -50,6 +50,12 @@ export interface EffectiveCandidate {
   readonly pointMilli: number;
   /** The effective default qty in milli-units — 0 means "derive the recovery gap". */
   readonly qtyMilli: number;
+  /**
+   * Story 1-2a — the SKU's client has departed: it takes no new work, so the
+   * sweep opens no breach (and mints no draft) for it, but a breach already
+   * open is recovered (closed) — it would otherwise stand forever.
+   */
+  readonly departed: boolean;
 }
 
 export interface SweepReport {
@@ -129,6 +135,14 @@ export class ReplenishmentSweep {
           continue;
         }
         const breach = await this.loadOpenBreach(tx, tenantId, warehouseId, candidate.skuId);
+        if (candidate.departed) {
+          // Story 1-2a — never raise for a departed client; close what stands.
+          if (breach !== null) {
+            await this.recoverBreach(tx, tenantId, breach);
+            recovered += 1;
+          }
+          continue;
+        }
         if (atpMilli < candidate.pointMilli) {
           if (breach !== null) {
             continue; // already active — the partial unique absorbed it; no second draft, no repeat event
@@ -176,15 +190,13 @@ export class ReplenishmentSweep {
     // also the ones carrying no defaults, because a policy row may target
     // any of them and the defaults map doubles as the identity source.
     const skuDefaults = await this.catalog.getSkuReorderDefaultsInTx(tx, tenantId);
-    // Story 1-2a — a departed client's SKUs are never candidates: it takes no
-    // new work, so no breach (and no suggested PO) may open for it.
+    // Story 1-2a — a departed client's SKUs stay candidates, flagged: the
+    // transitions phase never opens a breach for one but recovers one left
+    // open at departure.
     const departed = await departedClientIdsInTx(tx, tenantId);
 
     const candidates: EffectiveCandidate[] = [];
     for (const sku of skuDefaults) {
-      if (departed.has(sku.clientId)) {
-        continue;
-      }
       const override = policyBySku.get(sku.id);
       const pointMilli = override !== undefined ? override.reorderPointMilli : sku.reorderPoint;
       const qtyMilli = override !== undefined ? override.reorderQtyMilli : sku.reorderQty;
@@ -195,6 +207,7 @@ export class ReplenishmentSweep {
           name: sku.name,
           pointMilli,
           qtyMilli,
+          departed: departed.has(sku.clientId),
         });
       }
     }

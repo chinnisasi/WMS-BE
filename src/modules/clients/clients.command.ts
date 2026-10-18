@@ -41,7 +41,7 @@ import {
   type AddressInput,
 } from '../../shared/primitives/address';
 import { GSTIN_RE, gstinPrefixProblem, isGstinStateCode } from '../../shared/primitives/gstin';
-import { isEmailAddress, normalizeEmailAddress } from '../../shared/primitives/email';
+import { EMAIL_MAX_LENGTH, isEmailAddress, normalizeEmailAddress } from '../../shared/primitives/email';
 import { WIND_DOWN_BLOCKER_KINDS, type WindDownBlocker } from '../../shared/primitives/wind-down';
 // Story 1-2a — the wind-down reads, one file per owning module. Each imports
 // nothing from `modules/clients` (pinned by test/architecture.spec.ts), so
@@ -52,6 +52,7 @@ import { clientWindDownBlockersInTx as outboundBlockersInTx } from '../outbound/
 import { clientWindDownBlockersInTx as returnsBlockersInTx } from '../returns/client-wind-down';
 import { clientWindDownBlockersInTx as tenancyBlockersInTx } from '../tenancy/client-wind-down';
 import { clientWindDownBlockersInTx as billingBlockersInTx } from '../billing/client-wind-down';
+import { clientWindDownBlockersInTx as channelsBlockersInTx } from '../channels/client-wind-down';
 
 export interface CreateClientCommand {
   readonly tenantId: string;
@@ -1123,6 +1124,7 @@ export async function clientWindDownBlockersInTx(
     ...(await returnsBlockersInTx(tx, tenantId, clientId)),
     ...(await tenancyBlockersInTx(tx, tenantId, clientId)),
     ...(await billingBlockersInTx(tx, tenantId, clientId)),
+    ...(await channelsBlockersInTx(tx, tenantId, clientId)),
   ];
   return [...all].sort((a, b) => WIND_DOWN_BLOCKER_KINDS.indexOf(a.kind) - WIND_DOWN_BLOCKER_KINDS.indexOf(b.kind));
 }
@@ -1188,7 +1190,9 @@ export function assertContactFields(fields: {
     throw invalid(`name must be 1-${CLIENT_CONTACT_NAME_MAX} characters once trimmed (got ${nameLength}).`);
   }
   if (typeof fields.email !== 'string' || !isEmailAddress(fields.email)) {
-    throw invalid(`email must be an email address of at most 254 characters (got ${JSON.stringify(fields.email)}).`);
+    throw invalid(
+      `email must be an ASCII email address of at most ${EMAIL_MAX_LENGTH} characters (got ${JSON.stringify(fields.email)}).`,
+    );
   }
   let phone: string | null = null;
   if (fields.phone !== null) {

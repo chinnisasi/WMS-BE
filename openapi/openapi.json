@@ -41451,13 +41451,14 @@
             "type": "string",
             "example": "Asha Rao",
             "minLength": 1,
-            "maxLength": 120
+            "maxLength": 120,
+            "description": "1-120 characters (code points) once trimmed"
           },
           "email": {
             "type": "string",
             "example": "asha@acme.example",
             "maxLength": 254,
-            "description": "Stored trimmed and lower-cased; unique per client"
+            "description": "An ASCII address, stored trimmed and lower-cased; unique per client"
           },
           "phone": {
             "type": "string",
@@ -41500,7 +41501,8 @@
           "name": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 120
+            "maxLength": 120,
+            "description": "1-120 characters (code points) once trimmed — checked by the command"
           },
           "email": {
             "type": "string",

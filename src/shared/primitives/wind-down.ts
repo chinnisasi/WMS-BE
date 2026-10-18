@@ -22,6 +22,8 @@ export const WIND_DOWN_BLOCKER_KINDS = [
   'open-counts',
   'open-review-items',
   'unsettled-invoices',
+  // Decision 9 — any channel mapping of its SKUs (the owner unmaps first).
+  'channel-mappings',
 ] as const;
 export type WindDownBlockerKind = (typeof WIND_DOWN_BLOCKER_KINDS)[number];
 
