@@ -18,6 +18,7 @@ import type { ReservationSnapshot } from '../src/modules/inventory/reservation.s
 import { ReservationReaper, parseReservationReaperPollMs } from '../src/jobs/jobs.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -229,10 +230,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     const ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     const opsEmail = `ops-${ulid().toLowerCase()}@example.com`;
     const invited = await request(app.getHttpServer())
@@ -247,10 +245,7 @@ describe('real-time ATP and atomic reservations (e2e, story 2.3)', () => {
       .send({ token: invited.body.inviteToken as string, password: 'ops-password-123' })
       .expect(200);
     opsToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: opsEmail, password: 'ops-password-123' })
-        .expect(200)
+      await mintSignIn(app, { email: opsEmail, password: 'ops-password-123' })
     ).body.accessToken as string;
 
     // Warehouse → zone → two bins (the quarantine-exclusion test needs two).

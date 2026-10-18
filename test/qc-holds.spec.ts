@@ -10,6 +10,7 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import type { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -76,10 +77,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     // Warehouse → zone → two bins.
@@ -224,10 +222,7 @@ describe('QC hold and release (e2e, story 3.4)', () => {
       .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
       .expect(200);
     const token = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     return { userId, token };
   }

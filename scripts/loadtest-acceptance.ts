@@ -71,6 +71,7 @@ import postgres from 'postgres';
 import { createHmac, randomUUID as uuidv7 } from 'node:crypto';
 import { chdir } from 'node:process';
 import { pathToFileURL } from 'node:url';
+import { signInTwoStep } from './lib/two-step-sign-in';
 
 interface Args {
   readonly mode: 'smoke' | 'full';
@@ -128,6 +129,7 @@ const args = parseArgs();
 // ── environment (the same defaults the jest suites pin) ─────────────────
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
+process.env.MFA_ENCRYPTION_KEY ??= 'loadtest-only-mfa-encryption-key-0123456789abcdef';
 process.env.CHANNEL_ENCRYPTION_KEY ??= 'e2e-only-channel-encryption-key-0123456789abcdef';
 process.env.VALKEY_URL ??= 'redis://localhost:56379/0';
 // Only these two pollers are silenced (jest does the same); the OUTBOX RELAY
@@ -345,9 +347,9 @@ async function seedTenant(): Promise<RunContext> {
   if (typeof tenantId !== 'string' || typeof connectedBy !== 'string') {
     throw new Error(`tenant register failed: ${registered.status} ${JSON.stringify(registered.body) ?? ""}`);
   }
-  const session = await call('/tenants/sign-in', 'POST', { email, password: 'correct-horse-battery' });
-  const token = (session.body as { accessToken?: string })?.accessToken;
-  if (typeof token !== 'string') throw new Error(`sign-in failed: ${session.status}`);
+  // Story 6-1b — the owner signs in in two steps (the script holds the authenticator).
+  const token = (await signInTwoStep(`${origin}${API}`, email, 'correct-horse-battery')).accessToken;
+  if (typeof token !== 'string') throw new Error('sign-in failed: no access token');
   // Authorization carrier only — NO Idempotency-Key baked in. All three early
   // mutating POSTs below spread this object bare, and a fixed key reused
   // across different payloads trips the app's idempotency-key-reuse guard

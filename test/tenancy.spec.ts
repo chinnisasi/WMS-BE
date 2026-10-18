@@ -13,6 +13,7 @@ import { TenancyService } from '../src/modules/tenancy/tenancy.service';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn, signInAs } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -85,10 +86,7 @@ describe('tenancy (e2e)', () => {
   }
 
   async function signIn(email: string, password = 'correct-horse-battery'): Promise<string> {
-    const res = await request(app.getHttpServer())
-      .post(`${IDENTITY_URL}/sign-in`)
-      .send({ email, password })
-      .expect(200);
+    const res = await mintSignIn(app, { email, password });
     return res.body.accessToken as string;
   }
 
@@ -300,12 +298,28 @@ describe('tenancy (e2e)', () => {
     expect(malformed.body).toMatchObject({ code: 'idempotency-key-invalid' });
   });
 
-  test('sign-in verifies the password and returns a short-lived HS256 session', async () => {
+  // Story 6-1b — RETARGETED (guide §4): this pinned an owner's sign-in body
+  // carrying the session directly. An owner now signs in in two steps (the
+  // right password answers an enrolment challenge and opens no session), so
+  // it pins the two-step flow: the password step's challenge, then the
+  // session the code step issues — still a short-lived HS256 token.
+  test('sign-in verifies the password and, after the second step, returns a short-lived HS256 session', async () => {
     const email = `owner-${ulid().toLowerCase()}@example.com`;
     const registered = await registerTenant(email).expect(201);
     createdTenantIds.push(registered.body.tenant.id);
 
-    const token = await signIn(email);
+    const passwordStep = await request(app.getHttpServer())
+      .post(`${IDENTITY_URL}/sign-in`)
+      .set('X-WMS-Second-Factor', '1')
+      .send({ email, password: 'correct-horse-battery' })
+      .expect(200);
+    expect(passwordStep.body).toMatchObject({ challenge: 'enroll', expiresInSeconds: 600 });
+    expect(passwordStep.body.accessToken).toBeUndefined();
+    expect(passwordStep.headers['set-cookie']).toBeUndefined();
+
+    const completed = await signInAs(app, email, 'correct-horse-battery');
+    expect(completed.status).toBe(200);
+    const token = completed.body.accessToken as string;
     const [, payloadPart] = token.split('.');
     const payload = JSON.parse(Buffer.from(payloadPart!, 'base64url').toString('utf8')) as {
       sub: string;
@@ -560,11 +574,14 @@ describe('tenancy (e2e)', () => {
     const tenantId = registered.body.tenant.id as string;
     const code = `BLR-${ulid().slice(10, 16).toUpperCase()}`;
 
-    // Sign-in with a whitespace-padded email reaches the normalized lookup.
-    await request(app.getHttpServer())
+    // Sign-in with a whitespace-padded email reaches the normalized lookup
+    // (story 6-1b: the owner's password step answers its challenge).
+    const padded = await request(app.getHttpServer())
       .post(`${IDENTITY_URL}/sign-in`)
+      .set('X-WMS-Second-Factor', '1')
       .send({ email: `  ${email}  `, password: 'correct-horse-battery' })
       .expect(200);
+    expect(padded.body.challenge).toBe('enroll');
 
     const token = await signIn(email);
     await request(app.getHttpServer())

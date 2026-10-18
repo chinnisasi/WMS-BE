@@ -11,6 +11,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { eventHashOf } from '../src/modules/inventory/ledger.service';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -393,10 +394,7 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
       .send({ token: invited.body.inviteToken, password })
       .expect(200);
     const token = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password })
-        .expect(200)
+      await mintSignIn(app, { email, password })
     ).body.accessToken as string;
     return { token, userId, email };
   }
@@ -414,10 +412,7 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
     ownerUserId = registered.body.owner.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     ({ token: opsToken, userId: opsUserId } = await inviteMember('ops_manager'));
 
@@ -1116,10 +1111,7 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
     const raceTenantId = registered.body.tenant.id as string;
     createdTenantIds.push(raceTenantId);
     const raceToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     const put = (key: string): SupertestTest =>
@@ -1337,10 +1329,7 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
     const tenant2Id = registered.body.tenant.id as string;
     createdTenantIds.push(tenant2Id);
     const owner2Token = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     // The foreign queue is empty — RLS filters tenant 1's rows out of the read.

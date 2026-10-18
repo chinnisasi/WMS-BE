@@ -526,6 +526,13 @@
       "when": 1792296787615,
       "tag": "0074_secure_sessions",
       "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "7",
+      "when": 1792323756622,
+      "tag": "0075_second_factor",
+      "breakpoints": true
     }
   ]
 }

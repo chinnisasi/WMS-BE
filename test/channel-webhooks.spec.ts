@@ -19,6 +19,7 @@ import { ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { testAddress } from './support/shipment-address';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { declareChannelNoOps } from './support/audit-guard';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey and signs sessions; the
 // vault needs a real master key (any ≥32-char string).
@@ -203,10 +204,7 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
     ownerUserId = registered.body.owner.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     // The ops manager (channel.manage + orders.manage) and the accountant
@@ -229,10 +227,7 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
         .expect(200);
       if (role === 'ops_manager') {
         opsToken = (
-          await request(app.getHttpServer())
-            .post(`${API}/sign-in`)
-            .send({ email: acctEmail, password: 'ops-password-123' })
-            .expect(200)
+          await mintSignIn(app, { email: acctEmail, password: 'ops-password-123' })
         ).body.accessToken as string;
       } else {
         accountantUserId = (
@@ -1057,10 +1052,7 @@ describe('channel webhooks: ingest arms, verification, dedup, policy, RBAC (e2e,
         .expect(200)
     ).body.items.find((u: { id: string }) => u.id === accountantUserId).email as string;
     const accountantToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: accountantEmail, password: 'bean-password-123' })
-        .expect(200)
+      await mintSignIn(app, { email: accountantEmail, password: 'bean-password-123' })
     ).body.accessToken as string;
     await request(app.getHttpServer())
       .get(`${API}/${tenantId}/channels/connections/${connId}/mappings`)

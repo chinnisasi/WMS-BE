@@ -18,6 +18,7 @@ import { AnySessionGuard } from '../src/modules/tenancy/any-session.guard';
 import { PortalSessionGuard, PORTAL_SURFACE_DETAIL } from '../src/modules/clients/portal-session.guard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn, signInAs } from './support/sign-in';
 
 // Story 21-7 — the client portal: the `client` role and its invite rules, the
 // portal token (AD-4 amended for the fence only), the central fence on every
@@ -222,7 +223,7 @@ describe('client portal (e2e, story 21-7)', () => {
   // ── helpers ────────────────────────────────────────────────────────────────
 
   async function signIn(email: string, password = PASSWORD): Promise<string> {
-    return (await http().post(`${API}/sign-in`).send({ email, password }).expect(200)).body.accessToken as string;
+    return (await mintSignIn(app, { email, password })).body.accessToken as string;
   }
 
   async function createWarehouse(code: string, name: string): Promise<string> {
@@ -440,6 +441,8 @@ describe('client portal (e2e, story 21-7)', () => {
     'POST api/v1/echo',
     'POST api/v1/tenants',
     'POST api/v1/tenants/sign-in',
+    // Story 6-1b — the second step: its challenge token is the credential (no session exists yet).
+    'POST api/v1/tenants/sign-in/second-factor',
     // Story 6-1a — cookie-only: the refresh cookie names the session, and the
     // Origin + X-WMS-Session check replaces a bearer guard.
     'POST api/v1/tenants/session/refresh',
@@ -599,7 +602,7 @@ describe('client portal (e2e, story 21-7)', () => {
     it('the users list carries the client user with its client', async () => {
       const list = await http().get(`${API}/${tenantId}/users?limit=200`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
       const row = (list.body.items as { id: string }[]).find((item) => item.id === portalA.userId);
-      expect(row).toEqual({ id: portalA.userId, email: portalA.email, role: 'client', status: 'active', clientId: clientA, createdAt: expect.any(String), lockedUntil: null });
+      expect(row).toEqual({ id: portalA.userId, email: portalA.email, role: 'client', status: 'active', clientId: clientA, createdAt: expect.any(String), lockedUntil: null, secondFactorEnabled: false, secondFactorResetPending: false });
     });
   });
 
@@ -629,13 +632,17 @@ describe('client portal (e2e, story 21-7)', () => {
     });
 
     it('sign-in: a portal token carries client_id; the body carries user.clientId and the client', async () => {
+      // Story 6-1b — the portal is untouched (decision 4): one step, no
+      // X-WMS-Second-Factor header needed, the 6-1a body.
       const res = await http().post(`${API}/sign-in`).send({ email: portalA.email, password: PASSWORD }).expect(200);
+      expect(res.body.challenge).toBeUndefined();
       expect(payloadOf(res.body.accessToken as string)).toMatchObject({ sub: portalA.userId, tenant_id: tenantId, client_id: clientA });
       expect(res.body.user).toEqual({ id: portalA.userId, email: portalA.email, role: 'client', status: 'active', clientId: clientA, createdAt: expect.any(String) });
       expect(res.body.client).toEqual({ id: clientA, code: 'BRAND-A', name: 'Brand A Apparel' });
       const staff = await http().get(`${API}/${tenantId}/me`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
       expect(staff.body.user.clientId).toBeNull();
-      const ownerSignIn = await http().post(`${API}/sign-in`).send({ email: (await sql`select email from users where id = ${ownerUserId}`)[0]!.email as string, password: PASSWORD }).expect(200);
+      // The owner signs in through the real two-step flow (story 6-1b).
+      const ownerSignIn = await signInAs(app, (await sql`select email from users where id = ${ownerUserId}`)[0]!.email as string, PASSWORD);
       expect(ownerSignIn.body.client).toBeNull();
       expect(ownerSignIn.body.user.clientId).toBeNull();
     });

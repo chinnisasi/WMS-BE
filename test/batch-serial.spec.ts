@@ -9,6 +9,7 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { RECONCILIATION_DIVERGENCE_EVENT } from '../src/modules/inventory/reconcile';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -130,10 +131,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
       .expect(200);
     return {
       token: (
-        await request(app.getHttpServer())
-          .post(`${API}/sign-in`)
-          .send({ email, password: INVITEE_PASSWORD })
-          .expect(200)
+        await mintSignIn(app, { email, password: INVITEE_PASSWORD })
       ).body.accessToken as string,
     };
   }
@@ -149,10 +147,7 @@ describe('batch and serial traceability (e2e, story 2.4)', () => {
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     opsToken = (await createMember(ownerToken, 'ops_manager')).token;
 

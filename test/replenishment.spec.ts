@@ -13,6 +13,7 @@ import { ReplenishmentSchedulerWorker, parseReplenishmentPollMs } from '../src/j
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -82,10 +83,7 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       .expect(201);
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
-    const userIdOf = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email, password: 'correct-horse-battery' })
-      .expect(200);
+    const userIdOf = await mintSignIn(app, { email, password: 'correct-horse-battery' });
     ownerToken = userIdOf.body.accessToken as string;
 
     const mkMember = async (role: string): Promise<{ userId: string; token: string }> => {
@@ -101,10 +99,7 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
         .set(KEY_HEADER, ulid())
         .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
         .expect(200);
-      const session = await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: memberEmail, password: 'correct-horse-battery' })
-        .expect(200);
+      const session = await mintSignIn(app, { email: memberEmail, password: 'correct-horse-battery' });
       return { userId: invited.body.id as string, token: session.body.accessToken as string };
     };
     const ops = await mkMember('ops_manager');
@@ -215,10 +210,7 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
     const cTenantId = cRegistered.body.tenant.id as string;
     createdTenantIds.push(cTenantId);
     const cToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: cEmail, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email: cEmail, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     const cWarehouseId = (
       await request(app.getHttpServer())
@@ -1863,10 +1855,7 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       const dTenant = dRegistered.body.tenant.id as string;
       createdTenantIds.push(dTenant);
       const dToken = (
-        await request(app.getHttpServer())
-          .post(`${API}/sign-in`)
-          .send({ email: dEmail, password: 'correct-horse-battery' })
-          .expect(200)
+        await mintSignIn(app, { email: dEmail, password: 'correct-horse-battery' })
       ).body.accessToken as string;
       const dWh = (
         await request(app.getHttpServer())

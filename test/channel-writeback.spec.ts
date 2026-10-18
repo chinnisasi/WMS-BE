@@ -19,6 +19,7 @@ import type { OutboxRelay } from '../src/shared/events/outbox.seam';
 import { OUTBOX_MAX_ATTEMPTS } from '../src/shared/events/outbox';
 import { testAddress } from './support/shipment-address';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey and signs sessions; the
 // vault needs a real master key (any ≥32-char string).
@@ -193,10 +194,7 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
     ownerUserId = registered.body.owner.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     // The ops manager drives everything web-side (channel.manage,
@@ -214,10 +212,7 @@ describe('channel writeback: source filter, dedupe, convergence, echo, decouplin
       .send({ token: invited.body.inviteToken, password: 'ops-password-123' })
       .expect(200);
     opsToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: opsEmail, password: 'ops-password-123' })
-        .expect(200)
+      await mintSignIn(app, { email: opsEmail, password: 'ops-password-123' })
     ).body.accessToken as string;
 
     warehouseId = (

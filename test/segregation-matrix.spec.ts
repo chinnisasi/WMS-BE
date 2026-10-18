@@ -13,6 +13,7 @@ import {
   hazardClassesCompatible,
 } from '../src/shared/primitives/hazard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions — the same bootstrap
@@ -63,10 +64,7 @@ describe('segregation matrix (e2e, story 12-7)', () => {
       .expect(201);
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
-    ownerToken = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email, password: 'correct-horse-battery' })
-      .expect(200)
+    ownerToken = await mintSignIn(app, { email, password: 'correct-horse-battery' })
       .then((res) => res.body.accessToken as string);
   });
 
@@ -174,10 +172,7 @@ describe('segregation matrix (e2e, story 12-7)', () => {
       .set(KEY_HEADER, ulid())
       .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
       .expect(200);
-    const memberToken = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email, password: 'correct-horse-battery' })
-      .expect(200)
+    const memberToken = await mintSignIn(app, { email, password: 'correct-horse-battery' })
       .then((res) => res.body.accessToken as string);
 
     const res = await request(app.getHttpServer())
@@ -198,10 +193,7 @@ describe('segregation matrix (e2e, story 12-7)', () => {
       .send({ name: `Foreign Co ${ulid()}`, ownerEmail: foreignEmail, password: 'correct-horse-battery' })
       .expect(201);
     createdTenantIds.push(foreign.body.tenant.id as string);
-    const foreignToken = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email: foreignEmail, password: 'correct-horse-battery' })
-      .expect(200)
+    const foreignToken = await mintSignIn(app, { email: foreignEmail, password: 'correct-horse-battery' })
       .then((res) => res.body.accessToken as string);
 
     const res = await request(app.getHttpServer())

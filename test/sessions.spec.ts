@@ -15,6 +15,7 @@ import { signDeviceToken, tenantSessionSecret } from '../src/modules/tenancy/jwt
 import { REFRESH_COOKIE_NAME } from '../src/modules/tenancy/session-cookie';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow, noOpIdempotencyKey } from './support/audit-guard';
+import { signInAs } from './support/sign-in';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -73,12 +74,16 @@ describe('secure sessions (e2e, story 6-1a)', () => {
     return { tenantId: res.body.tenant.id as string, ownerId: res.body.owner.id as string, email };
   }
 
+  // Story 6-1b — the web client sends `X-WMS-Second-Factor: 1`: an owner's
+  // right password answers 200 with a challenge (no session yet).
   function signInReq(email: string, password: string, ip = newIp()) {
-    return http().post(`${API}/sign-in`).set('X-Forwarded-For', ip).send({ email, password });
+    return http().post(`${API}/sign-in`).set('X-Forwarded-For', ip).set('X-WMS-Second-Factor', '1').send({ email, password });
   }
 
+  /** The whole sign-in (story 6-1b: both steps for an owner), with the session's cookie. */
   async function signIn(email: string, password = PASSWORD): Promise<{ token: string; cookie: string; body: Record<string, unknown> }> {
-    const res = await signInReq(email, password).expect(200);
+    const res = await signInAs(app, email, password, { ip: newIp() });
+    expect(res.status).toBe(200);
     return { token: res.body.accessToken as string, cookie: refreshCookieOf(res), body: res.body as Record<string, unknown> };
   }
 
@@ -205,9 +210,17 @@ describe('secure sessions (e2e, story 6-1a)', () => {
   // ── web sessions ──────────────────────────────────────────────────────────
 
   describe('web sessions: refresh, sign-out, limits', () => {
+    // Story 6-1b — RETARGETED (guide §4): an owner's password step no longer
+    // opens the session (it answers a challenge, with no cookie and no row);
+    // the second step does, with the same cookie and body.
     it('sign-in sets the httpOnly refresh cookie and opens a session row', async () => {
       const t = await registerTenant();
-      const res = await signInReq(t.email, PASSWORD).expect(200);
+      const passwordStep = await signInReq(t.email, PASSWORD).expect(200);
+      expect(passwordStep.body.challenge).toBe('enroll');
+      expect(passwordStep.headers['set-cookie']).toBeUndefined();
+      expect(await sql`select id from sessions where user_id = ${t.ownerId}`).toHaveLength(0);
+      const res = await signInAs(app, t.email, PASSWORD, { ip: newIp() });
+      expect(res.status).toBe(200);
       const raw = (res.headers['set-cookie'] as unknown as string[]).find((v) => v.startsWith(REFRESH_COOKIE_NAME))!;
       expect(raw).toContain('HttpOnly');
       expect(raw).toContain('SameSite=Strict');

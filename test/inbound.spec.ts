@@ -8,6 +8,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -150,10 +151,7 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
       .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
       .expect(200);
     const token = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     return { userId, email, token };
   }
@@ -170,10 +168,7 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
     ownerUserId = registered.body.owner.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     // Warehouse → zone → one bin (bins are irrelevant to POs; the shape is).
@@ -723,7 +718,7 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
     // session the replay is still refused on authority first.
     await send().expect(401).then((res) => expect(res.body).toMatchObject({ code: 'session-ended', reason: 'role-changed' }));
     opsToken = (
-      await request(app.getHttpServer()).post(`${API}/sign-in`).send({ email: ops.email, password: 'correct-horse-battery' }).expect(200)
+      await mintSignIn(app, { email: ops.email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     await send().expect(403).then((res) => expect(res.body).toMatchObject({ code: 'role-denied' }));
   });

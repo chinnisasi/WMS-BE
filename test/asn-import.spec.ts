@@ -9,6 +9,7 @@ import { ASN_IMPORT_ROW_ERROR_CODES } from '../src/modules/inbound/asn-import.pa
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { expectAuditRow } from './support/audit-guard';
+import { mintSignIn } from './support/sign-in';
 
 // The ASN import (2026-10-17): many advance shipment notices from one CSV or
 // XLSX file. Every I/O matrix row of the spec, the dry run that writes
@@ -100,7 +101,7 @@ describe('ASN import (e2e, 2026-10-17)', () => {
       .send({ name: `Import Co ${ulid()}`, ownerEmail: email, password: PASSWORD })
       .expect(201);
     tenantId = registered.body.tenant.id as string;
-    ownerToken = (await http().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200)).body.accessToken as string;
+    ownerToken = (await mintSignIn(app, { email, password: PASSWORD })).body.accessToken as string;
 
     ({ id: wh1, code: wh1Code } = await createWarehouse('BLR-DC'));
     ({ code: wh2Code } = await createWarehouse('MUM-DC'));
@@ -204,7 +205,7 @@ describe('ASN import (e2e, 2026-10-17)', () => {
       .send({ email, role })
       .expect(201);
     await http().post(`${API}/${tenantId}/accept-invite`).set(KEY_HEADER, ulid()).send({ token: invited.body.inviteToken as string, password: PASSWORD }).expect(200);
-    const token = (await http().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200)).body.accessToken as string;
+    const token = (await mintSignIn(app, { email, password: PASSWORD })).body.accessToken as string;
     return { userId: invited.body.user.id as string, token, email };
   }
 
@@ -541,7 +542,7 @@ describe('ASN import (e2e, 2026-10-17)', () => {
       .send({ email, role: 'client', clientId: acme })
       .expect(201);
     await http().post(`${API}/${tenantId}/accept-invite`).set(KEY_HEADER, ulid()).send({ token: invited.body.inviteToken as string, password: PASSWORD }).expect(200);
-    const portalToken = (await http().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200)).body.accessToken as string;
+    const portalToken = (await mintSignIn(app, { email, password: PASSWORD })).body.accessToken as string;
     const portal = await upload(file, { token: portalToken }).expect(403);
     expect(portal.body).toMatchObject({ code: 'role-denied', detail: 'This is an operator surface.' });
     const portalCheck = await upload(file, { token: portalToken, dryRun: true, key: null }).expect(403);

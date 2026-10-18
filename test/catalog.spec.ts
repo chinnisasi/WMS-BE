@@ -8,6 +8,7 @@ import { ulid, uuidv7 } from '../src/shared/primitives/ids';
 import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -101,10 +102,7 @@ describe('catalog (e2e)', () => {
   }
 
   async function signIn(email: string, password = 'correct-horse-battery'): Promise<string> {
-    const res = await request(app.getHttpServer())
-      .post(`${IDENTITY_URL}/sign-in`)
-      .send({ email, password })
-      .expect(200);
+    const res = await mintSignIn(app, { email, password });
     return res.body.accessToken as string;
   }
 

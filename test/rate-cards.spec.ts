@@ -24,6 +24,7 @@ import {
   RATE_CARD_STATUSES,
 } from '../src/modules/billing/rate-cards';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { mintSignIn } from './support/sign-in';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -200,7 +201,7 @@ describe('story 21-3: rate cards', () => {
         .send({ name, ownerEmail: email, password: 'correct-horse-battery' })
         .expect(201);
       const token = (
-        await http().post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200)
+        await mintSignIn(app, { email, password: 'correct-horse-battery' })
       ).body.accessToken as string;
       return { tenantId: registered.body.tenant.id as string, ownerToken: token };
     }
@@ -218,7 +219,7 @@ describe('story 21-3: rate cards', () => {
         .set(KEY_HEADER, ulid())
         .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
         .expect(200);
-      return (await http().post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200)).body
+      return (await mintSignIn(app, { email, password: 'correct-horse-battery' })).body
         .accessToken as string;
     }
 

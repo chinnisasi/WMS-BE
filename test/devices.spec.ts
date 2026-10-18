@@ -10,6 +10,7 @@ import { open as openSealed } from '../src/shared/crypto/envelope';
 import { signDeviceToken, tenantSessionSecret } from '../src/modules/tenancy/jwt-session';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow, noOpIdempotencyKey, seededIdempotencyKey } from './support/audit-guard';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -74,10 +75,7 @@ describe('device enrollment, badge-in, revocation, self-test echo (e2e)', () => 
   }
 
   async function signIn(email: string, password = 'correct-horse-battery'): Promise<string> {
-    const res = await request(app.getHttpServer())
-      .post(`${IDENTITY_URL}/sign-in`)
-      .send({ email, password })
-      .expect(200);
+    const res = await mintSignIn(app, { email, password });
     return res.body.accessToken as string;
   }
 

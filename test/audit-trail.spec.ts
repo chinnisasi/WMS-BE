@@ -14,6 +14,7 @@ import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissi
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { noOpIdempotencyKey, unauditedKeys } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // Story 9-3a — the audit trail read (FR-28): `GET /tenants/{t}/reporting/audit`,
 // owner-only, cursor-paged on the server stamp. The paging and window rows
@@ -62,7 +63,7 @@ describe('the audit trail read (e2e, story 9-3a)', () => {
   const http = () => request(app.getHttpServer());
 
   async function signIn(email: string): Promise<string> {
-    return (await http().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200)).body.accessToken as string;
+    return (await mintSignIn(app, { email, password: PASSWORD })).body.accessToken as string;
   }
 
   function audit(query: Record<string, string | number> = {}, token = ownerToken) {

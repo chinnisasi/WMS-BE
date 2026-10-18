@@ -2838,3 +2838,38 @@ describe('architecture: no suite deletes the audit guard\'s evidence before the 
     expect(offenders).toEqual([]);
   });
 });
+
+describe('architecture: the second factor’s key material has one home (story 6-1b)', () => {
+  const tenancyRoot = join(SRC_ROOT, 'modules', 'tenancy');
+  const SECRETS_OWNER = join(tenancyRoot, 'second-factor-secrets.ts');
+  const ENVELOPE_IMPORT = /from\s+['"][^'"]*crypto\/envelope['"]/;
+
+  it('MFA_ENCRYPTION_KEY (and its _PREVIOUS) is read only in second-factor-secrets.ts', () => {
+    const offenders = files
+      .filter((file) => file.path !== SECRETS_OWNER && /process\.env\.MFA_ENCRYPTION_KEY/.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+    // Meaningful: the owner really reads both.
+    const owner = readFileSync(SECRETS_OWNER, 'utf8');
+    expect(owner).toContain('process.env.MFA_ENCRYPTION_KEY');
+    expect(owner).toContain('process.env.MFA_ENCRYPTION_KEY_PREVIOUS');
+  });
+
+  it('tenancy’s envelope importers are only enrollment.command.ts (and second-factor-secrets.ts, which does its own GCM)', () => {
+    const importers = files
+      .filter((file) => file.path.startsWith(tenancyRoot) && ENVELOPE_IMPORT.test(file.source))
+      .map((file) => file.path.slice(tenancyRoot.length + 1))
+      .sort();
+    for (const importer of importers) expect(['enrollment.command.ts', 'second-factor-secrets.ts']).toContain(importer);
+    expect(importers).toContain('enrollment.command.ts');
+    // The 2FA secrets never go through the device envelope (whose seal/open default to the device key).
+    expect(readFileSync(SECRETS_OWNER, 'utf8')).toContain("cipher.setAAD(");
+  });
+
+  it('the app refuses to boot without the key: main.ts runs the check before createApp', () => {
+    const main = readFileSync(join(SRC_ROOT, 'main.ts'), 'utf8');
+    const check = main.indexOf('assertSecondFactorKeyConfigured()');
+    expect(check).toBeGreaterThan(-1);
+    expect(check).toBeLessThan(main.indexOf('await createApp('));
+  });
+});

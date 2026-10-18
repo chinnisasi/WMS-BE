@@ -26,6 +26,7 @@ import { ProblemException } from '../src/shared/problem-details/problem.exceptio
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -245,7 +246,7 @@ describe('story 21-2b: client admin and attribution', () => {
         .send({ name, ownerEmail: email, password: 'correct-horse-battery' })
         .expect(201);
       const token = (
-        await http().post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200)
+        await mintSignIn(app, { email, password: 'correct-horse-battery' })
       ).body.accessToken as string;
       return { tenantId: registered.body.tenant.id as string, ownerToken: token, email };
     }
@@ -264,7 +265,7 @@ describe('story 21-2b: client admin and attribution', () => {
         .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
         .expect(200);
       const token = (
-        await http().post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200)
+        await mintSignIn(app, { email, password: 'correct-horse-battery' })
       ).body.accessToken as string;
       return { email, token };
     }
@@ -1292,7 +1293,7 @@ describe('story 21-2b: client admin and attribution', () => {
           .set(KEY_HEADER, ulid())
           .send({ token: invited.body.inviteToken as string, password: PASSWORD })
           .expect(200);
-        const signedIn = await http().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200);
+        const signedIn = await mintSignIn(app, { email, password: PASSWORD });
         return { token: signedIn.body.accessToken as string };
       }
 

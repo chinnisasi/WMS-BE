@@ -158,4 +158,11 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'user.sign_in_locked', targetType: 'user' },
   { action: 'device.badge_locked', targetType: 'device' },
   { action: 'device.badged_out', targetType: 'device' },
+  // Story 6-1b — the second factor's life (`second-factor.command.ts`, `second-factor.ts`).
+  { action: 'user.second_factor_enabled', targetType: 'user' },
+  { action: 'user.second_factor_disabled', targetType: 'user' },
+  { action: 'user.backup_codes_regenerated', targetType: 'user' },
+  { action: 'user.backup_code_used', targetType: 'user' },
+  { action: 'user.second_factor_locked', targetType: 'user' },
+  { action: 'user.second_factor_reset', targetType: 'user' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

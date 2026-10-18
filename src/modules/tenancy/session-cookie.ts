@@ -123,4 +123,6 @@ const SESSION_END_DETAIL: Record<SessionEndReason, string> = {
   idle: 'You were signed out after a period of inactivity.',
   absolute: 'Your session reached its time limit — sign in again.',
   legacy: 'Sessions were upgraded — sign in again.',
+  'second-factor-reset': 'An owner reset your two-factor sign-in — sign in and set it up again.',
+  'second-factor-changed': 'Your two-factor settings changed on another device — sign in again.',
 };

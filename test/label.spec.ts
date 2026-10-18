@@ -15,6 +15,7 @@ import { sealCredential } from '../src/modules/carriers/carrier-credentials';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -137,10 +138,7 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     const signIn = (address: string, password: string) =>
-      request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: address, password })
-        .expect(200)
+      mintSignIn(app, { email: address, password })
         .then((res) => res.body.accessToken as string);
     ownerToken = await signIn(email, 'correct-horse-battery');
     opsToken = await inviteAndSignIn('ops_manager', 'ops-password-123');
@@ -344,10 +342,7 @@ describe('labels and manifests: the shipment record and its closure (e2e, story 
       .set(KEY_HEADER, ulid())
       .send({ token: invited.body.inviteToken as string, password })
       .expect(200);
-    return request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email: address, password })
-      .expect(200)
+    return mintSignIn(app, { email: address, password })
       .then((res) => res.body.accessToken as string);
   }
 

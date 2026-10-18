@@ -123,6 +123,29 @@ export const users = pgTable('users', {
    * reactivation restores it.
    */
   statusBeforeDeactivation: text('status_before_deactivation'),
+  /**
+   * Story 6-1b — two-factor sign-in (RFC 6238 TOTP). The authenticator
+   * secret, sealed by `second-factor-secrets.ts` (AES-256-GCM, associated
+   * data `tenant_id:user_id`); set exactly while `mfa_enabled_at` is (the
+   * 0075 pairing CHECK). Never read outside the tenancy module.
+   */
+  mfaSecretSealed: text('mfa_secret_sealed'),
+  mfaEnabledAt: timestamp('mfa_enabled_at', { withTimezone: true, mode: 'string' }),
+  /** The last TOTP step accepted — a code is single-use, steps only move forward. */
+  mfaLastStep: bigint('mfa_last_step', { mode: 'number' }),
+  /** Consecutive wrong codes (5 → a 15-minute lock). */
+  mfaFailures: integer('mfa_failures').notNull().default(0),
+  /** Consecutive locks without a success (the 3rd is permanent until an owner unlocks). */
+  mfaLockCycles: integer('mfa_lock_cycles').notNull().default(0),
+  /** Wrong codes since the last successful sign-in (shown after the next one). */
+  mfaFailedSinceSuccess: integer('mfa_failed_since_success').notNull().default(0),
+  mfaLockedUntil: timestamp('mfa_locked_until', { withTimezone: true, mode: 'string' }),
+  /** An enrolment in progress — reused for 24 h so a scanned QR code stays valid. */
+  mfaPendingSecretSealed: text('mfa_pending_secret_sealed'),
+  mfaPendingCreatedAt: timestamp('mfa_pending_created_at', { withTimezone: true, mode: 'string' }),
+  /** sha256 of the one-time enrolment code an owner's reset hands over (72 h). */
+  mfaEnrolCodeHash: text('mfa_enrol_code_hash'),
+  mfaEnrolCodeExpiresAt: timestamp('mfa_enrol_code_expires_at', { withTimezone: true, mode: 'string' }),
   ...tenantTimestamps,
 });
 
@@ -168,6 +191,60 @@ export const sessions = pgTable(
 );
 
 export type SessionRow = typeof sessions.$inferSelect;
+
+/**
+ * Story 6-1b — the pending second step of a web sign-in. The right password
+ * creates one (no session yet); the code completes it. Token `<id>.<secret>`,
+ * the secret stored as sha256. `purpose` ∈ `totp | enroll`; a `totp`
+ * challenge records the user's `mfa_enabled_at` when it was issued
+ * (`enabled_at_seen`), so a factor changed since cannot complete it. CHECKs
+ * and RLS live only in migration 0075.
+ */
+export const signInChallenges = pgTable(
+  'sign_in_challenges',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    userId: uuid('user_id').notNull(),
+    purpose: text('purpose').notNull(),
+    secretHash: text('secret_hash').notNull(),
+    enabledAtSeen: timestamp('enabled_at_seen', { withTimezone: true, mode: 'string' }),
+    failures: integer('failures').notNull().default(0),
+    ip: text('ip').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'string' }).notNull(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true, mode: 'string' }),
+  },
+  (table) => [
+    index('sign_in_challenges_expires_at_idx').on(table.expiresAt),
+    index('sign_in_challenges_open_idx').on(table.tenantId, table.userId).where(sql`consumed_at is null`),
+  ],
+);
+
+/**
+ * Story 6-1b — single-use backup codes for a lost authenticator. Stored as
+ * HMAC-SHA256 under a pepper derived from `MFA_ENCRYPTION_KEY` over
+ * `user_id || code`; a set of ten is replaced whole, never appended to.
+ */
+export const userBackupCodes = pgTable(
+  'user_backup_codes',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    userId: uuid('user_id').notNull(),
+    codeHash: text('code_hash').notNull(),
+    usedAt: timestamp('used_at', { withTimezone: true, mode: 'string' }),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('user_backup_codes_user_code_unique').on(table.userId, table.codeHash),
+    index('user_backup_codes_unused_idx').on(table.userId).where(sql`used_at is null`),
+  ],
+);
 
 /**
  * Story 6-1a — password lockout counters, keyed on (sha256 of the normalised

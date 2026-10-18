@@ -10,6 +10,7 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -180,10 +181,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       .set(KEY_HEADER, ulid())
       .send({ token: invited.body.inviteToken, password: INVITEE_PASSWORD })
       .expect(200);
-    const signedIn = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email, password: INVITEE_PASSWORD })
-      .expect(200);
+    const signedIn = await mintSignIn(app, { email, password: INVITEE_PASSWORD });
     return {
       userId: signedIn.body.user.id as string,
       token: signedIn.body.accessToken as string,
@@ -193,10 +191,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
 
   /** Story 6-1a — a role change ends the user's web session; sign in again for a token under the new role. */
   async function signInAgain(email: string): Promise<string> {
-    const res = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email, password: INVITEE_PASSWORD })
-      .expect(200);
+    const res = await mintSignIn(app, { email, password: INVITEE_PASSWORD });
     return res.body.accessToken as string;
   }
 
@@ -211,10 +206,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     // An ops_manager (holds stock.adjust) and an operator (holds none).
@@ -809,10 +801,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       .expect(201);
     createdTenantIds.push(registered.body.tenant.id as string);
     const otherToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     // POST naming the FIRST tenant: rejected before any write.

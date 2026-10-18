@@ -16,6 +16,7 @@ import { ReplenishmentFacade } from '../src/modules/replenishment/replenishment.
 import type { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // spec-fix-new-warehouse-order-intake (epic-21 retro A2 / R1): a warehouse
 // created after the backend starts, a stock-less one, or one whose Valkey
@@ -102,10 +103,7 @@ describe('cold warehouse order intake: ATP self-arms its reservation counters (e
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     const csvHeader =

@@ -61,7 +61,7 @@ export function rateLimited(retryAfterSeconds: number): ProblemException {
   );
 }
 
-function minutesText(seconds: number): string {
+export function minutesText(seconds: number): string {
   const minutes = Math.max(1, Math.ceil(seconds / 60));
   return minutes === 1 ? '1 minute' : `${minutes} minutes`;
 }

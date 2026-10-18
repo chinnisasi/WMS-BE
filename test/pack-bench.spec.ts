@@ -8,6 +8,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -89,10 +90,7 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     const signIn = (address: string, password: string) =>
-      request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: address, password })
-        .expect(200)
+      mintSignIn(app, { email: address, password })
         .then((res) => res.body.accessToken as string);
     ownerToken = await signIn(email, 'correct-horse-battery');
 
@@ -594,10 +592,7 @@ describe('pack bench: device snapshot arms + device pack route (e2e, story 10.7)
       .expect(201);
     createdTenantIds.push(registered.body.tenant.id as string);
     const otherTenantId = registered.body.tenant.id as string;
-    const otherToken = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email, password: 'correct-horse-battery' })
-      .expect(200)
+    const otherToken = await mintSignIn(app, { email, password: 'correct-horse-battery' })
       .then((res) => res.body.accessToken as string);
     const minted = await request(app.getHttpServer())
       .post(`${API}/${otherTenantId}/devices/enrollment-codes`)

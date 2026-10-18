@@ -52,6 +52,7 @@ import {
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // Story 9-3c — ledger anchoring and chain alerts. Every matrix row is driven
 // through `InventoryFacade.runLedgerIntegrity` (one warehouse per scenario,
@@ -154,7 +155,7 @@ describe('ledger anchoring and chain alerts (e2e, story 9-3c)', () => {
   const httpReq = () => request(app.getHttpServer());
 
   async function signIn(email: string): Promise<string> {
-    return (await httpReq().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200)).body.accessToken as string;
+    return (await mintSignIn(app, { email, password: PASSWORD })).body.accessToken as string;
   }
 
   async function newHouse(label: string): Promise<House> {

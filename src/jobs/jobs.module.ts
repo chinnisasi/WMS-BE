@@ -25,6 +25,7 @@ import { TenancyService } from '../modules/tenancy/tenancy.service';
 import { AUDIT_EXPORT_STALE_MINUTES } from '../modules/tenancy/audit-export.runner';
 import { purgeEndedSessions } from '../modules/tenancy/sessions';
 import { purgeAuthCounters } from '../modules/tenancy/auth-attempts';
+import { purgeSecondFactorState } from '../modules/tenancy/second-factor';
 
 /** The problem code a failed ATP read fails closed with (A8's store split). */
 function codeOf(error: ProblemException): string | null {
@@ -1406,7 +1407,8 @@ export function parseSessionPurgePollMs(raw: string | undefined): number {
 /**
  * Story 6-1a — purges session rows that ended more than 30 days ago (each
  * tenant's delete in its own RLS-scoped transaction) and stale attempt
- * counters. Env-gated OFF when `SESSION_PURGE_POLL_MS` is unset/`0` (daily
+ * counters; story 6-1b — and spent sign-in challenges and stale pending
+ * authenticator secrets. Env-gated OFF when `SESSION_PURGE_POLL_MS` is unset/`0` (daily
  * in production: 86400000); single-flight; `unref`'d timer.
  */
 @Injectable()
@@ -1452,6 +1454,18 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, OnApplication
         await purgeAuthCounters(this.db);
       } catch (error) {
         this.logger.error(`Attempt-counter purge failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      // Story 6-1b — its own block: sign-in challenges that expired over a day
+      // ago and pending authenticator secrets older than 24 h. Its own tenant
+      // discovery, and a try/catch per tenant inside.
+      try {
+        await purgeSecondFactorState(this.db, this.authDb, (tenantId, error) =>
+          this.logger.error(
+            `Second-factor purge failed for tenant ${tenantId}: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
+      } catch (error) {
+        this.logger.error(`Second-factor purge failed: ${error instanceof Error ? error.message : String(error)}`);
       }
       return purged;
     } finally {
