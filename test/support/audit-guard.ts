@@ -73,6 +73,10 @@ export const AUDIT_NO_OP_ARMS = {
   'waves.cancel:already-cancelled': (snapshot: unknown) => entitySnapshot(snapshot, 'wave', 'cancelled'),
   /** `EnrollmentCommand.revoke` on an already-revoked device ("no second audit row"). */
   'devices.revoke:already-revoked': (snapshot: unknown) => entitySnapshot(snapshot, 'device', 'revoked'),
+  /** Story 6-1a — `UsersCommand.setUserStatus` deactivate on an already-deactivated user ("writes nothing but stores the key"). */
+  'users.deactivate:already-deactivated': (snapshot: unknown) => entitySnapshot(snapshot, 'user', 'deactivated'),
+  /** Story 6-1a — `UsersCommand.setUserStatus` reactivate on a user who is not deactivated. */
+  'users.reactivate:not-deactivated': (snapshot: unknown) => entitySnapshot(snapshot, 'user'),
 } as const satisfies Readonly<Record<string, (snapshot: unknown) => boolean>>;
 
 export type AuditNoOpArm = keyof typeof AUDIT_NO_OP_ARMS;

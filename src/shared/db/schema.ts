@@ -76,8 +76,13 @@ export type UserRole = (typeof userRoleEnum.enumValues)[number];
 /**
  * Invite lifecycle status: `invited` (credentials not yet set) → `active`.
  * Sign-in rejects `invited` users with 403 `invite-pending`.
+ *
+ * Story 6-1a: `deactivated` — an owner offboarded the user (sign-in answers
+ * the wrong-password 401, badge-in `badge-invalid`, every session revoked).
+ * Backstopped by `users_status_check` (migration 0074, the first CHECK on
+ * this column), pinned against this tuple by test/sessions.spec.ts.
  */
-export const USER_STATUSES = ['invited', 'active'] as const;
+export const USER_STATUSES = ['invited', 'active', 'deactivated'] as const;
 export type UserStatus = (typeof USER_STATUSES)[number];
 
 /**
@@ -112,10 +117,87 @@ export const users = pgTable('users', {
   clientId: uuid('client_id'),
   inviteTokenHash: text('invite_token_hash'),
   inviteExpiresAt: timestamp('invite_expires_at', { withTimezone: true, mode: 'string' }),
+  /**
+   * Story 6-1a — the status a deactivation replaced (`invited` | `active`),
+   * set exactly while `status = 'deactivated'` (the 0074 pairing CHECK);
+   * reactivation restores it.
+   */
+  statusBeforeDeactivation: text('status_before_deactivation'),
   ...tenantTimestamps,
 });
 
 export type User = typeof users.$inferSelect;
+
+/**
+ * Story 6-1a — server-side session records. One row per web, portal and
+ * badge-in session; the access token carries its id (`sid`) and every guard
+ * re-reads the row (revoked / idle / absolute) and the user's status, so a
+ * revocation bites on the next request. `kind` ∈ `SESSION_KINDS`
+ * (`modules/tenancy/sessions.ts`); `refresh_hash` / `prev_refresh_hash` are
+ * sha256 of the rotating refresh secret (web and portal only). Every time
+ * comparison uses the database's `now()`. CHECKs and RLS live only in the
+ * migration SQL (0074).
+ */
+export const sessions = pgTable(
+  'sessions',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    userId: uuid('user_id').notNull(),
+    kind: text('kind').notNull(),
+    deviceId: uuid('device_id'),
+    clientId: uuid('client_id'),
+    refreshHash: text('refresh_hash'),
+    prevRefreshHash: text('prev_refresh_hash'),
+    rotatedAt: timestamp('rotated_at', { withTimezone: true, mode: 'string' }),
+    createdAt: timestamp('created_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+    idleExpiresAt: timestamp('idle_expires_at', { withTimezone: true, mode: 'string' }).notNull(),
+    absoluteExpiresAt: timestamp('absolute_expires_at', { withTimezone: true, mode: 'string' }).notNull(),
+    revokedAt: timestamp('revoked_at', { withTimezone: true, mode: 'string' }),
+    revokedReason: text('revoked_reason'),
+  },
+  (table) => [
+    uniqueIndex('sessions_refresh_hash_unique').on(table.refreshHash),
+    index('sessions_user_live_idx').on(table.userId).where(sql`revoked_at is null`),
+    index('sessions_tenant_client_idx').on(table.tenantId, table.clientId),
+    index('sessions_device_idx').on(table.deviceId),
+  ],
+);
+
+export type SessionRow = typeof sessions.$inferSelect;
+
+/**
+ * Story 6-1a — password lockout counters, keyed on (sha256 of the normalised
+ * email, client IP) whether or not the account exists (A3), so an unknown
+ * email is indistinguishable and an attacker cannot lock an owner out of
+ * their own network. No `tenant_id` (an unknown email has none) and so no
+ * RLS: it holds no tenant data — a digest, an address and two counters.
+ */
+export const signinAttempts = pgTable(
+  'signin_attempts',
+  {
+    emailHash: text('email_hash').notNull(),
+    ip: text('ip').notNull(),
+    failures: integer('failures').notNull().default(0),
+    lockedUntil: timestamp('locked_until', { withTimezone: true, mode: 'string' }),
+    updatedAt: timestamp('updated_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  },
+  (table) => [primaryKey({ columns: [table.emailHash, table.ip] })],
+);
+
+/**
+ * Story 6-1a (A2) — fixed one-minute attempt windows for the sign-in (per
+ * client IP) and badge-in (per device) limits. In Postgres, never memory
+ * (the spec's Never list). No tenant data, no RLS.
+ */
+export const authRateLimits = pgTable('auth_rate_limits', {
+  bucket: text('bucket').primaryKey(),
+  windowStart: timestamp('window_start', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
+  count: integer('count').notNull().default(0),
+});
 
 /**
  * Story 21-1 — the client dimension (AD-23): one row per client brand whose
@@ -1842,6 +1924,10 @@ export const devices = pgTable(
     pushToken: text('push_token'),
     pushWarehouseId: uuid('push_warehouse_id'),
     pushRegisteredAt: timestamp('push_registered_at', { withTimezone: true, mode: 'string' }),
+    /** Story 6-1a (A1) — the device's consecutive wrong-PIN count; the PIN is the device's, so the lock is too. */
+    failedBadgeIns: integer('failed_badge_ins').notNull().default(0),
+    /** Story 6-1a — badge-in refused 423 `badge-locked` until this instant (5 failures → 15 min). */
+    badgeLockedUntil: timestamp('badge_locked_until', { withTimezone: true, mode: 'string' }),
     ...tenantTimestamps,
   },
   (table) => [

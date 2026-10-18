@@ -23,6 +23,8 @@ import { NotificationsFacade, PUSH_SENDING_STALE_MS } from '../modules/notificat
 import { TenancyModule } from '../modules/tenancy/tenancy.module';
 import { TenancyService } from '../modules/tenancy/tenancy.service';
 import { AUDIT_EXPORT_STALE_MINUTES } from '../modules/tenancy/audit-export.runner';
+import { purgeEndedSessions } from '../modules/tenancy/sessions';
+import { purgeAuthCounters } from '../modules/tenancy/auth-attempts';
 
 /** The problem code a failed ATP read fails closed with (A8's store split). */
 function codeOf(error: ProblemException): string | null {
@@ -1396,6 +1398,68 @@ export class LedgerIntegrityWorker implements OnApplicationBootstrap, OnApplicat
   }
 }
 
+/** `SESSION_PURGE_POLL_MS` (story 6-1a): the session/attempt purge cadence; unset/`0` = OFF. */
+export function parseSessionPurgePollMs(raw: string | undefined): number {
+  return parsePollMs('SESSION_PURGE_POLL_MS', raw);
+}
+
+/**
+ * Story 6-1a — purges session rows that ended more than 30 days ago (each
+ * tenant's delete in its own RLS-scoped transaction) and stale attempt
+ * counters. Env-gated OFF when `SESSION_PURGE_POLL_MS` is unset/`0` (daily
+ * in production: 86400000); single-flight; `unref`'d timer.
+ */
+@Injectable()
+export class SessionPurgeWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('SessionPurgeWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+
+  constructor(
+    @Inject(DATABASE) private readonly db: Database,
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+  ) {
+    this.pollMs = parseSessionPurgePollMs(process.env.SESSION_PURGE_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) return;
+    this.logger.log(`Session purge worker started (every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  async tick(): Promise<number> {
+    if (this.running) return 0;
+    this.running = true;
+    try {
+      // Independent: a failing session purge never stops the counter purge.
+      let purged = 0;
+      try {
+        purged = await purgeEndedSessions(this.db, this.authDb);
+      } catch (error) {
+        this.logger.error(`Session purge failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      try {
+        await purgeAuthCounters(this.db);
+      } catch (error) {
+        this.logger.error(`Attempt-counter purge failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return purged;
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
 @Module({
   imports: [
     SharedModule,
@@ -1428,6 +1492,8 @@ export class LedgerIntegrityWorker implements OnApplicationBootstrap, OnApplicat
     AuditExportWorker,
     // Story 9-3c — the ledger integrity check (env-gated OFF by default).
     LedgerIntegrityWorker,
+    // Story 6-1a — the session / attempt-counter purge (env-gated OFF by default).
+    SessionPurgeWorker,
   ],
   exports: [],
 })

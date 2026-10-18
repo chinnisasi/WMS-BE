@@ -4,7 +4,7 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { tenantSessionSecret, verifyTenantSession } from '../tenancy/jwt-session';
+import { PORTAL_SURFACE_DETAIL, verifyWebRequest } from '../tenancy/tenant-session.guard';
 import { getMemberPortalFactsIn } from '../tenancy/tenancy.service';
 import { clientSuspended, readSessionClientIn } from './clients.facade';
 
@@ -21,10 +21,7 @@ export interface PortalSessionRequest {
   portalSession?: PortalSession;
 }
 
-/** Story 21-7 — the reverse fence's one refusal (exact detail pinned by test/portal.spec.ts). */
-export const PORTAL_SURFACE_DETAIL = 'This is a client-portal surface.';
-
-const BEARER_RE = /^bearer\s+(.+)$/i;
+export { PORTAL_SURFACE_DETAIL };
 
 /**
  * Story 21-7 — the client-portal session guard (the clients module owns
@@ -51,15 +48,10 @@ export class PortalSessionGuard implements CanActivate {
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<PortalSessionRequest>();
-    const header = request.headers.authorization;
-    const match = typeof header === 'string' ? BEARER_RE.exec(header) : null;
-    if (match === null) {
-      throw unauthenticated('A Bearer session token is required.');
-    }
-    const session = verifyTenantSession(match[1]!.trim(), tenantSessionSecret());
-    if (session === null) {
-      throw unauthenticated('The session token is invalid or expired.');
-    }
+    // Story 6-1a — token kind `portal` + the server-side session (revoked /
+    // idle / absolute / user not active → 401 `session-ended`), then the
+    // 21-7 per-request user and client re-read below.
+    const session = await verifyWebRequest(this.db, request.headers, 'portal');
     if (session.clientId === null) {
       throw new ProblemException('role-denied', 403, 'Role lacks the required capability', PORTAL_SURFACE_DETAIL);
     }

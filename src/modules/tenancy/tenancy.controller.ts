@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, Patch, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 import {
@@ -20,12 +20,31 @@ import { CurrentSession } from './tenant-session.guard';
 import { TenantSessionGuard } from './tenant-session.guard';
 import type { TenantSession } from './jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from './idempotency-guard';
+import { clientIpOf } from './auth-attempts';
+import {
+  REFRESH_COOKIE_NAME,
+  assertSessionRequestOrigin,
+  clearedRefreshCookieHeader,
+  readCookie,
+  refreshCookieHeader,
+} from './session-cookie';
+
+/** The slice of the Express request / response the session routes touch. */
+interface SessionHttpRequest {
+  headers: Record<string, unknown>;
+  ip?: string;
+  socket?: { remoteAddress?: string };
+}
+interface SessionHttpResponse {
+  setHeader(name: string, value: string): unknown;
+}
 // Constructor params are types here but must stay value imports: Nest DI needs
 // the runtime class tokens for decorator metadata (eslint rule bends for them).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
   BinCommand,
   RegistrationCommand,
+  SessionCommand,
   SignInCommand,
   WarehouseCommand,
   ZoneCommand,
@@ -47,6 +66,7 @@ import {
   RegisterTenantDto,
   SignInDto,
   SignInResponse,
+  RefreshResponse,
   TenantRegistrationResponse,
   WarehouseListResponse,
   WarehouseResponse,
@@ -96,6 +116,7 @@ export class TenancyController {
   constructor(
     private readonly registrationCommand: RegistrationCommand,
     private readonly signInCommand: SignInCommand,
+    private readonly sessionCommand: SessionCommand,
     private readonly warehouseCommand: WarehouseCommand,
     private readonly zoneCommand: ZoneCommand,
     private readonly binCommand: BinCommand,
@@ -126,14 +147,84 @@ export class TenancyController {
 
   @Post('sign-in')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Verifies the password and issues a short-lived session token' })
+  @ApiOperation({
+    summary: 'Verifies the password, opens a server-side session and issues a short access token',
+    description:
+      'Story 6-1a: also sets the httpOnly refresh cookie (`wms_refresh`, path /api/v1/tenants/session). Attempts are counted per (email, client IP) BEFORE the password check: 5 consecutive failures lock that pair for 15 minutes (423 for any password, real or unknown email alike); 300 attempts a minute per client IP answer 429.',
+  })
   @ApiBody({ type: SignInDto })
   @ApiOkResponse({ type: SignInResponse })
   @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body') })
-  @ApiResponse({ status: 401, ...problemJsonResponse('Unknown email or wrong password (unauthenticated)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Unknown email, wrong password, or a deactivated account (unauthenticated — one answer for all three)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Invitation not yet accepted (invite-pending), or a client-portal user whose client is not active (client-suspended, story 21-7)') })
-  async signIn(@Body() dto: SignInDto): Promise<SignInResponse> {
-    return this.signInCommand.execute({ email: dto.email, password: dto.password });
+  @ApiResponse({ status: 423, ...problemJsonResponse('Too many failed attempts for this email from this address (sign-in-locked; `retryAfterSeconds`)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited; `retryAfterSeconds`)') })
+  async signIn(
+    @Body() dto: SignInDto,
+    @Req() request: SessionHttpRequest,
+    @Res({ passthrough: true }) response: SessionHttpResponse,
+  ): Promise<SignInResponse> {
+    const { refreshCookie, ...body } = await this.signInCommand.execute({
+      email: dto.email,
+      password: dto.password,
+      ip: clientIpOf(request),
+    });
+    response.setHeader('Set-Cookie', refreshCookieHeader(refreshCookie, body.refreshExpiresInSeconds));
+    return body;
+  }
+
+  @Post('session/refresh')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Story 6-1a — rotates the refresh cookie and issues a new access token',
+    description:
+      'Cookie-only (`wms_refresh`); requires an allow-listed Origin and `X-WMS-Session: 1`. Refresh never extends the idle window. A rotated token presented within 30 s is a tab race (a new access token, no new cookie); after that it is reuse and the session is revoked.',
+  })
+  @ApiOkResponse({ type: RefreshResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse('No session to refresh (unauthenticated), or the session is over (session-ended with `reason`: signed-out | deactivated | role-changed | client-suspended | refresh-reuse | idle | absolute)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Origin not allow-listed or the X-WMS-Session header missing (role-denied)') })
+  async refreshSession(
+    @Req() request: SessionHttpRequest,
+    @Res({ passthrough: true }) response: SessionHttpResponse,
+  ): Promise<RefreshResponse> {
+    assertSessionRequestOrigin(request.headers);
+    try {
+      const { refreshCookie, ...body } = await this.sessionCommand.refresh(
+        readCookie(request.headers.cookie, REFRESH_COOKIE_NAME),
+      );
+      if (refreshCookie !== null) {
+        response.setHeader('Set-Cookie', refreshCookieHeader(refreshCookie, body.refreshExpiresInSeconds));
+      }
+      return body;
+    } catch (error) {
+      // Only an ENDED session clears the cookie: an unrecognised secret (a
+      // stale tab presenting an older rotation) must not wipe the jar's
+      // newest cookie and sign every tab out.
+      if (error instanceof ProblemException && (error.getResponse() as { code?: unknown }).code === 'session-ended') {
+        response.setHeader('Set-Cookie', clearedRefreshCookieHeader());
+      }
+      throw error;
+    }
+  }
+
+  @Post('session/sign-out')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: 'Story 6-1a — ends the session server-side and clears the refresh cookie',
+    description:
+      'Names the session by the refresh cookie, else by the bearer token (an expired access token still works). Idempotent. Requires an allow-listed Origin and `X-WMS-Session: 1`.',
+  })
+  @ApiResponse({ status: 204, description: 'Signed out (or there was nothing to sign out)' })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Origin not allow-listed or the X-WMS-Session header missing (role-denied)') })
+  async signOut(
+    @Req() request: SessionHttpRequest,
+    @Res({ passthrough: true }) response: SessionHttpResponse,
+  ): Promise<void> {
+    assertSessionRequestOrigin(request.headers);
+    const header = request.headers.authorization;
+    const bearer = typeof header === 'string' ? (/^bearer\s+(.+)$/i.exec(header)?.[1]?.trim() ?? null) : null;
+    await this.sessionCommand.signOut(readCookie(request.headers.cookie, REFRESH_COOKIE_NAME), bearer);
+    response.setHeader('Set-Cookie', clearedRefreshCookieHeader());
   }
 
   @Post(':tenantId/warehouses')

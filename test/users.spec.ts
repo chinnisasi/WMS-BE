@@ -398,7 +398,7 @@ describe('users, roles, and permission gating (e2e)', () => {
     expect(signedIn.user.role).toBe('operator');
   });
 
-  test('role change is audited and applies on the user’s next command without re-login', async () => {
+  test('role change is audited, ends the user’s web session (6-1a), and the new role applies after sign-in', async () => {
     const email = `owner-${ulid().toLowerCase()}@example.com`;
     const { tenantId } = await registerTenant(email);
     const { token: ownerToken } = await signIn(email);
@@ -411,9 +411,15 @@ describe('users, roles, and permission gating (e2e)', () => {
     const changed = await setUserRole(ownerToken, tenantId, member.userId, { role: 'operator' }).expect(200);
     expect(changed.body).toMatchObject({ id: member.userId, role: 'operator', email: member.email });
 
-    // … and the SAME session (no re-login) is denied on their next command —
-    // authority is re-read from the DB, never a JWT claim.
-    const denied = await createWarehouse(member.token, tenantId).expect(403);
+    // … the SAME session ends at once (story 6-1a): a role change revokes the
+    // user's web sessions, with the reason the sign-in page shows …
+    const ended = await createWarehouse(member.token, tenantId).expect(401);
+    expect(ended.body).toMatchObject({ code: 'session-ended', reason: 'role-changed' });
+
+    // … and after signing in again the new role is denied — authority is
+    // re-read from the DB, never a JWT claim.
+    const again = await signIn(member.email, INVITEE_PASSWORD);
+    const denied = await createWarehouse(again.token, tenantId).expect(403);
     expect(denied.body).toMatchObject({ code: 'role-denied' });
     expect(denied.body.detail).toContain('operator');
     expect(denied.body.detail).toContain('warehouse.create');

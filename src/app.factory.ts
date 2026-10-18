@@ -26,7 +26,9 @@ export async function createApp(withListener = false): Promise<INestApplication>
   const corsOrigins = (process.env.CORS_ORIGIN ?? 'http://localhost:3001')
     .split(',')
     .map((origin) => origin.trim());
-  app.enableCors({ origin: corsOrigins });
+  // Story 6-1a — credentials for the allow-listed origins only: the refresh
+  // cookie rides /api/v1/tenants/session (refresh, sign-out).
+  app.enableCors({ origin: corsOrigins, credentials: true });
 
   // The OpenAPI document is built before the global prefix so its paths are
   // clean (/health) and the base path travels in `servers` instead (AD-8).

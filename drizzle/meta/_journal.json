@@ -519,6 +519,13 @@
       "when": 1792172139199,
       "tag": "0073_return_receipts",
       "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1792296787615,
+      "tag": "0074_secure_sessions",
+      "breakpoints": true
     }
   ]
 }

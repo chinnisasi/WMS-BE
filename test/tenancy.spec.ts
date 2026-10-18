@@ -499,12 +499,19 @@ describe('tenancy (e2e)', () => {
         .set('Authorization', `Bearer ${token}`);
 
     // Expired: signed a clock-hour ago with the real secret.
-    const expired = signTenantSession(tenantId, userId, secret, Math.floor(Date.now() / 1000) - 3600);
+    // Story 6-1a — an expired ACCESS token is `token-expired` (a refresh can fix it).
+    const expired = signTenantSession(
+      { tenantId, userId, sessionId: uuidv7(), kind: 'web', nowSeconds: Math.floor(Date.now() / 1000) - 3600 },
+      secret,
+    );
     const expiredRes = await sendWith(expired).expect(401);
-    expect(expiredRes.body).toMatchObject({ code: 'unauthenticated' });
+    expect(expiredRes.body).toMatchObject({ code: 'token-expired' });
 
     // Wrong secret: signature fails; the claims look perfect.
-    const forged = signTenantSession(tenantId, userId, 'attacker-chosen-secret-0123456789');
+    const forged = signTenantSession(
+      { tenantId, userId, sessionId: uuidv7(), kind: 'web' },
+      'attacker-chosen-secret-0123456789',
+    );
     const forgedRes = await sendWith(forged).expect(401);
     expect(forgedRes.body).toMatchObject({ code: 'unauthenticated' });
 

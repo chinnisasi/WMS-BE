@@ -665,7 +665,10 @@ describe('notifications (e2e, story 9-2)', () => {
     });
 
     it('a client-portal token is fenced (403 role-denied) on all three routes; another tenant’s path is 403 permission-denied', async () => {
-      const portalToken = signTenantSession(tenant.tenantId, tenant.ownerId, process.env.JWT_SECRET!, undefined, uuidv7());
+      const portalToken = signTenantSession(
+        { tenantId: tenant.tenantId, userId: tenant.ownerId, sessionId: uuidv7(), kind: 'portal', clientId: uuidv7() },
+        process.env.JWT_SECRET!,
+      );
       for (const call of [
         () => request(app.getHttpServer()).get(`${API}/${tenant.tenantId}/notifications`),
         () => request(app.getHttpServer()).get(`${API}/${tenant.tenantId}/notifications/status`),

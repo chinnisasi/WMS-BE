@@ -4,6 +4,7 @@
  */
 export { RegistrationCommand } from './registration.command';
 export { SignInCommand } from './sign-in.command';
+export { SessionCommand } from './session.command';
 export { WarehouseCommand } from './warehouse.command';
 export { ZoneCommand } from './zone.command';
 export { BinCommand } from './bin.command';

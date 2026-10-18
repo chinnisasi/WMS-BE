@@ -1,17 +1,29 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { eq } from 'drizzle-orm';
-import { AUTH_DATABASE } from '../../shared/shared.module';
+import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
+import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { Database } from '../../shared/db/db';
 import { tenants, users } from '../../shared/db/schema';
 import type { UserRole, UserStatus } from '../../shared/db/schema';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { SESSION_TTL_SECONDS, signTenantSession, tenantSessionSecret } from './jwt-session';
+import {
+  SIGNIN_LIMIT_PER_IP_PER_MINUTE,
+  clearSignInAttempts,
+  countSignInAttempt,
+  hitRateLimit,
+  settleSignInFailure,
+  signInLocked,
+} from './auth-attempts';
+import { auditSecurityEventInTx, createSessionInTx, refreshCookieValue } from './sessions';
 import { DUMMY_HASH, verifyPassword } from './passwords';
 import { clientSuspended, readSessionClientIn } from '../clients/clients.facade';
 
 export interface SignInInput {
   readonly email: string;
   readonly password: string;
+  /** Story 6-1a — the caller's address (`clientIpOf`): the lockout and attempt-limit key. */
+  readonly ip: string;
 }
 
 /** The signed-in user's shape in the sign-in response (Story 1.5). */
@@ -52,23 +64,38 @@ export interface SignInClient {
  */
 @Injectable()
 export class SignInCommand {
-  constructor(@Inject(AUTH_DATABASE) private readonly authDb: Database) {}
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(DATABASE) private readonly db: Database,
+  ) {}
 
   async execute(command: SignInInput): Promise<{
     accessToken: string;
     tokenType: 'Bearer';
     expiresInSeconds: number;
+    refreshExpiresInSeconds: number;
+    /** Story 6-1a — the refresh cookie's value (`<sid>.<secret>`); the controller sets it, the body never carries it. */
+    refreshCookie: string;
     tenant: { id: string; name: string; gstin: string | null };
     user: SignInUser;
     client: SignInClient | null;
   }> {
     const email = command.email.trim().toLowerCase();
+    // Story 6-1a — the attempt limit, then this attempt is COUNTED before the
+    // password is checked (own committed statement; a lock answers 423 for
+    // any password, real or unknown email alike).
+    await hitRateLimit(this.db, `signin-ip:${command.ip}`, SIGNIN_LIMIT_PER_IP_PER_MINUTE);
+    const counted = await countSignInAttempt(this.db, email, command.ip);
     const userRows = await this.authDb
       .select()
       .from(users)
       .where(eq(users.email, email))
       .limit(1);
     const user = userRows[0];
+    if (counted.locked) {
+      if (counted.newlyLocked && user !== undefined) await this.auditLock(user, command.ip);
+      throw signInLocked(counted.retryAfterSeconds);
+    }
     if (user?.status === 'invited') {
       // An invited user has no password yet (a DUMMY_HASH sentinel that no
       // credential verifies) — the 403 invite-pending must fire for ANY
@@ -76,6 +103,9 @@ export class SignInCommand {
       // rejection is time-indistinguishable from the 401 paths (no
       // enumeration of pending invites via timing).
       await verifyPassword(command.password, DUMMY_HASH);
+      // Code review — not a guess at a password (an invitee has none): this
+      // refusal never counts toward the lock.
+      await clearSignInAttempts(this.db, email, command.ip);
       throw new ProblemException(
         'invite-pending',
         403,
@@ -86,7 +116,10 @@ export class SignInCommand {
     // Always pay one scrypt round — unknown email vs wrong password must be
     // indistinguishable in body *and* in time (no enumeration).
     const ok = await verifyPassword(command.password, user?.passwordHash ?? DUMMY_HASH);
-    if (user === undefined || !ok) {
+    // Story 6-1a — a deactivated user answers exactly like a wrong password.
+    if (user === undefined || !ok || user.status !== 'active') {
+      const locked = await settleSignInFailure(this.db, email, command.ip);
+      if (locked && user !== undefined) await this.auditLock(user, command.ip);
       // One message for unknown email and wrong password — no enumeration.
       throw new ProblemException(
         'unauthenticated',
@@ -110,21 +143,38 @@ export class SignInCommand {
     if (user.clientId !== null) {
       const facts = await readSessionClientIn(this.authDb, user.tenantId, user.clientId);
       if (facts === null || facts.status !== 'active') {
+        // The password was right: a suspension is not a failed attempt.
+        await clearSignInAttempts(this.db, email, command.ip);
         throw clientSuspended();
       }
       client = { id: facts.id, code: facts.code, name: facts.name };
     }
+    await clearSignInAttempts(this.db, email, command.ip);
+
+    // Story 6-1a — the server-side session, written in the user's tenant
+    // transaction (RLS); its id rides the access token as `sid`.
+    const kind = user.clientId === null ? 'web' : 'portal';
+    const created = await withTenantTransaction(this.db, user.tenantId, (tx) =>
+      createSessionInTx(tx, { tenantId: user.tenantId, userId: user.id, kind, clientId: user.clientId }),
+    );
+    const accessTtl = Math.min(SESSION_TTL_SECONDS, created.absoluteInSeconds);
 
     return {
       accessToken: signTenantSession(
-        user.tenantId,
-        user.id,
+        {
+          tenantId: user.tenantId,
+          userId: user.id,
+          sessionId: created.sessionId,
+          kind,
+          clientId: user.clientId,
+          ttlSeconds: accessTtl,
+        },
         tenantSessionSecret(),
-        undefined,
-        user.clientId ?? undefined,
       ),
       tokenType: 'Bearer',
-      expiresInSeconds: SESSION_TTL_SECONDS,
+      expiresInSeconds: accessTtl,
+      refreshExpiresInSeconds: created.absoluteInSeconds,
+      refreshCookie: refreshCookieValue(created.sessionId, created.refreshSecret!),
       tenant: { id: tenant.id, name: tenant.name, gstin: tenant.gstin },
       user: {
         id: user.id,
@@ -136,5 +186,19 @@ export class SignInCommand {
       },
       client,
     };
+  }
+
+  /** Code review (C11) — the lock is audited once, when it is set, against the account (the system acted). */
+  private async auditLock(user: { id: string; tenantId: string }, ip: string): Promise<void> {
+    await withTenantTransaction(this.db, user.tenantId, (tx) =>
+      auditSecurityEventInTx(tx, {
+        tenantId: user.tenantId,
+        action: 'user.sign_in_locked',
+        targetType: 'user',
+        targetId: user.id,
+        actorUserId: null,
+        reference: `ip:${ip}`,
+      }),
+    );
   }
 }
