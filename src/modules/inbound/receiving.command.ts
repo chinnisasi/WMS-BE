@@ -550,8 +550,11 @@ export class ReceivingCommand {
       // ── story 1-2b: ADDITIVE, the same `?? undefined` rule ─────────────
       // Set only by the review queue's apply arm (decision 5), so every
       // device op hashes exactly as before; a re-run under the waiver is a
-      // different command than one without it.
-      shelfLifeWaiver: command.shelfLifeWaiver ?? undefined,
+      // different command than one without it. Only the FACT of the waiver
+      // is hashed — never the reviewer or the note — so a retried Accept by
+      // another reviewer (or with an edited note) after the re-run committed
+      // replays rather than answering 422 forever.
+      shelfLifeWaived: command.shelfLifeWaiver === undefined || command.shelfLifeWaiver === null ? undefined : true,
       occurredAt: command.occurredAt,
       lines: command.lines.map((line) => ({
         poLineId: line.poLineId,
@@ -663,9 +666,11 @@ export class ReceivingCommand {
         // Story 1-2b — a malformed expiry is a whole-op 400, as a malformed
         // instant is: it is the request's shape, not a rule a stale snapshot
         // can trip. Every RULE about the date is a per-line refusal below.
-        if (line.expiryDate !== null && line.expiryDate !== undefined && (typeof line.expiryDate !== 'string' || !isIsoDate(line.expiryDate))) {
+        if (line.expiryDate !== null && line.expiryDate !== undefined && (typeof line.expiryDate !== 'string' || !isIsoDate(line.expiryDate) || !/^2[01]\d\d-/.test(line.expiryDate))) {
+          // Years 2000–2199 only: a year 0000/0001 would reach
+          // `istMidnightOf` and fail in Postgres (a 500), never a label's date.
           throw grnValidation(
-            `expiryDate must be a calendar date YYYY-MM-DD (the label's date, read in IST) — got "${String(line.expiryDate)}".`,
+            `expiryDate must be a calendar date YYYY-MM-DD between 2000 and 2199 (the label's date, read in IST) — got "${String(line.expiryDate)}".`,
           );
         }
         // Story 21-6: a line reference names a line of THE document — a
@@ -843,12 +848,20 @@ export class ReceivingCommand {
       // `grn.recorded` event: every line goes to review as
       // `sku-client-mismatch` (the `grn.lines-refused` row), and the op
       // settles 201 with `{goodsReceipt: null, refusedReceipt}`.
-      if (lines.length === 0 && refusalClientId !== null) {
+      /**
+       * Story 1-1 (decision 6) — EVERY line refused → no receipt: no GRN code
+       * consumed, no header, no `grn.recorded`; the lines go to review and the
+       * op settles 201 with `{goodsReceipt: null, refusedReceipt}`. Story 1-2b
+       * reaches it from two places: before the document lock (the client and
+       * expiry refusals), and after the batch ensure when the expiry race
+       * refused every remaining line.
+       */
+      const settleAllRefused = async (refusalClient: string): Promise<RefusedReceiptSnapshot> => {
         const rejectedLines = this.clientRefusalLines(clientRefused, skuById, clientLabels, namedBlindClientId);
         const review = await this.raiseRefusalReviewsInTx(tx, command, idempotencyKey, {
           grnId: null,
           grnCode: null,
-          clientId: refusalClientId,
+          clientId: refusalClient,
           clientLabels,
           blindReasonCode,
           occurredAt,
@@ -859,7 +872,7 @@ export class ReceivingCommand {
           goodsReceipt: null,
           refusedReceipt: {
             warehouseId: command.warehouseId,
-            clientId: refusalClientId,
+            clientId: refusalClient,
             blindReasonCode,
             occurredAt,
             rejectedLines,
@@ -886,6 +899,9 @@ export class ReceivingCommand {
           .where(eq(devices.id, command.deviceId));
         await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, refusedSnapshot);
         return refusedSnapshot;
+      };
+      if (lines.length === 0 && refusalClientId !== null) {
+        return settleAllRefused(refusalClientId);
       }
 
       // ── the receiving bin (tenancy-owned master data) ───────────────────
@@ -1055,6 +1071,11 @@ export class ReceivingCommand {
           ...clientRefused.map((entry) => skuById.get(entry.line.skuId)!.clientId),
         ]);
         refusalClientId ??= skuById.get(clientRefused[0]!.line.skuId)!.clientId;
+        // Story 1-2b — the race refused every remaining line: the same
+        // all-refused arm, never an empty GRN header.
+        if (lines.every((_, receivableIndex) => racedLineIndexes.has(receivableIndexes[receivableIndex]!))) {
+          return settleAllRefused(refusalClientId);
+        }
       }
 
       // ── the GRN header (server-assigned code under the tenant seq lock) ──
@@ -2346,6 +2367,17 @@ export class ReceivingCommand {
         batchExpiry.set(key, istDateOf(canonicalInstant(batch.expiryDate)));
       }
     }
+    // (2) again, against the EXISTING batch's mfg date when the line carries
+    // none — else the fill below could write an expiry before the batch's mfg.
+    for (const { index, line } of candidates) {
+      const key = batchKey(line);
+      const expiry = line.expiryDate ?? null;
+      if (out.has(index) || key === null || expiry === null || line.mfgDate !== null) continue;
+      const batchMfg = existing.get(key)?.mfgDate ?? null;
+      if (batchMfg !== null && expiry < istDateOf(canonicalInstant(batchMfg))) {
+        refuse({ index, line, code: 'expiry-before-mfg', expiryDate: expiry });
+      }
+    }
 
     // (3): one expiry per batch — the existing one, else the first line's.
     for (const { index, line } of candidates) {
@@ -2362,7 +2394,9 @@ export class ReceivingCommand {
 
     // (4) + (5): the client's policy, against the EFFECTIVE expiry.
     for (const { index, line } of candidates) {
-      if (out.has(index) || !tracked(line)) continue;
+      // A tracked line WITHOUT a batch code is not judged here: it reaches
+      // `ensureBatchIdentity`'s 400 ("its lines need a batch code") as before.
+      if (out.has(index) || !tracked(line) || line.batchCode === null) continue;
       const policy = args.policyOfSku(line.skuId);
       if (!policy.expiryRequired) continue;
       const key = batchKey(line);

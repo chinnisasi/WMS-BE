@@ -1751,6 +1751,8 @@ export function openReceiptHoldQtyByLine(tx: TenantTx, tenantId: string, warehou
         eq(ledgerEvents.tenantId, qcHolds.tenantId),
         eq(ledgerEvents.warehouseId, qcHolds.warehouseId),
         eq(ledgerEvents.type, 'qc.held'),
+        // `?` beside the equality: the partial `ledger_events_hold_ref_idx` applies.
+        sql`${ledgerEvents.referenceDoc} ? 'holdId'`,
         sql`${ledgerEvents.referenceDoc}->>'holdId' = ${qcHolds.id}::text`,
       ),
     )
@@ -1777,6 +1779,8 @@ export async function openReceiptHoldQtyOfLineInTx(tx: TenantTx, tenantId: strin
         eq(ledgerEvents.tenantId, qcHolds.tenantId),
         eq(ledgerEvents.warehouseId, qcHolds.warehouseId),
         eq(ledgerEvents.type, 'qc.held'),
+        // `?` beside the equality: the partial `ledger_events_hold_ref_idx` applies.
+        sql`${ledgerEvents.referenceDoc} ? 'holdId'`,
         sql`${ledgerEvents.referenceDoc}->>'holdId' = ${qcHolds.id}::text`,
       ),
     )

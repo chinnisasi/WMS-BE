@@ -985,7 +985,18 @@ export class QcCommand {
       if (grnId === undefined) continue;
       placements.set(row.overReceiptId ?? grnId, { grnId, warehouseId: row.warehouseId, overReceiptId: row.overReceiptId });
     }
-    for (const [placementId, placement] of placements) {
+    // Lock order: hold row(s) → the GRN row. Two LAST holds of one placement
+    // released concurrently would each see the other open and neither would
+    // emit; the GRN row lock serialises them, and the later one — READ
+    // COMMITTED — sees the earlier release and emits. Sorted by GRN id.
+    const ordered = [...placements].sort(([, a], [, b]) => (a.grnId < b.grnId ? -1 : a.grnId > b.grnId ? 1 : 0));
+    for (const [placementId, placement] of ordered) {
+      await tx
+        .select({ id: goodsReceiptNotes.id })
+        .from(goodsReceiptNotes)
+        .where(and(eq(goodsReceiptNotes.tenantId, tenantId), eq(goodsReceiptNotes.id, placement.grnId)))
+        .limit(1)
+        .for('update');
       const open = await tx
         .select({ id: qcHolds.id })
         .from(qcHolds)

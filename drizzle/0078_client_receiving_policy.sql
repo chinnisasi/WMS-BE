@@ -71,6 +71,16 @@ ALTER TABLE "notifications" ADD CONSTRAINT "notifications_source_type_check" CHE
 	'reorder-breach', 'batch-alert', 'qc-hold', 'channel-sync', 'audit-export',
 	'ledger-chain-break', 'qc-receipt'
 ));--> statement-breakpoint
+-- ── hand-amended: the hold reference index (the 0069 shape) ──────────────
+-- Every reader of a hold's own `qc.held` events (putaway's open receipt-hold
+-- quantity, the awaiting-putaway tile, the holds list's held quantity)
+-- matches `reference_doc->>'holdId'`; each carries `reference_doc ? 'holdId'`
+-- beside the equality so the planner can prove this partial index applies
+-- (IMPLEMENTATION-GUIDE §9). SQL-only, like 0069's ledger reference indexes
+-- (drizzle-kit does not model an expression index here). DEPLOY NOTE (0069's):
+-- one transaction, so not CONCURRENTLY — against a large live ledger, pre-build
+-- it CONCURRENTLY by hand under this exact name (IF NOT EXISTS then skips it).
+CREATE INDEX IF NOT EXISTS "ledger_events_hold_ref_idx" ON "ledger_events" USING btree ("tenant_id","warehouse_id",("reference_doc"->>'holdId')) WHERE "reference_doc" ? 'holdId';--> statement-breakpoint
 -- ── the post-migration assertion (the 0064/0077 model) ────────────────────
 -- Made-up uuids. The accepted shapes are inserted first and rolled back by a
 -- sentinel exception, so a CHECK that refused everything fails the

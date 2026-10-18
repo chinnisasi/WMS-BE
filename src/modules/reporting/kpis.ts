@@ -368,7 +368,7 @@ const dockToStock: TileDefinition<'dockToStock'> = {
             from qc_holds h
             join ledger_events e
               on e.tenant_id = h.tenant_id and e.warehouse_id = h.warehouse_id
-             and e.type = 'qc.held' and e.reference_doc->>'holdId' = h.id::text
+             and e.type = 'qc.held' and e.reference_doc ? 'holdId' and e.reference_doc->>'holdId' = h.id::text
             where h.tenant_id = ${scope.tenantId}::uuid
               and h.warehouse_id = ${scope.warehouseId}::uuid
               and h.kind = 'receipt'

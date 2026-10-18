@@ -208,7 +208,12 @@ export class QcFacade {
       // Story 1-2b — the held quantity and batch, from each hold's OWN
       // `qc.held` events (one grouped read over the page's ids, never per
       // row) through the inventory facade; the batch code through catalog's.
-      const totals = await this.inventory.qcHeldTotalsInTx(tx, tenantId, rows.map((row) => row.hold.id));
+      const totals = await this.inventory.qcHeldTotalsInTx(
+        tx,
+        tenantId,
+        [...new Set(rows.map((row) => row.hold.warehouseId))],
+        rows.map((row) => row.hold.id),
+      );
       const singleBatch = (holdId: string): string | null => {
         const refs = totals.get(holdId)?.batchRefs ?? [];
         return refs.length === 1 ? (refs[0] ?? null) : null;

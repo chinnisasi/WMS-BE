@@ -17,10 +17,14 @@ import {
   toleranceMilli,
 } from '../src/modules/inbound/receiving.command';
 import { QC_HOLD_KINDS } from '../src/modules/inbound/qc.command';
+import { openReceiptHoldQtyByLine } from '../src/modules/putaway/putaway.command';
+import { withTenantTransaction } from '../src/shared/db/tenant-scope';
+import type { Database } from '../src/shared/db/db';
 import { REJECTED_OP_DECISIONS_BY_TYPE } from '../src/modules/tenancy/sync-report.command';
 import { SKU_NAMING_OP_TYPES } from '../src/modules/tenancy/client-wind-down';
 import { EVENT_ROUTES, decodeRaise, decodeResolve } from '../src/modules/notifications/notification-sources';
 import { NotificationsDeliveryHandler } from '../src/modules/notifications/notifications.delivery';
+import { ReceivingFacade } from '../src/modules/inbound/receiving.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
@@ -90,6 +94,8 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
   let ownerToken: string;
   let ownerUserId: string;
   let opsToken: string;
+  let opsUser: string;
+  const opsUserId = (): string => opsUser;
   let wh: string;
   let vendorId: string;
   let storageBinId: string;
@@ -186,7 +192,15 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
       ['EXP-B', 'pcs', true, false],
       ['EXP-U', 'pcs', false, false],
       ['EXP-K', 'pcs', true, false],
+      // An untracked KIT: never received, so not counted as untracked.
+      ['EXP-KIT', 'pcs', false, false],
     ]);
+    await http()
+      .post(`${API}/${tenantId}/catalog/skus/${sku('EXP', 'EXP-KIT')}/kit`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({ components: [{ skuId: sku('EXP', 'EXP-U'), quantity: 1 }] })
+      .expect(201);
     await importSkus('EXP0', [['EXP0-B', 'pcs', true, false]]);
     await importSkus('QC', [
       ['QC-A', 'pcs', false, false],
@@ -201,7 +215,9 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
 
     const operator = await createMember('operator');
     const ops = await createMember('ops_manager');
-    opsToken = (await mintSignIn(app, { email: ops.email, password: 'correct-horse-battery' })).body.accessToken as string;
+    const opsSignIn = await mintSignIn(app, { email: ops.email, password: 'correct-horse-battery' });
+    opsToken = opsSignIn.body.accessToken as string;
+    opsUser = opsSignIn.body.user.id as string;
     const minted = await http()
       .post(`${API}/${tenantId}/devices/enrollment-codes`)
       .set('Authorization', `Bearer ${ownerToken}`)
@@ -485,7 +501,7 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
         .get(`${API}/${tenantId}/clients/${client('EXP')}/receiving-policy`)
         .set('Authorization', `Bearer ${opsToken}`)
         .expect(200);
-      // EXP-U is the one untracked SKU of three.
+      // EXP-U is the one untracked SKU (EXP-KIT is untracked too, but a kit — excluded).
       expect(exp.body).toMatchObject({ expiryRequired: true, minShelfLifeDays: 90, untrackedSkuCount: 1 });
       // The clients list carries it too.
       const list = await http().get(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${opsToken}`).expect(200);
@@ -766,6 +782,25 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
       expect(res.body.refusedReceipt.rejectedLines[0]).toMatchObject({ code: 'expiry-before-mfg', batchCode: 'B-MFG' });
     });
 
+    it('an expiry year outside 2000–2199 is the same whole-op 400 (never a Postgres 500)', async () => {
+      for (const expiryDate of ['0001-01-01', '0000-12-31', '2200-01-01', '1999-12-31']) {
+        const res = await receive(blind('PLAIN', [line(sku('PLAIN', 'PL-B'), 1, { batchCode: 'B-YEAR', expiryDate })])).expect(400);
+        expect(res.body.detail).toContain('expiryDate');
+      }
+    });
+
+    it('`expiry-before-mfg` also judges against the EXISTING batch\'s mfg date when the line has none', async () => {
+      await receive(blind('PLAIN', [line(sku('PLAIN', 'PL-B'), 1, { batchCode: 'B-BMFG', mfgDate: '2026-10-01T00:00:00.000Z' })])).expect(201);
+      const res = await receive(blind('PLAIN', [line(sku('PLAIN', 'PL-B'), 1, { batchCode: 'B-BMFG', expiryDate: '2026-09-30' })])).expect(201);
+      expect(res.body.refusedReceipt.rejectedLines[0]).toMatchObject({ code: 'expiry-before-mfg', batchCode: 'B-BMFG' });
+      expect(await batchExpiry(sku('PLAIN', 'PL-B'), 'B-BMFG')).toBeNull();
+    });
+
+    it('a batch-tracked line with no batch code is the batch-code 400, not `expiry-required`', async () => {
+      const res = await receive(blind('EXP', [line(sku('EXP', 'EXP-B'), 1)])).expect(400);
+      expect(res.body.detail).toContain('batch code');
+    });
+
     it('a malformed expiry is a whole-op 400 (the request\'s shape)', async () => {
       const res = await receive(blind('PLAIN', [line(sku('PLAIN', 'PL-B'), 1, { batchCode: 'B-BAD', expiryDate: '2026-13-01' })])).expect(400);
       expect(res.body.code).toBe('validation-failed');
@@ -820,11 +855,54 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
       });
     });
 
-    it('Discard closes a shelf-life row and books nothing', async () => {
+    it('a retried Accept after the re-run committed replays — whoever retries, whatever the note (only the waiver\'s FACT is hashed)', async () => {
+      const res = await receive(blind('EXP', [line(sku('EXP', 'EXP-B'), 2, { batchCode: 'B-RETRY', expiryDate: '2026-12-02' })])).expect(201);
+      const opId = res.body.refusedReceipt.shelfLifeReviewOpId as string;
+      const row = await rejectedOp(opId);
+      const applied = await resolve(row.id, { decision: 'apply', note: 'first reviewer' }).expect(200);
+      const snapshot = (applied.body.outcome as { snapshot: unknown }).snapshot;
+      // The resolve's own transaction could roll back after the re-run (which
+      // runs in its own) committed; the retry re-executes with another
+      // reviewer's note under the same key — it must replay, never 422.
+      const receiving = app.get(ReceivingFacade);
+      const payload = row.payload as { warehouseId: string; blindReasonCode: string; clientId: string; occurredAt: string; lines: never[] };
+      const retried = await receiving.submitGoodsReceipt(
+        {
+          tenantId,
+          deviceId,
+          operatorUserId,
+          warehouseId: payload.warehouseId,
+          poId: null,
+          blindReasonCode: payload.blindReasonCode,
+          clientId: payload.clientId,
+          occurredAt: payload.occurredAt,
+          lines: payload.lines,
+          shelfLifeWaiver: { byUserId: opsUserId(), note: 'a different note, another reviewer' },
+        },
+        opId,
+      );
+      expect(retried).toEqual(snapshot);
+    });
+
+    it('the resolve note: over 500 code points is 400 and the row stays open; Discard records it in the outcome', async () => {
       const res = await receive(blind('EXP', [line(sku('EXP', 'EXP-B'), 1, { batchCode: 'B-DISC', expiryDate: '2026-11-30' })])).expect(201);
       const row = await rejectedOp(res.body.refusedReceipt.shelfLifeReviewOpId as string);
-      await resolve(row.id, { decision: 'discard' }).expect(200);
+      const tooLong = await resolve(row.id, { decision: 'apply', note: '𝒳'.repeat(501) }).expect(400);
+      expect(tooLong.body.detail).toContain('500');
+      expect((await rejectedOp(row.opId)).status).toBe('open');
+      const discarded = await resolve(row.id, { decision: 'discard', note: '  label unreadable  ' }).expect(200);
+      expect(discarded.body.outcome).toEqual({ kind: 'discard', note: 'label unreadable' });
       expect(await batchCount(sku('EXP', 'EXP-B'), 'B-DISC')).toBe(0);
+    });
+
+    it('a resolve without a note hashes byte-for-byte as before 1-2b (golden)', async () => {
+      const res = await receive(blind('EXP', [line(sku('EXP', 'EXP-B'), 1, { batchCode: 'B-GOLDR', expiryDate: '2026-11-29' })])).expect(201);
+      const row = await rejectedOp(res.body.refusedReceipt.shelfLifeReviewOpId as string);
+      const key = ulid();
+      await resolve(row.id, { decision: 'discard' }, key).expect(200);
+      const golden = `{"rejectedOpId":"${row.id}","decision":"discard"}`;
+      const stored = (await sql`select payload_hash from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`) as unknown as { payload_hash: string }[];
+      expect(stored[0]!.payload_hash).toBe(createHash('sha256').update(golden, 'utf8').digest('hex'));
     });
 
     it('an older op (no expiryDate) hashes byte-for-byte as before; an expiry joins the line after mfgDate (goldens)', async () => {
@@ -1103,6 +1181,18 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
       const released = EVENT_ROUTES.get('qc_hold.released');
       expect(decodeResolve(released as never, { holdId: grnId, warehouseId, kind: 'receipt' })).toEqual({ kind: 'ignore' });
       expect(decodeResolve(released as never, { holdId: grnId, warehouseId })).toMatchObject({ kind: 'resolve', sourceType: 'qc-hold' });
+    });
+
+    it('the open receipt-hold read (the real putaway query) can use ledger_events_hold_ref_idx', async () => {
+      const db = app.get<Database>(DATABASE);
+      const { sql: text, params } = await withTenantTransaction(db, tenantId, async (tx) =>
+        tx.select().from(openReceiptHoldQtyByLine(tx, tenantId, wh)).toSQL(),
+      );
+      const plan = await sql.begin(async (q) => {
+        await q`set local enable_seqscan = off`;
+        return (await q.unsafe(`explain ${text}`, params as never[])) as unknown as Record<string, string>[];
+      });
+      expect(plan.map((row) => Object.values(row)[0]).join('\n')).toContain('ledger_events_hold_ref_idx');
     });
 
     it('the hold kinds mirror the DB CHECK; the open-scope index names its narrowed predicate', async () => {

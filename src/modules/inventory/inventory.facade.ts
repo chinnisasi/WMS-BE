@@ -2101,9 +2101,10 @@ export class InventoryFacade {
   async qcHeldTotalsInTx(
     tx: TenantTx,
     tenantId: string,
+    warehouseIds: readonly string[],
     holdIds: readonly string[],
   ): Promise<Map<string, { readonly quantity: number; readonly batchRefs: readonly (string | null)[] }>> {
-    if (holdIds.length === 0) {
+    if (holdIds.length === 0 || warehouseIds.length === 0) {
       return new Map();
     }
     const rows = await tx
@@ -2116,7 +2117,11 @@ export class InventoryFacade {
       .where(
         and(
           eq(ledgerEvents.tenantId, tenantId),
+          // The hold's own warehouse(s) and the `?` predicate: the partial
+          // `ledger_events_hold_ref_idx` (tenant, warehouse, holdId) applies.
+          inArray(ledgerEvents.warehouseId, [...warehouseIds]),
           eq(ledgerEvents.type, 'qc.held'),
+          sql`${ledgerEvents.referenceDoc} ? 'holdId'`,
           inArray(sql`${ledgerEvents.referenceDoc}->>'holdId'`, [...holdIds]),
         ),
       )
@@ -2157,6 +2162,8 @@ export class InventoryFacade {
           eq(ledgerEvents.tenantId, tenantId),
           eq(ledgerEvents.warehouseId, warehouseId),
           eq(ledgerEvents.type, 'qc.held'),
+          // Story 1-2b — the `?` lets `ledger_events_hold_ref_idx` apply.
+          sql`${ledgerEvents.referenceDoc} ? 'holdId'`,
           sql`${ledgerEvents.referenceDoc}->>'holdId' = ${holdId}`,
         ),
       )
