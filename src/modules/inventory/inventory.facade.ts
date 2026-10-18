@@ -3,6 +3,7 @@ import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { batchOnHand, bins, ledgerEvents, skus, stockOnHand } from '../../shared/db/schema';
+import { skuCodeLabelsInTx } from '../clients/clients.facade';
 import type { LedgerEvent, UserRole } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
@@ -2292,6 +2293,8 @@ export class InventoryFacade {
       .select({
         id: skus.id,
         code: skus.code,
+        // Story 1-1 — the client labels a refusal that names codes.
+        clientId: skus.clientId,
         storageClass: skus.storageClass,
         hazardClass: skus.hazardClass,
         weightGrams: skus.weightGrams,
@@ -2333,7 +2336,7 @@ export class InventoryFacade {
     // same one `mergeBin` and `candidateFitsSku` import.
     if (isBulkAssetType(bin.type)) {
       const occupants = await tx
-        .select({ skuId: stockOnHand.skuId, skuCode: skus.code })
+        .select({ skuId: stockOnHand.skuId, skuCode: skus.code, clientId: skus.clientId })
         .from(stockOnHand)
         .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
         .where(
@@ -2344,7 +2347,7 @@ export class InventoryFacade {
             sql`${stockOnHand.quantity} > 0`,
           ),
         )
-        .groupBy(stockOnHand.skuId, skus.code);
+        .groupBy(stockOnHand.skuId, skus.code, skus.clientId);
       if (
         !bulkAssetOccupancyHolds(
           bin.type,
@@ -2352,8 +2355,17 @@ export class InventoryFacade {
           occupants.map((o) => o.skuId),
         )
       ) {
-        const holding = [...new Set(occupants.map((o) => o.skuCode))];
-        const moving = skuIds.map((id) => skuById.get(id)!.code);
+        // Story 1-1 — codes are per client: each is labelled with its client.
+        const holding = await skuCodeLabelsInTx(
+          tx,
+          args.tenantId,
+          occupants.map((o) => ({ code: o.skuCode, clientId: o.clientId })),
+        );
+        const moving = await skuCodeLabelsInTx(
+          tx,
+          args.tenantId,
+          skuIds.map((id) => ({ code: skuById.get(id)!.code, clientId: skuById.get(id)!.clientId })),
+        );
         throw new ProblemException(
           'bin-occupancy-conflict',
           409,

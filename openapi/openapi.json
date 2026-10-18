@@ -12120,7 +12120,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or an invalid body (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, or an invalid body (validation-failed) — story 1-1: a clientId beside a poId or an asnId",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12150,7 +12150,7 @@
             }
           },
           "404": {
-            "description": "Warehouse, purchase order, advance shipment notice, or a line's SKU does not exist in this tenant (not-found)",
+            "description": "Warehouse, purchase order, advance shipment notice, a blind receipt's client (story 1-1), or a line's SKU does not exist in this tenant (not-found)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -28669,7 +28669,8 @@
               "excursion.record",
               "transfer.confirm",
               "count.submit",
-              "return.receive"
+              "return.receive",
+              "grn.lines-refused"
             ]
           },
           "classification": {
@@ -28817,7 +28818,8 @@
               "excursion.record",
               "transfer.confirm",
               "count.submit",
-              "return.receive"
+              "return.receive",
+              "grn.lines-refused"
             ]
           },
           "classification": {
@@ -31083,6 +31085,7 @@
               "unknown-sku",
               "sku-client-mismatch",
               "mixed-client",
+              "client-required",
               "kit-cannot-hold-stock",
               "duplicate-asn-code",
               "invalid-asn-code",
@@ -33655,6 +33658,11 @@
             ],
             "description": "The blind-receive reason code (required when neither poId nor asnId is given, forbidden otherwise)"
           },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-1 — the client a BLIND receipt is for (named only beside blindReasonCode; a PO or ASN receipt takes its document's client, and naming one there is a 400). Absent (an older build): the client is derived from the first line's SKU. A line whose SKU belongs to another client is refused per line (`sku-client-mismatch` in rejectedLines) and the rest settles. An unknown client is a 404"
+          },
           "occurredAt": {
             "type": "string",
             "description": "Device time of the receipt (ISO-8601 UTC, Z-suffixed)",
@@ -33774,9 +33782,10 @@
             "enum": [
               "po-line-not-found",
               "po-line-not-open",
-              "asn-line-not-found"
+              "asn-line-not-found",
+              "sku-client-mismatch"
             ],
-            "description": "Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients"
+            "description": "Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt's line whose SKU belongs to another client than the receipt's; it goes to the review queue (Discard only)"
           },
           "reason": {
             "type": "string",
@@ -33851,6 +33860,11 @@
             "type": "string",
             "description": "Story 21-6 — the ASN's code; present only on an ASN receipt"
           },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-1 — the client whose goods the receipt booked (the PO's or ASN's client, or a blind receipt's chosen or derived client). Absent on a receipt replayed from before 1-1"
+          },
           "blindReasonCode": {
             "type": "string",
             "enum": [
@@ -33899,6 +33913,10 @@
             "items": {
               "$ref": "#/components/schemas/UnmatchedGrnLineDto"
             }
+          },
+          "reviewOpId": {
+            "type": "string",
+            "description": "Story 1-1 — the op id of the review row raised for the `sku-client-mismatch` lines (Conflicts & Reviews, type `grn.lines-refused`, Discard only); present only when one was raised"
           }
         },
         "required": [
@@ -33916,11 +33934,73 @@
           "lines"
         ]
       },
+      "RefusedReceiptDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The client the blind receipt named"
+          },
+          "blindReasonCode": {
+            "type": "string",
+            "enum": [
+              "unannounced-delivery",
+              "po-not-found",
+              "other",
+              null
+            ],
+            "nullable": true
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time of the receipt (ISO-8601 UTC)"
+          },
+          "rejectedLines": {
+            "description": "Every request line, each `sku-client-mismatch`",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RejectedGrnLineDto"
+            }
+          },
+          "reviewOpId": {
+            "type": "string",
+            "description": "The op id of the review row (`grn.lines-refused`, Discard only)"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "clientId",
+          "blindReasonCode",
+          "occurredAt",
+          "rejectedLines",
+          "reviewOpId"
+        ]
+      },
       "GoodsReceiptResponse": {
         "type": "object",
         "properties": {
           "goodsReceipt": {
-            "$ref": "#/components/schemas/GoodsReceiptDto"
+            "nullable": true,
+            "description": "The recorded GRN. Story 1-1 (decision 6): null when every line of a blind receipt was refused `sku-client-mismatch` — no receipt was recorded (no GRN code consumed); `refusedReceipt` then says what went to review",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GoodsReceiptDto"
+              }
+            ]
+          },
+          "refusedReceipt": {
+            "description": "Story 1-1 — present only when goodsReceipt is null",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RefusedReceiptDto"
+              }
+            ]
           }
         },
         "required": [
@@ -34034,6 +34114,11 @@
             ],
             "example": "ambient",
             "description": "Story 12.8 (UX-DR29): the SKU's storage class (defaults to `ambient`). It rides the snapshot beside the bin arm's class so the device's offline conformance mirror can refuse a non-conforming placement or draw in the Rejected banner — a refusal only the server knew about would queue in a dead zone and come back hours later as a rejection the operator can no longer act on."
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-1: the client the SKU belongs to. Code and barcode are unique per (tenant, client), so one barcode may name several SKUs; the device resolves a scan through the work's own SKUs first, then the document's client (`clients` names each)"
           }
         },
         "required": [
@@ -34048,7 +34133,8 @@
           "catchWeightTracked",
           "variantValues",
           "axes",
-          "storageClass"
+          "storageClass",
+          "clientId"
         ]
       },
       "CatalogSnapshotPoDto": {
@@ -34060,6 +34146,11 @@
           },
           "code": {
             "type": "string"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-1 (additive): the PO's client — the device resolves an unmatched scan within it"
           },
           "warehouseId": {
             "type": "string",
@@ -34080,6 +34171,7 @@
         "required": [
           "id",
           "code",
+          "clientId",
           "warehouseId",
           "vendorId",
           "lines"
@@ -34728,6 +34820,11 @@
             "nullable": true,
             "description": "The order's channel reference; null for a manual order"
           },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-1 (additive): the order's client — the device resolves a typed code within it after the RMA's own lines"
+          },
           "lines": {
             "type": "array",
             "items": {
@@ -34739,7 +34836,35 @@
           "id",
           "code",
           "orderReference",
+          "clientId",
           "lines"
+        ]
+      },
+      "CatalogSnapshotClientDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "description": "The client code (the tenant's own client's is `self`)"
+          },
+          "name": {
+            "type": "string",
+            "description": "The display name (the tenant's own client carries the tenant's name)"
+          },
+          "active": {
+            "type": "boolean",
+            "description": "False when suspended or departed — a blind receipt picks only an active client"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "name",
+          "active"
         ]
       },
       "CatalogSnapshotResponse": {
@@ -34828,6 +34953,13 @@
             "items": {
               "$ref": "#/components/schemas/CatalogOpenReturnDto"
             }
+          },
+          "clients": {
+            "description": "Story 1-1 (additive): every client referenced by a SKU or an open document of the snapshot — the names the device shows when a scan belongs to another client, and the blind receipt's client picker. A snapshot WITHOUT this field (an older server) puts the device in legacy mode: no picker, no clientId sent",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogSnapshotClientDto"
+            }
           }
         },
         "required": [
@@ -34843,7 +34975,8 @@
           "handlingUnits",
           "transferTasks",
           "countTasks",
-          "openReturns"
+          "openReturns",
+          "clients"
         ]
       },
       "GoodsReceiptEntryDto": {
@@ -34878,6 +35011,11 @@
           "asnCode": {
             "type": "string",
             "description": "Story 21-6 — the ASN's code; present only on an ASN receipt"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-1 — the client whose goods the receipt booked. Absent on an older receipt the 0076 backfill could not attribute (its lines named several clients, or none)"
           },
           "blindReasonCode": {
             "type": "string",

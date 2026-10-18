@@ -28,7 +28,8 @@ import { EWAY_GATEWAY, ewayGatewayFromEnv } from './eway-gateway';
  * exported (with the facade) for the api shell's `InvoicingController`.
  *
  * Story 8-2a: imports `CatalogModule` for ONE read — the HSN summary's
- * current-catalog-HSN hint (`CatalogFacade.getSkuHsnByCodesInTx`).
+ * current-catalog-HSN hint (`CatalogFacade.getSkuHsnByIdsInTx`; since story
+ * 1-1 by SKU id, the order line → SKU read through `OutboundFacade`).
  *
  * Story 8-2b: the e-way bills — `EwayDeliveryHandler` queues a bill on
  * `invoice.issued`, `EwayCommand` carries the finance verbs, and the

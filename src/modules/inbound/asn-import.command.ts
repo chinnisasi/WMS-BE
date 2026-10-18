@@ -203,11 +203,20 @@ export class AsnImportCommand {
 
       // ── group: (code, client cell), then settle each ASN's client — a
       //    blank client is the SKUs' client, so it joins that ASN ───────
+      // Story 1-1: a code may be held by several clients — every holder is
+      // offered to the resolver, which settles each ASN's client.
       const resolution = resolveAsnGroups(
         groupAsnImportRows(rows),
         (cell) => clients.get(cell.toUpperCase())?.id ?? null,
-        (row) => skus.get(row.sku)?.clientId,
+        (row) => (skus.get(row.sku) ?? []).map((sku) => sku.clientId),
       );
+      // A row's SKU WITHIN its ASN's client: that client's SKU when it holds
+      // the code; otherwise the first holder (another client's — refused
+      // `sku-client-mismatch` / `mixed-client` by the attribution rule).
+      const skuOf = (row: AsnImportRow, clientId: string | null): SkuByCode | undefined => {
+        const holders = skus.get(row.sku) ?? [];
+        return (clientId === null ? undefined : holders.find((sku) => sku.clientId === clientId)) ?? holders[0];
+      };
       for (const error of resolution.errors) {
         errors.push(error);
         refusedRows.add(error.rowNumber);
@@ -230,13 +239,17 @@ export class AsnImportCommand {
 
       // ── validate each group with the operator create's rules ───────────
       const accepted: AcceptedGroup[] = [];
-      for (const { group, clientId } of groups) {
+      for (const { group, clientId, clientRequired } of groups) {
         const firstRow = group.rows[0]!;
         const groupErrors: AsnImportRowError[] = [];
         const lines: { skuId: string; announcedQty: number }[] = [];
 
         // Row by row — first failure wins on a row (its cell refusals ran first).
-        for (const row of group.rows) {
+        // Story 1-1: an ASN whose client cannot be settled (`clientRequired`)
+        // has no client to resolve its codes in — it reports `client-required`
+        // only (below), never kit or precision refusals against an arbitrary
+        // holder's SKU.
+        for (const row of clientRequired ? [] : group.rows) {
           if (refusedRows.has(row.rowNumber)) continue;
           if (row.client !== '' && !clients.has(row.client.toUpperCase())) {
             refuse(row, 'unknown-client', `No client with code "${row.client}" exists in this tenant.`);
@@ -254,7 +267,7 @@ export class AsnImportCommand {
             }
             continue;
           }
-          const sku = skus.get(row.sku);
+          const sku = skuOf(row, clientId);
           if (sku === undefined) {
             refuse(row, 'unknown-sku', `No SKU with code "${row.sku}" exists in this tenant.`);
             continue;
@@ -286,11 +299,25 @@ export class AsnImportCommand {
         groupErrors.push(...rowDisagreements(group, warehouseCode), ...repeatedSkus(group));
 
         // Client attribution over the SKUs that resolved — the create's rule.
-        const known = group.rows
-          .map((row) => ({ row, sku: skus.get(row.sku) }))
+        const known = (clientRequired ? [] : group.rows)
+          .map((row) => ({ row, sku: skuOf(row, clientId) }))
           .filter((entry): entry is { row: AsnImportRow; sku: SkuByCode } => entry.sku !== undefined);
         const subjectClients = [...new Set(known.map((entry) => entry.sku.clientId))];
-        if (known.length > 0) {
+        if (clientRequired) {
+          // Story 1-1 — every code of this blank-client ASN is held by more
+          // than one client: name the client in the file.
+          const holders = [...new Set(group.rows.flatMap((row) => (skus.get(row.sku) ?? []).map((sku) => sku.clientId)))];
+          const holderLabels = await getClientLabelsInTx(tx, command.tenantId, holders);
+          groupErrors.push(
+            rowError(
+              firstRow.rowNumber,
+              group.asnCode,
+              'client-required',
+              `ASN "${group.asnCode}" names no client, and its SKU codes are held by more than one client ` +
+                `(${holders.map((id) => holderLabels.get(id) ?? id).sort().join(', ')}) — fill the client column.`,
+            ),
+          );
+        } else if (known.length > 0) {
           try {
             if (clientId === null) {
               // A blank client whose SKUs span clients (or an unknown client

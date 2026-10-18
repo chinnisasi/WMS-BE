@@ -177,8 +177,9 @@ const OPTIONAL_COLUMNS = [
 ] as const;
 const KNOWN_COLUMNS: ReadonlySet<string> = new Set([...REQUIRED_COLUMNS, ...OPTIONAL_COLUMNS]);
 
-const SKUS_TENANT_CODE = 'skus_tenant_id_code_unique';
-const SKUS_TENANT_BARCODE = 'skus_tenant_id_barcode_unique';
+// Story 1-1 (0076) — code and barcode are unique per (tenant, client).
+const SKUS_TENANT_CODE = 'skus_tenant_client_code_unique';
+const SKUS_TENANT_BARCODE = 'skus_tenant_client_barcode_unique';
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 interface RawRow {
@@ -314,13 +315,24 @@ export class ImportCommand {
         // Fix mode is set-membership against the LATEST run (newest
         // created_at, uuidv7 id tiebreaker) — no import picker, and repeated
         // fix rounds compose because each run's failures form the next set.
+        // Story 1-1: codes are per client, so the latest run is the latest
+        // run OF THE SAME CLIENT — the named client's when one is named
+        // (another client's later run never hides this client's fix set);
+        // the tenant's latest when none is named (it is inherited below).
         let fixSet: ReadonlySet<string> = new Set();
         const latest =
           command.mode === 'fix'
             ? await tx
                 .select({ id: catalogImports.id, clientId: catalogImports.clientId })
                 .from(catalogImports)
-                .where(eq(catalogImports.tenantId, command.tenantId))
+                .where(
+                  command.clientId === undefined
+                    ? eq(catalogImports.tenantId, command.tenantId)
+                    : and(
+                        eq(catalogImports.tenantId, command.tenantId),
+                        eq(catalogImports.clientId, command.clientId),
+                      ),
+                )
                 .orderBy(desc(catalogImports.createdAt), desc(catalogImports.id))
                 .limit(1)
             : [];
@@ -329,7 +341,8 @@ export class ImportCommand {
         // Decision 3's up-front guards against a mis-attributed SKU (whose
         // client is fixed once it has history): a named client must exist
         // in this tenant (404); a fix-mode re-run INHERITS its original
-        // run's client, and naming a different one is a 400; with more
+        // run's client (story 1-1: naming a client selects THAT client's
+        // latest run above, so the run and the client always agree); with more
         // than one client and none named, there is no default to fall back
         // to — 400 `client-required`. The `self` client is the default only
         // while it is the tenant's only client.
@@ -344,16 +357,6 @@ export class ImportCommand {
         const label = (id: string): string => labels.get(id) ?? id;
         let clientId: string;
         if (latest[0] !== undefined) {
-          if (command.clientId !== undefined && command.clientId !== latest[0].clientId) {
-            throw new ProblemException(
-              'validation-failed',
-              400,
-              'A fix-mode re-run keeps its original client',
-              `The run being fixed imported for client ${label(latest[0].clientId)}; ` +
-                `a fix-mode re-run inherits it and cannot import for ${label(command.clientId)}. ` +
-                'Omit clientId (or name the same client), or start an initial import for the other client.',
-            );
-          }
           clientId = latest[0].clientId;
         } else if (command.clientId !== undefined) {
           clientId = command.clientId;
@@ -506,7 +509,7 @@ export class ImportCommand {
         // the tenant's existing SKUs — one error per row, first failure wins.
         const seenCodes = new Map<string, number>();
         const seenBarcodes = new Map<string, string>();
-        const conflicts = await findTenantConflicts(tx, command.tenantId, valid);
+        const conflicts = await findClientConflicts(tx, command.tenantId, clientId, valid);
 
         const insertable: (ValidRow & { productId: string | null })[] = [];
         const seenVariants = new Map<string, number>();
@@ -516,12 +519,10 @@ export class ImportCommand {
             continue;
           }
           if (conflicts.codes.has(row.code)) {
-            // Story 21-2b: codes stay unique across the TENANT (decision 2),
-            // so the existing SKU may belong to any client — the detail names
-            // its owner so the operator can tell a re-import from a clash.
-            const ownerClientId = conflicts.codes.get(row.code)!;
-            const ownerCode = label(ownerClientId);
-            errors.push(rowError(row.rowNumber, row.code, 'duplicate-sku-code', `SKU code "${row.code}" already exists in this tenant's catalog (client ${ownerCode}) — duplicates are rejected, never merged.`));
+            // Story 1-1: codes are unique per (tenant, client) — only THIS
+            // run's client's existing SKU is a duplicate; another client may
+            // own the same code.
+            errors.push(rowError(row.rowNumber, row.code, 'duplicate-sku-code', `SKU code "${row.code}" already exists in this client's catalog (client ${label(clientId)}) — duplicates are rejected, never merged.`));
             continue;
           }
           if (row.barcode !== null && (seenBarcodes.has(row.barcode) || conflicts.barcodes.has(row.barcode))) {
@@ -648,14 +649,38 @@ export class ImportCommand {
             ];
             // `for('update')`: the kit command's cycle lock — kit and
             // component rows, ordered by id, so a concurrent KitCommand or
-            // GRN on the same SKUs serializes behind this pass.
+            // GRN on the same SKUs serializes behind this pass. Story 1-1: a
+            // code may be held by several clients, and a kit cell names THIS
+            // run's client's SKUs — only those rows are locked.
             const referencedSkuRows = await tx
               .select({ id: skus.id, code: skus.code, uom: skus.uom, clientId: skus.clientId })
               .from(skus)
-              .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.code, referencedCodes)))
+              .where(
+                and(
+                  eq(skus.tenantId, command.tenantId),
+                  eq(skus.clientId, clientId),
+                  inArray(skus.code, referencedCodes),
+                ),
+              )
               .orderBy(skus.id)
               .for('update');
-            const skuRowByCode = new Map(referencedSkuRows.map((r) => [r.code, r]));
+            const skuRowByCode = new Map<string, (typeof referencedSkuRows)[number]>(
+              referencedSkuRows.map((r) => [r.code, r]),
+            );
+            // An unlocked probe for codes this client does not hold but
+            // another does: they keep `mixed-client` (below), never
+            // `kit-component-not-found`. Nothing is written to those rows.
+            const missingCodes = referencedCodes.filter((code) => !skuRowByCode.has(code));
+            if (missingCodes.length > 0) {
+              const elsewhere = await tx
+                .select({ id: skus.id, code: skus.code, uom: skus.uom, clientId: skus.clientId })
+                .from(skus)
+                .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.code, missingCodes)))
+                .orderBy(skus.clientId);
+              for (const r of elsewhere) {
+                if (!skuRowByCode.has(r.code)) skuRowByCode.set(r.code, r);
+              }
+            }
             const referencedIds = referencedSkuRows.map((r) => r.id);
             // The one "is a kit" probe, over every referenced id at once: a
             // component that ALREADY carries composition rows is refused, so
@@ -930,7 +955,7 @@ export function duplicateSkuCode(code: string): ProblemException {
     'duplicate-sku-code',
     409,
     'SKU code already in use',
-    `SKU code "${code}" already exists in this tenant's catalog — duplicates are rejected, never merged.`,
+    `SKU code "${code}" already exists in this client's catalog — duplicates are rejected, never merged.`,
   );
 }
 
@@ -938,30 +963,34 @@ export function duplicateSkuCode(code: string): ProblemException {
 // `file-unreadable`) moved to `shared/import/sheet-reader.ts` with the reader
 // (the ASN import story) — both spreadsheet imports share one copy.
 
-/** Existing SKUs in this tenant colliding with the file's codes/barcodes. */
-async function findTenantConflicts(
+/**
+ * Existing SKUs of THIS run's client colliding with the file's codes and
+ * barcodes. Story 1-1: code and barcode are unique per (tenant, client)
+ * (`skus_tenant_client_code_unique`, `skus_tenant_client_barcode_unique`), so
+ * another client's SKU with the same code or barcode is not a duplicate.
+ */
+async function findClientConflicts(
   tx: TenantTx,
   tenantId: string,
+  clientId: string,
   rows: readonly ValidRow[],
-): Promise<{ codes: ReadonlyMap<string, string>; barcodes: ReadonlyMap<string, string> }> {
+): Promise<{ codes: ReadonlySet<string>; barcodes: ReadonlyMap<string, string> }> {
   const codes = [...new Set(rows.map((row) => row.code))];
   const barcodes = [...new Set(rows.map((row) => row.barcode).filter((b): b is string => b !== null))];
-  // Story 21-2b: code → the existing SKU's client (the duplicate's detail
-  // names the owner).
-  const codesSet = new Map<string, string>();
+  const codesSet = new Set<string>();
   const barcodesMap = new Map<string, string>();
   if (codes.length > 0) {
     const rowsOut = await tx
-      .select({ code: skus.code, clientId: skus.clientId })
+      .select({ code: skus.code })
       .from(skus)
-      .where(and(eq(skus.tenantId, tenantId), inArray(skus.code, codes)));
-    for (const row of rowsOut) codesSet.set(row.code, row.clientId);
+      .where(and(eq(skus.tenantId, tenantId), eq(skus.clientId, clientId), inArray(skus.code, codes)));
+    for (const row of rowsOut) codesSet.add(row.code);
   }
   if (barcodes.length > 0) {
     const rowsOut = await tx
       .select({ code: skus.code, barcode: skus.barcode })
       .from(skus)
-      .where(and(eq(skus.tenantId, tenantId), inArray(skus.barcode, barcodes)));
+      .where(and(eq(skus.tenantId, tenantId), eq(skus.clientId, clientId), inArray(skus.barcode, barcodes)));
     for (const row of rowsOut) barcodesMap.set(row.barcode, row.code);
   }
   return { codes: codesSet, barcodes: barcodesMap };

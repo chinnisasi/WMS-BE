@@ -17,6 +17,7 @@ import {
   skus,
   stockOnHand,
 } from '../../shared/db/schema';
+import { skuCodeLabelsInTx } from '../clients/clients.facade';
 import { uuidv7 } from '../../shared/primitives/ids';
 import {
   MAX_QUANTITY_MILLI,
@@ -363,6 +364,8 @@ export class PutawayCommand {
         .select({
           id: skus.id,
           code: skus.code,
+          // Story 1-1 — the client labels a refusal that names codes.
+          clientId: skus.clientId,
           uom: skus.uom,
           batchTracked: skus.batchTracked,
           serialTracked: skus.serialTracked,
@@ -600,10 +603,16 @@ export class PutawayCommand {
           targetBin.id,
         );
         if (!bulkAssetOccupancyHolds(targetBin.type, [command.skuId], holdingSkus.map((o) => o.skuId))) {
-          const holding = [...new Set(holdingSkus.map((o) => o.skuCode))];
+          // Story 1-1 — codes are per client: each is labelled with its client.
+          const holding = await skuCodeLabelsInTx(
+            tx,
+            command.tenantId,
+            holdingSkus.map((o) => ({ code: o.skuCode, clientId: o.clientId })),
+          );
+          const [placing] = await skuCodeLabelsInTx(tx, command.tenantId, [{ code: sku.code, clientId: sku.clientId }]);
           throw binOccupancyConflict(
             `Bin "${targetBin.code}" is a ${targetBin.type} (a bulk asset holds exactly ONE SKU): ` +
-              `it holds ${holding.map((code) => `"${code}"`).join(', ')} — place SKU "${sku.code}" ` +
+              `it holds ${holding.map((code) => `"${code}"`).join(', ')} — place SKU "${placing}" ` +
               'in another bulk asset, or top up the holding SKU.',
           );
         }
@@ -1336,9 +1345,9 @@ export async function occupantSkusInTx(
   tenantId: string,
   warehouseId: string,
   binId: string,
-): Promise<readonly { skuId: string; skuCode: string }[]> {
+): Promise<readonly { skuId: string; skuCode: string; clientId: string }[]> {
   const rows = await tx
-    .select({ skuId: stockOnHand.skuId, skuCode: skus.code })
+    .select({ skuId: stockOnHand.skuId, skuCode: skus.code, clientId: skus.clientId })
     .from(stockOnHand)
     .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
     .where(
@@ -1349,7 +1358,7 @@ export async function occupantSkusInTx(
         gt(stockOnHand.quantity, 0),
       ),
     )
-    .groupBy(stockOnHand.skuId, skus.code);
+    .groupBy(stockOnHand.skuId, skus.code, skus.clientId);
   return rows;
 }
 

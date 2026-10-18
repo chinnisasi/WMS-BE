@@ -52,7 +52,8 @@ import { assertSingleClientInTx } from '../clients/clients.facade';
 
 export const DEFAULT_SKU_PAGE_SIZE = 50;
 export const MAX_SKU_PAGE_SIZE = 200;
-const SKUS_TENANT_BARCODE = 'skus_tenant_id_barcode_unique';
+// Story 1-1 (0076) — a barcode is unique per (tenant, client).
+export const SKUS_TENANT_BARCODE = 'skus_tenant_client_barcode_unique';
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 /** The API response body for a SKU (idempotency snapshot + list item). */
@@ -882,14 +883,21 @@ export class SkuCommand {
             ? undefined
             : assertRecordableQuantity(fields.reorderQty, 'reorderQty', current.uom, precision);
 
-        // Barcode uniqueness per tenant: another SKU already holding the new
-        // barcode is a 409 naming it (the same conflict code the import
-        // reports row-level).
+        // Barcode uniqueness per (tenant, client) — story 1-1: another SKU OF
+        // THIS SKU'S CLIENT already holding the new barcode is a 409 naming
+        // it (the same conflict code the import reports row-level); another
+        // client's SKU may carry the same GTIN.
         if (fields.barcode !== undefined && fields.barcode !== current.barcode) {
           const collision = await tx
             .select({ code: skus.code })
             .from(skus)
-            .where(and(eq(skus.tenantId, command.tenantId), eq(skus.barcode, fields.barcode)))
+            .where(
+              and(
+                eq(skus.tenantId, command.tenantId),
+                eq(skus.clientId, current.clientId),
+                eq(skus.barcode, fields.barcode),
+              ),
+            )
             .limit(1);
           if (collision[0]) {
             throw duplicateBarcode(fields.barcode, collision[0].code);
@@ -1062,7 +1070,7 @@ export function duplicateBarcode(barcode: string, conflictingCode: string): Prob
     409,
     'Barcode already in use',
     conflictingCode === ''
-      ? `Barcode "${barcode}" already belongs to another SKU in this tenant.`
+      ? `Barcode "${barcode}" already belongs to another SKU of this client.`
       : `Barcode "${barcode}" already belongs to SKU "${conflictingCode}".`,
   );
 }

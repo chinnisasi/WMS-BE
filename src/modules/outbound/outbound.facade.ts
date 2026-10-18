@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, desc, eq, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { warehouseFilter, type ClientCountScope } from '../../shared/db/warehouse-filter';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
@@ -1302,6 +1302,26 @@ export class OutboundFacade {
       where o.tenant_id = ${tenantId}::uuid and o.id = any(${sql.param(distinct)}::uuid[])
     `)) as unknown as OrderRef[];
     return new Map(rows.map((row) => [row.orderId, { orderId: row.orderId, source: row.source, externalEventId: row.externalEventId }]));
+  }
+
+  /**
+   * Story 1-1 — the SKU of each order line, in the caller's transaction. A
+   * SKU code is unique per (tenant, client) only, so a reader that must name
+   * ONE SKU (invoicing's HSN hint) keys on the line's `sku_id`, never its
+   * frozen code. An id with no line row is absent from the map.
+   */
+  async orderLineSkuIdsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    orderLineIds: readonly string[],
+  ): Promise<ReadonlyMap<string, string>> {
+    const distinct = [...new Set(orderLineIds)].filter((id) => UUID_RE.test(id));
+    if (distinct.length === 0) return new Map();
+    const rows = await tx
+      .select({ id: orderLines.id, skuId: orderLines.skuId })
+      .from(orderLines)
+      .where(and(eq(orderLines.tenantId, tenantId), inArray(orderLines.id, distinct)));
+    return new Map(rows.map((row) => [row.id, row.skuId]));
   }
 }
 

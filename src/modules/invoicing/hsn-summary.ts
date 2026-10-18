@@ -305,15 +305,18 @@ function sumTotals(rows: readonly HsnSummaryRow[], invoiceCount: number): HsnSum
 
 /**
  * The summary's two aggregates and the issue lines, in the caller's tenant
- * transaction. `catalogHsnFor` is the catalog facade's in-tx read (the
- * invoicing module never reads `skus`).
+ * transaction. `catalogHsnFor` maps each issue line's ORDER LINE id to its
+ * SKU's current catalog HSN — through the outbound facade (line → SKU) and
+ * the catalog facade (SKU → HSN), both in-tx; the invoicing module never
+ * reads `skus` or `order_lines`. Story 1-1: by SKU, never by the frozen
+ * code — a code may be held by several clients.
  */
 export async function hsnSummaryInTx(
   tx: TenantTx,
   tenantId: string,
   gstin: string,
   period: HsnPeriod,
-  catalogHsnFor: (codes: readonly string[]) => Promise<ReadonlyMap<string, string | null>>,
+  catalogHsnFor: (orderLineIds: readonly string[]) => Promise<ReadonlyMap<string, string | null>>,
 ): Promise<HsnSummaryView> {
   const where = issuedInPeriod(tenantId, gstin, period);
 
@@ -414,6 +417,7 @@ export async function hsnSummaryInTx(
       b2b: B2B_SQL,
       invoiceId: invoices.id,
       invoiceNo: invoices.invoiceNo,
+      orderLineId: invoiceLines.orderLineId,
       skuCode: invoiceLines.skuCode,
       hsn: HSN_TRIMMED_SQL,
       taxablePaise: invoiceLines.taxablePaise,
@@ -430,7 +434,7 @@ export async function hsnSummaryInTx(
       ),
     )
     .orderBy(asc(invoices.issuedAt), asc(invoices.invoiceNo), asc(invoiceLines.skuCode), asc(invoiceLines.id));
-  const hints = await catalogHsnFor(issueRows.map((row) => row.skuCode));
+  const hints = await catalogHsnFor(issueRows.map((row) => row.orderLineId));
   const issueLines: HsnIssueLine[] = issueRows.map((row) => {
     const gst = addExact(addExact(row.igstPaise, row.cgstPaise, 'issue-line GST'), row.sgstPaise, 'issue-line GST');
     return {
@@ -443,7 +447,7 @@ export async function hsnSummaryInTx(
       taxablePaise: row.taxablePaise,
       gstPaise: gst,
       valuePaise: addExact(row.taxablePaise, gst, 'issue-line value'),
-      catalogHsn: hints.get(row.skuCode) ?? null,
+      catalogHsn: hints.get(row.orderLineId) ?? null,
     };
   });
 

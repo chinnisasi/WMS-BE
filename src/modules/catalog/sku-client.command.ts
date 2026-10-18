@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, eq, inArray, or } from 'drizzle-orm';
+import { and, eq, inArray, notInArray, or } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import type { PgColumn, PgTable } from 'drizzle-orm/pg-core';
 import { DATABASE } from '../../shared/shared.module';
@@ -47,6 +47,9 @@ export interface SkuClientCorrectionSnapshot {
 }
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
+// Story 1-1 (0076) — code and barcode are unique per (tenant, client).
+const SKUS_TENANT_CLIENT_CODE = 'skus_tenant_client_code_unique';
+const SKUS_TENANT_CLIENT_BARCODE = 'skus_tenant_client_barcode_unique';
 
 /**
  * Every place a SKU accrues HISTORY — anything that would disagree with a
@@ -93,8 +96,12 @@ const HISTORY_SOURCES: readonly {
  * locked `.for('update')` (the attach PATCH and the import lock it the same
  * way, product before SKU) → the group's SKU rows locked in id order → the
  * group re-derived UNDER the locks (a concurrent attach/compose → 409
- * `conflict`, retry) → the history check under the locks → a no-op
- * (already on that client) returns without writing → the update → one audit
+ * `conflict`, retry) → a no-op (already on that client) returns without
+ * writing → the history check under the locks → (story 1-1) the collision
+ * check: no member's code or barcode may already be held by another SKU of
+ * the TARGET client (409 `duplicate-sku-code` / `duplicate-barcode`; a 23505
+ * on the per-client indexes from a concurrent import maps to the same
+ * 409s) → the update → one audit
  * row per SKU (`sku.client-corrected`, reference `from <client> → to
  * <client> (key <key>)`) → the idempotency key LAST.
  *
@@ -208,14 +215,50 @@ export class SkuClientCommand {
         command.clientId,
         ...lockedRows.map((row) => row.clientId),
       ]);
+      const targetLabel = labels.get(command.clientId) ?? command.clientId;
       const ordered = [target, ...lockedRows.filter((r) => r.id !== target.id)];
+
+      // Story 1-1 — the collision check, under the locks: every member of the
+      // moved group lands in the target client's catalog, where code and
+      // barcode are unique. Named members are checked in the response order
+      // (the named SKU first), codes before barcodes.
+      await assertNoTargetCollisionsInTx(tx, command.tenantId, command.clientId, targetLabel, ordered);
+
       const moved: SkuSnapshot[] = [];
       for (const row of ordered) {
-        const updated = await tx
-          .update(skus)
-          .set({ clientId: command.clientId, updatedAt: nowIso() })
-          .where(and(eq(skus.tenantId, command.tenantId), eq(skus.id, row.id)))
-          .returning();
+        let updated: (typeof skus.$inferSelect)[];
+        try {
+          // A savepoint, so a unique violation leaves the transaction usable
+          // for the holder read below.
+          updated = await tx.transaction((savepoint) =>
+            savepoint
+              .update(skus)
+              .set({ clientId: command.clientId, updatedAt: nowIso() })
+              .where(and(eq(skus.tenantId, command.tenantId), eq(skus.id, row.id)))
+              .returning(),
+          );
+        } catch (err) {
+          // A concurrent import committed a colliding SKU between the check
+          // and the update: the per-client index is the arbiter.
+          if (isUniqueViolationOn(err, SKUS_TENANT_CLIENT_CODE)) {
+            throw targetCodeCollision(row.code, targetLabel);
+          }
+          if (isUniqueViolationOn(err, SKUS_TENANT_CLIENT_BARCODE)) {
+            const holder = await tx
+              .select({ code: skus.code })
+              .from(skus)
+              .where(
+                and(
+                  eq(skus.tenantId, command.tenantId),
+                  eq(skus.clientId, command.clientId),
+                  eq(skus.barcode, row.barcode),
+                ),
+              )
+              .limit(1);
+            throw targetBarcodeCollision(row.barcode, row.code, holder[0]?.code ?? null, targetLabel);
+          }
+          throw err;
+        }
         moved.push(await withConversions(tx, command.tenantId, updated[0]!));
         await tx.insert(auditEvents).values({
           id: uuidv7(),
@@ -279,6 +322,73 @@ export class SkuClientCommand {
     }
     return existing[0].responseSnapshot as SkuClientCorrectionSnapshot;
   }
+}
+
+/**
+ * Story 1-1 — no member of the moved group may take a code or a barcode
+ * another SKU of the TARGET client already holds (the group's own rows are
+ * excluded: they are the ones moving).
+ */
+async function assertNoTargetCollisionsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  targetClientId: string,
+  targetLabel: string,
+  members: readonly (typeof skus.$inferSelect)[],
+): Promise<void> {
+  const memberIds = members.map((row) => row.id);
+  const held = await tx
+    .select({ code: skus.code, barcode: skus.barcode })
+    .from(skus)
+    .where(
+      and(
+        eq(skus.tenantId, tenantId),
+        eq(skus.clientId, targetClientId),
+        notInArray(skus.id, memberIds),
+        or(
+          inArray(skus.code, members.map((row) => row.code)),
+          inArray(skus.barcode, members.map((row) => row.barcode)),
+        ),
+      ),
+    );
+  const heldCodes = new Set(held.map((row) => row.code));
+  const heldBarcodes = new Map(held.map((row) => [row.barcode, row.code] as const));
+  for (const row of members) {
+    if (heldCodes.has(row.code)) {
+      throw targetCodeCollision(row.code, targetLabel);
+    }
+  }
+  for (const row of members) {
+    const holder = heldBarcodes.get(row.barcode);
+    if (holder !== undefined) {
+      throw targetBarcodeCollision(row.barcode, row.code, holder, targetLabel);
+    }
+  }
+}
+
+function targetCodeCollision(code: string, targetLabel: string): ProblemException {
+  return new ProblemException(
+    'duplicate-sku-code',
+    409,
+    'SKU code already in use',
+    `SKU code "${code}" already exists in client ${targetLabel}'s catalog — the SKU cannot move there while that client holds the code.`,
+  );
+}
+
+function targetBarcodeCollision(
+  barcode: string,
+  code: string,
+  holder: string | null,
+  targetLabel: string,
+): ProblemException {
+  return new ProblemException(
+    'duplicate-barcode',
+    409,
+    'Barcode already in use',
+    `Barcode "${barcode}" of SKU "${code}" already belongs to ` +
+      (holder === null ? `another SKU of client ${targetLabel}` : `SKU "${holder}" of client ${targetLabel}`) +
+      ' — the SKU cannot move there while that client holds the barcode.',
+  );
 }
 
 /** Which kinds of history the SKU carries (empty = none — movable). */

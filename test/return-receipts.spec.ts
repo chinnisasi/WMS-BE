@@ -856,9 +856,13 @@ describe('return receipts (e2e, story 13-2)', () => {
     expect(await count(sql`select count(*)::int as n from ledger_events where tenant_id = ${tenantId} and type = 'return.received' and reference_doc->>'rmaId' = ${rma.id}`)).toBe(0);
   });
 
-  it('the per-type decision rule: every pre-13-2 op type keeps all three decisions; return.receive only discard', () => {
+  // Story 1-1 adds a second Discard-only type, the server-raised
+  // `grn.lines-refused` (a blind receipt's line of another client); every
+  // pre-13-2 type still keeps all three — the property this pins.
+  it('the per-type decision rule: every pre-13-2 op type keeps all three decisions; return.receive and grn.lines-refused only discard', () => {
+    const discardOnly = new Set(['return.receive', 'grn.lines-refused']);
     for (const type of REJECTED_OP_TYPES) {
-      expect(REJECTED_OP_DECISIONS_BY_TYPE[type]).toEqual(type === 'return.receive' ? ['discard'] : ['apply', 'recount', 'discard']);
+      expect(REJECTED_OP_DECISIONS_BY_TYPE[type]).toEqual(discardOnly.has(type) ? ['discard'] : ['apply', 'recount', 'discard']);
     }
   });
 

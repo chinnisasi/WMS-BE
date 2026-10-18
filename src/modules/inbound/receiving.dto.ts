@@ -30,7 +30,7 @@ import {
   MAX_HANDLING_UNIT_WEIGHT_GRAMS,
   MAX_HANDLING_UNITS_PER_REQUEST,
 } from '../catalog/handling-unit';
-import { MAX_HANDLING_UNITS_PER_GRN_LINE, UNMATCHED_LINE_REASONS } from './receiving.command';
+import { MAX_HANDLING_UNITS_PER_GRN_LINE, REJECTED_GRN_LINE_CODES, UNMATCHED_LINE_REASONS } from './receiving.command';
 // Story 3.5 (additive): the snapshot's putaway decision fields reuse the
 // putaway module's DTOs (one shape on every surface).
 import { PutawayBinDto, PutawayTaskDto } from '../putaway/putaway.dto';
@@ -167,6 +167,16 @@ export class SubmitGoodsReceiptDto {
   @IsIn(BLIND_REASON_ENUM as unknown as string[])
   blindReasonCode?: string | null;
 
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      'Story 1-1 — the client a BLIND receipt is for (named only beside blindReasonCode; a PO or ASN receipt takes its document\'s client, and naming one there is a 400). Absent (an older build): the client is derived from the first line\'s SKU. A line whose SKU belongs to another client is refused per line (`sku-client-mismatch` in rejectedLines) and the rest settles. An unknown client is a 404',
+  })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ description: 'Device time of the receipt (ISO-8601 UTC, Z-suffixed)', minLength: 20, maxLength: 35 })
   @IsString()
   @Length(20, 35)
@@ -248,9 +258,9 @@ export class RejectedGrnLineDto {
   qty!: number;
 
   @ApiProperty({
-    enum: ['po-line-not-found', 'po-line-not-open', 'asn-line-not-found'],
+    enum: [...REJECTED_GRN_LINE_CODES],
     description:
-      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients',
+      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt\'s line whose SKU belongs to another client than the receipt\'s; it goes to the review queue (Discard only)',
   })
   code!: string;
 
@@ -297,6 +307,14 @@ export class GoodsReceiptDto {
   @ApiProperty({ required: false, description: 'Story 21-6 — the ASN\'s code; present only on an ASN receipt' })
   asnCode?: string;
 
+  @ApiProperty({
+    format: 'uuid',
+    required: false,
+    description:
+      'Story 1-1 — the client whose goods the receipt booked (the PO\'s or ASN\'s client, or a blind receipt\'s chosen or derived client). Absent on a receipt replayed from before 1-1',
+  })
+  clientId?: string;
+
   @ApiProperty({ enum: [...BLIND_REASON_ENUM, null], type: String,
     nullable: true })
   blindReasonCode!: string | null;
@@ -328,11 +346,50 @@ export class GoodsReceiptDto {
     description: 'Story 21-6 — present only when some lines of a PO/ASN receipt settled unmatched (booked in full, crediting no document line)',
   })
   unmatchedLines?: readonly UnmatchedGrnLineDto[];
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Story 1-1 — the op id of the review row raised for the `sku-client-mismatch` lines (Conflicts & Reviews, type `grn.lines-refused`, Discard only); present only when one was raised',
+  })
+  reviewOpId?: string;
+}
+
+/**
+ * Story 1-1 (decision 6) — a blind receipt whose EVERY line was refused
+ * `sku-client-mismatch`: no receipt was recorded; the lines went to review.
+ */
+export class RefusedReceiptDto {
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The client the blind receipt named' })
+  clientId!: string;
+
+  @ApiProperty({ enum: [...BLIND_REASON_ENUM, null], type: String, nullable: true })
+  blindReasonCode!: string | null;
+
+  @ApiProperty({ description: 'Device time of the receipt (ISO-8601 UTC)' })
+  occurredAt!: string;
+
+  @ApiProperty({ type: [RejectedGrnLineDto], description: 'Every request line, each `sku-client-mismatch`' })
+  rejectedLines!: readonly RejectedGrnLineDto[];
+
+  @ApiProperty({ description: 'The op id of the review row (`grn.lines-refused`, Discard only)' })
+  reviewOpId!: string;
 }
 
 export class GoodsReceiptResponse {
-  @ApiProperty({ type: GoodsReceiptDto })
-  goodsReceipt!: GoodsReceiptDto;
+  @ApiProperty({
+    type: GoodsReceiptDto,
+    nullable: true,
+    description:
+      'The recorded GRN. Story 1-1 (decision 6): null when every line of a blind receipt was refused `sku-client-mismatch` — no receipt was recorded (no GRN code consumed); `refusedReceipt` then says what went to review',
+  })
+  goodsReceipt!: GoodsReceiptDto | null;
+
+  @ApiProperty({ type: RefusedReceiptDto, required: false, description: 'Story 1-1 — present only when goodsReceipt is null' })
+  refusedReceipt?: RefusedReceiptDto;
 }
 
 /** One GRN header of the list read. */
@@ -358,6 +415,14 @@ export class GoodsReceiptEntryDto {
 
   @ApiProperty({ required: false, description: 'Story 21-6 — the ASN\'s code; present only on an ASN receipt' })
   asnCode?: string;
+
+  @ApiProperty({
+    format: 'uuid',
+    required: false,
+    description:
+      'Story 1-1 — the client whose goods the receipt booked. Absent on an older receipt the 0076 backfill could not attribute (its lines named several clients, or none)',
+  })
+  clientId?: string;
 
   @ApiProperty({ enum: [...BLIND_REASON_ENUM, null], type: String,
     nullable: true, description: 'Set only on a blind receipt' })
@@ -635,6 +700,28 @@ export class CatalogSnapshotSkuDto {
       'Story 12.8 (UX-DR29): the SKU\'s storage class (defaults to `ambient`). It rides the snapshot beside the bin arm\'s class so the device\'s offline conformance mirror can refuse a non-conforming placement or draw in the Rejected banner — a refusal only the server knew about would queue in a dead zone and come back hours later as a rejection the operator can no longer act on.',
   })
   storageClass!: string;
+
+  @ApiProperty({
+    format: 'uuid',
+    description:
+      'Story 1-1: the client the SKU belongs to. Code and barcode are unique per (tenant, client), so one barcode may name several SKUs; the device resolves a scan through the work\'s own SKUs first, then the document\'s client (`clients` names each)',
+  })
+  clientId!: string;
+}
+
+/** Story 1-1 — one client named by the device snapshot (a SKU's or an open document's). */
+export class CatalogSnapshotClientDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ description: 'The client code (the tenant\'s own client\'s is `self`)' })
+  code!: string;
+
+  @ApiProperty({ description: 'The display name (the tenant\'s own client carries the tenant\'s name)' })
+  name!: string;
+
+  @ApiProperty({ description: 'False when suspended or departed — a blind receipt picks only an active client' })
+  active!: boolean;
 }
 
 /** One open PO of the device snapshot (header + line quantities). */
@@ -644,6 +731,9 @@ export class CatalogSnapshotPoDto {
 
   @ApiProperty()
   code!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'Story 1-1 (additive): the PO\'s client — the device resolves an unmatched scan within it' })
+  clientId!: string;
 
   @ApiProperty({ format: 'uuid' })
   warehouseId!: string;
@@ -892,6 +982,9 @@ export class CatalogOpenReturnDto {
   @ApiProperty({ type: String, nullable: true, description: "The order's channel reference; null for a manual order" })
   orderReference!: string | null;
 
+  @ApiProperty({ format: 'uuid', description: 'Story 1-1 (additive): the order\'s client — the device resolves a typed code within it after the RMA\'s own lines' })
+  clientId!: string;
+
   @ApiProperty({ type: [CatalogOpenReturnLineDto] })
   lines!: readonly CatalogOpenReturnLineDto[];
 }
@@ -947,4 +1040,11 @@ export class CatalogSnapshotResponse {
       'Story 13-2 (additive): the warehouse\'s return authorizations that can still receive (open or partially received) — the handheld receives returned units against them offline, grading each unit; units not on an authorization are queued for review, never refused on the device',
   })
   openReturns!: readonly CatalogOpenReturnDto[];
+
+  @ApiProperty({
+    type: [CatalogSnapshotClientDto],
+    description:
+      'Story 1-1 (additive): every client referenced by a SKU or an open document of the snapshot — the names the device shows when a scan belongs to another client, and the blind receipt\'s client picker. A snapshot WITHOUT this field (an older server) puts the device in legacy mode: no picker, no clientId sent',
+  })
+  clients!: readonly CatalogSnapshotClientDto[];
 }

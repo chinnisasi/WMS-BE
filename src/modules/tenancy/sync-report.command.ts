@@ -89,7 +89,12 @@ export type RejectedOpType =
   | 'count.submit'
   // Story 13-2 — a return receipt's refused entries (server-raised) or a
   // whole-op refusal (device-uploaded). Discard ONLY (human decision 4).
-  | 'return.receive';
+  | 'return.receive'
+  // Story 1-1 — a goods receipt's lines refused per line (a blind receipt's
+  // line whose SKU belongs to another client — `sku-client-mismatch`).
+  // SERVER-RAISED only (the device never uploads it: the op settled 201);
+  // Discard ONLY — re-receive the units on the right client.
+  | 'grn.lines-refused';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -100,7 +105,15 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'transfer.confirm',
   'count.submit',
   'return.receive',
+  'grn.lines-refused',
 ];
+
+/**
+ * Story 1-1 — the review types only the SERVER raises (a partial settlement's
+ * refused part, §7g). A device upload naming one is refused like
+ * `self-test.echo`: nothing on the device produces it.
+ */
+const SERVER_RAISED_ONLY_OP_TYPES: readonly RejectedOpType[] = ['grn.lines-refused'];
 
 /**
  * The resolve arms (the spec's human-judgment vocabulary — the DB statuses
@@ -130,10 +143,15 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   'transfer.confirm': REJECTED_OP_DECISIONS,
   'count.submit': REJECTED_OP_DECISIONS,
   'return.receive': ['discard'],
+  // Story 1-1 — a blind receipt's line of another client: re-applying the
+  // stored lines would be refused again (the receipt's client is fixed), so
+  // the remedy is to receive the units again under the right client; Discard
+  // records that the reviewer dealt with them and books nothing.
+  'grn.lines-refused': ['discard'],
 };
 
 /** The op types the apply arm can re-execute (every type admitting `apply`). */
-type ApplicableOpType = Exclude<RejectedOpType, 'return.receive'>;
+type ApplicableOpType = Exclude<RejectedOpType, 'return.receive' | 'grn.lines-refused'>;
 
 function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
   return REJECTED_OP_DECISIONS_BY_TYPE[opType].includes('apply');
@@ -298,6 +316,17 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['entries', 'array'],
     ['refusals', 'array-or-absent'],
   ],
+  // Story 1-1 — server-raised: the receipt, its client and the refused lines
+  // aligned with `refusals`.
+  'grn.lines-refused': [
+    ['warehouseId', 'uuid'],
+    // Null when every line was refused — no receipt was recorded (decision 6).
+    ['grnId', 'uuid-or-null'],
+    ['grnCode', 'string-or-null'],
+    ['clientId', 'uuid'],
+    ['lines', 'array'],
+    ['refusals', 'array'],
+  ],
 };
 
 const REJECTED_OP_DECISION_SET: ReadonlySet<string> = new Set<string>(REJECTED_OP_DECISIONS);
@@ -394,11 +423,15 @@ function assertSyncReportRowShape(row: unknown, index: number): void {
     throw invalidRow(index, String(opId), "opId must be the op's 26-character ULID.");
   }
   const opType = source.opType;
-  if (!REJECTED_OP_TYPES.includes(opType as RejectedOpType)) {
+  if (
+    !REJECTED_OP_TYPES.includes(opType as RejectedOpType) ||
+    SERVER_RAISED_ONLY_OP_TYPES.includes(opType as RejectedOpType)
+  ) {
+    const uploadable = REJECTED_OP_TYPES.filter((type) => !SERVER_RAISED_ONLY_OP_TYPES.includes(type));
     throw invalidRow(
       index,
       opId,
-      `opType "${String(opType)}" is not a reviewable op type (${REJECTED_OP_TYPES.join(', ')}) — self-test.echo ops are device diagnostics, never uploaded.`,
+      `opType "${String(opType)}" is not a reviewable op type (${uploadable.join(', ')}) — self-test.echo ops are device diagnostics, never uploaded.`,
     );
   }
   const classification = source.classification;
@@ -969,7 +1002,9 @@ export class SyncReportCommand {
             `A ${row.opType} row admits only ${admitted.map((d) => `"${d}"`).join(' | ')} — "${command.decision}" is not available.` +
               (row.opType === 'return.receive'
                 ? ' Create a return authorization for these units, then receive them again.'
-                : ''),
+                : row.opType === 'grn.lines-refused'
+                  ? " Receive these units again on a receipt for their own client."
+                  : ''),
             { decisions: [...admitted] },
           );
         }
@@ -1251,6 +1286,11 @@ export class SyncReportCommand {
             // `asnLineId` before validation, so an old op re-applies as before.
             asnId: (payload.asnId ?? null) as string | null,
             blindReasonCode: (payload.blindReasonCode ?? null) as string | null,
+            // Story 1-1: a blind receipt's chosen client, carried through.
+            // ABSENT stays absent (`undefined`, never null): the command
+            // hashes it only when present, so an older op re-applies
+            // byte-identically and the client is derived from its first line.
+            ...(typeof payload.clientId === 'string' ? { clientId: payload.clientId } : {}),
             // The op's business time: the payload's own, else the row's
             // opOccurredAt stamp (the device-sealed instant).
             occurredAt: opTime,

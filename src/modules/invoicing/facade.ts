@@ -42,6 +42,7 @@ import {
   toInvoiceView,
 } from './view';
 import type { InvoiceEntry, InvoiceView } from './view';
+import { OutboundFacade } from '../outbound/outbound.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import { normalizeStateName, resolveStateCode, type StateCodeEntry } from './generator';
 import {
@@ -127,6 +128,7 @@ export class InvoicingFacade {
     @Inject(DATABASE) private readonly db: Database,
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(EWAY_GATEWAY) private readonly ewayGateway: EwayGateway,
+    @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
   ) {}
 
   /**
@@ -270,7 +272,16 @@ export class InvoicingFacade {
       this.db,
       tenantId,
       async (tx) =>
-        hsnSummaryInTx(tx, tenantId, parsedGstin, parsedPeriod, (codes) => this.catalog.getSkuHsnByCodesInTx(tx, tenantId, codes)),
+        hsnSummaryInTx(tx, tenantId, parsedGstin, parsedPeriod, async (orderLineIds) => {
+          // Story 1-1 — by SKU: order line → SKU (outbound), SKU → HSN (catalog).
+          const skuIdByLine = await this.outbound.orderLineSkuIdsInTx(tx, tenantId, orderLineIds);
+          const hsnBySku = await this.catalog.getSkuHsnByIdsInTx(tx, tenantId, [...skuIdByLine.values()]);
+          const hints = new Map<string, string | null>();
+          for (const [lineId, skuId] of skuIdByLine) {
+            if (hsnBySku.has(skuId)) hints.set(lineId, hsnBySku.get(skuId) ?? null);
+          }
+          return hints;
+        }),
       { isolationLevel: 'repeatable read' },
     );
   }

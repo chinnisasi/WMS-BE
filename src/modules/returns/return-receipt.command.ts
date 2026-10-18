@@ -243,6 +243,8 @@ export interface OpenReturn {
   readonly id: string;
   readonly code: string;
   readonly orderReference: string | null;
+  /** Story 1-1 — the RMA's client (the device resolves a typed code within it). */
+  readonly clientId: string;
   readonly lines: readonly OpenReturnLine[];
 }
 
@@ -620,6 +622,7 @@ export async function openReturnsInTx(
       id: header.id,
       code: header.code,
       orderReference: header.orderReference,
+      clientId: header.clientId,
       lines: own.map((line) => {
         const facts = skuFacts.get(line.skuId);
         const received = receivedSerials.get(line.id) ?? new Set<string>();

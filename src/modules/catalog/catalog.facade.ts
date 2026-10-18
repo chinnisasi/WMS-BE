@@ -203,6 +203,12 @@ export interface SkuSummary {
    */
   readonly axes: string[] | null;
   /**
+   * Story 1-1: the client the SKU belongs to. Code and barcode are unique per
+   * (tenant, client), so one barcode may name several SKUs; the device
+   * resolves a scan through the work's own SKUs, then the document's client.
+   */
+  readonly clientId: string;
+  /**
    * Story 12.8 (UX-DR29): the SKU's storage class — the other half of the
    * device's offline conformance mirror. It rides the snapshot beside the
    * bin arm's class so the device can refuse a non-conforming placement or
@@ -417,11 +423,15 @@ export class CatalogFacade {
         // the device's offline conformance mirror reads both arms (SKU here,
         // bin on the putaway facade) beside the fields it already gates on.
         storageClass: skus.storageClass,
+        // Story 1-1: the owner client — a barcode may be shared across
+        // clients, so the device needs it to resolve within a document's
+        // client.
+        clientId: skus.clientId,
       })
       .from(skus)
       .leftJoin(products, eq(products.id, skus.productId))
       .where(eq(skus.tenantId, tenantId))
-      .orderBy(skus.code);
+      .orderBy(skus.code, skus.clientId, skus.id);
     // Story 10.2: the unit's declared precision joins the scan identity. It is
     // a property of the UNIT, so it is looked up here rather than selected —
     // still on the caller's transaction, still one query.
@@ -533,42 +543,45 @@ export class CatalogFacade {
   }
 
   /**
-   * The CURRENT catalog HSN of a set of SKU codes (story 8-2a), inside the
-   * caller's transaction — the HSN summary's hint beside an issued line whose
-   * frozen HSN is blank or malformed. A hint only: an issued invoice is never
-   * rewritten from it. A code the catalog does not know is absent from the
-   * map (codes are immutable and SKUs are never deleted, so in practice
-   * every snapshot code resolves).
+   * The CURRENT catalog HSN of a set of SKUs BY ID (story 8-2a; by id since
+   * story 1-1 — a code may be held by several clients, so a code no longer
+   * names one SKU), inside the caller's transaction — the HSN summary's hint
+   * beside an issued line whose frozen HSN is blank or malformed. A hint
+   * only: an issued invoice is never rewritten from it. An id the catalog
+   * does not know is absent from the map.
    */
-  async getSkuHsnByCodesInTx(
+  async getSkuHsnByIdsInTx(
     tx: TenantTx,
     tenantId: string,
-    codes: readonly string[],
+    skuIds: readonly string[],
   ): Promise<ReadonlyMap<string, string | null>> {
-    if (codes.length === 0) {
+    if (skuIds.length === 0) {
       return new Map();
     }
     const rows = await tx
-      .select({ code: skus.code, hsn: skus.hsn })
+      .select({ id: skus.id, hsn: skus.hsn })
       .from(skus)
-      .where(and(eq(skus.tenantId, tenantId), inArray(skus.code, [...new Set(codes)])));
-    return new Map(rows.map((row) => [row.code, row.hsn]));
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, [...new Set(skuIds)])));
+    return new Map(rows.map((row) => [row.id, row.hsn]));
   }
 
   /**
    * The ASN import (2026-10-17) — SKUs named BY CODE in a file, in bulk, in
-   * the caller's transaction, beside `getSkuHsnByCodesInTx`: each code's id,
-   * client, base unit with its declared precision, and whether it is a kit
-   * (the `getKitSkuIdsInTx` answer — kit-ness is the presence of composition
-   * rows, never a flag). Codes match exactly, as every SKU code read does;
-   * an unknown code is absent from the map. No lock (the ASN create reads its
-   * SKUs unlocked).
+   * the caller's transaction: each code's id, client, base unit with its
+   * declared precision, and whether it is a kit (the `getKitSkuIdsInTx`
+   * answer — kit-ness is the presence of composition rows, never a flag).
+   * Codes match exactly, as every SKU code read does; an unknown code is
+   * absent from the map. No lock (the ASN create reads its SKUs unlocked).
+   *
+   * Story 1-1: a code is unique per (tenant, client), so a code maps to
+   * EVERY SKU holding it — one per client, ordered by client id — and the
+   * caller resolves within the client it settles.
    */
   async getSkusByCodesInTx(
     tx: TenantTx,
     tenantId: string,
     codes: readonly string[],
-  ): Promise<ReadonlyMap<string, SkuByCode>> {
+  ): Promise<ReadonlyMap<string, readonly SkuByCode[]>> {
     const distinct = [...new Set(codes)].filter((code) => code !== '');
     if (distinct.length === 0) {
       return new Map();
@@ -576,21 +589,23 @@ export class CatalogFacade {
     const rows = await tx
       .select({ id: skus.id, code: skus.code, clientId: skus.clientId, uom: skus.uom })
       .from(skus)
-      .where(and(eq(skus.tenantId, tenantId), inArray(skus.code, distinct)));
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.code, distinct)))
+      .orderBy(skus.code, skus.clientId);
     const kits = new Set(await getKitSkuIdsInTx(tx, tenantId, rows.map((row) => row.id)));
-    return new Map(
-      rows.map((row) => [
-        row.code,
-        {
-          id: row.id,
-          code: row.code,
-          clientId: row.clientId,
-          uom: row.uom,
-          uomPrecision: uomPrecision(row.uom),
-          isKit: kits.has(row.id),
-        },
-      ]),
-    );
+    const byCode = new Map<string, SkuByCode[]>();
+    for (const row of rows) {
+      const list = byCode.get(row.code) ?? [];
+      list.push({
+        id: row.id,
+        code: row.code,
+        clientId: row.clientId,
+        uom: row.uom,
+        uomPrecision: uomPrecision(row.uom),
+        isKit: kits.has(row.id),
+      });
+      byCode.set(row.code, list);
+    }
+    return byCode;
   }
 
   /**
