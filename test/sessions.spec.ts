@@ -10,6 +10,7 @@ import { SESSION_KINDS, SESSION_REVOKE_REASONS } from '../src/modules/tenancy/se
 import { clientIpOf, unlockSignIn } from '../src/modules/tenancy/auth-attempts';
 import { signTenantSession } from '../src/modules/tenancy/jwt-session';
 import { SessionPurgeWorker } from '../src/jobs/jobs.module';
+import { SYSTEM_ACTOR_ID } from '../src/shared/primitives/audit';
 import { signDeviceToken, tenantSessionSecret } from '../src/modules/tenancy/jwt-session';
 import { REFRESH_COOKIE_NAME } from '../src/modules/tenancy/session-cookie';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -236,6 +237,9 @@ describe('secure sessions (e2e, story 6-1a)', () => {
       expect(reuse.body).toMatchObject({ code: 'session-ended', reason: 'refresh-reuse' });
       const after = await refresh(second).expect(401);
       expect(after.body).toMatchObject({ code: 'session-ended', reason: 'refresh-reuse' });
+      // Code review C11 — the theft signal is in the audit trail (the system detected it).
+      const [stolen] = await sql<{ id: string }[]>`select id from sessions where user_id = ${t.ownerId}`;
+      await expectAuditRow({ tenantId: t.tenantId, key: stolen!.id, action: 'session.reuse_detected', targetType: 'user', targetId: t.ownerId, actorUserId: SYSTEM_ACTOR_ID });
       expect((await me(t.tenantId, rotated.body.accessToken as string).expect(401)).body).toMatchObject({
         code: 'session-ended',
         reason: 'refresh-reuse',
@@ -284,6 +288,8 @@ describe('secure sessions (e2e, story 6-1a)', () => {
       await signOut(s.cookie).expect(204);
       expect((await me(t.tenantId, s.token).expect(401)).body).toMatchObject({ code: 'session-ended', reason: 'signed-out' });
       await signOut(s.cookie).expect(204);
+      const [ended] = await sql<{ id: string }[]>`select id from sessions where user_id = ${t.ownerId} and revoked_reason = 'signed-out'`;
+      await expectAuditRow({ tenantId: t.tenantId, key: ended!.id, action: 'session.signed_out', targetType: 'user', targetId: t.ownerId, actorUserId: t.ownerId });
 
       // By bearer only, with the access token already expired.
       const other = await signIn(t.email);
@@ -400,6 +406,8 @@ describe('secure sessions (e2e, story 6-1a)', () => {
       const locked = await signInReq(member.email, MEMBER_PASSWORD, ip).expect(423);
       expect(locked.body).toMatchObject({ code: 'sign-in-locked', retryAfterSeconds: expect.any(Number) });
       expect(locked.body.retryAfterSeconds).toBeGreaterThan(800);
+      const lockKey = `ip:${ip}`;
+      await expectAuditRow({ tenantId: t.tenantId, key: lockKey, action: 'user.sign_in_locked', targetType: 'user', targetId: member.userId, actorUserId: SYSTEM_ACTOR_ID });
       await signInReq(member.email, MEMBER_PASSWORD, newIp()).expect(200);
 
       const ghostIp = newIp();
@@ -443,6 +451,8 @@ describe('secure sessions (e2e, story 6-1a)', () => {
       }
       const locked = await badgeIn(t.tenantId, device.deviceToken, op.email, '1357').expect(423);
       expect(locked.body).toMatchObject({ code: 'badge-locked', retryAfterSeconds: expect.any(Number) });
+      const [lockRow] = await sql<{ reference: string }[]>`select reference from audit_events where action = 'device.badge_locked' and target_id = ${device.deviceId}`;
+      await expectAuditRow({ tenantId: t.tenantId, key: lockRow!.reference, action: 'device.badge_locked', targetType: 'device', targetId: device.deviceId, actorUserId: SYSTEM_ACTOR_ID });
       const list = await http().get(`${API}/${t.tenantId}/devices`).set('Authorization', `Bearer ${owner.token}`).expect(200);
       expect((list.body.items as { id: string; badgeLockedUntil: string | null }[]).find((d) => d.id === device.deviceId)!.badgeLockedUntil).toEqual(expect.any(String));
       const key = ulid();
@@ -517,6 +527,8 @@ describe('secure sessions (e2e, story 6-1a)', () => {
       const session = await badgeIn(t.tenantId, device.deviceToken, a.email).expect(200);
       await badgeIn(t.tenantId, device.deviceToken, b.email).expect(401);
       await http().post(`${API}/${t.tenantId}/devices/badge-out`).set('Authorization', `Bearer ${session.body.accessToken}`).expect(204);
+      const [outRow] = await sql<{ reference: string }[]>`select reference from audit_events where action = 'device.badged_out' and target_id = ${device.deviceId}`;
+      await expectAuditRow({ tenantId: t.tenantId, key: outRow!.reference, action: 'device.badged_out', targetType: 'device', targetId: device.deviceId, actorUserId: a.userId });
       expect((await echo(t.tenantId, session.body.accessToken as string).expect(401)).body.reason).toBe('signed-out');
       await badgeIn(t.tenantId, device.deviceToken, b.email).expect(200);
       // A bare device credential cannot badge out.

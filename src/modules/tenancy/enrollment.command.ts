@@ -28,12 +28,13 @@ import {
 } from './jwt-session';
 import {
   BADGE_IN_LIMIT_PER_DEVICE_PER_MINUTE,
+  badgeLocked,
   clearBadgeInAttemptsInTx,
   countBadgeInAttemptInTx,
   hitRateLimit,
   settleBadgeInFailureInTx,
 } from './auth-attempts';
-import { createSessionInTx, hasLiveBadgeSessionInTx, revokeSessionsInTx } from './sessions';
+import { auditSecurityEventInTx, createSessionInTx, hasLiveBadgeSessionInTx, revokeSessionsInTx } from './sessions';
 
 export const DEFAULT_DEVICE_PAGE_SIZE = 50;
 export const MAX_DEVICE_PAGE_SIZE = 200;
@@ -570,9 +571,12 @@ export class EnrollmentCommand {
     // (A1: the PIN is the device's, so the lock is too). A lock answers 423
     // for any PIN.
     await hitRateLimit(this.db, `badge-device:${command.deviceId}`, BADGE_IN_LIMIT_PER_DEVICE_PER_MINUTE);
-    await withTenantTransaction(this.db, command.tenantId, (tx) =>
-      countBadgeInAttemptInTx(tx, command.tenantId, command.deviceId),
-    );
+    const counted = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      const result = await countBadgeInAttemptInTx(tx, command.tenantId, command.deviceId);
+      if (result.newlyLocked) await auditBadgeLockInTx(tx, command.tenantId, command.deviceId);
+      return result;
+    });
+    if (counted.locked) throw badgeLocked(counted.retryAfterSeconds);
 
     const outcome = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       const deviceRows = await tx
@@ -667,11 +671,13 @@ export class EnrollmentCommand {
       };
     });
     if (!outcome.ok) {
-      await withTenantTransaction(this.db, command.tenantId, (tx) =>
-        outcome.pinOk
-          ? clearBadgeInAttemptsInTx(tx, command.tenantId, command.deviceId)
-          : settleBadgeInFailureInTx(tx, command.tenantId, command.deviceId),
-      );
+      await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+        if (outcome.pinOk) {
+          await clearBadgeInAttemptsInTx(tx, command.tenantId, command.deviceId);
+        } else if (await settleBadgeInFailureInTx(tx, command.tenantId, command.deviceId)) {
+          await auditBadgeLockInTx(tx, command.tenantId, command.deviceId);
+        }
+      });
       throw outcome.refusal;
     }
     return outcome.snapshot;
@@ -692,7 +698,23 @@ export class EnrollmentCommand {
         .where(and(eq(devices.id, command.deviceId), eq(devices.tenantId, command.tenantId)))
         .for('update')
         .limit(1);
+      // Code review (C11) — the badge-out is audited against the device, the operator acting.
+      const live = (await tx.execute(sql`
+        select id from sessions
+         where tenant_id = ${command.tenantId} and device_id = ${command.deviceId} and kind = 'badge' and revoked_at is null
+         order by created_at desc limit 1
+      `)) as unknown as Array<{ id: string }>;
       await revokeSessionsInTx(tx, command.tenantId, { deviceId: command.deviceId, kinds: ['badge'] }, 'signed-out');
+      if (live[0] !== undefined) {
+        await auditSecurityEventInTx(tx, {
+          tenantId: command.tenantId,
+          action: 'device.badged_out',
+          targetType: 'device',
+          targetId: command.deviceId,
+          actorUserId: command.userId,
+          reference: live[0].id,
+        });
+      }
       await tx
         .update(devices)
         .set({
@@ -1215,4 +1237,16 @@ async function replayDeviceKey(
   if (!existing[0]) return null;
   if (existing[0].payloadHash !== payloadHash) throw idempotencyKeyReuse();
   return (existing[0].responseSnapshot as { device: DeviceView }).device;
+}
+
+/** Code review (C11) — a device's badge-in lock, audited once when it is set (the system acted). */
+async function auditBadgeLockInTx(tx: TenantTx, tenantId: string, deviceId: string): Promise<void> {
+  await auditSecurityEventInTx(tx, {
+    tenantId,
+    action: 'device.badge_locked',
+    targetType: 'device',
+    targetId: deviceId,
+    actorUserId: null,
+    reference: `badge-lock:${new Date().toISOString()}`,
+  });
 }

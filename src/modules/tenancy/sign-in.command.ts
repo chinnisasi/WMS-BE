@@ -13,8 +13,9 @@ import {
   countSignInAttempt,
   hitRateLimit,
   settleSignInFailure,
+  signInLocked,
 } from './auth-attempts';
-import { createSessionInTx, refreshCookieValue } from './sessions';
+import { auditSecurityEventInTx, createSessionInTx, refreshCookieValue } from './sessions';
 import { DUMMY_HASH, verifyPassword } from './passwords';
 import { clientSuspended, readSessionClientIn } from '../clients/clients.facade';
 
@@ -84,13 +85,17 @@ export class SignInCommand {
     // password is checked (own committed statement; a lock answers 423 for
     // any password, real or unknown email alike).
     await hitRateLimit(this.db, `signin-ip:${command.ip}`, SIGNIN_LIMIT_PER_IP_PER_MINUTE);
-    await countSignInAttempt(this.db, email, command.ip);
+    const counted = await countSignInAttempt(this.db, email, command.ip);
     const userRows = await this.authDb
       .select()
       .from(users)
       .where(eq(users.email, email))
       .limit(1);
     const user = userRows[0];
+    if (counted.locked) {
+      if (counted.newlyLocked && user !== undefined) await this.auditLock(user, command.ip);
+      throw signInLocked(counted.retryAfterSeconds);
+    }
     if (user?.status === 'invited') {
       // An invited user has no password yet (a DUMMY_HASH sentinel that no
       // credential verifies) — the 403 invite-pending must fire for ANY
@@ -113,7 +118,8 @@ export class SignInCommand {
     const ok = await verifyPassword(command.password, user?.passwordHash ?? DUMMY_HASH);
     // Story 6-1a — a deactivated user answers exactly like a wrong password.
     if (user === undefined || !ok || user.status !== 'active') {
-      await settleSignInFailure(this.db, email, command.ip);
+      const locked = await settleSignInFailure(this.db, email, command.ip);
+      if (locked && user !== undefined) await this.auditLock(user, command.ip);
       // One message for unknown email and wrong password — no enumeration.
       throw new ProblemException(
         'unauthenticated',
@@ -180,5 +186,19 @@ export class SignInCommand {
       },
       client,
     };
+  }
+
+  /** Code review (C11) — the lock is audited once, when it is set, against the account (the system acted). */
+  private async auditLock(user: { id: string; tenantId: string }, ip: string): Promise<void> {
+    await withTenantTransaction(this.db, user.tenantId, (tx) =>
+      auditSecurityEventInTx(tx, {
+        tenantId: user.tenantId,
+        action: 'user.sign_in_locked',
+        targetType: 'user',
+        targetId: user.id,
+        actorUserId: null,
+        reference: `ip:${ip}`,
+      }),
+    );
   }
 }

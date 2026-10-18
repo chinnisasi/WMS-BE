@@ -93,7 +93,15 @@ type Counted = { failures: number; locked: boolean; retry_after: number };
  * throws) when this attempt is past the limit — a parallel burst never
  * reaches scrypt.
  */
-export async function countSignInAttempt(db: Database, email: string, ip: string): Promise<void> {
+export interface AttemptCount {
+  /** The pair is locked now (this attempt is refused 423). */
+  readonly locked: boolean;
+  readonly retryAfterSeconds: number;
+  /** This very attempt set the lock (code review C11 — audited once, at the transition). */
+  readonly newlyLocked: boolean;
+}
+
+export async function countSignInAttempt(db: Database, email: string, ip: string): Promise<AttemptCount> {
   const rows = (await db.execute(sql`
     insert into signin_attempts (email_hash, ip, failures, updated_at)
     values (${emailDigest(email)}, ${ip}, 1, now())
@@ -108,20 +116,25 @@ export async function countSignInAttempt(db: Database, email: string, ip: string
       updated_at = now()
     returning failures,
       (locked_until is not null and locked_until > now()) as locked,
+      -- Set by THIS statement: now() is fixed for the transaction, so a lock
+      -- set earlier carries an earlier instant.
+      (locked_until = now() + make_interval(secs => ${LOCK_SECONDS})) as newly_locked,
       coalesce(greatest(1, ceil(extract(epoch from (locked_until - now())))), 0)::int as retry_after
-  `)) as unknown as Counted[];
+  `)) as unknown as Array<Counted & { newly_locked: boolean }>;
   const row = rows[0]!;
-  if (row.locked) throw signInLocked(row.retry_after);
+  return { locked: row.locked, retryAfterSeconds: row.retry_after, newlyLocked: row.newly_locked };
 }
 
 /** A wrong password on the attempt that reached the limit locks the pair. */
-export async function settleSignInFailure(db: Database, email: string, ip: string): Promise<void> {
-  await db.execute(sql`
+export async function settleSignInFailure(db: Database, email: string, ip: string): Promise<boolean> {
+  const rows = (await db.execute(sql`
     update signin_attempts
        set locked_until = now() + make_interval(secs => ${LOCK_SECONDS}), updated_at = now()
      where email_hash = ${emailDigest(email)} and ip = ${ip}
        and locked_until is null and failures >= ${MAX_CONSECUTIVE_FAILURES}
-  `);
+    returning ip
+  `)) as unknown as unknown[];
+  return rows.length > 0;
 }
 
 /** A correct password resets the pair's count. */
@@ -162,7 +175,7 @@ export async function signInLockedUntil(db: Database, emails: readonly string[])
  * transaction, which must COMMIT before the PIN is checked). Same rules as
  * the password count.
  */
-export async function countBadgeInAttemptInTx(tx: TenantTx, tenantId: string, deviceId: string): Promise<void> {
+export async function countBadgeInAttemptInTx(tx: TenantTx, tenantId: string, deviceId: string): Promise<AttemptCount> {
   const rows = (await tx.execute(sql`
     update devices set
       failed_badge_ins = case when badge_locked_until is not null and badge_locked_until <= now()
@@ -175,18 +188,22 @@ export async function countBadgeInAttemptInTx(tx: TenantTx, tenantId: string, de
      where tenant_id = ${tenantId} and id = ${deviceId}
     returning failed_badge_ins as failures,
       (badge_locked_until is not null and badge_locked_until > now()) as locked,
+      (badge_locked_until = now() + make_interval(secs => ${LOCK_SECONDS})) as newly_locked,
       coalesce(greatest(1, ceil(extract(epoch from (badge_locked_until - now())))), 0)::int as retry_after
-  `)) as unknown as Counted[];
+  `)) as unknown as Array<Counted & { newly_locked: boolean }>;
   const row = rows[0];
-  if (row !== undefined && row.locked) throw badgeLocked(row.retry_after);
+  if (row === undefined) return { locked: false, retryAfterSeconds: 0, newlyLocked: false };
+  return { locked: row.locked, retryAfterSeconds: row.retry_after, newlyLocked: row.newly_locked };
 }
 
-export async function settleBadgeInFailureInTx(tx: TenantTx, tenantId: string, deviceId: string): Promise<void> {
-  await tx.execute(sql`
+export async function settleBadgeInFailureInTx(tx: TenantTx, tenantId: string, deviceId: string): Promise<boolean> {
+  const rows = (await tx.execute(sql`
     update devices set badge_locked_until = now() + make_interval(secs => ${LOCK_SECONDS})
      where tenant_id = ${tenantId} and id = ${deviceId}
        and badge_locked_until is null and failed_badge_ins >= ${MAX_CONSECUTIVE_FAILURES}
-  `);
+    returning id
+  `)) as unknown as unknown[];
+  return rows.length > 0;
 }
 
 export async function clearBadgeInAttemptsInTx(tx: TenantTx, tenantId: string, deviceId: string): Promise<void> {

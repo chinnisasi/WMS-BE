@@ -152,4 +152,10 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'user.unlocked', targetType: 'user' },
   { action: 'device.released', targetType: 'device' },
   { action: 'device.unlocked', targetType: 'device' },
+  // Code review (C11) — the security events of a session's life.
+  { action: 'session.reuse_detected', targetType: 'user' },
+  { action: 'session.signed_out', targetType: 'user' },
+  { action: 'user.sign_in_locked', targetType: 'user' },
+  { action: 'device.badge_locked', targetType: 'device' },
+  { action: 'device.badged_out', targetType: 'device' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

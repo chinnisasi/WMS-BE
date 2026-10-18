@@ -2,7 +2,8 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { Database } from '../../shared/db/db';
 import { isUuid } from '../../shared/primitives/ids';
-import { sessions } from '../../shared/db/schema';
+import { auditEvents, sessions } from '../../shared/db/schema';
+import { SYSTEM_ACTOR_ID } from '../../shared/primitives/audit';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 
 /**
@@ -57,6 +58,44 @@ const TOUCH_INTERVAL_SECONDS = 60;
 
 /** Session rows ended this long ago are purged by the daily job. */
 export const SESSION_RETENTION_DAYS = 30;
+
+/**
+ * Code review (C11) — the security events of a session's life, in the audit
+ * trail: `session.reuse_detected` (a rotated refresh token presented again —
+ * the token-theft signal), `session.signed_out`, `user.sign_in_locked`,
+ * `device.badge_locked`, `device.badged_out`, and the CLI's `user.unlocked`.
+ * The actor is the user who acted, or the system for what the system
+ * detected; `reference` carries the session id or the client address.
+ */
+export type SecurityAuditAction =
+  | 'session.reuse_detected'
+  | 'session.signed_out'
+  | 'user.sign_in_locked'
+  | 'device.badge_locked'
+  | 'device.badged_out'
+  | 'user.unlocked';
+
+export async function auditSecurityEventInTx(
+  tx: TenantTx,
+  event: {
+    readonly tenantId: string;
+    readonly action: SecurityAuditAction;
+    readonly targetType: 'user' | 'device';
+    readonly targetId: string;
+    /** null = the system detected it. */
+    readonly actorUserId: string | null;
+    readonly reference: string;
+  },
+): Promise<void> {
+  await tx.insert(auditEvents).values({
+    tenantId: event.tenantId,
+    actorUserId: event.actorUserId ?? SYSTEM_ACTOR_ID,
+    action: event.action,
+    targetType: event.targetType,
+    targetId: event.targetId,
+    reference: event.reference,
+  });
+}
 
 export function hashSecret(secret: string): string {
   return createHash('sha256').update(secret, 'utf8').digest('hex');
@@ -247,6 +286,28 @@ export async function hasLiveBadgeSessionInTx(tx: TenantTx, tenantId: string, de
   return rows.length > 0;
 }
 
+/** Ends one live web/portal session; the user it belonged to, or null when there was none to end. */
+export async function revokeWebSessionInTx(
+  tx: TenantTx,
+  tenantId: string,
+  sessionId: string,
+  reason: SessionRevokeReason,
+): Promise<string | null> {
+  const rows = await tx
+    .update(sessions)
+    .set({ revokedAt: sql`now()`, revokedReason: reason })
+    .where(
+      and(
+        eq(sessions.tenantId, tenantId),
+        eq(sessions.id, sessionId),
+        isNull(sessions.revokedAt),
+        inArray(sessions.kind, ['web', 'portal']),
+      ),
+    )
+    .returning({ userId: sessions.userId });
+  return rows[0]?.userId ?? null;
+}
+
 /** The refresh cookie's value: `<sid>.<secret>`. */
 export function parseRefreshCookie(value: unknown): { sessionId: string; secret: string } | null {
   if (typeof value !== 'string') return null;
@@ -352,6 +413,14 @@ export async function refreshSessionInTx(
       return { ok: true, userId: row.user_id, kind, clientId: row.client_id, refreshSecret: null, absoluteInSeconds: row.absolute_in };
     }
     await revokeSessionsInTx(tx, tenantId, { sessionId }, 'refresh-reuse');
+    await auditSecurityEventInTx(tx, {
+      tenantId,
+      action: 'session.reuse_detected',
+      targetType: 'user',
+      targetId: row.user_id,
+      actorUserId: null,
+      reference: sessionId,
+    });
     return { ok: false, reason: 'refresh-reuse' };
   }
   const next = newSecret();

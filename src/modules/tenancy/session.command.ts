@@ -1,7 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { decodeSignedPayload, SESSION_TTL_SECONDS, signTenantSession, tenantSessionSecret } from './jwt-session';
 import { sessionEnded } from './session-cookie';
@@ -9,8 +9,9 @@ import {
   parseRefreshCookie,
   refreshCookieValue,
   refreshSecretMatchesInTx,
+  auditSecurityEventInTx,
   refreshSessionInTx,
-  revokeSessionsInTx,
+  revokeWebSessionInTx,
   sessionTenantOf,
 } from './sessions';
 
@@ -87,7 +88,7 @@ export class SessionCommand {
       if (tenantId !== null) {
         const ended = await withTenantTransaction(this.db, tenantId, async (tx) => {
           if (!(await refreshSecretMatchesInTx(tx, fromCookie.sessionId, fromCookie.secret))) return false;
-          await revokeSessionsInTx(tx, tenantId, { sessionId: fromCookie.sessionId, kinds: ['web', 'portal'] }, 'signed-out');
+          await this.endAndAudit(tx, tenantId, fromCookie.sessionId);
           return true;
         });
         if (ended) return;
@@ -99,9 +100,21 @@ export class SessionCommand {
     const sessionId = payload.sid;
     const tenantId = await sessionTenantOf(this.authDb, sessionId);
     if (tenantId === null) return;
-    await withTenantTransaction(this.db, tenantId, (tx) =>
-      revokeSessionsInTx(tx, tenantId, { sessionId, kinds: ['web', 'portal'] }, 'signed-out'),
-    );
+    await withTenantTransaction(this.db, tenantId, (tx) => this.endAndAudit(tx, tenantId, sessionId));
+  }
+
+  /** Ends the session and, when one was live, audits `session.signed_out` (the user is the actor). */
+  private async endAndAudit(tx: TenantTx, tenantId: string, sessionId: string): Promise<void> {
+    const userId = await revokeWebSessionInTx(tx, tenantId, sessionId, 'signed-out');
+    if (userId === null) return;
+    await auditSecurityEventInTx(tx, {
+      tenantId,
+      action: 'session.signed_out',
+      targetType: 'user',
+      targetId: userId,
+      actorUserId: userId,
+      reference: sessionId,
+    });
   }
 }
 
