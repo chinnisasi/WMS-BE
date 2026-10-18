@@ -237,7 +237,7 @@ describe('rows and groups', () => {
     const { groups, errors } = resolveAsnGroups(
       groupAsnImportRows(rows),
       (cell) => (cell.toUpperCase() === 'GLOWCO' ? 'glowco-id' : null),
-      (row) => skuClient[row.sku],
+      (row) => (skuClient[row.sku] === undefined ? [] : [skuClient[row.sku]!]),
     );
     // One ASN per (client, code): MIX is ONE ASN, never two.
     expect(groups.map((g) => [g.group.asnCode, g.clientId, g.group.rows.map((r) => r.rowNumber)])).toEqual([
@@ -249,6 +249,32 @@ describe('rows and groups', () => {
     expect(errors.map((e) => [e.rowNumber, e.asnCode, e.code])).toEqual([[5, 'BAD', 'asn-rows-disagree']]);
     expect(errors[0]!.detail).toContain('row 4\'s "GLOWCO"');
     expect(rowDisagreements(groups[0]!.group)).toEqual([]);
+  });
+
+  it('story 1-1: a code held by several clients resolves within the ASN\'s client; a blank-only ASN held by several clients is client-required', () => {
+    const { rows } = readAsnImportRows([
+      // SHARED is held by GLOWCO and ACME; G1 only by GLOWCO.
+      sheetRow(2, { ...base, asn_code: 'NAMED', client: 'GLOWCO', sku: 'G1', quantity: '1' }),
+      sheetRow(3, { ...base, asn_code: 'NAMED', client: '', sku: 'SHARED', quantity: '1' }),
+      sheetRow(4, { ...base, asn_code: 'NARROW', client: '', sku: 'SHARED', quantity: '1' }),
+      sheetRow(5, { ...base, asn_code: 'NARROW', client: '', sku: 'G1', quantity: '1' }),
+      sheetRow(6, { ...base, asn_code: 'OPEN', client: '', sku: 'SHARED', quantity: '1' }),
+    ]);
+    const holders: Record<string, string[]> = { G1: ['glowco-id'], SHARED: ['acme-id', 'glowco-id'] };
+    const { groups, errors } = resolveAsnGroups(
+      groupAsnImportRows(rows),
+      (cell) => (cell.toUpperCase() === 'GLOWCO' ? 'glowco-id' : null),
+      (row) => holders[row.sku] ?? [],
+    );
+    expect(groups.map((g) => [g.group.asnCode, g.clientId, g.clientRequired, g.group.rows.map((r) => r.rowNumber)])).toEqual([
+      // A blank row whose code the named client holds agrees — no disagreement.
+      ['NAMED', 'glowco-id', false, [2, 3]],
+      // Only GLOWCO holds every code: settled.
+      ['NARROW', 'glowco-id', false, [4, 5]],
+      // Both clients hold every code: unsettled.
+      ['OPEN', null, true, [6]],
+    ]);
+    expect(errors).toEqual([]);
   });
 
   it('rows of one ASN must agree on client, warehouse and expected_at after normalising; a blank and a filled cell disagree', () => {

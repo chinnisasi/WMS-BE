@@ -32,7 +32,9 @@ export const MAX_ASN_IMPORT_ASNS = 500;
  * response DTO's enum so the web's copy map is a `Record` over it.
  *
  * - lookups: `unknown-client`, `unknown-warehouse`, `wrong-warehouse`, `unknown-sku`;
- * - client attribution: `sku-client-mismatch`, `mixed-client`;
+ * - client attribution: `sku-client-mismatch`, `mixed-client`, and (story
+ *   1-1) `client-required` — a blank-client ASN whose codes are each held by
+ *   several clients, so its client cannot be settled;
  * - the ASN's own rules: `kit-cannot-hold-stock`, `duplicate-asn-code`,
  *   `invalid-asn-code`, `too-many-lines`;
  * - file consistency: `asn-rows-disagree`, `duplicate-sku-in-asn`;
@@ -50,6 +52,7 @@ export const ASN_IMPORT_ROW_ERROR_CODES = [
   'unknown-sku',
   'sku-client-mismatch',
   'mixed-client',
+  'client-required',
   'kit-cannot-hold-stock',
   'duplicate-asn-code',
   'invalid-asn-code',
@@ -309,6 +312,12 @@ export function groupAsnImportRows(rows: readonly AsnImportRow[]): AsnImportGrou
 export interface ResolvedAsnGroup {
   readonly group: AsnImportGroup;
   readonly clientId: string | null;
+  /**
+   * Story 1-1 — true when a blank-client ASN's codes are held by SEVERAL
+   * clients in common, so its client cannot be settled (`client-required`).
+   * Distinct from a null client whose SKUs span clients (`mixed-client`).
+   */
+  readonly clientRequired: boolean;
 }
 
 /**
@@ -324,34 +333,55 @@ export interface ResolvedAsnGroup {
  *   client their SKUs name (null when they name none, or several — the
  *   command refuses that `mixed-client`, never splitting the ASN).
  *
+ * Story 1-1: a code is unique per (tenant, client), so a row's code may be
+ * held by several clients (`skuClientsOf` lists them all; empty when the code
+ * is unknown). A blank row is the client of its code WITHIN the ASN's
+ * client: it agrees with an explicit ASN whenever that client holds its code.
+ * A blank-only ASN's client is the one client holding EVERY known code; when
+ * several clients hold them all, the client cannot be settled — the group is
+ * marked `clientRequired` (the command refuses it `client-required`).
+ *
  * Rows stay in file order; ASNs in the order of their first row.
  */
 export function resolveAsnGroups(
   groups: readonly AsnImportGroup[],
   clientIdOf: (cell: string) => string | null,
-  skuClientOf: (row: AsnImportRow) => string | undefined,
+  skuClientsOf: (row: AsnImportRow) => readonly string[],
 ): { readonly groups: ResolvedAsnGroup[]; readonly errors: AsnImportRowError[] } {
   const errors: AsnImportRowError[] = [];
   const explicit = groups
     .filter((group) => group.rows[0]!.client !== '')
-    .map((group) => ({ group: { asnCode: group.asnCode, rows: [...group.rows] }, clientId: clientIdOf(group.rows[0]!.client) }));
-  const resolved: { group: { asnCode: string; rows: AsnImportRow[] }; clientId: string | null }[] = [...explicit];
+    .map((group) => ({
+      group: { asnCode: group.asnCode, rows: [...group.rows] },
+      clientId: clientIdOf(group.rows[0]!.client),
+      clientRequired: false,
+    }));
+  const resolved: { group: { asnCode: string; rows: AsnImportRow[] }; clientId: string | null; clientRequired: boolean }[] = [
+    ...explicit,
+  ];
   for (const blank of groups.filter((group) => group.rows[0]!.client === '')) {
-    const derived = [...new Set(blank.rows.map(skuClientOf).filter((id): id is string => id !== undefined))];
+    const known = blank.rows.map(skuClientsOf).filter((clients) => clients.length > 0);
+    // The clients holding EVERY known code of the blank rows.
+    const common =
+      known.length === 0 ? [] : [...new Set(known[0])].filter((id) => known.every((clients) => clients.includes(id)));
     const candidates = explicit.filter((entry) => entry.group.asnCode === blank.asnCode);
     if (candidates.length === 0) {
-      resolved.push({ group: { asnCode: blank.asnCode, rows: [...blank.rows] }, clientId: derived.length === 1 ? derived[0]! : null });
+      resolved.push({
+        group: { asnCode: blank.asnCode, rows: [...blank.rows] },
+        clientId: common.length === 1 ? common[0]! : null,
+        clientRequired: common.length > 1,
+      });
       continue;
     }
     const target =
-      candidates.find((entry) => entry.clientId !== null && derived.length === 1 && entry.clientId === derived[0]) ?? candidates[0]!;
+      candidates.find((entry) => entry.clientId !== null && common.includes(entry.clientId)) ?? candidates[0]!;
     target.group.rows.push(...blank.rows);
     target.group.rows.sort((a, b) => a.rowNumber - b.rowNumber);
     if (target.clientId === null) continue; // an unknown client: the ASN is refused for that already
     const named = target.group.rows.find((row) => row.client !== '')!;
     for (const row of blank.rows) {
-      const client = skuClientOf(row);
-      if (client !== undefined && client !== target.clientId) {
+      const clients = skuClientsOf(row);
+      if (clients.length > 0 && !clients.includes(target.clientId)) {
         errors.push(
           rowError(
             row.rowNumber,

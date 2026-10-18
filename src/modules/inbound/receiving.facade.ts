@@ -43,6 +43,8 @@ export interface GoodsReceiptEntry {
   /** Story 21-6 — present only on an ASN receipt. */
   readonly asnId?: string;
   readonly asnCode?: string;
+  /** Story 1-1 — the receipt's client; absent on an older receipt 0076 could not attribute. */
+  readonly clientId?: string;
   readonly blindReasonCode: string | null;
   readonly status: string;
   readonly recordedBy: string;
@@ -112,10 +114,18 @@ export interface CatalogSnapshot {
      * `ambient` (0035_storage_class.sql).
      */
     readonly storageClass: string;
+    /**
+     * Story 1-1: the SKU's client — code and barcode are unique per (tenant,
+     * client), so the device resolves within the document's client. Fifth
+     * mirror of the `SkuSummary` arm.
+     */
+    readonly clientId: string;
   }[];
   readonly openPurchaseOrders: readonly {
     readonly id: string;
     readonly code: string;
+    /** Story 1-1 — the PO's client. */
+    readonly clientId: string;
     readonly warehouseId: string;
     readonly vendorId: string;
     readonly lines: readonly PurchaseOrderLineSnapshot[];
@@ -249,6 +259,7 @@ export class ReceivingFacade {
           poId: goodsReceiptNotes.poId,
           asnId: goodsReceiptNotes.asnId,
           asnCode: advanceShipmentNotices.asnCode,
+          clientId: goodsReceiptNotes.clientId,
           blindReasonCode: goodsReceiptNotes.blindReasonCode,
           status: goodsReceiptNotes.status,
           recordedBy: goodsReceiptNotes.recordedBy,
@@ -317,12 +328,14 @@ export class ReceivingFacade {
             );
       const items = rows.map((full) => {
         // `createdAtText` is the cursor-only projection — never in the body.
-        const { createdAtText, asnId, asnCode, ...row } = full;
+        const { createdAtText, asnId, asnCode, clientId, ...row } = full;
         void createdAtText;
         return {
         ...row,
         // Story 21-6: present only on an ASN receipt.
         ...(asnId === null ? {} : { asnId, ...(asnCode === null ? {} : { asnCode }) }),
+        // Story 1-1: absent on an older receipt the backfill left unattributed.
+        ...(clientId === null ? {} : { clientId }),
         lineCount: aggregates.get(row.id)?.lineCount ?? 0,
         // int8 arrives as text through postgres.js; the contract is a number.
         // Story 10.1: and a read-model number is in BASE units, not the
@@ -434,6 +447,8 @@ export class ReceivingFacade {
         .select({
           id: purchaseOrders.id,
           code: purchaseOrders.code,
+          // Story 1-1 — the device resolves an unmatched scan within it.
+          clientId: purchaseOrders.clientId,
           warehouseId: purchaseOrders.warehouseId,
           vendorId: purchaseOrders.vendorId,
         })
@@ -517,6 +532,7 @@ export class ReceivingFacade {
         openPurchaseOrders: poRows.map((po) => ({
           id: po.id,
           code: po.code,
+          clientId: po.clientId,
           warehouseId: po.warehouseId,
           vendorId: po.vendorId,
           lines: linesByPo.get(po.id) ?? [],

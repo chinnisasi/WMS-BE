@@ -868,7 +868,7 @@ describe('catalog (e2e)', () => {
     expect(skuA).toBeTruthy();
     expect(skuB).toBeTruthy();
     // Both pre-checks pass (neither SKU carries the barcode yet), so the race
-    // is decided by the skus_tenant_id_barcode_unique constraint — the loser's
+    // is decided by the skus_tenant_client_barcode_unique constraint — the loser's
     // UPDATE must surface as the mapped 409, never a raw 500.
     const settled = await Promise.allSettled([
       patchSku(token, tenantId, skuA!.id, { barcode: 'RACE-BARCODE' }),

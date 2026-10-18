@@ -597,7 +597,13 @@ describe('story 21-2b: client admin and attribution', () => {
         expectProblem(await importCsv(['NOPE-2,Nope,pcs,1800,,,'], { clientId: otherTenant.clientId }), 404, 'not-found');
       });
 
-      it('an import for ACME stamps its SKUs and records ACME on the run; an existing code names its owner client', async () => {
+      // Story 1-1 — this test pinned 21-2b's TENANT-wide uniqueness (ACME
+      // importing the self client's `SELF-A` was a duplicate naming its owner).
+      // Codes are now unique per (tenant, client): another client's code is
+      // not a duplicate (the cross-client arm is pinned in
+      // `test/per-client-sku.spec.ts`), so the duplicate arm here is ACME's
+      // OWN code, and the detail names THIS client's catalog.
+      it('an import for ACME stamps its SKUs and records ACME on the run; ACME\'s own existing code is a duplicate naming its catalog', async () => {
         const res = await importCsv(
           [
             'ACME-A,Acme A,pcs,1800,,,',
@@ -606,14 +612,18 @@ describe('story 21-2b: client admin and attribution', () => {
             'ACME-D,Acme D,pcs,1800,,,',
             'ACME-E,Acme E,pcs,1800,,,',
             'ACME-F,Acme F,pcs,1800,,,',
-            'SELF-A,Clash,pcs,1800,,,',
           ],
           { clientId: acmeId },
         ).expect(201);
-        expect(res.body).toMatchObject({ committedRows: 6, failedRows: 1, clientId: acmeId });
-        expect(res.body.errors[0]).toMatchObject({ skuCode: 'SELF-A', code: 'duplicate-sku-code' });
+        expect(res.body).toMatchObject({ committedRows: 6, failedRows: 0, clientId: acmeId });
+        const clash = await importCsv(['ACME-A,Clash,pcs,1800,,,'], { clientId: acmeId }).expect(201);
+        expect(clash.body).toMatchObject({ committedRows: 0, failedRows: 1, clientId: acmeId });
+        expect(clash.body.errors[0]).toMatchObject({ skuCode: 'ACME-A', code: 'duplicate-sku-code' });
+        expect(clash.body.errors[0].detail).toContain("already exists in this client's catalog (client ACME)");
         // The tenant's own client is named as the company, never `self`.
-        expect(res.body.errors[0].detail).toContain(`(client ${tenantName} (your company))`);
+        const selfClash = await importCsv(['SELF-A,Clash,pcs,1800,,,'], { clientId: selfClientId }).expect(201);
+        expect(selfClash.body.errors[0]).toMatchObject({ skuCode: 'SELF-A', code: 'duplicate-sku-code' });
+        expect(selfClash.body.errors[0].detail).toContain(`(client ${tenantName} (your company))`);
         await refreshSkus();
         for (const code of ['ACME-A', 'ACME-B', 'ACME-C', 'ACME-D', 'ACME-E', 'ACME-F']) {
           expect(await skuClient(code)).toBe(acmeId);
@@ -635,23 +645,32 @@ describe('story 21-2b: client admin and attribution', () => {
         expect(await skuClient('SELF-D')).toBe(selfClientId);
       });
 
-      it('fix mode inherits the original run\'s client; naming a different client is 400', async () => {
+      // Story 1-1 — this test pinned that a corrected row never lands under a
+      // different client than its first attempt (21-2b decision 3). Fix mode's
+      // "latest run" is now the latest run OF THE NAMED CLIENT, so naming
+      // another client targets THAT client's fix set — ACME's failed row is
+      // not in it and is skipped, never imported under the other client. The
+      // pinned property holds by construction; the 400 arm is gone.
+      it('fix mode inherits the original run\'s client; naming a different client fixes that client\'s run, never this row', async () => {
         // The original ACME run: one row fails (a bad gst rate).
         const first = await importCsv(['ACME-FIX,Acme fix,pcs,999999,,,'], { clientId: acmeId }).expect(201);
         expect(first.body.failedRows).toBe(1);
-        expectProblem(
-          await importCsv(['ACME-FIX,Acme fix,pcs,1800,,,'], { mode: 'fix', clientId: selfClientId }),
-          400,
-          'validation-failed',
-        );
+        // Omitting clientId inherits the latest run's client (ACME).
         const fixed = await importCsv(['ACME-FIX,Acme fix,pcs,1800,,,'], { mode: 'fix' }).expect(201);
         expect(fixed.body).toMatchObject({ committedRows: 1, clientId: acmeId });
         await refreshSkus();
         expect(await skuClient('ACME-FIX')).toBe(acmeId);
-        // Naming the SAME client is fine.
         const again = await importCsv(['ACME-FIX2,x,pcs,999999,,,'], { clientId: acmeId }).expect(201);
         expect(again.body.failedRows).toBe(1);
-        await importCsv(['ACME-FIX2,x,pcs,1800,,,'], { mode: 'fix', clientId: acmeId }).expect(201);
+        // Naming ANOTHER client fixes that client's latest run: ACME's failed
+        // row is skipped, never imported under the self client.
+        const elsewhere = await importCsv(['ACME-FIX2,x,pcs,1800,,,'], { mode: 'fix', clientId: selfClientId }).expect(201);
+        expect(elsewhere.body).toMatchObject({ committedRows: 0, skippedRows: 1, clientId: selfClientId });
+        expect(await sql`select 1 from skus where tenant_id = ${tenantId} and code = 'ACME-FIX2'`).toHaveLength(0);
+        // Naming the SAME client fixes its own run, even after another
+        // client's later run.
+        const own = await importCsv(['ACME-FIX2,x,pcs,1800,,,'], { mode: 'fix', clientId: acmeId }).expect(201);
+        expect(own.body).toMatchObject({ committedRows: 1, clientId: acmeId });
       });
 
       it('the fingerprint is unchanged when clientId is absent, and carries it when present (golden)', async () => {

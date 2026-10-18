@@ -13,6 +13,7 @@ import {
   stockOnHand,
   zones,
 } from '../../shared/db/schema';
+import { skuCodeLabelsInTx } from '../clients/clients.facade';
 import { uuidv7 } from '../../shared/primitives/ids';
 import {
   MAX_QUANTITY_BASE,
@@ -731,6 +732,8 @@ export class BinCommand {
             skuId: stockOnHand.skuId,
             quantity: stockOnHand.quantity,
             skuCode: skus.code,
+            // Story 1-1 — the client labels a refusal that names codes.
+            clientId: skus.clientId,
             batchTracked: skus.batchTracked,
             serialTracked: skus.serialTracked,
             // Story 11-5: the attributes the target's weight/volume gates and
@@ -808,8 +811,17 @@ export class BinCommand {
           );
           const movedSkuIds = [...new Set(onHandRows.map((row) => row.skuId))];
           if (!bulkAssetOccupancyHolds(target.type, movedSkuIds, holdingSkus.map((o) => o.skuId))) {
-            const holding = [...new Set(holdingSkus.map((o) => o.skuCode))];
-            const moving = [...new Set(onHandRows.map((row) => row.skuCode))];
+            // Story 1-1 — codes are per client: each is labelled with its client.
+            const holding = await skuCodeLabelsInTx(
+              tx,
+              command.tenantId,
+              holdingSkus.map((o) => ({ code: o.skuCode, clientId: o.clientId })),
+            );
+            const moving = await skuCodeLabelsInTx(
+              tx,
+              command.tenantId,
+              onHandRows.map((row) => ({ code: row.skuCode, clientId: row.clientId })),
+            );
             throw binOccupancyConflict(
               `Merge refused — bin "${target.code}" is a ${target.type} (a bulk asset holds exactly ONE SKU): ` +
                 (holding.length > 0

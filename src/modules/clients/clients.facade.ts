@@ -88,6 +88,27 @@ export class ClientsFacade {
     return withTenantTransaction(this.db, tenantId, (tx) => listClientsInTx(tx, tenantId));
   }
 
+  /**
+   * Story 1-1 — the device catalog snapshot's `clients` arm: the named
+   * clients (every client a SKU or an open document of the snapshot
+   * references), `{id, code, name, active}`, in the `listClients` order. An
+   * id the tenant does not hold is absent. A read in its own transaction —
+   * the api shell composes it beside the other arms, never nested.
+   */
+  async snapshotClients(
+    tenantId: string,
+    clientIds: readonly string[],
+  ): Promise<{ id: string; code: string; name: string; active: boolean }[]> {
+    const wanted = new Set(clientIds);
+    if (wanted.size === 0) {
+      return [];
+    }
+    const all = await this.listClients(tenantId);
+    return all
+      .filter((client) => wanted.has(client.id))
+      .map((client) => ({ id: client.id, code: client.code, name: client.name, active: client.status === 'active' }));
+  }
+
   /** Story 21-7 — `GET …/portal/me` (see `portalMeIn`). */
   async portalMe(tenantId: string, userId: string, clientId: string): Promise<PortalMe> {
     return portalMeIn(this.db, tenantId, userId, clientId);
@@ -271,6 +292,31 @@ export async function getClientLabelsInTx(
     .from(clients)
     .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, distinct)));
   return new Map(rows.map((row) => [row.id, clientLabel(row)]));
+}
+
+/**
+ * Story 1-1 — operator-facing SKU code labels for a refusal that lists codes.
+ * A SKU code is unique per (tenant, client) only, so once the tenant holds
+ * more than one client each code is labelled `CODE (client)`; a one-client
+ * tenant reads the bare code, as before. Distinct, in input order.
+ */
+export async function skuCodeLabelsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  refs: readonly { readonly code: string; readonly clientId: string }[],
+): Promise<string[]> {
+  if (refs.length === 0) {
+    return [];
+  }
+  const all = await tx
+    .select({ id: clients.id, code: clients.code, name: clients.name, systemOwned: clients.systemOwned })
+    .from(clients)
+    .where(eq(clients.tenantId, tenantId));
+  const labels = new Map(all.map((row) => [row.id, clientLabel(row)]));
+  const out = refs.map((ref) =>
+    all.length > 1 ? `${ref.code} (${labels.get(ref.clientId) ?? ref.clientId})` : ref.code,
+  );
+  return [...new Set(out)];
 }
 
 /** One client's refusal label (see `getClientLabelsInTx`). */

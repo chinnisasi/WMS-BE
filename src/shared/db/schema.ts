@@ -666,10 +666,13 @@ export type IdempotencyKeyRow = typeof idempotencyKeys.$inferSelect;
 
 /**
  * Sellable units (Story 1.4 — the first catalog module tables; the module
- * owns these exclusively). Codes are unique per tenant — duplicate imports
- * are row-level rejections naming the code, never a silent merge. Barcodes
- * are unique per tenant too; a barcode resolving to two SKUs is a row-level
- * rejection naming the conflicting SKU. `barcode` is generated server-side at
+ * owns these exclusively). Codes are unique per (tenant, client) since
+ * story 1-1 (0076) — two client brands may both own `TSHIRT-M`; one client's
+ * duplicate import is a row-level rejection naming the code, never a silent
+ * merge. Barcodes are unique per (tenant, client) too (two brands may sell
+ * the same GTIN); a barcode resolving to two SKUs of one client is a
+ * row-level rejection naming the conflicting SKU. A scan resolves on the
+ * handheld through the work's own SKUs, then the document's client. `barcode` is generated server-side at
  * entry (uuidv7-derived) unless the import/edit supplies one. GST is stored
  * as basis points (integer); `reorderPoint`/`reorderQty` are base-UoM integer
  * defaults. No price/cost fields (spec 1.4 boundary). SKU code is immutable —
@@ -801,8 +804,16 @@ export const skus = pgTable(
     ...tenantTimestamps,
   },
   (table) => [
-    uniqueIndex('skus_tenant_id_code_unique').on(table.tenantId, table.code),
-    uniqueIndex('skus_tenant_id_barcode_unique').on(table.tenantId, table.barcode),
+    // Story 1-1 (0076) — code and barcode are unique per (tenant, client).
+    uniqueIndex('skus_tenant_client_code_unique').on(table.tenantId, table.clientId, table.code),
+    uniqueIndex('skus_tenant_client_barcode_unique').on(
+      table.tenantId,
+      table.clientId,
+      table.barcode,
+    ),
+    // Story 1-1 — the code lookups that run without a client (an ASN import
+    // row whose client is not yet settled, a catalog read by code).
+    index('skus_tenant_code_idx').on(table.tenantId, table.code),
     index('skus_created_at_id_idx').on(table.createdAt, table.id),
     index('skus_tenant_id_idx').on(table.tenantId),
     // Story 11.3 — the product list's skuCount and the SKU list's productId
@@ -2060,6 +2071,15 @@ export const goodsReceiptNotes = pgTable(
      * reason): `goods_receipt_notes_blind_pairing`, widened by 0064, enforces it.
      */
     asnId: uuid('asn_id'),
+    /**
+     * Story 1-1 — the client whose goods this receipt booked: the PO's or the
+     * ASN's client, or a blind receipt's chosen (or, from an older build,
+     * derived) client. Nullable with NO CHECK: older blind receipts could mix
+     * clients, so history cannot satisfy one; the command stamps every new
+     * row (pinned by `test/per-client-sku.spec.ts`). 0076 backfilled the
+     * single-client older rows.
+     */
+    clientId: uuid('client_id'),
     blindReasonCode: text('blind_reason_code'),
     status: text('status').notNull().default('recorded'),
     deviceId: uuid('device_id').notNull(),

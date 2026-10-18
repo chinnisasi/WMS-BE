@@ -533,6 +533,13 @@
       "when": 1792323756622,
       "tag": "0075_second_factor",
       "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "7",
+      "when": 1792337102701,
+      "tag": "0076_per_client_sku_identity",
+      "breakpoints": true
     }
   ]
 }

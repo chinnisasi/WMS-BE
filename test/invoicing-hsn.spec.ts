@@ -397,6 +397,17 @@ describe('invoicing: the HSN summary (e2e, story 8-2a)', () => {
         values (${uuidv7()}, ${tenantId}, ${id}, ${lineIds[i]!}, ${l.sku}, ${l.sku}, ${l.hsn}, ${l.qtyMilli}, 0, 'manual',
           ${l.taxable}, ${l.gstBps}, ${l.cgst ?? 0}, ${l.sgst ?? 0}, ${l.igst ?? 0}, ${l.hsn === null}, ${l.uom})
       `;
+      // Story 1-1 — the issue-line hint is read BY SKU, through the line's
+      // order line (a SKU code is unique per client only). A real invoice
+      // line always names a real order line, so the fixture writes one for
+      // every catalog SKU it names (the order itself is not needed).
+      const skuId = skuIds.get(l.sku);
+      if (skuId !== undefined) {
+        await sql`
+          insert into order_lines (id, tenant_id, order_id, sku_id, qty)
+          values (${lineIds[i]!}, ${tenantId}, ${uuidv7()}, ${skuId}, ${l.qtyMilli})
+        `;
+      }
     }
   }
 

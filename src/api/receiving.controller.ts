@@ -12,6 +12,7 @@ import { ReceivingFacade } from '../modules/inbound/receiving.facade';
 import { OutboundFacade } from '../modules/outbound/outbound.facade';
 import { QcFacade } from '../modules/inbound/qc.facade';
 import { MovementsFacade } from '../modules/movements/transfer.facade';
+import { ClientsFacade } from '../modules/clients/clients.facade';
 import { ReturnsFacade } from '../modules/returns/returns.facade';
 // Constructor params are types here but must stay value imports: Nest
 // decorator metadata needs the runtime class tokens (eslint rule bends).
@@ -70,6 +71,9 @@ export class ReceivingController {
     // Story 13-2: the snapshot's `openReturns` arm — the same composition
     // (the returns module is imported only by the api shell).
     @Inject(ReturnsFacade) private readonly returns: ReturnsFacade,
+    // Story 1-1: the snapshot's `clients` arm — read through the clients
+    // facade (inbound does not own the table), composed here like the others.
+    @Inject(ClientsFacade) private readonly clients: ClientsFacade,
   ) {}
 
   @Post(':tenantId/receiving/goods-receipts')
@@ -88,10 +92,10 @@ export class ReceivingController {
     description:
       'GRN recorded: server-assigned code, per-line physical/applied/excess quantities, ledger events for the applied portion (the idempotency snapshot). Story 21-9: a receipt against a closed PO or a cancelled/closed ASN is no longer refused — every line pends as an over-receipt against that document (applied 0); a closed PO with an open carried successor is booked against the successor instead (poId/poCode name it)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body (validation-failed) — story 1-1: a clientId beside a poId or an asnId') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or the operator was demoted to accountant (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, purchase order, advance shipment notice, or a line\'s SKU does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, purchase order, advance shipment notice, a blind receipt\'s client (story 1-1), or a line\'s SKU does not exist in this tenant (not-found)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('The document belongs to another warehouse (document-warehouse-mismatch — checked before the document\'s status, so a closed or cancelled document of another warehouse answers this too), the document has a status receiving does not know (po-not-open / asn-not-open — DEFENSIVE since story 21-9: a closed PO or a cancelled/closed ASN no longer refuses, the receipt pends for approval), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
@@ -118,6 +122,8 @@ export class ReceivingController {
         // when present, so the two spellings hash identically).
         asnId: dto.asnId ?? null,
         blindReasonCode: dto.blindReasonCode ?? null,
+        // Story 1-1: absent stays absent (hashed only when present).
+        ...(dto.clientId === undefined ? {} : { clientId: dto.clientId }),
         occurredAt: dto.occurredAt,
         lines: dto.lines.map((line) => ({
           poLineId: line.poLineId ?? null,
@@ -204,6 +210,15 @@ export class ReceivingController {
     // partially received RMAs. A plain facade call in its own transaction,
     // composed beside the task lists (never nested).
     const openReturns = await this.returns.getOpenReturns(tenantId, query.warehouseId);
+    // Story 1-1: every client a SKU or an open document references — the
+    // names the device shows when a scan is another client's, and the blind
+    // receipt's picker. Same sequential composition.
+    const clients = await this.clients.snapshotClients(tenantId, [
+      ...snapshot.skus.map((sku) => sku.clientId),
+      ...snapshot.openPurchaseOrders.map((po) => po.clientId),
+      ...snapshot.openAsns.map((asn) => asn.clientId),
+      ...openReturns.map((rma) => rma.clientId),
+    ]);
     return {
       ...snapshot,
       pickTasks: pickTasks.map((task) => ({ ...task })),
@@ -215,6 +230,7 @@ export class ReceivingController {
         ...rma,
         lines: rma.lines.map((line) => ({ ...line, batchCodes: [...line.batchCodes], serials: line.serials.map((serial) => ({ ...serial })) })),
       })),
+      clients,
     };
   }
 
