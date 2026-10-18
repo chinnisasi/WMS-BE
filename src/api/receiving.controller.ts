@@ -155,6 +155,10 @@ export class ReceivingController {
       },
       key,
     );
+    // Story 1-1 (decision 6): every line client-refused → no receipt.
+    if (snapshot.goodsReceipt === null) {
+      return { goodsReceipt: null, refusedReceipt: { ...snapshot.refusedReceipt } };
+    }
     return { goodsReceipt: { ...snapshot.goodsReceipt } };
   }
 

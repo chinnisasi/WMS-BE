@@ -23,6 +23,7 @@ import type {
   DecideOverReceiptCommand,
   GoodsReceiptSnapshot,
   OverReceiptDecisionSnapshot,
+  RefusedReceiptSnapshot,
   SubmitGoodsReceiptCommand,
 } from './receiving.command';
 import { CatalogFacade } from '../catalog/catalog.facade';
@@ -222,7 +223,7 @@ export class ReceivingFacade {
   async submitGoodsReceipt(
     command: SubmitGoodsReceiptCommand,
     idempotencyKey: string,
-  ): Promise<GoodsReceiptSnapshot> {
+  ): Promise<GoodsReceiptSnapshot | RefusedReceiptSnapshot> {
     return this.receiving.submitGoodsReceipt(command, idempotencyKey);
   }
 

@@ -18,7 +18,7 @@ import {
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { createHash } from 'node:crypto';
 import { recordServerRejectedOpInTx } from '../tenancy/server-rejected-op';
-import { assertClientInTenantInTx, getClientLabelsInTx } from '../clients/clients.facade';
+import { getClientLabelsInTx, shareLockClientInTx } from '../clients/clients.facade';
 import {
   MAX_QUANTITY_MILLI,
   QUANTITY_SCALE,
@@ -243,6 +243,23 @@ export interface GoodsReceiptSnapshot {
   };
 }
 
+/**
+ * Story 1-1 (decision 6) — the answer when EVERY line of a blind receipt was
+ * client-refused: no receipt was recorded (no GRN code, no row, no event);
+ * the lines went to review. The op still settles 201.
+ */
+export interface RefusedReceiptSnapshot {
+  readonly goodsReceipt: null;
+  readonly refusedReceipt: {
+    readonly warehouseId: string;
+    readonly clientId: string;
+    readonly blindReasonCode: string | null;
+    readonly occurredAt: string;
+    readonly rejectedLines: readonly RejectedGrnLine[];
+    readonly reviewOpId: string;
+  };
+}
+
 /** One pending/decided over-receipt of the Conflicts & Reviews surface. */
 export interface OverReceiptEntry {
   readonly id: string;
@@ -365,7 +382,7 @@ export class ReceivingCommand {
   async submitGoodsReceipt(
     command: SubmitGoodsReceiptCommand,
     idempotencyKey: string,
-  ): Promise<GoodsReceiptSnapshot> {
+  ): Promise<GoodsReceiptSnapshot | RefusedReceiptSnapshot> {
     // ── story 10.2: this fingerprint is over BASE units ────────────────────
     // Conversion moved out of the controller and into the command, behind the
     // replay lookup, so the hashed value changed with it: a key written by a
@@ -461,7 +478,7 @@ export class ReceivingCommand {
         if (existing[0].payloadHash !== payloadHash) {
           throw idempotencyKeyReuse();
         }
-        return existing[0].responseSnapshot as GoodsReceiptSnapshot;
+        return existing[0].responseSnapshot as GoodsReceiptSnapshot | RefusedReceiptSnapshot;
       }
 
       // ── input validation (400 before any write) ────────────────────────
@@ -526,6 +543,46 @@ export class ReceivingCommand {
         inputLines.map((line) => line.skuId),
       );
 
+      // ── story 1-1: a BLIND receipt that names its client ────────────────
+      // The client must exist (404) and be active (409 `client-not-active`,
+      // read under `FOR SHARE` so a suspend cannot commit in between). A line
+      // whose SKU belongs to another client is refused PER LINE
+      // (`sku-client-mismatch`, §7g): it is split off HERE, before every
+      // per-line rule below (kit, catch weight, precision, batch identity),
+      // so a refused line can never fail the whole op. An op WITHOUT
+      // `clientId` (an older build — decision 7) refuses nothing for client.
+      // A PO or ASN receipt refuses nothing for client either (decision 4).
+      const clientRefused: { index: number; line: GrnLineInput }[] = [];
+      let namedBlindClientId: string | null = null;
+      let clientLabels = new Map<string, string>();
+      if (blindReasonCode !== null && requestedClientId !== null) {
+        const client = await shareLockClientInTx(tx, command.tenantId, requestedClientId);
+        if (client.status !== 'active') {
+          throw new ProblemException(
+            'client-not-active',
+            409,
+            'The client is not active',
+            `Client ${client.code} is ${client.status} — a blind receipt cannot be booked to it.`,
+          );
+        }
+        namedBlindClientId = requestedClientId;
+        for (const [index, line] of inputLines.entries()) {
+          if (skuById.get(line.skuId)!.clientId !== requestedClientId) {
+            clientRefused.push({ index, line });
+          }
+        }
+        if (clientRefused.length > 0) {
+          clientLabels = await getClientLabelsInTx(tx, command.tenantId, [
+            requestedClientId,
+            ...clientRefused.map((entry) => skuById.get(entry.line.skuId)!.clientId),
+          ]);
+        }
+      }
+      const refusedIndexes = new Set(clientRefused.map((entry) => entry.index));
+      /** The request index of each receivable line (unmatchedLines name request indexes). */
+      const receivableIndexes = inputLines.map((_, index) => index).filter((index) => !refusedIndexes.has(index));
+      const receivableInput = receivableIndexes.map((index) => inputLines[index]!);
+
       // ── story 11.4: a kit SKU never receives stock (FR-38) ──────────────
       // A kit's stock IS its components' — a GRN line against a kit SKU
       // would invent independent stock the explosion never sees. The
@@ -534,7 +591,7 @@ export class ReceivingCommand {
       const kitSkuIds = await this.catalog.getKitSkuIdsInTx(
         tx,
         command.tenantId,
-        inputLines.map((line) => line.skuId),
+        receivableInput.map((line) => line.skuId),
       );
       if (kitSkuIds.length > 0) {
         throw kitCannotHoldStock(
@@ -549,7 +606,7 @@ export class ReceivingCommand {
       // every other SKU must carry none. Both directions fail CLOSED — a
       // weight list silently ignored on a non-catch-weight SKU would be a
       // weight the operator recorded and the system threw away.
-      for (const line of inputLines) {
+      for (const line of receivableInput) {
         const sku = skuById.get(line.skuId)!;
         if (sku.catchWeightTracked) {
           if (sku.serialTracked) {
@@ -577,13 +634,60 @@ export class ReceivingCommand {
       // Behind the replay lookup and with each line's unit in hand. Below
       // this point every quantity is milli-units; `command.lines` is not read
       // for a quantity again.
-      const lines: readonly GrnLineInput[] = inputLines.map((line) => {
+      const lines: readonly GrnLineInput[] = receivableInput.map((line) => {
         const uom = skuById.get(line.skuId)!.uom;
         return {
           ...line,
           qty: assertRecordableQuantity(line.qty, 'qty', uom, uomPrecision(uom)),
         };
       });
+
+      // ── story 1-1 (decision 6): EVERY line client-refused → no receipt ──
+      // No GRN code is consumed, no `goods_receipt_notes` row, no
+      // `grn.recorded` event: every line goes to review as
+      // `sku-client-mismatch` (the `grn.lines-refused` row), and the op
+      // settles 201 with `{goodsReceipt: null, refusedReceipt}`.
+      if (lines.length === 0 && namedBlindClientId !== null) {
+        const rejectedLines = this.clientRefusalLines(clientRefused, skuById, clientLabels, namedBlindClientId);
+        const review = await this.raiseClientRefusalReviewInTx(tx, command, idempotencyKey, {
+          grnId: null,
+          grnCode: null,
+          clientId: namedBlindClientId,
+          clientLabels,
+          blindReasonCode,
+          occurredAt,
+          clientRefused,
+          skuById,
+        });
+        const refusedSnapshot: RefusedReceiptSnapshot = {
+          goodsReceipt: null,
+          refusedReceipt: {
+            warehouseId: command.warehouseId,
+            clientId: namedBlindClientId,
+            blindReasonCode,
+            occurredAt,
+            rejectedLines,
+            reviewOpId: review.reviewOpId,
+          },
+        };
+        // The audit row targets the review row: nothing else was written.
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.operatorUserId,
+          action: 'goods_receipt.submitted',
+          targetType: 'rejected_op',
+          targetId: review.rejectedOpId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+        await tx
+          .update(devices)
+          .set({ lastSeenAt: nowIso(), updatedAt: nowIso() })
+          .where(eq(devices.id, command.deviceId));
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, refusedSnapshot);
+        return refusedSnapshot;
+      }
 
       // ── the receiving bin (tenancy-owned master data) ───────────────────
       const receivingBin = await ensureReceivingBinInTx(tx, command.tenantId, command.warehouseId);
@@ -690,36 +794,24 @@ export class ReceivingCommand {
           .for('update');
       }
 
-      // ── story 1-1: the receipt's client, and the blind per-line rule ────
-      // After the document lock, warehouse and status (the client is known
-      // only once the document is in hand); before the batch identity, so a
-      // refused line creates no batch on another client's SKU. A PO or an
-      // ASN receipt takes its document's client and refuses nothing here
-      // (decision 4 — another client's SKU arriving on a document still
-      // books unmatched to its own client's ledger, 21-6). A BLIND receipt
-      // is the named client's, or — from an older build that names none —
-      // its first line's SKU's client; a line whose SKU belongs to another
-      // client is refused PER LINE (`sku-client-mismatch`, §7g), the rest
-      // settles.
-      let receiptClientId: string;
-      const clientRefused: { index: number; line: GrnLineInput }[] = [];
+      // ── story 1-1: the receipt's client ────────────────────────────────
+      // After the document lock, warehouse and status (the document's client
+      // is known only once it is in hand). A PO or ASN receipt takes its
+      // document's client; a blind receipt the named client (split above),
+      // or — an older build naming none (decision 7) — the single client of
+      // its lines, else null (mixed lines each book to their own client).
+      let receiptClientId: string | null;
       if (po !== null) {
         receiptClientId = po.clientId;
       } else if (asn !== null) {
         receiptClientId = asn.clientId;
+      } else if (namedBlindClientId !== null) {
+        receiptClientId = namedBlindClientId;
       } else {
-        if (requestedClientId !== null) {
-          await assertClientInTenantInTx(tx, command.tenantId, requestedClientId);
-        }
-        receiptClientId = requestedClientId ?? skuById.get(lines[0]!.skuId)!.clientId;
-        for (const [index, line] of lines.entries()) {
-          if (skuById.get(line.skuId)!.clientId !== receiptClientId) {
-            clientRefused.push({ index, line });
-          }
-        }
+        const lineClients = [...new Set(lines.map((line) => skuById.get(line.skuId)!.clientId))];
+        receiptClientId = lineClients.length === 1 ? lineClients[0]! : null;
       }
-      const refusedIndexes = new Set(clientRefused.map((entry) => entry.index));
-      const receivable = lines.filter((_, index) => !refusedIndexes.has(index));
+      const receivable = lines;
 
       // ── batch identity through the catalog interface (AD-6) ────────────
       // One ensure per batch-tracked SKU (idempotent per (tenant, sku, code));
@@ -782,28 +874,13 @@ export class ReceivingCommand {
       const documentLabel =
         po !== null ? `purchase order "${po.code}"` : asn !== null ? `advance shipment notice "${asn.asnCode}"` : '';
 
-      // Story 1-1 — the blind per-line client refusals, in request order.
-      const clientLabels =
-        clientRefused.length === 0
-          ? new Map<string, string>()
-          : await getClientLabelsInTx(tx, command.tenantId, [
-              receiptClientId,
-              ...clientRefused.map((entry) => skuById.get(entry.line.skuId)!.clientId),
-            ]);
-      for (const [index, input] of lines.entries()) {
-        if (refusedIndexes.has(index)) {
-          const sku = skuById.get(input.skuId)!;
-          rejected.push({
-            poLineId: null,
-            skuId: input.skuId,
-            qty: fromMilli(input.qty),
-            code: 'sku-client-mismatch',
-            reason:
-              `SKU "${sku.code}" belongs to client ${clientLabels.get(sku.clientId) ?? sku.clientId}, not this receipt's client ` +
-              `${clientLabels.get(receiptClientId) ?? receiptClientId} — receive it on a receipt for its own client.`,
-          });
-          continue;
-        }
+      // Story 1-1 — the blind per-line client refusals, in request order (a
+      // blind receipt has no other refusal, so the order is the request's).
+      if (namedBlindClientId !== null) {
+        rejected.push(...this.clientRefusalLines(clientRefused, skuById, clientLabels, namedBlindClientId));
+      }
+      for (const [receivableIndex, input] of lines.entries()) {
+        const index = receivableIndexes[receivableIndex]!;
         const identity = batchIdentity.get(`${input.skuId}:${input.batchCode}`) ?? null;
         const base = {
           input,
@@ -1144,48 +1221,19 @@ export class ReceivingCommand {
       // its op id DERIVED from the key and recorded in the snapshot, so a
       // replay re-serves it and inserts nothing. Discard only.
       let reviewOpId: string | null = null;
-      if (clientRefused.length > 0) {
-        reviewOpId = refusedGrnLinesOpId(idempotencyKey);
-        await recordServerRejectedOpInTx(tx, this.outbox, {
-          tenantId: command.tenantId,
-          deviceId: command.deviceId,
-          operatorUserId: command.operatorUserId,
-          opId: reviewOpId,
-          opType: 'grn.lines-refused',
-          problemCode: 'sku-client-mismatch',
-          problemDetail:
-            `${clientRefused.length} line(s) of goods receipt "${code}" were not booked — their SKUs belong to another client than ` +
-            `the receipt's (${clientLabels.get(receiptClientId) ?? receiptClientId}). Receive them again on a receipt for their own client.`,
-          payload: {
-            warehouseId: command.warehouseId,
+      if (clientRefused.length > 0 && namedBlindClientId !== null) {
+        reviewOpId = (
+          await this.raiseClientRefusalReviewInTx(tx, command, idempotencyKey, {
             grnId,
             grnCode: code,
-            clientId: receiptClientId,
-            clientLabel: clientLabels.get(receiptClientId) ?? receiptClientId,
+            clientId: namedBlindClientId,
+            clientLabels,
             blindReasonCode,
             occurredAt,
-            // The refused lines only (base units), aligned with `refusals`.
-            lines: clientRefused.map(({ line }) => ({
-              skuId: line.skuId,
-              batchCode: line.batchCode,
-              mfgDate: line.mfgDate,
-              qty: fromMilli(line.qty),
-              ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
-            })),
-            refusals: clientRefused.map(({ index, line }) => {
-              const sku = skuById.get(line.skuId)!;
-              return {
-                lineIndex: index,
-                skuId: sku.id,
-                skuCode: sku.code,
-                skuClientId: sku.clientId,
-                skuClientLabel: clientLabels.get(sku.clientId) ?? sku.clientId,
-                reason: 'sku-client-mismatch',
-              };
-            }),
-          },
-          occurredAt,
-        });
+            clientRefused,
+            skuById,
+          })
+        ).reviewOpId;
       }
 
       // ── the snapshot (the outbox payload and idempotency replay carry it) ─
@@ -1204,8 +1252,9 @@ export class ReceivingCommand {
           // GRN's snapshot is byte-identical to its pre-21-6 shape.
           ...(asn === null ? {} : { asnId: asn.id, asnCode: asn.asnCode }),
           // Story 1-1 — the receipt's client (absent from a pre-1-1 stored
-          // snapshot, which replays as stored).
-          clientId: receiptClientId,
+          // snapshot, which replays as stored, and from an older build's
+          // mixed-client blind receipt — decision 7).
+          ...(receiptClientId === null ? {} : { clientId: receiptClientId }),
           blindReasonCode,
           status: 'recorded',
           deviceId: command.deviceId,
@@ -1784,6 +1833,101 @@ export class ReceivingCommand {
       }
     }
     return result;
+  }
+
+  /** Story 1-1 — the `rejectedLines` entries of the client-refused lines (base units, as sent). */
+  private clientRefusalLines(
+    clientRefused: readonly { index: number; line: GrnLineInput }[],
+    skuById: Map<string, typeof skus.$inferSelect>,
+    clientLabels: ReadonlyMap<string, string>,
+    receiptClientId: string,
+  ): RejectedGrnLine[] {
+    return clientRefused.map(({ line }) => {
+      const sku = skuById.get(line.skuId)!;
+      return {
+        poLineId: null,
+        skuId: line.skuId,
+        qty: line.qty,
+        code: 'sku-client-mismatch',
+        reason:
+          `SKU "${sku.code}" belongs to client ${clientLabels.get(sku.clientId) ?? sku.clientId}, not this receipt's client ` +
+          `${clientLabels.get(receiptClientId) ?? receiptClientId} — receive it on a receipt for its own client.`,
+      };
+    });
+  }
+
+  /**
+   * Story 1-1 — ONE review row for a blind receipt's client-refused lines
+   * (§7g): server-raised through tenancy (inbound writes no rejected_ops
+   * row), its op id DERIVED from the key and recorded in the snapshot, so a
+   * replay re-serves it and inserts nothing. Discard only. `grnId` and
+   * `grnCode` are null when every line was refused (decision 6 — no receipt).
+   */
+  private async raiseClientRefusalReviewInTx(
+    tx: TenantTx,
+    command: SubmitGoodsReceiptCommand,
+    idempotencyKey: string,
+    args: {
+      readonly grnId: string | null;
+      readonly grnCode: string | null;
+      readonly clientId: string;
+      readonly clientLabels: ReadonlyMap<string, string>;
+      readonly blindReasonCode: string | null;
+      readonly occurredAt: string;
+      readonly clientRefused: readonly { index: number; line: GrnLineInput }[];
+      readonly skuById: Map<string, typeof skus.$inferSelect>;
+    },
+  ): Promise<{ reviewOpId: string; rejectedOpId: string }> {
+    const reviewOpId = refusedGrnLinesOpId(idempotencyKey);
+    const clientLabel = args.clientLabels.get(args.clientId) ?? args.clientId;
+    const rejectedOpId = await recordServerRejectedOpInTx(tx, this.outbox, {
+      tenantId: command.tenantId,
+      deviceId: command.deviceId,
+      operatorUserId: command.operatorUserId,
+      opId: reviewOpId,
+      opType: 'grn.lines-refused',
+      problemCode: 'sku-client-mismatch',
+      problemDetail:
+        (args.grnCode === null
+          ? `No goods receipt was recorded — all ${args.clientRefused.length} line(s) belong to another client than the receipt's (${clientLabel}).`
+          : `${args.clientRefused.length} line(s) of goods receipt "${args.grnCode}" were not booked — their SKUs belong to another client than the receipt's (${clientLabel}).`) +
+        ' Receive them again on a receipt for their own client.',
+      payload: {
+        warehouseId: command.warehouseId,
+        grnId: args.grnId,
+        grnCode: args.grnCode,
+        clientId: args.clientId,
+        clientLabel,
+        blindReasonCode: args.blindReasonCode,
+        occurredAt: args.occurredAt,
+        // The refused lines only (base units, as sent), aligned with `refusals`.
+        lines: args.clientRefused.map(({ line }) => ({
+          skuId: line.skuId,
+          batchCode: line.batchCode,
+          mfgDate: line.mfgDate,
+          qty: line.qty,
+          ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
+        })),
+        refusals: args.clientRefused.map(({ index, line }) => {
+          const sku = args.skuById.get(line.skuId)!;
+          return {
+            lineIndex: index,
+            skuId: sku.id,
+            skuCode: sku.code,
+            skuClientId: sku.clientId,
+            skuClientLabel: args.clientLabels.get(sku.clientId) ?? sku.clientId,
+            reason: 'sku-client-mismatch',
+          };
+        }),
+      },
+      occurredAt: args.occurredAt,
+    });
+    if (rejectedOpId === null) {
+      // The key is new (the replay lookup ran above), so its derived op id
+      // cannot exist — fail loudly rather than write an audit row with no target.
+      throw new Error(`grn.lines-refused review row ${reviewOpId} already existed for a new key`);
+    }
+    return { reviewOpId, rejectedOpId };
   }
 
   /**

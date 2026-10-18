@@ -320,7 +320,8 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
   // aligned with `refusals`.
   'grn.lines-refused': [
     ['warehouseId', 'uuid'],
-    ['grnId', 'uuid'],
+    // Null when every line was refused — no receipt was recorded (decision 6).
+    ['grnId', 'uuid-or-null'],
     ['grnCode', 'string-or-null'],
     ['clientId', 'uuid'],
     ['lines', 'array'],

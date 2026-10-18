@@ -33934,11 +33934,73 @@
           "lines"
         ]
       },
+      "RefusedReceiptDto": {
+        "type": "object",
+        "properties": {
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The client the blind receipt named"
+          },
+          "blindReasonCode": {
+            "type": "string",
+            "enum": [
+              "unannounced-delivery",
+              "po-not-found",
+              "other",
+              null
+            ],
+            "nullable": true
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Device time of the receipt (ISO-8601 UTC)"
+          },
+          "rejectedLines": {
+            "description": "Every request line, each `sku-client-mismatch`",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RejectedGrnLineDto"
+            }
+          },
+          "reviewOpId": {
+            "type": "string",
+            "description": "The op id of the review row (`grn.lines-refused`, Discard only)"
+          }
+        },
+        "required": [
+          "warehouseId",
+          "clientId",
+          "blindReasonCode",
+          "occurredAt",
+          "rejectedLines",
+          "reviewOpId"
+        ]
+      },
       "GoodsReceiptResponse": {
         "type": "object",
         "properties": {
           "goodsReceipt": {
-            "$ref": "#/components/schemas/GoodsReceiptDto"
+            "nullable": true,
+            "description": "The recorded GRN. Story 1-1 (decision 6): null when every line of a blind receipt was refused `sku-client-mismatch` — no receipt was recorded (no GRN code consumed); `refusedReceipt` then says what went to review",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GoodsReceiptDto"
+              }
+            ]
+          },
+          "refusedReceipt": {
+            "description": "Story 1-1 — present only when goodsReceipt is null",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RefusedReceiptDto"
+              }
+            ]
           }
         },
         "required": [

@@ -355,9 +355,41 @@ export class GoodsReceiptDto {
   reviewOpId?: string;
 }
 
+/**
+ * Story 1-1 (decision 6) — a blind receipt whose EVERY line was refused
+ * `sku-client-mismatch`: no receipt was recorded; the lines went to review.
+ */
+export class RefusedReceiptDto {
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The client the blind receipt named' })
+  clientId!: string;
+
+  @ApiProperty({ enum: [...BLIND_REASON_ENUM, null], type: String, nullable: true })
+  blindReasonCode!: string | null;
+
+  @ApiProperty({ description: 'Device time of the receipt (ISO-8601 UTC)' })
+  occurredAt!: string;
+
+  @ApiProperty({ type: [RejectedGrnLineDto], description: 'Every request line, each `sku-client-mismatch`' })
+  rejectedLines!: readonly RejectedGrnLineDto[];
+
+  @ApiProperty({ description: 'The op id of the review row (`grn.lines-refused`, Discard only)' })
+  reviewOpId!: string;
+}
+
 export class GoodsReceiptResponse {
-  @ApiProperty({ type: GoodsReceiptDto })
-  goodsReceipt!: GoodsReceiptDto;
+  @ApiProperty({
+    type: GoodsReceiptDto,
+    nullable: true,
+    description:
+      'The recorded GRN. Story 1-1 (decision 6): null when every line of a blind receipt was refused `sku-client-mismatch` — no receipt was recorded (no GRN code consumed); `refusedReceipt` then says what went to review',
+  })
+  goodsReceipt!: GoodsReceiptDto | null;
+
+  @ApiProperty({ type: RefusedReceiptDto, required: false, description: 'Story 1-1 — present only when goodsReceipt is null' })
+  refusedReceipt?: RefusedReceiptDto;
 }
 
 /** One GRN header of the list read. */

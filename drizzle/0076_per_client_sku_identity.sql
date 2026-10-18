@@ -20,8 +20,11 @@
 -- `goods_receipt_notes.client_id` is a new NULLABLE column with no CHECK:
 -- older blind receipts could mix clients, so history cannot satisfy one. The
 -- receiving command stamps every new row. Older rows are backfilled below
--- from their lines' SKUs where those lines name exactly one client; mixed or
--- line-less older rows stay null and are listed by the notice.
+-- (decision 5) the way new rows are stamped: a PO receipt from its purchase
+-- order's client, an ASN receipt from its ASN's client, and only a BLIND
+-- receipt from its lines' SKUs where those lines name exactly one client;
+-- mixed or line-less blind rows (and a receipt whose document row is missing)
+-- stay null and are listed by the notice.
 DROP INDEX "skus_tenant_id_code_unique";--> statement-breakpoint
 DROP INDEX "skus_tenant_id_barcode_unique";--> statement-breakpoint
 ALTER TABLE "goods_receipt_notes" ADD COLUMN "client_id" uuid;--> statement-breakpoint
@@ -38,6 +41,18 @@ BEGIN
 	END IF;
 END $$;
 --> statement-breakpoint
+-- (decision 5) document receipts first: the document's client.
+UPDATE "goods_receipt_notes" g
+SET "client_id" = po."client_id"
+FROM "purchase_orders" po
+WHERE g."po_id" IS NOT NULL AND po."tenant_id" = g."tenant_id" AND po."id" = g."po_id";
+--> statement-breakpoint
+UPDATE "goods_receipt_notes" g
+SET "client_id" = asn."client_id"
+FROM "advance_shipment_notices" asn
+WHERE g."asn_id" IS NOT NULL AND asn."tenant_id" = g."tenant_id" AND asn."id" = g."asn_id";
+--> statement-breakpoint
+-- Blind receipts only: their lines' single client.
 UPDATE "goods_receipt_notes" g
 SET "client_id" = one."client_id"
 FROM (
@@ -47,10 +62,11 @@ FROM (
 	GROUP BY l."tenant_id", l."grn_id"
 	HAVING count(DISTINCT s."client_id") = 1
 ) one
-WHERE g."tenant_id" = one."tenant_id" AND g."id" = one."grn_id";
+WHERE g."po_id" IS NULL AND g."asn_id" IS NULL
+	AND g."tenant_id" = one."tenant_id" AND g."id" = one."grn_id";
 --> statement-breakpoint
 -- ── hand-amended: the notice — every older GRN left without a client ──────
--- Mixed-client or line-less receipts stay null (no CHECK; nothing reads the
+-- Mixed-client or line-less blind receipts stay null (no CHECK; nothing reads the
 -- column as required). Listed once so an operator can see them; never fatal.
 DO $$
 DECLARE

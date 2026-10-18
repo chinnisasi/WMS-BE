@@ -245,7 +245,11 @@ export class AsnImportCommand {
         const lines: { skuId: string; announcedQty: number }[] = [];
 
         // Row by row — first failure wins on a row (its cell refusals ran first).
-        for (const row of group.rows) {
+        // Story 1-1: an ASN whose client cannot be settled (`clientRequired`)
+        // has no client to resolve its codes in — it reports `client-required`
+        // only (below), never kit or precision refusals against an arbitrary
+        // holder's SKU.
+        for (const row of clientRequired ? [] : group.rows) {
           if (refusedRows.has(row.rowNumber)) continue;
           if (row.client !== '' && !clients.has(row.client.toUpperCase())) {
             refuse(row, 'unknown-client', `No client with code "${row.client}" exists in this tenant.`);
@@ -295,14 +299,14 @@ export class AsnImportCommand {
         groupErrors.push(...rowDisagreements(group, warehouseCode), ...repeatedSkus(group));
 
         // Client attribution over the SKUs that resolved — the create's rule.
-        const known = group.rows
+        const known = (clientRequired ? [] : group.rows)
           .map((row) => ({ row, sku: skuOf(row, clientId) }))
           .filter((entry): entry is { row: AsnImportRow; sku: SkuByCode } => entry.sku !== undefined);
         const subjectClients = [...new Set(known.map((entry) => entry.sku.clientId))];
         if (clientRequired) {
           // Story 1-1 — every code of this blank-client ASN is held by more
           // than one client: name the client in the file.
-          const holders = [...new Set(known.flatMap((entry) => (skus.get(entry.row.sku) ?? []).map((sku) => sku.clientId)))];
+          const holders = [...new Set(group.rows.flatMap((row) => (skus.get(row.sku) ?? []).map((sku) => sku.clientId)))];
           const holderLabels = await getClientLabelsInTx(tx, command.tenantId, holders);
           groupErrors.push(
             rowError(

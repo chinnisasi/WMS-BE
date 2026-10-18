@@ -341,7 +341,8 @@ export class ImportCommand {
         // Decision 3's up-front guards against a mis-attributed SKU (whose
         // client is fixed once it has history): a named client must exist
         // in this tenant (404); a fix-mode re-run INHERITS its original
-        // run's client, and naming a different one is a 400; with more
+        // run's client (story 1-1: naming a client selects THAT client's
+        // latest run above, so the run and the client always agree); with more
         // than one client and none named, there is no default to fall back
         // to — 400 `client-required`. The `self` client is the default only
         // while it is the tenant's only client.
@@ -356,16 +357,6 @@ export class ImportCommand {
         const label = (id: string): string => labels.get(id) ?? id;
         let clientId: string;
         if (latest[0] !== undefined) {
-          if (command.clientId !== undefined && command.clientId !== latest[0].clientId) {
-            throw new ProblemException(
-              'validation-failed',
-              400,
-              'A fix-mode re-run keeps its original client',
-              `The run being fixed imported for client ${label(latest[0].clientId)}; ` +
-                `a fix-mode re-run inherits it and cannot import for ${label(command.clientId)}. ` +
-                'Omit clientId (or name the same client), or start an initial import for the other client.',
-            );
-          }
           clientId = latest[0].clientId;
         } else if (command.clientId !== undefined) {
           clientId = command.clientId;
@@ -658,22 +649,36 @@ export class ImportCommand {
             ];
             // `for('update')`: the kit command's cycle lock — kit and
             // component rows, ordered by id, so a concurrent KitCommand or
-            // GRN on the same SKUs serializes behind this pass.
+            // GRN on the same SKUs serializes behind this pass. Story 1-1: a
+            // code may be held by several clients, and a kit cell names THIS
+            // run's client's SKUs — only those rows are locked.
             const referencedSkuRows = await tx
               .select({ id: skus.id, code: skus.code, uom: skus.uom, clientId: skus.clientId })
               .from(skus)
-              .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.code, referencedCodes)))
+              .where(
+                and(
+                  eq(skus.tenantId, command.tenantId),
+                  eq(skus.clientId, clientId),
+                  inArray(skus.code, referencedCodes),
+                ),
+              )
               .orderBy(skus.id)
               .for('update');
-            // Story 1-1: a code may be held by several clients. A kit cell
-            // names THIS run's client's SKUs: resolve within the run's client
-            // first; a code held only by another client keeps `mixed-client`
-            // (below), never `kit-component-not-found`.
-            const skuRowByCode = new Map<string, (typeof referencedSkuRows)[number]>();
-            for (const r of referencedSkuRows) {
-              const held = skuRowByCode.get(r.code);
-              if (held === undefined || (held.clientId !== clientId && r.clientId === clientId)) {
-                skuRowByCode.set(r.code, r);
+            const skuRowByCode = new Map<string, (typeof referencedSkuRows)[number]>(
+              referencedSkuRows.map((r) => [r.code, r]),
+            );
+            // An unlocked probe for codes this client does not hold but
+            // another does: they keep `mixed-client` (below), never
+            // `kit-component-not-found`. Nothing is written to those rows.
+            const missingCodes = referencedCodes.filter((code) => !skuRowByCode.has(code));
+            if (missingCodes.length > 0) {
+              const elsewhere = await tx
+                .select({ id: skus.id, code: skus.code, uom: skus.uom, clientId: skus.clientId })
+                .from(skus)
+                .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.code, missingCodes)))
+                .orderBy(skus.clientId);
+              for (const r of elsewhere) {
+                if (!skuRowByCode.has(r.code)) skuRowByCode.set(r.code, r);
               }
             }
             const referencedIds = referencedSkuRows.map((r) => r.id);

@@ -228,11 +228,15 @@ export class SkuClientCommand {
       for (const row of ordered) {
         let updated: (typeof skus.$inferSelect)[];
         try {
-          updated = await tx
-            .update(skus)
-            .set({ clientId: command.clientId, updatedAt: nowIso() })
-            .where(and(eq(skus.tenantId, command.tenantId), eq(skus.id, row.id)))
-            .returning();
+          // A savepoint, so a unique violation leaves the transaction usable
+          // for the holder read below.
+          updated = await tx.transaction((savepoint) =>
+            savepoint
+              .update(skus)
+              .set({ clientId: command.clientId, updatedAt: nowIso() })
+              .where(and(eq(skus.tenantId, command.tenantId), eq(skus.id, row.id)))
+              .returning(),
+          );
         } catch (err) {
           // A concurrent import committed a colliding SKU between the check
           // and the update: the per-client index is the arbiter.
@@ -240,7 +244,18 @@ export class SkuClientCommand {
             throw targetCodeCollision(row.code, targetLabel);
           }
           if (isUniqueViolationOn(err, SKUS_TENANT_CLIENT_BARCODE)) {
-            throw targetBarcodeCollision(row.barcode, row.code, null, targetLabel);
+            const holder = await tx
+              .select({ code: skus.code })
+              .from(skus)
+              .where(
+                and(
+                  eq(skus.tenantId, command.tenantId),
+                  eq(skus.clientId, command.clientId),
+                  eq(skus.barcode, row.barcode),
+                ),
+              )
+              .limit(1);
+            throw targetBarcodeCollision(row.barcode, row.code, holder[0]?.code ?? null, targetLabel);
           }
           throw err;
         }

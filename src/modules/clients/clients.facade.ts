@@ -99,14 +99,20 @@ export class ClientsFacade {
     tenantId: string,
     clientIds: readonly string[],
   ): Promise<{ id: string; code: string; name: string; active: boolean }[]> {
-    const wanted = new Set(clientIds);
-    if (wanted.size === 0) {
+    const wanted = [...new Set(clientIds)];
+    if (wanted.length === 0) {
       return [];
     }
-    const all = await this.listClients(tenantId);
-    return all
-      .filter((client) => wanted.has(client.id))
-      .map((client) => ({ id: client.id, code: client.code, name: client.name, active: client.status === 'active' }));
+    // The referenced ids directly — never the capped `listClients` read, which
+    // would lose clients past `MAX_CLIENT_LIST`.
+    const rows = await withTenantTransaction(this.db, tenantId, (tx) =>
+      tx
+        .select({ id: clients.id, code: clients.code, name: clients.name, status: clients.status })
+        .from(clients)
+        .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, wanted)))
+        .orderBy(desc(clients.systemOwned), asc(clients.code)),
+    );
+    return rows.map((client) => ({ id: client.id, code: client.code, name: client.name, active: client.status === 'active' }));
   }
 
   /** Story 21-7 — `GET …/portal/me` (see `portalMeIn`). */

@@ -214,6 +214,17 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
       .expect(201);
   }
 
+  function importCsvWith(header: string, rows: string[], clientId: string): Promise<request.Response> {
+    return http()
+      .post(`${API}/${tenantId}/catalog/imports`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .field('mode', 'initial')
+      .field('clientId', clientId)
+      .attach('file', Buffer.from([header, ...rows].join('\n'), 'utf8'), { filename: 'catalog.csv', contentType: 'text/csv' })
+      .expect(201);
+  }
+
   async function refreshSkus(): Promise<void> {
     const rows = (await sql`
       select s.id, s.code, c.code as client_code, c.system_owned
@@ -352,6 +363,15 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
       ).rejects.toMatchObject({ code: '23505', constraint_name: 'skus_tenant_client_barcode_unique' });
     });
 
+    it('a kit import naming a component code both clients hold composes over THIS client\'s SKU', async () => {
+      // BETA also holds ACME-COMP (seeded); ACME's kit names it.
+      const res = await importCsv(['ACME-KIT2,Acme kit two,pcs,1800,,ACME-KIT2-BC,ACME-COMP:1'], acme);
+      expect(res.body).toMatchObject({ committedRows: 1, failedRows: 0 });
+      await refreshSkus();
+      const rows = (await sql`select component_sku_id from kit_compositions where tenant_id = ${tenantId} and kit_sku_id = ${sku('ACME', 'ACME-KIT2')}`) as unknown as { component_sku_id: string }[];
+      expect(rows.map((row) => row.component_sku_id)).toEqual([sku('ACME', 'ACME-COMP')]);
+    });
+
     it('SKU edit: another client\'s barcode is free; this client\'s is 409 duplicate-barcode', async () => {
       const patch = (skuId: string, barcode: string) =>
         http()
@@ -392,6 +412,42 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
       const res = await correct(sku('ACME', 'ACME-SOLO'), beta).expect(409);
       expect(res.body).toMatchObject({ code: 'duplicate-barcode' });
       expect(res.body.detail).toContain('SKU "BETA-SOLO"');
+    });
+
+    it('a colliding SKU committed between the check and the update maps the 23505 to 409, naming the holder', async () => {
+      await importCsv(['ACME-RACE,Acme race,pcs,1800,,RACE-BC,'], acme);
+      await refreshSkus();
+      // A raw holder inserts BETA's colliding barcode and keeps its transaction
+      // open: the correction's check cannot see it, its update then waits on
+      // the unique index, and the holder's commit turns that wait into 23505.
+      const holder = postgres(process.env.DATABASE_URL!, { max: 1 });
+      try {
+        let release!: () => void;
+        const released = new Promise<void>((resolve) => (release = resolve));
+        const held = holder.begin(async (tx) => {
+          await tx`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode)
+                   values (${uuidv7()}, ${tenantId}, ${beta}, 'BETA-RACE', 'race', 'each', 0, 'RACE-BC')`;
+          await released;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const pending = correct(sku('ACME', 'ACME-RACE'), beta).then((res) => res);
+        // Wait until the correction is parked on the index.
+        for (let i = 0; i < 100; i += 1) {
+          const waiting = (await sql`select count(*)::int as n from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'`) as unknown as { n: number }[];
+          if (waiting[0]!.n > 0) break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        release();
+        await held;
+        const res = await pending;
+        expect(res.status).toBe(409);
+        expect(res.body).toMatchObject({ code: 'duplicate-barcode' });
+        expect(res.body.detail).toContain('SKU "BETA-RACE" of client BETA');
+        const moved = (await sql`select client_id from skus where id = ${sku('ACME', 'ACME-RACE')}`) as unknown as { client_id: string }[];
+        expect(moved[0]!.client_id).toBe(acme);
+      } finally {
+        await holder.end();
+      }
     });
 
     it('a SKU colliding with nothing moves', async () => {
@@ -513,7 +569,7 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
       expect(stored[0]!.payload_hash).toBe(createHash('sha256').update(golden, 'utf8').digest('hex'));
     });
 
-    it('an older build\'s mixed blind op derives the first line\'s client and refuses the rest per line', async () => {
+    it('an older build\'s mixed blind op settles as before 1-1: every line books to its own client, nothing refused, the GRN client null (decision 7)', async () => {
       const res = await receive({
         warehouseId: wh,
         blindReasonCode: 'unannounced-delivery',
@@ -521,9 +577,101 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
         lines: [line(sku('ACME', 'ACME-ONLY'), 1), line(sku('BETA', 'BETA-ONLY'), 2), line(sku('ACME', 'TSHIRT-M'), 1)],
       }).expect(201);
       const grn = res.body.goodsReceipt as GoodsReceipt;
-      expect(grn.clientId).toBe(acme);
-      expect(grn.lines.map((l) => l.skuId)).toEqual([sku('ACME', 'ACME-ONLY'), sku('ACME', 'TSHIRT-M')]);
-      expect(grn.rejectedLines!.map((l) => [l.skuId, l.code])).toEqual([[sku('BETA', 'BETA-ONLY'), 'sku-client-mismatch']]);
+      expect(grn.clientId).toBeUndefined();
+      expect(await grnClient(grn.id)).toBeNull();
+      expect(grn.rejectedLines).toBeUndefined();
+      expect(grn.reviewOpId).toBeUndefined();
+      expect(grn.lines.map((l) => l.skuId)).toEqual([sku('ACME', 'ACME-ONLY'), sku('BETA', 'BETA-ONLY'), sku('ACME', 'TSHIRT-M')]);
+      const events = (await sql`
+        select sku_id, client_id from ledger_events where tenant_id = ${tenantId} and reference_doc->>'grnId' = ${grn.id}
+      `) as unknown as { sku_id: string; client_id: string }[];
+      expect(new Map(events.map((e) => [e.sku_id, e.client_id]))).toEqual(
+        new Map([
+          [sku('ACME', 'ACME-ONLY'), acme],
+          [sku('BETA', 'BETA-ONLY'), beta],
+          [sku('ACME', 'TSHIRT-M'), acme],
+        ]),
+      );
+    });
+
+    it('a blind receipt whose EVERY line is another client\'s records no receipt; every line goes to review (decision 6)', async () => {
+      const grnCount = async () =>
+        ((await sql`select count(*)::int as n from goods_receipt_notes where tenant_id = ${tenantId}`) as unknown as { n: number }[])[0]!.n;
+      const recordedEvents = async () =>
+        ((await sql`select count(*)::int as n from outbox_messages where tenant_id = ${tenantId} and type = 'grn.recorded'`) as unknown as { n: number }[])[0]!.n;
+      const before = await grnCount();
+      const eventsBefore = await recordedEvents();
+      const key = ulid();
+      const body: GrnBody = {
+        warehouseId: wh,
+        blindReasonCode: 'other',
+        clientId: acme,
+        occurredAt: nowSecond(),
+        lines: [line(sku('BETA', 'BETA-ONLY'), 2), line(sku('BETA', 'TSHIRT-M'), 1)],
+      };
+      const res = await receive(body, key).expect(201);
+      expect(res.body.goodsReceipt).toBeNull();
+      expect(res.body.refusedReceipt).toMatchObject({ warehouseId: wh, clientId: acme, blindReasonCode: 'other' });
+      expect((res.body.refusedReceipt.rejectedLines as { skuId: string; qty: number; code: string }[]).map((l) => [l.skuId, l.qty, l.code])).toEqual([
+        [sku('BETA', 'BETA-ONLY'), 2, 'sku-client-mismatch'],
+        [sku('BETA', 'TSHIRT-M'), 1, 'sku-client-mismatch'],
+      ]);
+      expect(await grnCount()).toBe(before);
+      expect(await recordedEvents()).toBe(eventsBefore);
+      const review = await rejectedOpByOpId(res.body.refusedReceipt.reviewOpId as string);
+      expect(review).toMatchObject({ opType: 'grn.lines-refused', decisions: ['discard'], problemCode: 'sku-client-mismatch' });
+      expect(review.payload).toMatchObject({ grnId: null, grnCode: null, clientId: acme });
+      expect((review.payload.refusals as unknown[]).length).toBe(2);
+      // A replay re-serves the stored answer and records nothing.
+      const replayed = await receive(body, key).expect(201);
+      expect(replayed.body).toEqual(res.body);
+      expect(await grnCount()).toBe(before);
+      // No GRN code was consumed: the next receipt takes the next number.
+      const maxRows = (await sql`select max(substring(code from '^GRN-([0-9]+)$')::int) as max from goods_receipt_notes where tenant_id = ${tenantId}`) as unknown as { max: number }[];
+      const max = maxRows[0]!.max;
+      const next = await receive({ warehouseId: wh, blindReasonCode: 'other', clientId: acme, occurredAt: nowSecond(), lines: [line(sku('ACME', 'ACME-ONLY'), 1)] }).expect(201);
+      expect((next.body.goodsReceipt as GoodsReceipt).code).toBe(`GRN-${String(max + 1).padStart(4, '0')}`);
+      await http()
+        .post(`${API}/${tenantId}/rejected-ops/${review.id}/resolve`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ decision: 'discard' })
+        .expect(200);
+    });
+
+    it('another client\'s line that would fail a per-line rule is refused per line, not the whole op; no batch is created for it', async () => {
+      await importCsvWith('sku_code,name,uom,gst_rate,batch_tracked', ['BETA-LOT,Beta lot,pcs,1800,true'], beta);
+      await refreshSkus();
+      const res = await receive({
+        warehouseId: wh,
+        blindReasonCode: 'other',
+        clientId: acme,
+        occurredAt: nowSecond(),
+        lines: [line(sku('ACME', 'ACME-ONLY'), 1), { skuId: sku('BETA', 'BETA-LOT'), batchCode: 'LOT-1', mfgDate: null, qty: 1.5 }],
+      }).expect(201);
+      const grn = res.body.goodsReceipt as GoodsReceipt;
+      expect(grn.lines.map((l) => l.skuId)).toEqual([sku('ACME', 'ACME-ONLY')]);
+      expect(grn.rejectedLines!.map((l) => [l.skuId, l.qty, l.code])).toEqual([[sku('BETA', 'BETA-LOT'), 1.5, 'sku-client-mismatch']]);
+      const batches = (await sql`select 1 from batches where tenant_id = ${tenantId} and sku_id = ${sku('BETA', 'BETA-LOT')}`) as unknown as unknown[];
+      expect(batches).toHaveLength(0);
+      await http()
+        .post(`${API}/${tenantId}/rejected-ops/${(await rejectedOpByOpId(grn.reviewOpId!)).id}/resolve`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ decision: 'discard' })
+        .expect(200);
+    });
+
+    it('a blind receipt naming a suspended client is 409 client-not-active', async () => {
+      const gamma = await createClient('GAMMA', 'Gamma Goods');
+      await http()
+        .patch(`${API}/${tenantId}/clients/${gamma}/status`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ status: 'suspended' })
+        .expect(200);
+      const res = await receive({ warehouseId: wh, blindReasonCode: 'other', clientId: gamma, occurredAt: nowSecond(), lines: [line(sku('ACME', 'ACME-ONLY'), 1)] }).expect(409);
+      expect(res.body.code).toBe('client-not-active');
     });
 
     it('a clientId beside a PO is 400; an unknown client is 404', async () => {
@@ -581,14 +729,16 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
       expect(res.body.detail).toContain('grn.lines-refused');
     });
 
-    it('every GRN this suite wrote carries a client (the command stamps every new row)', async () => {
+    it('every GRN this suite wrote carries a client, but the older build\'s mixed blind one (decision 7)', async () => {
       const rows = (await sql`select count(*)::int as n from goods_receipt_notes where tenant_id = ${tenantId} and client_id is null`) as unknown as { n: number }[];
-      expect(rows[0]!.n).toBe(0);
+      expect(rows[0]!.n).toBe(1);
       const all = (await sql`select count(*)::int as n from goods_receipt_notes where tenant_id = ${tenantId}`) as unknown as { n: number }[];
       expect(all[0]!.n).toBeGreaterThan(3);
       // The GRN list carries it too.
       const list = await http().get(`${API}/${tenantId}/receiving/goods-receipts`).query({ limit: 100 }).set('Authorization', `Bearer ${ownerToken}`).expect(200);
-      expect((list.body.items as { clientId?: string }[]).every((item) => item.clientId === acme || item.clientId === beta)).toBe(true);
+      const listed = (list.body.items as { clientId?: string }[]).map((item) => item.clientId);
+      expect(listed.filter((id) => id === undefined)).toHaveLength(1);
+      expect(listed.every((id) => id === undefined || id === acme || id === beta)).toBe(true);
     });
   });
 
@@ -728,6 +878,10 @@ describe('migration 0076: the index swap, the GRN client backfill and its probes
   const grnSingle = uuidv7();
   const grnMixed = uuidv7();
   const grnEmpty = uuidv7();
+  const poId = uuidv7();
+  const asnId = uuidv7();
+  const grnPoMixed = uuidv7();
+  const grnAsnEmpty = uuidv7();
 
   function migrationStatements(): string[] {
     return readFileSync(resolve(process.cwd(), 'drizzle/0076_per_client_sku_identity.sql'), 'utf8')
@@ -785,6 +939,18 @@ describe('migration 0076: the index swap, the GRN client backfill and its probes
       await sql`insert into goods_receipt_notes (id, tenant_id, warehouse_id, code, blind_reason_code, device_id, recorded_by, occurred_at, recorded_at)
         values (${id}, ${tenantId}, ${tenantId}, ${code}, 'other', ${tenantId}, ${tenantId}, now(), now())`;
     }
+    // Decision 5 — document receipts take the document's client: a PO receipt
+    // of client B whose lines mix A and B (a 21-6 unmatched line), and a
+    // line-less ASN receipt of client A.
+    await sql`insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code) values (${poId}, ${tenantId}, ${clientB}, ${tenantId}, ${tenantId}, 'PO-0076')`;
+    await sql`insert into advance_shipment_notices (id, tenant_id, client_id, warehouse_id, asn_code) values (${asnId}, ${tenantId}, ${clientA}, ${tenantId}, 'ASN-0076')`;
+    await sql`insert into goods_receipt_notes (id, tenant_id, warehouse_id, code, po_id, device_id, recorded_by, occurred_at, recorded_at)
+      values (${grnPoMixed}, ${tenantId}, ${tenantId}, 'GRN-0004', ${poId}, ${tenantId}, ${tenantId}, now(), now())`;
+    await sql`insert into goods_receipt_notes (id, tenant_id, warehouse_id, code, asn_id, device_id, recorded_by, occurred_at, recorded_at)
+      values (${grnAsnEmpty}, ${tenantId}, ${tenantId}, 'GRN-0005', ${asnId}, ${tenantId}, ${tenantId}, now(), now())`;
+    await sql`insert into goods_receipt_lines (id, tenant_id, grn_id, sku_id, qty, applied_qty) values
+      (${uuidv7()}, ${tenantId}, ${grnPoMixed}, ${skuA}, 1000, 1000),
+      (${uuidv7()}, ${tenantId}, ${grnPoMixed}, ${skuB}, 1000, 1000)`;
     await sql`insert into goods_receipt_lines (id, tenant_id, grn_id, sku_id, qty, applied_qty) values
       (${uuidv7()}, ${tenantId}, ${grnSingle}, ${skuA}, 1000, 1000),
       (${uuidv7()}, ${tenantId}, ${grnSingle}, ${skuA2}, 1000, 1000),
@@ -808,12 +974,15 @@ describe('migration 0076: the index swap, the GRN client backfill and its probes
     }
   });
 
-  it('backfills a single-client GRN from its lines; leaves mixed and line-less ones null and lists them', async () => {
+  it('backfills document receipts from their document, a single-client blind GRN from its lines; leaves mixed and line-less blind ones null and lists them', async () => {
     const rows = (await sql`select id, client_id from goods_receipt_notes where tenant_id = ${tenantId}`) as unknown as { id: string; client_id: string | null }[];
     const byId = new Map(rows.map((row) => [row.id, row.client_id]));
     expect(byId.get(grnSingle)).toBe(clientA);
     expect(byId.get(grnMixed)).toBeNull();
     expect(byId.get(grnEmpty)).toBeNull();
+    // Decision 5: the document's client, whatever the lines say.
+    expect(byId.get(grnPoMixed)).toBe(clientB);
+    expect(byId.get(grnAsnEmpty)).toBe(clientA);
     const notice = notices.find((message) => message.startsWith('migration 0076:'));
     expect(notice).toBeDefined();
     expect(notice).toContain('2 goods receipt(s) left without a client');
