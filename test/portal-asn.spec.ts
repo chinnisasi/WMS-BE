@@ -11,6 +11,7 @@ import { OPERATOR_SURFACE_DETAIL } from '../src/modules/tenancy/tenant-session.g
 import { PORTAL_SURFACE_DETAIL } from '../src/modules/clients/portal-session.guard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // Story 21-7b — portal ASN entry: a client user announces its OWN inbound
 // shipment from the portal (`POST portal/inbound/asns`, the client taken from
@@ -158,7 +159,7 @@ describe('portal ASN entry (e2e, story 21-7b)', () => {
   // ── helpers ────────────────────────────────────────────────────────────────
 
   async function signIn(email: string): Promise<string> {
-    return (await http().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200)).body.accessToken as string;
+    return (await mintSignIn(app, { email, password: PASSWORD })).body.accessToken as string;
   }
 
   async function createWarehouse(code: string, name: string, city: string): Promise<string> {

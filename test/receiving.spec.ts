@@ -8,6 +8,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -61,10 +62,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     // Warehouse + vendor.
@@ -277,10 +275,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
       .expect(200);
     const token = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     return { userId, token };
   }

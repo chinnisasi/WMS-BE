@@ -18,6 +18,7 @@ import { DUMMY_HASH, hashPassword } from './passwords';
 import { shareLockClientInTx } from '../clients/clients.facade';
 import { emailDigest, signInLockedUntil } from './auth-attempts';
 import { revokeSessionsInTx } from './sessions';
+import { clearOpenChallengesInTx, clearSecondFactorLockInTx } from './second-factor';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -56,6 +57,8 @@ export interface UserView {
    * snapshots replay unchanged.
    */
   readonly lockedUntil?: string | null;
+  /** Story 6-1b — list reads only; optional for the same reason as `lockedUntil`. */
+  readonly secondFactorEnabled?: boolean;
 }
 
 export interface UserStatusInput {
@@ -460,6 +463,9 @@ export class UsersCommand {
       // request signs in again under the new role.
       if (target.role !== command.role) {
         await revokeSessionsInTx(tx, command.tenantId, { userId: target.id, kinds: ['web'] }, 'role-changed');
+        // Story 6-1b — a role change ends any sign-in in progress (a promotion
+        // to owner must meet the enrolment step on the next one).
+        await clearOpenChallengesInTx(tx, command.tenantId, target.id);
       }
 
       await insertAuditRow(tx, {
@@ -730,6 +736,8 @@ export class UsersCommand {
             .where(eq(users.id, target.id))
             .returning();
           await revokeSessionsInTx(tx, command.tenantId, { userId: target.id }, 'deactivated');
+          // Story 6-1b — and any sign-in in progress.
+          await clearOpenChallengesInTx(tx, command.tenantId, target.id);
           await tx
             .update(devices)
             .set({
@@ -807,6 +815,9 @@ export class UsersCommand {
       const target = targetRows[0];
       if (!target) throw userNotFound();
       await tx.execute(sql`delete from signin_attempts where email_hash = ${emailDigest(target.email)}`);
+      // Story 6-1b — and the two-factor lock (inside this tenant transaction:
+      // on a bare connection RLS would match nothing).
+      await clearSecondFactorLockInTx(tx, command.tenantId, target.id);
       await insertAuditRow(tx, {
         tenantId: command.tenantId,
         actorUserId: command.actorUserId,
@@ -849,11 +860,17 @@ export class UsersCommand {
         .orderBy(desc(users.createdAt), desc(users.id))
         .limit(pageSize + 1);
     });
-    const page = buildPage(rows.map(toUserView), pageSize);
-    // Story 6-1a — the Team card's Unlock reads `lockedUntil`.
+    const page = buildPage(rows, pageSize);
+    // Story 6-1a — the Team card's Unlock reads `lockedUntil`; story 6-1b —
+    // the later of the sign-in lock and the two-factor lock.
     const locks = await signInLockedUntil(this.db, page.items.map((user) => user.email));
+    const now = Date.now();
     return {
-      items: page.items.map((user) => ({ ...user, lockedUntil: locks.get(user.email) ?? null })),
+      items: page.items.map((row) => ({
+        ...toUserView(row),
+        lockedUntil: laterLock(locks.get(row.email) ?? null, secondFactorLockOf(row.mfaLockedUntil, now)),
+        secondFactorEnabled: row.mfaEnabledAt !== null,
+      })),
       nextCursor: page.nextCursor,
     };
   }
@@ -878,6 +895,22 @@ export class UsersCommand {
     }
     return toUserView(user);
   }
+}
+
+/** Story 6-1b — a permanent two-factor lock (`'infinity'`) reads as the far future: "until an owner unlocks". */
+export const PERMANENT_LOCK_INSTANT = '9999-12-31T23:59:59.999Z';
+
+function secondFactorLockOf(lockedUntil: string | null, now: number): string | null {
+  if (lockedUntil === null) return null;
+  if (lockedUntil === 'infinity') return PERMANENT_LOCK_INSTANT;
+  const at = Date.parse(lockedUntil);
+  return Number.isNaN(at) || at <= now ? null : new Date(at).toISOString();
+}
+
+function laterLock(a: string | null, b: string | null): string | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return Date.parse(a) >= Date.parse(b) ? a : b;
 }
 
 function toUserView(row: typeof users.$inferSelect): UserView {

@@ -15,6 +15,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { seededIdempotencyKey } from './support/audit-guard';
 import { importSecureSku } from './support/secure-sku';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -77,10 +78,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     // Warehouse + one zone.
@@ -449,10 +447,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       .send({ token: invited.body.inviteToken, password: 'correct-horse-battery' })
       .expect(200);
     return (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
   }
 
@@ -897,10 +892,7 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       .expect(201);
     createdTenantIds.push(registeredB.body.tenant.id);
     const tokenB = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: emailB, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email: emailB, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     const foreign = await merge(binA07, binA03, tokenB).expect(403);
     expect(foreign.body).toMatchObject({ code: 'permission-denied' });

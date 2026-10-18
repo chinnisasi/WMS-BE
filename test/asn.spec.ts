@@ -12,6 +12,7 @@ import { ASN_STATUSES } from '../src/modules/inbound/asn.command';
 import { BLIND_REASON_CODES } from '../src/modules/inbound/receiving.command';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // Story 21-6 — advance shipment notices: the ASN lifecycle, receiving against
 // a PO OR an ASN in one `grn.submit` (through the device route AND the
@@ -91,7 +92,7 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
       .send({ name: `ASN Co ${ulid()}`, ownerEmail: email, password: 'correct-horse-battery' })
       .expect(201);
     tenantId = registered.body.tenant.id as string;
-    ownerToken = (await http().post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200)).body
+    ownerToken = (await mintSignIn(app, { email, password: 'correct-horse-battery' })).body
       .accessToken as string;
 
     wh1 = await createWarehouse('ASN-W1');
@@ -204,7 +205,7 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
       .set(KEY_HEADER, ulid())
       .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
       .expect(200);
-    const token = (await http().post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200)).body
+    const token = (await mintSignIn(app, { email, password: 'correct-horse-battery' })).body
       .accessToken as string;
     return { userId: invited.body.user.id as string, token, email };
   }

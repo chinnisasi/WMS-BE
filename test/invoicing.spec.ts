@@ -21,6 +21,7 @@ import type { OutboxRelay } from '../src/shared/events/outbox.seam';
 import { CAPABILITIES, ROLE_CAPABILITIES } from '../src/modules/tenancy/permissions';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -236,10 +237,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect((registered.body.tenant as { gstin: string | null }).gstin).toBeNull(); // no gstin given
 
     const signIn = (address: string, password: string) =>
-      request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: address, password })
-        .expect(200)
+      mintSignIn(app, { email: address, password })
         .then((res) => res.body.accessToken as string);
     ownerToken = await signIn(email, 'correct-horse-battery');
     opsToken = await inviteAndSignIn('ops_manager', 'ops-password-123');
@@ -461,10 +459,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
       .set(KEY_HEADER, ulid())
       .send({ token: invited.body.inviteToken as string, password })
       .expect(200);
-    return request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email: address, password })
-      .expect(200)
+    return mintSignIn(app, { email: address, password })
       .then((res) => res.body.accessToken as string);
   }
 
@@ -2064,10 +2059,7 @@ describe('invoicing: GST invoice generation (e2e, story 8-1)', () => {
     expect(registered.body.tenant.gstin).toBe('27AAAPZ1234C1ZV');
     const stored = (await sql`select gstin from tenants where id = ${otherTenant}`) as unknown as { gstin: string }[];
     expect(stored[0]!.gstin).toBe('27AAAPZ1234C1ZV');
-    const signedIn = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email, password: 'correct-horse-battery' })
-      .expect(200);
+    const signedIn = await mintSignIn(app, { email, password: 'correct-horse-battery' });
     expect(signedIn.body.tenant.gstin).toBe('27AAAPZ1234C1ZV');
 
     const blank = await request(app.getHttpServer())

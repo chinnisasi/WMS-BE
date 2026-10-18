@@ -10,6 +10,7 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -168,10 +169,7 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
     createdTenantIds.push(tenantId);
     ke1CreateKey = ulid();
     const signIn = (address: string, password: string) =>
-      request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: address, password })
-        .expect(200)
+      mintSignIn(app, { email: address, password })
         .then((res) => res.body.accessToken as string);
     ownerToken = await signIn(email, 'correct-horse-battery');
     const invite = async (role: string, password: string): Promise<string> => {

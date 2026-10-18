@@ -13,6 +13,7 @@ import { addressFingerprint, normalizeAddressInput } from '../src/shared/primiti
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -68,7 +69,7 @@ describe('issuance-gate parity: GSTIN prefix at entry and the buyer legal name (
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer()).post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
 
     warehouseId = (await postWarehouse({ code: `GT-${ulid().slice(10, 16)}`, name: 'Gate WH', origin: testAddress(), gstin: '29AAAPZ1234C1ZV' }).expect(201)).body

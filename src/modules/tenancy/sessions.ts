@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import type { Database } from '../../shared/db/db';
 import { isUuid } from '../../shared/primitives/ids';
 import { auditEvents, sessions } from '../../shared/db/schema';
@@ -32,6 +32,10 @@ export const SESSION_REVOKE_REASONS = [
   'refresh-reuse',
   'released',
   'device-revoked',
+  // Story 6-1b — an owner reset this user's two-factor sign-in; the user
+  // changed (replaced, disabled, regenerated) their own on another device.
+  'second-factor-reset',
+  'second-factor-changed',
 ] as const;
 export type SessionRevokeReason = (typeof SESSION_REVOKE_REASONS)[number];
 
@@ -73,7 +77,14 @@ export type SecurityAuditAction =
   | 'user.sign_in_locked'
   | 'device.badge_locked'
   | 'device.badged_out'
-  | 'user.unlocked';
+  | 'user.unlocked'
+  // Story 6-1b — the second factor's life (`second-factor.ts`, `second-factor.command.ts`).
+  | 'user.second_factor_enabled'
+  | 'user.second_factor_disabled'
+  | 'user.backup_codes_regenerated'
+  | 'user.backup_code_used'
+  | 'user.second_factor_locked'
+  | 'user.second_factor_reset';
 
 export async function auditSecurityEventInTx(
   tx: TenantTx,
@@ -101,11 +112,13 @@ export function hashSecret(secret: string): string {
   return createHash('sha256').update(secret, 'utf8').digest('hex');
 }
 
-function newSecret(): string {
+/** A 256-bit url-safe secret (refresh tokens; 6-1b's sign-in challenge tokens). */
+export function newSecret(): string {
   return randomBytes(32).toString('base64url');
 }
 
-function sameHash(a: string, b: string): boolean {
+/** Constant-time comparison of two hex digests. */
+export function sameHash(a: string, b: string): boolean {
   const left = Buffer.from(a, 'hex');
   const right = Buffer.from(b, 'hex');
   return left.length === right.length && timingSafeEqual(left, right);
@@ -223,6 +236,8 @@ export interface RevokeFilter {
   readonly clientId?: string;
   readonly deviceId?: string;
   readonly kinds?: readonly SessionKind[];
+  /** Story 6-1b — every matching session BUT this one (the caller's own stays signed in). */
+  readonly exceptSessionId?: string;
 }
 
 /**
@@ -242,6 +257,7 @@ export async function revokeSessionsInTx(
   if (filter.clientId !== undefined) conditions.push(eq(sessions.clientId, filter.clientId));
   if (filter.deviceId !== undefined) conditions.push(eq(sessions.deviceId, filter.deviceId));
   if (filter.kinds !== undefined) conditions.push(inArray(sessions.kind, [...filter.kinds]));
+  if (filter.exceptSessionId !== undefined) conditions.push(ne(sessions.id, filter.exceptSessionId));
   if (
     filter.sessionId === undefined &&
     filter.userId === undefined &&

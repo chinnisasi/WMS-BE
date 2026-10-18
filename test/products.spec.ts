@@ -8,6 +8,7 @@ import { createApp } from '../src/app.factory';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions — the same bootstrap
@@ -87,10 +88,7 @@ describe('product variants (e2e, story 11-3)', () => {
     tenantId = registered.body.tenant.id as string;
     ownerUserId = registered.body.owner.id as string;
     createdTenantIds.push(tenantId);
-    ownerToken = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email, password: 'correct-horse-battery' })
-      .expect(200)
+    ownerToken = await mintSignIn(app, { email, password: 'correct-horse-battery' })
       .then((res) => res.body.accessToken as string);
 
     // ── scenario SKUs, imported the pre-11.3 way (no product columns — every

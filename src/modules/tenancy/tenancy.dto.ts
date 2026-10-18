@@ -292,6 +292,14 @@ export class UserResponse {
       'Story 6-1a — sign-in is locked for this email (5 failed attempts from one address) until this instant; on the user list only, null or absent when not locked',
   })
   lockedUntil?: string | null;
+
+  @ApiProperty({
+    type: Boolean,
+    required: false,
+    description:
+      'Story 6-1b — the user has two-factor sign-in set up; on the user list only (absent on stored invite / role-change snapshots)',
+  })
+  secondFactorEnabled?: boolean;
 }
 
 /** Story 6-1a — deactivate / reactivate. A reactivated never-accepted invitee carries a fresh invite token. */
@@ -434,6 +442,128 @@ export class SignInResponse {
       'Story 21-7 — the client brand of a client-portal user (the portal shell prints its name); null for the tenant’s own staff',
   })
   client!: SessionClientResponse | null;
+}
+
+/** Story 6-1b — an enrolled user's second step: the right password, then a code from the authenticator app. */
+export class TotpChallengeResponse {
+  @ApiProperty({ enum: ['totp'], example: 'totp' })
+  challenge!: 'totp';
+
+  @ApiProperty({ description: 'The one-time token for `POST /tenants/sign-in/second-factor` (no session exists yet)' })
+  challengeToken!: string;
+
+  @ApiProperty({ example: 300 })
+  expiresInSeconds!: number;
+}
+
+/** Story 6-1b — an owner who has not set up two-factor sign-in yet: the enrolment step. */
+export class EnrollChallengeResponse {
+  @ApiProperty({ enum: ['enroll'], example: 'enroll' })
+  challenge!: 'enroll';
+
+  @ApiProperty({ description: 'The one-time token for `POST /tenants/sign-in/second-factor` (no session exists yet)' })
+  challengeToken!: string;
+
+  @ApiProperty({ example: 600 })
+  expiresInSeconds!: number;
+
+  @ApiProperty({ description: 'The authenticator secret (base32) — the QR code\u2019s fallback. The same one for 24 h, so an app that scanned it keeps working' })
+  secret!: string;
+
+  @ApiProperty({ example: 'otpauth://totp/WMS%20(Acme)%3Aowner%40example.com?secret=…&issuer=WMS%20(Acme)' })
+  otpauthUri!: string;
+
+  @ApiProperty({ description: 'An owner reset this user\u2019s two-factor sign-in: the one-time enrolment code they handed over is needed too' })
+  enrolmentCodeRequired!: boolean;
+}
+
+export class SecondFactorSignInDto {
+  @ApiProperty({ description: 'The `challengeToken` from the sign-in response' })
+  @IsString()
+  @Length(1, 200)
+  challengeToken!: string;
+
+  @ApiProperty({ example: '123456', description: 'A 6-digit code from the authenticator app, or (code step only) a backup code `XXXXX-XXXXX`' })
+  @IsString()
+  @Length(1, 40)
+  code!: string;
+
+  @ApiProperty({ required: false, example: 'K7PQ2MXA', description: 'Enrolment after an owner\u2019s reset — the one-time code they handed over' })
+  @IsOptional()
+  @IsString()
+  @Length(1, 40)
+  enrolmentCode?: string;
+}
+
+/** Story 6-1b — the second step's answer: the sign-in body, plus what this step adds. */
+export class SecondFactorSignInResponse extends SignInResponse {
+  @ApiProperty({
+    type: [String],
+    required: false,
+    description: 'Enrolment only — the ten single-use backup codes, shown this once and never again',
+  })
+  backupCodes?: string[];
+
+  @ApiProperty({ required: false, example: 3, description: 'Wrong codes since the last successful sign-in (present only when there were any)' })
+  secondFactorFailedAttempts?: number;
+}
+
+/** Story 6-1b — My account → Security. */
+export class SecondFactorStatusResponse {
+  @ApiProperty()
+  enabled!: boolean;
+
+  @ApiProperty({ type: String, nullable: true, example: '2026-10-18T09:00:00.000Z' })
+  enabledAt!: string | null;
+
+  @ApiProperty({ description: 'The role must use two-factor sign-in (owners) — it cannot be turned off' })
+  required!: boolean;
+
+  @ApiProperty({ example: 10 })
+  backupCodesRemaining!: number;
+}
+
+export class SecondFactorSetupDto {
+  @ApiProperty({ required: false, description: 'With two-factor sign-in off: the current password' })
+  @IsOptional()
+  @IsString()
+  @Length(1, 200)
+  password?: string;
+
+  @ApiProperty({ required: false, description: 'With two-factor sign-in on: a current code or a backup code' })
+  @IsOptional()
+  @IsString()
+  @Length(1, 40)
+  code?: string;
+}
+
+export class SecondFactorSetupResponse {
+  @ApiProperty({ description: 'The new authenticator secret (base32) — confirm it with a code from the app' })
+  secret!: string;
+
+  @ApiProperty()
+  otpauthUri!: string;
+}
+
+export class SecondFactorCodeDto {
+  @ApiProperty({ example: '123456', description: 'A code from the authenticator app (or, where accepted, a backup code)' })
+  @IsString()
+  @Length(1, 40)
+  code!: string;
+}
+
+export class BackupCodesResponse {
+  @ApiProperty({ type: [String], description: 'Ten single-use backup codes `XXXXX-XXXXX` — shown this once' })
+  backupCodes!: string[];
+}
+
+/** Story 6-1b — an owner reset a colleague's two-factor sign-in. Null on the no-op arm (nothing to reset). */
+export class SecondFactorResetResponse {
+  @ApiProperty({ type: String, nullable: true, example: 'K7PQ2MXA', description: 'Hand this to the user in person — they need it to set up again (72 h)' })
+  enrolmentCode!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, example: '2026-10-21T09:00:00.000Z' })
+  enrolmentCodeExpiresAt!: string | null;
 }
 
 export class WarehouseResponse {

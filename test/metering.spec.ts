@@ -29,6 +29,7 @@ import {
 import { ProblemException } from '../src/shared/problem-details/problem.exception';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -294,7 +295,7 @@ describe('story 21-4: metering and storage snapshots', () => {
         .set(KEY_HEADER, ulid())
         .send({ name, ownerEmail: email, password: 'correct-horse-battery' })
         .expect(201);
-      const signedIn = await http().post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200);
+      const signedIn = await mintSignIn(app, { email, password: 'correct-horse-battery' });
       return {
         tenantId: registered.body.tenant.id as string,
         ownerToken: signedIn.body.accessToken as string,
@@ -315,7 +316,7 @@ describe('story 21-4: metering and storage snapshots', () => {
         .set(KEY_HEADER, ulid())
         .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
         .expect(200);
-      return (await http().post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200)).body
+      return (await mintSignIn(app, { email, password: 'correct-horse-battery' })).body
         .accessToken as string;
     }
 

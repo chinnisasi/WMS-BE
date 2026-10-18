@@ -9,6 +9,7 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions — the sibling suites'
@@ -159,7 +160,7 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
   }
 
   async function signIn(email: string, password = 'correct-horse-battery'): Promise<string> {
-    const res = await request(app.getHttpServer()).post(`${API}/sign-in`).send({ email, password }).expect(200);
+    const res = await mintSignIn(app, { email, password });
     return res.body.accessToken as string;
   }
 

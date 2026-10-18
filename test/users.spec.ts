@@ -16,6 +16,7 @@ import type { ProblemException } from '../src/shared/problem-details/problem.exc
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn, signInAs } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -107,10 +108,7 @@ describe('users, roles, and permission gating (e2e)', () => {
     token: string;
     user: { id: string; email: string; role: string; status: string };
   }> {
-    const res = await request(app.getHttpServer())
-      .post(`${IDENTITY_URL}/sign-in`)
-      .send({ email, password })
-      .expect(200);
+    const res = await mintSignIn(app, { email, password });
     return {
       token: res.body.accessToken as string,
       user: res.body.user as { id: string; email: string; role: string; status: string },
@@ -252,10 +250,15 @@ describe('users, roles, and permission gating (e2e)', () => {
     }
   }
 
+  // Story 6-1b — RETARGETED (guide §4): the owner's user shape now arrives
+  // with the session, from the SECOND step of the real two-step sign-in (the
+  // password step answers a challenge). The shape itself is unchanged.
   test('sign-in carries the user shape (id, email, role, status, clientId)', async () => {
     const email = `owner-${ulid().toLowerCase()}@example.com`;
     const { tenantId, ownerId } = await registerTenant(email);
-    const { user } = await signIn(email);
+    const completed = await signInAs(app, email, 'correct-horse-battery');
+    expect(completed.status).toBe(200);
+    const user = completed.body.user as Record<string, unknown>;
     // Story 21-7 deliberately widens the shape: every user carries `clientId`
     // (null for the tenant's own staff, set for a client-portal user).
     expect(user).toEqual({

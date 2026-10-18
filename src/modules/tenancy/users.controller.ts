@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { Type } from 'class-transformer';
 import { IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
 import {
@@ -24,16 +24,30 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from './idempotency-guard
 // the runtime class tokens for decorator metadata (eslint rule bends for them).
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { UsersCommand } from './users.command';
+// eslint-disable-next-line @typescript-eslint/consistent-type-imports
+import { SecondFactorCommand } from './second-factor.command';
+import type { SelfServiceCaller } from './second-factor.command';
+import { clientIpOf } from './auth-attempts';
 // InviteUserDto/SetUserRoleDto are bound to @Body() *and* read by the Swagger
 // explorer through emitDecoratorMetadata — a type-only import erases the
 // runtime reference and the OpenAPI document loses the request body.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
-import { InviteUserDto, SetUserRoleDto, UserStatusResponse } from './tenancy.dto';
+import {
+  InviteUserDto,
+  SecondFactorCodeDto,
+  SecondFactorSetupDto,
+  SetUserRoleDto,
+  UserStatusResponse,
+} from './tenancy.dto';
 import {
   AcceptInviteDto,
   AcceptInviteResponse,
   InviteUserResponse,
   MeResponse,
+  BackupCodesResponse,
+  SecondFactorResetResponse,
+  SecondFactorSetupResponse,
+  SecondFactorStatusResponse,
   UserListResponse,
   UserResponse,
 } from './tenancy.dto';
@@ -76,7 +90,10 @@ const IDEMPOTENCY_HEADER = [
 @ApiExtraModels(ProblemDetailsDto)
 @Controller('tenants')
 export class UsersController {
-  constructor(private readonly usersCommand: UsersCommand) {}
+  constructor(
+    private readonly usersCommand: UsersCommand,
+    private readonly secondFactorCommand: SecondFactorCommand,
+  ) {}
 
   @Post(':tenantId/users')
   @HttpCode(HttpStatus.CREATED)
@@ -252,6 +269,39 @@ export class UsersController {
     return { ...(await this.usersCommand.unlockUser({ tenantId, actorUserId: session.userId, targetUserId: userId }, key)) };
   }
 
+  @Post(':tenantId/users/:userId/second-factor/reset')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Story 6-1b — resets a colleague’s two-factor sign-in (users.role_change); answers a one-time enrolment code (72 h) to hand over in person',
+    description:
+      'Clears the authenticator, the backup codes, the lock and any sign-in in progress, and ends the user’s web sessions. Their next sign-in sets two-factor up again and needs the enrolment code. Keyed; a user with nothing to reset is a no-op (null code). Your own: My account → Security.',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: SecondFactorResetResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or malformed userId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks users.role_change (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('User does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Your own account (self-reset), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'userId', format: 'uuid' })
+  async resetSecondFactor(
+    @Param('tenantId') tenantId: string,
+    @Param('userId') userId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<SecondFactorResetResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUserIdParam(userId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return {
+      ...(await this.secondFactorCommand.reset({ tenantId, actorUserId: session.userId, targetUserId: userId }, key)),
+    };
+  }
+
   @Post(':tenantId/accept-invite')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Accepts a one-time invite (unauthenticated): sets the account password and activates the user' })
@@ -290,6 +340,156 @@ export class UsersController {
     const user = await this.usersCommand.me(tenantId, session.userId);
     return { user: { ...user } };
   }
+
+  // ── Story 6-1b — My account → Security (the caller acts only on themselves) ──
+  // Not keyed: the answers carry secrets or backup codes, which never enter
+  // `idempotency_keys`; a lost answer is recovered by regenerating. A wrong
+  // code is 422 (never 401 — that would sign the web user out).
+
+  @Get(':tenantId/me/second-factor')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Story 6-1b — the caller’s two-factor sign-in: on or off, required for the role, backup codes left' })
+  @ApiOkResponse({ type: SecondFactorStatusResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async secondFactorStatus(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<SecondFactorStatusResponse> {
+    assertOwnTenant(session, tenantId);
+    return { ...(await this.secondFactorCommand.status(tenantId, session.userId)) };
+  }
+
+  @Post(':tenantId/me/second-factor/setup')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Story 6-1b — starts setting up (or replacing) the authenticator: answers a new secret to scan, then confirm it',
+    description: 'With two-factor sign-in off it needs the current `password` (counted like sign-in); with it on, a current `code` (or a backup code).',
+  })
+  @ApiBody({ type: SecondFactorSetupDto })
+  @ApiOkResponse({ type: SecondFactorSetupResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body, or the proof this state needs is missing (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The factor changed while this ran (second-factor-changed)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Wrong password (password-invalid) or wrong code (second-factor-invalid; `attemptsLeft`) — the session stays') })
+  @ApiResponse({ status: 423, ...problemJsonResponse('Too many wrong passwords (sign-in-locked) or codes (second-factor-locked)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async secondFactorSetup(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Req() request: IpRequest,
+    @Body() dto: SecondFactorSetupDto,
+  ): Promise<SecondFactorSetupResponse> {
+    const caller = selfServiceCaller(session, tenantId, request);
+    return {
+      ...(await this.secondFactorCommand.setup(caller, {
+        ...(dto.password === undefined ? {} : { password: dto.password }),
+        ...(dto.code === undefined ? {} : { code: dto.code }),
+      })),
+    };
+  }
+
+  @Post(':tenantId/me/second-factor/confirm')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Story 6-1b — confirms the new authenticator with a code from it; answers ten backup codes once',
+    description: 'Replacing an authenticator ends your other web sessions (this one stays).',
+  })
+  @ApiBody({ type: SecondFactorCodeDto })
+  @ApiOkResponse({ type: BackupCodesResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('No setup in progress, or it expired after 24 h (second-factor-setup-expired), or it changed meanwhile (second-factor-changed)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Wrong code (second-factor-invalid; `attemptsLeft`) — the session stays') })
+  @ApiResponse({ status: 423, ...problemJsonResponse('Too many wrong codes (second-factor-locked)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async secondFactorConfirm(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Req() request: IpRequest,
+    @Body() dto: SecondFactorCodeDto,
+  ): Promise<BackupCodesResponse> {
+    return { ...(await this.secondFactorCommand.confirm(selfServiceCaller(session, tenantId, request), dto.code)) };
+  }
+
+  @Post(':tenantId/me/second-factor/backup-codes')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Story 6-1b — replaces the backup codes (the old ones stop working); answers the new ten once',
+    description: 'Needs a current code or a backup code. Ends your other web sessions (this one stays).',
+  })
+  @ApiBody({ type: SecondFactorCodeDto })
+  @ApiOkResponse({ type: BackupCodesResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Two-factor sign-in is off (second-factor-not-enabled), or it changed meanwhile (second-factor-changed)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Wrong code (second-factor-invalid; `attemptsLeft`) — the session stays') })
+  @ApiResponse({ status: 423, ...problemJsonResponse('Too many wrong codes (second-factor-locked)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async secondFactorBackupCodes(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Req() request: IpRequest,
+    @Body() dto: SecondFactorCodeDto,
+  ): Promise<BackupCodesResponse> {
+    return {
+      ...(await this.secondFactorCommand.regenerateBackupCodes(selfServiceCaller(session, tenantId, request), dto.code)),
+    };
+  }
+
+  @Post(':tenantId/me/second-factor/disable')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Story 6-1b — turns two-factor sign-in off (not for owners, who must use it)',
+    description: 'Needs a current code or a backup code. Ends your other web sessions (this one stays).',
+  })
+  @ApiBody({ type: SecondFactorCodeDto })
+  @ApiOkResponse({ type: SecondFactorStatusResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The role requires two-factor sign-in (second-factor-required), it is already off (second-factor-not-enabled), or it changed meanwhile (second-factor-changed)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Wrong code (second-factor-invalid; `attemptsLeft`) — the session stays') })
+  @ApiResponse({ status: 423, ...problemJsonResponse('Too many wrong codes (second-factor-locked)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async secondFactorDisable(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Req() request: IpRequest,
+    @Body() dto: SecondFactorCodeDto,
+  ): Promise<SecondFactorStatusResponse> {
+    return { ...(await this.secondFactorCommand.disable(selfServiceCaller(session, tenantId, request), dto.code)) };
+  }
+}
+
+/** The slice of the Express request the self-service routes read (the client address). */
+interface IpRequest {
+  headers: Record<string, unknown>;
+  ip?: string;
+  socket?: { remoteAddress?: string };
+}
+
+/** Story 6-1b — the self-service caller: the session's own user, on its own tenant's path. */
+function selfServiceCaller(session: TenantSession, tenantId: string, request: IpRequest): SelfServiceCaller {
+  assertOwnTenant(session, tenantId);
+  return { tenantId, userId: session.userId, sessionId: session.sessionId, ip: clientIpOf(request) };
 }
 
 function assertOwnTenant(session: TenantSession, tenantId: string): void {

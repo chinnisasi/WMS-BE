@@ -9,6 +9,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { openCredential } from '../src/modules/carriers/carrier-credentials';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { seededIdempotencyKey } from './support/audit-guard';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -84,10 +85,7 @@ describe('carrier adapter registry + tenant credential vault (e2e)', () => {
   }
 
   async function signIn(email: string, password = 'correct-horse-battery'): Promise<string> {
-    const res = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email, password })
-      .expect(200);
+    const res = await mintSignIn(app, { email, password });
     return res.body.accessToken as string;
   }
 

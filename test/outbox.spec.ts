@@ -14,6 +14,7 @@ import {
 import type { DomainEvent, EventBus } from '../src/shared/events/event-bus.seam';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions.
@@ -234,10 +235,7 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
 
     // The users command (retro item 3): the same-key invite replay returns
     // the snapshot and writes NO second outbox row.
-    const signIn = await request(app.getHttpServer())
-      .post(`${IDENTITY_URL}/sign-in`)
-      .send({ email, password: 'correct-horse-battery' })
-      .expect(200);
+    const signIn = await mintSignIn(app, { email, password: 'correct-horse-battery' });
     const token = signIn.body.accessToken as string;
 
     const inviteKey = ulid();
@@ -416,10 +414,7 @@ describe('transactional outbox substrate and relay (e2e, story outbox-relay)', (
       .expect(201);
     const tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
-    const signedIn = await request(app.getHttpServer())
-      .post(`${IDENTITY_URL}/sign-in`)
-      .send({ email: registered.body.owner.email as string, password: 'correct-horse-battery' })
-      .expect(200);
+    const signedIn = await mintSignIn(app, { email: registered.body.owner.email as string, password: 'correct-horse-battery' });
     const [scheme, token] = Bearer(signedIn.body.accessToken as string);
 
     // warehouse.created

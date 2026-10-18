@@ -36,6 +36,7 @@ import { AuditExportWorker, parseAuditExportPollMs } from '../src/jobs/jobs.modu
 import { signTenantSession } from '../src/modules/tenancy/jwt-session';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
+import { mintSignIn } from './support/sign-in';
 
 // Story 9-3b — the async audit export: `POST/GET …/reporting/audit/exports`,
 // `GET …/exports/{id}/file`, the runner behind `runDueAuditExports` (driven
@@ -101,7 +102,7 @@ describe('the async audit export (e2e, story 9-3b)', () => {
   const httpReq = () => request(app.getHttpServer());
 
   async function signIn(email: string): Promise<string> {
-    return (await httpReq().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200)).body.accessToken as string;
+    return (await mintSignIn(app, { email, password: PASSWORD })).body.accessToken as string;
   }
 
   async function invite(role: 'owner' | 'ops_manager', inTenant = tenantId, byToken = owner.token): Promise<Member> {

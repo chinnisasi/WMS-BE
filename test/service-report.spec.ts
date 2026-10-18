@@ -14,6 +14,7 @@ import { ReportingFacade } from '../src/modules/reporting/reporting.facade';
 import { readServiceFiguresInTx } from '../src/modules/reporting/service';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // Story 21-8 — per-client service reporting (CAP-10): one facade read behind
 // an operator route and a portal route. The relational facts (orders, order
@@ -174,7 +175,7 @@ describe('per-client service reporting (e2e, story 21-8)', () => {
   // ── helpers ────────────────────────────────────────────────────────────────
 
   async function signIn(email: string): Promise<string> {
-    return (await http().post(`${API}/sign-in`).send({ email, password: PASSWORD }).expect(200)).body.accessToken as string;
+    return (await mintSignIn(app, { email, password: PASSWORD })).body.accessToken as string;
   }
 
   async function createWarehouse(code: string): Promise<string> {

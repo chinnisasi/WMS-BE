@@ -11,6 +11,7 @@ import { testAvailabilityArm } from '../src/modules/channels/channel-availabilit
 import { testWritebackArm } from '../src/modules/channels/channel-writeback-port';
 import { testAddress } from './support/shipment-address';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres and signs sessions; the vault
 // needs a real master key (any ≥32-char string — the sha256 normalizes it).
@@ -126,10 +127,7 @@ describe('channel connections, credentials and config (e2e, story 7-1)', () => {
   }
 
   async function signIn(email: string, password = 'correct-horse-battery'): Promise<string> {
-    const res = await request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email, password })
-      .expect(200);
+    const res = await mintSignIn(app, { email, password });
     return res.body.accessToken as string;
   }
 

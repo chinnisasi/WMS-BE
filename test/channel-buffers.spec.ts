@@ -9,6 +9,7 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { ChannelsFacade } from '../src/modules/channels/channels.facade';
 import { testAddress } from './support/shipment-address';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey and signs sessions.
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
@@ -86,10 +87,7 @@ describe('standing buffers: place, adjust, clear, refuse, survive the reaper, re
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     const ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     const opsEmail = `ops-${ulid().toLowerCase()}@example.com`;
     const invited = await request(app.getHttpServer())
@@ -104,10 +102,7 @@ describe('standing buffers: place, adjust, clear, refuse, survive the reaper, re
       .send({ token: invited.body.inviteToken, password: 'ops-password-123' })
       .expect(200);
     opsToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: opsEmail, password: 'ops-password-123' })
-        .expect(200)
+      await mintSignIn(app, { email: opsEmail, password: 'ops-password-123' })
     ).body.accessToken as string;
 
     const warehouse = await request(app.getHttpServer())

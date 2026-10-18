@@ -77,6 +77,12 @@ export const AUDIT_NO_OP_ARMS = {
   'users.deactivate:already-deactivated': (snapshot: unknown) => entitySnapshot(snapshot, 'user', 'deactivated'),
   /** Story 6-1a — `UsersCommand.setUserStatus` reactivate on a user who is not deactivated. */
   'users.reactivate:not-deactivated': (snapshot: unknown) => entitySnapshot(snapshot, 'user'),
+  /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
+  'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
+    isRecord(snapshot) &&
+    sameKeys(snapshot, ['enrolmentCode', 'enrolmentCodeExpiresAt']) &&
+    snapshot.enrolmentCode === null &&
+    snapshot.enrolmentCodeExpiresAt === null,
 } as const satisfies Readonly<Record<string, (snapshot: unknown) => boolean>>;
 
 export type AuditNoOpArm = keyof typeof AUDIT_NO_OP_ARMS;

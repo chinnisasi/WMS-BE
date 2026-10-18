@@ -29,6 +29,7 @@ import { EMPTY_PART_B, ewbBillObject } from '../src/modules/invoicing/eway-json'
 import { invoiceFacts, stateCodeMapsInTx } from '../src/modules/invoicing/eway-view';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -275,10 +276,7 @@ describe('invoicing: e-way bills (e2e, story 8-2b)', () => {
   // ── fixtures ───────────────────────────────────────────────────────────────
 
   function signIn(address: string, password: string): Promise<string> {
-    return request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email: address, password })
-      .expect(200)
+    return mintSignIn(app, { email: address, password })
       .then((res) => res.body.accessToken as string);
   }
 

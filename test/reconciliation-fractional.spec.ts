@@ -13,6 +13,7 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { RECONCILIATION_DIVERGENCE_EVENT } from '../src/modules/inventory/reconcile';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -100,10 +101,7 @@ describe('reconciliation over fractional stock (e2e, story 10.4)', () => {
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     opsToken = await inviteAndSignIn('ops_manager', INVITEE_PASSWORD);
 
@@ -168,10 +166,7 @@ describe('reconciliation over fractional stock (e2e, story 10.4)', () => {
       .send({ token: invited.body.inviteToken, password })
       .expect(200);
     return (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: address, password })
-        .expect(200)
+      await mintSignIn(app, { email: address, password })
     ).body.accessToken as string;
   }
 

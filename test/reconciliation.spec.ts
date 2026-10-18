@@ -26,6 +26,7 @@ import {
 } from '../src/jobs/jobs.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -105,10 +106,7 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     ownerToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     const opsEmail = `ops-${ulid().toLowerCase()}@example.com`;
     const invited = await request(app.getHttpServer())
@@ -123,10 +121,7 @@ describe('continuous replay-reconciliation (e2e, story 2.2)', () => {
       .send({ token: invited.body.inviteToken, password: INVITEE_PASSWORD })
       .expect(200);
     opsToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: opsEmail, password: INVITEE_PASSWORD })
-        .expect(200)
+      await mintSignIn(app, { email: opsEmail, password: INVITEE_PASSWORD })
     ).body.accessToken as string;
 
     // One SKU via catalog import (the only SKU-creation path).

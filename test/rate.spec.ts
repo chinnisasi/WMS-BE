@@ -10,6 +10,7 @@ import { InventoryFacade } from '../src/modules/inventory/inventory.facade';
 import { MAX_QUANTITY_MILLI } from '../src/shared/primitives/quantity';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -246,10 +247,7 @@ describe('carrier rate shopping: the read that prices one order against every li
     const tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     const signIn = (address: string, password: string) =>
-      request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: address, password })
-        .expect(200)
+      mintSignIn(app, { email: address, password })
         .then((res) => res.body.accessToken as string);
     const ownerToken = await signIn(email, 'correct-horse-battery');
     const opsToken = await inviteAndSignIn(tenantId, ownerToken, 'ops_manager', 'ops-password-123');
@@ -382,10 +380,7 @@ describe('carrier rate shopping: the read that prices one order against every li
       .set(KEY_HEADER, ulid())
       .send({ token: invited.body.inviteToken as string, password })
       .expect(200);
-    return request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email: address, password })
-      .expect(200)
+    return mintSignIn(app, { email: address, password })
       .then((res) => res.body.accessToken as string);
   }
 

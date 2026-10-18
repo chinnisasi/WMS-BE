@@ -19,6 +19,7 @@ import { reportingWindow, istMidnightBefore } from '../src/modules/reporting/win
 import { PACK_FAILURE_ENTRIES } from '../src/shared/db/schema';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -202,10 +203,7 @@ describe('reporting: the operational dashboard (e2e, story 9-1)', () => {
   // ── fixtures ───────────────────────────────────────────────────────────────
 
   function signIn(address: string, password: string): Promise<string> {
-    return request(app.getHttpServer())
-      .post(`${API}/sign-in`)
-      .send({ email: address, password })
-      .expect(200)
+    return mintSignIn(app, { email: address, password })
       .then((res) => res.body.accessToken as string);
   }
 

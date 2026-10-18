@@ -12,6 +12,7 @@ import {
   ApiProperty,
   ApiResponse,
   ApiTags,
+  getSchemaPath,
 } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../../shared/problem-details/problem-details.openapi';
@@ -29,6 +30,9 @@ import {
   refreshCookieHeader,
 } from './session-cookie';
 
+/** Story 6-1b — the header a web build that can complete the second step sends on sign-in. */
+const SECOND_FACTOR_HEADER = 'x-wms-second-factor';
+
 /** The slice of the Express request / response the session routes touch. */
 interface SessionHttpRequest {
   headers: Record<string, unknown>;
@@ -45,6 +49,7 @@ import {
   BinCommand,
   RegistrationCommand,
   SessionCommand,
+  SecondFactorCommand,
   SignInCommand,
   WarehouseCommand,
   ZoneCommand,
@@ -66,6 +71,10 @@ import {
   RegisterTenantDto,
   SignInDto,
   SignInResponse,
+  TotpChallengeResponse,
+  EnrollChallengeResponse,
+  SecondFactorSignInDto,
+  SecondFactorSignInResponse,
   RefreshResponse,
   TenantRegistrationResponse,
   WarehouseListResponse,
@@ -116,6 +125,7 @@ export class TenancyController {
   constructor(
     private readonly registrationCommand: RegistrationCommand,
     private readonly signInCommand: SignInCommand,
+    private readonly secondFactorCommand: SecondFactorCommand,
     private readonly sessionCommand: SessionCommand,
     private readonly warehouseCommand: WarehouseCommand,
     private readonly zoneCommand: ZoneCommand,
@@ -148,25 +158,76 @@ export class TenancyController {
   @Post('sign-in')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
-    summary: 'Verifies the password, opens a server-side session and issues a short access token',
+    summary: 'Verifies the password; opens a server-side session — or, story 6-1b, asks for the second factor first',
     description:
-      'Story 6-1a: also sets the httpOnly refresh cookie (`wms_refresh`, path /api/v1/tenants/session). Attempts are counted per (email, client IP) BEFORE the password check: 5 consecutive failures lock that pair for 15 minutes (423 for any password, real or unknown email alike); 300 attempts a minute per client IP answer 429.',
+      'Story 6-1a: a session answer also sets the httpOnly refresh cookie (`wms_refresh`, path /api/v1/tenants/session). Attempts are counted per (email, client IP) BEFORE the password check: 5 consecutive failures lock that pair for 15 minutes (423 for any password, real or unknown email alike); 300 attempts a minute per client IP answer 429. ' +
+      'Story 6-1b: a user with two-factor sign-in set up gets `TotpChallengeResponse`; an owner who has not set it up yet gets `EnrollChallengeResponse` — both create no session and set no cookie, and are completed at `POST /tenants/sign-in/second-factor`. Clients tell the arms apart by the presence of `challenge`. A web client that can complete the second step sends `X-WMS-Second-Factor: 1`; without it, a sign-in that needs the second step answers 409 `client-outdated` and writes nothing.',
   })
   @ApiBody({ type: SignInDto })
-  @ApiOkResponse({ type: SignInResponse })
+  @ApiHeaders([
+    {
+      name: 'X-WMS-Second-Factor',
+      required: false,
+      description: 'Story 6-1b — `1` from a client that can complete the second step',
+      schema: { type: 'string', enum: ['1'] },
+    },
+  ])
+  @ApiExtraModels(SignInResponse, TotpChallengeResponse, EnrollChallengeResponse)
+  @ApiOkResponse({
+    schema: {
+      oneOf: [
+        { $ref: getSchemaPath(SignInResponse) },
+        { $ref: getSchemaPath(TotpChallengeResponse) },
+        { $ref: getSchemaPath(EnrollChallengeResponse) },
+      ],
+    },
+  })
   @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Unknown email, wrong password, or a deactivated account (unauthenticated — one answer for all three)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Invitation not yet accepted (invite-pending), or a client-portal user whose client is not active (client-suspended, story 21-7)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Story 6-1b — the second step is needed and the client did not send `X-WMS-Second-Factor: 1` (client-outdated: "Reload this page to sign in"); nothing was written') })
   @ApiResponse({ status: 423, ...problemJsonResponse('Too many failed attempts for this email from this address (sign-in-locked; `retryAfterSeconds`)') })
   @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited; `retryAfterSeconds`)') })
   async signIn(
     @Body() dto: SignInDto,
     @Req() request: SessionHttpRequest,
     @Res({ passthrough: true }) response: SessionHttpResponse,
-  ): Promise<SignInResponse> {
-    const { refreshCookie, ...body } = await this.signInCommand.execute({
+  ): Promise<SignInResponse | TotpChallengeResponse | EnrollChallengeResponse> {
+    const outcome = await this.signInCommand.execute({
       email: dto.email,
       password: dto.password,
+      ip: clientIpOf(request),
+      secondFactorCapable: request.headers[SECOND_FACTOR_HEADER] === '1',
+    });
+    // Story 6-1b — a challenge creates no session and sets no cookie.
+    if ('challenge' in outcome) return outcome;
+    const { refreshCookie, ...body } = outcome;
+    response.setHeader('Set-Cookie', refreshCookieHeader(refreshCookie, body.refreshExpiresInSeconds));
+    return body;
+  }
+
+  @Post('sign-in/second-factor')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Story 6-1b — completes a sign-in with the second factor and opens the session',
+    description:
+      'Not keyed: it issues a credential. A `totp` challenge takes a 6-digit code (steps t−1…t+1, each usable once) or a backup code; an `enroll` challenge takes a code from the newly set-up app (and, after an owner\u2019s reset, the one-time `enrolmentCode`), then answers the ten backup codes once. Every attempt is counted BEFORE the code is checked: 5 consecutive wrong codes lock two-factor sign-in for 15 minutes; the third lock without a success lasts until an owner unlocks it. Sets the refresh cookie like sign-in.',
+  })
+  @ApiBody({ type: SecondFactorSignInDto })
+  @ApiOkResponse({ type: SecondFactorSignInResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Wrong code (second-factor-invalid; `attemptsLeft`), or the challenge is unknown, expired, used, out of attempts, or the account changed (challenge-ended — sign in again)') })
+  @ApiResponse({ status: 423, ...problemJsonResponse('Too many wrong codes (second-factor-locked; `retryAfterSeconds`, null until an owner unlocks)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited; `retryAfterSeconds`)') })
+  async signInSecondFactor(
+    @Body() dto: SecondFactorSignInDto,
+    @Req() request: SessionHttpRequest,
+    @Res({ passthrough: true }) response: SessionHttpResponse,
+  ): Promise<SecondFactorSignInResponse> {
+    const { refreshCookie, ...body } = await this.secondFactorCommand.completeSignIn({
+      challengeToken: dto.challengeToken,
+      code: dto.code,
+      enrolmentCode: dto.enrolmentCode ?? null,
       ip: clientIpOf(request),
     });
     response.setHeader('Set-Cookie', refreshCookieHeader(refreshCookie, body.refreshExpiresInSeconds));

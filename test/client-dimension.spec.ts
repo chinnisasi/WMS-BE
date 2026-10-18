@@ -14,6 +14,7 @@ import { CLIENT_STATUSES } from '../src/modules/clients/clients.schema';
 import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -398,10 +399,7 @@ describe('story 21-1: the client dimension — one system-owned self client per 
         .expect(201);
       tenantId = registered.body.tenant.id as string;
       ownerToken = (
-        await request(app.getHttpServer())
-          .post(`${API}/sign-in`)
-          .send({ email, password: 'correct-horse-battery' })
-          .expect(200)
+        await mintSignIn(app, { email, password: 'correct-horse-battery' })
       ).body.accessToken as string;
 
       warehouseId = (

@@ -23,6 +23,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { expectAuditRow } from './support/audit-guard';
 import { dispatchedOrderFixtures, type Picklist } from './support/dispatched-order';
+import { mintSignIn } from './support/sign-in';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -148,7 +149,7 @@ describe('return receipts (e2e, story 13-2)', () => {
       .send({ name: `Return Receipts Co ${ulid()}`, ownerEmail: email, password: 'correct-horse-battery' })
       .expect(201);
     tenantId = registered.body.tenant.id as string;
-    ownerToken = (await http().post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200)).body.accessToken as string;
+    ownerToken = (await mintSignIn(app, { email, password: 'correct-horse-battery' })).body.accessToken as string;
     opsToken = (await createMember('ops_manager')).token;
     const floor = await createMember('operator');
     operatorUserId = floor.userId;
@@ -257,7 +258,7 @@ describe('return receipts (e2e, story 13-2)', () => {
       .set(KEY_HEADER, ulid())
       .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
       .expect(200);
-    const token = (await http().post(`${API}/sign-in`).send({ email, password: 'correct-horse-battery' }).expect(200)).body.accessToken as string;
+    const token = (await mintSignIn(app, { email, password: 'correct-horse-battery' })).body.accessToken as string;
     return { userId: invited.body.user.id as string, token, email };
   }
 

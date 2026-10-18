@@ -12,6 +12,7 @@ import { ORDER_LINE_STATUSES, ORDER_SOURCES, ORDER_STATUSES } from '../src/modul
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
+import { mintSignIn } from './support/sign-in';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -80,10 +81,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     tenantId = registered.body.tenant.id as string;
     createdTenantIds.push(tenantId);
     const signIn = (email: string, password: string) =>
-      request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email, password })
-        .expect(200)
+      mintSignIn(app, { email, password })
         .then((res) => res.body.accessToken as string);
     ownerToken = await signIn(email, 'correct-horse-battery');
 
@@ -966,10 +964,7 @@ describe('orders: manual entry, idempotent ingestion, acceptance reservation, ca
     const foreignTenantId = foreign.body.tenant.id as string;
     createdTenantIds.push(foreignTenantId);
     const foreignToken = (
-      await request(app.getHttpServer())
-        .post(`${API}/sign-in`)
-        .send({ email: foreignEmail, password: 'correct-horse-battery' })
-        .expect(200)
+      await mintSignIn(app, { email: foreignEmail, password: 'correct-horse-battery' })
     ).body.accessToken as string;
     const foreignWh = await request(app.getHttpServer())
       .post(`${API}/${foreignTenantId}/warehouses`)
