@@ -11,6 +11,7 @@ import {
 } from './jwt-session';
 import { deviceSessionEnded } from './session-cookie';
 import { checkSessionInTx } from './sessions';
+import { deviceRevoked } from './enrollment.command';
 
 export interface DeviceSessionRequest {
   headers: Record<string, unknown>;
@@ -79,6 +80,9 @@ export async function verifyDeviceRequest(db: Database, headers: Record<string, 
     );
     if (!check.ok) {
       if (check.reason === 'invalid') throw unauthenticated('The device token is invalid.');
+      // A revoked device keeps its existing answer: handhelds quarantine
+      // their queue on 403 `device-revoked` (the replay fate table).
+      if (check.reason === 'device-revoked') throw deviceRevoked();
       throw deviceSessionEnded(check.reason);
     }
     // Story 6-1a (A4) — a queued op names the operator who captured it; it

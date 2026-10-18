@@ -556,7 +556,10 @@ describe('the async audit export (e2e, story 9-3b)', () => {
       expect((await postExport({ actionPrefix: 'a%' }, owner).expect(400)).body.code).toBe('validation-failed');
       expect((await postExport({ targetType: 'spaceship' }, owner).expect(400)).body.code).toBe('validation-failed');
       expect((await postExport({ reference: 'x' }, owner).expect(400)).body.code).toBe('validation-failed');
-      const portalToken = signTenantSession(tenantId, owner.userId, process.env.JWT_SECRET!, undefined, uuidv7());
+      const portalToken = signTenantSession(
+        { tenantId, userId: owner.userId, sessionId: uuidv7(), kind: 'portal', clientId: uuidv7() },
+        process.env.JWT_SECRET!,
+      );
       const fenced = await httpReq()
         .post(`${API}/${tenantId}/reporting/audit/exports`)
         .set('Authorization', `Bearer ${portalToken}`)

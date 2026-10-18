@@ -268,12 +268,20 @@ describe('the audit trail read (e2e, story 9-3a)', () => {
     expect(res.body.detail).toContain('audit.view');
   });
 
-  it('a client-portal session is refused by the operator fence; another tenant is 403 permission-denied', async () => {
-    const portalToken = signTenantSession(tenantId, ownerUserId, tenantSessionSecret(), undefined, uuidv7());
+  it('a client-portal session is refused by the operator fence; a token naming no live session is 401', async () => {
+    const portalToken = signTenantSession(
+      { tenantId, userId: ownerUserId, sessionId: uuidv7(), kind: 'portal', clientId: uuidv7() },
+      tenantSessionSecret(),
+    );
     const portal = await audit({}, portalToken).expect(403);
     expect(portal.body).toMatchObject({ code: 'role-denied', detail: 'This is an operator surface.' });
-    const foreign = signTenantSession(uuidv7(), ownerUserId, tenantSessionSecret());
-    expect((await audit({}, foreign).expect(403)).body.code).toBe('permission-denied');
+    // Story 6-1a — a forged-tenant token names no server-side session: the
+    // guard answers 401 before the controller's tenant check is reached.
+    const foreign = signTenantSession(
+      { tenantId: uuidv7(), userId: ownerUserId, sessionId: uuidv7(), kind: 'web' },
+      tenantSessionSecret(),
+    );
+    expect((await audit({}, foreign).expect(401)).body.code).toBe('unauthenticated');
   });
 
   it('a read past its 5 s budget is 503 report-unavailable ("narrow the filters"), never a partial page', async () => {

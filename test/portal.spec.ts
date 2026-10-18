@@ -440,6 +440,10 @@ describe('client portal (e2e, story 21-7)', () => {
     'POST api/v1/echo',
     'POST api/v1/tenants',
     'POST api/v1/tenants/sign-in',
+    // Story 6-1a — cookie-only: the refresh cookie names the session, and the
+    // Origin + X-WMS-Session check replaces a bearer guard.
+    'POST api/v1/tenants/session/refresh',
+    'POST api/v1/tenants/session/sign-out',
     'POST api/v1/tenants/:tenantId/accept-invite',
     'POST api/v1/tenants/:tenantId/devices/enroll',
     'POST api/v1/tenants/:tenantId/webhooks/channels/:provider/:connectionId/orders',
@@ -595,23 +599,32 @@ describe('client portal (e2e, story 21-7)', () => {
     it('the users list carries the client user with its client', async () => {
       const list = await http().get(`${API}/${tenantId}/users?limit=200`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
       const row = (list.body.items as { id: string }[]).find((item) => item.id === portalA.userId);
-      expect(row).toEqual({ id: portalA.userId, email: portalA.email, role: 'client', status: 'active', clientId: clientA, createdAt: expect.any(String) });
+      expect(row).toEqual({ id: portalA.userId, email: portalA.email, role: 'client', status: 'active', clientId: clientA, createdAt: expect.any(String), lockedUntil: null });
     });
   });
 
   // ── the token ─────────────────────────────────────────────────────────────
 
   describe('the session token (AD-4 amended for the fence only)', () => {
-    it('an operator token’s payload keys are exactly sub, tenant_id, iat, exp — byte for byte', async () => {
-      expect(Object.keys(payloadOf(ownerToken))).toEqual(['sub', 'tenant_id', 'iat', 'exp']);
+    it('an operator token’s payload keys are exactly sub, tenant_id, kind, sid, iat, exp — byte for byte (6-1a)', async () => {
+      expect(Object.keys(payloadOf(ownerToken))).toEqual(['sub', 'tenant_id', 'kind', 'sid', 'iat', 'exp']);
       const user = uuidv7();
-      const token = signTenantSession(tenantId, user, 'pinned-secret-0123456789', 1_000);
+      const sid = uuidv7();
+      const token = signTenantSession(
+        { tenantId, userId: user, sessionId: sid, kind: 'web', nowSeconds: 1_000 },
+        'pinned-secret-0123456789',
+      );
       const [header, payload] = token.split('.');
       expect(Buffer.from(header!, 'base64url').toString('utf8')).toBe('{"alg":"HS256","typ":"JWT"}');
-      expect(Buffer.from(payload!, 'base64url').toString('utf8')).toBe(`{"sub":"${user}","tenant_id":"${tenantId}","iat":1000,"exp":1900}`);
-      const portal = signTenantSession(tenantId, user, 'pinned-secret-0123456789', 1_000, clientA);
+      expect(Buffer.from(payload!, 'base64url').toString('utf8')).toBe(
+        `{"sub":"${user}","tenant_id":"${tenantId}","kind":"web","sid":"${sid}","iat":1000,"exp":1900}`,
+      );
+      const portal = signTenantSession(
+        { tenantId, userId: user, sessionId: sid, kind: 'portal', clientId: clientA, nowSeconds: 1_000 },
+        'pinned-secret-0123456789',
+      );
       expect(Buffer.from(portal.split('.')[1]!, 'base64url').toString('utf8')).toBe(
-        `{"sub":"${user}","tenant_id":"${tenantId}","client_id":"${clientA}","iat":1000,"exp":1900}`,
+        `{"sub":"${user}","tenant_id":"${tenantId}","client_id":"${clientA}","kind":"portal","sid":"${sid}","iat":1000,"exp":1900}`,
       );
     });
 
@@ -629,7 +642,8 @@ describe('client portal (e2e, story 21-7)', () => {
 
     it('odd tokens are invalid: client_id null, non-UUID or numeric, or beside device_id → 401', async () => {
       const now = Math.floor(Date.now() / 1000);
-      const base = { sub: portalA.userId, tenant_id: tenantId, iat: now, exp: now + 600 };
+      // Story 6-1a — current-shape tokens carry `kind` and `sid`.
+      const base = { sub: portalA.userId, tenant_id: tenantId, kind: 'portal', sid: uuidv7(), iat: now, exp: now + 600 };
       for (const odd of [
         { ...base, client_id: null },
         { ...base, client_id: 'not-a-uuid' },
@@ -645,7 +659,9 @@ describe('client portal (e2e, story 21-7)', () => {
       expect(verifyDeviceSession(signRaw({ device_id: uuidv7(), tenant_id: tenantId, sub: portalA.userId, client_id: clientA, iat: now, exp: now + 600 }), process.env.JWT_SECRET!)).toBeNull();
       // Meaningful: the well-formed shapes verify.
       expect(verifyTenantSession(signRaw({ ...base, client_id: clientA }), process.env.JWT_SECRET!)).toMatchObject({ clientId: clientA });
-      expect(verifyTenantSession(signRaw(base), process.env.JWT_SECRET!)).toMatchObject({ clientId: null });
+      expect(verifyTenantSession(signRaw({ ...base, kind: 'web' }), process.env.JWT_SECRET!)).toMatchObject({ clientId: null });
+      // A portal kind without client_id (or a web kind with one) is invalid.
+      expect(verifyTenantSession(signRaw(base), process.env.JWT_SECRET!)).toBeNull();
     });
 
     it('a suspended client: a wrong password stays 401; the right one is 403 client-suspended; a live token’s next portal call is 403 client-suspended', async () => {

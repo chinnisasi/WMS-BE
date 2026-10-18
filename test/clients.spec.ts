@@ -1611,28 +1611,37 @@ describe('story 21-2b: client admin and attribution', () => {
         try {
           expectProblem(await draftRateCard(suspId), 409, 'client-not-active');
           expectProblem(await invitePortal(suspId), 409, 'client-not-active');
-          expectProblem(await announce(portal.token), 403, 'client-suspended');
+          // Story 6-1a — the suspension ended the portal session itself.
+          const ended = await announce(portal.token);
+          expect(ended.status).toBe(401);
+          expect(ended.body).toMatchObject({ code: 'session-ended', reason: 'client-suspended' });
           // Decision 1: operator work for a suspended client behaves as today.
           await createOrder([{ skuId: suspSkuId, quantity: 1 }]).expect(201);
         } finally {
           await setStatus(suspId, 'active').expect(200);
         }
         await draftRateCard(suspId).expect(201);
-        await announce(portal.token).expect(201);
+        const fresh = await signIn(portal.email).expect(200);
+        await announce(fresh.body.accessToken as string).expect(201);
       });
 
-      it('portal end to end: signed in → suspended (me and sign-in 403 client-suspended) → reactivated (the same token works again)', async () => {
+      it('portal end to end: signed in → suspended (the session ends; sign-in 403 client-suspended) → reactivated (sign in again)', async () => {
         const portal = await portalUser(suspId);
         await portalMe(portal.token).expect(200);
 
         await setStatus(suspId, 'suspended').expect(200);
-        expectProblem(await portalMe(portal.token), 403, 'client-suspended');
+        // Story 6-1a — the suspension revoked the portal session: 401 with the reason.
+        const ended = await portalMe(portal.token);
+        expect(ended.status).toBe(401);
+        expect(ended.body).toMatchObject({ code: 'session-ended', reason: 'client-suspended' });
         expectProblem(await signIn(portal.email), 403, 'client-suspended');
 
         await setStatus(suspId, 'active').expect(200);
-        const me = await portalMe(portal.token).expect(200);
+        // The old session stays ended; a fresh sign-in works.
+        expect((await portalMe(portal.token)).status).toBe(401);
+        const fresh = await signIn(portal.email).expect(200);
+        const me = await portalMe(fresh.body.accessToken as string).expect(200);
         expect(me.body.client).toEqual({ id: suspId, code: 'SUSP-A', name: 'Suspendable Brand' });
-        await signIn(portal.email).expect(200);
       });
 
       describe('races (deterministic: parked waiters, pg_blocking_pids)', () => {
