@@ -2257,7 +2257,9 @@ describe('picking: scan-verified picks with offline tolerance (e2e, story 4.3)',
     expect(revoked.body.code).toBe('device-revoked');
     expect(await lineStatus(line.id)).toBe('planned');
     // Un-revoke so the remaining assertions in this suite keep a live device.
+    // Story 6-1a — the revoke also ended the badge session; revive it too.
     await sql`update devices set status = 'active' where id = ${deviceId}`;
+    await sql`update sessions set revoked_at = null, revoked_reason = null where device_id = ${deviceId} and revoked_reason = 'device-revoked'`;
   });
 
   it('an explicit `serials: null` body — what the device sends for EVERY untracked-SKU pick — is accepted', async () => {
