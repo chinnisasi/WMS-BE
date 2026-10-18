@@ -14,5 +14,5 @@ if (email === undefined || !email.includes('@')) {
 }
 const db = createDatabase();
 const cleared = await unlockSignIn(db, email);
-console.log(cleared === 0 ? `${email}: no lock to clear` : `${email}: cleared ${cleared} lock record(s)`);
+process.stdout.write(`${cleared === 0 ? `${email}: no lock to clear` : `${email}: cleared ${cleared} lock record(s)`}\n`);
 process.exit(0);
