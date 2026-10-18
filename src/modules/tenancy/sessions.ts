@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type { Database } from '../../shared/db/db';
+import { isUuid } from '../../shared/primitives/ids';
 import { sessions } from '../../shared/db/schema';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 
@@ -218,6 +219,34 @@ export async function revokeSessionsInTx(
   return revoked.length;
 }
 
+/**
+ * Code review — does this secret belong to the session (its current or its
+ * previous refresh token)? Sign-out by cookie checks it: the `sid` alone is
+ * readable from any access token and must not be enough to end a session.
+ */
+export async function refreshSecretMatchesInTx(tx: TenantTx, sessionId: string, secret: string): Promise<boolean> {
+  const rows = await tx
+    .select({ current: sessions.refreshHash, previous: sessions.prevRefreshHash })
+    .from(sessions)
+    .where(eq(sessions.id, sessionId))
+    .limit(1);
+  const row = rows[0];
+  if (row === undefined) return false;
+  const presented = hashSecret(secret);
+  return (row.current !== null && sameHash(presented, row.current)) || (row.previous !== null && sameHash(presented, row.previous));
+}
+
+/** Code review — does the device hold a badge session that is still live (not revoked, not past its end)? */
+export async function hasLiveBadgeSessionInTx(tx: TenantTx, tenantId: string, deviceId: string): Promise<boolean> {
+  const rows = (await tx.execute(sql`
+    select 1 from sessions
+     where tenant_id = ${tenantId} and device_id = ${deviceId} and kind = 'badge'
+       and revoked_at is null and absolute_expires_at > now()
+     limit 1
+  `)) as unknown as unknown[];
+  return rows.length > 0;
+}
+
 /** The refresh cookie's value: `<sid>.<secret>`. */
 export function parseRefreshCookie(value: unknown): { sessionId: string; secret: string } | null {
   if (typeof value !== 'string') return null;
@@ -225,7 +254,7 @@ export function parseRefreshCookie(value: unknown): { sessionId: string; secret:
   if (dot <= 0 || dot === value.length - 1) return null;
   const sessionId = value.slice(0, dot);
   const secret = value.slice(dot + 1);
-  if (!/^[0-9a-f-]{36}$/i.test(sessionId) || !/^[A-Za-z0-9_-]{20,100}$/.test(secret)) return null;
+  if (!isUuid(sessionId) || !/^[A-Za-z0-9_-]{20,100}$/.test(secret)) return null;
   return { sessionId, secret };
 }
 

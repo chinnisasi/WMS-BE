@@ -222,7 +222,12 @@ export function clientIpOf(request: {
     const raw = Array.isArray(header) ? header.join(',') : typeof header === 'string' ? header : '';
     const chain = raw.split(',').map((part) => part.trim()).filter((part) => part.length > 0);
     const candidate = chain[chain.length - hops];
-    if (candidate !== undefined) return candidate;
+    if (candidate !== undefined) return normaliseIp(candidate);
   }
-  return request.socket?.remoteAddress ?? request.ip ?? 'unknown';
+  return normaliseIp(request.socket?.remoteAddress ?? request.ip ?? 'unknown');
+}
+
+/** An IPv4 address seen through an IPv6 socket (`::ffff:a.b.c.d`) keys as `a.b.c.d`. */
+function normaliseIp(address: string): string {
+  return address.startsWith('::ffff:') && address.includes('.') ? address.slice('::ffff:'.length) : address;
 }

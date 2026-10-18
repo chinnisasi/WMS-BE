@@ -197,7 +197,10 @@ export class TenancyController {
       }
       return body;
     } catch (error) {
-      if (error instanceof ProblemException && error.getStatus() === 401) {
+      // Only an ENDED session clears the cookie: an unrecognised secret (a
+      // stale tab presenting an older rotation) must not wipe the jar's
+      // newest cookie and sign every tab out.
+      if (error instanceof ProblemException && (error.getResponse() as { code?: unknown }).code === 'session-ended') {
         response.setHeader('Set-Cookie', clearedRefreshCookieHeader());
       }
       throw error;

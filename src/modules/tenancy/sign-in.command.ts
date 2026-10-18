@@ -98,6 +98,9 @@ export class SignInCommand {
       // rejection is time-indistinguishable from the 401 paths (no
       // enumeration of pending invites via timing).
       await verifyPassword(command.password, DUMMY_HASH);
+      // Code review — not a guess at a password (an invitee has none): this
+      // refusal never counts toward the lock.
+      await clearSignInAttempts(this.db, email, command.ip);
       throw new ProblemException(
         'invite-pending',
         403,
@@ -134,6 +137,8 @@ export class SignInCommand {
     if (user.clientId !== null) {
       const facts = await readSessionClientIn(this.authDb, user.tenantId, user.clientId);
       if (facts === null || facts.status !== 'active') {
+        // The password was right: a suspension is not a failed attempt.
+        await clearSignInAttempts(this.db, email, command.ip);
         throw clientSuspended();
       }
       client = { id: facts.id, code: facts.code, name: facts.name };

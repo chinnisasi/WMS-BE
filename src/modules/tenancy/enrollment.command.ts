@@ -33,7 +33,7 @@ import {
   hitRateLimit,
   settleBadgeInFailureInTx,
 } from './auth-attempts';
-import { createSessionInTx, revokeSessionsInTx } from './sessions';
+import { createSessionInTx, hasLiveBadgeSessionInTx, revokeSessionsInTx } from './sessions';
 
 export const DEFAULT_DEVICE_PAGE_SIZE = 50;
 export const MAX_DEVICE_PAGE_SIZE = 200;
@@ -595,14 +595,20 @@ export class EnrollmentCommand {
       const operator = operatorRows[0];
 
       const pinOk = await verifyPassword(command.pin, device.pinHash ?? DUMMY_HASH);
-      const bound =
-        operator !== undefined &&
-        operator.status === 'active' &&
-        (device.operatorUserId === null || device.operatorUserId === operator.id);
+      // Code review — a device whose bound operator has no LIVE badge session
+      // (the shift ended, or it was never badged in) is free for the next
+      // operator: their queued scans are held for review on the device (A4),
+      // so nothing replays under the newcomer.
+      const bindingFree =
+        device.operatorUserId === null ||
+        (operator !== undefined && device.operatorUserId === operator.id) ||
+        !(await hasLiveBadgeSessionInTx(tx, command.tenantId, device.id));
+      const bound = operator !== undefined && operator.status === 'active' && bindingFree;
       if (!pinOk || !bound) {
-        // Not thrown here: the throw would roll back nothing we need, but the
-        // lock settlement must commit — it runs after this transaction.
-        return { ok: false as const };
+        // Not thrown here: the lock settlement must commit, after this
+        // transaction. Only a WRONG PIN counts toward the lock — a right PIN
+        // refused for another reason clears the count (code review).
+        return { ok: false as const, pinOk, refusal: badgeInvalid() };
       }
       // Story 21-7 — a client-portal user never binds a floor device. AFTER
       // the PIN and binding checks, so a wrong PIN stays the one
@@ -611,12 +617,16 @@ export class EnrollmentCommand {
       // nothing. An allowlist: floor roles bind; the accountant keeps its
       // pre-21-7 badge-in (refused per command instead); every other role is refused.
       if (!(isFloorRole(operator.role) || operator.role === 'accountant')) {
-        throw new ProblemException(
-          'role-denied',
-          403,
-          'Role lacks the required capability',
-          `Role "${operator.role}" cannot operate a floor device.`,
-        );
+        return {
+          ok: false as const,
+          pinOk: true,
+          refusal: new ProblemException(
+            'role-denied',
+            403,
+            'Role lacks the required capability',
+            `Role "${operator.role}" cannot operate a floor device.`,
+          ),
+        };
       }
 
       await clearBadgeInAttemptsInTx(tx, command.tenantId, device.id);
@@ -658,9 +668,11 @@ export class EnrollmentCommand {
     });
     if (!outcome.ok) {
       await withTenantTransaction(this.db, command.tenantId, (tx) =>
-        settleBadgeInFailureInTx(tx, command.tenantId, command.deviceId),
+        outcome.pinOk
+          ? clearBadgeInAttemptsInTx(tx, command.tenantId, command.deviceId)
+          : settleBadgeInFailureInTx(tx, command.tenantId, command.deviceId),
       );
-      throw badgeInvalid();
+      throw outcome.refusal;
     }
     return outcome.snapshot;
   }

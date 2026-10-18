@@ -8,6 +8,7 @@ import { sessionEnded } from './session-cookie';
 import {
   parseRefreshCookie,
   refreshCookieValue,
+  refreshSecretMatchesInTx,
   refreshSessionInTx,
   revokeSessionsInTx,
   sessionTenantOf,
@@ -48,6 +49,8 @@ export class SessionCommand {
       if (outcome.reason === 'invalid') throw noSession();
       throw sessionEnded(outcome.reason);
     }
+    // The session's last second: nothing left to mint a token for.
+    if (outcome.absoluteInSeconds <= 0) throw sessionEnded('absolute');
     const ttl = Math.min(SESSION_TTL_SECONDS, outcome.absoluteInSeconds);
     return {
       accessToken: signTenantSession(
@@ -75,14 +78,25 @@ export class SessionCommand {
    * session, or one already ended, is a quiet success.
    */
   async signOut(cookie: string | null, bearer: string | null): Promise<void> {
-    let sessionId = parseRefreshCookie(cookie)?.sessionId ?? null;
-    if (sessionId === null && bearer !== null) {
-      const payload = decodeSignedPayload(bearer, tenantSessionSecret());
-      if (payload !== null && (payload.kind === 'web' || payload.kind === 'portal') && typeof payload.sid === 'string') {
-        sessionId = payload.sid;
+    // Code review — the cookie names a session only when its SECRET matches
+    // (the `sid` is readable from any access token); a bearer names one only
+    // through a valid signature (its expiry is not checked).
+    const fromCookie = parseRefreshCookie(cookie);
+    if (fromCookie !== null) {
+      const tenantId = await sessionTenantOf(this.authDb, fromCookie.sessionId);
+      if (tenantId !== null) {
+        const ended = await withTenantTransaction(this.db, tenantId, async (tx) => {
+          if (!(await refreshSecretMatchesInTx(tx, fromCookie.sessionId, fromCookie.secret))) return false;
+          await revokeSessionsInTx(tx, tenantId, { sessionId: fromCookie.sessionId, kinds: ['web', 'portal'] }, 'signed-out');
+          return true;
+        });
+        if (ended) return;
       }
     }
-    if (sessionId === null) return;
+    if (bearer === null) return;
+    const payload = decodeSignedPayload(bearer, tenantSessionSecret());
+    if (payload === null || (payload.kind !== 'web' && payload.kind !== 'portal') || typeof payload.sid !== 'string') return;
+    const sessionId = payload.sid;
     const tenantId = await sessionTenantOf(this.authDb, sessionId);
     if (tenantId === null) return;
     await withTenantTransaction(this.db, tenantId, (tx) =>

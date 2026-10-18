@@ -1441,12 +1441,19 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, OnApplication
     if (this.running) return 0;
     this.running = true;
     try {
-      const purged = await purgeEndedSessions(this.db, this.authDb);
-      await purgeAuthCounters(this.db);
+      // Independent: a failing session purge never stops the counter purge.
+      let purged = 0;
+      try {
+        purged = await purgeEndedSessions(this.db, this.authDb);
+      } catch (error) {
+        this.logger.error(`Session purge failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      try {
+        await purgeAuthCounters(this.db);
+      } catch (error) {
+        this.logger.error(`Attempt-counter purge failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
       return purged;
-    } catch (error) {
-      this.logger.error(`Session purge failed: ${error instanceof Error ? error.message : String(error)}`);
-      return 0;
     } finally {
       this.running = false;
     }

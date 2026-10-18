@@ -7,6 +7,9 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { USER_STATUSES } from '../src/shared/db/schema';
 import { USER_STATUSES as USER_STATUSES_DTO } from '../src/modules/tenancy/tenancy.dto';
 import { SESSION_KINDS, SESSION_REVOKE_REASONS } from '../src/modules/tenancy/sessions';
+import { clientIpOf, unlockSignIn } from '../src/modules/tenancy/auth-attempts';
+import { signTenantSession } from '../src/modules/tenancy/jwt-session';
+import { SessionPurgeWorker } from '../src/jobs/jobs.module';
 import { signDeviceToken, tenantSessionSecret } from '../src/modules/tenancy/jwt-session';
 import { REFRESH_COOKIE_NAME } from '../src/modules/tenancy/session-cookie';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -159,9 +162,11 @@ describe('secure sessions (e2e, story 6-1a)', () => {
         select conname, pg_get_constraintdef(oid) as def from pg_constraint
          where conname in ('users_status_check', 'sessions_kind_check', 'sessions_revoked_reason_check')`;
       const def = (name: string) => checks.find((row) => row.conname === name)!.def;
-      for (const status of USER_STATUSES) expect(def('users_status_check')).toContain(`'${status}'`);
-      for (const kind of SESSION_KINDS) expect(def('sessions_kind_check')).toContain(`'${kind}'`);
-      for (const reason of SESSION_REVOKE_REASONS) expect(def('sessions_revoked_reason_check')).toContain(`'${reason}'`);
+      // Both directions: every TS value is in the CHECK and the CHECK holds nothing else.
+      const literals = (text: string) => [...text.matchAll(/'([a-z-]+)'::text/g)].map((match) => match[1]).sort();
+      expect(literals(def('users_status_check'))).toEqual([...USER_STATUSES].sort());
+      expect(literals(def('sessions_kind_check'))).toEqual([...SESSION_KINDS].sort());
+      expect(literals(def('sessions_revoked_reason_check'))).toEqual([...SESSION_REVOKE_REASONS].sort());
     });
 
     it('RLS: the app role sees only its own tenant’s sessions (wms_rls_probe)', async () => {
@@ -446,7 +451,7 @@ describe('secure sessions (e2e, story 6-1a)', () => {
       await badgeIn(t.tenantId, device.deviceToken, op.email, '1357').expect(200);
     });
 
-    it('badge-in limit is per device: 30 operators badging in on 30 devices behind one address all succeed', async () => {
+    it('badge-in limit is per device: a device past 30 attempts a minute is 429 while another device behind the same address badges in', async () => {
       const t = await registerTenant();
       const owner = await signIn(t.email);
       const op = await createMember(owner.token, t.tenantId, 'operator');
@@ -555,6 +560,185 @@ describe('secure sessions (e2e, story 6-1a)', () => {
       expect((await echo(t.tenantId, token, uuidv7()).expect(409)).body.code).toBe('operator-mismatch');
       await echo(t.tenantId, token, a.userId).expect(200);
       await echo(t.tenantId, token).expect(200);
+    });
+  });
+  // ── code review additions ──────────────────────────────────────────────────
+
+  describe('code review: sign-out, refresh and guard edges', () => {
+    const payloadOf = (token: string) => JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString('utf8')) as { sid: string; sub: string };
+
+    it('sign-out by bearer works with an EXPIRED access token', async () => {
+      const t = await registerTenant();
+      const s = await signIn(t.email);
+      const { sid } = payloadOf(s.token);
+      const expired = signTenantSession(
+        { tenantId: t.tenantId, userId: t.ownerId, sessionId: sid, kind: 'web', nowSeconds: Math.floor(Date.now() / 1000) - 3600 },
+        tenantSessionSecret(),
+      );
+      await signOut(null, expired).expect(204);
+      const [row] = await sql`select revoked_reason from sessions where id = ${sid}`;
+      expect(row!.revoked_reason).toBe('signed-out');
+    });
+
+    it('sign-out by a cookie with the right sid but a WRONG secret ends nothing', async () => {
+      const t = await registerTenant();
+      const s = await signIn(t.email);
+      const { sid } = payloadOf(s.token);
+      await signOut(`${REFRESH_COOKIE_NAME}=${sid}.${'y'.repeat(43)}`).expect(204);
+      await me(t.tenantId, s.token).expect(200);
+    });
+
+    it('a cookie whose sid is not a UUID is a 401, never a 500', async () => {
+      await refresh(`${REFRESH_COOKIE_NAME}=${'-'.repeat(36)}.${'x'.repeat(43)}`).expect(401);
+      await signOut(`${REFRESH_COOKIE_NAME}=${'-'.repeat(36)}.${'x'.repeat(43)}`).expect(204);
+    });
+
+    it('an unrecognised secret does not clear the cookie; an ended session does', async () => {
+      const t = await registerTenant();
+      const s = await signIn(t.email);
+      const { sid } = payloadOf(s.token);
+      const stale = await refresh(`${REFRESH_COOKIE_NAME}=${sid}.${'z'.repeat(43)}`).expect(401);
+      expect(stale.headers['set-cookie']).toBeUndefined();
+      await signOut(s.cookie).expect(204);
+      const ended = await refresh(s.cookie).expect(401);
+      expect((ended.headers['set-cookie'] as unknown as string[]).some((v) => v.startsWith(`${REFRESH_COOKIE_NAME}=;`))).toBe(true);
+    });
+
+    it('a PORTAL session refreshes into a portal token that works on a portal route', async () => {
+      const t = await registerTenant();
+      const owner = await signIn(t.email);
+      const client = await http()
+        .post(`${API}/${t.tenantId}/clients`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .set('Idempotency-Key', ulid())
+        .send({ code: `BR-${ulid().slice(-6)}`, name: 'Brand' })
+        .expect(201);
+      const email = `portal-${ulid().toLowerCase()}@brand.example`;
+      const invited = await http()
+        .post(`${API}/${t.tenantId}/users`)
+        .set('Authorization', `Bearer ${owner.token}`)
+        .set('Idempotency-Key', ulid())
+        .send({ email, role: 'client', clientId: client.body.client.id })
+        .expect(201);
+      await http().post(`${API}/${t.tenantId}/accept-invite`).set('Idempotency-Key', ulid()).send({ token: invited.body.inviteToken, password: MEMBER_PASSWORD }).expect(200);
+      const portal = await signIn(email, MEMBER_PASSWORD);
+      expect(portal.body.refreshExpiresInSeconds).toBe(7 * 24 * 60 * 60);
+      const refreshed = await refresh(portal.cookie).expect(200);
+      const claims = JSON.parse(Buffer.from((refreshed.body.accessToken as string).split('.')[1]!, 'base64url').toString('utf8'));
+      expect(claims).toMatchObject({ kind: 'portal', client_id: client.body.client.id });
+      await http().get(`${API}/${t.tenantId}/portal/me`).set('Authorization', `Bearer ${refreshed.body.accessToken}`).expect(200);
+    });
+
+    it('AnySessionGuard re-reads the session: a signed-out web token and a released badge token are refused on the excursion route', async () => {
+      const t = await registerTenant();
+      const owner = await signIn(t.email);
+      const web = await signIn(t.email);
+      await signOut(web.cookie).expect(204);
+      const refusedWeb = await http().post(`${API}/${t.tenantId}/excursions`).set('Authorization', `Bearer ${web.token}`).set('Idempotency-Key', ulid()).send({}).expect(401);
+      expect(refusedWeb.body).toMatchObject({ code: 'session-ended', reason: 'signed-out' });
+
+      const op = await createMember(owner.token, t.tenantId, 'operator');
+      const device = await enrollDevice(owner.token, t.tenantId);
+      const badged = await badgeIn(t.tenantId, device.deviceToken, op.email).expect(200);
+      await deviceAction(owner.token, t.tenantId, device.deviceId, 'release').expect(200);
+      const refusedBadge = await http().post(`${API}/${t.tenantId}/excursions`).set('Authorization', `Bearer ${badged.body.accessToken}`).set('Idempotency-Key', ulid()).send({}).expect(401);
+      expect(refusedBadge.body).toMatchObject({ code: 'unauthenticated', reason: 'released' });
+    });
+  });
+
+  describe('code review: lockout edges', () => {
+    it('a successful badge-in resets the device count: 4 wrong, 1 right, 4 wrong — never locked', async () => {
+      const t = await registerTenant();
+      const owner = await signIn(t.email);
+      const op = await createMember(owner.token, t.tenantId, 'operator');
+      const device = await enrollDevice(owner.token, t.tenantId);
+      for (let i = 0; i < 4; i += 1) await badgeIn(t.tenantId, device.deviceToken, op.email, '0000').expect(401);
+      await badgeIn(t.tenantId, device.deviceToken, op.email).expect(200);
+      for (let i = 0; i < 4; i += 1) await badgeIn(t.tenantId, device.deviceToken, op.email, '0000').expect(401);
+      await badgeIn(t.tenantId, device.deviceToken, op.email).expect(200);
+    });
+
+    it('a right PIN refused for the binding never counts: B tries 6 times while A is badged in, then A still badges in', async () => {
+      const t = await registerTenant();
+      const owner = await signIn(t.email);
+      const a = await createMember(owner.token, t.tenantId, 'operator');
+      const b = await createMember(owner.token, t.tenantId, 'operator');
+      const device = await enrollDevice(owner.token, t.tenantId);
+      await badgeIn(t.tenantId, device.deviceToken, a.email).expect(200);
+      for (let i = 0; i < 6; i += 1) await badgeIn(t.tenantId, device.deviceToken, b.email).expect(401);
+      await badgeIn(t.tenantId, device.deviceToken, a.email).expect(200);
+    });
+
+    it('once the bound operator’s shift has ended, the next operator badges in without a release', async () => {
+      const t = await registerTenant();
+      const owner = await signIn(t.email);
+      const a = await createMember(owner.token, t.tenantId, 'operator');
+      const b = await createMember(owner.token, t.tenantId, 'operator');
+      const device = await enrollDevice(owner.token, t.tenantId);
+      await badgeIn(t.tenantId, device.deviceToken, a.email).expect(200);
+      await badgeIn(t.tenantId, device.deviceToken, b.email).expect(401);
+      await sql`update sessions set absolute_expires_at = now() - interval '1 second', idle_expires_at = now() - interval '1 second' where device_id = ${device.deviceId}`;
+      const next = await badgeIn(t.tenantId, device.deviceToken, b.email).expect(200);
+      expect(next.body.operator.email).toBe(b.email);
+    });
+
+    it('an invitee or a suspended client’s user retrying the right password is never locked by it', async () => {
+      const t = await registerTenant();
+      const owner = await signIn(t.email);
+      const email = `pending-${ulid().toLowerCase()}@example.com`;
+      await http().post(`${API}/${t.tenantId}/users`).set('Authorization', `Bearer ${owner.token}`).set('Idempotency-Key', ulid()).send({ email, role: 'operator' }).expect(201);
+      const ip = newIp();
+      for (let i = 0; i < 6; i += 1) await signInReq(email, 'anything-at-all', ip).expect(403);
+    });
+
+    it('clientIpOf: 0 hops ignores X-Forwarded-For; N hops takes the N-th from the right; ::ffff:a.b.c.d keys as a.b.c.d', () => {
+      const previous = process.env.TRUSTED_PROXY_HOPS;
+      try {
+        process.env.TRUSTED_PROXY_HOPS = '0';
+        expect(clientIpOf({ headers: { 'x-forwarded-for': '6.6.6.6' }, socket: { remoteAddress: '::ffff:10.0.0.5' } })).toBe('10.0.0.5');
+        process.env.TRUSTED_PROXY_HOPS = '1';
+        expect(clientIpOf({ headers: { 'x-forwarded-for': '6.6.6.6, 203.0.113.9' }, socket: { remoteAddress: '10.0.0.1' } })).toBe('203.0.113.9');
+        process.env.TRUSTED_PROXY_HOPS = '2';
+        expect(clientIpOf({ headers: { 'x-forwarded-for': '6.6.6.6, 203.0.113.9, 10.0.0.2' }, socket: { remoteAddress: '10.0.0.1' } })).toBe('203.0.113.9');
+      } finally {
+        process.env.TRUSTED_PROXY_HOPS = previous;
+      }
+    });
+
+    it('the CLI unlock (unlockSignIn) clears every address’s lock for the email', async () => {
+      const t = await registerTenant();
+      const ips = [newIp(), newIp()];
+      for (const ip of ips) for (let i = 0; i < 5; i += 1) await signInReq(t.email, 'wrong-password', ip).expect(401);
+      await signInReq(t.email, PASSWORD, ips[0]).expect(423);
+      const db = app.get(DATABASE) as Parameters<typeof unlockSignIn>[0];
+      expect(await unlockSignIn(db, t.email)).toBe(2);
+      await signInReq(t.email, PASSWORD, ips[0]).expect(200);
+      await signInReq(t.email, PASSWORD, ips[1]).expect(200);
+    });
+  });
+
+  describe('code review: the purge worker', () => {
+    it('purges sessions ended over 30 days ago (revoked or past their end) in every tenant, keeps live ones, and drops stale counters', async () => {
+      const a = await registerTenant();
+      const b = await registerTenant();
+      const live = await signIn(a.email);
+      await signIn(b.email);
+      const [aOld] = await sql<{ id: string }[]>`select id from sessions where user_id = ${a.ownerId} limit 1`;
+      // Two old sessions per tenant: one revoked long ago, one long past its end.
+      for (const t of [a, b]) {
+        await sql`insert into sessions (id, tenant_id, user_id, kind, idle_expires_at, absolute_expires_at, revoked_at, revoked_reason)
+                  values (gen_random_uuid(), ${t.tenantId}, ${t.ownerId}, 'web', now() - interval '40 days', now() - interval '40 days', now() - interval '31 days', 'signed-out'),
+                         (gen_random_uuid(), ${t.tenantId}, ${t.ownerId}, 'web', now() - interval '35 days', now() - interval '31 days', null, null)`;
+      }
+      await sql`insert into auth_rate_limits (bucket, window_start, count) values (${`stale-${ulid()}`}, now() - interval '2 days', 5)`;
+      const purged = await app.get(SessionPurgeWorker).tick();
+      expect(purged).toBe(4);
+      const remaining = await sql`select count(*)::int as n from sessions where tenant_id in (${a.tenantId}, ${b.tenantId})`;
+      expect(remaining[0]!.n).toBe(2);
+      await me(a.tenantId, live.token).expect(200);
+      void aOld;
+      const stale = await sql`select count(*)::int as n from auth_rate_limits where window_start < now() - interval '1 day'`;
+      expect(stale[0]!.n).toBe(0);
     });
   });
 });

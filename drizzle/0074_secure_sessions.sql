@@ -130,7 +130,7 @@ BEGIN
 	FOREACH probe IN ARRAY ARRAY[
 		'unknown user status', 'deactivated without a prior status', 'active with a prior status',
 		'unknown session kind', 'revoked without a reason', 'unknown revoke reason',
-		'badge without a device', 'portal without a client', 'web with a client',
+		'badge without a device', 'badge with a refresh token', 'portal without a client', 'portal with a device', 'web with a client',
 		'idle past absolute', 'negative failures', 'negative badge failures'
 	] LOOP
 		refused_by := NULL;
@@ -162,6 +162,10 @@ BEGIN
 					INSERT INTO "sessions" ("id","tenant_id","user_id","kind","idle_expires_at","absolute_expires_at","revoked_at","revoked_reason") VALUES (gen_random_uuid(), t, u, 'web', now(), now(), now(), 'idle');
 				WHEN 'badge without a device' THEN
 					INSERT INTO "sessions" ("id","tenant_id","user_id","kind","idle_expires_at","absolute_expires_at") VALUES (gen_random_uuid(), t, u, 'badge', now(), now());
+				WHEN 'badge with a refresh token' THEN
+					INSERT INTO "sessions" ("id","tenant_id","user_id","kind","device_id","refresh_hash","idle_expires_at","absolute_expires_at") VALUES (gen_random_uuid(), t, u, 'badge', gen_random_uuid(), 'h', now(), now());
+				WHEN 'portal with a device' THEN
+					INSERT INTO "sessions" ("id","tenant_id","user_id","kind","client_id","device_id","idle_expires_at","absolute_expires_at") VALUES (gen_random_uuid(), t, u, 'portal', gen_random_uuid(), gen_random_uuid(), now(), now());
 				WHEN 'portal without a client' THEN
 					INSERT INTO "sessions" ("id","tenant_id","user_id","kind","idle_expires_at","absolute_expires_at") VALUES (gen_random_uuid(), t, u, 'portal', now(), now());
 				WHEN 'web with a client' THEN
