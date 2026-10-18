@@ -6,7 +6,7 @@ import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { PORTAL_SURFACE_DETAIL, verifyWebRequest } from '../tenancy/tenant-session.guard';
 import { getMemberPortalFactsIn } from '../tenancy/tenancy.service';
-import { clientSuspended, readSessionClientIn } from './clients.facade';
+import { clientInactive, readSessionClientIn } from './clients.facade';
 
 /** Story 21-7 — what a portal route knows about its caller (re-read this request). */
 export interface PortalSession {
@@ -67,7 +67,9 @@ export class PortalSessionGuard implements CanActivate {
         }
         const client = await readSessionClientIn(tx, session.tenantId, clientId);
         if (client === null || client.status !== 'active') {
-          throw clientSuspended();
+          // Story 1-2a — a departed client answers `client-departed`; a
+          // suspended one keeps `client-suspended`.
+          throw clientInactive(client?.status ?? null);
         }
       },
       { clientId },

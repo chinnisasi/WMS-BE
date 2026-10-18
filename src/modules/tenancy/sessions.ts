@@ -36,6 +36,8 @@ export const SESSION_REVOKE_REASONS = [
   // changed (replaced, disabled, regenerated) their own on another device.
   'second-factor-reset',
   'second-factor-changed',
+  // Story 1-2a — the client departed: its portal sessions end at once.
+  'client-departed',
 ] as const;
 export type SessionRevokeReason = (typeof SESSION_REVOKE_REASONS)[number];
 

@@ -1519,7 +1519,8 @@ describe('story 21-2b: client admin and attribution', () => {
       beforeAll(async () => {
         suspId = (await createClient({ code: 'SUSP-A', name: 'Suspendable Brand' }).expect(201)).body.client.id as string;
         departedId = (await createClient({ code: 'GONE-A', name: 'Departed Brand' }).expect(201)).body.client.id as string;
-        // Nothing writes `departed` (the story's Never list) — only SQL can.
+        // Story 1-2a: departure is now an owner command (test/client-master.spec.ts);
+        // this suite only needs a departed row, so SQL sets it.
         await sql`update clients set status = 'departed' where id = ${departedId}`;
         await importCsv(['SUSP-1,Suspendable SKU,pcs,1800,,,'], { clientId: suspId }).expect(201);
         await refreshSkus();
@@ -1581,18 +1582,22 @@ describe('story 21-2b: client admin and attribution', () => {
         expect(await sql`select updated_at::text from clients where id = ${suspId}`).toEqual(updatedBefore);
       });
 
-      it('refusals: self 400, departed 409 client-not-active, a bad body 400, a non-owner 403 role-denied, another tenant 403 permission-denied, unknown or foreign 404, malformed id 400, no key 400 idempotency-key-required', async () => {
+      it('refusals: self 400, departed → suspended 409 client-not-active, a bad body 400, a non-owner 403 role-denied, another tenant 403 permission-denied, unknown or foreign 404, malformed id 400, no key 400 idempotency-key-required', async () => {
         const self = await setStatus(selfClientId, 'suspended');
         expectProblem(self, 400, 'validation-failed');
-        expect(self.body.detail).toMatch(/self client cannot be suspended or reactivated/);
+        // Story 1-2a: the self client never departs either — the words name all three.
+        expect(self.body.detail).toMatch(/self client cannot be suspended, departed or reactivated/);
 
-        const departed = await setStatus(departedId, 'active');
+        // Story 1-2a changed this arm: a departed client CAN be reactivated
+        // now (test/client-master.spec.ts pins it); only departed → suspended
+        // is still refused, with the new words.
+        const departed = await setStatus(departedId, 'suspended');
         expectProblem(departed, 409, 'client-not-active');
-        expect(departed.body.detail).toBe('Client "GONE-A" has departed — its status cannot change.');
-        expectProblem(await setStatus(departedId, 'suspended'), 409, 'client-not-active');
+        expect(departed.body.detail).toBe('Client "GONE-A" has departed — a departed client can only be reactivated.');
         expect(await statusOf(departedId)).toBe('departed');
 
-        for (const bad of ['departed', 'gone', '', null, 1]) {
+        // Story 1-2a: `departed` is a target now, so it left this list.
+        for (const bad of ['gone', '', null, 1]) {
           expectProblem(await setStatus(suspId, bad), 400, 'validation-failed');
         }
         expectProblem(
@@ -1616,13 +1621,14 @@ describe('story 21-2b: client admin and attribution', () => {
         const actor = (await sql<{ id: string }[]>`select id from users where tenant_id = ${tenantId} and role = 'owner' limit 1`)[0]!.id;
         const error = (await app
           .get(ClientsCommand)
-          .updateStatus({ tenantId, actorUserId: actor, clientId: suspId, status: 'departed' }, ulid())
+          .updateStatus({ tenantId, actorUserId: actor, clientId: suspId, status: 'gone' }, ulid())
           .catch((caught: unknown) => caught)) as ProblemException;
         expect(error).toBeInstanceOf(ProblemException);
         expect(error.getStatus()).toBe(400);
         expect(error.getResponse()).toMatchObject({ code: 'validation-failed' });
         expect(await statusOf(suspId)).toBe('active');
-        expect([...CLIENT_STATUS_TARGETS]).toEqual(['active', 'suspended']);
+        // Story 1-2a adds `departed`.
+        expect([...CLIENT_STATUS_TARGETS]).toEqual(['active', 'suspended', 'departed']);
       });
 
       it('suspension makes every gate reachable without SQL — and operator work continues (an order is 201)', async () => {

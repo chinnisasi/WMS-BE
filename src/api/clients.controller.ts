@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, UseGuards } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -20,14 +20,21 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/
 import { ClientsCommand } from '../modules/clients/clients.command';
 import { ClientsFacade, type ClientSnapshot } from '../modules/clients/clients.facade';
 import {
+  ClientContactListResponse,
+  ClientContactResponse,
   ClientListResponse,
   ClientResponse,
+  CreateClientContactDto,
   CreateClientDto,
   RenameClientDto,
+  UpdateClientAddressesDto,
+  UpdateClientContactDto,
   UpdateClientStatusDto,
   UpdateClientTaxDetailsDto,
 } from './clients.dto';
-import type { ClientDto } from './clients.dto';
+import type { ClientContactDto, ClientDto } from './clients.dto';
+import type { ClientContactSnapshot } from '../modules/clients/clients.facade';
+import { toAddressDto } from '../modules/tenancy/tenancy.dto';
 
 const IDEMPOTENCY_HEADER = [
   {
@@ -206,7 +213,7 @@ export class ClientsController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'Suspends or reactivates a client brand (owner-only). Suspension stops its portal (sign-in and every portal call), portal ASN announce, new portal users and rate-card drafts and activation; operator work and billing continue, and open ASNs stay open. An unchanged status is a no-op (nothing written or audited; the key is stored)',
+      'Suspends, departs or reactivates a client brand (owner-only). Suspension stops its portal (sign-in and every portal call), portal ASN announce, new portal users and rate-card drafts and activation; operator work and billing continue, and open ASNs stay open. Departure (story 1-2a) is allowed only once nothing is left open for the client (stock, open documents, pending decisions, unsettled invoices) and also stops every new piece of work for it and ends its portal sessions; history, reports, metering and invoices stay readable. A departed client can only be reactivated. An unchanged status is a no-op (nothing written or audited; the key is stored)',
   })
   @ApiBody({ type: UpdateClientStatusDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
@@ -214,13 +221,13 @@ export class ClientsController {
   @ApiResponse({
     status: 400,
     ...problemJsonResponse(
-      "Missing or malformed Idempotency-Key, a malformed clientId, a status other than active or suspended, or the tenant's own self client (validation-failed)",
+      "Missing or malformed Idempotency-Key, a malformed clientId, a status other than active, suspended or departed, or the tenant's own self client (validation-failed)",
     ),
   })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage — owner only (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The client has departed — its status cannot change (client-not-active), or a concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A departed client asked to be suspended — it can only be reactivated (client-not-active); a departure while work remains (client-not-wound-down — `blockers: [{kind, count, codes?}]` lists every blocker: stock, open-purchase-orders, open-asns, pending-over-receipts, open-orders, open-rmas, pending-adjustments, open-counts, open-review-items, unsettled-invoices); or a concurrent request with the same Idempotency-Key (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'clientId', format: 'uuid' })
@@ -242,12 +249,229 @@ export class ClientsController {
     );
     return { client: toClientDto(snapshot.client) };
   }
+
+  // ── Story 1-2a — addresses and contacts. Literal segments under
+  // `:clientId` at a deeper path than the `:clientId` PATCH, so nothing
+  // above can capture them.
+
+  @Patch(':tenantId/clients/:clientId/addresses')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Sets a client's registered and return addresses (owner-only, clients.manage). Each group: absent is unchanged, null clears it, a value replaces it whole. Allowed on the self client and on a departed one. An unchanged patch is a no-op (nothing written or audited; the key is stored)",
+  })
+  @ApiBody({ type: UpdateClientAddressesDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ClientResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed clientId, or an address field that breaks its rule — a missing field, an over-long one, a registered state code off the GST registration list, a pincode that is not six digits (validation-failed, naming the field)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage — owner only (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async updateAddresses(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UpdateClientAddressesDto,
+  ): Promise<ClientResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.updateAddresses(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        clientId,
+        registered: dto.registered,
+        returnAddress: dto.return,
+      },
+      key,
+    );
+    return { client: toClientDto(snapshot.client) };
+  }
+
+  @Get(':tenantId/clients/:clientId/contacts')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Lists a client's contacts — the primary first, then by name (any staff session; never the portal). At most 20",
+  })
+  @ApiOkResponse({ type: ClientContactListResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('A malformed clientId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async listContacts(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ClientContactListResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    return { items: (await this.facade.listClientContacts(tenantId, clientId)).map(toContactDto) };
+  }
+
+  @Post(':tenantId/clients/:clientId/contacts')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Adds a contact to a client (owner-only, clients.manage). The first contact becomes the primary' })
+  @ApiBody({ type: CreateClientContactDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: ClientContactResponse, description: 'The added contact (a matching Idempotency-Key replays it)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed clientId, or a name, email, phone or role that breaks its rule (validation-failed, naming the field)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No client with this id exists in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The client already has 20 contacts (contact-limit), another contact of the client has this email (duplicate-contact-email), or a concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  async addContact(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: CreateClientContactDto,
+  ): Promise<ClientContactResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.addContact(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        clientId,
+        name: dto.name,
+        email: dto.email,
+        phone: dto.phone,
+        roles: dto.roles,
+      },
+      key,
+    );
+    return { contact: toContactDto(snapshot.contact) };
+  }
+
+  @Patch(':tenantId/clients/:clientId/contacts/:contactId')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Edits a client contact (owner-only, clients.manage): absent fields are unchanged, a null phone clears it, isPrimary: true makes it the primary. An unchanged edit is a no-op (nothing written or audited; the key is stored)",
+  })
+  @ApiBody({ type: UpdateClientContactDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ClientContactResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed clientId or contactId, a field that breaks its rule, or isPrimary: false (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such client in this tenant, or no such contact of this client (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Another contact of the client has this email (duplicate-contact-email), or a concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  @ApiParam({ name: 'contactId', format: 'uuid' })
+  async editContact(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @Param('contactId') contactId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UpdateClientContactDto,
+  ): Promise<ClientContactResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    assertUuidParam('contactId', contactId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.editContact(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        clientId,
+        contactId,
+        name: dto.name,
+        email: dto.email,
+        phone: dto.phone,
+        roles: dto.roles,
+        isPrimary: dto.isPrimary,
+      },
+      key,
+    );
+    return { contact: toContactDto(snapshot.contact) };
+  }
+
+  @Delete(':tenantId/clients/:clientId/contacts/:contactId')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Removes a client contact (owner-only, clients.manage). The primary cannot be removed while other contacts remain' })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: ClientContactResponse, description: 'The removed contact (a matching Idempotency-Key replays it)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed clientId or contactId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such client in this tenant, or no such contact of this client (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The primary contact while others remain — make another primary first (primary-contact-required), or a concurrent request with the same Idempotency-Key (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'clientId', format: 'uuid' })
+  @ApiParam({ name: 'contactId', format: 'uuid' })
+  async removeContact(
+    @Param('tenantId') tenantId: string,
+    @Param('clientId') clientId: string,
+    @Param('contactId') contactId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<ClientContactResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUuidParam('clientId', clientId);
+    assertUuidParam('contactId', contactId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.command.removeContact(
+      { tenantId, actorUserId: session.userId, clientId, contactId },
+      key,
+    );
+    return { contact: toContactDto(snapshot.contact) };
+  }
+}
+
+function toContactDto(contact: ClientContactSnapshot): ClientContactDto {
+  return {
+    id: contact.id,
+    clientId: contact.clientId,
+    name: contact.name,
+    email: contact.email,
+    phone: contact.phone,
+    roles: [...contact.roles],
+    isPrimary: contact.isPrimary,
+    createdAt: contact.createdAt,
+    updatedAt: contact.updatedAt,
+  };
+}
+
+function assertUuidParam(name: string, value: string): void {
+  if (!UUID_RE.test(value)) {
+    throw new ProblemException('validation-failed', 400, `Malformed ${name}`, `${name} must be a uuid (got "${value}").`);
+  }
 }
 
 function toClientDto(client: ClientSnapshot): ClientDto {
-  // A replay of a pre-21-5 snapshot carries no tax details — read them as unset.
+  // A replay of a pre-21-5 snapshot carries no tax details — read them as
+  // unset; a pre-1-2a one carries no addresses — read them as null.
   return {
     ...client,
+    registeredAddress: client.registeredAddress ?? null,
+    returnAddress: toAddressDto(client.returnAddress ?? null),
     taxDetails: client.taxDetails ?? {
       legalName: null,
       gstin: null,

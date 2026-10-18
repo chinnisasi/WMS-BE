@@ -30,7 +30,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
-import { assertClientInTenantInTx, getClientLabelsInTx } from '../clients/clients.facade';
+import { assertClientTakesWorkInTx, getClientLabelsInTx } from '../clients/clients.facade';
 import { skuNotFound, withConversions, type SkuSnapshot } from './sku.command';
 
 export interface CorrectSkuClientCommand {
@@ -141,7 +141,10 @@ export class SkuClientCommand {
       if (!UUID_RE.test(command.skuId)) {
         throw skuNotFound();
       }
-      await assertClientInTenantInTx(tx, command.tenantId, command.clientId);
+      // Story 1-2a — the TARGET client exists (404) and takes work (409
+      // `client-departed`): moving SKUs onto a departed client would give it
+      // new catalog. FOR KEY SHARE, before the product and SKU locks.
+      await assertClientTakesWorkInTx(tx, command.tenantId, command.clientId);
 
       // Lock order: the product row FIRST (the attach PATCH and the import's
       // product pass take it before touching a SKU), then the SKU rows in id

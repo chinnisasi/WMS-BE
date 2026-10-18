@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, ne } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, idempotencyKeys } from '../../shared/db/schema';
@@ -12,10 +12,46 @@ import { revokeSessionsInTx } from '../tenancy/sessions';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
-import { CLIENT_CODE_RE, CLIENT_NAME_MAX, SELF_CLIENT_CODE, clients, type ClientStatus } from './clients.schema';
-import { clientNotFound, toClientSnapshot, type ClientSnapshot, type ClientTaxDetails } from './clients.facade';
-import { ADDRESS_FIELD_LENGTHS, PINCODE_RE } from '../../shared/primitives/address';
+import {
+  CLIENT_CODE_RE,
+  CLIENT_CONTACT_NAME_MAX,
+  CLIENT_CONTACT_ROLES,
+  CLIENT_NAME_MAX,
+  MAX_CLIENT_CONTACTS,
+  SELF_CLIENT_CODE,
+  clientContacts,
+  clients,
+  type ClientContactRole,
+  type ClientStatus,
+} from './clients.schema';
+import {
+  clientNotFound,
+  toClientContactSnapshot,
+  toClientSnapshot,
+  type ClientContactSnapshot,
+  type ClientSnapshot,
+  type ClientTaxDetails,
+} from './clients.facade';
+import {
+  ADDRESS_FIELD_LENGTHS,
+  PINCODE_RE,
+  assertAddress,
+  assertPhone,
+  normalizeAddressInput,
+  type AddressInput,
+} from '../../shared/primitives/address';
 import { GSTIN_RE, gstinPrefixProblem, isGstinStateCode } from '../../shared/primitives/gstin';
+import { isEmailAddress, normalizeEmailAddress } from '../../shared/primitives/email';
+import { WIND_DOWN_BLOCKER_KINDS, type WindDownBlocker } from '../../shared/primitives/wind-down';
+// Story 1-2a — the wind-down reads, one file per owning module. Each imports
+// nothing from `modules/clients` (pinned by test/architecture.spec.ts), so
+// composing them here makes no import cycle.
+import { clientWindDownBlockersInTx as inventoryBlockersInTx } from '../inventory/client-wind-down';
+import { clientWindDownBlockersInTx as inboundBlockersInTx } from '../inbound/client-wind-down';
+import { clientWindDownBlockersInTx as outboundBlockersInTx } from '../outbound/client-wind-down';
+import { clientWindDownBlockersInTx as returnsBlockersInTx } from '../returns/client-wind-down';
+import { clientWindDownBlockersInTx as tenancyBlockersInTx } from '../tenancy/client-wind-down';
+import { clientWindDownBlockersInTx as billingBlockersInTx } from '../billing/client-wind-down';
 
 export interface CreateClientCommand {
   readonly tenantId: string;
@@ -33,12 +69,13 @@ export interface RenameClientCommand {
 }
 
 /**
- * Story 21-10 — the statuses an owner may move a client between. A closed
- * subset of `CLIENT_STATUSES`: `departed` is a later, deliberate change
- * (PENDING), never reachable through this command. One tuple, used by the
- * command's own shape check, the DTO's `@IsIn` and its OpenAPI enum.
+ * Story 21-10 — the statuses an owner may move a client between. One tuple,
+ * used by the command's own shape check, the DTO's `@IsIn` and its OpenAPI
+ * enum. Story 1-2a adds `departed` (offboarding): active → departed and
+ * suspended → departed once the client is wound down, departed → active
+ * (reactivation); departed → suspended is refused 409.
  */
-export const CLIENT_STATUS_TARGETS = ['active', 'suspended'] as const satisfies readonly ClientStatus[];
+export const CLIENT_STATUS_TARGETS = ['active', 'suspended', 'departed'] as const satisfies readonly ClientStatus[];
 export type ClientStatusTarget = (typeof CLIENT_STATUS_TARGETS)[number];
 
 export interface UpdateClientStatusCommand {
@@ -144,12 +181,78 @@ export function taxDetailProblems(merged: ClientTaxDetails): string[] {
   return problems;
 }
 
+/**
+ * Story 1-2a — the address patch. Each group: ABSENT (undefined) leaves it
+ * unchanged, `null` clears it, a value replaces it whole.
+ */
+export interface UpdateClientAddressesCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly clientId: string;
+  readonly registered?: RegisteredAddressInput | null | undefined;
+  readonly returnAddress?: AddressInput | null | undefined;
+}
+
+/** Story 1-2a — the registered address as the client supplies it (`line2` optional). */
+export interface RegisteredAddressInput {
+  readonly line1: string;
+  readonly line2?: string | null | undefined;
+  readonly city: string;
+  readonly stateCode: string;
+  readonly pincode: string;
+}
+
+/** Story 1-2a — the registered address normalized (trimmed; a blank line2 absent). */
+interface NormalizedRegisteredAddress {
+  readonly line1: string;
+  readonly line2: string | undefined;
+  readonly city: string;
+  readonly stateCode: string;
+  readonly pincode: string;
+}
+
+export interface AddClientContactCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly clientId: string;
+  readonly name: string;
+  readonly email: string;
+  readonly phone?: string | null | undefined;
+  readonly roles?: readonly string[] | undefined;
+}
+
+/** Story 1-2a — a contact patch: an ABSENT field is unchanged; `phone: null` clears it. */
+export interface EditClientContactCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly clientId: string;
+  readonly contactId: string;
+  readonly name?: string | undefined;
+  readonly email?: string | undefined;
+  readonly phone?: string | null | undefined;
+  readonly roles?: readonly string[] | undefined;
+  readonly isPrimary?: boolean | undefined;
+}
+
+export interface RemoveClientContactCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly clientId: string;
+  readonly contactId: string;
+}
+
+/** Story 1-2a — the response body of a contact write (the idempotency snapshot). */
+export interface ClientContactMutationSnapshot {
+  readonly contact: ClientContactSnapshot;
+}
+
 /** The API response body for a client mutation (the idempotency snapshot). */
 export interface ClientMutationSnapshot {
   readonly client: ClientSnapshot;
 }
 
 const CLIENTS_TENANT_CODE = 'clients_tenant_id_code_unique';
+const CONTACT_EMAIL_UNIQUE = 'client_contacts_client_email_unique';
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 /** Trim + uppercase — the stored form (the warehouse-code convention). */
@@ -258,7 +361,7 @@ export class ClientsCommand {
         .from(clients)
         .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, command.clientId)))
         .limit(1)
-        .for('update');
+        .for('no key update');
       const current = lockedRows[0];
       if (current === undefined) {
         throw clientNotFound(command.clientId);
@@ -330,7 +433,7 @@ export class ClientsCommand {
         .from(clients)
         .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, command.clientId)))
         .limit(1)
-        .for('update');
+        .for('no key update');
       const current = lockedRows[0];
       if (current === undefined) {
         throw clientNotFound(command.clientId);
@@ -372,22 +475,29 @@ export class ClientsCommand {
 
   /**
    * Story 21-10 — suspend or reactivate a client brand (`active` ⇄
-   * `suspended`). Owner-only (`clients.manage`). The house skeleton: the
+   * `suspended`); story 1-2a — depart it (offboarding) and reactivate a
+   * departed one. Owner-only (`clients.manage`). The house skeleton: the
    * status shape check (400) and the hash (`arm: 'status'` first — pinned by
-   * a golden) before the tx; inside it, authority → replay → the id shape →
-   * lock the client row `FOR UPDATE` (404) → replay AGAIN under the lock →
-   * the self client (400) → a departed client (409 `client-not-active`) → a
-   * same-status no-op → the write → audit `client.suspended` /
-   * `client.reactivated` → the key LAST. No outbox event.
+   * a golden, unchanged by 1-2a) before the tx; inside it, authority →
+   * replay → the id shape → lock the client row `FOR UPDATE` (404) → replay
+   * AGAIN under the lock → the self client (400) → departed → suspended
+   * (409 `client-not-active`) → a same-status no-op → (departure only) the
+   * wind-down check (409 `client-not-wound-down`, every blocker listed) →
+   * the write → the portal sessions end (suspend: `client-suspended`; depart:
+   * `client-departed`) → audit `client.suspended` / `client.reactivated` /
+   * `client.departed` → the key LAST. No outbox event.
    *
    * The no-op DOES write the key, unlike rename: a status is not idempotent
    * in value. After someone else reactivates, a late retry of a stored
-   * no-op "suspend" must replay the stored answer, never suspend again.
+   * no-op "suspend" must replay the stored answer, never suspend again. A
+   * REFUSED departure writes no key (the transaction rolls back), so a retry
+   * after winding down re-runs the check.
    *
-   * What suspension stops is decided by the gates that read status per
-   * request (the portal guard, portal sign-in and `me`, the portal announce,
-   * the portal-user invite, rate-card draft and activation); operator work
-   * is untouched (21-10 decision 1), and open ASNs stay open (decision 2).
+   * The lock stays `FOR UPDATE` (1-2a): it conflicts with the `FOR KEY SHARE`
+   * every work creator takes through `assertClientTakesWorkInTx`, so a
+   * departure and a creation serialise — the wind-down check below sees
+   * every creation that committed first, and every creation after it reads
+   * `departed`.
    */
   async updateStatus(command: UpdateClientStatusCommand, idempotencyKey: string): Promise<ClientMutationSnapshot> {
     // The command is the boundary (a non-HTTP caller skips the DTO): a
@@ -430,16 +540,16 @@ export class ClientsCommand {
         throw new ProblemException(
           'validation-failed',
           400,
-          'The self client cannot be suspended or reactivated',
-          "The tenant's own client has no portal and is never suspended — the self client cannot be suspended or reactivated.",
+          'The self client cannot change status',
+          "The tenant's own client has no portal and never departs — the self client cannot be suspended, departed or reactivated.",
         );
       }
-      if (current.status === 'departed') {
+      if (current.status === 'departed' && status === 'suspended') {
         throw new ProblemException(
           'client-not-active',
           409,
           'Client is not active',
-          `Client "${current.code}" has departed — its status cannot change.`,
+          `Client "${current.code}" has departed — a departed client can only be reactivated.`,
         );
       }
       if (current.status === status) {
@@ -447,6 +557,14 @@ export class ClientsCommand {
         const unchanged: ClientMutationSnapshot = { client: toClientSnapshot(current) };
         await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
         return unchanged;
+      }
+      if (status === 'departed') {
+        // Story 1-2a decision 1 — departure only once wound down. Under the
+        // row's FOR UPDATE: every creation that committed first is counted.
+        const blockers = await clientWindDownBlockersInTx(tx, command.tenantId, current.id);
+        if (blockers.length > 0) {
+          throw clientNotWoundDown(current.code, blockers);
+        }
       }
 
       const rows = await tx
@@ -456,22 +574,415 @@ export class ClientsCommand {
         .returning();
       const snapshot: ClientMutationSnapshot = { client: toClientSnapshot(rows[0]!) };
       // Story 6-1a — a suspension ends the client's portal sessions now (the
-      // portal guard's per-request client read stays the second check).
+      // portal guard's per-request client read stays the second check);
+      // story 1-2a — so does a departure. A reactivation restores none: the
+      // portal user signs in again.
       if (status === 'suspended') {
         await revokeSessionsInTx(tx, command.tenantId, { clientId: current.id, kinds: ['portal'] }, 'client-suspended');
+      } else if (status === 'departed') {
+        await revokeSessionsInTx(tx, command.tenantId, { clientId: current.id, kinds: ['portal'] }, 'client-departed');
       }
 
       await this.audit(
         tx,
         command.tenantId,
         command.actorUserId,
-        status === 'suspended' ? 'client.suspended' : 'client.reactivated',
+        status === 'suspended' ? 'client.suspended' : status === 'departed' ? 'client.departed' : 'client.reactivated',
         current.id,
         idempotencyKey,
       );
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
       return snapshot;
     });
+  }
+
+  /**
+   * Story 1-2a — the client's registered and return addresses. `clients.manage`
+   * (owner-only). Each group: ABSENT leaves it unchanged, `null` clears it, a
+   * value replaces it whole. The house skeleton: normalize + hash before the
+   * tx (`arm: 'addresses'`, absent groups omitted — the conditional-key
+   * shape), authority → replay → lock the client `FOR NO KEY UPDATE` (404) →
+   * replay again → the shape rules (400 `validation-failed` naming the field)
+   * → an unchanged patch is a no-op that STORES the key (the
+   * `clients.addresses:unchanged` arm) → the write → audit
+   * `client.addresses_updated` → the key LAST. Allowed on the self client and
+   * on a departed one (an address is not work).
+   */
+  async updateAddresses(command: UpdateClientAddressesCommand, idempotencyKey: string): Promise<ClientMutationSnapshot> {
+    const registered = command.registered === undefined ? undefined : normalizeRegisteredAddress(command.registered);
+    const returnAddress = command.returnAddress === undefined ? undefined : normalizeReturnAddress(command.returnAddress);
+    const payloadHash = hashCommandPayload({
+      arm: 'addresses',
+      tenantId: command.tenantId,
+      clientId: command.clientId,
+      ...(registered === undefined ? {} : { registered }),
+      ...(returnAddress === undefined ? {} : { return: returnAddress }),
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'clients.manage');
+      const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
+      }
+      const current = await this.lockClientForEdit(tx, command.tenantId, command.clientId);
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
+      }
+
+      const patch: Partial<typeof clients.$inferInsert> = {};
+      if (registered !== undefined) {
+        const valid = registered === null ? null : assertRegisteredAddress(registered);
+        patch.registeredLine1 = valid?.line1 ?? null;
+        patch.registeredLine2 = valid?.line2 ?? null;
+        patch.registeredCity = valid?.city ?? null;
+        patch.registeredStateCode = valid?.stateCode ?? null;
+        patch.registeredPincode = valid?.pincode ?? null;
+      }
+      if (returnAddress !== undefined) {
+        const valid = returnAddress === null ? null : assertAddress(returnAddress, 'returnAddress');
+        patch.returnContactName = valid?.contactName ?? null;
+        patch.returnPhone = valid?.phone ?? null;
+        patch.returnLine1 = valid?.line1 ?? null;
+        patch.returnLine2 = valid === null ? null : (valid.line2 ?? null);
+        patch.returnCity = valid?.city ?? null;
+        patch.returnState = valid?.state ?? null;
+        patch.returnPincode = valid?.pincode ?? null;
+      }
+      const changed = (Object.keys(patch) as (keyof typeof patch)[]).some((field) => patch[field] !== current[field as keyof typeof current]);
+      if (!changed) {
+        // A declared no-op (`clients.addresses:unchanged`): nothing written or
+        // audited, the key stored — the status precedent, so a late retry
+        // after another edit replays this answer rather than reverting it.
+        const unchanged: ClientMutationSnapshot = { client: toClientSnapshot(current) };
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
+        return unchanged;
+      }
+      const rows = await tx
+        .update(clients)
+        .set({ ...patch, updatedAt: nowIso() })
+        .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, current.id)))
+        .returning();
+      const snapshot: ClientMutationSnapshot = { client: toClientSnapshot(rows[0]!) };
+      await this.audit(tx, command.tenantId, command.actorUserId, 'client.addresses_updated', current.id, idempotencyKey);
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /**
+   * Story 1-2a — add a contact to a client (`clients.manage`). The house
+   * skeleton: normalize + hash (`arm: 'contact-add'`) → authority → replay →
+   * lock the client `FOR NO KEY UPDATE` (404) → replay again → the shape
+   * rules (400 naming the field) → at most `MAX_CLIENT_CONTACTS` (409
+   * `contact-limit`) → the email unique per client (409
+   * `duplicate-contact-email`, the unique index the arbiter) → the insert
+   * (the FIRST contact becomes primary) → audit `client.contact_added` → key.
+   */
+  async addContact(command: AddClientContactCommand, idempotencyKey: string): Promise<ClientContactMutationSnapshot> {
+    const fields = normalizeContactFields(command);
+    const payloadHash = hashCommandPayload({
+      arm: 'contact-add',
+      tenantId: command.tenantId,
+      clientId: command.clientId,
+      name: fields.name,
+      email: fields.email,
+      phone: fields.phone ?? null,
+      roles: fields.roles ?? [],
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'clients.manage');
+      const replayed = await this.replayContact(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
+      }
+      const client = await this.lockClientForEdit(tx, command.tenantId, command.clientId);
+      const replayedUnderLock = await this.replayContact(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
+      }
+      const valid = assertContactFields({
+        name: fields.name,
+        email: fields.email,
+        phone: fields.phone ?? null,
+        roles: fields.roles ?? [],
+      });
+      const existing = await tx
+        .select({ id: clientContacts.id, email: clientContacts.email })
+        .from(clientContacts)
+        .where(and(eq(clientContacts.tenantId, command.tenantId), eq(clientContacts.clientId, client.id)));
+      if (existing.length >= MAX_CLIENT_CONTACTS) {
+        throw new ProblemException(
+          'contact-limit',
+          409,
+          'Too many contacts',
+          `Client "${client.code}" already has ${MAX_CLIENT_CONTACTS} contacts — remove one before adding another.`,
+        );
+      }
+      if (existing.some((row) => row.email === valid.email)) {
+        throw duplicateContactEmail(valid.email);
+      }
+      let inserted: typeof clientContacts.$inferSelect;
+      try {
+        const rows = await tx
+          .insert(clientContacts)
+          .values({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            clientId: client.id,
+            name: valid.name,
+            email: valid.email,
+            phone: valid.phone,
+            roles: [...valid.roles],
+            isPrimary: existing.length === 0,
+          })
+          .returning();
+        inserted = rows[0]!;
+      } catch (err) {
+        if (isUniqueViolationOn(err, CONTACT_EMAIL_UNIQUE)) {
+          throw duplicateContactEmail(valid.email);
+        }
+        throw err;
+      }
+      const snapshot: ClientContactMutationSnapshot = { contact: toClientContactSnapshot(inserted) };
+      await this.audit(tx, command.tenantId, command.actorUserId, 'client.contact_added', client.id, idempotencyKey);
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /**
+   * Story 1-2a — edit a contact (`clients.manage`). A patch: an ABSENT field
+   * is unchanged, `phone: null` clears the phone; `isPrimary: true` makes it
+   * the primary (`false` is a 400 above the transaction — the primary moves
+   * only by naming the new one). Moving the primary is TWO statements in this
+   * one transaction — clear the old, then set the new — because the partial
+   * unique index is not deferrable and a one-statement swap would trip it.
+   * An unchanged edit is a declared no-op that stores the key
+   * (`clients.contactEdit:unchanged`).
+   */
+  async editContact(command: EditClientContactCommand, idempotencyKey: string): Promise<ClientContactMutationSnapshot> {
+    if (command.isPrimary === false) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Invalid contact edit',
+        'isPrimary may only be true — make another contact primary to move the primary.',
+      );
+    }
+    const fields = normalizeContactFields(command);
+    const payloadHash = hashCommandPayload({
+      arm: 'contact-edit',
+      tenantId: command.tenantId,
+      clientId: command.clientId,
+      contactId: command.contactId,
+      ...(fields.name === undefined ? {} : { name: fields.name }),
+      ...(fields.email === undefined ? {} : { email: fields.email }),
+      ...(fields.phone === undefined ? {} : { phone: fields.phone }),
+      ...(fields.roles === undefined ? {} : { roles: fields.roles }),
+      ...(command.isPrimary === undefined ? {} : { isPrimary: command.isPrimary }),
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'clients.manage');
+      const replayed = await this.replayContact(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
+      }
+      const client = await this.lockClientForEdit(tx, command.tenantId, command.clientId);
+      const replayedUnderLock = await this.replayContact(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
+      }
+      const current = await this.readContact(tx, command.tenantId, client.id, command.contactId);
+      const valid = assertContactFields({
+        name: fields.name ?? current.name,
+        email: fields.email ?? current.email,
+        phone: fields.phone === undefined ? current.phone : fields.phone,
+        roles: fields.roles ?? (current.roles as ClientContactRole[]),
+      });
+      const makePrimary = command.isPrimary === true && !current.isPrimary;
+      const unchanged =
+        !makePrimary &&
+        valid.name === current.name &&
+        valid.email === current.email &&
+        valid.phone === current.phone &&
+        sameRoles(valid.roles, current.roles);
+      if (unchanged) {
+        const snapshot: ClientContactMutationSnapshot = { contact: toClientContactSnapshot(current) };
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+        return snapshot;
+      }
+      if (valid.email !== current.email) {
+        const clash = await tx
+          .select({ id: clientContacts.id })
+          .from(clientContacts)
+          .where(
+            and(
+              eq(clientContacts.tenantId, command.tenantId),
+              eq(clientContacts.clientId, client.id),
+              eq(clientContacts.email, valid.email),
+              ne(clientContacts.id, current.id),
+            ),
+          )
+          .limit(1);
+        if (clash.length > 0) {
+          throw duplicateContactEmail(valid.email);
+        }
+      }
+      if (makePrimary) {
+        // Two statements, one transaction: clear the old primary FIRST.
+        await tx
+          .update(clientContacts)
+          .set({ isPrimary: false, updatedAt: nowIso() })
+          .where(
+            and(
+              eq(clientContacts.tenantId, command.tenantId),
+              eq(clientContacts.clientId, client.id),
+              eq(clientContacts.isPrimary, true),
+            ),
+          );
+      }
+      let updated: typeof clientContacts.$inferSelect;
+      try {
+        const rows = await tx
+          .update(clientContacts)
+          .set({
+            name: valid.name,
+            email: valid.email,
+            phone: valid.phone,
+            roles: [...valid.roles],
+            ...(makePrimary ? { isPrimary: true } : {}),
+            updatedAt: nowIso(),
+          })
+          .where(and(eq(clientContacts.tenantId, command.tenantId), eq(clientContacts.id, current.id)))
+          .returning();
+        updated = rows[0]!;
+      } catch (err) {
+        if (isUniqueViolationOn(err, CONTACT_EMAIL_UNIQUE)) {
+          throw duplicateContactEmail(valid.email);
+        }
+        throw err;
+      }
+      const snapshot: ClientContactMutationSnapshot = { contact: toClientContactSnapshot(updated) };
+      await this.audit(tx, command.tenantId, command.actorUserId, 'client.contact_edited', client.id, idempotencyKey);
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /**
+   * Story 1-2a — remove a contact (`clients.manage`). The primary cannot be
+   * removed while other contacts remain (409 `primary-contact-required` —
+   * make another primary first); the last contact can. Audited
+   * `client.contact_removed`; the answer is the removed contact.
+   */
+  async removeContact(command: RemoveClientContactCommand, idempotencyKey: string): Promise<ClientContactMutationSnapshot> {
+    const payloadHash = hashCommandPayload({
+      arm: 'contact-remove',
+      tenantId: command.tenantId,
+      clientId: command.clientId,
+      contactId: command.contactId,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'clients.manage');
+      const replayed = await this.replayContact(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
+      }
+      const client = await this.lockClientForEdit(tx, command.tenantId, command.clientId);
+      const replayedUnderLock = await this.replayContact(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
+      }
+      const current = await this.readContact(tx, command.tenantId, client.id, command.contactId);
+      if (current.isPrimary) {
+        const others = await tx
+          .select({ id: clientContacts.id })
+          .from(clientContacts)
+          .where(
+            and(
+              eq(clientContacts.tenantId, command.tenantId),
+              eq(clientContacts.clientId, client.id),
+              ne(clientContacts.id, current.id),
+            ),
+          )
+          .limit(1);
+        if (others.length > 0) {
+          throw new ProblemException(
+            'primary-contact-required',
+            409,
+            'The primary contact cannot be removed',
+            `${current.name} is the primary contact of client "${client.code}" — make another contact primary first.`,
+          );
+        }
+      }
+      await tx
+        .delete(clientContacts)
+        .where(and(eq(clientContacts.tenantId, command.tenantId), eq(clientContacts.id, current.id)));
+      const snapshot: ClientContactMutationSnapshot = { contact: toClientContactSnapshot(current) };
+      await this.audit(tx, command.tenantId, command.actorUserId, 'client.contact_removed', client.id, idempotencyKey);
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /** Story 1-2a — the client row `FOR NO KEY UPDATE` (the non-status writers' lock), 404 when absent. */
+  private async lockClientForEdit(
+    tx: TenantTx,
+    tenantId: string,
+    clientId: string,
+  ): Promise<typeof clients.$inferSelect> {
+    if (!UUID_RE.test(clientId)) {
+      throw clientNotFound(clientId);
+    }
+    const rows = await tx
+      .select()
+      .from(clients)
+      .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
+      .limit(1)
+      .for('no key update');
+    const row = rows[0];
+    if (row === undefined) {
+      throw clientNotFound(clientId);
+    }
+    return row;
+  }
+
+  /** One contact of the (locked) client, 404 `not-found` otherwise (another client's is the same 404). */
+  private async readContact(
+    tx: TenantTx,
+    tenantId: string,
+    clientId: string,
+    contactId: string,
+  ): Promise<typeof clientContacts.$inferSelect> {
+    if (!UUID_RE.test(contactId)) {
+      throw contactNotFound(contactId);
+    }
+    const rows = await tx
+      .select()
+      .from(clientContacts)
+      .where(
+        and(eq(clientContacts.tenantId, tenantId), eq(clientContacts.clientId, clientId), eq(clientContacts.id, contactId)),
+      )
+      .limit(1);
+    const row = rows[0];
+    if (row === undefined) {
+      throw contactNotFound(contactId);
+    }
+    return row;
+  }
+
+  private async replayContact(
+    tx: TenantTx,
+    tenantId: string,
+    idempotencyKey: string,
+    payloadHash: string,
+  ): Promise<ClientContactMutationSnapshot | null> {
+    return (await this.replay(tx, tenantId, idempotencyKey, payloadHash)) as ClientContactMutationSnapshot | null;
   }
 
   private async replay(
@@ -504,7 +1015,12 @@ export class ClientsCommand {
       | 'client.renamed'
       | 'client.tax-details-updated'
       | 'client.suspended'
-      | 'client.reactivated',
+      | 'client.reactivated'
+      | 'client.departed'
+      | 'client.addresses_updated'
+      | 'client.contact_added'
+      | 'client.contact_edited'
+      | 'client.contact_removed',
     clientId: string,
     reference: string,
   ): Promise<void> {
@@ -525,7 +1041,7 @@ export class ClientsCommand {
     tenantId: string,
     idempotencyKey: string,
     payloadHash: string,
-    snapshot: ClientMutationSnapshot,
+    snapshot: ClientMutationSnapshot | ClientContactMutationSnapshot,
   ): Promise<void> {
     try {
       await tx.insert(idempotencyKeys).values({
@@ -587,5 +1103,180 @@ function duplicateClientCode(code: string): ProblemException {
     409,
     'Client code already in use',
     `Client code "${code}" already exists for this tenant.`,
+  );
+}
+
+/**
+ * Story 1-2a — every wind-down blocker of one client, composed from the
+ * owning modules' file-level reads, in `WIND_DOWN_BLOCKER_KINDS` order.
+ * Empty = the client may depart.
+ */
+export async function clientWindDownBlockersInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientId: string,
+): Promise<WindDownBlocker[]> {
+  const all = [
+    ...(await inventoryBlockersInTx(tx, tenantId, clientId)),
+    ...(await inboundBlockersInTx(tx, tenantId, clientId)),
+    ...(await outboundBlockersInTx(tx, tenantId, clientId)),
+    ...(await returnsBlockersInTx(tx, tenantId, clientId)),
+    ...(await tenancyBlockersInTx(tx, tenantId, clientId)),
+    ...(await billingBlockersInTx(tx, tenantId, clientId)),
+  ];
+  return [...all].sort((a, b) => WIND_DOWN_BLOCKER_KINDS.indexOf(a.kind) - WIND_DOWN_BLOCKER_KINDS.indexOf(b.kind));
+}
+
+/** Story 1-2a — 409 `client-not-wound-down`, every blocker in `extensions.blockers`. */
+export function clientNotWoundDown(code: string, blockers: readonly WindDownBlocker[]): ProblemException {
+  const listed = blockers.map((blocker) => `${blocker.kind} (${blocker.count})`).join(', ');
+  return new ProblemException(
+    'client-not-wound-down',
+    409,
+    'Client is not wound down',
+    `Client "${code}" cannot depart while work remains: ${listed}. Finish, cancel or settle each, then depart it again.`,
+    { blockers },
+  );
+}
+
+/**
+ * Story 1-2a — the LENIENT normalize step of a contact write (never throws —
+ * it is what the hash fingerprints): the name trimmed, the email trimmed and
+ * lower-cased, a blank phone read as `null`, the roles sorted into
+ * vocabulary order (an unknown role kept, sorted last, for the validator to
+ * refuse by name). An absent field stays absent.
+ */
+export function normalizeContactFields(command: {
+  readonly name?: string | undefined;
+  readonly email?: string | undefined;
+  readonly phone?: string | null | undefined;
+  readonly roles?: readonly string[] | undefined;
+}): { name?: string; email?: string; phone?: string | null; roles?: string[] } {
+  const out: { name?: string; email?: string; phone?: string | null; roles?: string[] } = {};
+  if (command.name !== undefined) out.name = typeof command.name === 'string' ? command.name.trim() : command.name;
+  if (command.email !== undefined) {
+    out.email = typeof command.email === 'string' ? normalizeEmailAddress(command.email) : command.email;
+  }
+  if (command.phone !== undefined) {
+    const phone = typeof command.phone === 'string' ? command.phone.trim() : command.phone;
+    out.phone = phone === '' ? null : phone;
+  }
+  if (command.roles !== undefined) {
+    const rank = (role: string): number => {
+      const index = (CLIENT_CONTACT_ROLES as readonly string[]).indexOf(role);
+      return index === -1 ? CLIENT_CONTACT_ROLES.length : index;
+    };
+    out.roles = Array.isArray(command.roles)
+      ? [...command.roles].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0))
+      : (command.roles as unknown as string[]);
+  }
+  return out;
+}
+
+/** Story 1-2a — a contact's shape rules (400 `validation-failed` naming the field). */
+export function assertContactFields(fields: {
+  readonly name: unknown;
+  readonly email: unknown;
+  readonly phone: unknown;
+  readonly roles: unknown;
+}): { name: string; email: string; phone: string | null; roles: readonly ClientContactRole[] } {
+  const invalid = (detail: string): ProblemException =>
+    new ProblemException('validation-failed', 400, 'Invalid client contact', detail);
+  if (typeof fields.name !== 'string') throw invalid('name must be text.');
+  const nameLength = [...fields.name].length;
+  if (nameLength < 1 || nameLength > CLIENT_CONTACT_NAME_MAX) {
+    throw invalid(`name must be 1-${CLIENT_CONTACT_NAME_MAX} characters once trimmed (got ${nameLength}).`);
+  }
+  if (typeof fields.email !== 'string' || !isEmailAddress(fields.email)) {
+    throw invalid(`email must be an email address of at most 254 characters (got ${JSON.stringify(fields.email)}).`);
+  }
+  let phone: string | null = null;
+  if (fields.phone !== null) {
+    if (typeof fields.phone !== 'string') throw invalid('phone must be text or null.');
+    phone = assertPhone(fields.phone, 'phone');
+  }
+  if (!Array.isArray(fields.roles)) throw invalid('roles must be a list.');
+  const roles = fields.roles as unknown[];
+  for (const role of roles) {
+    if (typeof role !== 'string' || !(CLIENT_CONTACT_ROLES as readonly string[]).includes(role)) {
+      throw invalid(`roles must each be one of ${JSON.stringify(CLIENT_CONTACT_ROLES)} (got ${JSON.stringify(role)}).`);
+    }
+  }
+  if (new Set(roles).size !== roles.length) {
+    throw invalid('roles must not repeat a role.');
+  }
+  return { name: fields.name, email: fields.email, phone, roles: roles as ClientContactRole[] };
+}
+
+function sameRoles(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((role, index) => role === b[index]);
+}
+
+/** Story 1-2a — the registered address's lenient normalize (hashed; never throws). */
+export function normalizeRegisteredAddress(input: RegisteredAddressInput | null): NormalizedRegisteredAddress | null {
+  if (input === null) return null;
+  const trim = (value: unknown): string => (typeof value === 'string' ? value.trim() : (value as string));
+  const line2 = input.line2 === undefined || input.line2 === null ? undefined : trim(input.line2);
+  return {
+    line1: trim(input.line1),
+    line2: line2 === '' ? undefined : line2,
+    city: trim(input.city),
+    stateCode: trim(input.stateCode),
+    pincode: trim(input.pincode),
+  };
+}
+
+/** Story 1-2a — the return address's lenient normalize (the shipment shape's own). */
+export function normalizeReturnAddress(input: AddressInput | null): AddressInput | null {
+  return input === null ? null : (normalizeAddressInput(input) ?? null);
+}
+
+/**
+ * Story 1-2a — the registered address's shape rules (the 21-5 billing
+ * columns' shapes): every field but line2 required, the ceilings, a GST
+ * registration state code, a six-digit pincode. 400 naming the field.
+ */
+export function assertRegisteredAddress(address: NormalizedRegisteredAddress): NormalizedRegisteredAddress {
+  const invalid = (detail: string): ProblemException =>
+    new ProblemException('validation-failed', 400, 'Invalid registered address', detail);
+  for (const field of ['line1', 'city', 'stateCode', 'pincode'] as const) {
+    if (typeof address[field] !== 'string' || address[field] === '') {
+      throw invalid(`registeredAddress.${field} is required — an address is entered whole, never partial.`);
+    }
+  }
+  if (address.line2 !== undefined && typeof address.line2 !== 'string') {
+    throw invalid('registeredAddress.line2 must be text.');
+  }
+  const ceilings = { line1: ADDRESS_FIELD_LENGTHS.line1, line2: ADDRESS_FIELD_LENGTHS.line2, city: ADDRESS_FIELD_LENGTHS.city } as const;
+  for (const field of ['line1', 'line2', 'city'] as const) {
+    const value = address[field];
+    if (value !== undefined && [...value].length > ceilings[field]) {
+      throw invalid(`registeredAddress.${field} is at most ${ceilings[field]} characters (got ${[...value].length}).`);
+    }
+  }
+  if (!isGstinStateCode(address.stateCode)) {
+    throw invalid(`registeredAddress.stateCode must be a GST registration state code (got "${address.stateCode}").`);
+  }
+  if (!PINCODE_RE.test(address.pincode)) {
+    throw invalid(`registeredAddress.pincode must be six digits (got "${address.pincode}").`);
+  }
+  return address;
+}
+
+function duplicateContactEmail(email: string): ProblemException {
+  return new ProblemException(
+    'duplicate-contact-email',
+    409,
+    'Contact email already in use',
+    `A contact with email "${email}" already exists for this client.`,
+  );
+}
+
+function contactNotFound(contactId: string): ProblemException {
+  return new ProblemException(
+    'not-found',
+    404,
+    'Contact not found',
+    `No contact with id "${contactId}" exists for this client.`,
   );
 }

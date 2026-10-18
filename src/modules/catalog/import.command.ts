@@ -56,7 +56,7 @@ import {
 import { MAX_KIT_COMPONENTS, kitEventPayload } from './kit.command';
 import { getKitSkuIdsInTx } from './kit.store';
 import { ensureSelfClientInTx } from '../clients/ensure-self-client';
-import { assertClientInTenantInTx, clientLabel, listClientsInTx } from '../clients/clients.facade';
+import { assertClientInTenantInTx, clientLabel, listClientsInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
 
 export const IMPORT_MODES = ['initial', 'fix'] as const;
 export type ImportMode = (typeof IMPORT_MODES)[number];
@@ -370,6 +370,10 @@ export class ImportCommand {
         } else {
           clientId = await ensureSelfClientInTx(tx, command.tenantId);
         }
+        // Story 1-2a — the run's client, however it was settled (named, a
+        // fix-mode inheritance, or the `self` default), takes no new SKUs
+        // once departed: 409 `client-departed`, under FOR KEY SHARE.
+        await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
 
         if (command.mode === 'fix') {
           if (latest[0]) {

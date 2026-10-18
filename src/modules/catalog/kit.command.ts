@@ -26,7 +26,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { DEFAULT_SKU_PAGE_SIZE, MAX_SKU_PAGE_SIZE } from './sku.command';
-import { assertSingleClientInTx } from '../clients/clients.facade';
+import { assertSingleClientInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
 import { getKitSkuIdsInTx } from './kit.store';
 import { uomPrecision } from './uom';
 
@@ -739,10 +739,13 @@ async function assertKitSharesOneClient(
   componentIds: readonly string[],
   componentById: ReadonlyMap<string, typeof skus.$inferSelect>,
 ): Promise<void> {
-  await assertSingleClientInTx(
+  const clientId = await assertSingleClientInTx(
     tx,
     tenantId,
     [kit.clientId, ...componentIds.map((id) => componentById.get(id)!.clientId)],
     `Kit "${kit.code}"`,
   );
+  // Story 1-2a — a departed client's kit takes no new composition (409
+  // `client-departed`).
+  await assertClientTakesWorkInTx(tx, tenantId, clientId);
 }

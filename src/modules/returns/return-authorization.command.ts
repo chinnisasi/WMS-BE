@@ -28,6 +28,7 @@ import type { OrderInvoiceFacts } from '../outbound/outbound.facade';
 import { RETURN_AUTHORIZATION_CANCELLED_EVENT, RETURN_AUTHORIZATION_CREATED_EVENT } from './events';
 import type { ReturnAuthorizationEventPayload } from './events';
 import type { ReturnReceiptView } from './return-receipt.command';
+import { assertClientTakesWorkInTx } from '../clients/clients.facade';
 
 // ── vocabularies ─────────────────────────────────────────────────────────────
 
@@ -782,6 +783,14 @@ export class ReturnAuthorizationCommand {
       const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replayed !== null) {
         return replayed;
+      }
+      // 3b. Story 1-2a — the order's client takes work (409
+      //     `client-departed`), FOR KEY SHARE, before the order lock (the
+      //     client first, then documents). An unknown order falls through to
+      //     the 404 under the lock below; an order's client never changes.
+      const orderFacts = await this.outbound.orderInvoiceFactsInTx(tx, command.tenantId, command.orderId);
+      if (orderFacts !== null) {
+        await assertClientTakesWorkInTx(tx, command.tenantId, orderFacts.clientId);
       }
       // 4. The order lock — a create has no row to lock; this serialises
       //    over-authorization AND same-key creates on one order.

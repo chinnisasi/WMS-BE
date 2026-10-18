@@ -19,6 +19,7 @@ import { CatalogFacade } from '../catalog/catalog.facade';
 import { InboundFacade } from '../inbound/inbound.facade';
 import { REPLENISHMENT_SCHEDULER_ACTOR_ID, recoveryGapMilli } from './replenishment.command';
 import { appendBreachCleared } from './replenishment.events';
+import { departedClientIdsInTx } from '../clients/clients.facade';
 
 /**
  * The breach sweep (story 6.1): the worker's per-scope evaluation, in THREE
@@ -175,9 +176,15 @@ export class ReplenishmentSweep {
     // also the ones carrying no defaults, because a policy row may target
     // any of them and the defaults map doubles as the identity source.
     const skuDefaults = await this.catalog.getSkuReorderDefaultsInTx(tx, tenantId);
+    // Story 1-2a — a departed client's SKUs are never candidates: it takes no
+    // new work, so no breach (and no suggested PO) may open for it.
+    const departed = await departedClientIdsInTx(tx, tenantId);
 
     const candidates: EffectiveCandidate[] = [];
     for (const sku of skuDefaults) {
+      if (departed.has(sku.clientId)) {
+        continue;
+      }
       const override = policyBySku.get(sku.id);
       const pointMilli = override !== undefined ? override.reorderPointMilli : sku.reorderPoint;
       const qtyMilli = override !== undefined ? override.reorderQtyMilli : sku.reorderQty;

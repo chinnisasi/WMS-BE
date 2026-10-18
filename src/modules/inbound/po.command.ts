@@ -19,7 +19,7 @@ import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
-import { assertSingleClientInTx, getClientLabelsInTx, mixedClient } from '../clients/clients.facade';
+import { assertSingleClientInTx, getClientLabelsInTx, mixedClient, assertClientTakesWorkInTx } from '../clients/clients.facade';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
@@ -264,6 +264,10 @@ export class PurchaseOrderCommand {
       [...skuFacts.values()].map((sku) => sku.clientId),
       `Purchase order "${command.code}"`,
     );
+    // Story 1-2a — no new work for a departed client (409 `client-departed`),
+    // under FOR KEY SHARE so a departure cannot commit between here and the
+    // insert. The first lock this transaction takes.
+    await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
     const uomBySku = new Map([...skuFacts].map(([id, sku]) => [id, sku.uom]));
     // Story 10.2: conversion and the precision refusal, behind the replay
     // lookup above and with each line's unit in hand.

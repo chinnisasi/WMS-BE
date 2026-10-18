@@ -18,6 +18,7 @@ import {
   getClientLabelsInTx,
   getClientsByCodesInTx,
   getClientsInTx,
+  assertClientTakesWorkInTx,
 } from '../clients/clients.facade';
 import { CatalogFacade, type SkuByCode } from '../catalog/catalog.facade';
 import { kitCannotHoldStock } from '../catalog/kit.store';
@@ -340,6 +341,19 @@ export class AsnImportCommand {
             } else {
               throw error;
             }
+          }
+        }
+
+        // Story 1-2a — a departed client takes no new ASN, whichever way the
+        // group's client was settled (a named client cell or the SKUs' own):
+        // a row error on the group's first row, under FOR KEY SHARE.
+        if (clientId !== null) {
+          try {
+            await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
+          } catch (error) {
+            const problem = problemOf(error);
+            if (problem === null || problem.code !== 'client-departed') throw error;
+            groupErrors.push(rowError(firstRow.rowNumber, group.asnCode, 'client-departed', problem.detail));
           }
         }
 

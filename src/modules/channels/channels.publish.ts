@@ -24,6 +24,7 @@ import {
   type ChannelAvailabilityPublication,
   type PublishedScope,
 } from './channels.events';
+import { assertClientTakesWorkInTx } from '../clients/clients.facade';
 
 /**
  * The availability-sync publication machinery (story 7-1), as its own
@@ -732,6 +733,7 @@ export class ChannelsPublishService {
         );
       }
       // Every mapped sku must be this tenant's (the catalog facade read).
+      const mappedClientIds = new Set<string>();
       for (const item of items) {
         const sku = await this.catalog.findSku(tenantId, item.skuId);
         if (sku === null) {
@@ -742,6 +744,12 @@ export class ChannelsPublishService {
             `No sku ${item.skuId} exists in this tenant.`,
           );
         }
+        mappedClientIds.add(sku.clientId);
+      }
+      // Story 1-2a — a departed client's SKUs take no new mapping (409
+      // `client-departed`), in id order (the lock order).
+      for (const clientId of [...mappedClientIds].sort()) {
+        await assertClientTakesWorkInTx(tx, tenantId, clientId);
       }
       let written = 0;
       for (const item of items) {

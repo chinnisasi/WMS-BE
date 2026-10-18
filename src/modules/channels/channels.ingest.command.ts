@@ -11,7 +11,7 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { CatalogFacade } from '../catalog/catalog.facade';
-import { getClientLabelsInTx } from '../clients/clients.facade';
+import { getClientLabelsInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
 import { OutboundFacade } from '../outbound/outbound.facade';
 import type { CreateOrderCommand } from '../outbound/outbound.facade';
 import { CONNECTION_COLUMNS } from './channels.view';
@@ -25,6 +25,7 @@ import {
   orderBackorderRejected,
   cancellationUnresolved,
   validationFailedIngest,
+  ingestClientDeparted,
 } from './channels.errors';
 import type { ParsedChannelCancellation, ParsedChannelOrder } from './channel-registry';
 
@@ -184,6 +185,23 @@ export class ChannelsIngestCommand {
         error: `the order's mapped SKUs belong to more than one client (${named})`,
       });
       throw ingestMixedClient(connectionId, `SKUs of more than one client (${named})`);
+    }
+    // Story 1-2a — beside the mixed-client pre-check: a FIRST delivery for a
+    // departed client is refused here as the same typed 422 the order
+    // command's own refusal maps to (`mapIngestRejection`), metered
+    // `validation-failed` — never a transient retry. The order command's
+    // phase-3 check stays the guard against a departure in between.
+    if (prior === null && skuClientIds.size === 1) {
+      try {
+        await withTenantTransaction(this.db, tenantId, (tx) =>
+          assertClientTakesWorkInTx(tx, tenantId, [...skuClientIds][0]!),
+        );
+      } catch (err) {
+        if (err instanceof ProblemException) {
+          throw await this.mapIngestRejection(tenantId, connectionId, startedAt, err);
+        }
+        throw err;
+      }
     }
 
     // ── the order command (the ONE acceptance path, 4-1's) ────────────────
@@ -363,6 +381,12 @@ export class ChannelsIngestCommand {
       // `failed`.
       status = 'validation-failed';
       mapped = ingestMixedClient(connectionId, 'SKUs (or kit components) of more than one client');
+    } else if (code === 'client-departed') {
+      // Story 1-2a: the order's client has departed — a catalog/offboarding
+      // fact the channel's retry cannot fix: a typed 422, metered
+      // `validation-failed` (the mixed-client arm's shape), never `failed`.
+      status = 'validation-failed';
+      mapped = ingestClientDeparted(connectionId, (err.getResponse() as { detail?: string }).detail ?? err.message);
     } else if (code === 'validation-failed') {
       status = 'validation-failed';
     } else if (err.getStatus() === 503) {

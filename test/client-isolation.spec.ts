@@ -965,7 +965,11 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // the parent). None lost.
       // Story 6-1a: + sessions_tenant_isolation (0074).
       // Story 6-1b: + sign_in_challenges and user_backup_codes (0075, the plain tenant policy).
-      expect(policies).toHaveLength(114);
+      // Story 1-2a: + client_contacts_tenant_isolation (0077, client-bound on both arms).
+      expect(policies).toHaveLength(115);
+      const contactPolicy = policies.find((row) => row.policyname === 'client_contacts_tenant_isolation')!;
+      expect(contactPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      expect(contactPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       for (const name of [
         'sessions_tenant_isolation',
         'sign_in_challenges_tenant_isolation',

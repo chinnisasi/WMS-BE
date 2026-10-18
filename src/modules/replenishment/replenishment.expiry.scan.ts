@@ -22,6 +22,7 @@ import type { BatchIntake } from '../catalog/catalog.facade';
 import { REPLENISHMENT_SCHEDULER_ACTOR_ID } from './replenishment.command';
 import { appendBatchAlertCleared } from './replenishment.events';
 import type { ExpiryPolicySnapshot } from './replenishment.command';
+import { departedClientIdsInTx } from '../clients/clients.facade';
 
 /**
  * The expiry scan (story 6.2, FR-23): the scheduler tick's SECOND evaluation
@@ -114,6 +115,15 @@ export class ExpiryScan {
       // Fresh scope sums: a batch consumed since phase 1 is ABSENT here — its
       // open alerts resolve below, never ride a stale enumeration.
       const freshScopes = await this.inventory.batchScopeSumsInTx(tx, tenantId, warehouseId);
+      // Story 1-2a — a departed client's SKUs raise no new alert (it takes no
+      // new work). Its open alerts, if any, still resolve below once their
+      // scope empties — they are dropped from the RAISE pass only.
+      const departed = await departedClientIdsInTx(tx, tenantId);
+      const skuClients =
+        departed.size === 0
+          ? new Map<string, string>()
+          : await this.catalog.skuClientIdsInTx(tx, tenantId, freshScopes.map((scope) => scope.skuId));
+      const raisable = freshScopes.filter((scope) => !departed.has(skuClients.get(scope.skuId) ?? ''));
       const skuIds = [...new Set(freshScopes.map((scope) => scope.skuId))];
       // Batch intake facts on the caller's transaction — the catalog facade's
       // in-tx read; no second connection while this one is held.
@@ -149,7 +159,7 @@ export class ExpiryScan {
       const nowMs = Date.parse(raisedAt);
       // The scope iteration follows the lock order (skuId, batchId) — the
       // same order the open-alert read took its locks in.
-      const ordered = [...freshScopes].sort((a, b) =>
+      const ordered = [...raisable].sort((a, b) =>
         a.skuId < b.skuId
           ? -1
           : a.skuId > b.skuId

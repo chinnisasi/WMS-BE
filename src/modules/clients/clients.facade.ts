@@ -4,9 +4,10 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { MAX_CLIENT_LIST, clients, type ClientStatus } from './clients.schema';
+import { MAX_CLIENT_LIST, clientContacts, clients, type ClientContactRole, type ClientStatus } from './clients.schema';
 import type { UserRole, UserStatus } from '../../shared/db/schema';
 import { getMemberPortalFactsIn } from '../tenancy/tenancy.service';
+import { addressFromColumns, type AddressSnapshot } from '../../shared/primitives/address';
 
 /** One client as every read of this module returns it. */
 export interface ClientSnapshot {
@@ -25,6 +26,23 @@ export interface ClientSnapshot {
    * `ClientsCommand.updateTaxDetails`.
    */
   readonly taxDetails: ClientTaxDetails;
+  /**
+   * Story 1-2a — the registered address (null when unset). A stored snapshot
+   * from before 1-2a carries neither address; the controller reads it as null.
+   */
+  readonly registeredAddress: ClientRegisteredAddress | null;
+  /** Story 1-2a — the return-to address, in the shipment shape (null when unset). */
+  readonly returnAddress: AddressSnapshot | null;
+}
+
+/** Story 1-2a — a client's registered address (the billing columns' shapes). */
+export interface ClientRegisteredAddress {
+  readonly line1: string;
+  readonly line2: string | null;
+  readonly city: string;
+  /** A two-digit GST registration state code. */
+  readonly stateCode: string;
+  readonly pincode: string;
 }
 
 /** Story 21-5 — a client's tax details (every field nullable). */
@@ -37,6 +55,39 @@ export interface ClientTaxDetails {
   /** A two-digit GST registration state code. */
   readonly billingStateCode: string | null;
   readonly billingPincode: string | null;
+}
+
+/**
+ * Story 1-2a — one contact of a client brand, as every read and write of
+ * contacts returns it. Never on the clients list (decision 6): read through
+ * `GET …/clients/{c}/contacts` by staff only.
+ */
+export interface ClientContactSnapshot {
+  readonly id: string;
+  readonly clientId: string;
+  readonly name: string;
+  readonly email: string;
+  readonly phone: string | null;
+  /** A subset of `CLIENT_CONTACT_ROLES`, in vocabulary order; empty = a general contact. */
+  readonly roles: readonly ClientContactRole[];
+  /** Exactly one contact is primary while any exist (listed first; 5.2's default recipient). */
+  readonly isPrimary: boolean;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export function toClientContactSnapshot(row: typeof clientContacts.$inferSelect): ClientContactSnapshot {
+  return {
+    id: row.id,
+    clientId: row.clientId,
+    name: row.name,
+    email: row.email,
+    phone: row.phone,
+    roles: row.roles as ClientContactRole[],
+    isPrimary: row.isPrimary,
+    createdAt: new Date(row.createdAt).toISOString(),
+    updatedAt: new Date(row.updatedAt).toISOString(),
+  };
 }
 
 /** The facts the attribution rules need about one client (bulk read). */
@@ -65,6 +116,25 @@ export function toClientSnapshot(row: typeof clients.$inferSelect): ClientSnapsh
       billingStateCode: row.billingStateCode,
       billingPincode: row.billingPincode,
     },
+    registeredAddress:
+      row.registeredLine1 === null
+        ? null
+        : {
+            line1: row.registeredLine1,
+            line2: row.registeredLine2,
+            city: row.registeredCity ?? '',
+            stateCode: row.registeredStateCode ?? '',
+            pincode: row.registeredPincode ?? '',
+          },
+    returnAddress: addressFromColumns({
+      contactName: row.returnContactName,
+      phone: row.returnPhone,
+      line1: row.returnLine1,
+      line2: row.returnLine2,
+      city: row.returnCity,
+      state: row.returnState,
+      pincode: row.returnPincode,
+    }),
   };
 }
 
@@ -113,6 +183,23 @@ export class ClientsFacade {
         .orderBy(desc(clients.systemOwned), asc(clients.code)),
     );
     return rows.map((client) => ({ id: client.id, code: client.code, name: client.name, active: client.status === 'active' }));
+  }
+
+  /**
+   * Story 1-2a — one client's contacts, the primary first, then by name, then
+   * by id (at most 20). 404 when the client is not this tenant's. A staff
+   * read (any operator session — decision 6); never a portal read.
+   */
+  async listClientContacts(tenantId: string, clientId: string): Promise<ClientContactSnapshot[]> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertClientInTenantInTx(tx, tenantId, clientId);
+      const rows = await tx
+        .select()
+        .from(clientContacts)
+        .where(and(eq(clientContacts.tenantId, tenantId), eq(clientContacts.clientId, clientId)))
+        .orderBy(desc(clientContacts.isPrimary), asc(clientContacts.name), asc(clientContacts.id));
+      return rows.map(toClientContactSnapshot);
+    });
   }
 
   /** Story 21-7 — `GET …/portal/me` (see `portalMeIn`). */
@@ -177,11 +264,18 @@ export interface LockedClientFacts extends ClientFacts {
 }
 
 /**
- * Story 21-3 — lock the client row (`FOR UPDATE`) on the caller's
- * transaction and return its facts, 404 `not-found` when absent. The rate-card
- * activation and cancel commands serialise on it: every card transition of
- * one client runs under this one row lock, so two activations can never
- * interleave. A lock, never a write — the clients module still owns the table.
+ * Story 21-3 — lock the client row on the caller's transaction and return its
+ * facts, 404 `not-found` when absent. The rate-card activation and cancel
+ * commands serialise on it: every card transition of one client runs under
+ * this one row lock, so two activations can never interleave; 21-5's client
+ * invoice prepare, refresh and issue take it too. A lock, never a write — the
+ * clients module still owns the table.
+ *
+ * Story 1-2a — `FOR NO KEY UPDATE`, no longer `FOR UPDATE`: it still
+ * conflicts with itself, with `FOR SHARE` (the create-gates) and with the
+ * status command's `FOR UPDATE`, but NOT with `FOR KEY SHARE` — so a long
+ * invoice prepare never queues every order create of the client behind it
+ * (`assertClientTakesWorkInTx` takes `FOR KEY SHARE`).
  */
 export async function lockClientInTx(
   tx: TenantTx,
@@ -193,12 +287,93 @@ export async function lockClientInTx(
     .from(clients)
     .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
     .limit(1)
-    .for('update');
+    .for('no key update');
   const row = rows[0];
   if (row === undefined) {
     throw clientNotFound(clientId);
   }
   return { ...row, status: row.status as ClientStatus };
+}
+
+/**
+ * Story 1-2a — "no new work": the ONE gate every path that creates work for a
+ * client runs (PO / ASN / order / RMA create, channel ingest and mappings,
+ * catalog import, SKU client correction, kit and variant attach, a positive
+ * adjustment or count gain). It takes the client row `FOR KEY SHARE` on the
+ * caller's transaction — weakest lock, so concurrent creators never
+ * serialise against each other nor against the non-status writers' `FOR NO
+ * KEY UPDATE` — but it conflicts with the status command's `FOR UPDATE`:
+ * a departure and a creation serialise, and a creation arriving behind a
+ * committing departure re-reads `departed` (READ COMMITTED). 404 when
+ * absent; 409 `client-departed` when departed. A SUSPENDED client still
+ * takes work (decision 5 — suspension cuts only the portal). Run it FIRST in
+ * the transaction, before any document or advisory lock.
+ */
+export async function assertClientTakesWorkInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientId: string,
+): Promise<LockedClientFacts> {
+  const rows = await tx
+    .select({ id: clients.id, code: clients.code, name: clients.name, systemOwned: clients.systemOwned, status: clients.status })
+    .from(clients)
+    .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
+    .limit(1)
+    .for('key share');
+  const row = rows[0];
+  if (row === undefined) {
+    throw clientNotFound(clientId);
+  }
+  if (row.status === 'departed') {
+    throw clientDeparted(clientLabel(row));
+  }
+  return { id: row.id, code: row.code, systemOwned: row.systemOwned, status: row.status as ClientStatus };
+}
+
+/**
+ * Story 1-2a — the departed clients among `clientIds`, under the same `FOR
+ * KEY SHARE` as `assertClientTakesWorkInTx` (the receipt's per-line refusal
+ * reads them so a departure cannot commit between the read and the booking).
+ * Returns id → refusal label; an unknown id is absent.
+ */
+export async function departedClientsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  clientIds: readonly string[],
+): Promise<Map<string, string>> {
+  const distinct = [...new Set(clientIds)];
+  if (distinct.length === 0) {
+    return new Map();
+  }
+  const rows = await tx
+    .select({ id: clients.id, code: clients.code, name: clients.name, systemOwned: clients.systemOwned, status: clients.status })
+    .from(clients)
+    .where(and(eq(clients.tenantId, tenantId), inArray(clients.id, distinct)))
+    .orderBy(asc(clients.id))
+    .for('key share');
+  return new Map(rows.filter((row) => row.status === 'departed').map((row) => [row.id, clientLabel(row)]));
+}
+
+/**
+ * Story 1-2a — every departed client of the tenant (an unlocked read): the
+ * replenishment sweep and expiry scan skip their SKUs.
+ */
+export async function departedClientIdsInTx(tx: TenantTx, tenantId: string): Promise<Set<string>> {
+  const rows = await tx
+    .select({ id: clients.id })
+    .from(clients)
+    .where(and(eq(clients.tenantId, tenantId), eq(clients.status, 'departed')));
+  return new Set(rows.map((row) => row.id));
+}
+
+/** Story 1-2a — 409 `client-departed`: work refused for a client that has left. */
+export function clientDeparted(label: string): ProblemException {
+  return new ProblemException(
+    'client-departed',
+    409,
+    'The client has departed',
+    `Client ${label} has departed — it takes no new work. An owner can reactivate it in Settings → Clients.`,
+  );
 }
 
 /**
@@ -421,6 +596,25 @@ export function clientSuspended(): ProblemException {
   );
 }
 
+/**
+ * Story 1-2a — 403 `client-departed`: a client-portal user whose client has
+ * DEPARTED (its account with the warehouse has ended). Sign-in, the portal
+ * guard and portal `me` answer it instead of `client-suspended`.
+ */
+export function clientAccountEnded(): ProblemException {
+  return new ProblemException(
+    'client-departed',
+    403,
+    'Client account has ended',
+    "Your company's account with the warehouse has ended.",
+  );
+}
+
+/** Story 1-2a — the portal refusal for a non-active client: departed or suspended. */
+export function clientInactive(status: ClientStatus | null): ProblemException {
+  return status === 'departed' ? clientAccountEnded() : clientSuspended();
+}
+
 /** Story 21-7 — `GET …/portal/me`: the portal user and its client, exact keys. */
 export interface PortalMe {
   readonly user: {
@@ -450,7 +644,7 @@ export async function portalMeIn(db: Database, tenantId: string, userId: string,
       }
       const client = await readSessionClientIn(tx, tenantId, clientId);
       if (client === null || client.status !== 'active') {
-        throw clientSuspended();
+        throw clientInactive(client?.status ?? null);
       }
       return {
         user: { id: user.id, email: user.email, role: user.role, status: user.status as UserStatus, clientId },

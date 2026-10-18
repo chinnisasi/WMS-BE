@@ -26,11 +26,11 @@ import {
 } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import {
-  assertClientInTenantInTx,
   assertSingleClientInTx,
-  clientSuspended,
+  clientInactive,
   getClientLabelsInTx,
   shareLockClientInTx,
+  assertClientTakesWorkInTx,
 } from '../clients/clients.facade';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -702,7 +702,11 @@ export class AsnCommand {
       assertLineShape(command.lines);
 
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
-      const client = await assertClientInTenantInTx(tx, command.tenantId, command.clientId);
+      // Story 1-2a — the client exists (404) and takes work (409
+      // `client-departed`), under FOR KEY SHARE: the first lock this
+      // transaction takes. Amend stays unguarded — an open ASN already
+      // blocks its client's departure.
+      const client = await assertClientTakesWorkInTx(tx, command.tenantId, command.clientId);
       const skuFacts = await this.readSkus(tx, command.tenantId, command.lines.map((line) => line.skuId));
       await assertAsnClientInTx(
         tx,
@@ -809,7 +813,8 @@ export class AsnCommand {
         // waits for this announce or is re-read here once it commits.
         const client = await shareLockClientInTx(tx, command.tenantId, command.clientId);
         if (client.status !== 'active') {
-          throw clientSuspended();
+          // Story 1-2a — departed answers `client-departed`, suspended `client-suspended`.
+          throw clientInactive(client.status);
         }
 
         const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);

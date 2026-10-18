@@ -1,8 +1,30 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { Transform } from 'class-transformer';
-import { IsIn, IsOptional, IsString, Length, Matches, MaxLength, ValidateIf } from 'class-validator';
-import { CLIENT_NAME_MAX, CLIENT_STATUSES, type ClientStatus } from '../modules/clients/clients.schema';
+import { Transform, Type } from 'class-transformer';
+import {
+  ArrayMaxSize,
+  IsArray,
+  IsBoolean,
+  IsIn,
+  IsOptional,
+  IsString,
+  Length,
+  Matches,
+  MaxLength,
+  ValidateIf,
+  ValidateNested,
+} from 'class-validator';
+import {
+  CLIENT_CONTACT_NAME_MAX,
+  CLIENT_CONTACT_ROLES,
+  CLIENT_NAME_MAX,
+  CLIENT_STATUSES,
+  type ClientContactRole,
+  type ClientStatus,
+} from '../modules/clients/clients.schema';
 import { CLIENT_STATUS_TARGETS, type ClientStatusTarget } from '../modules/clients/clients.command';
+import { ADDRESS_FIELD_LENGTHS } from '../shared/primitives/address';
+import { EMAIL_MAX_LENGTH, IsEmailAddress } from '../shared/primitives/email';
+import { AddressDto } from '../modules/tenancy/tenancy.dto';
 
 /**
  * Story 21-2b — the client admin surface's DTOs. The DTO mirrors the shape
@@ -46,15 +68,15 @@ export class RenameClientDto {
 
 /**
  * Story 21-10 — suspend (`suspended`) or reactivate (`active`) a client
- * brand. `departed` is not a target here (departure is a later, deliberate
- * change); the command re-checks the same tuple (it is the boundary).
+ * brand; story 1-2a — depart it (`departed`, offboarding). The command
+ * re-checks the same tuple (it is the boundary).
  */
 export class UpdateClientStatusDto {
   @ApiProperty({
     enum: [...CLIENT_STATUS_TARGETS],
     example: 'suspended',
     description:
-      'The status to move the client to: `suspended` stops its portal (sign-in, every portal call, ASN announce), new portal users and new rate-card drafts and activation; `active` restores them. Operator work continues either way',
+      'The status to move the client to: `suspended` stops its portal (sign-in, every portal call, ASN announce), new portal users and new rate-card drafts and activation — operator work continues; `departed` (only once nothing is left open for it — 409 `client-not-wound-down` lists the blockers) also stops every new piece of work and ends its portal sessions, keeping its history; `active` restores either',
   })
   @IsIn(CLIENT_STATUS_TARGETS)
   status!: ClientStatusTarget;
@@ -142,6 +164,191 @@ export class ClientTaxDetailsDto {
   billingPincode!: string | null;
 }
 
+/** Story 1-2a — the registered address as a request sends it. */
+export class ClientRegisteredAddressInputDto {
+  @ApiProperty({ example: '4th Floor, Prestige Towers', maxLength: ADDRESS_FIELD_LENGTHS.line1 })
+  @Trimmed()
+  @IsString()
+  @Length(1, ADDRESS_FIELD_LENGTHS.line1)
+  line1!: string;
+
+  @ApiProperty({ required: false, nullable: true, type: String, maxLength: ADDRESS_FIELD_LENGTHS.line2, description: 'Omit (or null) when there is none' })
+  @Trimmed()
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @Length(0, ADDRESS_FIELD_LENGTHS.line2)
+  line2?: string | null;
+
+  @ApiProperty({ example: 'Mumbai', maxLength: ADDRESS_FIELD_LENGTHS.city })
+  @Trimmed()
+  @IsString()
+  @Length(1, ADDRESS_FIELD_LENGTHS.city)
+  city!: string;
+
+  @ApiProperty({ example: '27', description: 'A two-digit GST registration state code' })
+  @Trimmed()
+  @IsString()
+  @MaxLength(10)
+  stateCode!: string;
+
+  @ApiProperty({ example: '400001', description: 'Six digits, as text' })
+  @Trimmed()
+  @IsString()
+  @MaxLength(20)
+  pincode!: string;
+}
+
+/**
+ * Story 1-2a — `PATCH …/clients/{c}/addresses`. Each group: ABSENT leaves it
+ * unchanged, `null` clears it, a value replaces it whole. Every shape rule
+ * (the state code, the pincode, the ceilings) is the command's too, behind
+ * the replay lookup.
+ */
+export class UpdateClientAddressesDto {
+  @ApiProperty({ required: false, nullable: true, type: ClientRegisteredAddressInputDto, description: "The client's registered address (absent = unchanged, null = cleared)" })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @ValidateNested()
+  @Type(() => ClientRegisteredAddressInputDto)
+  registered?: ClientRegisteredAddressInputDto | null;
+
+  @ApiProperty({ required: false, nullable: true, type: AddressDto, description: 'Where returned goods go back to — the shipment address shape (absent = unchanged, null = cleared)' })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @ValidateNested()
+  @Type(() => AddressDto)
+  return?: AddressDto | null;
+}
+
+/** Story 1-2a — a client's registered address as every read returns it. */
+export class ClientRegisteredAddressDto {
+  @ApiProperty()
+  line1!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  line2!: string | null;
+
+  @ApiProperty()
+  city!: string;
+
+  @ApiProperty({ description: 'A two-digit GST registration state code' })
+  stateCode!: string;
+
+  @ApiProperty({ description: 'Six digits' })
+  pincode!: string;
+}
+
+const LowerTrimmed = () =>
+  Transform(({ value }) => (typeof value === 'string' ? value.trim().toLowerCase() : value));
+
+/** Story 1-2a — add a contact. */
+export class CreateClientContactDto {
+  @ApiProperty({ example: 'Asha Rao', minLength: 1, maxLength: CLIENT_CONTACT_NAME_MAX })
+  @Trimmed()
+  @IsString()
+  @Length(1, CLIENT_CONTACT_NAME_MAX)
+  name!: string;
+
+  @ApiProperty({ example: 'asha@acme.example', maxLength: EMAIL_MAX_LENGTH, description: 'Stored trimmed and lower-cased; unique per client' })
+  @LowerTrimmed()
+  @IsString()
+  @IsEmailAddress()
+  email!: string;
+
+  @ApiProperty({ required: false, nullable: true, type: String, maxLength: ADDRESS_FIELD_LENGTHS.phone, description: 'Omit, null or blank for none' })
+  @Trimmed()
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(ADDRESS_FIELD_LENGTHS.phone)
+  phone?: string | null;
+
+  @ApiProperty({ required: false, enum: [...CLIENT_CONTACT_ROLES], isArray: true, description: 'What the contact is for — none is a general contact. No role twice' })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(CLIENT_CONTACT_ROLES.length)
+  @IsIn(CLIENT_CONTACT_ROLES, { each: true })
+  roles?: ClientContactRole[];
+}
+
+/** Story 1-2a — edit a contact: an absent field is unchanged; `isPrimary: true` makes it the primary. */
+export class UpdateClientContactDto {
+  @ApiProperty({ required: false, minLength: 1, maxLength: CLIENT_CONTACT_NAME_MAX })
+  @Trimmed()
+  @IsOptional()
+  @IsString()
+  @Length(1, CLIENT_CONTACT_NAME_MAX)
+  name?: string;
+
+  @ApiProperty({ required: false, maxLength: EMAIL_MAX_LENGTH })
+  @LowerTrimmed()
+  @IsOptional()
+  @IsString()
+  @IsEmailAddress()
+  email?: string;
+
+  @ApiProperty({ required: false, nullable: true, type: String, maxLength: ADDRESS_FIELD_LENGTHS.phone, description: 'null or blank clears it' })
+  @Trimmed()
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  @MaxLength(ADDRESS_FIELD_LENGTHS.phone)
+  phone?: string | null;
+
+  @ApiProperty({ required: false, enum: [...CLIENT_CONTACT_ROLES], isArray: true })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(CLIENT_CONTACT_ROLES.length)
+  @IsIn(CLIENT_CONTACT_ROLES, { each: true })
+  roles?: ClientContactRole[];
+
+  @ApiProperty({ required: false, description: 'true makes this the primary contact (the previous primary is cleared). false is refused — make another contact primary instead' })
+  @IsOptional()
+  @IsBoolean()
+  isPrimary?: boolean;
+}
+
+/** Story 1-2a — one client contact. */
+export class ClientContactDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  clientId!: string;
+
+  @ApiProperty()
+  name!: string;
+
+  @ApiProperty({ description: 'Lower-cased' })
+  email!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  phone!: string | null;
+
+  @ApiProperty({ enum: [...CLIENT_CONTACT_ROLES], isArray: true, description: 'In vocabulary order; empty = a general contact' })
+  roles!: ClientContactRole[];
+
+  @ApiProperty({ description: 'Exactly one contact is primary while any exist — listed first, the default recipient of client notifications' })
+  isPrimary!: boolean;
+
+  @ApiProperty({ description: 'ISO-8601 UTC creation time' })
+  createdAt!: string;
+
+  @ApiProperty({ description: 'ISO-8601 UTC last update' })
+  updatedAt!: string;
+}
+
+export class ClientContactResponse {
+  @ApiProperty({ type: ClientContactDto })
+  contact!: ClientContactDto;
+}
+
+export class ClientContactListResponse {
+  @ApiProperty({ type: [ClientContactDto], description: 'The primary first, then by name, then by id (at most 20)' })
+  items!: readonly ClientContactDto[];
+}
+
 export class ClientDto {
   @ApiProperty({ format: 'uuid' })
   id!: string;
@@ -178,6 +385,12 @@ export class ClientDto {
     description: "Story 21-5 — the recipient's tax details a services tax invoice names (every field nullable; never required)",
   })
   taxDetails!: ClientTaxDetailsDto;
+
+  @ApiProperty({ type: ClientRegisteredAddressDto, nullable: true, description: "Story 1-2a — the client's registered address (null when unset)" })
+  registeredAddress!: ClientRegisteredAddressDto | null;
+
+  @ApiProperty({ type: AddressDto, nullable: true, description: 'Story 1-2a — where returned goods go back to, in the shipment address shape (null when unset)' })
+  returnAddress!: AddressDto | null;
 }
 
 export class ClientResponse {

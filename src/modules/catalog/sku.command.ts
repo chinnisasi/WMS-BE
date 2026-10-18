@@ -48,7 +48,7 @@ import {
   normalizeVariantValues,
   productNotFound,
 } from './product.command';
-import { assertSingleClientInTx } from '../clients/clients.facade';
+import { assertSingleClientInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
 
 export const DEFAULT_SKU_PAGE_SIZE = 50;
 export const MAX_SKU_PAGE_SIZE = 200;
@@ -733,6 +733,9 @@ export class SkuCommand {
               [current.clientId, ...siblingClients.map((row) => row.clientId)],
               `Product "${product.name}"`,
             );
+            // Story 1-2a — a departed client's SKU joins no product (409
+            // `client-departed`).
+            await assertClientTakesWorkInTx(tx, command.tenantId, current.clientId);
             // Duplicate variants are refused: two SKUs in one product
             // carrying identical values is the 409 the I/O matrix names,
             // checked in-transaction (the repo's no-FK convention — a
