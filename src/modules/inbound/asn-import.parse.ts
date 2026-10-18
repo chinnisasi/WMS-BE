@@ -53,6 +53,8 @@ export const ASN_IMPORT_ROW_ERROR_CODES = [
   'sku-client-mismatch',
   'mixed-client',
   'client-required',
+  // Story 1-2a — the ASN's client has departed (it takes no new work).
+  'client-departed',
   'kit-cannot-hold-stock',
   'duplicate-asn-code',
   'invalid-asn-code',

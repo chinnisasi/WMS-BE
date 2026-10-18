@@ -329,6 +329,31 @@ export const clients = pgTable(
     billingStateCode: text('billing_state_code'),
     /** Six digits, text (leading zeros are significant). */
     billingPincode: text('billing_pincode'),
+    /**
+     * Story 1-2a — the registered address (the billing columns' shapes: a
+     * two-digit GST registration state code, a six-digit pincode). All or
+     * none, `line2` optional — the `clients_registered_address_format` CHECK
+     * lives ONLY in `drizzle/0077_client_master_record.sql`. Written only by
+     * `ClientsCommand.updateAddresses` (`clients.manage`).
+     */
+    registeredLine1: text('registered_line1'),
+    registeredLine2: text('registered_line2'),
+    registeredCity: text('registered_city'),
+    registeredStateCode: text('registered_state_code'),
+    registeredPincode: text('registered_pincode'),
+    /**
+     * Story 1-2a — the return-to address (the shipment address shape,
+     * `AddressInput` / `assertAddress`): where returns disposition sends a
+     * client's goods back. All or none, `line2` optional — the
+     * `clients_return_address_format` CHECK lives ONLY in migration 0077.
+     */
+    returnContactName: text('return_contact_name'),
+    returnPhone: text('return_phone'),
+    returnLine1: text('return_line1'),
+    returnLine2: text('return_line2'),
+    returnCity: text('return_city'),
+    returnState: text('return_state'),
+    returnPincode: text('return_pincode'),
   },
   (table) => [
     uniqueIndex('clients_tenant_id_code_unique').on(table.tenantId, table.code),
@@ -342,6 +367,49 @@ export const clients = pgTable(
 );
 
 export type Client = typeof clients.$inferSelect;
+
+/**
+ * Story 1-2a — the roles a client contact may carry (an empty list is a
+ * general contact). Mirrored by the `client_contacts_roles_check` CHECK
+ * (migration 0077, no duplicates), the DTO's `@IsIn` and the web.
+ */
+export const CLIENT_CONTACT_ROLES = ['operations', 'billing', 'returns'] as const;
+export type ClientContactRole = (typeof CLIENT_CONTACT_ROLES)[number];
+
+/**
+ * Story 1-2a — a client brand's contacts: a list with roles, at most 20 per
+ * client, exactly one primary while any exist (the partial unique index; the
+ * command moves it in two statements because the index is not deferrable).
+ * Email is stored trimmed and lower-cased and unique per client. Owned by the
+ * clients module (written only by `ClientsCommand`); the CHECKs and the RLS
+ * policy — the tenant arm plus the 0041 `app.client_id` clause on
+ * `client_id` — live ONLY in `drizzle/0077_client_master_record.sql`.
+ */
+export const clientContacts = pgTable(
+  'client_contacts',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    name: text('name').notNull(),
+    email: text('email').notNull(),
+    phone: text('phone'),
+    roles: text('roles').array().notNull().default(sql`'{}'::text[]`),
+    isPrimary: boolean('is_primary').notNull().default(false),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('client_contacts_client_email_unique').on(table.clientId, table.email),
+    uniqueIndex('client_contacts_one_primary_unique')
+      .on(table.clientId)
+      .where(sql`is_primary`),
+    index('client_contacts_tenant_client_idx').on(table.tenantId, table.clientId),
+  ],
+);
+
+export type ClientContactRow = typeof clientContacts.$inferSelect;
 
 /**
  * Append-only audit trail for user/role actions (Story 1.5): one row per

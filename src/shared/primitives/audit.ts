@@ -165,4 +165,11 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'user.backup_code_used', targetType: 'user' },
   { action: 'user.second_factor_locked', targetType: 'user' },
   { action: 'user.second_factor_reset', targetType: 'user' },
+  // Story 1-2a — the client master record (`ClientsCommand`): departure, the
+  // address patch, the contact list. Every one targets the client.
+  { action: 'client.departed', targetType: 'client' },
+  { action: 'client.addresses_updated', targetType: 'client' },
+  { action: 'client.contact_added', targetType: 'client' },
+  { action: 'client.contact_edited', targetType: 'client' },
+  { action: 'client.contact_removed', targetType: 'client' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

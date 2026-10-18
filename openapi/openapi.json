@@ -146,7 +146,7 @@
             }
           },
           "403": {
-            "description": "Invitation not yet accepted (invite-pending), a client-portal user whose client is not active (client-suspended, story 21-7), or — story 6-1b — an owner reset this user’s two-factor sign-in and the enrolment code has expired (enrolment-code-expired: ask for another reset; nothing counted)",
+            "description": "Invitation not yet accepted (invite-pending), a client-portal user whose client is suspended (client-suspended, story 21-7) or has departed (client-departed, story 1-2a), or — story 6-1b — an owner reset this user’s two-factor sign-in and the enrolment code has expired (enrolment-code-expired: ask for another reset; nothing counted)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -292,7 +292,7 @@
             }
           },
           "401": {
-            "description": "No session to refresh (unauthenticated), or the session is over (session-ended with `reason`: signed-out | deactivated | role-changed | client-suspended | refresh-reuse | idle | absolute)",
+            "description": "No session to refresh (unauthenticated), or the session is over (session-ended with `reason`: signed-out | deactivated | role-changed | client-suspended | client-departed | refresh-reuse | idle | absolute)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -21141,7 +21141,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, a malformed clientId, a status other than active or suspended, or the tenant's own self client (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, a status other than active, suspended or departed, or the tenant's own self client (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -21181,7 +21181,7 @@
             }
           },
           "409": {
-            "description": "The client has departed — its status cannot change (client-not-active), or a concurrent request with the same Idempotency-Key (conflict)",
+            "description": "A departed client asked to be suspended — it can only be reactivated (client-not-active); a departure while work remains (client-not-wound-down — `blockers: [{kind, count, codes?}]` lists every blocker: stock, open-purchase-orders, open-asns, pending-over-receipts, open-orders, open-rmas, pending-adjustments, open-counts, open-review-items, unsettled-invoices); or a concurrent request with the same Idempotency-Key (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -21206,7 +21206,614 @@
             "bearer": []
           }
         ],
-        "summary": "Suspends or reactivates a client brand (owner-only). Suspension stops its portal (sign-in and every portal call), portal ASN announce, new portal users and rate-card drafts and activation; operator work and billing continue, and open ASNs stay open. An unchanged status is a no-op (nothing written or audited; the key is stored)",
+        "summary": "Suspends, departs or reactivates a client brand (owner-only). Suspension stops its portal (sign-in and every portal call), portal ASN announce, new portal users and rate-card drafts and activation; operator work and billing continue, and open ASNs stay open. Departure (story 1-2a) is allowed only once nothing is left open for the client (stock, open documents, pending decisions, unsettled invoices) and also stops every new piece of work for it and ends its portal sessions; history, reports, metering and invoices stay readable. A departed client can only be reactivated. An unchanged status is a no-op (nothing written or audited; the key is stored)",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/addresses": {
+      "patch": {
+        "operationId": "ClientsController_updateAddresses",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateClientAddressesDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, or an address field that breaks its rule — a missing field, an over-long one, a registered state code off the GST registration list, a pincode that is not six digits (validation-failed, naming the field)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Sets a client's registered and return addresses (owner-only, clients.manage). Each group: absent is unchanged, null clears it, a value replaces it whole. Allowed on the self client and on a departed one. An unchanged patch is a no-op (nothing written or audited; the key is stored)",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/contacts": {
+      "get": {
+        "operationId": "ClientsController_listContacts",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientContactListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists a client's contacts — the primary first, then by name (any staff session; never the portal). At most 20",
+        "tags": [
+          "clients"
+        ]
+      },
+      "post": {
+        "operationId": "ClientsController_addContact",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateClientContactDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The added contact (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientContactResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, or a name, email, phone or role that breaks its rule (validation-failed, naming the field)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The client already has 20 contacts (contact-limit), another contact of the client has this email (duplicate-contact-email), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Adds a contact to a client (owner-only, clients.manage). The first contact becomes the primary",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/clients/{clientId}/contacts/{contactId}": {
+      "patch": {
+        "operationId": "ClientsController_editContact",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "contactId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateClientContactDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientContactResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId or contactId, a field that breaks its rule, or isPrimary: false (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such client in this tenant, or no such contact of this client (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another contact of the client has this email (duplicate-contact-email), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Edits a client contact (owner-only, clients.manage): absent fields are unchanged, a null phone clears it, isPrimary: true makes it the primary. An unchanged edit is a no-op (nothing written or audited; the key is stored)",
+        "tags": [
+          "clients"
+        ]
+      },
+      "delete": {
+        "operationId": "ClientsController_removeContact",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "contactId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The removed contact (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientContactResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed clientId or contactId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such client in this tenant, or no such contact of this client (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The primary contact while others remain — make another primary first (primary-contact-required), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Removes a client contact (owner-only, clients.manage). The primary cannot be removed while other contacts remain",
         "tags": [
           "clients"
         ]
@@ -23557,7 +24164,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -23645,7 +24252,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -23747,7 +24354,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -23824,7 +24431,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -23937,7 +24544,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -24025,7 +24632,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended); or the user may not announce for this client (role-denied)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a); or the user may not announce for this client (role-denied)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -24132,7 +24739,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -24242,7 +24849,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -24319,7 +24926,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -24417,7 +25024,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -24475,7 +25082,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -24573,7 +25180,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -24681,7 +25288,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -24748,7 +25355,7 @@
             }
           },
           "403": {
-            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)",
+            "description": "An operator session — \"This is a client-portal surface.\" (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -31086,6 +31693,7 @@
               "sku-client-mismatch",
               "mixed-client",
               "client-required",
+              "client-departed",
               "kit-cannot-hold-stock",
               "duplicate-asn-code",
               "invalid-asn-code",
@@ -33783,9 +34391,10 @@
               "po-line-not-found",
               "po-line-not-open",
               "asn-line-not-found",
-              "sku-client-mismatch"
+              "sku-client-mismatch",
+              "client-departed"
             ],
-            "description": "Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt's line whose SKU belongs to another client than the receipt's; it goes to the review queue (Discard only)"
+            "description": "Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt's line whose SKU belongs to another client than the receipt's; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU's client has departed; also to review (Discard only — re-receive after an owner reactivates the client)"
           },
           "reason": {
             "type": "string",
@@ -33944,7 +34553,7 @@
           "clientId": {
             "type": "string",
             "format": "uuid",
-            "description": "The client the blind receipt named"
+            "description": "The client the blind receipt named — or (story 1-2a), when no client was named, the first refused line's client (a departed one)"
           },
           "blindReasonCode": {
             "type": "string",
@@ -33961,7 +34570,7 @@
             "description": "Device time of the receipt (ISO-8601 UTC)"
           },
           "rejectedLines": {
-            "description": "Every request line, each `sku-client-mismatch`",
+            "description": "Every request line, each `sku-client-mismatch` or (story 1-2a) `client-departed`",
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RejectedGrnLineDto"
@@ -33986,7 +34595,7 @@
         "properties": {
           "goodsReceipt": {
             "nullable": true,
-            "description": "The recorded GRN. Story 1-1 (decision 6): null when every line of a blind receipt was refused `sku-client-mismatch` — no receipt was recorded (no GRN code consumed); `refusedReceipt` then says what went to review",
+            "description": "The recorded GRN. Story 1-1 (decision 6): null when every line of a blind receipt was refused `sku-client-mismatch` — or (story 1-2a) every line of any receipt was refused `sku-client-mismatch` / `client-departed` — no receipt was recorded (no GRN code consumed); `refusedReceipt` then says what went to review",
             "type": "object",
             "allOf": [
               {
@@ -40459,6 +41068,36 @@
           "billingPincode"
         ]
       },
+      "ClientRegisteredAddressDto": {
+        "type": "object",
+        "properties": {
+          "line1": {
+            "type": "string"
+          },
+          "line2": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string"
+          },
+          "stateCode": {
+            "type": "string",
+            "description": "A two-digit GST registration state code"
+          },
+          "pincode": {
+            "type": "string",
+            "description": "Six digits"
+          }
+        },
+        "required": [
+          "line1",
+          "line2",
+          "city",
+          "stateCode",
+          "pincode"
+        ]
+      },
       "ClientDto": {
         "type": "object",
         "properties": {
@@ -40507,6 +41146,26 @@
                 "$ref": "#/components/schemas/ClientTaxDetailsDto"
               }
             ]
+          },
+          "registeredAddress": {
+            "nullable": true,
+            "description": "Story 1-2a — the client's registered address (null when unset)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientRegisteredAddressDto"
+              }
+            ]
+          },
+          "returnAddress": {
+            "nullable": true,
+            "description": "Story 1-2a — where returned goods go back to, in the shipment address shape (null when unset)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AddressDto"
+              }
+            ]
           }
         },
         "required": [
@@ -40518,7 +41177,9 @@
           "systemOwned",
           "createdAt",
           "updatedAt",
-          "taxDetails"
+          "taxDetails",
+          "registeredAddress",
+          "returnAddress"
         ]
       },
       "ClientListResponse": {
@@ -40636,15 +41297,239 @@
             "type": "string",
             "enum": [
               "active",
-              "suspended"
+              "suspended",
+              "departed"
             ],
             "example": "suspended",
-            "description": "The status to move the client to: `suspended` stops its portal (sign-in, every portal call, ASN announce), new portal users and new rate-card drafts and activation; `active` restores them. Operator work continues either way"
+            "description": "The status to move the client to: `suspended` stops its portal (sign-in, every portal call, ASN announce), new portal users and new rate-card drafts and activation — operator work continues; `departed` (only once nothing is left open for it — 409 `client-not-wound-down` lists the blockers) also stops every new piece of work and ends its portal sessions, keeping its history; `active` restores either"
           }
         },
         "required": [
           "status"
         ]
+      },
+      "ClientRegisteredAddressInputDto": {
+        "type": "object",
+        "properties": {
+          "line1": {
+            "type": "string",
+            "example": "4th Floor, Prestige Towers",
+            "maxLength": 200
+          },
+          "line2": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "Omit (or null) when there is none"
+          },
+          "city": {
+            "type": "string",
+            "example": "Mumbai",
+            "maxLength": 100
+          },
+          "stateCode": {
+            "type": "string",
+            "example": "27",
+            "description": "A two-digit GST registration state code"
+          },
+          "pincode": {
+            "type": "string",
+            "example": "400001",
+            "description": "Six digits, as text"
+          }
+        },
+        "required": [
+          "line1",
+          "city",
+          "stateCode",
+          "pincode"
+        ]
+      },
+      "UpdateClientAddressesDto": {
+        "type": "object",
+        "properties": {
+          "registered": {
+            "nullable": true,
+            "description": "The client's registered address (absent = unchanged, null = cleared)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientRegisteredAddressInputDto"
+              }
+            ]
+          },
+          "return": {
+            "nullable": true,
+            "description": "Where returned goods go back to — the shipment address shape (absent = unchanged, null = cleared)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AddressDto"
+              }
+            ]
+          }
+        }
+      },
+      "ClientContactDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string",
+            "description": "Lower-cased"
+          },
+          "phone": {
+            "type": "string",
+            "nullable": true
+          },
+          "roles": {
+            "type": "array",
+            "description": "In vocabulary order; empty = a general contact",
+            "items": {
+              "type": "string",
+              "enum": [
+                "operations",
+                "billing",
+                "returns"
+              ]
+            }
+          },
+          "isPrimary": {
+            "type": "boolean",
+            "description": "Exactly one contact is primary while any exist — listed first, the default recipient of client notifications"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last update"
+          }
+        },
+        "required": [
+          "id",
+          "clientId",
+          "name",
+          "email",
+          "phone",
+          "roles",
+          "isPrimary",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "ClientContactListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "The primary first, then by name, then by id (at most 20)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientContactDto"
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "CreateClientContactDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "example": "Asha Rao",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "1-120 characters (code points) once trimmed"
+          },
+          "email": {
+            "type": "string",
+            "example": "asha@acme.example",
+            "maxLength": 254,
+            "description": "An ASCII address, stored trimmed and lower-cased; unique per client"
+          },
+          "phone": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 20,
+            "description": "Omit, null or blank for none"
+          },
+          "roles": {
+            "type": "array",
+            "description": "What the contact is for — none is a general contact. No role twice",
+            "items": {
+              "type": "string",
+              "enum": [
+                "operations",
+                "billing",
+                "returns"
+              ]
+            }
+          }
+        },
+        "required": [
+          "name",
+          "email"
+        ]
+      },
+      "ClientContactResponse": {
+        "type": "object",
+        "properties": {
+          "contact": {
+            "$ref": "#/components/schemas/ClientContactDto"
+          }
+        },
+        "required": [
+          "contact"
+        ]
+      },
+      "UpdateClientContactDto": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "1-120 characters (code points) once trimmed — checked by the command"
+          },
+          "email": {
+            "type": "string",
+            "maxLength": 254
+          },
+          "phone": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 20,
+            "description": "null or blank clears it"
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "operations",
+                "billing",
+                "returns"
+              ]
+            }
+          },
+          "isPrimary": {
+            "type": "boolean",
+            "description": "true makes this the primary contact (the previous primary is cleared). false is refused — make another contact primary instead"
+          }
+        }
       },
       "RateCardLineResponseDto": {
         "type": "object",

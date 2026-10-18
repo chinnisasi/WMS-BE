@@ -169,6 +169,10 @@ export function assertAddress(
   }
   for (const field of REQUIRED_ADDRESS_FIELDS) {
     const value = address[field] as string;
+    if (field === 'phone') {
+      assertPhone(value, `${label}.phone`);
+      continue;
+    }
     const ceiling = field === 'pincode' ? 6 : ADDRESS_FIELD_LENGTHS[field];
     if (value.length > ceiling) {
       throw addressValidationFailed(
@@ -187,6 +191,26 @@ export function assertAddress(
     );
   }
   return address as AddressInput;
+}
+
+/**
+ * Story 1-2a — the phone rule, extracted from `assertAddress` so a client
+ * contact's phone is held to the shipment address's: trimmed by the caller,
+ * non-empty, at most `ADDRESS_FIELD_LENGTHS.phone` characters. The value is
+ * a phone NUMBER only in the loose sense carriers accept (digits, spaces,
+ * `+`, dashes) — no format is imposed. 400 `validation-failed` naming the
+ * field.
+ */
+export function assertPhone(value: string, field: string): string {
+  if (value.length === 0) {
+    throw addressValidationFailed(`${field} must not be blank.`);
+  }
+  if (value.length > ADDRESS_FIELD_LENGTHS.phone) {
+    throw addressValidationFailed(
+      `${field} is at most ${ADDRESS_FIELD_LENGTHS.phone} characters (got ${value.length}).`,
+    );
+  }
+  return value;
 }
 
 /**

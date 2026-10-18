@@ -260,7 +260,7 @@ export class RejectedGrnLineDto {
   @ApiProperty({
     enum: [...REJECTED_GRN_LINE_CODES],
     description:
-      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt\'s line whose SKU belongs to another client than the receipt\'s; it goes to the review queue (Discard only)',
+      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt\'s line whose SKU belongs to another client than the receipt\'s; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU\'s client has departed; also to review (Discard only — re-receive after an owner reactivates the client)',
   })
   code!: string;
 
@@ -363,7 +363,7 @@ export class RefusedReceiptDto {
   @ApiProperty({ format: 'uuid' })
   warehouseId!: string;
 
-  @ApiProperty({ format: 'uuid', description: 'The client the blind receipt named' })
+  @ApiProperty({ format: 'uuid', description: "The client the blind receipt named — or (story 1-2a), when no client was named, the first refused line's client (a departed one)" })
   clientId!: string;
 
   @ApiProperty({ enum: [...BLIND_REASON_ENUM, null], type: String, nullable: true })
@@ -372,7 +372,7 @@ export class RefusedReceiptDto {
   @ApiProperty({ description: 'Device time of the receipt (ISO-8601 UTC)' })
   occurredAt!: string;
 
-  @ApiProperty({ type: [RejectedGrnLineDto], description: 'Every request line, each `sku-client-mismatch`' })
+  @ApiProperty({ type: [RejectedGrnLineDto], description: 'Every request line, each `sku-client-mismatch` or (story 1-2a) `client-departed`' })
   rejectedLines!: readonly RejectedGrnLineDto[];
 
   @ApiProperty({ description: 'The op id of the review row (`grn.lines-refused`, Discard only)' })
@@ -384,7 +384,7 @@ export class GoodsReceiptResponse {
     type: GoodsReceiptDto,
     nullable: true,
     description:
-      'The recorded GRN. Story 1-1 (decision 6): null when every line of a blind receipt was refused `sku-client-mismatch` — no receipt was recorded (no GRN code consumed); `refusedReceipt` then says what went to review',
+      'The recorded GRN. Story 1-1 (decision 6): null when every line of a blind receipt was refused `sku-client-mismatch` — or (story 1-2a) every line of any receipt was refused `sku-client-mismatch` / `client-departed` — no receipt was recorded (no GRN code consumed); `refusedReceipt` then says what went to review',
   })
   goodsReceipt!: GoodsReceiptDto | null;
 

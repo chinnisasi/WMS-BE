@@ -53,7 +53,7 @@ import {
 
 const PORTAL_401 = 'Missing, invalid or expired session token — or the user is no longer an active client-portal user of this client (unauthenticated)';
 const PORTAL_403 =
-  'An operator session — "This is a client-portal surface." (role-denied); the session belongs to another tenant (permission-denied); or the client is not active (client-suspended)';
+  'An operator session — "This is a client-portal surface." (role-denied); the session belongs to another tenant (permission-denied); or the client is suspended (client-suspended) or has departed (client-departed, story 1-2a)';
 const IDEMPOTENCY_HEADER = [
   {
     name: 'Idempotency-Key',

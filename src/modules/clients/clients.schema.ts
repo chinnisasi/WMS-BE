@@ -6,10 +6,13 @@
  * to re-point.
  */
 export {
+  CLIENT_CONTACT_ROLES,
   CLIENT_STATUSES,
   SELF_CLIENT_CODE,
+  clientContacts,
   clients,
   type Client,
+  type ClientContactRole,
   type ClientStatus,
 } from '../../shared/db/schema';
 /**
@@ -30,3 +33,7 @@ export const CLIENT_NAME_MAX = 200;
  * by code) — a deliberate ceiling, revisited with client filters (PENDING).
  */
 export const MAX_CLIENT_LIST = 500;
+/** Story 1-2a — the most contacts one client holds (a 21st is 409 `contact-limit`). */
+export const MAX_CLIENT_CONTACTS = 20;
+/** Story 1-2a — the contact name ceiling (the 0077 CHECK). */
+export const CLIENT_CONTACT_NAME_MAX = 120;

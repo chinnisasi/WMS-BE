@@ -117,6 +117,7 @@ const SESSION_END_DETAIL: Record<SessionEndReason, string> = {
   deactivated: 'This account has been deactivated.',
   'role-changed': 'Your role changed — sign in again.',
   'client-suspended': "Your company's portal access is suspended.",
+  'client-departed': "Your company's account with the warehouse has ended.",
   'refresh-reuse': 'This session was used from somewhere else and has been ended for safety — sign in again.',
   released: 'A supervisor released this device — badge in again.',
   'device-revoked': 'This device was revoked.',

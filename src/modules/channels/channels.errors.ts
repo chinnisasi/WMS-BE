@@ -218,6 +218,20 @@ export function ingestMixedClient(connectionId: string, what: string): ProblemEx
 }
 
 /**
+ * Story 1-2a — 422 `validation-failed`: the order's mapped SKUs belong to a
+ * client that has departed. Not transient — the channel's retry lands the
+ * same refusal until an owner reactivates the client or the mappings change.
+ */
+export function ingestClientDeparted(connectionId: string, why: string): ProblemException {
+  return new ProblemException(
+    'validation-failed',
+    422,
+    'Channel order refused — the client has departed',
+    `Connection ${connectionId}'s order is for a client that has departed: ${why}`,
+  );
+}
+
+/**
  * 409 `order-backorder-rejected` — RD-3's whole-order post-grant refusal
  * under `backorder_policy: 'reject'`: any line whose grant came back short
  * (zero-grant included) releases everything and refuses the order. No order

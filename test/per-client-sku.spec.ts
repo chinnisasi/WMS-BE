@@ -662,7 +662,9 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
         .expect(200);
     });
 
-    it('a blind receipt naming a suspended client is 409 client-not-active', async () => {
+    // Story 1-2a decision 5 re-pinned this: a SUSPENDED client still ships and
+    // receives — the receipt is no longer refused whole (was 409 client-not-active).
+    it('a blind receipt naming a suspended client is accepted (decision 5) — its other-client line is refused per line', async () => {
       const gamma = await createClient('GAMMA', 'Gamma Goods');
       await http()
         .patch(`${API}/${tenantId}/clients/${gamma}/status`)
@@ -670,8 +672,9 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
         .set(KEY_HEADER, ulid())
         .send({ status: 'suspended' })
         .expect(200);
-      const res = await receive({ warehouseId: wh, blindReasonCode: 'other', clientId: gamma, occurredAt: nowSecond(), lines: [line(sku('ACME', 'ACME-ONLY'), 1)] }).expect(409);
-      expect(res.body.code).toBe('client-not-active');
+      const res = await receive({ warehouseId: wh, blindReasonCode: 'other', clientId: gamma, occurredAt: nowSecond(), lines: [line(sku('ACME', 'ACME-ONLY'), 1)] }).expect(201);
+      expect(res.body.goodsReceipt).toBeNull();
+      expect(res.body.refusedReceipt).toMatchObject({ clientId: gamma, rejectedLines: [expect.objectContaining({ code: 'sku-client-mismatch' })] });
     });
 
     it('a clientId beside a PO is 400; an unknown client is 404', async () => {

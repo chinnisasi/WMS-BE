@@ -2,7 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, eq } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { assertSingleClientInTx } from '../clients/clients.facade';
+import { assertSingleClientInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
 import {
   auditEvents,
   channelMappings,
@@ -1222,7 +1222,10 @@ export class ChannelsCommandService {
       // later, delivery by delivery. Refused here, 409 `mixed-client` naming
       // the clients.
       if (mappedClientIds.length > 0) {
-        await assertSingleClientInTx(tx, command.tenantId, mappedClientIds, 'The mapping set');
+        const clientId = await assertSingleClientInTx(tx, command.tenantId, mappedClientIds, 'The mapping set');
+        // Story 1-2a — a departed client takes no new channel mappings
+        // (409 `client-departed`). An empty set (unmapping) is always allowed.
+        await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
       }
 
       // The scope-ceiling arithmetic (row 5's 400): distinct SKUs × ACTIVE

@@ -540,6 +540,13 @@
       "when": 1792337102701,
       "tag": "0076_per_client_sku_identity",
       "breakpoints": true
+    },
+    {
+      "idx": 77,
+      "version": "7",
+      "when": 1792343941561,
+      "tag": "0077_client_master_record",
+      "breakpoints": true
     }
   ]
 }

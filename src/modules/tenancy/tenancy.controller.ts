@@ -184,7 +184,7 @@ export class TenancyController {
   })
   @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Unknown email, wrong password, or a deactivated account (unauthenticated — one answer for all three)') })
-  @ApiResponse({ status: 403, ...problemJsonResponse('Invitation not yet accepted (invite-pending), a client-portal user whose client is not active (client-suspended, story 21-7), or — story 6-1b — an owner reset this user’s two-factor sign-in and the enrolment code has expired (enrolment-code-expired: ask for another reset; nothing counted)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Invitation not yet accepted (invite-pending), a client-portal user whose client is suspended (client-suspended, story 21-7) or has departed (client-departed, story 1-2a), or — story 6-1b — an owner reset this user’s two-factor sign-in and the enrolment code has expired (enrolment-code-expired: ask for another reset; nothing counted)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('Story 6-1b — the second step is needed and the client did not send `X-WMS-Second-Factor: 1` (client-outdated: "Reload this page to sign in"); nothing was written') })
   @ApiResponse({ status: 423, ...problemJsonResponse('Too many failed attempts for this email from this address (sign-in-locked; `retryAfterSeconds`)') })
   @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited; `retryAfterSeconds`)') })
@@ -243,7 +243,7 @@ export class TenancyController {
       'Cookie-only (`wms_refresh`); requires an allow-listed Origin and `X-WMS-Session: 1`. Refresh never extends the idle window. A rotated token presented within 30 s is a tab race (a new access token, no new cookie); after that it is reuse and the session is revoked.',
   })
   @ApiOkResponse({ type: RefreshResponse })
-  @ApiResponse({ status: 401, ...problemJsonResponse('No session to refresh (unauthenticated), or the session is over (session-ended with `reason`: signed-out | deactivated | role-changed | client-suspended | refresh-reuse | idle | absolute)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('No session to refresh (unauthenticated), or the session is over (session-ended with `reason`: signed-out | deactivated | role-changed | client-suspended | client-departed | refresh-reuse | idle | absolute)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Origin not allow-listed or the X-WMS-Session header missing (role-denied)') })
   async refreshSession(
     @Req() request: SessionHttpRequest,

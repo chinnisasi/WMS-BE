@@ -44,7 +44,7 @@ import {
 } from '../../shared/primitives/address';
 import type { AddressInput, AddressSnapshot } from '../../shared/primitives/address';
 import { uomPrecision } from '../catalog/uom';
-import { assertSingleClientInTx } from '../clients/clients.facade';
+import { assertSingleClientInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
 
 // ── state machine + policy constants (the outbound module exclusively owns
 // the order state machine, AD-6 — no other module may add or transition
@@ -617,6 +617,10 @@ export class OrderCommandService {
         [...lineSkus.values(), ...componentSkus.values()].map((sku) => sku.clientId),
         'The order',
       );
+      // Story 1-2a — an early exit for a departed client (409
+      // `client-departed`) before any grant moves. NOT the guard: this phase
+      // commits before phase 3 writes, so the check runs again there.
+      await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
       return { replayed: null, destination, consigneeGstin, lines: linesWithRates, explosions, clientId };
     });
     if (preflight.replayed !== null) {
@@ -738,6 +742,12 @@ export class OrderCommandService {
         // the client the preflight DERIVED from its lines' and components'
         // SKUs (the tenant's `self` client on a D2C tenant; no branch).
         const clientId = preflight.clientId!;
+        // Story 1-2a — THE guard: the first statement of the write
+        // transaction takes the client FOR KEY SHARE, so a departure (FOR
+        // UPDATE) either committed first — refused here, 409
+        // `client-departed`, and the grants released by the rollback path
+        // below — or waits for this order, whose open status then blocks it.
+        await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
         try {
           await tx.insert(orders).values({
             id: orderId,

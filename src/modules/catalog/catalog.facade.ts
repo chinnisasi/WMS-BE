@@ -135,6 +135,8 @@ export interface SkuReorderDefaults {
   /** Milli-units (AD-9 / 10.1) — 0 means "no tenant-wide default". */
   readonly reorderPoint: number;
   readonly reorderQty: number;
+  /** Story 1-2a — the SKU's client (the sweep skips a departed client's SKUs). */
+  readonly clientId: string;
 }
 
 /** The hazard segregation matrix as the story 12-7 admin read carries it. */
@@ -330,10 +332,30 @@ export class CatalogFacade {
         uom: skus.uom,
         reorderPoint: skus.reorderPoint,
         reorderQty: skus.reorderQty,
+        clientId: skus.clientId,
       })
       .from(skus)
       .where(eq(skus.tenantId, tenantId))
       .orderBy(skus.code);
+  }
+
+  /**
+   * Story 1-2a — each SKU's client, on the caller's transaction (the expiry
+   * scan skips a departed client's SKUs). An unknown id is absent.
+   */
+  async skuClientIdsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    skuIds: readonly string[],
+  ): Promise<ReadonlyMap<string, string>> {
+    if (skuIds.length === 0) {
+      return new Map();
+    }
+    const rows = await tx
+      .select({ id: skus.id, clientId: skus.clientId })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, [...new Set(skuIds)])));
+    return new Map(rows.map((row) => [row.id, row.clientId]));
   }
 
   /**

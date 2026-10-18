@@ -77,6 +77,10 @@ export const AUDIT_NO_OP_ARMS = {
   'users.deactivate:already-deactivated': (snapshot: unknown) => entitySnapshot(snapshot, 'user', 'deactivated'),
   /** Story 6-1a — `UsersCommand.setUserStatus` reactivate on a user who is not deactivated. */
   'users.reactivate:not-deactivated': (snapshot: unknown) => entitySnapshot(snapshot, 'user'),
+  /** Story 1-2a — `ClientsCommand.editContact` with nothing changed ("a declared no-op that stores the key"). */
+  'clients.contactEdit:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'contact'),
+  /** Story 1-2a — `ClientsCommand.updateAddresses` with nothing changed (stores the key). */
+  'clients.addresses:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'client'),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

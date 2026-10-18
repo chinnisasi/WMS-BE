@@ -174,8 +174,11 @@ describe('architecture: the ledger core is append-only and inventory-module-owne
       // through undetected).
       // The allowed suffixes must END the specifier (the closing quote):
       // `\\b` would wave through an `inventory.facade.internal` reach-through.
+      // Story 1-2a: `client-wind-down` is the one declared file-level seam
+      // beside the facade (the clients status command composes it; it
+      // imports only shared/ — pinned in the clients block).
       '(?:modules/inventory|\\.\\./inventory)/' +
-        '(?!inventory\\.(facade|module|dto)[\'"])',
+        '(?!(?:inventory\\.(facade|module|dto)|client-wind-down)[\'"])',
     );
     const inventoryRoot = join(SRC_ROOT, 'modules', 'inventory');
     const siblingModules = files.filter(
@@ -254,9 +257,11 @@ describe('architecture: the order aggregate is outbound-module-owned (story 4.1)
     // The allowed suffixes must END the specifier (the closing quote), not
     // merely sit on a word boundary: `\\b` would wave through a
     // `outbound.facade.internal` that is every bit a reach-through.
+    // Story 1-2a: `client-wind-down` is the declared file-level seam (see
+    // the inventory twin).
     const outboundInternals = new RegExp(
       '(?:modules/outbound|\\.\\./outbound)/' +
-        '(?!outbound\\.(facade|module|dto)[\'"])',
+        '(?!(?:outbound\\.(facade|module|dto)|client-wind-down)[\'"])',
     );
     const siblingModules = files.filter(
       (file) =>
@@ -837,8 +842,9 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
    * receiving-bin precedent); the invariant that matters is who WRITES the
    * table.
    */
-  const CLIENT_TABLES = ['clients'] as const;
-  const RAW_CLIENT_TABLES = 'clients';
+  // Story 1-2a — `client_contacts` joins the clients module's tables.
+  const CLIENT_TABLES = ['clients', 'clientContacts'] as const;
+  const RAW_CLIENT_TABLES = 'clients|client_contacts';
   const clientsRoot = join(SRC_ROOT, 'modules', 'clients');
 
   it('no clients-table write happens outside the clients module', () => {
@@ -910,6 +916,67 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  /**
+   * Story 1-2a — the wind-down reads. Each owning module exports a file-level
+   * `clientWindDownBlockersInTx` that the clients module's status command
+   * composes; every such file imports only `drizzle-orm` and `shared/` (so
+   * never `modules/clients`, nor a command file that imports the clients
+   * facade) — the dependency stays one-way, with no import cycle.
+   */
+  const WIND_DOWN_FILES = ['inventory', 'inbound', 'outbound', 'returns', 'tenancy', 'billing', 'channels'].map((module) =>
+    join(SRC_ROOT, 'modules', module, 'client-wind-down.ts'),
+  );
+
+  it('story 1-2a: every wind-down file imports only drizzle-orm and shared/ — nothing from modules/clients', () => {
+    const offenders: string[] = [];
+    for (const path of WIND_DOWN_FILES) {
+      const source = readFileSync(path, 'utf8');
+      expect(source).toMatch(/export async function clientWindDownBlockersInTx\(/);
+      for (const match of source.matchAll(/from '([^']+)'/g)) {
+        const target = match[1]!;
+        if (target !== 'drizzle-orm' && !target.startsWith('../../shared/')) offenders.push(`${path}: imports ${target}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningful: the status command composes all six.
+    const command = readFileSync(join(clientsRoot, 'clients.command.ts'), 'utf8');
+    for (const module of ['inventory', 'inbound', 'outbound', 'returns', 'tenancy', 'billing', 'channels']) {
+      expect(command).toContain(`from '../${module}/client-wind-down'`);
+    }
+  });
+
+  /**
+   * Story 1-2a — "no new work": every path that creates work for a client
+   * runs the one gate, `assertClientTakesWorkInTx`. A path that dropped it
+   * would let a departed client take new work silently.
+   */
+  const TAKES_WORK_CALLERS = [
+    ['inbound', 'po.command.ts'],
+    ['inbound', 'asn.command.ts'],
+    ['inbound', 'asn-import.command.ts'],
+    ['outbound', 'order.command.ts'],
+    ['channels', 'channels.ingest.command.ts'],
+    ['channels', 'channels.command.ts'],
+    ['channels', 'channels.publish.ts'],
+    ['catalog', 'import.command.ts'],
+    ['catalog', 'sku-client.command.ts'],
+    ['catalog', 'kit.command.ts'],
+    ['catalog', 'sku.command.ts'],
+    ['returns', 'return-authorization.command.ts'],
+    ['inventory', 'inventory.command.ts'],
+  ] as const;
+
+  it('story 1-2a: every work-creating path calls assertClientTakesWorkInTx', () => {
+    const missing = TAKES_WORK_CALLERS.map(([module, file]) => join(SRC_ROOT, 'modules', module, file)).filter(
+      (path) => !/assertClientTakesWorkInTx\(/.test(readFileSync(path, 'utf8')),
+    );
+    expect(missing).toEqual([]);
+    // The order create runs it twice: phase 1 (an early exit) and the top of
+    // the phase-3 write transaction (the guard).
+    const order = readFileSync(join(SRC_ROOT, 'modules', 'outbound', 'order.command.ts'), 'utf8');
+    expect(order.match(/await assertClientTakesWorkInTx\(/g)?.length).toBe(2);
   });
 
   it('the correction command really is the writer (the guard is meaningful)', () => {
@@ -1276,8 +1343,10 @@ describe('architecture: channel connections are channels-module-owned (story 7-1
     // command/registry/errors/events/view imports, and allow only the
     // facade/module/dto forms, so it is pinned against a detector typo the
     // same way the carriers block is.
+    // Story 1-2a: `client-wind-down` is the declared file-level seam the
+    // clients status command composes (it imports only shared/).
     const guard = new RegExp(
-      '(?:modules/channels|\\.\\./channels)/(?!(?:channels\\.facade|channels\\.module|channels\\.dto)[\'"])',
+      '(?:modules/channels|\\.\\./channels)/(?!(?:channels\\.facade|channels\\.module|channels\\.dto|client-wind-down)[\'"])',
     );
     for (const reaching of [
       "from '../channels/channels.command'",
@@ -1700,7 +1769,9 @@ describe('architecture: rate cards are billing-module-owned (story 21-3)', () =>
 
   it('no other module reaches into the billing module past the facade', () => {
     const offenders: string[] = [];
-    const reach = /from '[^']*modules\/billing\/(?!billing\.facade'|billing\.module'|rate-cards')[^']*'|from '\.\.\/billing\/(?!billing\.facade'|billing\.module'|rate-cards')[^']*'/;
+    // Story 1-2a: `client-wind-down` is the declared file-level seam the
+    // clients status command composes (it imports only shared/).
+    const reach = /from '[^']*modules\/billing\/(?!billing\.facade'|billing\.module'|rate-cards'|client-wind-down')[^']*'|from '\.\.\/billing\/(?!billing\.facade'|billing\.module'|rate-cards'|client-wind-down')[^']*'/;
     for (const file of files.filter((f) => !f.path.startsWith(billingRoot) && !f.path.startsWith(join(SRC_ROOT, 'api')))) {
       if (reach.test(file.source)) offenders.push(file.path);
     }
@@ -1929,12 +2000,19 @@ describe('architecture: return authorizations are returns-module-owned (story 13
 
   it('no other module reaches into the returns module (only the api shell and the root import it, through the facade/module)', () => {
     const importsReturns = /(?:modules\/returns|\.\.\/returns)\//;
-    const reaching = /(?:modules\/returns|\.\.\/returns)\/(?!returns\.(?:facade|module|dto)['"])/;
+    // Story 1-2a: `client-wind-down` is the declared file-level seam the
+    // clients status command composes (it imports only shared/ and its own table).
+    const reaching = /(?:modules\/returns|\.\.\/returns)\/(?!(?:returns\.(?:facade|module|dto)|client-wind-down)['"])/;
     expect(reaching.test("from '../modules/returns/return-authorization.command'")).toBe(true);
     expect(reaching.test("from '../modules/returns/returns.facade'")).toBe(false);
     const importers = files.filter((file) => !file.path.startsWith(returnsRoot) && importsReturns.test(file.source));
     expect(importers.some((file) => file.path === join(SRC_ROOT, 'api', 'returns.controller.ts'))).toBe(true);
-    const allowed = (path: string): boolean => path.startsWith(join(SRC_ROOT, 'api')) || path === join(SRC_ROOT, 'app.module.ts');
+    const allowed = (path: string): boolean =>
+      path.startsWith(join(SRC_ROOT, 'api')) ||
+      path === join(SRC_ROOT, 'app.module.ts') ||
+      // Story 1-2a — the clients status command composes the wind-down read
+      // (and only that: `reaching` below still refuses anything else).
+      path === join(SRC_ROOT, 'modules', 'clients', 'clients.command.ts');
     expect(importers.filter((file) => !allowed(file.path)).map((file) => file.path)).toEqual([]);
     expect(importers.filter((file) => reaching.test(file.source)).map((file) => file.path)).toEqual([]);
     const moduleSource = readFileSync(join(returnsRoot, 'returns.module.ts'), 'utf8');

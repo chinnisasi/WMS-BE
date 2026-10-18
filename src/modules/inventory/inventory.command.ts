@@ -51,6 +51,7 @@ import { MAX_HANDLING_UNITS_PER_REQUEST } from '../catalog/handling-unit';
 // Story 11.4 — the kit-ness reads, same escape: file-level in-tx helpers out
 // of catalog (the store above), never a DI edge on `CatalogModule`.
 import { getKitSkuIdsInTx, kitCannotHoldStock } from '../catalog/kit.store';
+import { assertClientTakesWorkInTx } from '../clients/clients.facade';
 
 /**
  * `stock.adjustment` (Story 2.1): the first movement producer, exercisable
@@ -708,6 +709,14 @@ export class StockAdjustmentCommand {
     // unit the delta is measured in).
     await this.assertBinInWarehouse(tx, command);
     const sku = await this.assertSkuInTenant(tx, command);
+    // Story 1-2a decision 7 — stock that turns up for a DEPARTED client is
+    // refused (409 `client-departed`) until an owner reactivates it: a
+    // positive adjustment, and (through this same guard set) a pending
+    // adjustment's approval and a count variance's gain. A write-off of what
+    // is there stays allowed. FOR KEY SHARE on the client row.
+    if (command.quantityDelta > 0) {
+      await assertClientTakesWorkInTx(tx, command.tenantId, sku.clientId);
+    }
 
     // ── story 11.4: a kit SKU never adjusts stock (FR-38) ───────────────
     // A kit's stock IS its components' — an adjustment against a kit SKU
@@ -1005,11 +1014,13 @@ export class StockAdjustmentCommand {
     // so the approval path re-asks them against committed state).
     batchTracked: boolean;
     serialTracked: boolean;
+    clientId: string;
   }> {
     const rows = await tx
       .select({
         id: skus.id,
         code: skus.code,
+        clientId: skus.clientId,
         uom: skus.uom,
         catchWeightTracked: skus.catchWeightTracked,
         batchTracked: skus.batchTracked,

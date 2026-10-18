@@ -29,7 +29,7 @@ import {
 } from './auth-attempts';
 import { auditSecurityEventInTx, createSessionInTx, refreshCookieValue } from './sessions';
 import { DUMMY_HASH, verifyPassword } from './passwords';
-import { clientSuspended, readSessionClientIn } from '../clients/clients.facade';
+import { clientInactive, readSessionClientIn } from '../clients/clients.facade';
 
 export interface SignInInput {
   readonly email: string;
@@ -240,8 +240,9 @@ export class SignInCommand {
       const facts = await readSessionClientIn(this.authDb, user.tenantId, user.clientId);
       if (facts === null || facts.status !== 'active') {
         // The password was right: a suspension is not a failed attempt.
+        // Story 1-2a — a departed client answers `client-departed`.
         await clearSignInAttempts(this.db, email, command.ip);
-        throw clientSuspended();
+        throw clientInactive(facts?.status ?? null);
       }
       client = { id: facts.id, code: facts.code, name: facts.name };
     }
