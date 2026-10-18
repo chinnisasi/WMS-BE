@@ -28,7 +28,7 @@ import { UsersCommand } from './users.command';
 // explorer through emitDecoratorMetadata — a type-only import erases the
 // runtime reference and the OpenAPI document loses the request body.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
-import { InviteUserDto, SetUserRoleDto } from './tenancy.dto';
+import { InviteUserDto, SetUserRoleDto, UserStatusResponse } from './tenancy.dto';
 import {
   AcceptInviteDto,
   AcceptInviteResponse,
@@ -166,6 +166,92 @@ export class UsersController {
     return { ...user };
   }
 
+  @Post(':tenantId/users/:userId/deactivate')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Story 6-1a — deactivates a user (users.role_change): no sign-in or badge-in, every session ends now, device bindings released, a pending invite cancelled; history kept. Idempotent (an already-deactivated user writes nothing)' })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: UserStatusResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or malformed userId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks users.role_change (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('User does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The last active Owner (last-owner — self-deactivation included), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'userId', format: 'uuid' })
+  async deactivateUser(
+    @Param('tenantId') tenantId: string,
+    @Param('userId') userId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<UserStatusResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUserIdParam(userId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return this.usersCommand.setUserStatus(
+      { tenantId, actorUserId: session.userId, targetUserId: userId, arm: 'deactivate' },
+      key,
+    );
+  }
+
+  @Post(':tenantId/users/:userId/reactivate')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Story 6-1a — reactivates a deactivated user (users.role_change), restoring the status deactivation replaced; a never-accepted invitee gets a fresh invite token. Idempotent' })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: UserStatusResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or malformed userId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks users.role_change (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('User does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'userId', format: 'uuid' })
+  async reactivateUser(
+    @Param('tenantId') tenantId: string,
+    @Param('userId') userId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<UserStatusResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUserIdParam(userId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return this.usersCommand.setUserStatus(
+      { tenantId, actorUserId: session.userId, targetUserId: userId, arm: 'reactivate' },
+      key,
+    );
+  }
+
+  @Post(':tenantId/users/:userId/unlock')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Story 6-1a — clears the sign-in lock on this user’s email from every address (users.role_change). Audited; keyed' })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: UserResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or malformed userId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks users.role_change (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('User does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'userId', format: 'uuid' })
+  async unlockUser(
+    @Param('tenantId') tenantId: string,
+    @Param('userId') userId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<UserResponse> {
+    assertOwnTenant(session, tenantId);
+    assertUserIdParam(userId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return { ...(await this.usersCommand.unlockUser({ tenantId, actorUserId: session.userId, targetUserId: userId }, key)) };
+  }
+
   @Post(':tenantId/accept-invite')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Accepts a one-time invite (unauthenticated): sets the account password and activates the user' })
@@ -216,3 +302,12 @@ function assertOwnTenant(session: TenantSession, tenantId: string): void {
     );
   }
 }
+
+/** Story 6-1a — a malformed `userId` is a 400, never a database cast error. */
+function assertUserIdParam(userId: string): void {
+  if (!UUID_PARAM_RE.test(userId)) {
+    throw new ProblemException('validation-failed', 400, 'Validation failed', 'userId must be a UUID.');
+  }
+}
+
+const UUID_PARAM_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

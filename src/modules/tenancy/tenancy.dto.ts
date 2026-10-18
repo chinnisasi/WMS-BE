@@ -283,6 +283,27 @@ export class UserResponse {
 
   @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
   createdAt!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    description:
+      'Story 6-1a — sign-in is locked for this email (5 failed attempts from one address) until this instant; on the user list only, null or absent when not locked',
+  })
+  lockedUntil?: string | null;
+}
+
+/** Story 6-1a — deactivate / reactivate. A reactivated never-accepted invitee carries a fresh invite token. */
+export class UserStatusResponse {
+  @ApiProperty({ type: UserResponse })
+  user!: UserResponse;
+
+  @ApiProperty({ required: false, description: 'Present only when reactivation restored an `invited` user — the new one-time invite token' })
+  inviteToken?: string;
+
+  @ApiProperty({ required: false })
+  inviteExpiresAt?: string;
 }
 
 export class InviteUserDto {

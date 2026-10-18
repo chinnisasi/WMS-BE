@@ -8,6 +8,7 @@ import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
+import { revokeSessionsInTx } from '../tenancy/sessions';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
@@ -454,6 +455,11 @@ export class ClientsCommand {
         .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, current.id)))
         .returning();
       const snapshot: ClientMutationSnapshot = { client: toClientSnapshot(rows[0]!) };
+      // Story 6-1a — a suspension ends the client's portal sessions now (the
+      // portal guard's per-request client read stays the second check).
+      if (status === 'suspended') {
+        await revokeSessionsInTx(tx, command.tenantId, { clientId: current.id, kinds: ['portal'] }, 'client-suspended');
+      }
 
       await this.audit(
         tx,

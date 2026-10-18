@@ -3,7 +3,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { auditEvents, idempotencyKeys, users } from '../../shared/db/schema';
+import { auditEvents, devices, idempotencyKeys, users } from '../../shared/db/schema';
 import type { UserRole, UserStatus } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
@@ -16,6 +16,8 @@ import { assertPermission } from './permissions';
 import { getMemberRoleIn } from './tenancy.service';
 import { DUMMY_HASH, hashPassword } from './passwords';
 import { shareLockClientInTx } from '../clients/clients.facade';
+import { emailDigest, signInLockedUntil } from './auth-attempts';
+import { revokeSessionsInTx } from './sessions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
@@ -28,7 +30,13 @@ export const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const USERS_EMAIL = 'users_email_unique';
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
-export type UserAction = 'user.invited' | 'user.role_changed' | 'user.accepted';
+export type UserAction =
+  | 'user.invited'
+  | 'user.role_changed'
+  | 'user.accepted'
+  | 'user.deactivated'
+  | 'user.reactivated'
+  | 'user.unlocked';
 
 /** The user shape every users response carries — never password material. */
 export interface UserView {
@@ -42,6 +50,25 @@ export interface UserView {
    */
   readonly clientId: string | null;
   readonly createdAt: string;
+  /**
+   * Story 6-1a — sign-in is locked for this email (from some address) until
+   * this instant; list reads only. Optional so stored invite / role-change
+   * snapshots replay unchanged.
+   */
+  readonly lockedUntil?: string | null;
+}
+
+export interface UserStatusInput {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly targetUserId: string;
+}
+
+/** Story 6-1a — deactivate / reactivate. A reactivated never-accepted invitee gets a fresh invite token. */
+export interface UserStatusSnapshot {
+  readonly user: UserView;
+  readonly inviteToken?: string;
+  readonly inviteExpiresAt?: string;
 }
 
 export interface InviteUserInput {
@@ -388,13 +415,12 @@ export class UsersCommand {
       // READ COMMITTED two concurrent demotions of *different* owners would
       // each count 2 from their own snapshot; the row locks make the second
       // transaction re-read the freshly demoted row before its count runs.
-      const demotingLastOwner = target.role === 'owner' && command.role !== 'owner';
+      // Story 6-1a — only ACTIVE owners count: demoting the last active owner
+      // is refused; a deactivated owner can be demoted freely.
+      const demotingLastOwner =
+        target.role === 'owner' && target.status === 'active' && command.role !== 'owner';
       if (demotingLastOwner) {
-        await tx
-          .select({ id: users.id })
-          .from(users)
-          .where(and(eq(users.tenantId, command.tenantId), eq(users.role, 'owner')))
-          .for('update');
+        await lockActiveOwners(tx, command.tenantId);
       }
 
       const updatedRows = await tx
@@ -406,7 +432,8 @@ export class UsersCommand {
             eq(users.tenantId, command.tenantId),
             demotingLastOwner
               ? sql`1 < (select count(*) from ${users} owner_rows
-                  where owner_rows.tenant_id = ${users.tenantId} and owner_rows.role = 'owner')`
+                  where owner_rows.tenant_id = ${users.tenantId} and owner_rows.role = 'owner'
+                    and owner_rows.status = 'active')`
               : undefined,
           ),
         )
@@ -429,6 +456,11 @@ export class UsersCommand {
         );
       }
       const updated = toUserView(updatedRows[0]!);
+      // Story 6-1a — a changed role ends the user's web sessions: their next
+      // request signs in again under the new role.
+      if (target.role !== command.role) {
+        await revokeSessionsInTx(tx, command.tenantId, { userId: target.id, kinds: ['web'] }, 'role-changed');
+      }
 
       await insertAuditRow(tx, {
         tenantId: command.tenantId,
@@ -620,6 +652,176 @@ export class UsersCommand {
     return snapshot;
   }
 
+  /**
+   * Story 6-1a — offboarding (`users.role_change`, owner). Deactivate: the
+   * user can no longer sign in or badge in; EVERY session ends now (web,
+   * portal, badge); their device bindings and push registrations clear; a
+   * pending invite is cancelled. History, attribution and the audit trail
+   * are untouched. The last ACTIVE owner cannot be deactivated (409
+   * `last-owner` — self-deactivation included). Reactivate restores the
+   * status the deactivation replaced; a never-accepted invitee gets a fresh
+   * invite token in the response. A no-op (already in that state) writes
+   * nothing but stores the key. `arm` is in the hash, so the two arms never
+   * replay each other.
+   */
+  async setUserStatus(
+    command: UserStatusInput & { readonly arm: 'deactivate' | 'reactivate' },
+    idempotencyKey: string,
+  ): Promise<UserStatusSnapshot> {
+    const payloadHash = hashCommandPayload({
+      arm: command.arm,
+      tenantId: command.tenantId,
+      targetUserId: command.targetUserId,
+    });
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'users.role_change');
+      const replayed = await replayUserKey(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) return replayed as UserStatusSnapshot;
+
+      // Owner rows first (the demotion's lock order), then the target.
+      await lockActiveOwners(tx, command.tenantId);
+      const targetRows = await tx
+        .select()
+        .from(users)
+        .where(and(eq(users.id, command.targetUserId), eq(users.tenantId, command.tenantId)))
+        .for('update')
+        .limit(1);
+      const target = targetRows[0];
+      if (!target) throw userNotFound();
+      const again = await replayUserKey(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (again !== null) return again as UserStatusSnapshot;
+
+      let body: UserStatusSnapshot;
+      if (command.arm === 'deactivate') {
+        if (target.status === 'deactivated') {
+          body = { user: toUserView(target) };
+        } else {
+          if (target.role === 'owner' && target.status === 'active') {
+            const others = await tx
+              .select({ id: users.id })
+              .from(users)
+              .where(
+                and(
+                  eq(users.tenantId, command.tenantId),
+                  eq(users.role, 'owner'),
+                  eq(users.status, 'active'),
+                  sql`${users.id} <> ${target.id}`,
+                ),
+              )
+              .limit(1);
+            if (others.length === 0) {
+              throw new ProblemException(
+                'last-owner',
+                409,
+                'Cannot deactivate the last Owner',
+                'The last active Owner of a tenant cannot be deactivated — make another user an Owner first.',
+              );
+            }
+          }
+          const updated = await tx
+            .update(users)
+            .set({
+              status: 'deactivated',
+              statusBeforeDeactivation: target.status,
+              inviteTokenHash: null,
+              inviteExpiresAt: null,
+              updatedAt: nowIso(),
+            })
+            .where(eq(users.id, target.id))
+            .returning();
+          await revokeSessionsInTx(tx, command.tenantId, { userId: target.id }, 'deactivated');
+          await tx
+            .update(devices)
+            .set({
+              operatorUserId: null,
+              pushToken: null,
+              pushWarehouseId: null,
+              pushRegisteredAt: null,
+              updatedAt: nowIso(),
+            })
+            .where(and(eq(devices.tenantId, command.tenantId), eq(devices.operatorUserId, target.id)));
+          await insertAuditRow(tx, {
+            tenantId: command.tenantId,
+            actorUserId: command.actorUserId,
+            action: 'user.deactivated',
+            targetType: 'user',
+            targetId: target.id,
+            reference: idempotencyKey,
+          });
+          body = { user: toUserView(updated[0]!) };
+        }
+      } else if (target.status !== 'deactivated') {
+        body = { user: toUserView(target) };
+      } else {
+        const restore = target.statusBeforeDeactivation === 'invited' ? 'invited' : 'active';
+        const rawToken = restore === 'invited' ? generateInviteToken() : null;
+        const expiresAt = rawToken === null ? null : new Date(Date.now() + INVITE_TTL_MS).toISOString();
+        const updated = await tx
+          .update(users)
+          .set({
+            status: restore,
+            statusBeforeDeactivation: null,
+            ...(rawToken === null ? {} : { inviteTokenHash: hashInviteToken(rawToken), inviteExpiresAt: expiresAt }),
+            updatedAt: nowIso(),
+          })
+          .where(eq(users.id, target.id))
+          .returning();
+        await insertAuditRow(tx, {
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'user.reactivated',
+          targetType: 'user',
+          targetId: target.id,
+          reference: idempotencyKey,
+        });
+        body =
+          rawToken === null
+            ? { user: toUserView(updated[0]!) }
+            : { user: toUserView(updated[0]!), inviteToken: rawToken, inviteExpiresAt: expiresAt! };
+      }
+      await storeUserKey(tx, command.tenantId, idempotencyKey, payloadHash, body);
+      return body;
+    });
+  }
+
+  /**
+   * Story 6-1a — Unlock (`users.role_change`): clears the sign-in lock on
+   * this user's email from every address. Keyed and audited; unlocking an
+   * unlocked user is a quiet success (still audited — the owner acted).
+   */
+  async unlockUser(command: UserStatusInput, idempotencyKey: string): Promise<UserView> {
+    const payloadHash = hashCommandPayload({
+      arm: 'unlock',
+      tenantId: command.tenantId,
+      targetUserId: command.targetUserId,
+    });
+    const body = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'users.role_change');
+      const replayed = await replayUserKey(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) return replayed;
+      const targetRows = await tx
+        .select()
+        .from(users)
+        .where(and(eq(users.id, command.targetUserId), eq(users.tenantId, command.tenantId)))
+        .limit(1);
+      const target = targetRows[0];
+      if (!target) throw userNotFound();
+      await tx.execute(sql`delete from signin_attempts where email_hash = ${emailDigest(target.email)}`);
+      await insertAuditRow(tx, {
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'user.unlocked',
+        targetType: 'user',
+        targetId: target.id,
+        reference: idempotencyKey,
+      });
+      const snapshot = { user: { ...toUserView(target), lockedUntil: null } };
+      await storeUserKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+    return normaliseUserView(body.user);
+  }
+
   /** Cursor list of the tenant's users — a read, open to any tenant member. */
   async list(
     tenantId: string,
@@ -648,7 +850,12 @@ export class UsersCommand {
         .limit(pageSize + 1);
     });
     const page = buildPage(rows.map(toUserView), pageSize);
-    return { items: page.items, nextCursor: page.nextCursor };
+    // Story 6-1a — the Team card's Unlock reads `lockedUntil`.
+    const locks = await signInLockedUntil(this.db, page.items.map((user) => user.email));
+    return {
+      items: page.items.map((user) => ({ ...user, lockedUntil: locks.get(user.email) ?? null })),
+      nextCursor: page.nextCursor,
+    };
   }
 
   /** The signed-in caller's own user row (`GET …/me`) — a read. */
@@ -736,4 +943,57 @@ function invalidCursor(): ProblemException {
     'Malformed pagination cursor',
     'The cursor parameter is not a valid opaque page cursor.',
   );
+}
+
+/** Story 6-1a — lock the tenant's active owner rows (the last-owner guards' serialisation point). */
+async function lockActiveOwners(tx: TenantTx, tenantId: string): Promise<void> {
+  await tx
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.tenantId, tenantId), eq(users.role, 'owner'), eq(users.status, 'active')))
+    .for('update');
+}
+
+function userNotFound(): ProblemException {
+  return new ProblemException('not-found', 404, 'User not found', 'No user with this id exists in this tenant.');
+}
+
+async function replayUserKey(
+  tx: TenantTx,
+  tenantId: string,
+  idempotencyKey: string,
+  payloadHash: string,
+): Promise<{ user: UserView } | null> {
+  const existing = await tx
+    .select()
+    .from(idempotencyKeys)
+    .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+    .limit(1);
+  if (!existing[0]) return null;
+  if (existing[0].payloadHash !== payloadHash) throw idempotencyKeyReuse();
+  const stored = existing[0].responseSnapshot as { user: UserView };
+  return { ...stored, user: normaliseUserView(stored.user) };
+}
+
+async function storeUserKey(
+  tx: TenantTx,
+  tenantId: string,
+  idempotencyKey: string,
+  payloadHash: string,
+  body: unknown,
+): Promise<void> {
+  try {
+    await tx.insert(idempotencyKeys).values({
+      id: uuidv7(),
+      tenantId,
+      key: idempotencyKey,
+      payloadHash,
+      responseSnapshot: body as Record<string, unknown>,
+    });
+  } catch (err) {
+    if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
+      throw concurrentIdempotency();
+    }
+    throw err;
+  }
 }

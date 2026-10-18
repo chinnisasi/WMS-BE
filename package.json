@@ -20,7 +20,8 @@
     "db:verify": "bun src/shared/db/verify.ts",
     "openapi:export": "bun src/api/export-openapi.ts",
     "loadtest:smoke": "bun scripts/loadtest-acceptance.ts --mode smoke",
-    "seed:demo": "bun scripts/seed-demo.ts"
+    "seed:demo": "bun scripts/seed-demo.ts",
+    "auth:unlock": "bun scripts/auth-unlock.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1151.0",
