@@ -78,9 +78,22 @@
     },
     "/tenants/sign-in": {
       "post": {
-        "description": "Story 6-1a: also sets the httpOnly refresh cookie (`wms_refresh`, path /api/v1/tenants/session). Attempts are counted per (email, client IP) BEFORE the password check: 5 consecutive failures lock that pair for 15 minutes (423 for any password, real or unknown email alike); 300 attempts a minute per client IP answer 429.",
+        "description": "Story 6-1a: a session answer also sets the httpOnly refresh cookie (`wms_refresh`, path /api/v1/tenants/session). Attempts are counted per (email, client IP) BEFORE the password check: 5 consecutive failures lock that pair for 15 minutes (423 for any password, real or unknown email alike); 300 attempts a minute per client IP answer 429. Story 6-1b: a user with two-factor sign-in set up gets `TotpChallengeResponse`; an owner who has not set it up yet gets `EnrollChallengeResponse` — both create no session and set no cookie, and are completed at `POST /tenants/sign-in/second-factor`. Clients tell the arms apart by the presence of `challenge`. A web client that can complete the second step sends `X-WMS-Second-Factor: 1`; without it, a sign-in that needs the second step answers 409 `client-outdated` and writes nothing.",
         "operationId": "TenancyController_signIn",
-        "parameters": [],
+        "parameters": [
+          {
+            "name": "X-WMS-Second-Factor",
+            "in": "header",
+            "description": "Story 6-1b — `1` from a client that can complete the second step",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "1"
+              ]
+            }
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -97,7 +110,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SignInResponse"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/SignInResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/TotpChallengeResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/EnrollChallengeResponse"
+                    }
+                  ]
                 }
               }
             }
@@ -132,6 +155,16 @@
               }
             }
           },
+          "409": {
+            "description": "Story 6-1b — the second step is needed and the client did not send `X-WMS-Second-Factor: 1` (client-outdated: \"Reload this page to sign in\"); nothing was written",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
           "423": {
             "description": "Too many failed attempts for this email from this address (sign-in-locked; `retryAfterSeconds`)",
             "content": {
@@ -153,7 +186,80 @@
             }
           }
         },
-        "summary": "Verifies the password, opens a server-side session and issues a short access token",
+        "summary": "Verifies the password; opens a server-side session — or, story 6-1b, asks for the second factor first",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/sign-in/second-factor": {
+      "post": {
+        "description": "Not keyed: it issues a credential. A `totp` challenge takes a 6-digit code (steps t−1…t+1, each usable once) or a backup code; an `enroll` challenge takes a code from the newly set-up app (and, after an owner’s reset, the one-time `enrolmentCode`), then answers the ten backup codes once. Every attempt is counted BEFORE the code is checked: 5 consecutive wrong codes lock two-factor sign-in for 15 minutes; the third lock without a success lasts until an owner unlocks it. Sets the refresh cookie like sign-in.",
+        "operationId": "TenancyController_signInSecondFactor",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecondFactorSignInDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecondFactorSignInResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Wrong code (second-factor-invalid; `attemptsLeft`), or the challenge is unknown, expired, used, out of attempts, or the account changed (challenge-ended — sign in again)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "423": {
+            "description": "Too many wrong codes (second-factor-locked; `retryAfterSeconds`, null until an owner unlocks)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts from this address (rate-limited; `retryAfterSeconds`)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Story 6-1b — completes a sign-in with the second factor and opens the session",
         "tags": [
           "tenancy"
         ]
@@ -2183,6 +2289,126 @@
         ]
       }
     },
+    "/tenants/{tenantId}/users/{userId}/second-factor/reset": {
+      "post": {
+        "description": "Clears the authenticator, the backup codes, the lock and any sign-in in progress, and ends the user’s web sessions. Their next sign-in sets two-factor up again and needs the enrolment code. Keyed; a user with nothing to reset is a no-op (null code). Your own: My account → Security.",
+        "operationId": "UsersController_resetSecondFactor",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "userId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecondFactorResetResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or malformed userId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks users.role_change (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "User does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Your own account (self-reset), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 6-1b — resets a colleague’s two-factor sign-in (users.role_change); answers a one-time enrolment code (72 h) to hand over in person",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
     "/tenants/{tenantId}/accept-invite": {
       "post": {
         "operationId": "UsersController_acceptInvite",
@@ -2311,6 +2537,540 @@
           }
         ],
         "summary": "The signed-in user’s own row (id, email, role, status)",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/me/second-factor": {
+      "get": {
+        "operationId": "UsersController_secondFactorStatus",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecondFactorStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 6-1b — the caller’s two-factor sign-in: on or off, required for the role, backup codes left",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/me/second-factor/setup": {
+      "post": {
+        "description": "With two-factor sign-in off it needs the current `password` (counted like sign-in); with it on, a current `code` (or a backup code).",
+        "operationId": "UsersController_secondFactorSetup",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecondFactorSetupDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecondFactorSetupResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body, or the proof this state needs is missing (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The factor changed while this ran (second-factor-changed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Wrong password (password-invalid) or wrong code (second-factor-invalid; `attemptsLeft`) — the session stays",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "423": {
+            "description": "Too many wrong passwords (sign-in-locked) or codes (second-factor-locked)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts from this address (rate-limited)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 6-1b — starts setting up (or replacing) the authenticator: answers a new secret to scan, then confirm it",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/me/second-factor/confirm": {
+      "post": {
+        "description": "Replacing an authenticator ends your other web sessions (this one stays).",
+        "operationId": "UsersController_secondFactorConfirm",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecondFactorCodeDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupCodesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "No setup in progress, or it expired after 24 h (second-factor-setup-expired), or it changed meanwhile (second-factor-changed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Wrong code (second-factor-invalid; `attemptsLeft`) — the session stays",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "423": {
+            "description": "Too many wrong codes (second-factor-locked)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts from this address (rate-limited)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 6-1b — confirms the new authenticator with a code from it; answers ten backup codes once",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/me/second-factor/backup-codes": {
+      "post": {
+        "description": "Needs a current code or a backup code. Ends your other web sessions (this one stays).",
+        "operationId": "UsersController_secondFactorBackupCodes",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecondFactorCodeDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupCodesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Two-factor sign-in is off (second-factor-not-enabled), or it changed meanwhile (second-factor-changed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Wrong code (second-factor-invalid; `attemptsLeft`) — the session stays",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "423": {
+            "description": "Too many wrong codes (second-factor-locked)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts from this address (rate-limited)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 6-1b — replaces the backup codes (the old ones stop working); answers the new ten once",
+        "tags": [
+          "tenancy"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/me/second-factor/disable": {
+      "post": {
+        "description": "Needs a current code or a backup code. Ends your other web sessions (this one stays).",
+        "operationId": "UsersController_secondFactorDisable",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SecondFactorCodeDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecondFactorStatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid body",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The role requires two-factor sign-in (second-factor-required), it is already off (second-factor-not-enabled), or it changed meanwhile (second-factor-changed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Wrong code (second-factor-invalid; `attemptsLeft`) — the session stays",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "423": {
+            "description": "Too many wrong codes (second-factor-locked)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts from this address (rate-limited)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 6-1b — turns two-factor sign-in off (not for owners, who must use it)",
         "tags": [
           "tenancy"
         ]
@@ -25252,26 +26012,6 @@
           "owner"
         ]
       },
-      "SignInDto": {
-        "type": "object",
-        "properties": {
-          "email": {
-            "type": "string",
-            "example": "priya@example.com",
-            "format": "email"
-          },
-          "password": {
-            "type": "string",
-            "example": "correct-horse-battery",
-            "minLength": 1,
-            "maxLength": 200
-          }
-        },
-        "required": [
-          "email",
-          "password"
-        ]
-      },
       "UserResponse": {
         "type": "object",
         "properties": {
@@ -25317,6 +26057,10 @@
             "type": "string",
             "nullable": true,
             "description": "Story 6-1a — sign-in is locked for this email (5 failed attempts from one address) until this instant; on the user list only, null or absent when not locked"
+          },
+          "secondFactorEnabled": {
+            "type": "boolean",
+            "description": "Story 6-1b — the user has two-factor sign-in set up; on the user list only (absent on stored invite / role-change snapshots)"
           }
         },
         "required": [
@@ -25385,6 +26129,173 @@
                 "$ref": "#/components/schemas/SessionClientResponse"
               }
             ]
+          }
+        },
+        "required": [
+          "accessToken",
+          "tokenType",
+          "expiresInSeconds",
+          "refreshExpiresInSeconds",
+          "tenant",
+          "user",
+          "client"
+        ]
+      },
+      "TotpChallengeResponse": {
+        "type": "object",
+        "properties": {
+          "challenge": {
+            "type": "string",
+            "enum": [
+              "totp"
+            ],
+            "example": "totp"
+          },
+          "challengeToken": {
+            "type": "string",
+            "description": "The one-time token for `POST /tenants/sign-in/second-factor` (no session exists yet)"
+          },
+          "expiresInSeconds": {
+            "type": "number",
+            "example": 300
+          }
+        },
+        "required": [
+          "challenge",
+          "challengeToken",
+          "expiresInSeconds"
+        ]
+      },
+      "EnrollChallengeResponse": {
+        "type": "object",
+        "properties": {
+          "challenge": {
+            "type": "string",
+            "enum": [
+              "enroll"
+            ],
+            "example": "enroll"
+          },
+          "challengeToken": {
+            "type": "string",
+            "description": "The one-time token for `POST /tenants/sign-in/second-factor` (no session exists yet)"
+          },
+          "expiresInSeconds": {
+            "type": "number",
+            "example": 600
+          },
+          "secret": {
+            "type": "string",
+            "description": "The authenticator secret (base32) — the QR code’s fallback. The same one for 24 h, so an app that scanned it keeps working"
+          },
+          "otpauthUri": {
+            "type": "string",
+            "example": "otpauth://totp/WMS%20(Acme)%3Aowner%40example.com?secret=…&issuer=WMS%20(Acme)"
+          },
+          "enrolmentCodeRequired": {
+            "type": "boolean",
+            "description": "An owner reset this user’s two-factor sign-in: the one-time enrolment code they handed over is needed too"
+          }
+        },
+        "required": [
+          "challenge",
+          "challengeToken",
+          "expiresInSeconds",
+          "secret",
+          "otpauthUri",
+          "enrolmentCodeRequired"
+        ]
+      },
+      "SignInDto": {
+        "type": "object",
+        "properties": {
+          "email": {
+            "type": "string",
+            "example": "priya@example.com",
+            "format": "email"
+          },
+          "password": {
+            "type": "string",
+            "example": "correct-horse-battery",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "email",
+          "password"
+        ]
+      },
+      "SecondFactorSignInDto": {
+        "type": "object",
+        "properties": {
+          "challengeToken": {
+            "type": "string",
+            "description": "The `challengeToken` from the sign-in response"
+          },
+          "code": {
+            "type": "string",
+            "example": "123456",
+            "description": "A 6-digit code from the authenticator app, or (code step only) a backup code `XXXXX-XXXXX`"
+          },
+          "enrolmentCode": {
+            "type": "string",
+            "example": "K7PQ2MXA",
+            "description": "Enrolment after an owner’s reset — the one-time code they handed over"
+          }
+        },
+        "required": [
+          "challengeToken",
+          "code"
+        ]
+      },
+      "SecondFactorSignInResponse": {
+        "type": "object",
+        "properties": {
+          "accessToken": {
+            "type": "string",
+            "description": "HS256 session token (15 min), claims: sub + tenant_id (+ client_id for a client-portal user, story 21-7)"
+          },
+          "tokenType": {
+            "type": "string",
+            "example": "Bearer"
+          },
+          "expiresInSeconds": {
+            "type": "number",
+            "example": 900
+          },
+          "refreshExpiresInSeconds": {
+            "type": "number",
+            "example": 43200,
+            "description": "Story 6-1a — seconds until the session can no longer be refreshed (its absolute end). The refresh token itself rides an httpOnly cookie; the client stores this to tell a refreshable session from an ended one."
+          },
+          "tenant": {
+            "$ref": "#/components/schemas/TenantResponse"
+          },
+          "user": {
+            "$ref": "#/components/schemas/UserResponse"
+          },
+          "client": {
+            "nullable": true,
+            "description": "Story 21-7 — the client brand of a client-portal user (the portal shell prints its name); null for the tenant’s own staff",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SessionClientResponse"
+              }
+            ]
+          },
+          "backupCodes": {
+            "description": "Enrolment only — the ten single-use backup codes, shown this once and never again",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "secondFactorFailedAttempts": {
+            "type": "number",
+            "example": 3,
+            "description": "Wrong codes since the last successful sign-in (present only when there were any)"
           }
         },
         "required": [
@@ -26282,6 +27193,26 @@
           "user"
         ]
       },
+      "SecondFactorResetResponse": {
+        "type": "object",
+        "properties": {
+          "enrolmentCode": {
+            "type": "string",
+            "nullable": true,
+            "example": "K7PQ2MXA",
+            "description": "Hand this to the user in person — they need it to set up again (72 h)"
+          },
+          "enrolmentCodeExpiresAt": {
+            "type": "string",
+            "nullable": true,
+            "example": "2026-10-21T09:00:00.000Z"
+          }
+        },
+        "required": [
+          "enrolmentCode",
+          "enrolmentCodeExpiresAt"
+        ]
+      },
       "AcceptInviteDto": {
         "type": "object",
         "properties": {
@@ -26321,6 +27252,90 @@
         },
         "required": [
           "user"
+        ]
+      },
+      "SecondFactorStatusResponse": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "enabledAt": {
+            "type": "string",
+            "nullable": true,
+            "example": "2026-10-18T09:00:00.000Z"
+          },
+          "required": {
+            "type": "boolean",
+            "description": "The role must use two-factor sign-in (owners) — it cannot be turned off"
+          },
+          "backupCodesRemaining": {
+            "type": "number",
+            "example": 10
+          }
+        },
+        "required": [
+          "enabled",
+          "enabledAt",
+          "required",
+          "backupCodesRemaining"
+        ]
+      },
+      "SecondFactorSetupDto": {
+        "type": "object",
+        "properties": {
+          "password": {
+            "type": "string",
+            "description": "With two-factor sign-in off: the current password"
+          },
+          "code": {
+            "type": "string",
+            "description": "With two-factor sign-in on: a current code or a backup code"
+          }
+        }
+      },
+      "SecondFactorSetupResponse": {
+        "type": "object",
+        "properties": {
+          "secret": {
+            "type": "string",
+            "description": "The new authenticator secret (base32) — confirm it with a code from the app"
+          },
+          "otpauthUri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "secret",
+          "otpauthUri"
+        ]
+      },
+      "SecondFactorCodeDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "example": "123456",
+            "description": "A code from the authenticator app (or, where accepted, a backup code)"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "BackupCodesResponse": {
+        "type": "object",
+        "properties": {
+          "backupCodes": {
+            "description": "Ten single-use backup codes `XXXXX-XXXXX` — shown this once",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "backupCodes"
         ]
       },
       "CatalogImportErrorResponse": {

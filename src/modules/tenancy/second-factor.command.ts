@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, eq, sql } from 'drizzle-orm';
 import { AUTH_DATABASE, DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { idempotencyKeys, tenants, users } from '../../shared/db/schema';
+import { auditEvents, idempotencyKeys, tenants, users } from '../../shared/db/schema';
 import type { UserRole } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -20,7 +20,8 @@ import {
   signInLocked,
   SIGNIN_LIMIT_PER_IP_PER_MINUTE,
 } from './auth-attempts';
-import { auditSecurityEventInTx, revokeSessionsInTx } from './sessions';
+import { auditSecurityEventInTx, revokeSessionsInTx, type SecurityAuditAction } from './sessions';
+import { nowIso } from '../../shared/primitives/time';
 import { issueWebSessionInTx, type IssuedWebSession } from './sign-in.command';
 import {
   base32Encode,
@@ -338,13 +339,16 @@ export class SecondFactorCommand {
         body = { enrolmentCode: null, enrolmentCodeExpiresAt: null };
       } else {
         body = await resetSecondFactorInTx(tx, command.tenantId, target.id);
-        await auditSecurityEventInTx(tx, {
+        // Step 10 of the skeleton: the keyed command's audit row, reference = the key.
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
           tenantId: command.tenantId,
-          action: 'user.second_factor_reset',
+          actorUserId: command.actorUserId,
+          action: 'user.second_factor_reset' satisfies SecurityAuditAction,
           targetType: 'user',
           targetId: target.id,
-          actorUserId: command.actorUserId,
           reference: idempotencyKey,
+          occurredAt: nowIso(),
         });
       }
       try {

@@ -59,6 +59,8 @@
  * carries on.
  */
 
+import { enrolmentOf, signInTwoStep } from './lib/two-step-sign-in';
+
 // The API's JSON bodies are consumed loosely here (a seed script, not a
 // typed client) — one deliberate `any` alias instead of a hundred casts.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -237,9 +239,14 @@ interface Account {
 const accounts = new Map<string, Account>();
 let tenantId: string | undefined;
 
+/**
+ * Story 6-1b — the owner signs in in two steps; the seed holds the owner's
+ * authenticator (`scripts/lib/two-step-sign-in.ts`) and prints it at the end
+ * so a person can add it to a real app. Other roles answer in one step.
+ */
 async function signIn(email: string): Promise<string> {
-  const res = await call('POST', '/tenants/sign-in', { body: { email, password: PASSWORD }, idempotent: false });
-  return res.body.accessToken as string;
+  const body = await signInTwoStep(BASE_URL, email, PASSWORD);
+  return body.accessToken;
 }
 
 /** A fresh-enough web session for the role (tokens live 15 minutes; refreshed at 10). */
@@ -1142,6 +1149,16 @@ async function main(): Promise<void> {
   say('');
   say(` Logins (password for every account: ${PASSWORD})`);
   for (const account of accounts.values()) say(`   ${account.role.padEnd(24)} ${account.email}`);
+  // Story 6-1b — the owner signs in with a second factor: add this to an
+  // authenticator app (the URI as a QR code, or type the secret).
+  const ownerEnrolment = accounts.has('owner') ? enrolmentOf(accounts.get('owner')!.email) : null;
+  if (ownerEnrolment !== null) {
+    say('');
+    say(' Owner two-factor sign-in (authenticator app)');
+    say(`   otpauth URI   ${ownerEnrolment.otpauthUri}`);
+    say(`   Secret        ${ownerEnrolment.secret}`);
+    say(`   Backup codes  ${ownerEnrolment.backupCodes.join('  ')}`);
+  }
   say('');
   say(' Handheld (wms-mobile)');
   if (deviceLabel) say(`   Enrolled demo device "${deviceLabel}" — badge in with an operator email + PIN ${DEVICE_PIN}`);

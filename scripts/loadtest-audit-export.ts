@@ -34,6 +34,7 @@ import { chdir } from 'node:process';
 import { pathToFileURL } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 import postgres from 'postgres';
+import { signInTwoStep } from './lib/two-step-sign-in';
 
 interface Args {
   readonly events: number;
@@ -56,6 +57,7 @@ const args = parseArgs(process.argv.slice(2));
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'loadtest-only-secret-0123456789abcdef';
+process.env.MFA_ENCRYPTION_KEY ??= 'loadtest-only-mfa-encryption-key-0123456789abcdef';
 process.env.DEVICE_ENCRYPTION_KEY ??= 'loadtest-only-device-encryption-key-0123456789abcdef';
 process.env.VALKEY_URL ??= 'redis://localhost:56379/0';
 // No background worker may compete with the run being measured — the script
@@ -145,7 +147,8 @@ async function main(): Promise<void> {
     });
     const tenantId = registered.tenant.id;
     const ownerId = registered.owner.id;
-    const token = (await call<{ accessToken: string }>(origin, 'sign-in', 200, '/tenants/sign-in', 'POST', { email, password: PASSWORD })).accessToken;
+    // Story 6-1b — the owner signs in in two steps (the script holds the authenticator).
+    const token = (await signInTwoStep(`${origin}${API}`, email, PASSWORD)).accessToken;
 
     // ── seed to exactly --events audit rows ───────────────────────────────
     const existing = Number(((await direct`select count(*)::int as n from audit_events where tenant_id = ${tenantId}`)[0] as { n: number }).n);

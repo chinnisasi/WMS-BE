@@ -1459,7 +1459,7 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, OnApplication
       // ago and pending authenticator secrets older than 24 h. Its own tenant
       // discovery, and a try/catch per tenant inside.
       try {
-        purged += await purgeSecondFactorState(this.db, this.authDb, (tenantId, error) =>
+        await purgeSecondFactorState(this.db, this.authDb, (tenantId, error) =>
           this.logger.error(
             `Second-factor purge failed for tenant ${tenantId}: ${error instanceof Error ? error.message : String(error)}`,
           ),
