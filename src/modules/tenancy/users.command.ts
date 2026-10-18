@@ -59,6 +59,8 @@ export interface UserView {
   readonly lockedUntil?: string | null;
   /** Story 6-1b — list reads only; optional for the same reason as `lockedUntil`. */
   readonly secondFactorEnabled?: boolean;
+  /** Story 6-1b (amendment) — a reset's enrolment code is outstanding and 2FA is not set up again. List only. */
+  readonly secondFactorResetPending?: boolean;
 }
 
 export interface UserStatusInput {
@@ -870,6 +872,7 @@ export class UsersCommand {
         ...toUserView(row),
         lockedUntil: laterLock(locks.get(row.email) ?? null, secondFactorLockOf(row.mfaLockedUntil, now)),
         secondFactorEnabled: row.mfaEnabledAt !== null,
+        secondFactorResetPending: row.mfaEnrolCodeHash !== null && row.mfaEnabledAt === null,
       })),
       nextCursor: page.nextCursor,
     };

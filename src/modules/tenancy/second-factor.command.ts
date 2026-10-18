@@ -27,7 +27,8 @@ import {
   base32Encode,
   challengeEnded,
   clearOpenChallengesInTx,
-  commitSecondFactorInTx,
+  withCommittedFactor,
+  factorChanged,
   ENROLMENT_CODE_SECONDS,
   hashEnrolmentCode,
   newEnrolmentCode,
@@ -105,8 +106,8 @@ export class SecondFactorCommand {
     const parsed = parseChallengeToken(input.challengeToken);
     if (parsed === null) throw challengeEnded();
     const located = (await this.authDb.execute(sql`
-      select tenant_id, purpose from sign_in_challenges where id = ${parsed.id}
-    `)) as unknown as Array<{ tenant_id: string; purpose: SignInChallengePurpose }>;
+      select tenant_id, user_id, purpose from sign_in_challenges where id = ${parsed.id}
+    `)) as unknown as Array<{ tenant_id: string; user_id: string; purpose: SignInChallengePurpose }>;
     const found = located[0];
     if (found === undefined) throw challengeEnded();
     const tenantId = found.tenant_id;
@@ -114,6 +115,8 @@ export class SecondFactorCommand {
 
     const verified = await verifySecondFactorInput(this.db, {
       tenantId,
+      // tx1 locks this user row first; the challenge must still belong to it.
+      userId: found.user_id,
       ip: input.ip,
       code: input.code,
       challenge: parsed,
@@ -124,8 +127,7 @@ export class SecondFactorCommand {
       enrolmentCode: input.enrolmentCode ?? null,
     });
 
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      const committed = await commitSecondFactorInTx(tx, verified, { stepRule: 'advance', signIn: true });
+    return withCommittedFactor(this.db, verified, { stepRule: 'advance', signIn: true }, async (tx, committed) => {
       const userId = verified.userId;
       let backupCodes: string[] | undefined;
       if (purpose === 'enroll') {
@@ -203,15 +205,19 @@ export class SecondFactorCommand {
         { ...this.selfServiceInput(caller, proof.code), source: 'active', allowBackupCode: true },
         secondFactorNotEnabled,
       );
-      return withTenantTransaction(this.db, caller.tenantId, async (tx) => {
-        await commitSecondFactorInTx(tx, verified, { stepRule: 'advance', signIn: false });
+      return withCommittedFactor(this.db, verified, { stepRule: 'advance', signIn: false }, async (tx) => {
         return this.startSetupInTx(tx, caller);
       });
     }
     if (proof.password === undefined) throw proofRequired('Enter your current password.');
     await this.assertPassword(caller, proof.password);
     return withTenantTransaction(this.db, caller.tenantId, async (tx) => {
-      await tx.execute(sql`select id from users where tenant_id = ${caller.tenantId} and id = ${caller.userId} for update`);
+      // "Off" was read outside the lock: a factor confirmed meanwhile must not
+      // be replaced on the password alone.
+      const locked = (await tx.execute(sql`
+        select (mfa_enabled_at is null) as off from users where tenant_id = ${caller.tenantId} and id = ${caller.userId} for update
+      `)) as unknown as Array<{ off: boolean }>;
+      if (locked[0]?.off !== true) throw factorChanged();
       return this.startSetupInTx(tx, caller);
     });
   }
@@ -229,8 +235,7 @@ export class SecondFactorCommand {
       { ...this.selfServiceInput(caller, code), source: 'pending', allowBackupCode: false },
       setupExpired,
     );
-    return withTenantTransaction(this.db, caller.tenantId, async (tx) => {
-      await commitSecondFactorInTx(tx, verified, { stepRule: 'set', signIn: false });
+    return withCommittedFactor(this.db, verified, { stepRule: 'set', signIn: false }, async (tx) => {
       const before = (await tx.execute(sql`
         select (mfa_enabled_at is not null) as replacing from users where tenant_id = ${caller.tenantId} and id = ${caller.userId}
       `)) as unknown as Array<{ replacing: boolean }>;
@@ -255,8 +260,7 @@ export class SecondFactorCommand {
       { ...this.selfServiceInput(caller, code), source: 'active', allowBackupCode: true },
       secondFactorNotEnabled,
     );
-    return withTenantTransaction(this.db, caller.tenantId, async (tx) => {
-      await commitSecondFactorInTx(tx, verified, { stepRule: 'advance', signIn: false });
+    return withCommittedFactor(this.db, verified, { stepRule: 'advance', signIn: false }, async (tx) => {
       const backupCodes = await replaceBackupCodesInTx(tx, caller.tenantId, caller.userId);
       await this.endOtherSessionsInTx(tx, caller);
       await this.auditSelf(tx, caller, 'user.backup_codes_regenerated');
@@ -274,15 +278,15 @@ export class SecondFactorCommand {
       { ...this.selfServiceInput(caller, code), source: 'active', allowBackupCode: true },
       secondFactorNotEnabled,
     );
-    return withTenantTransaction(this.db, caller.tenantId, async (tx) => {
-      await commitSecondFactorInTx(tx, verified, { stepRule: 'advance', signIn: false });
+    return withCommittedFactor(this.db, verified, { stepRule: 'advance', signIn: false }, async (tx) => {
       // The role is re-read under the user lock commit took: a promotion to
       // owner between the check above and here still refuses.
       const role = (await tx.execute(sql`select role from users where tenant_id = ${caller.tenantId} and id = ${caller.userId}`)) as unknown as Array<{ role: UserRole }>;
       if (secondFactorRequired(role[0]!.role)) throw secondFactorRequiredRefusal();
       await tx.execute(sql`
         update users set mfa_secret_sealed = null, mfa_enabled_at = null, mfa_last_step = null,
-                         mfa_pending_secret_sealed = null, mfa_pending_created_at = null
+                         mfa_pending_secret_sealed = null, mfa_pending_created_at = null,
+                         mfa_failed_since_success = 0
          where tenant_id = ${caller.tenantId} and id = ${caller.userId}
       `);
       await tx.execute(sql`delete from user_backup_codes where tenant_id = ${caller.tenantId} and user_id = ${caller.userId}`);
@@ -476,7 +480,7 @@ export async function resetSecondFactorInTx(
   const expiresAt = new Date(Date.now() + ENROLMENT_CODE_SECONDS * 1000).toISOString();
   await tx.execute(sql`
     update users set mfa_secret_sealed = null, mfa_enabled_at = null, mfa_last_step = null,
-                     mfa_failures = 0, mfa_lock_cycles = 0, mfa_locked_until = null,
+                     mfa_failures = 0, mfa_lock_cycles = 0, mfa_locked_until = null, mfa_failed_since_success = 0,
                      mfa_pending_secret_sealed = null, mfa_pending_created_at = null,
                      mfa_enrol_code_hash = ${hashEnrolmentCode(enrolmentCode)},
                      mfa_enrol_code_expires_at = ${expiresAt}::timestamptz

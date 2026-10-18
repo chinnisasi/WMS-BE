@@ -27,9 +27,11 @@ export const MFA_KEY_MIN_LENGTH = 32;
 const SEALED_VERSION = 'v1';
 
 export class MissingSecondFactorKeyError extends Error {
-  constructor() {
+  constructor(name: 'MFA_ENCRYPTION_KEY' | 'MFA_ENCRYPTION_KEY_PREVIOUS' = 'MFA_ENCRYPTION_KEY') {
     super(
-      `MFA_ENCRYPTION_KEY is required for two-factor sign-in (set it to at least ${MFA_KEY_MIN_LENGTH} characters; see .env.example). ` +
+      name === 'MFA_ENCRYPTION_KEY_PREVIOUS'
+        ? `MFA_ENCRYPTION_KEY_PREVIOUS is set but shorter than ${MFA_KEY_MIN_LENGTH} characters — set the full previous key, or unset it.`
+        : `MFA_ENCRYPTION_KEY is required for two-factor sign-in (set it to at least ${MFA_KEY_MIN_LENGTH} characters; see .env.example). ` +
         'Losing it makes every enrolled authenticator unreadable — every owner must then be reset with `bun run auth:reset-2fa <email>`.',
     );
   }
@@ -59,9 +61,18 @@ function openingKeys(): KeyMaterial[] {
   return keys;
 }
 
-/** The boot check (main.ts): the app refuses to start without a usable key. */
+/**
+ * The boot check (main.ts): the app refuses to start without a usable key —
+ * and with a `MFA_ENCRYPTION_KEY_PREVIOUS` that is set but too short (it
+ * would be ignored, and every blob sealed under it would never open).
+ * Unset or empty, the previous key is simply absent.
+ */
 export function assertSecondFactorKeyConfigured(): void {
   currentKey();
+  const previous = process.env.MFA_ENCRYPTION_KEY_PREVIOUS;
+  if (previous !== undefined && previous !== '' && previous.length < MFA_KEY_MIN_LENGTH) {
+    throw new MissingSecondFactorKeyError('MFA_ENCRYPTION_KEY_PREVIOUS');
+  }
 }
 
 function associatedData(tenantId: string, userId: string): Buffer {

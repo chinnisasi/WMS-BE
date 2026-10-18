@@ -184,7 +184,7 @@ export class TenancyController {
   })
   @ApiResponse({ status: 400, ...problemJsonResponse('Invalid body') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Unknown email, wrong password, or a deactivated account (unauthenticated — one answer for all three)') })
-  @ApiResponse({ status: 403, ...problemJsonResponse('Invitation not yet accepted (invite-pending), or a client-portal user whose client is not active (client-suspended, story 21-7)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Invitation not yet accepted (invite-pending), a client-portal user whose client is not active (client-suspended, story 21-7), or — story 6-1b — an owner reset this user’s two-factor sign-in and the enrolment code has expired (enrolment-code-expired: ask for another reset; nothing counted)') })
   @ApiResponse({ status: 409, ...problemJsonResponse('Story 6-1b — the second step is needed and the client did not send `X-WMS-Second-Factor: 1` (client-outdated: "Reload this page to sign in"); nothing was written') })
   @ApiResponse({ status: 423, ...problemJsonResponse('Too many failed attempts for this email from this address (sign-in-locked; `retryAfterSeconds`)') })
   @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited; `retryAfterSeconds`)') })
@@ -219,6 +219,7 @@ export class TenancyController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Wrong code (second-factor-invalid; `attemptsLeft`), or the challenge is unknown, expired, used, out of attempts, or the account changed (challenge-ended — sign in again)') })
   @ApiResponse({ status: 423, ...problemJsonResponse('Too many wrong codes (second-factor-locked; `retryAfterSeconds`, null until an owner unlocks)') })
   @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited; `retryAfterSeconds`)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The stored secret cannot be opened with the configured key (second-factor-unavailable); nothing was counted') })
   async signInSecondFactor(
     @Body() dto: SecondFactorSignInDto,
     @Req() request: SessionHttpRequest,

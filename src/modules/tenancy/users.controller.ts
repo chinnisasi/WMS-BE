@@ -379,6 +379,7 @@ export class UsersController {
   @ApiResponse({ status: 422, ...problemJsonResponse('Wrong password (password-invalid) or wrong code (second-factor-invalid; `attemptsLeft`) — the session stays') })
   @ApiResponse({ status: 423, ...problemJsonResponse('Too many wrong passwords (sign-in-locked) or codes (second-factor-locked)') })
   @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The stored secret cannot be opened with the configured key (second-factor-unavailable); nothing was counted') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async secondFactorSetup(
     @Param('tenantId') tenantId: string,
@@ -412,6 +413,7 @@ export class UsersController {
   @ApiResponse({ status: 422, ...problemJsonResponse('Wrong code (second-factor-invalid; `attemptsLeft`) — the session stays') })
   @ApiResponse({ status: 423, ...problemJsonResponse('Too many wrong codes (second-factor-locked)') })
   @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The stored secret cannot be opened with the configured key (second-factor-unavailable); nothing was counted') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async secondFactorConfirm(
     @Param('tenantId') tenantId: string,
@@ -439,6 +441,7 @@ export class UsersController {
   @ApiResponse({ status: 422, ...problemJsonResponse('Wrong code (second-factor-invalid; `attemptsLeft`) — the session stays') })
   @ApiResponse({ status: 423, ...problemJsonResponse('Too many wrong codes (second-factor-locked)') })
   @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The stored secret cannot be opened with the configured key (second-factor-unavailable); nothing was counted') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async secondFactorBackupCodes(
     @Param('tenantId') tenantId: string,
@@ -468,6 +471,7 @@ export class UsersController {
   @ApiResponse({ status: 422, ...problemJsonResponse('Wrong code (second-factor-invalid; `attemptsLeft`) — the session stays') })
   @ApiResponse({ status: 423, ...problemJsonResponse('Too many wrong codes (second-factor-locked)') })
   @ApiResponse({ status: 429, ...problemJsonResponse('Too many attempts from this address (rate-limited)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The stored secret cannot be opened with the configured key (second-factor-unavailable); nothing was counted') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async secondFactorDisable(
     @Param('tenantId') tenantId: string,

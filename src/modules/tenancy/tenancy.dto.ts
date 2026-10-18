@@ -300,6 +300,14 @@ export class UserResponse {
       'Story 6-1b — the user has two-factor sign-in set up; on the user list only (absent on stored invite / role-change snapshots)',
   })
   secondFactorEnabled?: boolean;
+
+  @ApiProperty({
+    type: Boolean,
+    required: false,
+    description:
+      'Story 6-1b — an owner reset this user’s two-factor sign-in and they have not set it up again (an enrolment code is outstanding); on the user list only',
+  })
+  secondFactorResetPending?: boolean;
 }
 
 /** Story 6-1a — deactivate / reactivate. A reactivated never-accepted invitee carries a fresh invite token. */

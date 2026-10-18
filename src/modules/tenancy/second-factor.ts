@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
+import { Logger } from '@nestjs/common';
 import { sql } from 'drizzle-orm';
 import type { Database } from '../../shared/db/db';
 import type { UserRole } from '../../shared/db/schema';
@@ -147,8 +148,9 @@ export function newTotpSecret(): Buffer {
 
 /** `otpauth://totp/<issuer>:<email>?secret=…&issuer=…` — the issuer is `WMS (<tenant name>)`. */
 export function otpauthUri(secretBase32: string, email: string, tenantName: string): string {
-  const issuer = `WMS (${tenantName})`;
-  const label = encodeURIComponent(`${issuer}:${email}`);
+  // A ':' splits issuer from account in the label: keep it out of both parts.
+  const issuer = `WMS (${tenantName})`.replace(/:/g, ' ');
+  const label = encodeURIComponent(`${issuer}:${email.replace(/:/g, ' ')}`);
   const params = new URLSearchParams({
     secret: secretBase32,
     issuer,
@@ -333,15 +335,33 @@ export function secondFactorLocked(retryAfterSeconds: number | null): ProblemExc
   );
 }
 
-export function secondFactorInvalid(status: 401 | 422, attemptsLeft: number): ProblemException {
+export function secondFactorInvalid(status: 401 | 422, attemptsLeft: number, detail = 'That code is not right.'): ProblemException {
   return new ProblemException(
     'second-factor-invalid',
     status,
     'Wrong code',
-    attemptsLeft > 0
-      ? `That code is not right. ${attemptsLeft === 1 ? '1 attempt' : `${attemptsLeft} attempts`} left.`
-      : 'That code is not right.',
+    attemptsLeft > 0 ? `${detail} ${attemptsLeft === 1 ? '1 attempt' : `${attemptsLeft} attempts`} left.` : detail,
     { attemptsLeft },
+  );
+}
+
+/** The sealed secret will not open (the key it was sealed under is not configured): nothing counted. */
+export function secondFactorUnavailable(): ProblemException {
+  return new ProblemException(
+    'second-factor-unavailable',
+    503,
+    'Two-factor sign-in unavailable',
+    'Two-factor sign-in cannot be checked right now — tell an owner (the server key is not configured).',
+  );
+}
+
+/** The reset's enrolment code expired: a fresh reset is needed (answered at the password step). */
+export function enrolmentCodeExpired(): ProblemException {
+  return new ProblemException(
+    'enrolment-code-expired',
+    403,
+    'Enrolment code expired',
+    'Ask an owner to reset your two-factor sign-in again.',
   );
 }
 
@@ -381,7 +401,7 @@ export function setupExpired(): ProblemException {
   );
 }
 
-function factorChanged(): ProblemException {
+export function factorChanged(): ProblemException {
   return new ProblemException(
     'second-factor-changed',
     409,
@@ -397,8 +417,12 @@ export type SecretSource = 'active' | 'pending';
 
 export interface VerifyInput {
   readonly tenantId: string;
-  /** The signed-in user (self-service); for the sign-in step it comes from the challenge. */
-  readonly userId?: string;
+  /**
+   * The user: the signed-in caller (self-service), or — at sign-in — the
+   * challenge's user from the auth-connection lookup (tx1 locks this row
+   * FIRST, the order tx2 takes; the challenge must belong to it).
+   */
+  readonly userId: string;
   readonly ip: string;
   readonly code: string;
   /** The sign-in step's challenge; absent on the self-service routes. */
@@ -420,25 +444,30 @@ export interface VerifiedFactor {
   /** `mfa_enabled_at` (active) or `mfa_pending_created_at` (pending) when tx1 read it. */
   readonly factorSeen: string | null;
   readonly invalidStatus: 401 | 422;
+  /** The wrong-code detail this attempt answers (the enrolment step after a reset names both codes). */
+  readonly invalidDetail?: string;
   readonly match: { readonly kind: 'totp'; readonly step: number } | { readonly kind: 'backup'; readonly hashes: readonly string[] };
 }
 
 type Tx1Outcome =
   | { readonly kind: 'challenge-ended' }
   | { readonly kind: 'no-factor' }
+  | { readonly kind: 'unavailable' }
   | { readonly kind: 'locked'; readonly retryAfterSeconds: number | null }
   | {
       readonly kind: 'counted';
-      readonly userId: string;
       readonly purpose: SignInChallengePurpose | null;
-      readonly sealed: string;
+      readonly secret: Buffer;
       readonly factorSeen: string;
-      readonly userFailures: number;
-      readonly challengeFailures: number | null;
       readonly unusedBackupHashes: readonly string[];
       readonly enrolCodeHash: string | null;
       readonly enrolCodeLive: boolean;
     };
+
+const logger = new Logger('SecondFactor');
+
+/** The enrolment step after a reset: the code that was wrong may be either. */
+export const ENROLMENT_INVALID_DETAIL = 'The authenticator code or the enrolment code is not right.';
 
 /**
  * Steps 1–3 of the shared verifier. Counts the attempt and COMMITS before the
@@ -455,67 +484,85 @@ export async function verifySecondFactorInput(
   // 1. The per-IP attempt limit.
   await hitRateLimit(db, `second-factor-ip:${input.ip}`, SIGNIN_LIMIT_PER_IP_PER_MINUTE);
 
-  // 2. tx1 — validate, check the lock, count, commit.
+  // 2. tx1 — validate, check the lock, open the secret, count, commit.
   const outcome = await withTenantTransaction(db, input.tenantId, (tx) => countAttemptInTx(tx, input));
   if (outcome.kind === 'challenge-ended') throw challengeEnded();
   if (outcome.kind === 'no-factor') throw missingFactor();
+  if (outcome.kind === 'unavailable') throw secondFactorUnavailable();
   if (outcome.kind === 'locked') throw secondFactorLocked(outcome.retryAfterSeconds);
 
   // 3. Check the code with no transaction open.
   let match: VerifiedFactor['match'] | null = null;
   const totp = normaliseTotpCode(input.code);
   if (totp !== null) {
-    let secret: Buffer | null = null;
-    try {
-      secret = openSecondFactorSecret(outcome.sealed, input.tenantId, outcome.userId);
-    } catch {
-      secret = null;
-    }
-    const step = secret === null ? null : matchTotp(secret, totp);
+    const step = matchTotp(outcome.secret, totp);
     if (step !== null) match = { kind: 'totp', step };
   } else if (input.allowBackupCode) {
     const backup = normaliseBackupCode(input.code);
     if (backup !== null) {
-      const hashes = backupCodeHashCandidates(outcome.userId, backup);
+      const hashes = backupCodeHashCandidates(input.userId, backup);
       if (hashes.some((hash) => outcome.unusedBackupHashes.some((stored) => sameHash(hash, stored)))) {
         match = { kind: 'backup', hashes };
       }
     }
   }
-  // The reset's enrolment code: required whenever the user holds one; an
-  // expired one never matches (a fresh reset is needed).
-  if (match !== null && outcome.purpose === 'enroll' && outcome.enrolCodeHash !== null) {
+  // The reset's enrolment code: required whenever the user holds one (an
+  // expired one is refused at the password step — `enrolment-code-expired`).
+  const enrolmentStep = outcome.purpose === 'enroll' && outcome.enrolCodeHash !== null;
+  if (match !== null && enrolmentStep) {
     const given = input.enrolmentCode ?? '';
-    const ok = outcome.enrolCodeLive && given.length > 0 && sameHash(hashEnrolmentCode(given), outcome.enrolCodeHash);
+    const ok = outcome.enrolCodeLive && given.length > 0 && sameHash(hashEnrolmentCode(given), outcome.enrolCodeHash!);
     if (!ok) match = null;
   }
+  const invalidDetail = enrolmentStep ? ENROLMENT_INVALID_DETAIL : undefined;
   if (match === null) {
-    const lockedNow = await settleFailure(db, input.tenantId, outcome.userId, input.ip);
-    const left = lockedNow
-      ? 0
-      : Math.max(
-          0,
-          Math.min(
-            MAX_SECOND_FACTOR_FAILURES - outcome.userFailures,
-            outcome.challengeFailures === null ? MAX_SECOND_FACTOR_FAILURES : MAX_SECOND_FACTOR_FAILURES - outcome.challengeFailures,
-          ),
-        );
-    throw secondFactorInvalid(input.invalidStatus, left);
+    const left = await settleWrongCode(db, input.tenantId, input.userId, input.ip, input.challenge?.id ?? null);
+    throw secondFactorInvalid(input.invalidStatus, left, invalidDetail);
   }
   return {
     tenantId: input.tenantId,
-    userId: outcome.userId,
+    userId: input.userId,
     ip: input.ip,
     challenge: input.challenge === undefined || outcome.purpose === null ? null : { id: input.challenge.id, purpose: outcome.purpose },
     source: input.source,
     factorSeen: outcome.factorSeen,
     invalidStatus: input.invalidStatus,
+    ...(invalidDetail === undefined ? {} : { invalidDetail }),
     match,
   };
 }
 
 async function countAttemptInTx(tx: TenantTx, input: VerifyInput): Promise<Tx1Outcome> {
-  let userId = input.userId;
+  const userId = input.userId;
+  // The user row FIRST, then the challenge — the order tx2 takes (a
+  // different order deadlocks a duplicate verify against another's tx2).
+  const users = (await tx.execute(sql`
+    select status, mfa_failures,
+           case when ${input.source}::text = 'active' then mfa_secret_sealed else mfa_pending_secret_sealed end as sealed,
+           case when ${input.source}::text = 'active' then mfa_enabled_at::text else mfa_pending_created_at::text end as factor_seen,
+           (${input.source}::text = 'pending' and mfa_pending_created_at <= now() - make_interval(secs => ${PENDING_SECRET_SECONDS})) as pending_stale,
+           (mfa_locked_until is not null and mfa_locked_until > now()) as locked,
+           (mfa_locked_until = 'infinity') as locked_forever,
+           coalesce(greatest(1, ceil(extract(epoch from (mfa_locked_until - now())))), 0)::float8 as retry_after,
+           mfa_enrol_code_hash,
+           (mfa_enrol_code_expires_at is not null and mfa_enrol_code_expires_at > now()) as enrol_code_live
+      from users
+     where tenant_id = ${input.tenantId} and id = ${userId}
+     for update
+  `)) as unknown as Array<{
+    status: string;
+    mfa_failures: number;
+    sealed: string | null;
+    factor_seen: string | null;
+    pending_stale: boolean | null;
+    locked: boolean;
+    locked_forever: boolean | null;
+    retry_after: number;
+    mfa_enrol_code_hash: string | null;
+    enrol_code_live: boolean;
+  }>;
+  const user = users[0];
+
   let purpose: SignInChallengePurpose | null = null;
   if (input.challenge !== undefined) {
     const rows = (await tx.execute(sql`
@@ -531,40 +578,13 @@ async function countAttemptInTx(tx: TenantTx, input: VerifyInput): Promise<Tx1Ou
       !sameHash(hashSecret(input.challenge.secret), row.secret_hash) ||
       !row.open ||
       row.failures >= MAX_SECOND_FACTOR_FAILURES ||
-      (userId !== undefined && row.user_id !== userId)
+      row.user_id !== userId
     ) {
       return { kind: 'challenge-ended' };
     }
-    userId = row.user_id;
     purpose = row.purpose;
   }
-  if (userId === undefined) return { kind: 'challenge-ended' };
 
-  const users = (await tx.execute(sql`
-    select status, mfa_failures,
-           case when ${input.source}::text = 'active' then mfa_secret_sealed else mfa_pending_secret_sealed end as sealed,
-           case when ${input.source}::text = 'active' then mfa_enabled_at::text else mfa_pending_created_at::text end as factor_seen,
-           (${input.source}::text = 'pending' and mfa_pending_created_at <= now() - make_interval(secs => ${PENDING_SECRET_SECONDS})) as pending_stale,
-           (mfa_locked_until is not null and mfa_locked_until > now()) as locked,
-           (mfa_locked_until = 'infinity') as locked_forever,
-           coalesce(greatest(1, ceil(extract(epoch from (mfa_locked_until - now())))), 0)::float8 as retry_after,
-           mfa_enrol_code_hash,
-           (mfa_enrol_code_expires_at is not null and mfa_enrol_code_expires_at > now()) as enrol_code_live
-      from users
-     where tenant_id = ${input.tenantId} and id = ${userId}
-  `)) as unknown as Array<{
-    status: string;
-    mfa_failures: number;
-    sealed: string | null;
-    factor_seen: string | null;
-    pending_stale: boolean | null;
-    locked: boolean;
-    locked_forever: boolean | null;
-    retry_after: number;
-    mfa_enrol_code_hash: string | null;
-    enrol_code_live: boolean;
-  }>;
-  const user = users[0];
   if (user === undefined || user.status !== 'active') return { kind: 'challenge-ended' };
   if (user.locked) {
     return { kind: 'locked', retryAfterSeconds: user.locked_forever ? null : Number(user.retry_after) };
@@ -575,6 +595,17 @@ async function countAttemptInTx(tx: TenantTx, input: VerifyInput): Promise<Tx1Ou
   if (expectedSource !== input.source) return { kind: 'challenge-ended' };
   if (user.sealed === null || user.factor_seen === null || user.pending_stale === true) {
     return purpose === null ? { kind: 'no-factor' } : { kind: 'challenge-ended' };
+  }
+  // The secret must open BEFORE anything is counted: a key lost or rotated
+  // away is the operator's fault, never the user's wrong code.
+  let secret: Buffer;
+  try {
+    secret = openSecondFactorSecret(user.sealed, input.tenantId, userId);
+  } catch (error) {
+    logger.error(
+      `Second-factor secret of user ${userId} (tenant ${input.tenantId}) does not open: ${error instanceof Error ? error.message : 'unknown error'} — is MFA_ENCRYPTION_KEY (or _PREVIOUS) the key it was sealed under?`,
+    );
+    return { kind: 'unavailable' };
   }
   // Backstop: a count already at the limit with no lock (a crash between the
   // count and the settle) locks now.
@@ -593,19 +624,15 @@ async function countAttemptInTx(tx: TenantTx, input: VerifyInput): Promise<Tx1Ou
     }
   }
 
-  const counted = (await tx.execute(sql`
+  await tx.execute(sql`
     update users set mfa_failures = mfa_failures + 1, mfa_failed_since_success = mfa_failed_since_success + 1
      where tenant_id = ${input.tenantId} and id = ${userId}
-    returning mfa_failures
-  `)) as unknown as Array<{ mfa_failures: number }>;
-  let challengeFailures: number | null = null;
+  `);
   if (input.challenge !== undefined) {
-    const rows = (await tx.execute(sql`
+    await tx.execute(sql`
       update sign_in_challenges set failures = failures + 1
        where id = ${input.challenge.id} and tenant_id = ${input.tenantId}
-      returning failures
-    `)) as unknown as Array<{ failures: number }>;
-    challengeFailures = rows[0]!.failures;
+    `);
   }
   const unused = input.allowBackupCode
     ? ((await tx.execute(sql`
@@ -615,12 +642,9 @@ async function countAttemptInTx(tx: TenantTx, input: VerifyInput): Promise<Tx1Ou
     : [];
   return {
     kind: 'counted',
-    userId,
     purpose,
-    sealed: user.sealed,
+    secret,
     factorSeen: user.factor_seen,
-    userFailures: counted[0]!.mfa_failures,
-    challengeFailures,
     unusedBackupHashes: unused.map((row) => row.code_hash),
     enrolCodeHash: user.mfa_enrol_code_hash,
     enrolCodeLive: user.enrol_code_live,
@@ -647,21 +671,66 @@ async function setLockInTx(tx: TenantTx, tenantId: string, userId: string): Prom
   return rows[0] === undefined ? null : { forever: rows[0].forever };
 }
 
-/** After a wrong code: lock if this was the limit (audited once, by the statement that sets it). */
-async function settleFailure(db: Database, tenantId: string, userId: string, ip: string): Promise<boolean> {
+/**
+ * After a wrong code — at the check, or a reuse caught at commit: lock if the
+ * count has reached the limit (audited once, by the statement that sets it),
+ * and answer the attempts really left (0 once locked).
+ */
+async function settleWrongCode(
+  db: Database,
+  tenantId: string,
+  userId: string,
+  ip: string,
+  challengeId: string | null,
+): Promise<number> {
   return withTenantTransaction(db, tenantId, async (tx) => {
     const lock = await setLockInTx(tx, tenantId, userId);
-    if (lock === null) return false;
-    await auditSecurityEventInTx(tx, {
-      tenantId,
-      action: 'user.second_factor_locked',
-      targetType: 'user',
-      targetId: userId,
-      actorUserId: null,
-      reference: `ip:${ip}`,
-    });
-    return true;
+    if (lock !== null) {
+      await auditSecurityEventInTx(tx, {
+        tenantId,
+        action: 'user.second_factor_locked',
+        targetType: 'user',
+        targetId: userId,
+        actorUserId: null,
+        reference: `ip:${ip}`,
+      });
+      return 0;
+    }
+    const rows = (await tx.execute(sql`
+      select u.mfa_failures,
+             (select c.failures from sign_in_challenges c where c.tenant_id = u.tenant_id and c.id = ${challengeId}::uuid) as challenge_failures
+        from users u where u.tenant_id = ${tenantId} and u.id = ${userId}
+    `)) as unknown as Array<{ mfa_failures: number; challenge_failures: number | null }>;
+    const row = rows[0];
+    if (row === undefined) return 0;
+    const userLeft = MAX_SECOND_FACTOR_FAILURES - row.mfa_failures;
+    const challengeLeft = row.challenge_failures === null ? MAX_SECOND_FACTOR_FAILURES : MAX_SECOND_FACTOR_FAILURES - row.challenge_failures;
+    return Math.max(0, Math.min(userLeft, challengeLeft));
   });
+}
+
+/** A step already spent or a backup code already used, found under tx2's lock. */
+class SecondFactorReuse extends Error {}
+
+/**
+ * tx2 and the route's work in one transaction (`commitSecondFactorInTx`, then
+ * `work`). A reuse found at commit rolls the transaction back, then settles
+ * exactly as a wrong code does (the tx1 count stands; the 5th locks) and
+ * answers the attempts really left.
+ */
+export async function withCommittedFactor<T>(
+  db: Database,
+  verified: VerifiedFactor,
+  options: { readonly stepRule: 'advance' | 'set'; readonly signIn: boolean },
+  work: (tx: TenantTx, committed: CommittedFactor) => Promise<T>,
+): Promise<T> {
+  try {
+    return await withTenantTransaction(db, verified.tenantId, async (tx) => work(tx, await commitSecondFactorInTx(tx, verified, options)));
+  } catch (error) {
+    if (!(error instanceof SecondFactorReuse)) throw error;
+    const left = await settleWrongCode(db, verified.tenantId, verified.userId, verified.ip, verified.challenge?.id ?? null);
+    throw secondFactorInvalid(verified.invalidStatus, left, verified.invalidDetail);
+  }
 }
 
 export interface CommittedFactor {
@@ -717,7 +786,7 @@ export async function commitSecondFactorInTx(
                  and (mfa_last_step is null or mfa_last_step < ${step})
               returning id`,
     )) as unknown as unknown[];
-    if (advanced.length === 0) throw secondFactorInvalid(verified.invalidStatus, 0);
+    if (advanced.length === 0) throw new SecondFactorReuse();
   } else {
     const spent = (await tx.execute(sql`
       update user_backup_codes set used_at = now()
@@ -725,7 +794,7 @@ export async function commitSecondFactorInTx(
          and code_hash in (${sql.join(verified.match.hashes.map((hash) => sql`${hash}`), sql`, `)})
       returning id
     `)) as unknown as Array<{ id: string }>;
-    if (spent[0] === undefined) throw secondFactorInvalid(verified.invalidStatus, 0);
+    if (spent[0] === undefined) throw new SecondFactorReuse();
     usedBackupCode = true;
     await auditSecurityEventInTx(tx, {
       tenantId,

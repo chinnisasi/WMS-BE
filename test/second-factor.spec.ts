@@ -127,6 +127,16 @@ describe('two-factor sign-in (e2e, story 6-1b)', () => {
     return { userId: invited.body.user.id as string, email };
   }
 
+  /** A staff member who opted in through Security (enrolled with the helper's authenticator). */
+  async function optedInMember(ownerToken: string, tenantId: string, role: string): Promise<{ userId: string; email: string; token: string }> {
+    const member = await createMember(ownerToken, tenantId, role);
+    const token = (await mintSignIn(app, { email: member.email, password: MEMBER_PASSWORD })).body.accessToken as string;
+    const setup = await security(tenantId, token, '/setup').send({ password: MEMBER_PASSWORD }).expect(200);
+    rememberFactor(member.email, setup.body.secret as string);
+    await security(tenantId, token, '/confirm').send({ code: (await nextTotpCode(member.email)).code }).expect(200);
+    return { ...member, token };
+  }
+
   /** A 6-digit code that is NOT valid for this secret anywhere near now. */
   function wrongCode(secret: Buffer): string {
     const now = totpStepOf();
@@ -241,6 +251,11 @@ describe('two-factor sign-in (e2e, story 6-1b)', () => {
       process.env.MFA_ENCRYPTION_KEY = 'too-short';
       expect(() => assertSecondFactorKeyConfigured()).toThrow(MissingSecondFactorKeyError);
       process.env.MFA_ENCRYPTION_KEY = saved.key;
+      expect(() => assertSecondFactorKeyConfigured()).not.toThrow();
+      // A previous key set but short would be ignored, and every blob it sealed would never open.
+      process.env.MFA_ENCRYPTION_KEY_PREVIOUS = 'short-previous';
+      expect(() => assertSecondFactorKeyConfigured()).toThrow(/MFA_ENCRYPTION_KEY_PREVIOUS/);
+      process.env.MFA_ENCRYPTION_KEY_PREVIOUS = '';
       expect(() => assertSecondFactorKeyConfigured()).not.toThrow();
       const main = readFileSync(resolve(__dirname, '../src/main.ts'), 'utf8');
       expect(main.indexOf('assertSecondFactorKeyConfigured()')).toBeGreaterThan(-1);
@@ -531,14 +546,96 @@ describe('two-factor sign-in (e2e, story 6-1b)', () => {
       expect((await sql`select count(*)::int as n from sessions where user_id = ${b.userId} and revoked_at is null`)[0]!.n).toBe(before);
     });
 
-    it('a promotion to owner ends a sign-in in progress; the next sign-in meets the enrolment step (no code)', async () => {
+    it('a promotion to owner ends a sign-in in progress: the open code step answers challenge-ended, no session', async () => {
       const t = await enrolledOwner();
-      const b = await createMember(t.token, t.tenantId, 'operator');
-      const plain = await http().post(`${API}/sign-in`).set('X-Forwarded-For', newIp()).send({ email: b.email, password: MEMBER_PASSWORD }).expect(200);
-      expect(plain.body.challenge).toBeUndefined();
+      const b = await optedInMember(t.token, t.tenantId, 'operator');
+      const challenge = (await passwordStep(b.email, MEMBER_PASSWORD).expect(200)).body as { challenge: string; challengeToken: string };
+      expect(challenge.challenge).toBe('totp');
       await http().patch(`${API}/${t.tenantId}/users/${b.userId}`).set('Authorization', `Bearer ${t.token}`).set('Idempotency-Key', ulid()).send({ role: 'owner' }).expect(200);
+      const before = (await sql`select count(*)::int as n from sessions where user_id = ${b.userId} and revoked_at is null`)[0]!.n;
+      expect((await codeStep(challenge.challengeToken, (await nextTotpCode(b.email)).code).expect(401)).body.code).toBe('challenge-ended');
+      expect((await sql`select count(*)::int as n from sessions where user_id = ${b.userId} and revoked_at is null`)[0]!.n).toBe(before);
+    });
+
+    it('deactivate then reactivate during a challenge: the code step still answers challenge-ended', async () => {
+      const t = await enrolledOwner();
+      const b = await optedInMember(t.token, t.tenantId, 'ops_manager');
+      const challenge = (await passwordStep(b.email, MEMBER_PASSWORD).expect(200)).body.challengeToken as string;
+      for (const arm of ['deactivate', 'reactivate']) {
+        await http().post(`${API}/${t.tenantId}/users/${b.userId}/${arm}`).set('Authorization', `Bearer ${t.token}`).set('Idempotency-Key', ulid()).expect(200);
+      }
+      expect((await codeStep(challenge, (await nextTotpCode(b.email)).code).expect(401)).body.code).toBe('challenge-ended');
+    });
+
+    it('an undecryptable active secret (the key it was sealed under is gone): 503, nothing counted', async () => {
+      const t = await enrolledOwner();
+      const saved = process.env.MFA_ENCRYPTION_KEY;
+      process.env.MFA_ENCRYPTION_KEY = 'some-other-key-material-0123456789abcdefghij';
+      const foreign = sealSecondFactorSecret(Buffer.from('twenty-byte-secret!!'), t.tenantId, t.ownerId);
+      process.env.MFA_ENCRYPTION_KEY = saved;
+      await sql`update users set mfa_secret_sealed = ${foreign} where id = ${t.ownerId}`;
+      const challenge = (await passwordStep(t.email).expect(200)).body.challengeToken as string;
+      const res = await codeStep(challenge, '123456').expect(503);
+      expect(res.body.code).toBe('second-factor-unavailable');
+      expect((await userRow(t.ownerId)).mfa_failures).toBe(0);
+      const challengeId = challenge.split('.')[0]!;
+      expect((await sql`select failures from sign_in_challenges where id = ${challengeId}`)[0]!.failures).toBe(0);
+    });
+
+    it('a reuse caught at commit is a wrong code: as the 5th failure it sets the lock (attemptsLeft 0)', async () => {
+      const t = await enrolledOwner();
+      // Every code near now is a spent step; four wrong codes already stand.
+      await sql`update users set mfa_last_step = ${totpStepOf() + 5}, mfa_failures = 4 where id = ${t.ownerId}`;
+      const ip = newIp();
+      const challenge = (await passwordStep(t.email).expect(200)).body.challengeToken as string;
+      const res = await codeStep(challenge, totpAt(enrolledFactorOf(t.email).secret, totpStepOf()), ip).expect(401);
+      expect(res.body).toMatchObject({ code: 'second-factor-invalid', attemptsLeft: 0 });
+      expect((await userRow(t.ownerId)).mfa_locked_until).not.toBeNull();
+      const lockRef = `ip:${ip}`;
+      expect(await sql`select id from audit_events where tenant_id = ${t.tenantId} and reference = ${lockRef} and action = 'user.second_factor_locked'`).toHaveLength(1);
+    });
+
+    it('an expired enrolment code is refused at the password step (403 enrolment-code-expired), no challenge, nothing counted', async () => {
+      const t = await enrolledOwner();
+      const b = await optedInMember(t.token, t.tenantId, 'operator');
+      await http().post(`${API}/${t.tenantId}/users/${b.userId}/second-factor/reset`).set('Authorization', `Bearer ${t.token}`).set('Idempotency-Key', ulid()).expect(200);
+      await sql`update users set mfa_enrol_code_expires_at = now() - interval '1 minute' where id = ${b.userId}`;
+      const before = (await sql`select count(*)::int as n from sign_in_challenges where user_id = ${b.userId}`)[0]!.n;
+      const res = await passwordStep(b.email, MEMBER_PASSWORD).expect(403);
+      expect(res.body).toMatchObject({ code: 'enrolment-code-expired', detail: 'Ask an owner to reset your two-factor sign-in again.' });
+      expect((await sql`select count(*)::int as n from sign_in_challenges where user_id = ${b.userId}`)[0]!.n).toBe(before);
+      expect((await userRow(b.userId)).mfa_failures).toBe(0);
+    });
+
+    it('a reset of a non-owner: the next sign-in is the enrolment step, and it needs the code', async () => {
+      const t = await enrolledOwner();
+      const b = await optedInMember(t.token, t.tenantId, 'accountant');
+      await sql`update users set mfa_failed_since_success = 5 where id = ${b.userId}`;
+      const reset = await http().post(`${API}/${t.tenantId}/users/${b.userId}/second-factor/reset`).set('Authorization', `Bearer ${t.token}`).set('Idempotency-Key', ulid()).expect(200);
+      // The reset clears the stale failure count too.
+      expect((await userRow(b.userId)).mfa_failed_since_success).toBe(0);
+      const list = await http().get(`${API}/${t.tenantId}/users`).set('Authorization', `Bearer ${t.token}`).expect(200);
+      expect((list.body.items as Array<{ id: string; secondFactorResetPending?: boolean }>).find((row) => row.id === b.userId)!.secondFactorResetPending).toBe(true);
       const enrol = await passwordStep(b.email, MEMBER_PASSWORD).expect(200);
-      expect(enrol.body).toMatchObject({ challenge: 'enroll', enrolmentCodeRequired: false });
+      expect(enrol.body).toMatchObject({ challenge: 'enroll', enrolmentCodeRequired: true });
+      const secret = base32Decode(enrol.body.secret as string);
+      const refused = await codeStep(enrol.body.challengeToken as string, totpAt(secret, totpStepOf() - 1)).expect(401);
+      expect(refused.body.detail).toContain('The authenticator code or the enrolment code is not right.');
+      await codeStep(enrol.body.challengeToken as string, totpAt(secret, totpStepOf()), newIp(), reset.body.enrolmentCode as string).expect(200);
+    });
+
+    it('`bun run auth:unlock` clears a permanent two-factor lock and its counters (audited, reference cli)', async () => {
+      const t = await enrolledOwner();
+      await sql`update users set mfa_locked_until = 'infinity', mfa_lock_cycles = 3, mfa_failures = 2 where id = ${t.ownerId}`;
+      const run = spawnSync('bun', ['scripts/auth-unlock.ts', t.email], {
+        cwd: resolve(__dirname, '..'),
+        env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL, DATABASE_AUTH_URL: process.env.DATABASE_URL },
+        encoding: 'utf8',
+      });
+      expect(run.status).toBe(0);
+      expect(run.stdout).toContain('two-factor lock — cleared');
+      expect(await userRow(t.ownerId)).toMatchObject({ mfa_failures: 0, mfa_lock_cycles: 0, mfa_locked_until: null });
+      await expectAuditRow({ tenantId: t.tenantId, key: 'cli', action: 'user.unlocked', targetType: 'user', targetId: t.ownerId, actorUserId: '01900000-0000-7000-8000-000000000000' });
     });
 
     it('lost phone: a backup code signs in once (spent, audited); the same code again is refused', async () => {

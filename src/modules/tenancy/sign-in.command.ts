@@ -12,6 +12,7 @@ import {
   base32Encode,
   clientOutdated,
   createChallengeInTx,
+  enrolmentCodeExpired,
   ENROLL_CHALLENGE_SECONDS,
   otpauthUri,
   pendingSecretInTx,
@@ -251,7 +252,12 @@ export class SignInCommand {
     // the enrolment step; both before any session exists. Everyone else —
     // and every portal user (decision 4: the portal is untouched) — gets the
     // 6-1a body, byte-identical.
-    if (user.clientId === null && (user.mfaEnabledAt !== null || secondFactorRequired(user.role))) {
+    // Spec amendment 2026-10-18: any staff user holding a reset's enrolment
+    // code meets the enrolment step too, owner or not.
+    if (
+      user.clientId === null &&
+      (user.mfaEnabledAt !== null || secondFactorRequired(user.role) || user.mfaEnrolCodeHash !== null)
+    ) {
       if (command.secondFactorCapable !== true) throw clientOutdated();
       return withTenantTransaction(this.db, user.tenantId, (tx) =>
         issueChallengeInTx(tx, { ...user, mfaEnabledAt: user.mfaEnabledAt }, tenant, command.ip),
@@ -293,10 +299,14 @@ async function issueChallengeInTx(
   ip: string,
 ): Promise<TotpChallenge | EnrollChallenge> {
   const locked = (await tx.execute(sql`
-    select mfa_enabled_at::text as enabled_at, (mfa_enrol_code_hash is not null) as enrol_code_required
+    select mfa_enabled_at::text as enabled_at, (mfa_enrol_code_hash is not null) as enrol_code_required,
+           (mfa_enrol_code_hash is not null and mfa_enrol_code_expires_at <= now()) as enrol_code_expired
       from users where tenant_id = ${user.tenantId} and id = ${user.id} for update
-  `)) as unknown as Array<{ enabled_at: string | null; enrol_code_required: boolean }>;
+  `)) as unknown as Array<{ enabled_at: string | null; enrol_code_required: boolean; enrol_code_expired: boolean }>;
   const row = locked[0]!;
+  // Spec amendment 2026-10-18 — an expired enrolment code is answered here,
+  // before any challenge exists (nothing counted): a fresh reset is needed.
+  if (row.enabled_at === null && row.enrol_code_expired) throw enrolmentCodeExpired();
   if (row.enabled_at !== null) {
     const challengeToken = await createChallengeInTx(tx, {
       tenantId: user.tenantId,
