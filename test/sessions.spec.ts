@@ -328,8 +328,10 @@ describe('secure sessions (e2e, story 6-1a)', () => {
       // The other arm under the same key is a different payload.
       await userAction(owner.token, t.tenantId, ravi.userId, 'reactivate', key).expect(422);
 
-      const back = await userAction(owner.token, t.tenantId, ravi.userId, 'reactivate').expect(200);
+      const reactivateKey = ulid();
+      const back = await userAction(owner.token, t.tenantId, ravi.userId, 'reactivate', reactivateKey).expect(200);
       expect(back.body.user.status).toBe('active');
+      await expectAuditRow({ tenantId: t.tenantId, key: reactivateKey, action: 'user.reactivated', targetType: 'user', targetId: ravi.userId, actorUserId: t.ownerId });
       expect(back.body.inviteToken).toBeUndefined();
       await signIn(ravi.email, MEMBER_PASSWORD);
     });

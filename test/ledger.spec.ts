@@ -51,6 +51,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
   let tenantId: string;
   let ownerToken: string;
   let opsToken: string;
+  let opsEmail: string;
   let opsUserId: string;
   let operatorToken: string;
   let warehouseId: string;
@@ -166,7 +167,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
   async function createMember(
     ownerToken: string,
     role: string,
-  ): Promise<{ userId: string; token: string }> {
+  ): Promise<{ userId: string; token: string; email: string }> {
     const email = `member-${ulid().toLowerCase()}@example.com`;
     const invited = await request(app.getHttpServer())
       .post(`${API}/${tenantId}/users`)
@@ -186,7 +187,17 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
     return {
       userId: signedIn.body.user.id as string,
       token: signedIn.body.accessToken as string,
+      email,
     };
+  }
+
+  /** Story 6-1a — a role change ends the user's web session; sign in again for a token under the new role. */
+  async function signInAgain(email: string): Promise<string> {
+    const res = await request(app.getHttpServer())
+      .post(`${API}/sign-in`)
+      .send({ email, password: INVITEE_PASSWORD })
+      .expect(200);
+    return res.body.accessToken as string;
   }
 
   beforeAll(async () => {
@@ -209,6 +220,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
     // An ops_manager (holds stock.adjust) and an operator (holds none).
     const ops = await createMember(ownerToken, 'ops_manager');
     opsToken = ops.token;
+    opsEmail = ops.email;
     opsUserId = ops.userId;
     operatorToken = (await createMember(ownerToken, 'operator')).token;
 
@@ -448,6 +460,10 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       .send({ role: 'operator' })
       .expect(200);
 
+    // Story 6-1a — the role change ended the old session; the new session's
+    // replay is refused on authority before the snapshot is served.
+    expect((await adjust(opsToken, body, key).expect(401)).body).toMatchObject({ code: 'session-ended', reason: 'role-changed' });
+    opsToken = await signInAgain(opsEmail);
     const replay = await adjust(opsToken, body, key).expect(403);
     expect(replay.body).toMatchObject({ status: 403, code: 'role-denied' });
     expect(replay.body.detail).toContain('stock.adjust');
@@ -459,6 +475,7 @@ describe('append-only ledger core and derived quantities (e2e, story 2.1)', () =
       .set(KEY_HEADER, ulid())
       .send({ role: 'ops_manager' })
       .expect(200);
+    opsToken = await signInAgain(opsEmail);
   });
 
   it('over-draw: 422 insufficient-on-hand naming the bin and current on-hand, with nothing persisted', async () => {

@@ -679,10 +679,11 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
       lines: [{ skuId: skuIds.get('INB-A')!, orderedQty: 2, unitCostPaise: 999 }],
     };
     const key = ulid();
+    let opsToken = ops.token;
     const send = (keyOverride = key): SupertestTest =>
       request(app.getHttpServer())
         .post(`${API}/${tenantId}/inbound/purchase-orders`)
-        .set('Authorization', `Bearer ${ops.token}`)
+        .set('Authorization', `Bearer ${opsToken}`)
         .set(KEY_HEADER, keyOverride)
         .send(body);
 
@@ -718,6 +719,12 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
       .set(KEY_HEADER, ulid())
       .send({ role: 'operator' })
       .expect(200);
+    // Story 6-1a — the role change ended the old session; under a fresh
+    // session the replay is still refused on authority first.
+    await send().expect(401).then((res) => expect(res.body).toMatchObject({ code: 'session-ended', reason: 'role-changed' }));
+    opsToken = (
+      await request(app.getHttpServer()).post(`${API}/sign-in`).send({ email: ops.email, password: 'correct-horse-battery' }).expect(200)
+    ).body.accessToken as string;
     await send().expect(403).then((res) => expect(res.body).toMatchObject({ code: 'role-denied' }));
   });
 

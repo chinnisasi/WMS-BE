@@ -963,8 +963,10 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // 0073 (story 13-2) added two more — return_receipts (the same
       // client-bound shape) and return_receipt_lines (inheriting through
       // the parent). None lost.
-      expect(policies).toHaveLength(111);
+      // Story 6-1a: + sessions_tenant_isolation (0074).
+      expect(policies).toHaveLength(112);
       for (const name of [
+        'sessions_tenant_isolation',
         'push_deliveries_tenant_isolation',
         'audit_exports_tenant_isolation',
         'audit_export_files_tenant_isolation',
