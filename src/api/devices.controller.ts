@@ -154,8 +154,10 @@ export class DevicesController {
   })
   @ApiBody({ type: BadgeInDto })
   @ApiOkResponse({ type: BadgeInResponse })
-  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token (unauthenticated), or wrong operator/PIN (badge-invalid)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token (unauthenticated, with `reason` when a session ended), or wrong operator/PIN — and a deactivated operator (badge-invalid)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked)') })
+  @ApiResponse({ status: 423, ...problemJsonResponse('Story 6-1a — 5 wrong PINs on this device lock badge-in for 15 minutes, for any PIN (badge-locked; `retryAfterSeconds`)') })
+  @ApiResponse({ status: 429, ...problemJsonResponse('Story 6-1a — more than 30 badge-in attempts a minute on this device (rate-limited; `retryAfterSeconds`)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
   async badgeIn(
     @Param('tenantId') tenantId: string,
@@ -169,6 +171,88 @@ export class DevicesController {
       operatorEmail: dto.operatorEmail,
       pin: dto.pin,
     });
+  }
+
+  @Post(':tenantId/devices/badge-out')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @UseGuards(DeviceSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 6-1a — badge-out: ends this shift’s badge session, unbinds the operator (the next shift can badge in) and drops the push registration. The handheld refuses while scans are queued; the server does not police the queue',
+  })
+  @ApiResponse({ status: 204, description: 'Badged out' })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid badge token (unauthenticated, with `reason`)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('A bare device credential (no operator badged in) (role-denied)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
+  async badgeOut(
+    @Param('tenantId') tenantId: string,
+    @CurrentDeviceSession() session: DeviceSession,
+  ): Promise<void> {
+    assertOwnTenant(session.tenantId, tenantId);
+    if (session.kind !== 'badge' || session.userId === null) {
+      throw new ProblemException('role-denied', 403, 'Role lacks the required capability', 'No operator is badged in on this device.');
+    }
+    await this.enrollment.badgeOut({ tenantId, deviceId: session.deviceId, userId: session.userId });
+  }
+
+  @Post(':tenantId/devices/:deviceId/release')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Story 6-1a — Release device (device.manage): ends the badge session (`released`), clears the operator binding and push registration so another operator can badge in. Audited; keyed',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: DeviceResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or malformed deviceId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks device.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Device does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'deviceId', format: 'uuid' })
+  async releaseDevice(
+    @Param('tenantId') tenantId: string,
+    @Param('deviceId') deviceId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<DeviceResponse> {
+    assertOwnTenant(session.tenantId, tenantId);
+    assertUuidParam(deviceId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return toDeviceResponse(
+      await this.enrollment.releaseDevice({ tenantId, actorUserId: session.userId, deviceId }, key),
+    );
+  }
+
+  @Post(':tenantId/devices/:deviceId/unlock')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Story 6-1a — clears the device’s wrong-PIN lock (device.manage). Audited; keyed' })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.OK, type: DeviceResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or malformed deviceId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks device.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Device does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'deviceId', format: 'uuid' })
+  async unlockDevice(
+    @Param('tenantId') tenantId: string,
+    @Param('deviceId') deviceId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<DeviceResponse> {
+    assertOwnTenant(session.tenantId, tenantId);
+    assertUuidParam(deviceId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    return toDeviceResponse(
+      await this.enrollment.unlockDevice({ tenantId, actorUserId: session.userId, deviceId }, key),
+    );
   }
 
   @Get(':tenantId/devices')

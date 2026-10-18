@@ -20,11 +20,20 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import {
+  BADGE_SESSION_TTL_SECONDS,
   DEVICE_SESSION_TTL_SECONDS,
   signBadgeInSession,
   signDeviceToken,
   tenantSessionSecret,
 } from './jwt-session';
+import {
+  BADGE_IN_LIMIT_PER_DEVICE_PER_MINUTE,
+  clearBadgeInAttemptsInTx,
+  countBadgeInAttemptInTx,
+  hitRateLimit,
+  settleBadgeInFailureInTx,
+} from './auth-attempts';
+import { createSessionInTx, revokeSessionsInTx } from './sessions';
 
 export const DEFAULT_DEVICE_PAGE_SIZE = 50;
 export const MAX_DEVICE_PAGE_SIZE = 200;
@@ -34,7 +43,12 @@ export const ENROLLMENT_CODE_TTL_MS = 15 * 60 * 1000;
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 const DEVICES_ENROLLMENT_CODE_HASH_UNIQUE = 'devices_enrollment_code_hash_unique';
 
-export type DeviceAction = 'device.enrollment_code_minted' | 'device.enrolled' | 'device.revoked';
+export type DeviceAction =
+  | 'device.enrollment_code_minted'
+  | 'device.enrolled'
+  | 'device.revoked'
+  | 'device.released'
+  | 'device.unlocked';
 
 /** The device shape the web Settings device list (and revoke) carries. */
 export interface DeviceView {
@@ -48,6 +62,8 @@ export interface DeviceView {
   readonly lastSeenAt: string | null;
   readonly revokedAt: string | null;
   readonly createdAt: string;
+  /** Story 6-1a — badge-in refused (wrong PINs) until this instant; null when not locked. Optional: stored snapshots predate it. */
+  readonly badgeLockedUntil?: string | null;
 }
 
 export interface MintEnrollmentCodeInput {
@@ -96,6 +112,9 @@ export interface BadgeInSnapshot {
   readonly accessToken: string;
   readonly tokenType: 'Bearer';
   readonly expiresInSeconds: number;
+  /** Story 6-1a — the renewed device credential (a rolling 30 days); the old one stays valid until its own expiry. */
+  readonly deviceToken: string;
+  readonly deviceTokenExpiresInSeconds: number;
   readonly operator: { readonly id: string; readonly email: string; readonly role: UserRole };
   readonly device: { readonly id: string; readonly label: string };
 }
@@ -545,7 +564,17 @@ export class EnrollmentCommand {
    * idempotency key applies (the sign-in pattern).
    */
   async badgeIn(command: BadgeInInput): Promise<BadgeInSnapshot> {
-    const snapshot = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+    // Story 6-1a — the per-device attempt limit (A2: every handheld shares the
+    // warehouse's one NAT address, so never per IP), then this attempt is
+    // COUNTED in its own committed transaction before the PIN is checked
+    // (A1: the PIN is the device's, so the lock is too). A lock answers 423
+    // for any PIN.
+    await hitRateLimit(this.db, `badge-device:${command.deviceId}`, BADGE_IN_LIMIT_PER_DEVICE_PER_MINUTE);
+    await withTenantTransaction(this.db, command.tenantId, (tx) =>
+      countBadgeInAttemptInTx(tx, command.tenantId, command.deviceId),
+    );
+
+    const outcome = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
       const deviceRows = await tx
         .select()
         .from(devices)
@@ -571,7 +600,9 @@ export class EnrollmentCommand {
         operator.status === 'active' &&
         (device.operatorUserId === null || device.operatorUserId === operator.id);
       if (!pinOk || !bound) {
-        throw badgeInvalid();
+        // Not thrown here: the throw would roll back nothing we need, but the
+        // lock settlement must commit — it runs after this transaction.
+        return { ok: false as const };
       }
       // Story 21-7 — a client-portal user never binds a floor device. AFTER
       // the PIN and binding checks, so a wrong PIN stays the one
@@ -588,6 +619,7 @@ export class EnrollmentCommand {
         );
       }
 
+      await clearBadgeInAttemptsInTx(tx, command.tenantId, device.id);
       await tx
         .update(devices)
         .set({
@@ -597,20 +629,166 @@ export class EnrollmentCommand {
         })
         .where(eq(devices.id, device.id));
 
+      // Story 6-1a — one live badge session per device: a re-badge ends the
+      // previous one, then opens this shift's (12 h, no idle limit).
+      await revokeSessionsInTx(tx, command.tenantId, { deviceId: device.id, kinds: ['badge'] }, 'released');
+      const created = await createSessionInTx(tx, {
+        tenantId: command.tenantId,
+        userId: operator.id,
+        kind: 'badge',
+        deviceId: device.id,
+      });
+      const secret = tenantSessionSecret();
       return {
-        accessToken: signBadgeInSession(
-          command.tenantId,
-          device.id,
-          operator.id,
-          tenantSessionSecret(),
-        ),
-        tokenType: 'Bearer' as const,
-        expiresInSeconds: DEVICE_SESSION_TTL_SECONDS,
-        operator: { id: operator.id, email: operator.email, role: operator.role },
-        device: { id: device.id, label: device.label ?? '' },
+        ok: true as const,
+        snapshot: {
+          accessToken: signBadgeInSession(
+            { tenantId: command.tenantId, deviceId: device.id, userId: operator.id, sessionId: created.sessionId },
+            secret,
+          ),
+          tokenType: 'Bearer' as const,
+          expiresInSeconds: BADGE_SESSION_TTL_SECONDS,
+          // The rolling renewal: an enrolled device in daily use never expires.
+          deviceToken: signDeviceToken(command.tenantId, device.id, secret),
+          deviceTokenExpiresInSeconds: DEVICE_SESSION_TTL_SECONDS,
+          operator: { id: operator.id, email: operator.email, role: operator.role },
+          device: { id: device.id, label: device.label ?? '' },
+        },
       };
     });
-    return snapshot;
+    if (!outcome.ok) {
+      await withTenantTransaction(this.db, command.tenantId, (tx) =>
+        settleBadgeInFailureInTx(tx, command.tenantId, command.deviceId),
+      );
+      throw badgeInvalid();
+    }
+    return outcome.snapshot;
+  }
+
+  /**
+   * Story 6-1a — `POST …/devices/badge-out` (the badged operator, badge
+   * token): ends this shift's session, unbinds the operator so the next
+   * shift can badge in, and drops the push registration. Not keyed (the
+   * badge-in pattern; a repeat is a no-op). The handheld refuses to badge out
+   * while scans are queued — the server does not police the queue.
+   */
+  async badgeOut(command: { tenantId: string; deviceId: string; userId: string }): Promise<void> {
+    await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      await tx
+        .select({ id: devices.id })
+        .from(devices)
+        .where(and(eq(devices.id, command.deviceId), eq(devices.tenantId, command.tenantId)))
+        .for('update')
+        .limit(1);
+      await revokeSessionsInTx(tx, command.tenantId, { deviceId: command.deviceId, kinds: ['badge'] }, 'signed-out');
+      await tx
+        .update(devices)
+        .set({
+          operatorUserId: null,
+          pushToken: null,
+          pushWarehouseId: null,
+          pushRegisteredAt: null,
+          updatedAt: nowIso(),
+        })
+        .where(
+          and(
+            eq(devices.id, command.deviceId),
+            eq(devices.tenantId, command.tenantId),
+            eq(devices.operatorUserId, command.userId),
+          ),
+        );
+    });
+  }
+
+  /**
+   * Story 6-1a (A5) — Release device (`device.manage`, keyed, audited): a
+   * supervisor frees a device whose operator has gone home — the badge
+   * session ends (`released`), the binding and push registration clear. The
+   * device keeps its queue; on the next badge-in by someone else it moves the
+   * previous operator's scans to web review (A4).
+   */
+  async releaseDevice(command: RevokeDeviceInput, idempotencyKey: string): Promise<DeviceView> {
+    return this.supervisorDeviceAction(command, idempotencyKey, 'device.released', async (tx) => {
+      await revokeSessionsInTx(tx, command.tenantId, { deviceId: command.deviceId, kinds: ['badge'] }, 'released');
+      return {
+        operatorUserId: null,
+        pushToken: null,
+        pushWarehouseId: null,
+        pushRegisteredAt: null,
+      };
+    });
+  }
+
+  /** Story 6-1a — Unlock (`device.manage`, keyed, audited): clears the device's PIN lock. */
+  async unlockDevice(command: RevokeDeviceInput, idempotencyKey: string): Promise<DeviceView> {
+    return this.supervisorDeviceAction(command, idempotencyKey, 'device.unlocked', async () => ({
+      failedBadgeIns: 0,
+      badgeLockedUntil: null,
+    }));
+  }
+
+  private async supervisorDeviceAction(
+    command: RevokeDeviceInput,
+    idempotencyKey: string,
+    action: 'device.released' | 'device.unlocked',
+    change: (tx: TenantTx) => Promise<Partial<typeof devices.$inferInsert>>,
+  ): Promise<DeviceView> {
+    const payloadHash = hashCommandPayload({
+      arm: action,
+      tenantId: command.tenantId,
+      deviceId: command.deviceId,
+      actorUserId: command.actorUserId,
+    });
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'device.manage');
+      const replayed = await replayDeviceKey(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) return replayed;
+
+      const deviceRows = await tx
+        .select()
+        .from(devices)
+        .where(and(eq(devices.id, command.deviceId), eq(devices.tenantId, command.tenantId)))
+        .for('update')
+        .limit(1);
+      if (!deviceRows[0]) throw deviceNotFound();
+      // Replay again under the lock (guide §1 step 6): a parked same-key
+      // duplicate answers the winner's snapshot.
+      const again = await replayDeviceKey(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (again !== null) return again;
+
+      const updatedRows = await tx
+        .update(devices)
+        .set({ ...(await change(tx)), updatedAt: nowIso() })
+        .where(and(eq(devices.id, command.deviceId), eq(devices.tenantId, command.tenantId)))
+        .returning();
+      const updated = updatedRows[0]!;
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action,
+        targetType: 'device',
+        targetId: command.deviceId,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
+      const body = toDeviceView(updated, null);
+      try {
+        await tx.insert(idempotencyKeys).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          key: idempotencyKey,
+          payloadHash,
+          responseSnapshot: { device: body },
+        });
+      } catch (err) {
+        if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
+          throw concurrentIdempotency();
+        }
+        throw err;
+      }
+      return body;
+    });
   }
 
   /**
@@ -704,6 +882,8 @@ export class EnrollmentCommand {
         )
         .returning();
       const updated = updatedRows[0]!;
+      // Story 6-1a — the badge session ends with the device.
+      await revokeSessionsInTx(tx, command.tenantId, { deviceId: command.deviceId, kinds: ['badge'] }, 'device-revoked');
 
       await tx.insert(auditEvents).values({
         id: uuidv7(),
@@ -979,6 +1159,10 @@ function toDeviceView(row: typeof devices.$inferSelect, operatorEmail: string | 
     lastSeenAt: row.lastSeenAt,
     revokedAt: row.revokedAt,
     createdAt: row.createdAt,
+    badgeLockedUntil:
+      row.badgeLockedUntil !== null && Date.parse(row.badgeLockedUntil) > Date.now()
+        ? new Date(row.badgeLockedUntil).toISOString()
+        : null,
   };
 }
 
@@ -1002,4 +1186,21 @@ function invalidCursor(): ProblemException {
     'Malformed pagination cursor',
     'The cursor parameter is not a valid opaque page cursor.',
   );
+}
+
+/** The keyed device actions' replay read: the stored `{device}` or null; a different payload is 422. */
+async function replayDeviceKey(
+  tx: TenantTx,
+  tenantId: string,
+  idempotencyKey: string,
+  payloadHash: string,
+): Promise<DeviceView | null> {
+  const existing = await tx
+    .select()
+    .from(idempotencyKeys)
+    .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+    .limit(1);
+  if (!existing[0]) return null;
+  if (existing[0].payloadHash !== payloadHash) throw idempotencyKeyReuse();
+  return (existing[0].responseSnapshot as { device: DeviceView }).device;
 }

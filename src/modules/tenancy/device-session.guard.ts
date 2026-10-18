@@ -81,6 +81,18 @@ export async function verifyDeviceRequest(db: Database, headers: Record<string, 
       if (check.reason === 'invalid') throw unauthenticated('The device token is invalid.');
       throw deviceSessionEnded(check.reason);
     }
+    // Story 6-1a (A4) — a queued op names the operator who captured it; it
+    // never replays under another operator's session. An absent header is
+    // accepted (builds before 6-1a send none).
+    const opOperator = headers['x-op-operator'];
+    if (typeof opOperator === 'string' && opOperator !== '' && opOperator !== session.userId) {
+      throw new ProblemException(
+        'operator-mismatch',
+        409,
+        'Operator mismatch',
+        'This scan was captured by another operator — it goes to review instead of replaying under this badge-in.',
+      );
+    }
   }
   return session;
 }

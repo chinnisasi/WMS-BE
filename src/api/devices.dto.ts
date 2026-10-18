@@ -107,8 +107,14 @@ export class BadgeInResponse {
   @ApiProperty({ enum: ['Bearer'] })
   tokenType!: 'Bearer';
 
-  @ApiProperty()
+  @ApiProperty({ description: 'Story 6-1a — the badge session lasts one shift (43200 = 12 h)' })
   expiresInSeconds!: number;
+
+  @ApiProperty({ description: 'Story 6-1a — the renewed device credential (a rolling 30 days); store it before the session. The previous one stays valid until its own expiry.' })
+  deviceToken!: string;
+
+  @ApiProperty({ example: 2592000 })
+  deviceTokenExpiresInSeconds!: number;
 
   @ApiProperty({ type: BadgeInOperatorResponse })
   operator!: BadgeInOperatorResponse;
@@ -151,6 +157,14 @@ export class DeviceResponse {
 
   @ApiProperty()
   createdAt!: string;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    description: 'Story 6-1a — badge-in is locked (5 wrong PINs) until this instant; null or absent when not locked',
+  })
+  badgeLockedUntil?: string | null;
 }
 
 export class DeviceListResponse {
