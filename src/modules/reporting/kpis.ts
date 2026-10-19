@@ -347,6 +347,8 @@ const dockToStock: TileDefinition<'dockToStock'> = {
     // min(putaway qty, on-hand there) > 0. Story 21-9 (decision 4): the
     // putaway qty is `applied_qty` + Σ APPROVED over-receipt excess of the
     // line (`approvedExcessByLine`), so approved excess counts as work.
+    // Story 1-2b (§7f amended): minus the line's units on an OPEN receipt QC
+    // hold (`openReceiptHoldQtyByLine`) — held stock is not work.
     const awaiting = await rowsOf<{ n: string }>(
       tx,
       sql`select count(*)::bigint as n
@@ -361,6 +363,18 @@ const dockToStock: TileDefinition<'dockToStock'> = {
               and o.status = 'approved'
             group by o.grn_line_id
           ) ax on ax.grn_line_id = l.id
+          left join (
+            select h.grn_line_id, sum(abs(e.quantity_delta))::bigint as held
+            from qc_holds h
+            join ledger_events e
+              on e.tenant_id = h.tenant_id and e.warehouse_id = h.warehouse_id
+             and e.type = 'qc.held' and e.reference_doc ? 'holdId' and e.reference_doc->>'holdId' = h.id::text
+            where h.tenant_id = ${scope.tenantId}::uuid
+              and h.warehouse_id = ${scope.warehouseId}::uuid
+              and h.kind = 'receipt'
+              and h.status = 'open'
+            group by h.grn_line_id
+          ) qh on qh.grn_line_id = l.id
           cross join lateral (
             select b.id from bins b
             where b.tenant_id = g.tenant_id and b.warehouse_id = g.warehouse_id
@@ -369,9 +383,9 @@ const dockToStock: TileDefinition<'dockToStock'> = {
           ) rb
           where g.tenant_id = ${scope.tenantId}::uuid
             and g.warehouse_id = ${scope.warehouseId}::uuid
-            and l.applied_qty + coalesce(ax.excess, 0) > 0
+            and l.applied_qty + coalesce(ax.excess, 0) - coalesce(qh.held, 0) > 0
             and least(
-              l.applied_qty + coalesce(ax.excess, 0),
+              l.applied_qty + coalesce(ax.excess, 0) - coalesce(qh.held, 0),
               coalesce(
                 case when l.batch_id is null
                   then (select sum(soh.quantity) from stock_on_hand soh

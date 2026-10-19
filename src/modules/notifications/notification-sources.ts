@@ -35,6 +35,9 @@ export const NOTIFICATION_SOURCE_TYPES = [
   // Story 9-3c — a ledger chain break (inventory's integrity check). Owner
   // only (`ledger.acknowledge`), one entry per break, never pushed.
   'ledger-chain-break',
+  // Story 1-2b — QC on receipt: ONE entry per receipt (or approved excess)
+  // placed on holds, resolved when none of its holds remains open.
+  'qc-receipt',
 ] as const;
 
 export type NotificationSourceType = (typeof NOTIFICATION_SOURCE_TYPES)[number];
@@ -71,6 +74,8 @@ export const SOURCE_RESOLUTIONS = {
   // Story 9-3c — open until an owner acknowledges it; detection never
   // auto-heals, so nothing else resolves it.
   'ledger-chain-break': ['acknowledged'],
+  // Story 1-2b — open until every hold of the placement is released.
+  'qc-receipt': ['released'],
 } as const satisfies Record<NotificationSourceType, readonly string[]>;
 
 // ── the summaries — a per-source allowlist, built key by key ────────────────
@@ -115,6 +120,13 @@ export interface BatchAlertSummary {
 export interface QcHoldSummary {
   readonly skuId: string;
   readonly reason: string;
+}
+/** Story 1-2b — one receipt (or approved excess) placed on QC holds. */
+export interface QcReceiptSummary {
+  readonly grnId: string;
+  readonly grnCode: string;
+  /** How many lines were held. */
+  readonly count: number;
 }
 export interface ChannelSyncSummary {
   readonly connectionId: string;
@@ -169,7 +181,8 @@ export type NotificationSummary =
   | QcHoldSummary
   | ChannelSyncSummary
   | AuditExportSummary
-  | LedgerChainBreakSummary;
+  | LedgerChainBreakSummary
+  | QcReceiptSummary;
 
 /** A raise decoded: the entry's identity, its warehouse, its summary and (9-3b) its recipient. */
 export interface DecodedRaise {
@@ -460,7 +473,37 @@ export const NOTIFICATION_SOURCES: Readonly<Record<NotificationSourceType, Sourc
         }));
       },
     },
-    resolves: [{ type: 'qc_hold.released', decode: fixedResolve('holdId', 'released') }],
+    resolves: [
+      {
+        type: 'qc_hold.released',
+        // Story 1-2b — a RECEIPT hold raised no `qc-hold` entry (its receipt
+        // raised one `qc-receipt` entry), so its release resolves nothing
+        // here: ignored, never a tombstone.
+        decode: (payload) => (payload.kind === 'receipt' ? 'ignore' : fixedResolve('holdId', 'released')(payload)),
+      },
+    ],
+  },
+  'qc-receipt': {
+    // Story 1-2b (inbound's receipt and over-receipt approval). The entry is
+    // keyed by the PLACEMENT — the GRN for a receipt, the over-receipt for an
+    // approved excess — so one receipt is one entry whatever its line count.
+    raise: {
+      type: 'qc_hold.receipt_placed',
+      decode: (payload) => {
+        const sourceId = uuid(payload, 'placementId');
+        const grnId = uuid(payload, 'grnId');
+        const grnCode = text(payload, 'grnCode');
+        const count = finite(payload, 'count');
+        if (sourceId === null || grnId === null || grnCode === null) return null;
+        if (count === null || !Number.isInteger(count) || count < 1) return null;
+        return withWarehouse(payload, (warehouseId) => ({
+          sourceId,
+          warehouseId,
+          summary: { grnId, grnCode, count } satisfies QcReceiptSummary,
+        }));
+      },
+    },
+    resolves: [{ type: 'qc_hold.receipt_cleared', decode: fixedResolve('placementId', 'released') }],
   },
   'channel-sync': {
     raise: {
@@ -629,6 +672,8 @@ export const SOURCE_AUDIENCE: Readonly<Record<NotificationSourceType, SourceAudi
   // Story 9-3c — the capability of the command that resolves it (the
   // acknowledge): owner-only.
   'ledger-chain-break': { capability: 'ledger.acknowledge' },
+  // Story 1-2b — who releases receipt holds (`qc.manage`).
+  'qc-receipt': { capability: 'qc.manage' },
 };
 
 /** The source types a role sees — an allowlist; an unknown role sees none. */

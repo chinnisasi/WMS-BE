@@ -2,7 +2,10 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { qcHolds } from '../../shared/db/schema';
+import { goodsReceiptLines, goodsReceiptNotes, qcHolds, skus } from '../../shared/db/schema';
+import { fromMilli } from '../../shared/primitives/quantity';
+import { InventoryFacade } from '../inventory/inventory.facade';
+import { CatalogFacade } from '../catalog/catalog.facade';
 import type { UserRole } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
@@ -15,8 +18,11 @@ import { openQcHoldsForBinsInTx, QcCommand } from './qc.command';
 import type {
   HoldScopeInTxCommand,
   PlaceQcHoldCommand,
+  QcHoldKind,
   QcHoldSnapshot,
   ReleaseQcHoldCommand,
+  ReleaseReceiptHoldsCommand,
+  ReleaseReceiptHoldsSnapshot,
 } from './qc.command';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 
@@ -36,11 +42,27 @@ export interface QcHoldEntry {
   readonly releasedAt: string | null;
   /** Row creation time (the keyset cursor field) — part of the read contract. */
   readonly createdAt: string;
+  /** Story 1-2b — `manual` or `receipt` (QC on receipt). */
+  readonly kind: QcHoldKind;
+  /** Story 1-2b — a receipt hold's GRN line / GRN / code (null on a manual hold). */
+  readonly grnLineId?: string;
+  readonly grnId: string | null;
+  readonly grnCode: string | null;
+  readonly overReceiptId: string | null;
+  /** Story 1-2b — the held SKU's client. */
+  readonly clientId: string;
+  /** Story 1-2b — the one batch the hold moved (null when untracked or several). */
+  readonly batchId: string | null;
+  readonly batchCode: string | null;
+  /** Story 1-2b — Σ of the hold's own `qc.held` events, base units. */
+  readonly heldQty: number;
 }
 
 export interface ListQcHoldsQuery {
   readonly warehouseId?: string | undefined;
   readonly status?: 'open' | 'released' | undefined;
+  /** Story 1-2b — only one GRN's receipt holds. */
+  readonly grnId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -88,6 +110,9 @@ export class QcFacade {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(QcCommand) private readonly qc: QcCommand,
+    // Story 1-2b — the holds list's held quantity (the ledger) and batch code.
+    @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
   ) {}
 
   /** `qc-holds.place` — the Ops Manager quarantine command (`qc.manage`). */
@@ -98,6 +123,14 @@ export class QcFacade {
   /** `qc-holds/:id/release` — the Ops Manager release command (`qc.manage`). */
   async releaseHold(command: ReleaseQcHoldCommand, idempotencyKey: string): Promise<QcHoldSnapshot> {
     return this.qc.releaseHold(command, idempotencyKey);
+  }
+
+  /** Story 1-2b — `qc-holds/release-receipt`: every open receipt hold of one GRN (`qc.manage`). */
+  async releaseReceiptHolds(
+    command: ReleaseReceiptHoldsCommand,
+    idempotencyKey: string,
+  ): Promise<ReleaseReceiptHoldsSnapshot> {
+    return this.qc.releaseReceiptHolds(command, idempotencyKey);
   }
 
   /**
@@ -147,8 +180,16 @@ export class QcFacade {
         await assertWarehouseInTenant(tx, tenantId, query.warehouseId);
       }
       const rows = await tx
-        .select()
+        .select({
+          hold: qcHolds,
+          grnId: goodsReceiptLines.grnId,
+          grnCode: goodsReceiptNotes.code,
+          clientId: skus.clientId,
+        })
         .from(qcHolds)
+        .innerJoin(skus, eq(skus.id, qcHolds.skuId))
+        .leftJoin(goodsReceiptLines, eq(goodsReceiptLines.id, qcHolds.grnLineId))
+        .leftJoin(goodsReceiptNotes, eq(goodsReceiptNotes.id, goodsReceiptLines.grnId))
         .where(
           and(
             eq(qcHolds.tenantId, tenantId),
@@ -156,6 +197,7 @@ export class QcFacade {
               ? undefined
               : eq(qcHolds.warehouseId, query.warehouseId),
             query.status === undefined ? undefined : eq(qcHolds.status, query.status),
+            query.grnId === undefined ? undefined : eq(goodsReceiptLines.grnId, query.grnId),
             before === undefined
               ? undefined
               : sql`(${qcHolds.createdAt}, ${qcHolds.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -163,20 +205,48 @@ export class QcFacade {
         )
         .orderBy(desc(qcHolds.createdAt), desc(qcHolds.id))
         .limit(pageSize + 1);
-      const items = rows.map((row) => ({
-        id: row.id,
-        tenantId: row.tenantId,
-        warehouseId: row.warehouseId,
-        skuId: row.skuId,
-        binId: row.binId,
-        reason: row.reason,
-        status: row.status as QcHoldEntry['status'],
-        heldBy: row.heldBy,
-        heldAt: canonicalInstant(row.heldAt),
-        releasedBy: row.releasedBy,
-        releasedAt: row.releasedAt === null ? null : canonicalInstant(row.releasedAt),
-        createdAt: canonicalInstant(row.createdAt),
-      }));
+      // Story 1-2b — the held quantity and batch, from each hold's OWN
+      // `qc.held` events (one grouped read over the page's ids, never per
+      // row) through the inventory facade; the batch code through catalog's.
+      const totals = await this.inventory.qcHeldTotalsInTx(
+        tx,
+        tenantId,
+        [...new Set(rows.map((row) => row.hold.warehouseId))],
+        rows.map((row) => row.hold.id),
+      );
+      const singleBatch = (holdId: string): string | null => {
+        const refs = totals.get(holdId)?.batchRefs ?? [];
+        return refs.length === 1 ? (refs[0] ?? null) : null;
+      };
+      const batchIds = [...new Set(rows.map((row) => singleBatch(row.hold.id)).filter((id): id is string => id !== null))];
+      const batchCodes = await this.catalog.batchCodesByIdsInTx(tx, tenantId, batchIds);
+      const items = rows.map(({ hold: row, grnId, grnCode, clientId }) => {
+        const batchId = singleBatch(row.id);
+        return {
+          id: row.id,
+          tenantId: row.tenantId,
+          warehouseId: row.warehouseId,
+          skuId: row.skuId,
+          binId: row.binId,
+          reason: row.reason,
+          status: row.status as QcHoldEntry['status'],
+          heldBy: row.heldBy,
+          heldAt: canonicalInstant(row.heldAt),
+          releasedBy: row.releasedBy,
+          releasedAt: row.releasedAt === null ? null : canonicalInstant(row.releasedAt),
+          createdAt: canonicalInstant(row.createdAt),
+          kind: row.kind as QcHoldKind,
+          ...(row.grnLineId === null ? {} : { grnLineId: row.grnLineId }),
+          grnId: grnId ?? null,
+          grnCode: grnCode ?? null,
+          overReceiptId: row.overReceiptId,
+          clientId,
+          batchId,
+          batchCode: batchId === null ? null : (batchCodes.get(batchId) ?? null),
+          // Read model — base units (story 10.1).
+          heldQty: fromMilli(totals.get(row.id)?.quantity ?? 0),
+        };
+      });
       return buildPage(items, pageSize);
     });
   }

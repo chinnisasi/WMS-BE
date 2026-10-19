@@ -18,7 +18,15 @@ import {
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { createHash } from 'node:crypto';
 import { recordServerRejectedOpInTx } from '../tenancy/server-rejected-op';
-import { getClientLabelsInTx, shareLockClientInTx, departedClientsInTx } from '../clients/clients.facade';
+import {
+  DEFAULT_RECEIVING_POLICY,
+  departedClientsInTx,
+  getClientLabelsInTx,
+  receivingPoliciesInTx,
+  shareLockClientInTx,
+  type ClientReceivingPolicy,
+} from '../clients/clients.facade';
+import { QC_RECEIPT_PLACED_EVENT, QcCommand } from './qc.command';
 import {
   MAX_QUANTITY_MILLI,
   QUANTITY_SCALE,
@@ -33,7 +41,7 @@ import {
   assertCatchWeightGrams,
 } from '../catalog/handling-unit';
 import type { CreateHandlingUnitInput } from '../catalog/catalog.facade';
-import { assertUtcIso, nowIso } from '../../shared/primitives/time';
+import { assertUtcIso, isIsoDate, istDateOf, istMidnightOf, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -82,6 +90,16 @@ export interface GrnLineInput {
   /** Optional batch mfg date (ISO-8601 UTC). */
   readonly mfgDate: string | null;
   /**
+   * Story 1-2b — the batch's expiry date as the label states it: an IST
+   * CALENDAR DATE `YYYY-MM-DD` (never an instant). Optional on the wire AND
+   * on a stored older payload, so the command normalises it to
+   * `expiryDate ?? null`; hashed only when present (`?? undefined`), so every
+   * queued older op hashes byte-for-byte as before. A malformed date is a
+   * whole-op 400; every RULE about it (untracked SKU, before mfg, the batch's
+   * own expiry, the client's policy) is a per-line refusal.
+   */
+  readonly expiryDate?: string | null | undefined;
+  /**
    * Physically received quantity. In the SKU's BASE UoM on the way in (story
    * 10.2 — the controller no longer scales) and in milli-units once
    * `submitGoodsReceipt` has converted it, behind its replay lookup.
@@ -124,6 +142,14 @@ export interface SubmitGoodsReceiptCommand {
   /** Device time (AD-1) — the ledger events' and GRN's business time. */
   readonly occurredAt: string;
   readonly lines: readonly GrnLineInput[];
+  /**
+   * Story 1-2b (decision 5) — a reviewer accepted a `grn.shelf-life-refused`
+   * row: the shelf-life rule is WAIVED for this re-run only (departed,
+   * tolerance, QC, the document state and late receipts apply as on any
+   * receipt). Set ONLY by the review queue's apply arm — never on the HTTP
+   * DTO — and hashed when present.
+   */
+  readonly shelfLifeWaiver?: { readonly byUserId: string; readonly note: string } | undefined;
 }
 
 export interface DecideOverReceiptCommand {
@@ -155,6 +181,12 @@ export interface GoodsReceiptLineSnapshot {
   /** The excess pended for approval (0 unless over-received). */
   readonly excessQty: number;
   /**
+   * Story 1-2b — the part of `appliedQty` past the open quantity that booked
+   * within the client's receiving tolerance. Present only when > 0, so a
+   * receipt under the default policy is byte-identical.
+   */
+  readonly toleranceQty?: number;
+  /**
    * Story 10.3: the handling units this line produced, in creation order —
    * present only on a catch-weight line. These ids are what a unit label is
    * printed with and what the pack bench scans back, so the receipt response
@@ -177,15 +209,68 @@ export const REJECTED_GRN_LINE_CODES = [
   'asn-line-not-found',
   'sku-client-mismatch',
   'client-departed',
+  // Story 1-2b — the expiry rules, each a PER-LINE refusal (§7g — a stale
+  // snapshot can trip any of them, so never a whole-op 400).
+  'expiry-on-untracked',
+  'expiry-before-mfg',
+  'batch-expiry-mismatch',
+  'expiry-required',
+  'shelf-life-short',
 ] as const;
+export type RejectedGrnLineCode = (typeof REJECTED_GRN_LINE_CODES)[number];
 
-/** The two client-level per-line refusals (split off before every other per-line rule). */
-type ClientRefusalCode = 'sku-client-mismatch' | 'client-departed';
+/**
+ * The per-line refusals split off before every other per-line rule: the two
+ * client-level ones (1-1, 1-2a) and story 1-2b's five expiry ones. Every
+ * code but `shelf-life-short` goes to the `grn.lines-refused` review row
+ * (Discard only); `shelf-life-short` goes to its own `grn.shelf-life-refused`
+ * row (Apply with a note, or Discard).
+ */
+type LineRefusalCode =
+  | 'sku-client-mismatch'
+  | 'client-departed'
+  | 'expiry-on-untracked'
+  | 'expiry-before-mfg'
+  | 'batch-expiry-mismatch'
+  | 'expiry-required'
+  | 'shelf-life-short';
 interface ClientRefusedLine {
   readonly index: number;
   readonly line: GrnLineInput;
-  readonly code: ClientRefusalCode;
+  readonly code: LineRefusalCode;
+  /**
+   * Story 1-2b — the expiry the rule judged (the line's own, or — for
+   * `expiry-required` / `shelf-life-short` — the effective one: the line's,
+   * else its batch's); null when none.
+   */
+  readonly expiryDate?: string | null;
+  /** Story 1-2b — `shelf-life-short` only: the client's minimum (0 when none — an expired batch). */
+  readonly minShelfLifeDays?: number;
+  /** Story 1-2b — `shelf-life-short` only: IST days from the receipt's date to the expiry. */
+  readonly remainingDays?: number;
 }
+
+/**
+ * Story 1-2b — the `grn.lines-refused` row's `problemCode` when its lines
+ * carry several codes: the departure keeps winning, as before 1-2b.
+ */
+export const LINES_REFUSED_CODE_PRECEDENCE = [
+  'client-departed',
+  'sku-client-mismatch',
+  'batch-expiry-mismatch',
+  'expiry-before-mfg',
+  'expiry-on-untracked',
+  'expiry-required',
+] as const satisfies readonly LineRefusalCode[];
+
+/** Story 1-2b — the expiry codes (the refusal entries of these carry the line's identity). */
+const EXPIRY_REFUSAL_CODES: ReadonlySet<LineRefusalCode> = new Set([
+  'expiry-on-untracked',
+  'expiry-before-mfg',
+  'batch-expiry-mismatch',
+  'expiry-required',
+  'shelf-life-short',
+]);
 
 /** One line the server refused to settle (naming the reason — the other lines settle). */
 export interface RejectedGrnLine {
@@ -197,6 +282,16 @@ export interface RejectedGrnLine {
   readonly qty: number;
   readonly code: string;
   readonly reason: string;
+  /**
+   * Story 1-2b — present only on an EXPIRY refusal (the five 1-2b codes), so
+   * every older entry — and every entry stored before 1-2b — is unchanged:
+   * the line's index in the request, its batch code, the expiry judged and
+   * (`shelf-life-short` only) the client's minimum remaining life.
+   */
+  readonly index?: number;
+  readonly batchCode?: string | null;
+  readonly expiryDate?: string | null;
+  readonly minShelfLifeDays?: number;
 }
 
 /**
@@ -252,6 +347,19 @@ export interface GoodsReceiptSnapshot {
      * (its op id, derived from the key); present only when one was raised.
      */
     readonly reviewOpId?: string;
+    /**
+     * Story 1-2b — the `grn.shelf-life-refused` review row raised for the
+     * `shelf-life-short` lines (its op id, derived from the key with its own
+     * salt); present only when one was raised.
+     */
+    readonly shelfLifeReviewOpId?: string;
+    /** Story 1-2b — how many booked lines were put on receipt QC holds (present only when > 0). */
+    readonly qcHeldLines?: number;
+    /**
+     * Story 1-2b — how many booked lines of a QC-on-receipt client were NOT
+     * held (serial-tracked or catch-weight — PENDING); present only when > 0.
+     */
+    readonly qcSkippedLines?: number;
   };
 }
 
@@ -268,7 +376,14 @@ export interface RefusedReceiptSnapshot {
     readonly blindReasonCode: string | null;
     readonly occurredAt: string;
     readonly rejectedLines: readonly RejectedGrnLine[];
-    readonly reviewOpId: string;
+    /**
+     * The `grn.lines-refused` row's op id. Story 1-2b: absent when every line
+     * was refused `shelf-life-short` (only the shelf-life row was raised) —
+     * a stored pre-1-2b snapshot always carries it.
+     */
+    readonly reviewOpId?: string;
+    /** Story 1-2b — the `grn.shelf-life-refused` row's op id, when one was raised. */
+    readonly shelfLifeReviewOpId?: string;
   };
 }
 
@@ -295,6 +410,11 @@ export interface OverReceiptEntry {
   readonly decidedAt: string | null;
   /** Row creation time (the keyset cursor field) — part of the read contract. */
   readonly createdAt: string;
+  /**
+   * Story 1-2b — on an approval's answer only: the receipt QC hold the
+   * approved excess was put on (a QC-on-receipt client). Absent otherwise.
+   */
+  readonly qcHoldId?: string;
 }
 
 /** The decide response (the idempotency snapshot). */
@@ -381,6 +501,8 @@ export class ReceivingCommand {
     // projections via the inventory facade's in-transaction passthrough.
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+    // Story 1-2b — the receipt-scoped QC hold (this module's own command).
+    @Inject(QcCommand) private readonly qc: QcCommand,
   ) {}
 
   /**
@@ -425,6 +547,14 @@ export class ReceivingCommand {
       // older blind op (no client) hashes byte-for-byte as before — pinned by
       // a literal golden in `test/per-client-sku.spec.ts`.
       clientId: command.clientId ?? undefined,
+      // ── story 1-2b: ADDITIVE, the same `?? undefined` rule ─────────────
+      // Set only by the review queue's apply arm (decision 5), so every
+      // device op hashes exactly as before; a re-run under the waiver is a
+      // different command than one without it. Only the FACT of the waiver
+      // is hashed — never the reviewer or the note — so a retried Accept by
+      // another reviewer (or with an edited note) after the re-run committed
+      // replays rather than answering 422 forever.
+      shelfLifeWaived: command.shelfLifeWaiver === undefined || command.shelfLifeWaiver === null ? undefined : true,
       occurredAt: command.occurredAt,
       lines: command.lines.map((line) => ({
         poLineId: line.poLineId,
@@ -432,6 +562,10 @@ export class ReceivingCommand {
         skuId: line.skuId,
         batchCode: line.batchCode,
         mfgDate: line.mfgDate,
+        // Story 1-2b — the line's expiry (an IST date), only when present:
+        // a queued older op (no key) hashes byte-for-byte as before (golden
+        // in `test/client-receiving-policy.spec.ts`).
+        expiryDate: line.expiryDate ?? undefined,
         qty: line.qty,
         // Story 10.3 — ADDITIVE and in the operator's own order. `null`
         // normalizes to `undefined`, which `JSON.stringify` drops, so a
@@ -467,6 +601,7 @@ export class ReceivingCommand {
       asnLineId: line.asnLineId ?? null,
       batchCode: line.batchCode ?? null,
       mfgDate: line.mfgDate ?? null,
+      expiryDate: line.expiryDate ?? null,
       weightsGrams: line.weightsGrams ?? null,
     }));
     assertWeightShape(inputLines);
@@ -527,6 +662,16 @@ export class ReceivingCommand {
         }
         if (line.mfgDate !== null) {
           assertUtc(line.mfgDate, 'mfgDate');
+        }
+        // Story 1-2b — a malformed expiry is a whole-op 400, as a malformed
+        // instant is: it is the request's shape, not a rule a stale snapshot
+        // can trip. Every RULE about the date is a per-line refusal below.
+        if (line.expiryDate !== null && line.expiryDate !== undefined && (typeof line.expiryDate !== 'string' || !isIsoDate(line.expiryDate) || !/^2[01]\d\d-/.test(line.expiryDate))) {
+          // Years 2000–2199 only: a year 0000/0001 would reach
+          // `istMidnightOf` and fail in Postgres (a 500), never a label's date.
+          throw grnValidation(
+            `expiryDate must be a calendar date YYYY-MM-DD between 2000 and 2199 (the label's date, read in IST) — got "${String(line.expiryDate)}".`,
+          );
         }
         // Story 21-6: a line reference names a line of THE document — a
         // `poLineId` only beside `poId`, an `asnLineId` only beside `asnId`.
@@ -594,6 +739,33 @@ export class ReceivingCommand {
           clientRefused.push({ index, line, code: 'sku-client-mismatch' });
         }
       }
+
+      // ── story 1-2b: the receiving policies and the expiry rules ─────────
+      // Read ONCE, here — beside the departed read, before any document
+      // lock (the lock order stays "client first"). Expiry and QC use each
+      // line's OWN SKU client; tolerance uses the document's, which is the
+      // same client (a matched document line has the line's SKU). A receipt
+      // reads the policy committed when it reads it (no serialisation
+      // against an edit). Each expiry rule is a PER-LINE refusal, evaluated
+      // with the client refusals, before the all-refused arm, the batch
+      // ensure and settlement — a refused line creates no batch.
+      const policyByClient = await receivingPoliciesInTx(
+        tx,
+        command.tenantId,
+        inputLines.map((line) => skuById.get(line.skuId)!.clientId),
+      );
+      const policyOfSku = (skuId: string): ClientReceivingPolicy =>
+        policyByClient.get(skuById.get(skuId)!.clientId) ?? DEFAULT_RECEIVING_POLICY;
+      const expiryPhase = await this.expiryRefusalsInTx(tx, command.tenantId, {
+        inputLines,
+        alreadyRefused: new Set(clientRefused.map((entry) => entry.index)),
+        skuById,
+        policyOfSku,
+        receiptDate: istDateOf(occurredAt),
+        waived: command.shelfLifeWaiver !== undefined && command.shelfLifeWaiver !== null,
+      });
+      clientRefused.push(...expiryPhase.refused);
+      clientRefused.sort((a, b) => a.index - b.index);
       if (clientRefused.length > 0) {
         clientLabels = await getClientLabelsInTx(tx, command.tenantId, [
           ...(namedBlindClientId === null ? [] : [namedBlindClientId]),
@@ -605,7 +777,7 @@ export class ReceivingCommand {
        * names: the blind receipt's named client, else the first refused
        * line's own client (every such line is a departed client's).
        */
-      const refusalClientId =
+      let refusalClientId =
         namedBlindClientId ?? (clientRefused.length > 0 ? skuById.get(clientRefused[0]!.line.skuId)!.clientId : null);
       const refusedIndexes = new Set(clientRefused.map((entry) => entry.index));
       /** The request index of each receivable line (unmatchedLines name request indexes). */
@@ -676,12 +848,20 @@ export class ReceivingCommand {
       // `grn.recorded` event: every line goes to review as
       // `sku-client-mismatch` (the `grn.lines-refused` row), and the op
       // settles 201 with `{goodsReceipt: null, refusedReceipt}`.
-      if (lines.length === 0 && refusalClientId !== null) {
+      /**
+       * Story 1-1 (decision 6) — EVERY line refused → no receipt: no GRN code
+       * consumed, no header, no `grn.recorded`; the lines go to review and the
+       * op settles 201 with `{goodsReceipt: null, refusedReceipt}`. Story 1-2b
+       * reaches it from two places: before the document lock (the client and
+       * expiry refusals), and after the batch ensure when the expiry race
+       * refused every remaining line.
+       */
+      const settleAllRefused = async (refusalClient: string): Promise<RefusedReceiptSnapshot> => {
         const rejectedLines = this.clientRefusalLines(clientRefused, skuById, clientLabels, namedBlindClientId);
-        const review = await this.raiseClientRefusalReviewInTx(tx, command, idempotencyKey, {
+        const review = await this.raiseRefusalReviewsInTx(tx, command, idempotencyKey, {
           grnId: null,
           grnCode: null,
-          clientId: refusalClientId,
+          clientId: refusalClient,
           clientLabels,
           blindReasonCode,
           occurredAt,
@@ -692,11 +872,14 @@ export class ReceivingCommand {
           goodsReceipt: null,
           refusedReceipt: {
             warehouseId: command.warehouseId,
-            clientId: refusalClientId,
+            clientId: refusalClient,
             blindReasonCode,
             occurredAt,
             rejectedLines,
-            reviewOpId: review.reviewOpId,
+            // Story 1-2b — each present only when its row was raised (a
+            // receipt refused only for client reasons is byte-identical).
+            ...(review.reviewOpId === null ? {} : { reviewOpId: review.reviewOpId }),
+            ...(review.shelfLifeReviewOpId === null ? {} : { shelfLifeReviewOpId: review.shelfLifeReviewOpId }),
           },
         };
         // The audit row targets the review row: nothing else was written.
@@ -716,6 +899,9 @@ export class ReceivingCommand {
           .where(eq(devices.id, command.deviceId));
         await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, refusedSnapshot);
         return refusedSnapshot;
+      };
+      if (lines.length === 0 && refusalClientId !== null) {
+        return settleAllRefused(refusalClientId);
       }
 
       // ── the receiving bin (tenancy-owned master data) ───────────────────
@@ -847,7 +1033,50 @@ export class ReceivingCommand {
       // a batch code on a non-batch-tracked SKU, or a missing one on a
       // batch-tracked SKU, is a 400 before any write. Story 1-1: only the
       // lines that will settle (a refused line's batch is never created).
-      const batchIdentity = await this.ensureBatchIdentity(tx, { ...command, lines: receivable }, skuById);
+      // Story 1-2b: one input per (sku, code), carrying the receipt's merged
+      // expiry; an existing batch with a NULL expiry is filled (never
+      // overwritten — `fillNullExpiry`).
+      const batchIdentity = await this.ensureBatchIdentity(
+        tx,
+        { ...command, lines: receivable },
+        skuById,
+        expiryPhase.batchExpiry,
+      );
+      // ── story 1-2b: a concurrent writer beat this receipt to the expiry ──
+      // After the ensure, a batch whose resolved expiry is not the one this
+      // receipt judged its lines against (another receipt filled the null
+      // first) refuses those lines `batch-expiry-mismatch`, per line — never
+      // a 409 (a retry replays the same input, and the device drops a 409).
+      const racedLineIndexes = new Set<number>();
+      for (const [receivableIndex, input] of lines.entries()) {
+        if (!skuById.get(input.skuId)!.batchTracked || input.batchCode === null) {
+          continue;
+        }
+        const key = `${input.skuId}:${input.batchCode}`;
+        const expected = expiryPhase.batchExpiry.get(key) ?? null;
+        if (expected === null) {
+          continue;
+        }
+        const resolved = batchIdentity.get(key)?.expiryDate ?? null;
+        if (resolved === null || istDateOf(canonicalInstant(resolved)) !== expected) {
+          const index = receivableIndexes[receivableIndex]!;
+          racedLineIndexes.add(index);
+          clientRefused.push({ index, line: inputLines[index]!, code: 'batch-expiry-mismatch', expiryDate: input.expiryDate ?? expected });
+        }
+      }
+      if (racedLineIndexes.size > 0) {
+        clientRefused.sort((a, b) => a.index - b.index);
+        clientLabels = await getClientLabelsInTx(tx, command.tenantId, [
+          ...(namedBlindClientId === null ? [] : [namedBlindClientId]),
+          ...clientRefused.map((entry) => skuById.get(entry.line.skuId)!.clientId),
+        ]);
+        refusalClientId ??= skuById.get(clientRefused[0]!.line.skuId)!.clientId;
+        // Story 1-2b — the race refused every remaining line: the same
+        // all-refused arm, never an empty GRN header.
+        if (lines.every((_, receivableIndex) => racedLineIndexes.has(receivableIndexes[receivableIndex]!))) {
+          return settleAllRefused(refusalClientId);
+        }
+      }
 
       // ── the GRN header (server-assigned code under the tenant seq lock) ──
       const grnId = uuidv7();
@@ -895,6 +1124,8 @@ export class ReceivingCommand {
         readonly batchId: string | null;
         readonly batchCode: string | null;
         readonly applied: number;
+        /** Story 1-2b — the within-tolerance part of `applied` (0 unless a tolerance booked excess). */
+        readonly toleranceQty: number;
       }
       const settled: SettledLine[] = [];
       const rejected: RejectedGrnLine[] = [];
@@ -903,16 +1134,28 @@ export class ReceivingCommand {
       const documentLabel =
         po !== null ? `purchase order "${po.code}"` : asn !== null ? `advance shipment notice "${asn.asnCode}"` : '';
 
-      // Story 1-1 — the blind per-line client refusals, in request order (a
-      // blind receipt has no other refusal, so the order is the request's).
+      // Story 1-1 — the per-line refusals (client, and story 1-2b's expiry
+      // rules), in request order, ahead of any document-line rejection.
       rejected.push(...this.clientRefusalLines(clientRefused, skuById, clientLabels, namedBlindClientId));
+      /**
+       * Story 1-2b — the tolerance ceiling still open on a document line:
+       * `ordered + floor_to_uom_step(ordered × bps / 10000) − received`
+       * (milli-units), started on the line's first touch and shrunk line by
+       * line beside `openRemaining`. With the default policy (0 bps) it
+       * equals `openRemaining`, so the fold is the pre-1-2b fold exactly.
+       */
+      const ceilingRemaining = new Map<string, number>();
       for (const [receivableIndex, input] of lines.entries()) {
         const index = receivableIndexes[receivableIndex]!;
+        if (racedLineIndexes.has(index)) {
+          continue; // story 1-2b — refused per line after the ensure (above)
+        }
         const identity = batchIdentity.get(`${input.skuId}:${input.batchCode}`) ?? null;
         const base = {
           input,
           batchId: identity?.id ?? null,
           batchCode: identity?.code ?? null,
+          toleranceQty: 0,
         };
         if (po === null && asn === null) {
           // Blind arm: the physical quantity applies in full (no document to gate it).
@@ -1030,15 +1273,29 @@ export class ReceivingCommand {
         }
         const lineId = uuidv7();
         const remaining = openRemaining.get(reference) ?? 0;
-        const applied = Math.max(0, Math.min(input.qty, remaining));
+        // ── story 1-2b: the receiving tolerance (the document's client —
+        // the matched line's SKU's) ────────────────────────────────────────
+        // `applied = clamp(qty, 0, ceiling − received)`; the part of it past
+        // the open quantity is the within-tolerance slice (`tolerance_qty`,
+        // no over-receipt row); the rest pends as before.
+        let ceiling = ceilingRemaining.get(reference);
+        if (ceiling === undefined) {
+          const ordered = po !== null ? poLineById.get(reference)!.orderedQty : asnLineById.get(reference)!.announcedQty;
+          const uom = skuById.get(input.skuId)!.uom;
+          ceiling = remaining + toleranceMilli(ordered, policyOfSku(input.skuId).receivingToleranceBps, uomPrecision(uom));
+        }
+        const applied = Math.max(0, Math.min(input.qty, ceiling));
+        const toleranceQty = Math.max(0, applied - Math.max(0, remaining));
         const excess = input.qty - applied;
         openRemaining.set(reference, remaining - applied);
+        ceilingRemaining.set(reference, ceiling - applied);
         settled.push({
           ...base,
           lineId,
           poLineId: po !== null ? reference : null,
           asnLineId: asn !== null ? reference : null,
           applied,
+          toleranceQty,
         });
         if (excess > 0) {
           // Pending over-receipt: the excess applies only on approval.
@@ -1069,6 +1326,7 @@ export class ReceivingCommand {
             batchId: entry.batchId,
             qty: entry.input.qty,
             appliedQty: entry.applied,
+            toleranceQty: entry.toleranceQty,
           })),
         );
       }
@@ -1170,6 +1428,43 @@ export class ReceivingCommand {
         await this.inventory.appendLedgerEventInTx(tx, movement);
       }
 
+      // ── story 1-2b: QC on receipt ───────────────────────────────────────
+      // A booked line of a `qc_on_receipt` client (its OWN SKU's client) is
+      // put on its own receipt-scoped hold, in this transaction: one hold
+      // per GRN line, moving exactly that line's applied quantity from
+      // Receiving into the QC-HOLD bin — never a sweep of the (sku, bin)
+      // scope (other receipts' units stay put). No bin lock, no role gate
+      // (a consequence of the receipt); the actor is the device operator and
+      // the business time the receipt's. Serial-tracked and catch-weight
+      // lines book UNHELD (PENDING) and are counted.
+      const qcHeld: { holdId: string; grnLineId: string }[] = [];
+      let qcSkippedLines = 0;
+      for (const entry of settled) {
+        if (entry.applied <= 0 || !policyOfSku(entry.input.skuId).qcOnReceipt) {
+          continue;
+        }
+        const sku = skuById.get(entry.input.skuId)!;
+        if (sku.serialTracked || sku.catchWeightTracked) {
+          qcSkippedLines += 1;
+          continue;
+        }
+        const holdId = await this.qc.holdReceiptLineInTx(tx, {
+          tenantId: command.tenantId,
+          warehouseId: command.warehouseId,
+          skuId: entry.input.skuId,
+          grnLineId: entry.lineId,
+          overReceiptId: null,
+          receivingBinId: receivingBin.binId,
+          batchId: entry.batchId,
+          quantity: entry.applied,
+          actorUserId: command.operatorUserId,
+          occurredAt,
+          recordedAt,
+          reason: `QC on receipt — ${code}`,
+        });
+        qcHeld.push({ holdId, grnLineId: entry.lineId });
+      }
+
       // Applied portions move `received_qty` (open stays derived) — on the
       // document line actually credited (an unmatched line credits none).
       const appliedByPoLine = sumAppliedBy(settled, (entry) => entry.poLineId);
@@ -1248,19 +1543,20 @@ export class ReceivingCommand {
       // its op id DERIVED from the key and recorded in the snapshot, so a
       // replay re-serves it and inserts nothing. Discard only.
       let reviewOpId: string | null = null;
+      let shelfLifeReviewOpId: string | null = null;
       if (clientRefused.length > 0 && refusalClientId !== null) {
-        reviewOpId = (
-          await this.raiseClientRefusalReviewInTx(tx, command, idempotencyKey, {
-            grnId,
-            grnCode: code,
-            clientId: refusalClientId,
-            clientLabels,
-            blindReasonCode,
-            occurredAt,
-            clientRefused,
-            skuById,
-          })
-        ).reviewOpId;
+        const review = await this.raiseRefusalReviewsInTx(tx, command, idempotencyKey, {
+          grnId,
+          grnCode: code,
+          clientId: refusalClientId,
+          clientLabels,
+          blindReasonCode,
+          occurredAt,
+          clientRefused,
+          skuById,
+        });
+        reviewOpId = review.reviewOpId;
+        shelfLifeReviewOpId = review.shelfLifeReviewOpId;
       }
 
       // ── the snapshot (the outbox payload and idempotency replay carry it) ─
@@ -1301,6 +1597,8 @@ export class ReceivingCommand {
             qty: fromMilli(entry.input.qty),
             appliedQty: fromMilli(entry.applied),
             excessQty: fromMilli(entry.input.qty - entry.applied),
+            // Story 1-2b: present only when a tolerance booked excess.
+            ...(entry.toleranceQty > 0 ? { toleranceQty: fromMilli(entry.toleranceQty) } : {}),
             // Story 10.3: present only on a catch-weight line, so a
             // non-catch-weight GRN's snapshot is byte-identical to its
             // pre-10.3 shape (`JSON.stringify` drops absent keys).
@@ -1311,6 +1609,9 @@ export class ReceivingCommand {
           ...(rejected.length === 0 ? {} : { rejectedLines: rejected }),
           ...(unmatched.length === 0 ? {} : { unmatchedLines: unmatched }),
           ...(reviewOpId === null ? {} : { reviewOpId }),
+          ...(shelfLifeReviewOpId === null ? {} : { shelfLifeReviewOpId }),
+          ...(qcHeld.length === 0 ? {} : { qcHeldLines: qcHeld.length }),
+          ...(qcSkippedLines === 0 ? {} : { qcSkippedLines }),
         },
       };
 
@@ -1345,6 +1646,26 @@ export class ReceivingCommand {
         });
       }
 
+      // Story 1-2b — ONE event per receipt placed on holds (never one per
+      // hold): the notification panel raises ONE `qc-receipt` entry, keyed by
+      // the placement (the GRN here; an approved excess's own id there).
+      if (qcHeld.length > 0) {
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: QC_RECEIPT_PLACED_EVENT,
+          occurredAt: nowIso(),
+          payload: {
+            placementId: grnId,
+            grnId,
+            grnCode: code,
+            warehouseId: command.warehouseId,
+            holdIds: qcHeld.map((hold) => hold.holdId),
+            count: qcHeld.length,
+          },
+        });
+      }
+
       // Story 9-3a — the audit row (step 10). The actor is the operator the
       // op was recorded by — on a replayed handheld op, the original one.
       await tx.insert(auditEvents).values({
@@ -1357,6 +1678,34 @@ export class ReceivingCommand {
         reference: idempotencyKey,
         occurredAt: nowIso(),
       });
+      // Story 1-2b — one audit row per receipt placed on QC holds.
+      if (qcHeld.length > 0) {
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.operatorUserId,
+          action: 'qc_hold.receipt_placed',
+          targetType: 'goods_receipt',
+          targetId: grnId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+      }
+      // Story 1-2b (decision 5) — a shelf-life refusal accepted from review:
+      // the re-run records who waived the rule (the reviewer), against the
+      // receipt it booked. The note rides the review row's resolved outcome.
+      if (command.shelfLifeWaiver !== undefined && command.shelfLifeWaiver !== null) {
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.shelfLifeWaiver.byUserId,
+          action: 'goods_receipt.shelf_life_waived',
+          targetType: 'goods_receipt',
+          targetId: grnId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+      }
 
       // ── device heartbeat + idempotency key (the invariant order's tail) ──
       await tx
@@ -1453,6 +1802,8 @@ export class ReceivingCommand {
 
       // Story 21-6 — the ASN code, for the response and the outbox payload.
       let asnCode: string | null = null;
+      /** Story 1-2b — the receipt hold placed on the approved excess (a QC-on-receipt client). */
+      let excessHoldId: string | null = null;
       if (command.decision === 'approve') {
         // Story 11.4: the approval is a third +stock writer — the excess
         // applies as a fresh `grn.received` delta at DECISION time, days after
@@ -1468,7 +1819,15 @@ export class ReceivingCommand {
         // writes nothing but status, and need not serialize against a kit
         // create.
         const lockedSkus = await tx
-          .select({ code: skus.code })
+          .select({
+            code: skus.code,
+            // Story 1-2b — the client whose policy decides whether the
+            // approved excess is QC-held, and the two tracking flags that
+            // book a line unheld.
+            clientId: skus.clientId,
+            serialTracked: skus.serialTracked,
+            catchWeightTracked: skus.catchWeightTracked,
+          })
           .from(skus)
           .where(and(eq(skus.tenantId, command.tenantId), eq(skus.id, row.skuId)))
           .orderBy(skus.id)
@@ -1595,6 +1954,59 @@ export class ReceivingCommand {
           // Re-derived like every receipt (a terminal ASN stays terminal).
           await deriveAsnStatusInTx(tx, command.tenantId, row.asnId);
         }
+
+        // ── story 1-2b: QC on receipt holds an approved excess too ─────────
+        // The policy CURRENT at approval (read now, plainly — no
+        // serialisation against an edit). The excess booked into Receiving
+        // above is held the receipt's way: its own hold naming the GRN line
+        // and this over-receipt, moving exactly the excess; the actor is the
+        // approver. Serial-tracked and catch-weight lines book unheld.
+        const sku = lockedSkus[0];
+        if (sku !== undefined && !sku.serialTracked && !sku.catchWeightTracked) {
+          const policy =
+            (await receivingPoliciesInTx(tx, command.tenantId, [sku.clientId])).get(sku.clientId) ?? DEFAULT_RECEIVING_POLICY;
+          if (policy.qcOnReceipt) {
+            const holdId = await this.qc.holdReceiptLineInTx(tx, {
+              tenantId: command.tenantId,
+              warehouseId: row.warehouseId,
+              skuId: row.skuId,
+              grnLineId: row.grnLineId,
+              overReceiptId: row.id,
+              receivingBinId: receivingBin.binId,
+              batchId: grnLine.batchId,
+              quantity: row.excessQty,
+              actorUserId: command.actorUserId,
+              occurredAt: decidedAt,
+              recordedAt: decidedAt,
+              reason: `QC on receipt — ${grn.code}`,
+            });
+            excessHoldId = holdId;
+            await this.outbox.append(tx, {
+              messageId: uuidv7(),
+              tenantId: command.tenantId,
+              type: QC_RECEIPT_PLACED_EVENT,
+              occurredAt: decidedAt,
+              payload: {
+                placementId: row.id,
+                grnId: row.grnId,
+                grnCode: grn.code,
+                warehouseId: row.warehouseId,
+                holdIds: [holdId],
+                count: 1,
+              },
+            });
+            await tx.insert(auditEvents).values({
+              id: uuidv7(),
+              tenantId: command.tenantId,
+              actorUserId: command.actorUserId,
+              action: 'qc_hold.receipt_placed',
+              targetType: 'goods_receipt',
+              targetId: row.grnId,
+              reference: idempotencyKey,
+              occurredAt: decidedAt,
+            });
+          }
+        }
       } else if (row.asnId !== null) {
         // The reject arm stays lock-free beyond its own row: a plain read
         // of the code for the response.
@@ -1681,6 +2093,8 @@ export class ReceivingCommand {
           decidedBy: command.actorUserId,
           decidedAt,
           createdAt: canonicalInstant(row.createdAt),
+          // Story 1-2b: present only when the approved excess was QC-held.
+          ...(excessHoldId === null ? {} : { qcHoldId: excessHoldId }),
         },
       };
       await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
@@ -1832,9 +2246,11 @@ export class ReceivingCommand {
     tx: TenantTx,
     command: SubmitGoodsReceiptCommand,
     skuById: Map<string, typeof skus.$inferSelect>,
-  ): Promise<Map<string, { id: string; code: string }>> {
-    const result = new Map<string, { id: string; code: string }>();
-    const inputsBySku = new Map<string, { code: string; mfgDate?: string }[]>();
+    batchExpiry: ReadonlyMap<string, string | null>,
+  ): Promise<Map<string, { id: string; code: string; expiryDate: string | null }>> {
+    const result = new Map<string, { id: string; code: string; expiryDate: string | null }>();
+    const inputsBySku = new Map<string, { code: string; mfgDate?: string; expiryDate?: string }[]>();
+    let fillsExpiry = false;
     for (const line of command.lines) {
       const sku = skuById.get(line.skuId)!;
       if (sku.batchTracked) {
@@ -1843,9 +2259,16 @@ export class ReceivingCommand {
         }
         const inputs = inputsBySku.get(line.skuId) ?? [];
         if (!inputs.some((input) => input.code === line.batchCode)) {
+          // Story 1-2b — ONE input per (sku, code), carrying the receipt's
+          // merged expiry (a line without one and a line with one on the
+          // same batch merge, taking the non-null one), stored as the
+          // instant its IST date begins.
+          const expiry = batchExpiry.get(`${line.skuId}:${line.batchCode}`) ?? null;
+          fillsExpiry ||= expiry !== null;
           inputs.push({
             code: line.batchCode,
             ...(line.mfgDate === null ? {} : { mfgDate: line.mfgDate }),
+            ...(expiry === null ? {} : { expiryDate: istMidnightOf(expiry) }),
           });
           inputsBySku.set(line.skuId, inputs);
         }
@@ -1854,19 +2277,151 @@ export class ReceivingCommand {
       }
     }
     for (const [skuId, inputs] of inputsBySku) {
-      const ensured = await this.catalog.ensureBatchesInTx(tx, command.tenantId, skuId, inputs);
+      // `fillNullExpiry` is receiving's alone (manual movements never fill):
+      // an existing batch's NULL expiry takes the receipt's; a non-null one
+      // is never overwritten — the caller compares what resolved.
+      const ensured = await this.catalog.ensureBatchesInTx(tx, command.tenantId, skuId, inputs, {
+        fillNullExpiry: fillsExpiry,
+      });
       for (const batch of ensured) {
-        result.set(`${skuId}:${batch.code}`, { id: batch.id, code: batch.code });
+        result.set(`${skuId}:${batch.code}`, { id: batch.id, code: batch.code, expiryDate: batch.expiryDate });
       }
     }
     return result;
   }
 
   /**
+   * Story 1-2b — the five expiry rules, PER LINE (§7g), over the lines no
+   * client rule refused, in request order. Returns the refused lines and,
+   * per batch-tracked `(sku, batch code)`, the receipt's merged expiry (an
+   * IST date, or null) the ensure stores and the rules judged against.
+   *
+   * 1. `expiry-on-untracked` — an expiry on a SKU that is not batch-tracked
+   *    (expiry lives on the batch).
+   * 2. `expiry-before-mfg` — the line's expiry precedes its own mfg date.
+   * 3. `batch-expiry-mismatch` (any client) — the line's expiry differs, by
+   *    IST date, from the existing batch's non-null expiry, or from an
+   *    earlier line of this receipt naming the same batch (later lines are
+   *    refused). A line without an expiry merges with one that has it.
+   * 4. `expiry-required` — the client requires expiry, the SKU is
+   *    batch-tracked, and the EFFECTIVE expiry (the line's, else its
+   *    batch's) is null.
+   * 5. `shelf-life-short` — the client requires expiry and the effective
+   *    expiry is fewer IST days after the receipt's date than its minimum
+   *    (0 when none — so an already expired batch is refused whenever
+   *    expiry is required). Skipped under the review's waiver only.
+   *
+   * No query at all when no line carries an expiry and no line's client
+   * requires one — the default policy reads nothing more than before.
+   */
+  private async expiryRefusalsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    args: {
+      readonly inputLines: readonly GrnLineInput[];
+      readonly alreadyRefused: ReadonlySet<number>;
+      readonly skuById: Map<string, typeof skus.$inferSelect>;
+      readonly policyOfSku: (skuId: string) => ClientReceivingPolicy;
+      /** The receipt's business date, `istDateOf(occurredAt)`. */
+      readonly receiptDate: string;
+      readonly waived: boolean;
+    },
+  ): Promise<{ refused: ClientRefusedLine[]; batchExpiry: Map<string, string | null> }> {
+    const refused: ClientRefusedLine[] = [];
+    const batchExpiry = new Map<string, string | null>();
+    const candidates = args.inputLines
+      .map((line, index) => ({ index, line }))
+      .filter(({ index }) => !args.alreadyRefused.has(index));
+    const anyExpiry = candidates.some(({ line }) => (line.expiryDate ?? null) !== null);
+    const anyRequired = candidates.some(({ line }) => args.policyOfSku(line.skuId).expiryRequired);
+    if (!anyExpiry && !anyRequired) {
+      return { refused, batchExpiry };
+    }
+    const out = new Set<number>();
+    const refuse = (entry: ClientRefusedLine): void => {
+      refused.push(entry);
+      out.add(entry.index);
+    };
+    const tracked = (line: GrnLineInput): boolean => args.skuById.get(line.skuId)!.batchTracked;
+    const batchKey = (line: GrnLineInput): string | null =>
+      tracked(line) && line.batchCode !== null ? `${line.skuId}:${line.batchCode}` : null;
+
+    // (1) + (2): the line's own facts.
+    for (const { index, line } of candidates) {
+      const expiry = line.expiryDate ?? null;
+      if (expiry === null) continue;
+      if (!tracked(line)) {
+        refuse({ index, line, code: 'expiry-on-untracked', expiryDate: expiry });
+      } else if (line.mfgDate !== null && expiry < istDateOf(line.mfgDate)) {
+        refuse({ index, line, code: 'expiry-before-mfg', expiryDate: expiry });
+      }
+    }
+
+    // The existing batches, read by (sku, code) — compared by IST date.
+    const pairs = candidates
+      .filter(({ index, line }) => !out.has(index) && batchKey(line) !== null)
+      .map(({ line }) => ({ skuId: line.skuId, code: line.batchCode! }));
+    const existing = await this.catalog.batchesByCodesInTx(tx, tenantId, pairs);
+    for (const [key, batch] of existing) {
+      if (batch.expiryDate !== null) {
+        batchExpiry.set(key, istDateOf(canonicalInstant(batch.expiryDate)));
+      }
+    }
+    // (2) again, against the EXISTING batch's mfg date when the line carries
+    // none — else the fill below could write an expiry before the batch's mfg.
+    for (const { index, line } of candidates) {
+      const key = batchKey(line);
+      const expiry = line.expiryDate ?? null;
+      if (out.has(index) || key === null || expiry === null || line.mfgDate !== null) continue;
+      const batchMfg = existing.get(key)?.mfgDate ?? null;
+      if (batchMfg !== null && expiry < istDateOf(canonicalInstant(batchMfg))) {
+        refuse({ index, line, code: 'expiry-before-mfg', expiryDate: expiry });
+      }
+    }
+
+    // (3): one expiry per batch — the existing one, else the first line's.
+    for (const { index, line } of candidates) {
+      const key = batchKey(line);
+      const expiry = line.expiryDate ?? null;
+      if (out.has(index) || key === null || expiry === null) continue;
+      const known = batchExpiry.get(key) ?? null;
+      if (known === null) {
+        batchExpiry.set(key, expiry);
+      } else if (known !== expiry) {
+        refuse({ index, line, code: 'batch-expiry-mismatch', expiryDate: expiry });
+      }
+    }
+
+    // (4) + (5): the client's policy, against the EFFECTIVE expiry.
+    for (const { index, line } of candidates) {
+      // A tracked line WITHOUT a batch code is not judged here: it reaches
+      // `ensureBatchIdentity`'s 400 ("its lines need a batch code") as before.
+      if (out.has(index) || !tracked(line) || line.batchCode === null) continue;
+      const policy = args.policyOfSku(line.skuId);
+      if (!policy.expiryRequired) continue;
+      const key = batchKey(line);
+      const effective = line.expiryDate ?? (key === null ? null : (batchExpiry.get(key) ?? null));
+      if (effective === null) {
+        refuse({ index, line, code: 'expiry-required', expiryDate: null });
+        continue;
+      }
+      if (args.waived) continue;
+      const minimum = policy.minShelfLifeDays ?? 0;
+      const remainingDays = istDaysBetween(args.receiptDate, effective);
+      if (remainingDays < minimum) {
+        refuse({ index, line, code: 'shelf-life-short', expiryDate: effective, minShelfLifeDays: minimum, remainingDays });
+      }
+    }
+    return { refused, batchExpiry };
+  }
+
+  /**
    * Story 1-1 — the `rejectedLines` entries of the client-refused lines (base
-   * units, as sent); story 1-2a adds the `client-departed` words.
-   * `receiptClientId` is the blind receipt's named client (a mismatch line
-   * exists only beside one).
+   * units, as sent); story 1-2a adds the `client-departed` words. Story 1-2b
+   * adds the five expiry codes, whose entries ALSO carry the line's identity
+   * (`index`, `batchCode`, `expiryDate`, `minShelfLifeDays`) — a client
+   * refusal's entry is unchanged. `receiptClientId` is the blind receipt's
+   * named client (a mismatch line exists only beside one).
    */
   private clientRefusalLines(
     clientRefused: readonly ClientRefusedLine[],
@@ -1874,9 +2429,24 @@ export class ReceivingCommand {
     clientLabels: ReadonlyMap<string, string>,
     receiptClientId: string | null,
   ): RejectedGrnLine[] {
-    return clientRefused.map(({ line, code }) => {
+    return clientRefused.map((entry) => {
+      const { line, code } = entry;
       const sku = skuById.get(line.skuId)!;
       const skuClient = clientLabels.get(sku.clientId) ?? sku.clientId;
+      if (EXPIRY_REFUSAL_CODES.has(code)) {
+        return {
+          poLineId: line.poLineId,
+          ...(line.asnLineId === null || line.asnLineId === undefined ? {} : { asnLineId: line.asnLineId }),
+          skuId: line.skuId,
+          qty: line.qty,
+          code,
+          reason: expiryRefusalReason(entry, sku.code, line.batchCode, skuClient),
+          index: entry.index,
+          batchCode: line.batchCode,
+          expiryDate: entry.expiryDate ?? null,
+          ...(entry.minShelfLifeDays === undefined ? {} : { minShelfLifeDays: entry.minShelfLifeDays }),
+        };
+      }
       return {
         poLineId: null,
         skuId: line.skuId,
@@ -1892,13 +2462,21 @@ export class ReceivingCommand {
   }
 
   /**
-   * Story 1-1 — ONE review row for a blind receipt's client-refused lines
-   * (§7g): server-raised through tenancy (inbound writes no rejected_ops
-   * row), its op id DERIVED from the key and recorded in the snapshot, so a
-   * replay re-serves it and inserts nothing. Discard only. `grnId` and
-   * `grnCode` are null when every line was refused (decision 6 — no receipt).
+   * Story 1-1 — the review rows for a receipt's per-line refusals (§7g):
+   * server-raised through tenancy (inbound writes no rejected_ops row), each
+   * op id DERIVED from the key with its own salt and recorded in the
+   * snapshot, so a replay re-serves it and inserts nothing. `grnId` and
+   * `grnCode` are null when every line was refused (decision 6 — no
+   * receipt).
+   *
+   * Story 1-2b — TWO rows: `grn.lines-refused` (every refused line but the
+   * short-dated ones — Discard only, its `problemCode` by
+   * `LINES_REFUSED_CODE_PRECEDENCE`, the departure still winning) and
+   * `grn.shelf-life-refused` (the `shelf-life-short` lines only — Apply with
+   * a note, which re-runs exactly those lines under the waiver, or Discard;
+   * its payload is the original receipt's header plus only those lines).
    */
-  private async raiseClientRefusalReviewInTx(
+  private async raiseRefusalReviewsInTx(
     tx: TenantTx,
     command: SubmitGoodsReceiptCommand,
     idempotencyKey: string,
@@ -1912,66 +2490,125 @@ export class ReceivingCommand {
       readonly clientRefused: readonly ClientRefusedLine[];
       readonly skuById: Map<string, typeof skus.$inferSelect>;
     },
-  ): Promise<{ reviewOpId: string; rejectedOpId: string }> {
-    const reviewOpId = refusedGrnLinesOpId(idempotencyKey);
+  ): Promise<{ reviewOpId: string | null; shelfLifeReviewOpId: string | null; rejectedOpId: string }> {
+    const linesRefused = args.clientRefused.filter((entry) => entry.code !== 'shelf-life-short');
+    const shelfLifeRefused = args.clientRefused.filter((entry) => entry.code === 'shelf-life-short');
+    let reviewOpId: string | null = null;
+    let shelfLifeReviewOpId: string | null = null;
+    let firstRejectedOpId: string | null = null;
     const clientLabel = args.clientLabels.get(args.clientId) ?? args.clientId;
-    // Story 1-2a — a departed client's lines (any receipt) are refused for
-    // their client's departure; a blind receipt's other-client lines (1-1)
-    // for the mismatch. The row's code is the departure when any line is.
-    const departed = args.clientRefused.some((entry) => entry.code === 'client-departed');
-    const rejectedOpId = await recordServerRejectedOpInTx(tx, this.outbox, {
-      tenantId: command.tenantId,
-      deviceId: command.deviceId,
-      operatorUserId: command.operatorUserId,
-      opId: reviewOpId,
-      opType: 'grn.lines-refused',
-      problemCode: departed ? 'client-departed' : 'sku-client-mismatch',
-      problemDetail: departed
-        ? (args.grnCode === null
-            ? `No goods receipt was recorded — all ${args.clientRefused.length} line(s) were refused, their SKUs' client (${clientLabel}) having departed or differing from the receipt's.`
-            : `${args.clientRefused.length} line(s) of goods receipt "${args.grnCode}" were not booked — their SKUs' client has departed or differs from the receipt's.`) +
-          ' Re-receive them after an owner reactivates the client.'
-        : (args.grnCode === null
-            ? `No goods receipt was recorded — all ${args.clientRefused.length} line(s) belong to another client than the receipt's (${clientLabel}).`
-            : `${args.clientRefused.length} line(s) of goods receipt "${args.grnCode}" were not booked — their SKUs belong to another client than the receipt's (${clientLabel}).`) +
-          ' Receive them again on a receipt for their own client.',
-      payload: {
-        warehouseId: command.warehouseId,
-        grnId: args.grnId,
-        grnCode: args.grnCode,
-        clientId: args.clientId,
-        clientLabel,
-        blindReasonCode: args.blindReasonCode,
+    const refusalEntry = (entry: ClientRefusedLine): Record<string, unknown> => {
+      const { index, line } = entry;
+      const sku = args.skuById.get(line.skuId)!;
+      return {
+        lineIndex: index,
+        skuId: sku.id,
+        skuCode: sku.code,
+        skuClientId: sku.clientId,
+        skuClientLabel: args.clientLabels.get(sku.clientId) ?? sku.clientId,
+        reason: entry.code,
+        // Story 1-2b — the expiry codes name the batch and the date judged.
+        ...(EXPIRY_REFUSAL_CODES.has(entry.code)
+          ? {
+              batchCode: line.batchCode,
+              expiryDate: entry.expiryDate ?? null,
+              ...(entry.minShelfLifeDays === undefined ? {} : { minShelfLifeDays: entry.minShelfLifeDays }),
+              ...(entry.remainingDays === undefined ? {} : { remainingDays: entry.remainingDays }),
+            }
+          : {}),
+      };
+    };
+
+    if (linesRefused.length > 0) {
+      reviewOpId = refusedGrnLinesOpId(idempotencyKey);
+      const codes = new Set(linesRefused.map((entry) => entry.code));
+      const problemCode = LINES_REFUSED_CODE_PRECEDENCE.find((code) => codes.has(code))!;
+      const rejectedOpId = await recordServerRejectedOpInTx(tx, this.outbox, {
+        tenantId: command.tenantId,
+        deviceId: command.deviceId,
+        operatorUserId: command.operatorUserId,
+        opId: reviewOpId,
+        opType: 'grn.lines-refused',
+        problemCode,
+        problemDetail: linesRefusedDetail(problemCode, linesRefused, args.grnCode, clientLabel),
+        payload: {
+          warehouseId: command.warehouseId,
+          grnId: args.grnId,
+          grnCode: args.grnCode,
+          clientId: args.clientId,
+          clientLabel,
+          blindReasonCode: args.blindReasonCode,
+          occurredAt: args.occurredAt,
+          // The refused lines only (base units, as sent), aligned with `refusals`.
+          lines: linesRefused.map(({ line }) => ({
+            skuId: line.skuId,
+            batchCode: line.batchCode,
+            mfgDate: line.mfgDate,
+            // Story 1-2b — present only when the line carried one.
+            ...(line.expiryDate === null || line.expiryDate === undefined ? {} : { expiryDate: line.expiryDate }),
+            qty: line.qty,
+            ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
+          })),
+          refusals: linesRefused.map(refusalEntry),
+        },
         occurredAt: args.occurredAt,
-        // The refused lines only (base units, as sent), aligned with `refusals`.
-        lines: args.clientRefused.map(({ line }) => ({
-          skuId: line.skuId,
-          batchCode: line.batchCode,
-          mfgDate: line.mfgDate,
-          qty: line.qty,
-          ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
-        })),
-        refusals: args.clientRefused.map((entry) => {
-          const { index, line } = entry;
-          const sku = args.skuById.get(line.skuId)!;
-          return {
-            lineIndex: index,
-            skuId: sku.id,
-            skuCode: sku.code,
-            skuClientId: sku.clientId,
-            skuClientLabel: args.clientLabels.get(sku.clientId) ?? sku.clientId,
-            reason: entry.code,
-          };
-        }),
-      },
-      occurredAt: args.occurredAt,
-    });
-    if (rejectedOpId === null) {
-      // The key is new (the replay lookup ran above), so its derived op id
-      // cannot exist — fail loudly rather than write an audit row with no target.
-      throw new Error(`grn.lines-refused review row ${reviewOpId} already existed for a new key`);
+      });
+      if (rejectedOpId === null) {
+        // The key is new (the replay lookup ran above), so its derived op id
+        // cannot exist — fail loudly rather than write an audit row with no target.
+        throw new Error(`grn.lines-refused review row ${reviewOpId} already existed for a new key`);
+      }
+      firstRejectedOpId = rejectedOpId;
     }
-    return { reviewOpId, rejectedOpId };
+
+    if (shelfLifeRefused.length > 0) {
+      shelfLifeReviewOpId = shelfLifeRefusedOpId(idempotencyKey);
+      const minimum = Math.max(...shelfLifeRefused.map((entry) => entry.minShelfLifeDays ?? 0));
+      const rejectedOpId = await recordServerRejectedOpInTx(tx, this.outbox, {
+        tenantId: command.tenantId,
+        deviceId: command.deviceId,
+        operatorUserId: command.operatorUserId,
+        opId: shelfLifeReviewOpId,
+        opType: 'grn.shelf-life-refused',
+        problemCode: 'shelf-life-short',
+        problemDetail:
+          (args.grnCode === null
+            ? `No goods receipt was recorded — ${shelfLifeRefused.length} line(s) were refused`
+            : `${shelfLifeRefused.length} line(s) of goods receipt "${args.grnCode}" were not booked`) +
+          ` — their remaining shelf life is below the client's minimum of ${minimum} day(s) (or the batch has expired).` +
+          ' Accept them anyway with a note (they book as on any receipt), or discard them.',
+        // The ORIGINAL receipt's header plus only these lines — exactly what
+        // Apply re-runs (under the waiver, with the row's own op id as key).
+        payload: {
+          warehouseId: command.warehouseId,
+          poId: command.poId,
+          ...(command.asnId === null || command.asnId === undefined ? {} : { asnId: command.asnId }),
+          blindReasonCode: args.blindReasonCode,
+          ...(command.clientId === null || command.clientId === undefined ? {} : { clientId: command.clientId }),
+          occurredAt: args.occurredAt,
+          grnId: args.grnId,
+          grnCode: args.grnCode,
+          clientLabel,
+          lines: shelfLifeRefused.map(({ line }) => ({
+            poLineId: line.poLineId,
+            ...(line.asnLineId === null || line.asnLineId === undefined ? {} : { asnLineId: line.asnLineId }),
+            skuId: line.skuId,
+            batchCode: line.batchCode,
+            mfgDate: line.mfgDate,
+            expiryDate: line.expiryDate ?? null,
+            qty: line.qty,
+            ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
+          })),
+          refusals: shelfLifeRefused.map(refusalEntry),
+        },
+        occurredAt: args.occurredAt,
+      });
+      if (rejectedOpId === null) {
+        throw new Error(`grn.shelf-life-refused review row ${shelfLifeReviewOpId} already existed for a new key`);
+      }
+      firstRejectedOpId ??= rejectedOpId;
+    }
+    return { reviewOpId, shelfLifeReviewOpId, rejectedOpId: firstRejectedOpId! };
   }
 
   /**
@@ -2017,6 +2654,110 @@ export function refusedGrnLinesOpId(idempotencyKey: string): string {
   if (derived !== idempotencyKey) return derived;
   const last = derived.charAt(25);
   return derived.slice(0, 25) + (last === '0' ? '1' : '0');
+}
+
+/**
+ * Story 1-2b — the `grn.shelf-life-refused` row's op id: derived from the
+ * key like `refusedGrnLinesOpId`, with its OWN salt — so the two rows a
+ * receipt may raise never share an id.
+ */
+export function shelfLifeRefusedOpId(idempotencyKey: string): string {
+  const digest = createHash('sha256').update(`${idempotencyKey}:grn-shelf-life-refused`).digest();
+  let tail = '';
+  for (let i = 0; i < 16; i++) tail += ULID_ALPHABET.charAt(digest[i]! & 31);
+  const derived = idempotencyKey.slice(0, 10).toUpperCase() + tail;
+  if (derived !== idempotencyKey) return derived;
+  const last = derived.charAt(25);
+  return derived.slice(0, 25) + (last === '0' ? '1' : '0');
+}
+
+/**
+ * Story 1-2b — the receiving tolerance of one document line, milli-units:
+ * `floor_to_uom_step(ordered × bps / 10000)`, where the step is one unit of
+ * the SKU's declared precision (1 each = 1000 milli; 1 g of kg = 1 milli).
+ * Exact integer arithmetic (BigInt — `ordered × bps` can pass 2⁵³). 0 bps →
+ * 0, so the default policy's ceiling is the ordered quantity exactly.
+ */
+export function toleranceMilli(orderedMilli: number, bps: number, precision: number): number {
+  if (bps <= 0 || orderedMilli <= 0) {
+    return 0;
+  }
+  const step = BigInt(QUANTITY_SCALE / 10 ** Math.min(Math.max(precision, 0), 3));
+  const raw = (BigInt(orderedMilli) * BigInt(bps)) / 10_000n;
+  return Number((raw / step) * step);
+}
+
+/** Story 1-2b — IST calendar days from `from` to `to` (both `YYYY-MM-DD`); negative when `to` is earlier. */
+export function istDaysBetween(from: string, to: string): number {
+  return Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000);
+}
+
+/** Story 1-2b — the operator-facing reason of one expiry refusal (the device shows its own words by code). */
+function expiryRefusalReason(entry: ClientRefusedLine, skuCode: string, batchCode: string | null, clientLabel: string): string {
+  const batch = batchCode === null ? '' : ` batch "${batchCode}"`;
+  switch (entry.code) {
+    case 'expiry-on-untracked':
+      return `SKU "${skuCode}" is not batch-tracked — an expiry date (${entry.expiryDate}) lives on a batch, so this line was not booked. Receive it again without the expiry date.`;
+    case 'expiry-before-mfg':
+      return `SKU "${skuCode}"${batch}: the expiry date ${entry.expiryDate} is before the line's mfg date — check the label and receive it again.`;
+    case 'batch-expiry-mismatch':
+      return `SKU "${skuCode}"${batch}: the expiry date ${entry.expiryDate} differs from the batch's — one batch has one expiry. Check the label; receive it with the batch's expiry or under its own batch code.`;
+    case 'expiry-required':
+      return `SKU "${skuCode}"${batch}: client ${clientLabel} requires an expiry date on batch-tracked goods and none was given — receive it again with the label's expiry date.`;
+    case 'shelf-life-short':
+      return `SKU "${skuCode}"${batch} expires ${entry.expiryDate} — ${entry.remainingDays} day(s) of shelf life left, below client ${clientLabel}'s minimum of ${entry.minShelfLifeDays} — not booked; it is in review (accept anyway, or discard).`;
+    default:
+      return `SKU "${skuCode}" was refused (${entry.code}).`;
+  }
+}
+
+/**
+ * Story 1-2b — the `grn.lines-refused` row's `problemDetail`, by its
+ * winning code. A row of client refusals only keeps its pre-1-2b words
+ * byte for byte; expiry codes add their own sentence.
+ */
+function linesRefusedDetail(
+  problemCode: (typeof LINES_REFUSED_CODE_PRECEDENCE)[number],
+  refused: readonly ClientRefusedLine[],
+  grnCode: string | null,
+  clientLabel: string,
+): string {
+  const clientOnly = refused.every((entry) => entry.code === 'client-departed' || entry.code === 'sku-client-mismatch');
+  const mixedTail = clientOnly ? '' : ' Other lines were refused for their expiry date — each line names its reason.';
+  if (problemCode === 'client-departed') {
+    return (
+      (grnCode === null
+        ? `No goods receipt was recorded — all ${refused.length} line(s) were refused, their SKUs' client (${clientLabel}) having departed or differing from the receipt's.`
+        : `${refused.length} line(s) of goods receipt "${grnCode}" were not booked — their SKUs' client has departed or differs from the receipt's.`) +
+      ' Re-receive them after an owner reactivates the client.' +
+      mixedTail
+    );
+  }
+  if (problemCode === 'sku-client-mismatch') {
+    return (
+      (grnCode === null
+        ? `No goods receipt was recorded — all ${refused.length} line(s) belong to another client than the receipt's (${clientLabel}).`
+        : `${refused.length} line(s) of goods receipt "${grnCode}" were not booked — their SKUs belong to another client than the receipt's (${clientLabel}).`) +
+      ' Receive them again on a receipt for their own client.' +
+      mixedTail
+    );
+  }
+  const head =
+    grnCode === null
+      ? `No goods receipt was recorded — all ${refused.length} line(s) were refused for their expiry date`
+      : `${refused.length} line(s) of goods receipt "${grnCode}" were not booked for their expiry date`;
+  const why: Record<string, string> = {
+    'batch-expiry-mismatch': "an expiry that differs from its batch's",
+    'expiry-before-mfg': 'an expiry before its mfg date',
+    'expiry-on-untracked': 'an expiry on a SKU that is not batch-tracked',
+    'expiry-required': `no expiry date, which client ${clientLabel} requires`,
+  };
+  const counts = new Map<string, number>();
+  for (const entry of refused) counts.set(entry.code, (counts.get(entry.code) ?? 0) + 1);
+  const parts = LINES_REFUSED_CODE_PRECEDENCE.filter((code) => counts.has(code) && why[code] !== undefined).map(
+    (code) => `${counts.get(code)} with ${why[code]}`,
+  );
+  return `${head} (${parts.join('; ')}). Check the labels and receive them again.`;
 }
 
 function grnValidation(detail: string): ProblemException {

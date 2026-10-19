@@ -5,6 +5,7 @@ import {
   IsArray,
   IsBoolean,
   IsIn,
+  IsInt,
   IsOptional,
   IsString,
   Length,
@@ -18,6 +19,9 @@ import {
   CLIENT_CONTACT_ROLES,
   CLIENT_NAME_MAX,
   CLIENT_STATUSES,
+  MIN_SHELF_LIFE_DAYS_MAX,
+  MIN_SHELF_LIFE_DAYS_MIN,
+  RECEIVING_TOLERANCE_BPS_MAX,
   type ClientContactRole,
   type ClientStatus,
 } from '../modules/clients/clients.schema';
@@ -349,6 +353,88 @@ export class ClientContactListResponse {
   items!: readonly ClientContactDto[];
 }
 
+/**
+ * Story 1-2b — a client's receiving policy, as every read returns it. The
+ * tolerance is in BASIS POINTS (500 = 5 %).
+ */
+export class ClientReceivingPolicyDto {
+  @ApiProperty({
+    type: 'integer',
+    minimum: 0,
+    maximum: RECEIVING_TOLERANCE_BPS_MAX,
+    example: 500,
+    description:
+      'Over-receipt tolerance in basis points of the ordered / announced quantity (500 = 5 %). Excess within it books at once (floored to the unit\'s step); the rest pends for approval as before. 0 = every excess pends',
+  })
+  receivingToleranceBps!: number;
+
+  @ApiProperty({
+    description:
+      'Every booked receipt line of this client is put on its own receipt-scoped QC hold (released one by one or per receipt). Serial-tracked and catch-weight lines are not held',
+  })
+  qcOnReceipt!: boolean;
+
+  @ApiProperty({
+    description:
+      'A batch-tracked line must carry an expiry date (or its batch must already have one), else it is refused per line (`expiry-required`); an already expired batch is refused (`shelf-life-short`). Untracked SKUs are not covered',
+  })
+  expiryRequired!: boolean;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    minimum: MIN_SHELF_LIFE_DAYS_MIN,
+    maximum: MIN_SHELF_LIFE_DAYS_MAX,
+    description:
+      "The minimum remaining shelf life, in IST calendar days from the receipt's business date to the expiry date; a shorter line is refused (`shelf-life-short`, its own review row, Accept anyway with a note). Only beside expiryRequired; null = none",
+  })
+  minShelfLifeDays!: number | null;
+}
+
+/**
+ * Story 1-2b — `PUT …/clients/{c}/receiving-policy`: a FULL replace of the
+ * four fields (never "omitted = unchanged"). The command re-checks every
+ * rule (it is the boundary) and names the field in its 400.
+ */
+export class UpdateClientReceivingPolicyDto {
+  @ApiProperty({ type: 'integer', minimum: 0, maximum: RECEIVING_TOLERANCE_BPS_MAX, example: 500, description: 'Basis points, an integer (500 = 5 %)' })
+  @IsInt()
+  receivingToleranceBps!: number;
+
+  @ApiProperty()
+  @IsBoolean()
+  qcOnReceipt!: boolean;
+
+  @ApiProperty()
+  @IsBoolean()
+  expiryRequired!: boolean;
+
+  @ApiProperty({
+    type: 'integer',
+    nullable: true,
+    minimum: MIN_SHELF_LIFE_DAYS_MIN,
+    maximum: MIN_SHELF_LIFE_DAYS_MAX,
+    description: 'IST calendar days; null for none. Requires expiryRequired',
+  })
+  @ValidateIf((_, value) => value !== null)
+  @IsInt()
+  minShelfLifeDays!: number | null;
+}
+
+/** Story 1-2b — `GET …/clients/{c}/receiving-policy`. */
+export class ClientReceivingPolicyResponse extends ClientReceivingPolicyDto {
+  @ApiProperty({ format: 'uuid' })
+  clientId!: string;
+
+  @ApiProperty({
+    type: 'integer',
+    minimum: 0,
+    description:
+      "How many of the client's SKUs are NOT batch-tracked (kits excluded) — the expiry rules do not reach them; they receive as before",
+  })
+  untrackedSkuCount!: number;
+}
+
 export class ClientDto {
   @ApiProperty({ format: 'uuid' })
   id!: string;
@@ -391,6 +477,14 @@ export class ClientDto {
 
   @ApiProperty({ type: AddressDto, nullable: true, description: 'Story 1-2a — where returned goods go back to, in the shipment address shape (null when unset)' })
   returnAddress!: AddressDto | null;
+
+  @ApiProperty({
+    type: ClientReceivingPolicyDto,
+    required: false,
+    description:
+      'Story 1-2b — the receiving policy. Optional: a mutation answer stored before 1-2b replays without it; every fresh read carries it',
+  })
+  receivingPolicy?: ClientReceivingPolicyDto;
 }
 
 export class ClientResponse {

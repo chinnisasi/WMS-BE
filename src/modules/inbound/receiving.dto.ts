@@ -98,6 +98,19 @@ export class GrnLineInputDto {
   mfgDate?: string | null;
 
   @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    example: '2027-03-31',
+    description:
+      "Story 1-2b — the batch's expiry date as the label states it: an IST calendar date YYYY-MM-DD (a malformed one is a 400). Omit when there is none. Every rule about it is a per-line refusal: on an untracked SKU (`expiry-on-untracked`), before the line's mfg date (`expiry-before-mfg`), unlike the batch's existing expiry or another line's for the same batch (`batch-expiry-mismatch`), missing when the client requires it (`expiry-required`), or fewer days away than the client's minimum (`shelf-life-short`, its own review row)",
+  })
+  @IsOptional()
+  @IsString()
+  @Length(10, 10)
+  expiryDate?: string | null;
+
+  @ApiProperty({
     description: `Physically received quantity. ${QUANTITY_FIELD_DESCRIPTION}`,
     minimum: 0.001,
     maximum: MAX_QUANTITY_BASE,
@@ -236,6 +249,14 @@ export class GrnLineDto {
 
   @ApiProperty({
     required: false,
+    minimum: 0,
+    description:
+      "Story 1-2b — the part of appliedQty past the open quantity that booked at once within the client's receiving tolerance (no over-receipt). Present only when > 0",
+  })
+  toleranceQty?: number;
+
+  @ApiProperty({
+    required: false,
     type: [String],
     description:
       'Catch weight (story 10.3): the handling units this line produced, in the order their weights were supplied — present only on a catch-weight line. These ids are what a unit label carries and what the pack bench scans back.',
@@ -260,12 +281,30 @@ export class RejectedGrnLineDto {
   @ApiProperty({
     enum: [...REJECTED_GRN_LINE_CODES],
     description:
-      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt\'s line whose SKU belongs to another client than the receipt\'s; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU\'s client has departed; also to review (Discard only — re-receive after an owner reactivates the client)',
+      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt\'s line whose SKU belongs to another client than the receipt\'s; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU\'s client has departed; also to review (Discard only — re-receive after an owner reactivates the client). Story 1-2b — the expiry rules, each per line: `expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required` (review, Discard only) and `shelf-life-short` (its own review row — Accept anyway with a note, or Discard)',
   })
   code!: string;
 
   @ApiProperty({ description: 'Human-readable reason naming the line state' })
   reason!: string;
+
+  @ApiProperty({ required: false, type: 'integer', minimum: 0, description: "Story 1-2b — the line's index in the request (present on an expiry refusal only)" })
+  index?: number;
+
+  @ApiProperty({ required: false, type: String, nullable: true, description: "Story 1-2b — the line's batch code (present on an expiry refusal only)" })
+  batchCode?: string | null;
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    description:
+      "Story 1-2b — the expiry date the rule judged (YYYY-MM-DD, IST): the line's own, or for `expiry-required` / `shelf-life-short` the effective one (the line's, else its batch's); null when none. Present on an expiry refusal only",
+  })
+  expiryDate?: string | null;
+
+  @ApiProperty({ required: false, type: 'integer', minimum: 0, description: "Story 1-2b — `shelf-life-short` only: the client's minimum remaining shelf life in days (0 when the client sets none — the batch had expired)" })
+  minShelfLifeDays?: number;
 }
 
 /** Story 21-6 — one request line that settled unmatched (applied in full, no line credited). */
@@ -350,9 +389,27 @@ export class GoodsReceiptDto {
   @ApiProperty({
     required: false,
     description:
-      'Story 1-1 — the op id of the review row raised for the `sku-client-mismatch` lines (Conflicts & Reviews, type `grn.lines-refused`, Discard only); present only when one was raised',
+      'Story 1-1 — the op id of the review row raised for the refused lines (Conflicts & Reviews, type `grn.lines-refused`, Discard only) — since 1-2a/1-2b every per-line refusal but `shelf-life-short` (which has its own row, `shelfLifeReviewOpId`); present only when one was raised',
   })
   reviewOpId?: string;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Story 1-2b — the op id of the review row raised for the `shelf-life-short` lines (type `grn.shelf-life-refused` — Accept anyway with a note, or Discard); present only when one was raised',
+  })
+  shelfLifeReviewOpId?: string;
+
+  @ApiProperty({ required: false, minimum: 1, description: "Story 1-2b — how many booked lines were put on receipt QC holds (the client's QC on receipt); present only when > 0" })
+  qcHeldLines?: number;
+
+  @ApiProperty({
+    required: false,
+    minimum: 1,
+    description:
+      'Story 1-2b — how many booked lines of a QC-on-receipt client were NOT held because the SKU is serial-tracked or catch-weight; present only when > 0',
+  })
+  qcSkippedLines?: number;
 }
 
 /**
@@ -372,11 +429,22 @@ export class RefusedReceiptDto {
   @ApiProperty({ description: 'Device time of the receipt (ISO-8601 UTC)' })
   occurredAt!: string;
 
-  @ApiProperty({ type: [RejectedGrnLineDto], description: 'Every request line, each `sku-client-mismatch` or (story 1-2a) `client-departed`' })
+  @ApiProperty({
+    type: [RejectedGrnLineDto],
+    description:
+      'Every request line, each `sku-client-mismatch` or (story 1-2a) `client-departed` or (story 1-2b) one of the expiry codes (`expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required`, `shelf-life-short`)',
+  })
   rejectedLines!: readonly RejectedGrnLineDto[];
 
-  @ApiProperty({ description: 'The op id of the review row (`grn.lines-refused`, Discard only)' })
-  reviewOpId!: string;
+  @ApiProperty({
+    required: false,
+    description:
+      'The op id of the review row (`grn.lines-refused`, Discard only). Story 1-2b: absent when every line was refused `shelf-life-short` (only that row was raised)',
+  })
+  reviewOpId?: string;
+
+  @ApiProperty({ required: false, description: 'Story 1-2b — the op id of the `grn.shelf-life-refused` review row, when one was raised' })
+  shelfLifeReviewOpId?: string;
 }
 
 export class GoodsReceiptResponse {
@@ -579,6 +647,13 @@ export class OverReceiptDto {
 
   @ApiProperty({ description: 'Row creation time (the keyset cursor field), ISO-8601 UTC' })
   createdAt!: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: "Story 1-2b — on an approval's answer only: the receipt QC hold the approved excess was put on (the client's QC on receipt)",
+  })
+  qcHoldId?: string;
 }
 
 export class OverReceiptListQuery {
@@ -709,6 +784,25 @@ export class CatalogSnapshotSkuDto {
   clientId!: string;
 }
 
+/**
+ * Story 1-2b — a client's receiving policy as the device snapshot carries it
+ * (the `GET …/clients/{c}/receiving-policy` fields; declared here because a
+ * module DTO never imports the api shell).
+ */
+export class CatalogClientReceivingPolicyDto {
+  @ApiProperty({ type: 'integer', minimum: 0, maximum: 10000, description: 'Over-receipt tolerance, basis points of the ordered / announced quantity (500 = 5 %)' })
+  receivingToleranceBps!: number;
+
+  @ApiProperty({ description: 'Booked lines are put on receipt QC holds' })
+  qcOnReceipt!: boolean;
+
+  @ApiProperty({ description: 'A batch-tracked line needs an expiry date' })
+  expiryRequired!: boolean;
+
+  @ApiProperty({ type: 'integer', nullable: true, description: 'Minimum remaining shelf life in IST calendar days, or null' })
+  minShelfLifeDays!: number | null;
+}
+
 /** Story 1-1 — one client named by the device snapshot (a SKU's or an open document's). */
 export class CatalogSnapshotClientDto {
   @ApiProperty({ format: 'uuid' })
@@ -722,6 +816,14 @@ export class CatalogSnapshotClientDto {
 
   @ApiProperty({ description: 'False when suspended or departed — a blind receipt picks only an active client' })
   active!: boolean;
+
+  @ApiProperty({
+    type: () => CatalogClientReceivingPolicyDto,
+    required: false,
+    description:
+      'Story 1-2b — the client\'s receiving policy, so the handheld can WARN at the dock (it never blocks; the server decides on replay). Absent = the device warns about nothing',
+  })
+  receivingPolicy?: CatalogClientReceivingPolicyDto;
 }
 
 /** One open PO of the device snapshot (header + line quantities). */
@@ -759,7 +861,7 @@ export class CatalogSnapshotAsnLineDto {
   @ApiProperty({ description: 'Received to date, in base UoM', minimum: 0 })
   receivedQty!: number;
 
-  @ApiProperty({ description: 'Derived: announcedQty − receivedQty (negative after an approved over-receipt)' })
+  @ApiProperty({ description: 'Derived: announcedQty − receivedQty, clamped at 0 for display (story 1-2b — received may pass announced after an approved over-receipt or a within-tolerance receipt)', minimum: 0 })
   openQty!: number;
 }
 

@@ -18,6 +18,9 @@ import {
   CLIENT_CONTACT_ROLES,
   CLIENT_NAME_MAX,
   MAX_CLIENT_CONTACTS,
+  MIN_SHELF_LIFE_DAYS_MAX,
+  MIN_SHELF_LIFE_DAYS_MIN,
+  RECEIVING_TOLERANCE_BPS_MAX,
   SELF_CLIENT_CODE,
   clientContacts,
   clients,
@@ -210,6 +213,21 @@ interface NormalizedRegisteredAddress {
   readonly city: string;
   readonly stateCode: string;
   readonly pincode: string;
+}
+
+/**
+ * Story 1-2b — the receiving policy write: a FULL replace of the four fields
+ * (never the addresses DTO's "omitted = unchanged"). The tolerance is in
+ * basis points (the web converts a percent by string arithmetic).
+ */
+export interface UpdateReceivingPolicyCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly clientId: string;
+  readonly receivingToleranceBps: number;
+  readonly qcOnReceipt: boolean;
+  readonly expiryRequired: boolean;
+  readonly minShelfLifeDays: number | null;
 }
 
 export interface AddClientContactCommand {
@@ -673,6 +691,69 @@ export class ClientsCommand {
   }
 
   /**
+   * Story 1-2b — a client's receiving policy (`clients.manage`, owner-only).
+   * A FULL replace of the four fields. The `updateAddresses` skeleton: hash
+   * before the tx (`arm: 'receiving-policy'`, the tolerance as its bps
+   * integer) → authority → replay → lock the client `FOR NO KEY UPDATE`
+   * (404) → replay again under the lock → the shape rules (400
+   * `validation-failed` naming the field) → an unchanged policy is a no-op
+   * that STORES the key (`clients.receivingPolicy:unchanged`) and writes
+   * nothing else → the write → audit `client.receiving_policy_updated` → the
+   * key LAST. Allowed on the self client and on a departed one (a policy is
+   * not work).
+   */
+  async updateReceivingPolicy(
+    command: UpdateReceivingPolicyCommand,
+    idempotencyKey: string,
+  ): Promise<ClientMutationSnapshot> {
+    const payloadHash = hashCommandPayload({
+      arm: 'receiving-policy',
+      tenantId: command.tenantId,
+      clientId: command.clientId,
+      receivingToleranceBps: command.receivingToleranceBps,
+      qcOnReceipt: command.qcOnReceipt,
+      expiryRequired: command.expiryRequired,
+      minShelfLifeDays: command.minShelfLifeDays,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'clients.manage');
+      const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) {
+        return replayed;
+      }
+      const current = await this.lockClientForEdit(tx, command.tenantId, command.clientId);
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) {
+        return replayedUnderLock;
+      }
+      const valid = assertReceivingPolicy(command);
+      const changed =
+        valid.receivingToleranceBps !== current.receivingToleranceBps ||
+        valid.qcOnReceipt !== current.qcOnReceipt ||
+        valid.expiryRequired !== current.expiryRequired ||
+        valid.minShelfLifeDays !== current.minShelfLifeDays;
+      if (!changed) {
+        // A declared no-op (`clients.receivingPolicy:unchanged`): nothing
+        // written or audited, the key stored — so a late retry after another
+        // edit replays this answer rather than reverting it.
+        const unchanged: ClientMutationSnapshot = { client: toClientSnapshot(current) };
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
+        return unchanged;
+      }
+      const rows = await tx
+        .update(clients)
+        .set({ ...valid, updatedAt: nowIso() })
+        .where(and(eq(clients.tenantId, command.tenantId), eq(clients.id, current.id)))
+        .returning();
+      const snapshot: ClientMutationSnapshot = { client: toClientSnapshot(rows[0]!) };
+      await this.audit(tx, command.tenantId, command.actorUserId, 'client.receiving_policy_updated', current.id, idempotencyKey);
+      await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /**
    * Story 1-2a — add a contact to a client (`clients.manage`). The house
    * skeleton: normalize + hash (`arm: 'contact-add'`) → authority → replay →
    * lock the client `FOR NO KEY UPDATE` (404) → replay again → the shape
@@ -1019,6 +1100,7 @@ export class ClientsCommand {
       | 'client.reactivated'
       | 'client.departed'
       | 'client.addresses_updated'
+      | 'client.receiving_policy_updated'
       | 'client.contact_added'
       | 'client.contact_edited'
       | 'client.contact_removed',
@@ -1265,6 +1347,60 @@ export function assertRegisteredAddress(address: NormalizedRegisteredAddress): N
     throw invalid(`registeredAddress.pincode must be six digits (got "${address.pincode}").`);
   }
   return address;
+}
+
+/**
+ * Story 1-2b — the receiving policy's shape rules (the 0078 CHECKs, answered
+ * as a 400 `validation-failed` naming the field): the tolerance an integer
+ * 0–10000 basis points; the minimum remaining life null or an integer
+ * 1–3650 days, and only beside `expiryRequired`.
+ */
+export function assertReceivingPolicy(command: {
+  readonly receivingToleranceBps: unknown;
+  readonly qcOnReceipt: unknown;
+  readonly expiryRequired: unknown;
+  readonly minShelfLifeDays: unknown;
+}): {
+  receivingToleranceBps: number;
+  qcOnReceipt: boolean;
+  expiryRequired: boolean;
+  minShelfLifeDays: number | null;
+} {
+  // The refused field rides as an extension member (`field`), so the web maps
+  // the error to its input by name, never by reading the prose.
+  const invalid = (field: string, detail: string): ProblemException =>
+    new ProblemException('validation-failed', 400, 'Invalid receiving policy', detail, { field });
+  const bps = command.receivingToleranceBps;
+  if (typeof bps !== 'number' || !Number.isInteger(bps) || bps < 0 || bps > RECEIVING_TOLERANCE_BPS_MAX) {
+    throw invalid(
+      'receivingToleranceBps',
+      `receivingToleranceBps must be a whole number of basis points from 0 to ${RECEIVING_TOLERANCE_BPS_MAX} (got ${JSON.stringify(bps)}).`,
+    );
+  }
+  if (typeof command.qcOnReceipt !== 'boolean') {
+    throw invalid('qcOnReceipt', `qcOnReceipt must be true or false (got ${JSON.stringify(command.qcOnReceipt)}).`);
+  }
+  if (typeof command.expiryRequired !== 'boolean') {
+    throw invalid('expiryRequired', `expiryRequired must be true or false (got ${JSON.stringify(command.expiryRequired)}).`);
+  }
+  const days = command.minShelfLifeDays;
+  if (days !== null) {
+    if (typeof days !== 'number' || !Number.isInteger(days) || days < MIN_SHELF_LIFE_DAYS_MIN || days > MIN_SHELF_LIFE_DAYS_MAX) {
+      throw invalid(
+        'minShelfLifeDays',
+        `minShelfLifeDays must be null or a whole number of days from ${MIN_SHELF_LIFE_DAYS_MIN} to ${MIN_SHELF_LIFE_DAYS_MAX} (got ${JSON.stringify(days)}).`,
+      );
+    }
+    if (!command.expiryRequired) {
+      throw invalid('minShelfLifeDays', 'minShelfLifeDays needs expiryRequired — a minimum remaining life is judged against a required expiry date.');
+    }
+  }
+  return {
+    receivingToleranceBps: bps,
+    qcOnReceipt: command.qcOnReceipt,
+    expiryRequired: command.expiryRequired,
+    minShelfLifeDays: days,
+  };
 }
 
 function duplicateContactEmail(email: string): ProblemException {

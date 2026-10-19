@@ -944,7 +944,9 @@ export function lineSnapshot(row: PurchaseOrderLine): PurchaseOrderLineSnapshot 
     // here, so this is where milli-units become the base UoM again.
     orderedQty: fromMilli(row.orderedQty),
     receivedQty: fromMilli(row.receivedQty),
-    openQty: fromMilli(row.orderedQty - row.receivedQty),
+    // Story 1-2b — clamped at 0 for display: received may pass ordered (an
+    // approved over-receipt, or a within-tolerance receipt).
+    openQty: fromMilli(Math.max(0, row.orderedQty - row.receivedQty)),
     unitCostPaise: row.unitCostPaise,
     expectedDate: row.expectedDate === null ? null : canonicalInstant(row.expectedDate),
     status: row.status,

@@ -5699,7 +5699,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, unknown decision, or the payload refusing an arm (validation-failed — including a payload recount cannot re-plan)",
+            "description": "Missing or malformed Idempotency-Key, unknown decision, or the payload refusing an arm (validation-failed — including a payload recount cannot re-plan; story 1-2b: Apply on a grn.shelf-life-refused row without a note, or a note over 500 characters)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -5739,7 +5739,7 @@
             }
           },
           "409": {
-            "description": "Row already resolved (rejected-op-resolved), a decision the op type does not admit — story 13-2: a return.receive row is Discard only (decision-not-available, member decisions), a pending count task on the bin (count-task-open), or the re-executed command's own conflict (verbatim)",
+            "description": "Row already resolved (rejected-op-resolved), a decision the op type does not admit — story 13-2: a return.receive row is Discard only; story 1-2b: a grn.shelf-life-refused row admits Apply and Discard (decision-not-available, member decisions), a pending count task on the bin (count-task-open), or the re-executed command's own conflict (verbatim)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12958,6 +12958,16 @@
             }
           },
           {
+            "name": "grnId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-2b — only one goods receipt's QC-on-receipt holds",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -13155,6 +13165,126 @@
           }
         ],
         "summary": "Releases a QC hold (qc.manage) — qc.released movements return exactly the held units (the hold's own ledger arms) to its recorded origin bin; audited",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/qc-holds/release-receipt": {
+      "post": {
+        "operationId": "ReceivingController_releaseReceiptHolds",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReleaseReceiptHoldsDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The released holds (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReleaseReceiptHoldsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed grnId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks qc.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No goods receipt with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The receipt has no open QC-on-receipt hold (qc-hold-released), a hold's origin bin is gone (qc-hold-origin-bin-gone), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 1-2b — releases EVERY open QC-on-receipt hold of one goods receipt in one transaction (qc.manage) — each hold's own qc.released arms return its units to the Receiving bin, where they become putaway work; one audit row; the receipt's notification resolves",
         "tags": [
           "receiving"
         ]
@@ -21341,6 +21471,220 @@
         ]
       }
     },
+    "/tenants/{tenantId}/clients/{clientId}/receiving-policy": {
+      "get": {
+        "operationId": "ClientsController_getReceivingPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientReceivingPolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Reads a client's receiving policy — tolerance (basis points), QC on receipt, expiry required, minimum remaining shelf life — plus how many of its SKUs are untracked (any staff session; never the portal)",
+        "tags": [
+          "clients"
+        ]
+      },
+      "put": {
+        "operationId": "ClientsController_updateReceivingPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateClientReceivingPolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed clientId, or a field that breaks its rule — a tolerance outside 0-10000 basis points, a minimum shelf life outside 1-3650 days or without expiryRequired (validation-failed, naming the field)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks clients.manage — owner only (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Replaces a client's receiving policy whole (owner-only, clients.manage). Allowed on the self client and on a departed one. An unchanged policy is a no-op (nothing written or audited; the key is stored)",
+        "tags": [
+          "clients"
+        ]
+      }
+    },
     "/tenants/{tenantId}/clients/{clientId}/contacts": {
       "get": {
         "operationId": "ClientsController_listContacts",
@@ -29277,7 +29621,8 @@
               "transfer.confirm",
               "count.submit",
               "return.receive",
-              "grn.lines-refused"
+              "grn.lines-refused",
+              "grn.shelf-life-refused"
             ]
           },
           "classification": {
@@ -29426,7 +29771,8 @@
               "transfer.confirm",
               "count.submit",
               "return.receive",
-              "grn.lines-refused"
+              "grn.lines-refused",
+              "grn.shelf-life-refused"
             ]
           },
           "classification": {
@@ -29555,6 +29901,11 @@
           "occurredAt": {
             "type": "string",
             "description": "The decision instant (ISO-8601 UTC; server clock when absent)"
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Story 1-2b — the reviewer's note (trimmed, at most 500 characters). REQUIRED to apply a `grn.shelf-life-refused` row — accepting short-dated goods (400 without one; the row stays open); recorded in the outcome on any decision"
           }
         },
         "required": [
@@ -31218,7 +31569,8 @@
           },
           "openQty": {
             "type": "number",
-            "description": "Derived: orderedQty − receivedQty (may go negative after an approved over-receipt — Story 3.3 relaxes the 3.1 `minimum: 0` bound)"
+            "description": "Derived: orderedQty − receivedQty, clamped at 0 for display (story 1-2b — received may pass ordered after an approved over-receipt or a within-tolerance receipt)",
+            "minimum": 0
           },
           "unitCostPaise": {
             "type": "number",
@@ -31517,7 +31869,8 @@
           },
           "openQty": {
             "type": "number",
-            "description": "Derived: announcedQty − receivedQty (negative after an approved over-receipt)"
+            "description": "Derived: announcedQty − receivedQty, clamped at 0 for display (story 1-2b — received may pass announced after an approved over-receipt or a within-tolerance receipt)",
+            "minimum": 0
           }
         },
         "required": [
@@ -34214,6 +34567,12 @@
             "minLength": 20,
             "maxLength": 35
           },
+          "expiryDate": {
+            "type": "string",
+            "nullable": true,
+            "example": "2027-03-31",
+            "description": "Story 1-2b — the batch's expiry date as the label states it: an IST calendar date YYYY-MM-DD (a malformed one is a 400). Omit when there is none. Every rule about it is a per-line refusal: on an untracked SKU (`expiry-on-untracked`), before the line's mfg date (`expiry-before-mfg`), unlike the batch's existing expiry or another line's for the same batch (`batch-expiry-mismatch`), missing when the client requires it (`expiry-required`), or fewer days away than the client's minimum (`shelf-life-short`, its own review row)"
+          },
           "qty": {
             "type": "number",
             "description": "Physically received quantity. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
@@ -34343,6 +34702,11 @@
             "description": "The excess pended for approval — the whole quantity on a late receipt against a closed or cancelled document (story 21-9)",
             "minimum": 0
           },
+          "toleranceQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 1-2b — the part of appliedQty past the open quantity that booked at once within the client's receiving tolerance (no over-receipt). Present only when > 0"
+          },
           "handlingUnitIds": {
             "description": "Catch weight (story 10.3): the handling units this line produced, in the order their weights were supplied — present only on a catch-weight line. These ids are what a unit label carries and what the pack bench scans back.",
             "type": "array",
@@ -34392,13 +34756,38 @@
               "po-line-not-open",
               "asn-line-not-found",
               "sku-client-mismatch",
-              "client-departed"
+              "client-departed",
+              "expiry-on-untracked",
+              "expiry-before-mfg",
+              "batch-expiry-mismatch",
+              "expiry-required",
+              "shelf-life-short"
             ],
-            "description": "Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt's line whose SKU belongs to another client than the receipt's; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU's client has departed; also to review (Discard only — re-receive after an owner reactivates the client)"
+            "description": "Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt's line whose SKU belongs to another client than the receipt's; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU's client has departed; also to review (Discard only — re-receive after an owner reactivates the client). Story 1-2b — the expiry rules, each per line: `expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required` (review, Discard only) and `shelf-life-short` (its own review row — Accept anyway with a note, or Discard)"
           },
           "reason": {
             "type": "string",
             "description": "Human-readable reason naming the line state"
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Story 1-2b — the line's index in the request (present on an expiry refusal only)"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 1-2b — the line's batch code (present on an expiry refusal only)"
+          },
+          "expiryDate": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 1-2b — the expiry date the rule judged (YYYY-MM-DD, IST): the line's own, or for `expiry-required` / `shelf-life-short` the effective one (the line's, else its batch's); null when none. Present on an expiry refusal only"
+          },
+          "minShelfLifeDays": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Story 1-2b — `shelf-life-short` only: the client's minimum remaining shelf life in days (0 when the client sets none — the batch had expired)"
           }
         },
         "required": [
@@ -34525,7 +34914,21 @@
           },
           "reviewOpId": {
             "type": "string",
-            "description": "Story 1-1 — the op id of the review row raised for the `sku-client-mismatch` lines (Conflicts & Reviews, type `grn.lines-refused`, Discard only); present only when one was raised"
+            "description": "Story 1-1 — the op id of the review row raised for the refused lines (Conflicts & Reviews, type `grn.lines-refused`, Discard only) — since 1-2a/1-2b every per-line refusal but `shelf-life-short` (which has its own row, `shelfLifeReviewOpId`); present only when one was raised"
+          },
+          "shelfLifeReviewOpId": {
+            "type": "string",
+            "description": "Story 1-2b — the op id of the review row raised for the `shelf-life-short` lines (type `grn.shelf-life-refused` — Accept anyway with a note, or Discard); present only when one was raised"
+          },
+          "qcHeldLines": {
+            "type": "number",
+            "minimum": 1,
+            "description": "Story 1-2b — how many booked lines were put on receipt QC holds (the client's QC on receipt); present only when > 0"
+          },
+          "qcSkippedLines": {
+            "type": "number",
+            "minimum": 1,
+            "description": "Story 1-2b — how many booked lines of a QC-on-receipt client were NOT held because the SKU is serial-tracked or catch-weight; present only when > 0"
           }
         },
         "required": [
@@ -34570,7 +34973,7 @@
             "description": "Device time of the receipt (ISO-8601 UTC)"
           },
           "rejectedLines": {
-            "description": "Every request line, each `sku-client-mismatch` or (story 1-2a) `client-departed`",
+            "description": "Every request line, each `sku-client-mismatch` or (story 1-2a) `client-departed` or (story 1-2b) one of the expiry codes (`expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required`, `shelf-life-short`)",
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RejectedGrnLineDto"
@@ -34578,7 +34981,11 @@
           },
           "reviewOpId": {
             "type": "string",
-            "description": "The op id of the review row (`grn.lines-refused`, Discard only)"
+            "description": "The op id of the review row (`grn.lines-refused`, Discard only). Story 1-2b: absent when every line was refused `shelf-life-short` (only that row was raised)"
+          },
+          "shelfLifeReviewOpId": {
+            "type": "string",
+            "description": "Story 1-2b — the op id of the `grn.shelf-life-refused` review row, when one was raised"
           }
         },
         "required": [
@@ -34586,8 +34993,7 @@
           "clientId",
           "blindReasonCode",
           "occurredAt",
-          "rejectedLines",
-          "reviewOpId"
+          "rejectedLines"
         ]
       },
       "GoodsReceiptResponse": {
@@ -34808,7 +35214,8 @@
           },
           "openQty": {
             "type": "number",
-            "description": "Derived: announcedQty − receivedQty (negative after an approved over-receipt)"
+            "description": "Derived: announcedQty − receivedQty, clamped at 0 for display (story 1-2b — received may pass announced after an approved over-receipt or a within-tolerance receipt)",
+            "minimum": 0
           }
         },
         "required": [
@@ -35449,6 +35856,36 @@
           "lines"
         ]
       },
+      "CatalogClientReceivingPolicyDto": {
+        "type": "object",
+        "properties": {
+          "receivingToleranceBps": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "description": "Over-receipt tolerance, basis points of the ordered / announced quantity (500 = 5 %)"
+          },
+          "qcOnReceipt": {
+            "type": "boolean",
+            "description": "Booked lines are put on receipt QC holds"
+          },
+          "expiryRequired": {
+            "type": "boolean",
+            "description": "A batch-tracked line needs an expiry date"
+          },
+          "minShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Minimum remaining shelf life in IST calendar days, or null"
+          }
+        },
+        "required": [
+          "receivingToleranceBps",
+          "qcOnReceipt",
+          "expiryRequired",
+          "minShelfLifeDays"
+        ]
+      },
       "CatalogSnapshotClientDto": {
         "type": "object",
         "properties": {
@@ -35467,6 +35904,14 @@
           "active": {
             "type": "boolean",
             "description": "False when suspended or departed — a blind receipt picks only an active client"
+          },
+          "receivingPolicy": {
+            "description": "Story 1-2b — the client's receiving policy, so the handheld can WARN at the dock (it never blocks; the server decides on replay). Absent = the device warns about nothing",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CatalogClientReceivingPolicyDto"
+              }
+            ]
           }
         },
         "required": [
@@ -35794,6 +36239,11 @@
           "createdAt": {
             "type": "string",
             "description": "Row creation time (the keyset cursor field), ISO-8601 UTC"
+          },
+          "qcHoldId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-2b — on an approval's answer only: the receipt QC hold the approved excess was put on (the client's QC on receipt)"
           }
         },
         "required": [
@@ -35931,6 +36381,19 @@
           "createdAt": {
             "type": "string",
             "description": "Row creation time (the keyset cursor field), ISO-8601 UTC"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "receipt"
+            ],
+            "description": "Story 1-2b — `receipt`: placed by the receipt itself (the client's QC on receipt), one per GRN line; `manual`: an Ops Manager's (sku, bin) scope hold. Always present on the list; on a command's answer present only for a receipt hold"
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-2b — the GRN line a receipt hold holds (receipt holds only)"
           }
         },
         "required": [
@@ -35959,13 +36422,183 @@
           "qcHold"
         ]
       },
+      "ReleaseReceiptHoldsDto": {
+        "type": "object",
+        "properties": {
+          "grnId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The goods receipt whose open QC-on-receipt holds are released"
+          }
+        },
+        "required": [
+          "grnId"
+        ]
+      },
+      "ReleaseReceiptHoldsResponse": {
+        "type": "object",
+        "properties": {
+          "grnId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnCode": {
+            "type": "string",
+            "description": "The GRN code"
+          },
+          "qcHolds": {
+            "description": "Every hold this call released",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QcHoldDto"
+            }
+          }
+        },
+        "required": [
+          "grnId",
+          "grnCode",
+          "qcHolds"
+        ]
+      },
+      "QcHoldEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "binId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The origin bin (release returns here)"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why the stock is quarantined (carried verbatim)"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "released"
+            ]
+          },
+          "heldBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "heldAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "releasedBy": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "releasedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC instant when released; null while the hold is open"
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "Row creation time (the keyset cursor field), ISO-8601 UTC"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "receipt"
+            ],
+            "description": "Story 1-2b — `receipt`: placed by the receipt itself (the client's QC on receipt), one per GRN line; `manual`: an Ops Manager's (sku, bin) scope hold"
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-2b — the GRN line a receipt hold holds (receipt holds only)"
+          },
+          "grnId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 1-2b — the receipt hold's GRN (null on a manual hold)"
+          },
+          "grnCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 1-2b — the receipt hold's GRN code (null on a manual hold)"
+          },
+          "overReceiptId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 1-2b — set when the receipt hold holds an approved over-receipt's excess"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-2b — the held SKU's client"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true,
+            "description": "Story 1-2b — the batch held (null on an untracked SKU, or when a manual hold moved several batches)"
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 1-2b — that batch's code"
+          },
+          "heldQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 1-2b — the quantity the hold moved into QC (the sum of its own qc.held events), base UoM"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "skuId",
+          "binId",
+          "reason",
+          "status",
+          "heldBy",
+          "heldAt",
+          "releasedBy",
+          "releasedAt",
+          "createdAt",
+          "kind",
+          "grnId",
+          "grnCode",
+          "overReceiptId",
+          "clientId",
+          "batchId",
+          "batchCode",
+          "heldQty"
+        ]
+      },
       "QcHoldListResponse": {
         "type": "object",
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/QcHoldDto"
+              "$ref": "#/components/schemas/QcHoldEntryDto"
             }
           },
           "nextCursor": {
@@ -41098,6 +41731,39 @@
           "pincode"
         ]
       },
+      "ClientReceivingPolicyDto": {
+        "type": "object",
+        "properties": {
+          "receivingToleranceBps": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "example": 500,
+            "description": "Over-receipt tolerance in basis points of the ordered / announced quantity (500 = 5 %). Excess within it books at once (floored to the unit's step); the rest pends for approval as before. 0 = every excess pends"
+          },
+          "qcOnReceipt": {
+            "type": "boolean",
+            "description": "Every booked receipt line of this client is put on its own receipt-scoped QC hold (released one by one or per receipt). Serial-tracked and catch-weight lines are not held"
+          },
+          "expiryRequired": {
+            "type": "boolean",
+            "description": "A batch-tracked line must carry an expiry date (or its batch must already have one), else it is refused per line (`expiry-required`); an already expired batch is refused (`shelf-life-short`). Untracked SKUs are not covered"
+          },
+          "minShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "The minimum remaining shelf life, in IST calendar days from the receipt's business date to the expiry date; a shorter line is refused (`shelf-life-short`, its own review row, Accept anyway with a note). Only beside expiryRequired; null = none"
+          }
+        },
+        "required": [
+          "receivingToleranceBps",
+          "qcOnReceipt",
+          "expiryRequired",
+          "minShelfLifeDays"
+        ]
+      },
       "ClientDto": {
         "type": "object",
         "properties": {
@@ -41164,6 +41830,14 @@
             "allOf": [
               {
                 "$ref": "#/components/schemas/AddressDto"
+              }
+            ]
+          },
+          "receivingPolicy": {
+            "description": "Story 1-2b — the receiving policy. Optional: a mutation answer stored before 1-2b replays without it; every fresh read carries it",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ClientReceivingPolicyDto"
               }
             ]
           }
@@ -41369,6 +42043,81 @@
             ]
           }
         }
+      },
+      "ClientReceivingPolicyResponse": {
+        "type": "object",
+        "properties": {
+          "receivingToleranceBps": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "example": 500,
+            "description": "Over-receipt tolerance in basis points of the ordered / announced quantity (500 = 5 %). Excess within it books at once (floored to the unit's step); the rest pends for approval as before. 0 = every excess pends"
+          },
+          "qcOnReceipt": {
+            "type": "boolean",
+            "description": "Every booked receipt line of this client is put on its own receipt-scoped QC hold (released one by one or per receipt). Serial-tracked and catch-weight lines are not held"
+          },
+          "expiryRequired": {
+            "type": "boolean",
+            "description": "A batch-tracked line must carry an expiry date (or its batch must already have one), else it is refused per line (`expiry-required`); an already expired batch is refused (`shelf-life-short`). Untracked SKUs are not covered"
+          },
+          "minShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "The minimum remaining shelf life, in IST calendar days from the receipt's business date to the expiry date; a shorter line is refused (`shelf-life-short`, its own review row, Accept anyway with a note). Only beside expiryRequired; null = none"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "untrackedSkuCount": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many of the client's SKUs are NOT batch-tracked (kits excluded) — the expiry rules do not reach them; they receive as before"
+          }
+        },
+        "required": [
+          "receivingToleranceBps",
+          "qcOnReceipt",
+          "expiryRequired",
+          "minShelfLifeDays",
+          "clientId",
+          "untrackedSkuCount"
+        ]
+      },
+      "UpdateClientReceivingPolicyDto": {
+        "type": "object",
+        "properties": {
+          "receivingToleranceBps": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000,
+            "example": 500,
+            "description": "Basis points, an integer (500 = 5 %)"
+          },
+          "qcOnReceipt": {
+            "type": "boolean"
+          },
+          "expiryRequired": {
+            "type": "boolean"
+          },
+          "minShelfLifeDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 3650,
+            "description": "IST calendar days; null for none. Requires expiryRequired"
+          }
+        },
+        "required": [
+          "receivingToleranceBps",
+          "qcOnReceipt",
+          "expiryRequired",
+          "minShelfLifeDays"
+        ]
       },
       "ClientContactDto": {
         "type": "object",
@@ -45127,6 +45876,87 @@
           "resolution"
         ]
       },
+      "QcReceiptSummaryDto": {
+        "type": "object",
+        "properties": {
+          "grnId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "grnCode": {
+            "type": "string",
+            "description": "The goods receipt code"
+          },
+          "count": {
+            "type": "number",
+            "minimum": 1,
+            "description": "How many lines were held"
+          }
+        },
+        "required": [
+          "grnId",
+          "grnCode",
+          "count"
+        ]
+      },
+      "QcReceiptNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "qc-receipt"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/QcReceiptSummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "released",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
       "NotificationListResponse": {
         "type": "object",
         "properties": {
@@ -45164,6 +45994,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/LedgerChainBreakNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/QcReceiptNotificationDto"
                 }
               ],
               "discriminator": {
@@ -45178,7 +46011,8 @@
                   "qc-hold": "#/components/schemas/QcHoldNotificationDto",
                   "channel-sync": "#/components/schemas/ChannelSyncNotificationDto",
                   "audit-export": "#/components/schemas/AuditExportNotificationDto",
-                  "ledger-chain-break": "#/components/schemas/LedgerChainBreakNotificationDto"
+                  "ledger-chain-break": "#/components/schemas/LedgerChainBreakNotificationDto",
+                  "qc-receipt": "#/components/schemas/QcReceiptNotificationDto"
                 }
               }
             }
