@@ -157,6 +157,11 @@ export class PutawayPlacementResponse {
 }
 
 export class PutawayPlacementListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only placements of one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, format: 'uuid', description: 'Narrow to one warehouse' })
   @IsOptional()
   @IsUUID()
@@ -229,6 +234,11 @@ export class PutawayTaskDto {
 }
 
 export class PutawayTaskListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only tasks of one client's SKUs. An unknown id is an empty list" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ format: 'uuid', description: 'Warehouse the tasks are derived for' })
   @IsUUID()
   warehouseId!: string;

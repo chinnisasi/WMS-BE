@@ -3294,6 +3294,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only one client's SKUs. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "cursor",
             "required": false,
             "in": "query",
@@ -3809,6 +3819,16 @@
             "required": true,
             "in": "path",
             "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only one client's products. An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -4542,6 +4562,16 @@
             "required": true,
             "in": "path",
             "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only one client's kits. An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -6348,6 +6378,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only pendings of one client's SKUs. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "status",
             "required": false,
             "in": "query",
@@ -6686,6 +6726,16 @@
             "name": "warehouseId",
             "required": true,
             "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only events of one client's SKUs. An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -7326,6 +7376,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only stock of one client's SKUs. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "skuId",
             "required": false,
             "in": "query",
@@ -7849,6 +7909,16 @@
             "name": "warehouseId",
             "required": true,
             "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only one client's purchase orders. An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -10164,6 +10234,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only one client's orders (manifests and waves: any order of the client). An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "status",
             "required": false,
             "in": "query",
@@ -10329,6 +10409,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only lines of one client's orders. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "status",
             "required": false,
             "in": "query",
@@ -10473,6 +10563,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only rows of one client's orders or SKUs. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "from",
             "required": false,
             "in": "query",
@@ -10595,6 +10695,16 @@
             "name": "warehouseId",
             "required": true,
             "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only rows of one client's orders or SKUs. An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -10850,6 +10960,16 @@
             "name": "warehouseId",
             "required": true,
             "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only one client's orders (manifests and waves: any order of the client). An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -11991,6 +12111,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only one client's orders (manifests and waves: any order of the client). An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "status",
             "required": false,
             "in": "query",
@@ -12265,6 +12395,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only one client's goods receipts (a legacy receipt with no client matches through its lines' SKUs). An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "warehouseId",
             "required": false,
             "in": "query",
@@ -12494,6 +12634,16 @@
             "required": true,
             "in": "path",
             "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only over-receipts of one client's SKUs. An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -12997,6 +13147,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only holds on one client's SKUs (manual holds included). An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "warehouseId",
             "required": false,
             "in": "query",
@@ -13484,6 +13644,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only placements of one client's SKUs. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "warehouseId",
             "required": false,
             "in": "query",
@@ -13586,6 +13756,16 @@
             "required": true,
             "in": "path",
             "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only tasks of one client's SKUs. An unknown id is an empty list",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -14789,6 +14969,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only transfers with at least one line of one client's SKUs. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "status",
             "required": false,
             "in": "query",
@@ -15867,6 +16057,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only variances of one client's SKUs. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "status",
             "required": false,
             "in": "query",
@@ -16312,6 +16512,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only policies of one client's SKUs. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "warehouseId",
             "required": false,
             "in": "query",
@@ -16543,6 +16753,16 @@
             "required": true,
             "in": "path",
             "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only breaches of one client's SKUs. An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -16785,6 +17005,16 @@
             "required": true,
             "in": "path",
             "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only suggestions for one client's SKUs. An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -17212,6 +17442,16 @@
             "required": true,
             "in": "path",
             "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only alerts on one client's SKUs. An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -18647,6 +18887,16 @@
             }
           },
           {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only invoices of one client's orders. An unknown id is an empty page",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "name": "warehouseId",
             "required": false,
             "in": "query",
@@ -19004,6 +19254,16 @@
             "required": true,
             "in": "path",
             "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only e-way bills of one client's orders (through the invoice). An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"
@@ -26895,6 +27155,16 @@
             "required": true,
             "in": "path",
             "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-5a — only one client's return authorizations. An unknown id is an empty page",
             "schema": {
               "format": "uuid",
               "type": "string"

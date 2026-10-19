@@ -76,6 +76,8 @@ export interface ListRmasQuery {
   readonly warehouseId?: string | undefined;
   readonly status?: RmaStatus | undefined;
   readonly orderId?: string | undefined;
+  /** Story 1-5a — only one client's return authorizations (an unknown id is an empty page). */
+  readonly clientId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -176,6 +178,7 @@ export class ReturnsFacade {
             query.warehouseId === undefined ? undefined : eq(returnAuthorizations.warehouseId, canonicalUuid(query.warehouseId)),
             query.status === undefined ? undefined : eq(returnAuthorizations.status, query.status),
             query.orderId === undefined ? undefined : eq(returnAuthorizations.orderId, canonicalUuid(query.orderId)),
+            query.clientId === undefined ? undefined : eq(returnAuthorizations.clientId, canonicalUuid(query.clientId)),
             before === undefined
               ? undefined
               : sql`(${returnAuthorizations.createdAt}, ${returnAuthorizations.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,

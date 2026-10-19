@@ -386,6 +386,9 @@ export class SkuCommand {
     cursor?: string,
     limit: number = DEFAULT_SKU_PAGE_SIZE,
     productId?: string,
+    // Story 1-5a — the staff client filter, a named option (never a further
+    // positional argument).
+    options: { readonly clientId?: string | undefined } = {},
   ): Promise<Page<SkuSnapshot>> {
     const pageSize = Math.min(Math.max(Math.trunc(limit) || DEFAULT_SKU_PAGE_SIZE, 1), MAX_SKU_PAGE_SIZE);
     const before = cursor === undefined ? undefined : decodeCursorSafe(cursor);
@@ -395,10 +398,11 @@ export class SkuCommand {
       // Story 11.3: the optional product filter — the variants of ONE product
       // (the 11-6 matrix's data source), still keyset-paginated on the same
       // (created_at, id) sort.
-      const scope =
-        productId === undefined
-          ? eq(skus.tenantId, tenantId)
-          : and(eq(skus.tenantId, tenantId), eq(skus.productId, productId));
+      const scope = and(
+        eq(skus.tenantId, tenantId),
+        productId === undefined ? undefined : eq(skus.productId, productId),
+        options.clientId === undefined ? undefined : eq(skus.clientId, options.clientId),
+      );
       const skuRows = await tx
         .select()
         .from(skus)

@@ -26,6 +26,11 @@ import { IsInstant } from '../shared/primitives/instant-range';
 // ── inputs ───────────────────────────────────────────────────────────────────
 
 export class EwayBillListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only e-way bills of one client's orders (through the invoice). An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, enum: EWAY_BILL_STATUSES, description: 'Only bills in this status' })
   @IsOptional()
   @IsIn(EWAY_BILL_STATUSES)

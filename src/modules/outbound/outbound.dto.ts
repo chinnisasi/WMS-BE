@@ -273,6 +273,11 @@ const TO_DESCRIPTION = (column: string): string =>
 
 /** Query of the warehouse-scoped order list (keyset cursor pagination). */
 export class OrderListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only one client's orders (manifests and waves: any order of the client). An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, enum: [...ORDER_STATUSES], description: 'Story 9-1 — only orders in this status' })
   @IsOptional()
   @IsIn(ORDER_STATUSES)
@@ -324,6 +329,14 @@ export class OrderListQuery {
   @Max(200)
   limit?: number;
 }
+
+/**
+ * Query of the wave-policy list (story 1-5a). It used to share `OrderListQuery`;
+ * a policy belongs to no client, so it takes every field that DTO took EXCEPT
+ * `clientId` — a `clientId` here is refused 400 (`forbidNonWhitelisted`)
+ * rather than silently ignored.
+ */
+export class WavePolicyListQuery extends OmitType(OrderListQuery, ['clientId'] as const) {}
 
 /** One header row of the order list (no lines — the detail read carries them). */
 export class OrderEntryDto {
@@ -1588,6 +1601,11 @@ export class OrderRatesResponse {
 
 /** Query of a windowed fact list (pack failures, backorder refusals): `[from, to)` on `created_at`. */
 export class OutboundWindowListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only rows of one client's orders or SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, format: 'date-time', description: FROM_DESCRIPTION('created_at') })
   @IsOptional()
   @IsInstant()
@@ -1615,6 +1633,11 @@ export class OutboundWindowListQuery {
 
 /** Query of the picklist-line list: optional status, `[from, to)` on `updated_at` (the flip time of a terminal status). */
 export class PicklistLineListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only lines of one client's orders. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, enum: [...PICKLIST_LINE_STATUSES], description: 'Only lines in this status' })
   @IsOptional()
   @IsIn(PICKLIST_LINE_STATUSES)

@@ -29,6 +29,7 @@ import {
   ManifestListResponse,
   ManifestResponse,
   OrderListQuery,
+  WavePolicyListQuery,
   OrderListResponse,
   OutboundWindowListQuery,
   BackorderRefusalListResponse,
@@ -477,6 +478,7 @@ export class OutboundController {
     const listQuery: ListOrdersFilter = {
       status: query.status,
       source: query.source,
+      clientId: query.clientId,
       backordered: query.backordered,
       from: query.from,
       to: query.to,
@@ -514,6 +516,7 @@ export class OutboundController {
     assertInstantRange(query.from, query.to);
     const page = await this.outbound.listPicklistLines(tenantId, warehouseId, {
       status: query.status,
+      clientId: query.clientId,
       from: query.from,
       to: query.to,
       cursor: query.cursor,
@@ -546,6 +549,7 @@ export class OutboundController {
     assertUuidParam(warehouseId, 'warehouseId');
     assertInstantRange(query.from, query.to);
     const page = await this.outbound.listPackFailures(tenantId, warehouseId, {
+      clientId: query.clientId,
       from: query.from,
       to: query.to,
       cursor: query.cursor,
@@ -581,6 +585,7 @@ export class OutboundController {
     assertUuidParam(warehouseId, 'warehouseId');
     assertInstantRange(query.from, query.to);
     const page = await this.outbound.listBackorderRefusals(tenantId, warehouseId, {
+      clientId: query.clientId,
       from: query.from,
       to: query.to,
       cursor: query.cursor,
@@ -662,6 +667,8 @@ export class OutboundController {
     assertOwnTenant(session, tenantId);
     assertUuidParam(warehouseId, 'warehouseId');
     const page = await this.outbound.listManifests(tenantId, warehouseId, {
+      // Story 1-5a: wired explicitly — this route used to pass only cursor/limit.
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     });
@@ -728,7 +735,7 @@ export class OutboundController {
     @Param('tenantId') tenantId: string,
     @Param('warehouseId') warehouseId: string,
     @CurrentSession() session: TenantSession,
-    @Query() query: OrderListQuery,
+    @Query() query: WavePolicyListQuery,
   ): Promise<WavePolicyListResponse> {
     assertOwnTenant(session, tenantId);
     assertUuidParam(warehouseId, 'warehouseId');
@@ -1047,6 +1054,8 @@ export class OutboundController {
     assertOwnTenant(session, tenantId);
     assertUuidParam(warehouseId, 'warehouseId');
     const page = await this.outbound.listWaves(tenantId, warehouseId, {
+      // Story 1-5a: wired explicitly — this route used to pass only cursor/limit.
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     });

@@ -55,6 +55,11 @@ export class UpsertReorderPolicyDto {
 }
 
 export class ReorderPolicyListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only policies of one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, format: 'uuid', description: 'Only one warehouse\'s policies' })
   @IsOptional()
   @IsUUID()
@@ -118,6 +123,11 @@ export class ReorderPolicyListResponse {
 // ── breach: list + dismiss ──────────────────────────────────────────────────
 
 export class BreachListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only breaches of one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({
     required: false,
     enum: [...REPLENISHMENT_BREACH_STATUSES],
@@ -191,6 +201,11 @@ export class BreachListResponse {
 // ── suggested PO: list + submit ─────────────────────────────────────────────
 
 export class SuggestedPoListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only suggestions for one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({
     required: false,
     enum: [...SUGGESTED_PO_STATUSES],
@@ -364,6 +379,11 @@ export class ExpiryPolicyResponse {
 // ── batch alerts: list + dismiss ────────────────────────────────────────────
 
 export class BatchAlertListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only alerts on one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({
     required: false,
     enum: [...BATCH_ALERT_KINDS],

@@ -63,6 +63,8 @@ export interface ListQcHoldsQuery {
   readonly status?: 'open' | 'released' | undefined;
   /** Story 1-2b — only one GRN's receipt holds. */
   readonly grnId?: string | undefined;
+  /** Story 1-5a — only holds on one client's SKUs (every kind, manual holds included). */
+  readonly clientId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -198,6 +200,9 @@ export class QcFacade {
               : eq(qcHolds.warehouseId, query.warehouseId),
             query.status === undefined ? undefined : eq(qcHolds.status, query.status),
             query.grnId === undefined ? undefined : eq(goodsReceiptLines.grnId, query.grnId),
+            // Story 1-5a: through the held SKU (already inner-joined) — a
+            // manual hold names no GRN line, so never through the receipt.
+            query.clientId === undefined ? undefined : eq(skus.clientId, query.clientId),
             before === undefined
               ? undefined
               : sql`(${qcHolds.createdAt}, ${qcHolds.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,

@@ -65,6 +65,11 @@ import {
 } from './catalog.dto';
 
 export class SkuListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()
@@ -87,6 +92,11 @@ export class SkuListQuery {
 }
 
 export class ProductListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only one client's products. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()
@@ -101,8 +111,13 @@ export class ProductListQuery {
   limit?: number;
 }
 
-// Story 11.4 — the kit list query (the sku/product list shape, no filters yet).
+// Story 11.4 — the kit list query (the sku/product list shape; story 1-5a adds the client filter).
 export class KitListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only one client's kits. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
   @IsOptional()
   @IsString()
@@ -229,6 +244,7 @@ export class CatalogController {
       query.cursor,
       query.limit === undefined ? undefined : query.limit,
       query.productId,
+      { clientId: query.clientId },
     );
     return {
       items: page.items.map(toSkuResponse),
@@ -423,6 +439,7 @@ export class CatalogController {
       tenantId,
       query.cursor,
       query.limit === undefined ? undefined : query.limit,
+      { clientId: query.clientId },
     );
     return {
       items: page.items.map((item) => ({ ...item, axes: [...item.axes] })),
@@ -687,6 +704,7 @@ export class CatalogController {
       tenantId,
       query.cursor,
       query.limit === undefined ? undefined : query.limit,
+      { clientId: query.clientId },
     );
     return {
       items: page.items.map((item) => ({ ...item, components: item.components.map((c) => ({ ...c })) })),

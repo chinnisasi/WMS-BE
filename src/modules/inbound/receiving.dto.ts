@@ -522,6 +522,11 @@ export class GoodsReceiptEntryDto {
 }
 
 export class GoodsReceiptListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only one client's goods receipts (a legacy receipt with no client matches through its lines' SKUs). An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, format: 'uuid', description: 'Narrow to one warehouse' })
   @IsOptional()
   @IsUUID()
@@ -657,6 +662,11 @@ export class OverReceiptDto {
 }
 
 export class OverReceiptListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only over-receipts of one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, enum: ['pending', 'approved', 'rejected'] })
   @IsOptional()
   @IsIn(['pending', 'approved', 'rejected'])

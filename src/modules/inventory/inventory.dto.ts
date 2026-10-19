@@ -244,6 +244,11 @@ export class StockAdjustmentDto {
 
 /** Query for the event-timeline read (keyset cursor pagination). */
 export class LedgerEventsQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only events of one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, format: 'uuid', description: 'Only events of one SKU' })
   @IsOptional()
   @IsUUID()
@@ -612,6 +617,11 @@ export type StockListOrder = (typeof STOCK_LIST_ORDERS)[number];
 
 /** Query of the stock-list read (keyset cursor pagination). */
 export class StockListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only stock of one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, format: 'uuid', description: 'Only rows of one SKU' })
   @IsOptional()
   @IsUUID()
@@ -1004,6 +1014,11 @@ export class StockAdjustmentPendingResponse {
 
 /** Query of the pending-queue read (keyset cursor pagination, UX-DR25). */
 export class AdjustmentPendingsQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only pendings of one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, description: "Filter by decision state — omitted means every status" })
   @IsOptional()
   @IsIn(ADJUSTMENT_PENDING_STATUSES as unknown as string[])

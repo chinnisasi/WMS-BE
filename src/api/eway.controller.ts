@@ -83,6 +83,7 @@ export class EwayController {
   ): Promise<EwayBillListResponse> {
     assertOwnTenantToken(session.tenantId, tenantId);
     assertInstantRange(query.from, query.to);
+    // The DTO passes whole; the facade reads `clientId` explicitly (story 1-5a).
     const page = await this.facade.listEwayBills(tenantId, query);
     return { items: page.items.map(toBillDto), nextCursor: page.nextCursor };
   }

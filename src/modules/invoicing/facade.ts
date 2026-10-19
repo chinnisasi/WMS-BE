@@ -35,6 +35,7 @@ import type { Page } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
+import { orderOfClient } from '../../shared/db/client-filter';
 import {
   INVOICE_LIST_DEFAULT_PAGE_SIZE,
   INVOICE_LIST_MAX_PAGE_SIZE,
@@ -76,6 +77,8 @@ export interface ListEwayBillsQuery {
   readonly warehouseId?: string | undefined;
   /** Story 9-1 — `generated` bills of this source. */
   readonly source?: EwaySource | undefined;
+  /** Story 1-5a — bills of one client's orders (through the invoice). */
+  readonly clientId?: string | undefined;
   /** Story 9-1 — `[from, to)` on `created_at` (when the bill was queued). */
   readonly from?: string | undefined;
   readonly to?: string | undefined;
@@ -86,6 +89,8 @@ export interface ListEwayBillsQuery {
 export interface ListInvoicesQuery {
   /** Story 9-1 — one warehouse (asserted in-tenant first). */
   readonly warehouseId?: string | undefined;
+  /** Story 1-5a — invoices of one client's orders (an invoice is one order's). */
+  readonly clientId?: string | undefined;
   /** Story 9-1 — `[from, to)` on `issued_at` (an awaiting invoice has none, so it never matches a window). */
   readonly from?: string | undefined;
   readonly to?: string | undefined;
@@ -161,6 +166,10 @@ export class InvoicingFacade {
               ? undefined
               : sql`exists (select 1 from invoices inv where inv.tenant_id = ${ewayBills.tenantId} and inv.id = ${ewayBills.invoiceId} and inv.warehouse_id = ${query.warehouseId}::uuid)`,
             query.source === undefined ? undefined : eq(ewayBills.source, query.source),
+            // Story 1-5a — a bill belongs to its invoice's order's client.
+            query.clientId === undefined
+              ? undefined
+              : sql`exists (select 1 from invoices inv where inv.tenant_id = ${ewayBills.tenantId} and inv.id = ${ewayBills.invoiceId} and ${orderOfClient(sql`inv.order_id`, tenantId, query.clientId)})`,
             query.from === undefined ? undefined : sql`${ewayBills.createdAt} >= ${query.from}::timestamptz`,
             query.to === undefined ? undefined : sql`${ewayBills.createdAt} < ${query.to}::timestamptz`,
             before === undefined
@@ -350,6 +359,8 @@ export class InvoicingFacade {
           and(
             eq(invoices.tenantId, tenantId),
             query.warehouseId === undefined ? undefined : eq(invoices.warehouseId, query.warehouseId),
+            // Story 1-5a — through the invoice's one order.
+            query.clientId === undefined ? undefined : orderOfClient(invoices.orderId, tenantId, query.clientId),
             query.from === undefined ? undefined : sql`${invoices.issuedAt} >= ${query.from}::timestamptz`,
             query.to === undefined ? undefined : sql`${invoices.issuedAt} < ${query.to}::timestamptz`,
             before === undefined

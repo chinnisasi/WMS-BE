@@ -121,6 +121,7 @@ export class InvoicingController {
     assertInstantRange(query.from, query.to);
     const page = await this.invoices.listInvoices(tenantId, {
       warehouseId: query.warehouseId,
+      clientId: query.clientId,
       from: query.from,
       to: query.to,
       cursor: query.cursor,

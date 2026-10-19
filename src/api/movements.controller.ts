@@ -541,6 +541,7 @@ export class MovementsController {
     const page = await this.movements.listCountVariances(tenantId, {
       status: query.status,
       warehouseId: query.warehouseId,
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     });
@@ -631,6 +632,7 @@ export class MovementsController {
       status: query.status,
       sourceWarehouseId: query.sourceWarehouseId,
       destWarehouseId: query.destWarehouseId,
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     });

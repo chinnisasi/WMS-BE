@@ -176,6 +176,8 @@ export class PutawayFacade {
             query.warehouseId === undefined
               ? undefined
               : eq(putawayPlacements.warehouseId, query.warehouseId),
+            // Story 1-5a: through the placed SKU (already inner-joined).
+            query.clientId === undefined ? undefined : eq(skus.clientId, query.clientId),
             before === undefined
               ? undefined
               : sql`(${putawayPlacements.createdAt}, ${putawayPlacements.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -209,10 +211,34 @@ export class PutawayFacade {
    * null when no bin fits. Derived on every read — there is no claim/state
    * table in v1.
    */
-  async getPutawayTasks(tenantId: string, warehouseId: string): Promise<readonly PutawayTask[]> {
-    return withTenantTransaction(this.db, tenantId, (tx) =>
-      this.getPutawayTasksInTx(tx, tenantId, warehouseId),
-    );
+  async getPutawayTasks(
+    tenantId: string,
+    warehouseId: string,
+    // Story 1-5a — the staff client filter, a named option.
+    options: { readonly clientId?: string | undefined } = {},
+  ): Promise<readonly PutawayTask[]> {
+    const clientId = options.clientId;
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const tasks = await this.getPutawayTasksInTx(tx, tenantId, warehouseId);
+      if (clientId === undefined || tasks.length === 0) return tasks;
+      // Story 1-5a: the web list's client filter, by each task's SKU. Applied
+      // AFTER the derivation, at this wrapper only — the device snapshot and
+      // the KPIs call the InTx derivation and stay unfiltered, and each task
+      // is derived independently, so a filtered task is identical to its
+      // unfiltered self.
+      const owned = await tx
+        .select({ id: skus.id })
+        .from(skus)
+        .where(
+          and(
+            eq(skus.tenantId, tenantId),
+            eq(skus.clientId, clientId),
+            inArray(skus.id, [...new Set(tasks.map((task) => task.skuId))]),
+          ),
+        );
+      const ownedIds = new Set(owned.map((row) => row.id));
+      return tasks.filter((task) => ownedIds.has(task.skuId));
+    });
   }
 
   /**

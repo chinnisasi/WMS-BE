@@ -77,6 +77,8 @@ export interface PurchaseOrderEntry {
 
 export interface ListPurchaseOrdersQuery {
   readonly status?: PoStatus | undefined;
+  /** Story 1-5a — only one client's POs (an unknown id is an empty page). */
+  readonly clientId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -390,6 +392,7 @@ export class InboundFacade {
             eq(purchaseOrders.tenantId, tenantId),
             eq(purchaseOrders.warehouseId, warehouseId),
             query.status === undefined ? undefined : eq(purchaseOrders.status, query.status),
+            query.clientId === undefined ? undefined : eq(purchaseOrders.clientId, query.clientId),
             before === undefined
               ? undefined
               : sql`(${purchaseOrders.createdAt}, ${purchaseOrders.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,

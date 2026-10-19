@@ -568,6 +568,13 @@
       "when": 1792425826334,
       "tag": "0080_sku_master",
       "breakpoints": true
+    },
+    {
+      "idx": 81,
+      "version": "7",
+      "when": 1792433690390,
+      "tag": "0081_client_filter_indexes",
+      "breakpoints": true
     }
   ]
 }

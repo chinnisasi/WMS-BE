@@ -341,6 +341,11 @@ export class ResolveCountVarianceDto {
 
 /** GET …/movements/variances query (the 5-5-destined resolution queue). */
 export class CountVarianceListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only variances of one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, enum: [...COUNT_VARIANCE_STATUSES] })
   @IsOptional()
   @IsIn(COUNT_VARIANCE_STATUSES as unknown as string[])
