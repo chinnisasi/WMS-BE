@@ -876,6 +876,8 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       systemOwned: false,
       retiredAt: null,
       retiredBy: null,
+      // Story 1-5b: a pre-1.5b snapshot replays shared (`normalizeBin`).
+      dedicatedClientId: null,
     });
   });
 
@@ -1620,7 +1622,8 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       .set(KEY_HEADER, key)
       .send({ code: 'A-92-04', capacity: 100, type: 'shelf' })
       .expect(201);
-    expect(replay.body).toMatchObject({ code: 'A-92-04', storageClass: 'ambient' });
+    // Story 1-5b: the pre-1.5b snapshot also lacks the dedicated client.
+    expect(replay.body).toMatchObject({ code: 'A-92-04', storageClass: 'ambient', dedicatedClientId: null });
   });
 
   // ── Story 12-2 — the merge hazard gate (FR-41) ─────────────────────────────

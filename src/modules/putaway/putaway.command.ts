@@ -773,11 +773,16 @@ export class PutawayCommand {
       // placed against a task suggested before a bin was dedicated (a shared
       // bin the preferred walk now skips) needs no mismatch reason. The
       // recorded suggestion is then that unpreferred one, so a stored row's
-      // "reason is null iff target = suggestion" invariant holds.
+      // "reason is null iff target = suggestion" invariant holds. Only when
+      // NO reason was given: a placement there WITH a reason is a deliberate
+      // skip of the client's own bin — the preferred suggestion and the
+      // reason are recorded.
       const recordedSuggestion =
         suggestion === null
           ? null
-          : suggestion.unpreferred !== null && suggestion.unpreferred.binId === command.toBinId
+          : command.reasonCode === null &&
+              suggestion.unpreferred !== null &&
+              suggestion.unpreferred.binId === command.toBinId
             ? suggestion.unpreferred
             : { binId: suggestion.binId, binCode: suggestion.binCode };
       const suggestedBinId = recordedSuggestion?.binId ?? null;
@@ -1049,7 +1054,6 @@ export async function suggestBinInTx(
 ): Promise<{
   binId: string;
   binCode: string;
-  rationale: string;
   unpreferred: { binId: string; binCode: string } | null;
 } | null> {
   const candidates = await binCandidatesInTx(tx, tenantId, warehouseId);
@@ -1058,11 +1062,11 @@ export async function suggestBinInTx(
     return null;
   }
   const unpreferred = pickPutawayCandidate(candidates, skuAttrs, qty, skuId, { preferOwn: false });
-  const labels = await dedicatedClientLabelsInTx(tx, tenantId, [preferred]);
+  // No rationale here: the placement (the only caller) never reads one, and
+  // the client labels would be an extra query inside the bin-row lock.
   return {
     binId: preferred.binId,
     binCode: preferred.binCode,
-    rationale: putawayRationale(preferred, labels),
     unpreferred: unpreferred === null ? null : { binId: unpreferred.binId, binCode: unpreferred.binCode },
   };
 }
@@ -1108,7 +1112,7 @@ export function pickPutawayCandidate(
 
 /**
  * Story 1-5b — the ONE operator-facing rationale for a picked candidate (the
- * suggestion and the task derivation share it; base units). A dedicated bin
+ * task derivation's; base units). A dedicated bin
  * names its client: `Dedicated to GLOWCO — lowest occupancy (o/c) — room for
  * r`; a shared bin keeps the pre-1.5b text. `clientLabels` maps a dedicated
  * client id to its refusal label (`getClientLabelsInTx`); an unknown id falls

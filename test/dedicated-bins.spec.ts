@@ -403,6 +403,22 @@ describe('dedicated client bins (e2e, story 1-5b)', () => {
     const grid = (await listBins(loc)).filter((row) => row.code.startsWith('M-'));
     expect(grid).toHaveLength(2);
     expect(grid.every((row) => row.dedicatedClientId === glow)).toBe(true);
+
+    // The fingerprint carries the client: the same key with another client is
+    // a different request (422), on create and on grid.
+    const createKey = ulid();
+    await auth(http().post(base)).set(KEY_HEADER, createKey)
+      .send({ code: 'N-05', capacity: 10, type: 'shelf', dedicatedClientId: glow }).expect(201);
+    const createReuse = await auth(http().post(base)).set(KEY_HEADER, createKey)
+      .send({ code: 'N-05', capacity: 10, type: 'shelf', dedicatedClientId: susp }).expect(422);
+    expect(createReuse.body.code).toBe('idempotency-key-reuse');
+    const gridKey = ulid();
+    const gridBody = { aisleFrom: 'Q', aisleTo: 'Q', baysPerAisle: 1, levelsPerBay: 1, capacity: 10, type: 'shelf' };
+    await auth(http().post(`${base}/grid`)).set(KEY_HEADER, gridKey).send({ ...gridBody, dedicatedClientId: glow }).expect(201);
+    const gridReuse = await auth(http().post(`${base}/grid`)).set(KEY_HEADER, gridKey)
+      .send({ ...gridBody, dedicatedClientId: susp }).expect(422);
+    expect(gridReuse.body.code).toBe('idempotency-key-reuse');
+
     const departedGrid = await auth(http().post(`${base}/grid`)).set(KEY_HEADER, ulid())
       .send({ aisleFrom: 'P', aisleTo: 'P', baysPerAisle: 1, levelsPerBay: 1, capacity: 10, type: 'shelf', dedicatedClientId: dept })
       .expect(409);
@@ -468,6 +484,22 @@ describe('dedicated client bins (e2e, story 1-5b)', () => {
     expect(placed.body.placement).toMatchObject({ toBinId: first.id, suggestedBinId: first.id, reasonCode: null });
   });
 
+  it('a placement into the unpreferred shared bin WITH a reason is a deliberate skip: the own bin is recorded as the suggestion, the reason kept', async () => {
+    const loc = await newWarehouse();
+    const sharedBin = await createBin(loc, 'U-01');
+    const glowBin = await createBin(loc, 'U-02', { dedicatedClientId: glow });
+    await adjust(loc.wh, glowBin.id, glowSku, 1); // the shared bin is what the unpreferred walk picks
+
+    const grn = await blindGrn(loc.wh, glowSku, 2);
+    expect((await tasks(loc.wh)).find((row) => row.grnLineId === grn.lineId)!.suggestedBin?.binId).toBe(glowBin.id);
+    const placed = await place(loc.wh, grn, glowSku, 2, sharedBin.id, 'operator-preference').expect(201);
+    expect(placed.body.placement).toMatchObject({
+      toBinId: sharedBin.id,
+      suggestedBinId: glowBin.id,
+      reasonCode: 'operator-preference',
+    });
+  });
+
   // ── merge and transfer receive ─────────────────────────────────────────────
 
   it('merge refuses moving another client\'s stock into a dedicated bin (400), nothing committed', async () => {
@@ -516,7 +548,7 @@ describe('dedicated client bins (e2e, story 1-5b)', () => {
 
   // ── the QC release race ────────────────────────────────────────────────────
 
-  it('a dedication and a QC release of another client\'s hold into the bin serialise on the bin row — the dedication is refused either way', async () => {
+  it('a QC release parked first on the bin row, then a dedication behind it: they serialise, the release lands and the dedication is refused', async () => {
     const loc = await newWarehouse();
     const bin = await createBin(loc, 'R-01');
     await adjust(loc.wh, bin.id, selfSku, 2);
