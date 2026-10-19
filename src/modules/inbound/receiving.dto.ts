@@ -843,6 +843,9 @@ export class CatalogSnapshotPoDto {
   @ApiProperty({ format: 'uuid' })
   vendorId!: string;
 
+  @ApiProperty({ description: "Story 1-3 — the vendor's name as the PO froze it (the handheld's receive card shows it; an older server omits it)" })
+  vendorName!: string;
+
   @ApiProperty({ type: [PurchaseOrderLineDto], description: 'Per-line ordered / received / open quantities' })
   lines!: readonly PurchaseOrderLineDto[];
 }

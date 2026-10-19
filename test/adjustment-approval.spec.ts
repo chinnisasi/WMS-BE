@@ -118,7 +118,8 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
         'goods_receipt_notes',
         'purchase_order_lines',
         'purchase_orders',
-        'vendors',
+        'partner_client_links',
+        'business_partners',
         'kit_compositions',
       ]) {
         await sql.unsafe(`DELETE FROM ${table} WHERE tenant_id = ANY($1::uuid[])`, [createdTenantIds]);

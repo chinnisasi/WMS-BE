@@ -40,6 +40,7 @@ import {
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -868,14 +869,7 @@ describe('notifications (e2e, story 9-2)', () => {
 
     it('ACCEPTANCE: a pending over-receipt is listed newest-first, open, in its warehouse for the owner (not the operator); approval resolves it', async () => {
       const t = main;
-      const vendorId = (
-        await request(app.getHttpServer())
-          .post(`${API}/${t.tenantId}/vendors`)
-          .set('Authorization', `Bearer ${t.ownerToken}`)
-          .set(KEY_HEADER, ulid())
-          .send({ code: 'V-NT', name: 'Notify Vendor' })
-          .expect(201)
-      ).body.vendor.id as string;
+      const vendorId = await createLinkedVendor(app, t.tenantId, t.ownerToken, { code: 'V-NT', name: 'Notify Vendor' });
       const po = (
         await request(app.getHttpServer())
           .post(`${API}/${t.tenantId}/inbound/purchase-orders`)

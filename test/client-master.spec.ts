@@ -37,6 +37,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow, noOpIdempotencyKey, seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor, linkVendor } from './support/linked-vendor';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -123,7 +124,7 @@ describe('story 1-2a: the client master record', () => {
   }
 
   async function createClient(code: string): Promise<string> {
-    return (
+    const id = (
       await http()
         .post(`${API}/${tenantId}/clients`)
         .set('Authorization', `Bearer ${ownerToken}`)
@@ -131,6 +132,9 @@ describe('story 1-2a: the client master record', () => {
         .send({ code, name: `${code} Brand` })
         .expect(201)
     ).body.client.id as string;
+    // Story 1-3 — a PO's vendor must be linked to its client: the suite's vendor trades with every client it creates.
+    if (vendorId !== undefined) await linkVendor(app, tenantId, ownerToken, vendorId, id);
+    return id;
   }
 
   function importCsv(csvRows: string[], clientId: string, token = ownerToken): SupertestTest {
@@ -331,14 +335,7 @@ describe('story 1-2a: the client master record', () => {
         .send({ capacity: 100000, type: 'shelf', code: 'A-01-01' })
         .expect(201)
     ).body.id as string;
-    vendorId = (
-      await http()
-        .post(`${API}/${tenantId}/vendors`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'VEND-CM', name: 'Client Master Vendor' })
-        .expect(201)
-    ).body.vendor.id as string;
+    vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'VEND-CM', name: 'Client Master Vendor' });
 
     const minted = await http()
       .post(`${API}/${tenantId}/devices/enrollment-codes`)

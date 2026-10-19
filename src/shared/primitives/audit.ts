@@ -71,6 +71,14 @@ export const AUDIT_TARGET_TYPES = [
   'manifest',
   'order',
   'over_receipt',
+  // Story 1-3 — a business partner (`partner.created | updated | deactivated
+  // | reactivated`) and one of its client links (`partner.linked |
+  // link_updated | link_deactivated | link_reactivated`). The Story 3.1
+  // `vendor` target left the write registry with them (no writer stores it
+  // now); the audit read still accepts it for historical rows —
+  // `AUDIT_READ_TARGET_TYPES`.
+  'partner',
+  'partner_link',
   'pick',
   'picklist_line',
   'product',
@@ -94,7 +102,6 @@ export const AUDIT_TARGET_TYPES = [
   'tenant',
   'transfer_order',
   'user',
-  'vendor',
   'warehouse',
   'wave',
   'wave_policy',
@@ -102,6 +109,18 @@ export const AUDIT_TARGET_TYPES = [
 ] as const;
 
 export type AuditTargetType = (typeof AUDIT_TARGET_TYPES)[number];
+
+/**
+ * Story 1-3 — target types no writer stores any more but historical rows
+ * carry: `vendor` (Story 3.1's `vendor.created`, until the partner master
+ * replaced it). Kept on the audit read's filter so an owner can still find
+ * those rows; never written.
+ */
+export const RETIRED_AUDIT_TARGET_TYPES = ['vendor'] as const;
+
+/** The audit read's `targetType` filter vocabulary: every written type plus the retired ones. */
+export const AUDIT_READ_TARGET_TYPES = [...AUDIT_TARGET_TYPES, ...RETIRED_AUDIT_TARGET_TYPES] as const;
+export type AuditReadTargetType = (typeof AUDIT_READ_TARGET_TYPES)[number];
 
 /**
  * The audit rows story 9-3a added (going forward only — no backfill). One
@@ -116,7 +135,6 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'purchase_order.created', targetType: 'purchase_order' },
   { action: 'purchase_order.amended', targetType: 'purchase_order' },
   { action: 'purchase_order.closed', targetType: 'purchase_order' },
-  { action: 'vendor.created', targetType: 'vendor' },
   { action: 'sku.edited', targetType: 'sku' },
   { action: 'product.created', targetType: 'product' },
   { action: 'product.edited', targetType: 'product' },
@@ -180,4 +198,15 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'goods_receipt.shelf_life_waived', targetType: 'goods_receipt' },
   { action: 'qc_hold.receipt_placed', targetType: 'goods_receipt' },
   { action: 'qc_hold.receipt_released', targetType: 'goods_receipt' },
+  // Story 1-3 — the business partner master (`PartnersCommand`). The Story
+  // 3.1 `vendor.created` audit action left the registry with it (the outbox
+  // event of that name stays).
+  { action: 'partner.created', targetType: 'partner' },
+  { action: 'partner.updated', targetType: 'partner' },
+  { action: 'partner.deactivated', targetType: 'partner' },
+  { action: 'partner.reactivated', targetType: 'partner' },
+  { action: 'partner.linked', targetType: 'partner_link' },
+  { action: 'partner.link_updated', targetType: 'partner_link' },
+  { action: 'partner.link_deactivated', targetType: 'partner_link' },
+  { action: 'partner.link_reactivated', targetType: 'partner_link' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

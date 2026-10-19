@@ -10,6 +10,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by default;
 // CI provides the service container) and signs sessions — the sibling suites'
@@ -1163,7 +1164,7 @@ describe('the rejected-op sync report + the Conflicts & Reviews queue (story 5-6
     const skuId = await importSku(ownerToken, tenantId, 'LATE-PO-1');
     const owner = (path: string) =>
       request(app.getHttpServer()).post(`${API}/${tenantId}${path}`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid());
-    const vendorId = (await owner('/vendors').send({ code: 'V-LATE', name: 'Late Vendor' }).expect(201)).body.vendor.id as string;
+    const vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'V-LATE', name: 'Late Vendor' });
     const po = (
       await owner('/inbound/purchase-orders')
         .send({ warehouseId, vendorId, code: 'PO-LATE-1', lines: [{ skuId, orderedQty: 10, unitCostPaise: 100 }] })

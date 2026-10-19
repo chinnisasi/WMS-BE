@@ -33,6 +33,7 @@ import type { OverReceiptEntry } from './receiving.command';
 import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/time';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { OPEN_ASN_STATUSES, asnLineSnapshot, type AsnLineSnapshot } from './asn.command';
+import { partnerNamesInTx, type VendorSnapshotV1 } from '../partners/partners.facade';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
 export interface GoodsReceiptEntry {
@@ -129,6 +130,8 @@ export interface CatalogSnapshot {
     readonly clientId: string;
     readonly warehouseId: string;
     readonly vendorId: string;
+    /** Story 1-3 — the vendor's name as the PO froze it (the receive card shows it). */
+    readonly vendorName: string;
     readonly lines: readonly PurchaseOrderLineSnapshot[];
   }[];
   /** Story 21-6 (additive): the warehouse's open ASNs (announced or partially received). */
@@ -452,6 +455,7 @@ export class ReceivingFacade {
           clientId: purchaseOrders.clientId,
           warehouseId: purchaseOrders.warehouseId,
           vendorId: purchaseOrders.vendorId,
+          vendorSnapshot: purchaseOrders.vendorSnapshot,
         })
         .from(purchaseOrders)
         .where(
@@ -470,6 +474,13 @@ export class ReceivingFacade {
               .from(purchaseOrderLines)
               .where(inArray(purchaseOrderLines.poId, poRows.map((po) => po.id)))
               .orderBy(purchaseOrderLines.createdAt, purchaseOrderLines.id);
+      // Story 1-3 — the vendor's name: the PO's frozen snapshot (every PO
+      // carries one since 0079); the live partner name only as a fallback.
+      const liveNames = await partnerNamesInTx(
+        tx,
+        tenantId,
+        poRows.filter((po) => po.vendorSnapshot === null).map((po) => po.vendorId),
+      );
       const linesByPo = new Map<string, PurchaseOrderLineSnapshot[]>();
       for (const line of lineRows) {
         const list = linesByPo.get(line.poId) ?? [];
@@ -536,6 +547,7 @@ export class ReceivingFacade {
           clientId: po.clientId,
           warehouseId: po.warehouseId,
           vendorId: po.vendorId,
+          vendorName: (po.vendorSnapshot as VendorSnapshotV1 | null)?.name ?? liveNames.get(po.vendorId) ?? '',
           lines: linesByPo.get(po.id) ?? [],
         })),
         openAsns: asnRows.map((row) => ({

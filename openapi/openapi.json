@@ -7454,202 +7454,6 @@
         ]
       }
     },
-    "/tenants/{tenantId}/vendors": {
-      "post": {
-        "operationId": "InboundController_createVendor",
-        "parameters": [
-          {
-            "name": "tenantId",
-            "required": true,
-            "in": "path",
-            "description": "Owning tenant (must match the session)",
-            "schema": {
-              "format": "uuid",
-              "type": "string"
-            }
-          },
-          {
-            "name": "Idempotency-Key",
-            "in": "header",
-            "description": "Client-generated ULID key; replays return the original response",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "minLength": 26,
-              "maxLength": 26,
-              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateVendorDto"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "Vendor created (the idempotency snapshot)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/VendorResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Missing or malformed Idempotency-Key, or invalid body",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsDto"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid session token",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsDto"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Session belongs to another tenant (permission-denied), or the caller lacks vendor.manage (role-denied)",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsDto"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Vendor code already in use (conflict, naming the code), or a concurrent idempotent request (conflict)",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsDto"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsDto"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ],
-        "summary": "Creates a vendor (vendor.manage) — code unique per tenant",
-        "tags": [
-          "inbound"
-        ]
-      },
-      "get": {
-        "operationId": "InboundController_listVendors",
-        "parameters": [
-          {
-            "name": "tenantId",
-            "required": true,
-            "in": "path",
-            "description": "Owning tenant (must match the session)",
-            "schema": {
-              "format": "uuid",
-              "type": "string"
-            }
-          },
-          {
-            "name": "cursor",
-            "required": false,
-            "in": "query",
-            "description": "Opaque keyset cursor from the previous page",
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "limit",
-            "required": false,
-            "in": "query",
-            "schema": {
-              "minimum": 1,
-              "maximum": 200,
-              "example": 50,
-              "type": "number"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/VendorListResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Malformed cursor (invalid-cursor) or out-of-range limit (validation-failed)",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsDto"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Missing or invalid session token",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsDto"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Session belongs to another tenant (permission-denied)",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetailsDto"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer": []
-          }
-        ],
-        "summary": "Lists the tenant's vendors (keyset cursor pagination — open to any member)",
-        "tags": [
-          "inbound"
-        ]
-      }
-    },
     "/tenants/{tenantId}/inbound/purchase-orders": {
       "post": {
         "operationId": "InboundController_createPurchaseOrder",
@@ -7729,7 +7533,7 @@
             }
           },
           "404": {
-            "description": "Warehouse, vendor, or a line's SKU does not exist in this tenant (not-found)",
+            "description": "Warehouse, a line's SKU, or the vendor does not exist in this tenant (not-found — the SKU's 404 wins over the vendor's)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7739,7 +7543,7 @@
             }
           },
           "409": {
-            "description": "PO code already in use (conflict, naming the code), or a concurrent idempotent request (conflict)",
+            "description": "PO code already in use (conflict, naming the code); lines spanning clients (mixed-client); a departed client (client-departed); a partner without the vendor role (partner-not-vendor), an inactive vendor (vendor-inactive), or a vendor with no active link to the PO's client (vendor-not-linked, naming the client); or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -20352,7 +20156,7 @@
             "name": "targetType",
             "required": false,
             "in": "query",
-            "description": "Only actions on this kind of target",
+            "description": "Only actions on this kind of target (`vendor` matches the rows written before story 1-3 — no writer stores it now)",
             "schema": {
               "type": "string",
               "enum": [
@@ -20381,6 +20185,8 @@
                 "manifest",
                 "order",
                 "over_receipt",
+                "partner",
+                "partner_link",
                 "pick",
                 "picklist_line",
                 "product",
@@ -20401,11 +20207,11 @@
                 "tenant",
                 "transfer_order",
                 "user",
-                "vendor",
                 "warehouse",
                 "wave",
                 "wave_policy",
-                "zone"
+                "zone",
+                "vendor"
               ]
             }
           },
@@ -22160,6 +21966,773 @@
         "summary": "Removes a client contact (owner-only, clients.manage). The primary cannot be removed while other contacts remain",
         "tags": [
           "clients"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/partners": {
+      "get": {
+        "operationId": "PartnersController_listPartners",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "role",
+            "required": false,
+            "in": "query",
+            "description": "Partners holding this role (with clientId: an active link in this role)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "vendor",
+                "consignee",
+                "transporter"
+              ]
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Partners with an ACTIVE link to this client",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "inactive"
+              ]
+            }
+          },
+          {
+            "name": "q",
+            "required": false,
+            "in": "query",
+            "description": "Matches code, name, legal name or GSTIN (case-insensitive, literal)",
+            "schema": {
+              "maxLength": 100,
+              "type": "string"
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PartnerListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed filter, cursor or limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's business partners by code (keyset), each with its client links — filter by role, an ACTIVE link to a client, status, or a search over code, name, legal name and GSTIN",
+        "tags": [
+          "partners"
+        ]
+      },
+      "post": {
+        "operationId": "PartnersController_createPartner",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePartnerDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The created partner, active (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PartnerResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a field that breaks its rule (validation-failed, naming the field); a PAN other than the GSTIN's (pan-gstin-mismatch); a GSTIN of another state than the registered address (gstin-state-mismatch)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks vendor.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The code is taken (partner-code-taken), the GSTIN belongs to another partner (partner-gstin-taken, naming it), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Creates a business partner (vendor.manage) — one GST registration, with its roles",
+        "tags": [
+          "partners"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/partners/{partnerId}": {
+      "patch": {
+        "operationId": "PartnersController_updatePartner",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "partnerId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePartnerDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PartnerResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a field that breaks its rule (validation-failed / pan-gstin-mismatch / gstin-state-mismatch)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks vendor.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No partner with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "partner-code-taken, partner-gstin-taken, a role removed while an active link carries it (partner-role-in-use), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Edits a business partner (vendor.manage). Tri-state: an absent key is unchanged, null clears; every rule runs on the merged row. An unchanged edit is a no-op (nothing written or audited; the key is stored)",
+        "tags": [
+          "partners"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/partners/{partnerId}/status": {
+      "patch": {
+        "operationId": "PartnersController_updatePartnerStatus",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "partnerId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePartnerStatusDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PartnerResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an unknown status, or a reason with `active` (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks vendor.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No partner with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Deactivates (with an optional reason) or reactivates a partner (vendor.manage). Inactive: kept off new POs and links, its defaults cleared; open POs keep receiving. Reactivating clears the reason and brings no default back. The same status is a no-op that stores the key",
+        "tags": [
+          "partners"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/partners/{partnerId}/links": {
+      "post": {
+        "operationId": "PartnersController_createPartnerLink",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "partnerId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePartnerLinkDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The partner, its new link included",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PartnerResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed body (validation-failed), or a transporter / a role the partner lacks (link-role-invalid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks vendor.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such partner or client in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The link already exists (link-exists, naming linkId), the partner is inactive (partner-inactive), the client has departed (client-departed), the client code is taken (link-client-code-taken), a concurrent default (default-vendor-conflict), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Links a vendor or consignee to a client (vendor.manage) — optionally as the client's default vendor",
+        "tags": [
+          "partners"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/partners/{partnerId}/links/{linkId}": {
+      "patch": {
+        "operationId": "PartnersController_updatePartnerLink",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "partnerId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "linkId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePartnerLinkDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PartnerResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed body, a default on a switched-off or consignee link (validation-failed), or a reactivation the partner's roles no longer allow (link-role-invalid)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks vendor.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such partner, or no such link on it (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "partner-inactive, client-departed, link-client-code-taken, default-vendor-conflict, or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Edits a client link (vendor.manage): the client's code (null clears), active (false switches it off and clears its default; links are never deleted) and the default vendor flag. An unchanged edit is a no-op that stores the key",
+        "tags": [
+          "partners"
         ]
       }
     },
@@ -31380,97 +31953,6 @@
           "history"
         ]
       },
-      "CreateVendorDto": {
-        "type": "object",
-        "properties": {
-          "code": {
-            "type": "string",
-            "description": "Vendor code — unique per tenant",
-            "minLength": 1,
-            "maxLength": 64
-          },
-          "name": {
-            "type": "string",
-            "description": "Vendor name",
-            "minLength": 1,
-            "maxLength": 200
-          },
-          "isDefault": {
-            "type": "boolean",
-            "default": false,
-            "description": "The tenant’s default vendor (Epic 6 suggested-PO drafts read it)"
-          }
-        },
-        "required": [
-          "code",
-          "name"
-        ]
-      },
-      "VendorDto": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "tenantId": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "code": {
-            "type": "string",
-            "description": "Vendor code (unique per tenant)"
-          },
-          "name": {
-            "type": "string"
-          },
-          "isDefault": {
-            "type": "boolean",
-            "description": "The tenant’s default vendor flag"
-          },
-          "createdAt": {
-            "type": "string",
-            "description": "ISO-8601 UTC creation time"
-          }
-        },
-        "required": [
-          "id",
-          "tenantId",
-          "code",
-          "name",
-          "isDefault",
-          "createdAt"
-        ]
-      },
-      "VendorResponse": {
-        "type": "object",
-        "properties": {
-          "vendor": {
-            "$ref": "#/components/schemas/VendorDto"
-          }
-        },
-        "required": [
-          "vendor"
-        ]
-      },
-      "VendorListResponse": {
-        "type": "object",
-        "properties": {
-          "items": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/VendorDto"
-            }
-          },
-          "nextCursor": {
-            "type": "string",
-            "nullable": true
-          }
-        },
-        "required": [
-          "items"
-        ]
-      },
       "PurchaseOrderLineInputDto": {
         "type": "object",
         "properties": {
@@ -31540,6 +32022,95 @@
           "vendorId",
           "code",
           "lines"
+        ]
+      },
+      "PartnerAddressDto": {
+        "type": "object",
+        "properties": {
+          "line1": {
+            "type": "string"
+          },
+          "line2": {
+            "type": "string",
+            "nullable": true
+          },
+          "city": {
+            "type": "string"
+          },
+          "stateCode": {
+            "type": "string",
+            "description": "A two-digit GST registration state code"
+          },
+          "pincode": {
+            "type": "string",
+            "description": "Six digits"
+          }
+        },
+        "required": [
+          "line1",
+          "line2",
+          "city",
+          "stateCode",
+          "pincode"
+        ]
+      },
+      "VendorSnapshotDto": {
+        "type": "object",
+        "properties": {
+          "v": {
+            "type": "number",
+            "enum": [
+              1
+            ],
+            "description": "The snapshot shape version"
+          },
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "legalName": {
+            "type": "string",
+            "nullable": true
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "stateCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The registered state, else the GSTIN's prefix"
+          },
+          "registeredAddress": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PartnerAddressDto"
+              }
+            ]
+          },
+          "dispatchAddress": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PartnerAddressDto"
+              }
+            ]
+          }
+        },
+        "required": [
+          "v",
+          "code",
+          "name",
+          "legalName",
+          "gstin",
+          "stateCode",
+          "registeredAddress",
+          "dispatchAddress"
         ]
       },
       "PurchaseOrderLineDto": {
@@ -31644,6 +32215,16 @@
             "format": "uuid",
             "nullable": true,
             "description": "Story 21-2b — the client the PO is for, derived from its lines' SKUs. Absent or null only on a replayed response stored before 21-2b"
+          },
+          "vendorSnapshot": {
+            "nullable": true,
+            "description": "Story 1-3 — the vendor as it was when the PO was created (copied to a close successor; never rewritten by a later partner edit). Absent or null only on a replayed response stored before 1-3",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VendorSnapshotDto"
+              }
+            ]
           },
           "lines": {
             "description": "Per-line ordered / received / open (detail and mutations; headers only on the list)",
@@ -35175,6 +35756,10 @@
             "type": "string",
             "format": "uuid"
           },
+          "vendorName": {
+            "type": "string",
+            "description": "Story 1-3 — the vendor's name as the PO froze it (the handheld's receive card shows it; an older server omits it)"
+          },
           "lines": {
             "description": "Per-line ordered / received / open quantities",
             "type": "array",
@@ -35189,6 +35774,7 @@
           "clientId",
           "warehouseId",
           "vendorId",
+          "vendorName",
           "lines"
         ]
       },
@@ -38519,10 +39105,15 @@
             "type": "string",
             "format": "uuid"
           },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 1-3 — the SKU's client: the draft's vendor must be an active vendor linked to it"
+          },
           "vendorId": {
             "type": "string",
             "nullable": true,
-            "description": "The suggested vendor, null when the tenant carried no default"
+            "description": "The suggested vendor — the SKU's client's default vendor at detection; null when the client had none"
           },
           "quantityMilli": {
             "type": "number",
@@ -38555,6 +39146,7 @@
           "breachId",
           "warehouseId",
           "skuId",
+          "clientId",
           "vendorId",
           "quantityMilli",
           "status",
@@ -41423,6 +42015,8 @@
               "manifest",
               "order",
               "over_receipt",
+              "partner",
+              "partner_link",
               "pick",
               "picklist_line",
               "product",
@@ -41443,13 +42037,13 @@
               "tenant",
               "transfer_order",
               "user",
-              "vendor",
               "warehouse",
               "wave",
               "wave_policy",
-              "zone"
+              "zone",
+              "vendor"
             ],
-            "description": "Only actions on this kind of target"
+            "description": "Only actions on this kind of target (`vendor` matches the rows written before story 1-3 — no writer stores it now)"
           },
           "targetId": {
             "type": "string",
@@ -41510,6 +42104,8 @@
               "manifest",
               "order",
               "over_receipt",
+              "partner",
+              "partner_link",
               "pick",
               "picklist_line",
               "product",
@@ -41530,13 +42126,13 @@
               "tenant",
               "transfer_order",
               "user",
-              "vendor",
               "warehouse",
               "wave",
               "wave_policy",
-              "zone"
+              "zone",
+              "vendor"
             ],
-            "description": "Only actions on this kind of target"
+            "description": "Only actions on this kind of target (`vendor` matches the rows written before story 1-3 — no writer stores it now)"
           },
           "targetId": {
             "type": "string",
@@ -42277,6 +42873,476 @@
           "isPrimary": {
             "type": "boolean",
             "description": "true makes this the primary contact (the previous primary is cleared). false is refused — make another contact primary instead"
+          }
+        }
+      },
+      "PartnerLinkDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "vendor",
+              "consignee"
+            ]
+          },
+          "active": {
+            "type": "boolean"
+          },
+          "isDefault": {
+            "type": "boolean",
+            "description": "The client's default vendor (at most one per client)"
+          },
+          "clientCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The client's own code for the partner"
+          }
+        },
+        "required": [
+          "id",
+          "clientId",
+          "role",
+          "active",
+          "isDefault",
+          "clientCode"
+        ]
+      },
+      "PartnerDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "The display name"
+          },
+          "legalName": {
+            "type": "string",
+            "nullable": true
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true
+          },
+          "pan": {
+            "type": "string",
+            "nullable": true
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "vendor",
+                "consignee",
+                "transporter"
+              ]
+            }
+          },
+          "registeredAddress": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PartnerAddressDto"
+              }
+            ]
+          },
+          "dispatchAddress": {
+            "nullable": true,
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PartnerAddressDto"
+              }
+            ]
+          },
+          "contactName": {
+            "type": "string",
+            "nullable": true
+          },
+          "contactPhone": {
+            "type": "string",
+            "nullable": true
+          },
+          "contactEmail": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ]
+          },
+          "inactiveReason": {
+            "type": "string",
+            "nullable": true,
+            "description": "Why it is inactive (null while active)"
+          },
+          "links": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PartnerLinkDto"
+            }
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC creation time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC last-mutation time"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "code",
+          "name",
+          "legalName",
+          "gstin",
+          "pan",
+          "roles",
+          "registeredAddress",
+          "dispatchAddress",
+          "contactName",
+          "contactPhone",
+          "contactEmail",
+          "status",
+          "inactiveReason",
+          "links",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "PartnerListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PartnerDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items",
+          "nextCursor"
+        ]
+      },
+      "PartnerAddressInputDto": {
+        "type": "object",
+        "properties": {
+          "line1": {
+            "type": "string",
+            "example": "Plot 12, MIDC",
+            "maxLength": 200
+          },
+          "line2": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "Omit (or null) when there is none"
+          },
+          "city": {
+            "type": "string",
+            "example": "Pune",
+            "maxLength": 100
+          },
+          "stateCode": {
+            "type": "string",
+            "example": "27",
+            "description": "A two-digit GST registration state code"
+          },
+          "pincode": {
+            "type": "string",
+            "example": "411001",
+            "description": "Six digits, as text"
+          }
+        },
+        "required": [
+          "line1",
+          "city",
+          "stateCode",
+          "pincode"
+        ]
+      },
+      "CreatePartnerDto": {
+        "type": "object",
+        "properties": {
+          "legalName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "The registered legal name"
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true,
+            "example": "27ABCDE1234F1Z5",
+            "description": "One GST registration — unique per tenant (409 `partner-gstin-taken` names the holder). Uppercased; absent for an unregistered supplier"
+          },
+          "pan": {
+            "type": "string",
+            "nullable": true,
+            "example": "ABCDE1234F",
+            "description": "Derived from the GSTIN's characters 3-12 when absent and a GSTIN is present; a different PAN is 400 `pan-gstin-mismatch`"
+          },
+          "registeredAddress": {
+            "nullable": true,
+            "description": "The registered address — its state must be the GSTIN's (400 `gstin-state-mismatch`)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PartnerAddressInputDto"
+              }
+            ]
+          },
+          "dispatchAddress": {
+            "nullable": true,
+            "description": "Where goods ship from (or to, for a consignee)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PartnerAddressInputDto"
+              }
+            ]
+          },
+          "contactName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 120
+          },
+          "contactPhone": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 20
+          },
+          "contactEmail": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 254
+          },
+          "code": {
+            "type": "string",
+            "example": "SUP-001",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Unique per tenant (409 `partner-code-taken`); trimmed, case kept"
+          },
+          "name": {
+            "type": "string",
+            "example": "Deccan Packaging",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "The display name"
+          },
+          "roles": {
+            "type": "array",
+            "minItems": 1,
+            "description": "The roles the partner plays (at least one)",
+            "items": {
+              "type": "string",
+              "enum": [
+                "vendor",
+                "consignee",
+                "transporter"
+              ]
+            }
+          }
+        },
+        "required": [
+          "code",
+          "name",
+          "roles"
+        ]
+      },
+      "PartnerResponse": {
+        "type": "object",
+        "properties": {
+          "partner": {
+            "$ref": "#/components/schemas/PartnerDto"
+          }
+        },
+        "required": [
+          "partner"
+        ]
+      },
+      "UpdatePartnerDto": {
+        "type": "object",
+        "properties": {
+          "legalName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "The registered legal name"
+          },
+          "gstin": {
+            "type": "string",
+            "nullable": true,
+            "example": "27ABCDE1234F1Z5",
+            "description": "One GST registration — unique per tenant (409 `partner-gstin-taken` names the holder). Uppercased; absent for an unregistered supplier"
+          },
+          "pan": {
+            "type": "string",
+            "nullable": true,
+            "example": "ABCDE1234F",
+            "description": "Derived from the GSTIN's characters 3-12 when absent and a GSTIN is present; a different PAN is 400 `pan-gstin-mismatch`"
+          },
+          "registeredAddress": {
+            "nullable": true,
+            "description": "The registered address — its state must be the GSTIN's (400 `gstin-state-mismatch`)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PartnerAddressInputDto"
+              }
+            ]
+          },
+          "dispatchAddress": {
+            "nullable": true,
+            "description": "Where goods ship from (or to, for a consignee)",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PartnerAddressInputDto"
+              }
+            ]
+          },
+          "contactName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 120
+          },
+          "contactPhone": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 20
+          },
+          "contactEmail": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 254
+          },
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "roles": {
+            "type": "array",
+            "description": "The full new role set. Removing vendor or consignee while an active link carries it is 409 `partner-role-in-use`",
+            "items": {
+              "type": "string",
+              "enum": [
+                "vendor",
+                "consignee",
+                "transporter"
+              ]
+            }
+          }
+        }
+      },
+      "UpdatePartnerStatusDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ],
+            "description": "`inactive` keeps the partner off new documents (open POs keep receiving); `active` restores it and clears the reason"
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "Why it was deactivated — only with `inactive`"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "CreatePartnerLinkDto": {
+        "type": "object",
+        "properties": {
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The client (the tenant's own `self` client included)"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "vendor",
+              "consignee",
+              "transporter"
+            ],
+            "description": "vendor or consignee — a transporter is never linked (400 `link-role-invalid`)"
+          },
+          "clientCode": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 64,
+            "description": "The client's own code for this partner — trimmed, case kept; unique per client and role"
+          },
+          "isDefault": {
+            "type": "boolean",
+            "description": "Make it the client's default vendor (vendor links only; the previous default is cleared)"
+          }
+        },
+        "required": [
+          "clientId",
+          "role"
+        ]
+      },
+      "UpdatePartnerLinkDto": {
+        "type": "object",
+        "properties": {
+          "clientCode": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 64,
+            "description": "Absent unchanged, null clears"
+          },
+          "active": {
+            "type": "boolean",
+            "description": "false switches the link off (and clears its default); true switches it back on"
+          },
+          "isDefault": {
+            "type": "boolean",
+            "description": "true makes it the client's default vendor; false clears it"
           }
         }
       },

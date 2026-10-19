@@ -16,10 +16,10 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
-import { InboundFacade } from '../inbound/inbound.facade';
 import { REPLENISHMENT_SCHEDULER_ACTOR_ID, recoveryGapMilli } from './replenishment.command';
 import { appendBreachCleared } from './replenishment.events';
 import { departedClientIdsInTx } from '../clients/clients.facade';
+import { findDefaultVendorForClientInTx } from '../partners/partners.facade';
 
 /**
  * The breach sweep (story 6.1): the worker's per-scope evaluation, in THREE
@@ -56,6 +56,11 @@ export interface EffectiveCandidate {
    * open is recovered (closed) — it would otherwise stand forever.
    */
   readonly departed: boolean;
+  /**
+   * Story 1-3 — the SKU's client: the draft's default vendor is THAT
+   * client's (decision 2), never a tenant-wide one.
+   */
+  readonly clientId: string;
 }
 
 export interface SweepReport {
@@ -80,8 +85,6 @@ export class ReplenishmentSweep {
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
     // The tenant-wide SKU defaults, in-tx (catalog tables stay module-exclusive).
     @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
-    // The deterministic default-vendor pick (inbound owns `vendors`).
-    @Inject(InboundFacade) private readonly inbound: InboundFacade,
   ) {}
 
   /**
@@ -114,15 +117,17 @@ export class ReplenishmentSweep {
 
       let opened = 0;
       let recovered = 0;
-      // The default vendor is picked at most once per scope — lazily, only
-      // when a breach actually opens (deterministic min (created_at, id),
-      // null when the tenant carries none).
-      let vendor: { id: string; code: string; name: string } | null | undefined;
-      const defaultVendor = async (): Promise<{ id: string; code: string; name: string } | null> => {
-        if (vendor === undefined) {
-          vendor = await this.inbound.findDefaultVendorInTx(tx, tenantId);
+      // Story 1-3 — the default vendor is the SKU's CLIENT's (the active
+      // partner whose active vendor link is that client's default), picked
+      // at most once per client per scope — lazily, only when a breach
+      // actually opens. Null when the client has none: the draft carries
+      // `vendorId: null` and a person picks one.
+      const vendorByClient = new Map<string, { id: string; code: string; name: string } | null>();
+      const defaultVendor = async (clientId: string): Promise<{ id: string; code: string; name: string } | null> => {
+        if (!vendorByClient.has(clientId)) {
+          vendorByClient.set(clientId, await findDefaultVendorForClientInTx(tx, tenantId, clientId));
         }
-        return vendor;
+        return vendorByClient.get(clientId)!;
       };
 
       for (const candidate of fresh) {
@@ -147,7 +152,7 @@ export class ReplenishmentSweep {
           if (breach !== null) {
             continue; // already active — the partial unique absorbed it; no second draft, no repeat event
           }
-          await this.openBreach(tx, tenantId, warehouseId, candidate, atpMilli, await defaultVendor());
+          await this.openBreach(tx, tenantId, warehouseId, candidate, atpMilli, await defaultVendor(candidate.clientId));
           opened += 1;
         } else if (breach !== null) {
           await this.recoverBreach(tx, tenantId, breach);
@@ -208,6 +213,7 @@ export class ReplenishmentSweep {
           pointMilli,
           qtyMilli,
           departed: departed.has(sku.clientId),
+          clientId: sku.clientId,
         });
       }
     }
@@ -310,8 +316,8 @@ export class ReplenishmentSweep {
         warehouseId,
         skuId: candidate.skuId,
         breachId,
-        // No default vendor → the draft carries null and the human submit
-        // names one (the I/O matrix's vendor-null arm).
+        // No default vendor for the SKU's client → the draft carries null
+        // and the human submit names one (the I/O matrix's vendor-null arm).
         vendorId: vendor === null ? null : vendor.id,
         quantityMilli,
         status: 'draft',

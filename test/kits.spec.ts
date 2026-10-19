@@ -11,6 +11,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -219,14 +220,7 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
     ).body.id as string;
 
     // ── the over-receipt test's vendor ────────────────────────────────────
-    vendorId = (
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/vendors`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'KIT-VEND-1', name: 'Kit Vendor 1' })
-        .expect(201)
-    ).body.vendor.id as string;
+    vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'KIT-VEND-1', name: 'Kit Vendor 1' });
 
     // ── all scenario SKUs via catalog import ───────────────────────────────
     const csvHeader =
@@ -326,7 +320,8 @@ describe('kits: kit_compositions, the never-independent-stock guards, order expl
         'goods_receipt_notes',
         'purchase_order_lines',
         'purchase_orders',
-        'vendors',
+        'partner_client_links',
+        'business_partners',
         'order_lines',
         'orders',
       ]) {

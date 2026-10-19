@@ -16,6 +16,7 @@ import { InvoicingFacade } from '../src/modules/invoicing/facade';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor, linkVendor } from './support/linked-vendor';
 
 // Story 1-1 — per-client SKU identity: code and barcode unique per (tenant,
 // client) (migration 0076), the GRN's client (stamped on every new receipt;
@@ -118,14 +119,7 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
         .send({ origin: testAddress(), code: `PCS-${ulid().slice(20)}`, name: 'PCS warehouse' })
         .expect(201)
     ).body.id as string;
-    vendorId = (
-      await http()
-        .post(`${API}/${tenantId}/vendors`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'V-PCS', name: 'PCS Vendor' })
-        .expect(201)
-    ).body.vendor.id as string;
+    vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'V-PCS', name: 'PCS Vendor' });
 
     const clients = await http().get(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
     selfClient = (clients.body.items as { id: string; systemOwned: boolean }[]).find((c) => c.systemOwned)!.id;
@@ -199,6 +193,8 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
       .set(KEY_HEADER, ulid())
       .send({ code, name })
       .expect(201);
+    // Story 1-3 — a PO's vendor must be linked to its client: the suite's vendor trades with every client it creates.
+    if (vendorId !== undefined) await linkVendor(app, tenantId, ownerToken, vendorId, res.body.client.id as string);
     return res.body.client.id as string;
   }
 

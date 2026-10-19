@@ -26,7 +26,9 @@ export const CAPABILITIES = [
   'stock.adjust',
   // Story 3.1 — the inbound module's mutations (vendor master data + the PO
   // lifecycle). Owner and Ops Manager only; Operator and Accountant are
-  // read-only.
+  // read-only. Story 1-3: `vendor.manage` now guards the whole business
+  // partner master — vendors, consignees, transporters and their client
+  // links (decision 4: the name is kept; nothing displays a capability label).
   'vendor.manage',
   'po.manage',
   // Story 3.2 — floor-device lifecycle (mint one-time enrollment codes,

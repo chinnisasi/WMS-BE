@@ -15,6 +15,7 @@ import { AUTH_DATABASE, DATABASE } from '../src/shared/shared.module';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -542,14 +543,7 @@ describe('story 21-1: the client dimension — one system-owned self client per 
         .expect(201);
 
       // purchase_orders: a vendor + a PO through the real create command.
-      const vendorId = (
-        await request(app.getHttpServer())
-          .post(`${API}/${tenantId}/vendors`)
-          .set('Authorization', `Bearer ${ownerToken}`)
-          .set(KEY_HEADER, ulid())
-          .send({ code: 'CD-VEND', name: 'Client-dim Vendor' })
-          .expect(201)
-      ).body.vendor.id as string;
+      const vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'CD-VEND', name: 'Client-dim Vendor' });
       await request(app.getHttpServer())
         .post(`${API}/${tenantId}/inbound/purchase-orders`)
         .set('Authorization', `Bearer ${ownerToken}`)

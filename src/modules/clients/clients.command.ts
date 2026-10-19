@@ -44,6 +44,14 @@ import {
   type AddressInput,
 } from '../../shared/primitives/address';
 import { GSTIN_RE, gstinPrefixProblem, isGstinStateCode } from '../../shared/primitives/gstin';
+// Story 1-3 — the registered-address rule moved to `shared/` so business
+// partners share it; re-exported so this module's import paths still hold.
+import {
+  assertRegisteredAddress,
+  normalizeRegisteredAddress,
+  type RegisteredAddressInput,
+} from '../../shared/primitives/registered-address';
+export { assertRegisteredAddress, normalizeRegisteredAddress, type RegisteredAddressInput };
 import { EMAIL_MAX_LENGTH, isEmailAddress, normalizeEmailAddress } from '../../shared/primitives/email';
 import { WIND_DOWN_BLOCKER_KINDS, type WindDownBlocker } from '../../shared/primitives/wind-down';
 // Story 1-2a — the wind-down reads, one file per owning module. Each imports
@@ -195,24 +203,6 @@ export interface UpdateClientAddressesCommand {
   readonly clientId: string;
   readonly registered?: RegisteredAddressInput | null | undefined;
   readonly returnAddress?: AddressInput | null | undefined;
-}
-
-/** Story 1-2a — the registered address as the client supplies it (`line2` optional). */
-export interface RegisteredAddressInput {
-  readonly line1: string;
-  readonly line2?: string | null | undefined;
-  readonly city: string;
-  readonly stateCode: string;
-  readonly pincode: string;
-}
-
-/** Story 1-2a — the registered address normalized (trimmed; a blank line2 absent). */
-interface NormalizedRegisteredAddress {
-  readonly line1: string;
-  readonly line2: string | undefined;
-  readonly city: string;
-  readonly stateCode: string;
-  readonly pincode: string;
 }
 
 /**
@@ -1298,55 +1288,9 @@ function sameRoles(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((role, index) => role === b[index]);
 }
 
-/** Story 1-2a — the registered address's lenient normalize (hashed; never throws). */
-export function normalizeRegisteredAddress(input: RegisteredAddressInput | null): NormalizedRegisteredAddress | null {
-  if (input === null) return null;
-  const trim = (value: unknown): string => (typeof value === 'string' ? value.trim() : (value as string));
-  const line2 = input.line2 === undefined || input.line2 === null ? undefined : trim(input.line2);
-  return {
-    line1: trim(input.line1),
-    line2: line2 === '' ? undefined : line2,
-    city: trim(input.city),
-    stateCode: trim(input.stateCode),
-    pincode: trim(input.pincode),
-  };
-}
-
 /** Story 1-2a — the return address's lenient normalize (the shipment shape's own). */
 export function normalizeReturnAddress(input: AddressInput | null): AddressInput | null {
   return input === null ? null : (normalizeAddressInput(input) ?? null);
-}
-
-/**
- * Story 1-2a — the registered address's shape rules (the 21-5 billing
- * columns' shapes): every field but line2 required, the ceilings, a GST
- * registration state code, a six-digit pincode. 400 naming the field.
- */
-export function assertRegisteredAddress(address: NormalizedRegisteredAddress): NormalizedRegisteredAddress {
-  const invalid = (detail: string): ProblemException =>
-    new ProblemException('validation-failed', 400, 'Invalid registered address', detail);
-  for (const field of ['line1', 'city', 'stateCode', 'pincode'] as const) {
-    if (typeof address[field] !== 'string' || address[field] === '') {
-      throw invalid(`registeredAddress.${field} is required — an address is entered whole, never partial.`);
-    }
-  }
-  if (address.line2 !== undefined && typeof address.line2 !== 'string') {
-    throw invalid('registeredAddress.line2 must be text.');
-  }
-  const ceilings = { line1: ADDRESS_FIELD_LENGTHS.line1, line2: ADDRESS_FIELD_LENGTHS.line2, city: ADDRESS_FIELD_LENGTHS.city } as const;
-  for (const field of ['line1', 'line2', 'city'] as const) {
-    const value = address[field];
-    if (value !== undefined && [...value].length > ceilings[field]) {
-      throw invalid(`registeredAddress.${field} is at most ${ceilings[field]} characters (got ${[...value].length}).`);
-    }
-  }
-  if (!isGstinStateCode(address.stateCode)) {
-    throw invalid(`registeredAddress.stateCode must be a GST registration state code (got "${address.stateCode}").`);
-  }
-  if (!PINCODE_RE.test(address.pincode)) {
-    throw invalid(`registeredAddress.pincode must be six digits (got "${address.pincode}").`);
-  }
-  return address;
 }
 
 /**

@@ -83,6 +83,12 @@ export const AUDIT_NO_OP_ARMS = {
   'clients.addresses:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'client'),
   /** Story 1-2b — `ClientsCommand.updateReceivingPolicy` with nothing changed (stores the key). */
   'clients.receivingPolicy:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'client'),
+  /** Story 1-3 — `PartnersCommand.update` with nothing changed (stores the key). */
+  'partners.update:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'partner'),
+  /** Story 1-3 — `PartnersCommand.updateStatus` to the status (and reason) already in place (stores the key). */
+  'partners.status:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'partner'),
+  /** Story 1-3 — `PartnersCommand.updateLink` with nothing changed (stores the key). */
+  'partners.linkUpdate:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'partner'),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

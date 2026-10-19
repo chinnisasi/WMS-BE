@@ -14,6 +14,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -46,7 +47,7 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
   let valkey: Redis;
   const createdTenantIds: string[] = [];
 
-  // Tenant A — the main arms tenant (two default vendors, three SKUs, two
+  // Tenant A — the main arms tenant (two linked vendors, one the client's default; three SKUs, two
   // warehouses).
   let tenantId: string;
   let ownerToken: string;
@@ -55,7 +56,7 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
   let warehouseId: string; // W1 — the sweep arms
   let policyWarehouseId: string; // W2 — the policy/list arms (no stock)
   let binW1: string;
-  let expectedDefaultVendorId: string; // min (created_at, id) — the deterministic pick
+  let expectedDefaultVendorId: string; // the self client's default vendor (story 1-3)
   let breachIds: Record<string, string>; // sku code → the FIRST sweep's breach
   let draftIds: Record<string, string>; // sku code → the minted draft
   let suiteDb: SuiteDatabase;
@@ -171,25 +172,12 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
     }
     expect(skuIds.size).toBe(5);
 
-    // Two DEFAULT vendors — several defaults are possible (no single-default
-    // unique): the sweep must pick deterministically min (created_at, id).
-    const mkVendor = async (code: string): Promise<string> =>
-      (
-        await request(app.getHttpServer())
-          .post(`${API}/${tenantId}/vendors`)
-          .set('Authorization', `Bearer ${ownerToken}`)
-          .set(KEY_HEADER, ulid())
-          .send({ code, name: `${code} vendor`, isDefault: true })
-          .expect(201)
-      ).body.vendor.id as string;
-    const v1 = await mkVendor('RP-VEND-001');
-    await mkVendor('RP-VEND-002');
-    const minDefault = await sql`
-      select id from vendors
-      where tenant_id = ${tenantId}::uuid and is_default = true
-      order by created_at asc, id asc limit 1`;
-    expectedDefaultVendorId = (minDefault[0] as unknown as { id: string }).id;
-    expect(expectedDefaultVendorId).toBe(v1); // created FIRST → the smallest
+    // Story 1-3 — the default vendor is the SKU's CLIENT's (decision 2): a
+    // vendor linked to the tenant's own client as its default, beside a
+    // second linked vendor that is not — the sweep must pick the default.
+    const v1 = await createLinkedVendor(app, tenantId, ownerToken, { code: 'RP-VEND-001', name: 'RP-VEND-001 vendor', isDefault: true });
+    await createLinkedVendor(app, tenantId, ownerToken, { code: 'RP-VEND-002', name: 'RP-VEND-002 vendor' });
+    expectedDefaultVendorId = v1;
 
     // State reset, not a readiness requirement: seed the warehouse's
     // reservation counters + ready marker from the (still empty) journal.
@@ -891,6 +879,105 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
     expect(rpB.status).toBe('open');
   });
 
+  it('story 1-3 — a stale draft: its vendor\'s link to the SKU\'s client switched off → submit refused 409 vendor-not-linked, the draft stays a draft; the list carries the draft\'s client', async () => {
+    const dB = (await draftRows(tenantId, warehouseId, skuIds.get('RP-B')!))[0]!;
+    expect(dB.vendor_id).toBe(expectedDefaultVendorId);
+    const listed = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/replenishment/suggested-pos?status=draft&limit=200`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    const clients = await request(app.getHttpServer()).get(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
+    const selfClient = (clients.body.items as { id: string; systemOwned: boolean }[]).find((c) => c.systemOwned)!.id;
+    expect((listed.body.items as { id: string; clientId: string }[]).find((row) => row.id === dB.id)!.clientId).toBe(selfClient);
+    const partners = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/partners?q=RP-VEND-001`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    const linkId = (partners.body.items[0].links as { id: string; clientId: string }[]).find((l) => l.clientId === selfClient)!.id;
+    const patchLink = (active: boolean) =>
+      request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/partners/${expectedDefaultVendorId}/links/${linkId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send(active ? { active: true, isDefault: true } : { active: false })
+        .expect(200);
+    await patchLink(false);
+    try {
+      const refused = await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/replenishment/suggested-pos/${dB.id}/submit`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .expect(409);
+      expect(refused.body.code).toBe('vendor-not-linked');
+      expect((await draftRows(tenantId, warehouseId, skuIds.get('RP-B')!))[0]!.status).toBe('draft');
+    } finally {
+      await patchLink(true);
+    }
+  });
+
+  it('story 1-3 — the default vendor is the SKU\'s CLIENT\'s: another client\'s default is never drafted; deactivating the client\'s default partner makes the next sweep draft vendorId null', async () => {
+    // Its own tenant: two brands, each with its own default vendor. VY (Y's
+    // default) is created FIRST and is also linked to X (not as default) —
+    // the pre-1-3 tenant-wide pick, min (created_at, id) over the defaults,
+    // would have drafted VY for X's SKU.
+    const email = `owner-d-${ulid().toLowerCase()}@example.com`;
+    const registered = await request(app.getHttpServer())
+      .post(API)
+      .set(KEY_HEADER, ulid())
+      .send({ name: `Per-client Defaults Co ${ulid()}`, ownerEmail: email, password: 'correct-horse-battery' })
+      .expect(201);
+    const dTenant = registered.body.tenant.id as string;
+    createdTenantIds.push(dTenant);
+    const dToken = (await mintSignIn(app, { email, password: 'correct-horse-battery' })).body.accessToken as string;
+    const owner = (method: 'post' | 'patch' | 'put', path: string): SupertestTest =>
+      request(app.getHttpServer())[method](`${API}/${dTenant}${path}`).set('Authorization', `Bearer ${dToken}`).set(KEY_HEADER, ulid());
+    const dWarehouse = (
+      await owner('post', '/warehouses')
+        .send({ origin: testAddress(), code: `RP-D-${ulid().slice(10, 14).toUpperCase()}`, name: 'Defaults WH' })
+        .expect(201)
+    ).body.id as string;
+    const clientX = (await owner('post', '/clients').send({ code: 'BRAND-X', name: 'Brand X' }).expect(201)).body.client.id as string;
+    const clientY = (await owner('post', '/clients').send({ code: 'BRAND-Y', name: 'Brand Y' }).expect(201)).body.client.id as string;
+    const header =
+      'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,catch_weight_tracked,reorder_point,reorder_qty,barcode,abc_class';
+    const importFor = async (clientId: string, rows: string[]): Promise<void> => {
+      await owner('post', '/catalog/imports')
+        .field('mode', 'initial')
+        .field('clientId', clientId)
+        .attach('file', Buffer.from([header, ...rows].join('\n'), 'utf8'), { filename: 'catalog-d.csv', contentType: 'text/csv' })
+        .expect(201);
+    };
+    // X-1 breaches now (point 4, no stock); X-2 carries no default point —
+    // a policy override makes it a candidate after the deactivation.
+    await importFor(clientX, ['RPD-X1,Brand X one,pcs,,1800,,false,false,false,4,5,,', 'RPD-X2,Brand X two,pcs,,1800,,false,false,false,,,,']);
+    await importFor(clientY, ['RPD-Y1,Brand Y one,pcs,,1800,,false,false,false,4,5,,']);
+    const skuRows = (await sql`select id, code from skus where tenant_id = ${dTenant}`) as unknown as { id: string; code: string }[];
+    const dSku = (code: string): string => skuRows.find((row) => row.code === code)!.id;
+
+    const vY = await createLinkedVendor(app, dTenant, dToken, { code: 'RPD-VY', name: 'Brand Y default', clientIds: [clientY], isDefault: true });
+    await owner('post', `/partners/${vY}/links`).send({ clientId: clientX, role: 'vendor' }).expect(201);
+    const vX = await createLinkedVendor(app, dTenant, dToken, { code: 'RPD-VX', name: 'Brand X default', clientIds: [clientX], isDefault: true });
+    await app.get(InventoryFacade).rebuildReservationCounters(dTenant, dWarehouse);
+
+    const first = await replenishment.sweepScope(dTenant, dWarehouse);
+    expect(first).toMatchObject({ opened: 2 });
+    expect((await draftRows(dTenant, dWarehouse, dSku('RPD-X1')))[0]!.vendor_id).toBe(vX);
+    expect((await draftRows(dTenant, dWarehouse, dSku('RPD-Y1')))[0]!.vendor_id).toBe(vY);
+
+    // Deactivate X's default partner: its default is cleared, and nothing
+    // falls back to another client's default (VY is still X-linked, Y's default).
+    const off = await owner('patch', `/partners/${vX}/status`).send({ status: 'inactive', reason: 'stopped supplying' }).expect(200);
+    expect((off.body.partner.links as { clientId: string; isDefault: boolean }[]).find((l) => l.clientId === clientX)!.isDefault).toBe(false);
+    await owner('put', '/replenishment/policies').send({ warehouseId: dWarehouse, skuId: dSku('RPD-X2'), reorderPoint: 4000, reorderQty: 5000 }).expect(200);
+    const second = await replenishment.sweepScope(dTenant, dWarehouse);
+    expect(second).toMatchObject({ opened: 1 });
+    const minted = (await draftRows(dTenant, dWarehouse, dSku('RPD-X2')))[0]!;
+    expect(minted.status).toBe('draft');
+    expect(minted.vendor_id).toBeNull();
+    // Y keeps its own default; the drafts already minted are untouched.
+    expect((await draftRows(dTenant, dWarehouse, dSku('RPD-Y1')))[0]!.vendor_id).toBe(vY);
+  });
+
   it('submit with a quantity that fails the mint’s UoM precision guard: 400 verbatim, the draft stays a draft', async () => {
     // RP-B is `pcs` — whole units, zero decimal places. 1500 milli = 1.5 pcs
     // passes the DTO's integer-milli guard but the inbound mint's precision
@@ -933,14 +1020,7 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
   });
 
   it('submit in tenant C with a vendor edit: the PO mints with the edited vendor and quantity', async () => {
-    const vendorId = (
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantC.id}/vendors`)
-        .set('Authorization', `Bearer ${tenantC.ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'RPN-1', name: 'Late Vendor' })
-        .expect(201)
-    ).body.vendor.id as string;
+    const vendorId = await createLinkedVendor(app, tenantC.id, tenantC.ownerToken, { code: 'RPN-1', name: 'Late Vendor' });
 
     const submitted = await request(app.getHttpServer())
       .post(`${API}/${tenantC.id}/replenishment/suggested-pos/${tenantC.draftId}/submit`)

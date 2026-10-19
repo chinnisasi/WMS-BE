@@ -130,7 +130,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
     await sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode)
       values (${skuBId}, ${tenantId}, ${clientB}, 'CI-SKU-B', 'Isolation SKU B', 'each', 1800, ${ulid()})`;
 
-    await sql`insert into vendors (id, tenant_id, code, name) values (${vendorId}, ${tenantId}, 'CI-V', 'Isolation Vendor')`;
+    await sql`insert into business_partners (id, tenant_id, code, name, roles) values (${vendorId}, ${tenantId}, 'CI-V', 'Isolation Vendor', array['vendor'])`;
     await sql`insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code, status)
       values (${uuidv7()}, ${tenantId}, ${clientA}, ${warehouseId}, ${vendorId}, 'CI-PO-A', 'open')`;
     await sql`insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code, status)
@@ -555,7 +555,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
             tx`insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code, status)
               values (
                 ${uuidv7()}, ${tenantId}, ${clientB}, ${warehouseId},
-                (select id from vendors where tenant_id = ${tenantId} and code = 'CI-V' limit 1),
+                (select id from business_partners where tenant_id = ${tenantId} and code = 'CI-V' limit 1),
                 'CI-PO-FOREIGN', 'open'
               )`,
           );
@@ -630,7 +630,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
         tx`insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code, status)
           values (
             ${uuidv7()}, ${tenantId}, ${clientA}, ${warehouseId},
-            (select id from vendors where tenant_id = ${tenantId} and code = 'CI-V' limit 1),
+            (select id from business_partners where tenant_id = ${tenantId} and code = 'CI-V' limit 1),
             'CI-PO-OWN', 'open'
           )`,
       );
@@ -966,7 +966,14 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 6-1a: + sessions_tenant_isolation (0074).
       // Story 6-1b: + sign_in_challenges and user_backup_codes (0075, the plain tenant policy).
       // Story 1-2a: + client_contacts_tenant_isolation (0077, client-bound on both arms).
-      expect(policies).toHaveLength(115);
+      // Story 1-3: + partner_client_links_tenant_isolation (0079, client-bound on
+      // both arms); vendors_tenant_isolation was RENAMED to
+      // business_partners_tenant_isolation (the plain tenant policy), not added.
+      expect(policies).toHaveLength(116);
+      const linkPolicy = policies.find((row) => row.policyname === 'partner_client_links_tenant_isolation')!;
+      expect(linkPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      expect(linkPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      expect(policies.some((row) => row.policyname === 'vendors_tenant_isolation')).toBe(false);
       const contactPolicy = policies.find((row) => row.policyname === 'client_contacts_tenant_isolation')!;
       expect(contactPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(contactPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
@@ -980,6 +987,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
         'ledger_integrity_state_tenant_isolation',
         'ledger_chain_breaks_tenant_isolation',
         'ledger_anchor_worm_copies_tenant_isolation',
+        'business_partners_tenant_isolation',
       ]) {
         expect(policies.find((row) => row.policyname === name)!.qual).toBe(
           "(tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::uuid)",
@@ -1080,7 +1088,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // One order and one PO with a line per client, and a held order
       // reservation per client — below the API, like the rest of this suite.
       const vendorId = uuidv7();
-      await sql`insert into vendors (id, tenant_id, code, name) values (${vendorId}, ${tenantId}, 'CI-V-21-7', 'Portal probe vendor')`;
+      await sql`insert into business_partners (id, tenant_id, code, name, roles) values (${vendorId}, ${tenantId}, 'CI-V-21-7', 'Portal probe vendor', array['vendor'])`;
       for (const [clientId, skuId] of [
         [clientA, skuAId],
         [clientB, skuBId],

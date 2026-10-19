@@ -13,6 +13,7 @@ import { InventoryModule } from './modules/inventory/inventory.module';
 import { MovementsModule } from './modules/movements/movements.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { OutboundModule } from './modules/outbound/outbound.module';
+import { PartnersModule } from './modules/partners/partners.module';
 import { PutawayModule } from './modules/putaway/putaway.module';
 import { ReplenishmentModule } from './modules/replenishment/replenishment.module';
 import { ReportingModule } from './modules/reporting/reporting.module';
@@ -37,6 +38,8 @@ import { JobsModule } from './jobs/jobs.module';
     BillingModule,
     CatalogModule,
     InventoryModule,
+    // Story 1-3 — the business partner master (before inbound, whose PO guard reads it).
+    PartnersModule,
     InboundModule,
     PutawayModule,
     OutboundModule,

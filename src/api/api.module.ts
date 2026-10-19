@@ -33,6 +33,8 @@ import { ReplenishmentController } from './replenishment.controller';
 import { ReportingController } from './reporting.controller';
 import { ReportingModule } from '../modules/reporting/reporting.module';
 import { ClientsController } from './clients.controller';
+import { PartnersController } from './partners.controller';
+import { PartnersModule } from '../modules/partners/partners.module';
 import { ClientsModule } from '../modules/clients/clients.module';
 import { RateCardsController } from './rate-cards.controller';
 import { BillingUsageController } from './billing-usage.controller';
@@ -59,7 +61,7 @@ import { SharedModule } from '../shared/shared.module';
  * any identity creation). Both modules are spine-singletons already imported
  * by the root — no new module instances, no duplicate routes.
  *
- * Story 3.1: the inbound surface (vendor create/list + PO create/amend/
+ * Story 3.1: the inbound surface (PO create/amend/
  * close/list/detail) rides the same shape — `InboundModule` is a
  * spine-singleton already imported by the root; every mutation goes through
  * `InboundFacade`.
@@ -83,7 +85,7 @@ import { SharedModule } from '../shared/shared.module';
   // Story 21-7 — SharedModule: Nest instantiates a route guard in the
   // CONTROLLER's module, so `PortalSessionGuard`'s DATABASE dependency must
   // resolve here too.
-  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule],
+  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule, PartnersModule],
   controllers: [
     HealthController,
     EchoController,
@@ -127,6 +129,11 @@ import { SharedModule } from '../shared/shared.module';
     // by the root; the mutations go through `ClientsCommand`, the list
     // through `ClientsFacade`.
     ClientsController,
+    // Story 1-3 — the business partner master (list, create, edit, status,
+    // client links): `PartnersModule` is a spine-singleton already imported
+    // by the root; the mutations go through `PartnersCommand`, the list
+    // through `PartnersFacade`.
+    PartnersController,
     // Story 21-3 — the rate-card surface (list, in-force, draft, edit,
     // activate, cancel, discard) rides the same shape: `BillingModule` is a
     // spine-singleton already imported by the root; the mutations go through

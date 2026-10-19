@@ -3,7 +3,7 @@ import { SharedModule } from '../../shared/shared.module';
 import { CatalogModule } from '../catalog/catalog.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { PutawayModule } from '../putaway/putaway.module';
-import { VendorCommand } from './vendors.command';
+import { PartnersModule } from '../partners/partners.module';
 import { PurchaseOrderCommand } from './po.command';
 import { AsnCommand } from './asn.command';
 import { AsnImportCommand } from './asn-import.command';
@@ -14,8 +14,9 @@ import { QcCommand } from './qc.command';
 import { QcFacade } from './qc.facade';
 
 /**
- * Inbound module (Story 3.1): vendor master data and the purchase-order
- * lifecycle — the upstream half of receiving. `vendors`,
+ * Inbound module (Story 3.1): the purchase-order lifecycle — the upstream
+ * half of receiving. Story 1-3 moved the vendor master data to the partners
+ * module (`business_partners`, read here only through `partners.facade.ts`).
  * `purchase_orders`, and `purchase_order_lines` are module-exclusive; the
  * only stock truth stays the inventory module's ledger (a PO is not stock —
  * this module writes no ledger events, no stock tables).
@@ -48,9 +49,8 @@ import { QcFacade } from './qc.facade';
 // catalog cycle; the decorator must not touch the loading binding eagerly
 // (the catalog↔tenancy pattern).
 @Module({
-  imports: [SharedModule, forwardRef(() => CatalogModule), InventoryModule, PutawayModule],
+  imports: [SharedModule, forwardRef(() => CatalogModule), InventoryModule, PutawayModule, PartnersModule],
   providers: [
-    VendorCommand,
     PurchaseOrderCommand,
     // Story 21-6 — the advance shipment notice lifecycle.
     AsnCommand,
