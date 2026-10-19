@@ -918,10 +918,13 @@ export class ReturnReceiptCommand {
         .orderBy(asc(returnAuthorizationLines.lineNo))
         .for('update');
       const lineById = new Map(rmaLines.map((line) => [line.id, line]));
+      // Story 1-4 — FOR SHARE: a tracking-flag flip cannot interleave with
+      // this posting (the SKU edit's flag guard takes the row FOR UPDATE).
       const skuFacts = await this.catalog.skuFactsInTx(
         tx,
         tenantId,
         rmaLines.map((line) => line.skuId),
+        { lock: 'share' },
       );
 
       // 9. Resolve and pre-lock the serials named on matching lines, sorted

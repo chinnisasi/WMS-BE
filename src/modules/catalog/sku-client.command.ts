@@ -18,6 +18,7 @@ import {
   asnLines,
   reservations,
   serials,
+  skuBarcodes,
   skus,
   stockAdjustmentPendings,
   transferOrderLines,
@@ -31,7 +32,9 @@ import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import { assertClientTakesWorkInTx, getClientLabelsInTx } from '../clients/clients.facade';
-import { skuNotFound, withConversions, type SkuSnapshot } from './sku.command';
+import { normalizeStoredSku, skuNotFound, withPackaging, type SkuSnapshot } from './sku.command';
+import { SKU_BARCODES_UNIQUE } from './sku-master';
+import { duplicateProductName } from './product.command';
 
 export interface CorrectSkuClientCommand {
   readonly tenantId: string;
@@ -50,6 +53,8 @@ const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 // Story 1-1 (0076) — code and barcode are unique per (tenant, client).
 const SKUS_TENANT_CLIENT_CODE = 'skus_tenant_client_code_unique';
 const SKUS_TENANT_CLIENT_BARCODE = 'skus_tenant_client_barcode_unique';
+// Story 1-4 (0080) — the barcode authority and the per-client product names.
+const PRODUCTS_TENANT_CLIENT_NAME = 'products_tenant_client_name_unique';
 
 /**
  * Every place a SKU accrues HISTORY — anything that would disagree with a
@@ -195,7 +200,7 @@ export class SkuClientCommand {
       // A no-op (already on that client — the group shares one client) writes
       // nothing and audits nothing.
       if (lockedRows.every((row) => row.clientId === command.clientId)) {
-        return { skus: [await withConversions(tx, command.tenantId, target)] };
+        return { skus: [await withPackaging(tx, command.tenantId, target)] };
       }
 
       // The history check, UNDER the locks — every member must be clean.
@@ -226,8 +231,14 @@ export class SkuClientCommand {
       // barcode are unique. Named members are checked in the response order
       // (the named SKU first), codes before barcodes.
       await assertNoTargetCollisionsInTx(tx, command.tenantId, command.clientId, targetLabel, ordered);
+      // Story 1-4 — every barcode row of the moving SKUs (primary, extra
+      // base-level and pack-level) against the target's `sku_barcodes` and
+      // codes, and the moving products' names against the target's products.
+      await assertNoTargetBarcodeRowCollisionsInTx(tx, command.tenantId, command.clientId, targetLabel, ordered);
+      await assertNoTargetProductNameCollisionsInTx(tx, command.tenantId, command.clientId, group.productIds);
 
-      const moved: SkuSnapshot[] = [];
+      const movedRows: (typeof skus.$inferSelect)[] = [];
+      const moved = movedRows;
       for (const row of ordered) {
         let updated: (typeof skus.$inferSelect)[];
         try {
@@ -262,7 +273,7 @@ export class SkuClientCommand {
           }
           throw err;
         }
-        moved.push(await withConversions(tx, command.tenantId, updated[0]!));
+        moved.push(updated[0]!);
         await tx.insert(auditEvents).values({
           id: uuidv7(),
           tenantId: command.tenantId,
@@ -276,7 +287,46 @@ export class SkuClientCommand {
           occurredAt: nowIso(),
         });
       }
-      const snapshot: SkuClientCorrectionSnapshot = { skus: moved };
+      // Story 1-4 — the barcode rows and the products move with their SKUs
+      // (the ONLY writer of `sku_barcodes.client_id` after creation, and the
+      // only one of `products.client_id` once SKUs are attached —
+      // architecture pins). A concurrent write that took a barcode or a
+      // product name in the target is the arbiter's 23505, mapped.
+      try {
+        await tx.transaction(async (savepoint) => {
+          await savepoint
+            .update(skuBarcodes)
+            .set({ clientId: command.clientId, updatedAt: nowIso() })
+            .where(and(eq(skuBarcodes.tenantId, command.tenantId), inArray(skuBarcodes.skuId, ordered.map((row) => row.id))));
+          if (group.productIds.length > 0) {
+            await savepoint
+              .update(products)
+              .set({ clientId: command.clientId, updatedAt: nowIso() })
+              .where(and(eq(products.tenantId, command.tenantId), inArray(products.id, group.productIds)));
+          }
+        });
+      } catch (err) {
+        if (isUniqueViolationOn(err, SKU_BARCODES_UNIQUE)) {
+          throw new ProblemException(
+            'duplicate-barcode',
+            409,
+            'Barcode already in use',
+            `A barcode of the moving SKUs was taken in client ${targetLabel} by a concurrent write — the SKU cannot move there while that client holds the barcode.`,
+          );
+        }
+        if (isUniqueViolationOn(err, PRODUCTS_TENANT_CLIENT_NAME)) {
+          throw new ProblemException(
+            'duplicate-product-name',
+            409,
+            'Product name already in use',
+            `A product name of the moving group was taken in client ${targetLabel} by a concurrent write — retry.`,
+          );
+        }
+        throw err;
+      }
+      const snapshots: SkuSnapshot[] = [];
+      for (const row of moved) snapshots.push(await withPackaging(tx, command.tenantId, row));
+      const snapshot: SkuClientCorrectionSnapshot = { skus: snapshots };
 
       try {
         await tx.insert(idempotencyKeys).values({
@@ -323,7 +373,9 @@ export class SkuClientCommand {
     if (existing[0].payloadHash !== payloadHash) {
       throw idempotencyKeyReuse();
     }
-    return existing[0].responseSnapshot as SkuClientCorrectionSnapshot;
+    // Story 1-4 — a pre-1.4 stored response lacks `shelfLifeDays`/`barcodes`.
+    const stored = existing[0].responseSnapshot as SkuClientCorrectionSnapshot;
+    return { skus: stored.skus.map(normalizeStoredSku) };
   }
 }
 
@@ -366,6 +418,124 @@ async function assertNoTargetCollisionsInTx(
     if (holder !== undefined) {
       throw targetBarcodeCollision(row.barcode, row.code, holder, targetLabel);
     }
+  }
+}
+
+/**
+ * Story 1-4 — every `sku_barcodes` row of the moving SKUs against the
+ * target client: held there by another SKU → 409 `duplicate-barcode` naming
+ * the member, the holder and its level; equal to a target SKU code → 409
+ * `barcode-is-code` (decision 13). The group's own rows are excluded.
+ */
+async function assertNoTargetBarcodeRowCollisionsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  targetClientId: string,
+  targetLabel: string,
+  members: readonly (typeof skus.$inferSelect)[],
+): Promise<void> {
+  const memberIds = members.map((row) => row.id);
+  const codeById = new Map(members.map((row) => [row.id, row.code] as const));
+  const rows = await tx
+    .select({ skuId: skuBarcodes.skuId, barcode: skuBarcodes.barcode })
+    .from(skuBarcodes)
+    .where(and(eq(skuBarcodes.tenantId, tenantId), inArray(skuBarcodes.skuId, memberIds)));
+  // (`inArray` over an empty list is refused by drizzle — a sentinel keeps
+  // the reverse-direction check below running for a SKU with no rows.)
+  const barcodes = rows.length === 0 ? [''] : [...new Set(rows.map((row) => row.barcode))];
+  const held = await tx
+    .select({ barcode: skuBarcodes.barcode, uom: skuBarcodes.uom, holder: skus.code })
+    .from(skuBarcodes)
+    .innerJoin(skus, eq(skus.id, skuBarcodes.skuId))
+    .where(
+      and(
+        eq(skuBarcodes.tenantId, tenantId),
+        eq(skuBarcodes.clientId, targetClientId),
+        notInArray(skuBarcodes.skuId, memberIds),
+        inArray(skuBarcodes.barcode, barcodes),
+      ),
+    );
+  const heldBy = new Map(held.map((row) => [row.barcode, row] as const));
+  for (const row of rows) {
+    const holder = heldBy.get(row.barcode);
+    if (holder !== undefined) {
+      throw new ProblemException(
+        'duplicate-barcode',
+        409,
+        'Barcode already in use',
+        `Barcode "${row.barcode}" of SKU "${codeById.get(row.skuId)}" already belongs to SKU "${holder.holder}" (its ${holder.uom} barcode) of client ${targetLabel} — the SKU cannot move there while that client holds the barcode.`,
+      );
+    }
+  }
+  // Decision 13, both directions: a moving barcode equal to a target SKU
+  // code, and a moving SKU code equal to a target barcode.
+  const codes = await tx
+    .select({ code: skus.code })
+    .from(skus)
+    .where(and(eq(skus.tenantId, tenantId), eq(skus.clientId, targetClientId), notInArray(skus.id, memberIds), inArray(skus.code, barcodes)));
+  if (codes[0] !== undefined) {
+    const moving = rows.find((row) => row.barcode === codes[0]!.code)!;
+    throw targetBarcodeIsCode(
+      `Barcode "${moving.barcode}" of SKU "${codeById.get(moving.skuId)}" equals the code of SKU "${codes[0].code}" in client ${targetLabel}`,
+    );
+  }
+  const memberCodes = [...new Set(members.map((row) => row.code))];
+  const barcodesAsCodes = await tx
+    .select({ barcode: skuBarcodes.barcode, holder: skus.code })
+    .from(skuBarcodes)
+    .innerJoin(skus, eq(skus.id, skuBarcodes.skuId))
+    .where(
+      and(
+        eq(skuBarcodes.tenantId, tenantId),
+        eq(skuBarcodes.clientId, targetClientId),
+        notInArray(skuBarcodes.skuId, memberIds),
+        inArray(skuBarcodes.barcode, memberCodes),
+      ),
+    )
+    .limit(1);
+  if (barcodesAsCodes[0] !== undefined) {
+    throw targetBarcodeIsCode(
+      `SKU code "${barcodesAsCodes[0].barcode}" of the moving SKU equals a barcode of SKU "${barcodesAsCodes[0].holder}" in client ${targetLabel}`,
+    );
+  }
+}
+
+function targetBarcodeIsCode(clash: string): ProblemException {
+  return new ProblemException(
+    'barcode-is-code',
+    409,
+    'Barcode equals a SKU code',
+    `${clash} — a barcode may not equal any SKU code in a client, so the SKU cannot move there.`,
+  );
+}
+
+/** Story 1-4 — the moving products' names must be free among the target client's products. */
+async function assertNoTargetProductNameCollisionsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  targetClientId: string,
+  productIds: readonly string[],
+): Promise<void> {
+  if (productIds.length === 0) return;
+  const moving = await tx
+    .select({ name: products.name })
+    .from(products)
+    .where(and(eq(products.tenantId, tenantId), inArray(products.id, [...productIds])));
+  if (moving.length === 0) return;
+  const clash = await tx
+    .select({ name: products.name })
+    .from(products)
+    .where(
+      and(
+        eq(products.tenantId, tenantId),
+        eq(products.clientId, targetClientId),
+        notInArray(products.id, [...productIds]),
+        inArray(products.name, moving.map((row) => row.name)),
+      ),
+    )
+    .limit(1);
+  if (clash[0] !== undefined) {
+    throw duplicateProductName(clash[0].name);
   }
 }
 

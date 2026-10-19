@@ -919,6 +919,50 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
   });
 
   /**
+   * Story 1-4 — `sku_barcodes.client_id` always equals its SKU's: set at the
+   * row's insert (create, import, the edit's primary writer — all from the
+   * SKU) and moved only by the correction command, beside `skus.client_id`.
+   * `products.client_id` likewise moves only with the correction once SKUs
+   * are attached; the product edit may change it only while the product has
+   * none (its `product-has-skus` guard) — so those two files are the only
+   * writers.
+   */
+  const BARCODE_CLIENT_UPDATE = /\.update\(\s*skuBarcodes\s*\)\s*\.set\(\s*\{[^}]*\bclientId\b/;
+  const RAW_BARCODE_CLIENT_UPDATE = /\bupdate\s+"?sku_barcodes"?\s+set\b[^;`]*\bclient_id\b/i;
+  const PRODUCT_CLIENT_UPDATE = /\.update\(\s*products\s*\)\s*\.set\(\s*\{[^}]*\bclientId\b/;
+  const RAW_PRODUCT_CLIENT_UPDATE = /\bupdate\s+"?products"?\s+set\b[^;`]*\bclient_id\b/i;
+  const PRODUCT_COMMAND_FILE = join(SRC_ROOT, 'modules', 'catalog', 'product.command.ts');
+
+  it('story 1-4: only the correction command updates sku_barcodes.client_id; only it and the empty-product edit update products.client_id', () => {
+    const offenders: string[] = [];
+    for (const file of files) {
+      if (file.path === CORRECTION_FILE) continue;
+      for (const pattern of [BARCODE_CLIENT_UPDATE, RAW_BARCODE_CLIENT_UPDATE]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+      if (file.path === PRODUCT_COMMAND_FILE) continue;
+      for (const pattern of [PRODUCT_CLIENT_UPDATE, RAW_PRODUCT_CLIENT_UPDATE]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+      if (/\.update\(\s*(skuBarcodes|products)\b/.test(file.source) && SKU_CLIENT_ASSIGN.test(file.source)) {
+        offenders.push(`${file.path}: /${SKU_CLIENT_ASSIGN.source}/`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // Meaningful: the correction moves both, the product edit guards its move.
+    const correction = readFileSync(CORRECTION_FILE, 'utf8');
+    expect(correction).toMatch(/\.update\(skuBarcodes\)\s*\.set\(\{ clientId: command\.clientId/);
+    expect(correction).toMatch(/\.update\(products\)\s*\.set\(\{ clientId: command\.clientId/);
+    const productCommand = readFileSync(PRODUCT_COMMAND_FILE, 'utf8');
+    expect(productCommand).toContain("'product-has-skus'");
+    expect(productCommand).toMatch(/if \(clientChanges\) updates\.clientId = resultingClientId;/);
+    // The patterns bite on the shapes they name.
+    expect(BARCODE_CLIENT_UPDATE.test('tx.update(skuBarcodes).set({ clientId: x })')).toBe(true);
+    expect(RAW_BARCODE_CLIENT_UPDATE.test('UPDATE sku_barcodes SET client_id = $1')).toBe(true);
+    expect(PRODUCT_CLIENT_UPDATE.test('tx.update(products).set({ name, clientId: x })')).toBe(true);
+  });
+
+  /**
    * Story 1-2a — the wind-down reads. Each owning module exports a file-level
    * `clientWindDownBlockersInTx` that the clients module's status command
    * composes; every such file imports only `drizzle-orm` and `shared/` (so
@@ -964,6 +1008,8 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
     ['catalog', 'sku-client.command.ts'],
     ['catalog', 'kit.command.ts'],
     ['catalog', 'sku.command.ts'],
+    // Story 1-4 — a product is created for (or moved to) a client.
+    ['catalog', 'product.command.ts'],
     ['returns', 'return-authorization.command.ts'],
     ['inventory', 'inventory.command.ts'],
   ] as const;

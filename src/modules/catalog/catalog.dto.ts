@@ -38,6 +38,26 @@ import { UOMS } from './uom';
 import { MAX_SKU_DIMENSION_MM, MAX_SKU_WEIGHT_GRAMS } from './sku-attributes';
 import { AXIS_NAME_MAX, MAX_PRODUCT_AXES, PRODUCT_NAME_MAX } from './product.command';
 import { MAX_KIT_COMPONENTS } from './kit.command';
+// Story 1-4 — the SKU master's shared bounds (the DTO mirrors; the command is the boundary).
+import {
+  BARCODE_MAX,
+  BARCODE_RE,
+  HSN_MAX,
+  MAX_EXTRA_BARCODES,
+  MAX_PACK_FACTOR,
+  MAX_PACK_LEVELS,
+  MAX_SHELF_LIFE_DAYS,
+  MIN_PACK_FACTOR,
+  MIN_SHELF_LIFE_DAYS,
+  SKU_CODE_MAX,
+  SKU_NAME_MAX,
+} from './sku-master';
+
+/** Story 1-4 (decision 12) — the barcode rule as two DTO patterns (printable ASCII, trimmed; no `;`). */
+const BarcodeRule = () => (target: object, key: string | symbol) => {
+  Matches(BARCODE_RE, { message: `${String(key)} must be printable ASCII with no leading or trailing space` })(target, key);
+  Matches(/^[^;]*$/, { message: `${String(key)} may not contain ";"` })(target, key);
+};
 
 /**
  * Trim inputs at the validation boundary so the command layer's normalized
@@ -129,6 +149,18 @@ export class SkuUomConversionResponse {
 
   @ApiProperty({ example: 12, description: 'Positive integer, relative to the SKU\'s base UoM' })
   factor!: number;
+}
+
+/** Story 1-4 — one barcode of a SKU with its level. */
+export class SkuBarcodeResponse {
+  @ApiProperty({ example: '8901234567890' })
+  barcode!: string;
+
+  @ApiProperty({ example: 'case', enum: [...UOMS], description: 'The level this barcode names — the SKU\'s base uom or one of its pack levels' })
+  uom!: string;
+
+  @ApiProperty({ example: false, description: 'The primary barcode (always at the base uom; equals `barcode` on the SKU)' })
+  isPrimary!: boolean;
 }
 
 export class SkuResponse {
@@ -291,11 +323,262 @@ export class SkuResponse {
   @ApiProperty({ example: '0198f7a2-1b3c-7d4e-8f90-112233445588', description: 'Generated server-side (uuidv7) unless provided' })
   barcode!: string;
 
-  @ApiProperty({ type: [SkuUomConversionResponse] })
+  @ApiProperty({
+    type: [SkuUomConversionResponse],
+    description: 'Story 1-4 — the SKU\'s pack levels (one unit of `uom` = `factor` base units), sorted by uom',
+  })
   uomConversions!: SkuUomConversionResponse[];
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    example: 365,
+    description:
+      'Story 1-4 — total shelf life in days from manufacture (1–3650), or null when unset. Not the client policy\'s minimum REMAINING shelf life.',
+  })
+  shelfLifeDays!: number | null;
+
+  @ApiProperty({
+    type: [SkuBarcodeResponse],
+    description: 'Story 1-4 — every barcode of the SKU with its level: the primary first, then by (uom, barcode). Empty only on a replayed response stored before 1-4',
+  })
+  barcodes!: SkuBarcodeResponse[];
 
   @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
   createdAt!: string;
+}
+
+/** Story 1-4 — the create's and the packaging PUT's response. */
+export class SkuWriteResponse {
+  @ApiProperty({ type: SkuResponse })
+  sku!: SkuResponse;
+}
+
+/** Story 1-4 — one pack level: one unit of `uom` = `factor` base units. */
+export class PackLevelDto {
+  @ApiProperty({
+    example: 'case',
+    maxLength: 32,
+    description: 'The level\'s unit — the uom vocabulary (aliases such as `cases` resolve); never the SKU\'s base uom',
+  })
+  @Trimmed()
+  @IsString()
+  @Length(1, 32)
+  uom!: string;
+
+  @ApiProperty({ example: 12, minimum: MIN_PACK_FACTOR, maximum: MAX_PACK_FACTOR, description: 'Base units in one unit of this level — a whole number' })
+  @IsInt()
+  @Min(MIN_PACK_FACTOR)
+  @Max(MAX_PACK_FACTOR)
+  factor!: number;
+}
+
+/** Story 1-4 — one non-primary barcode and the level it names. */
+export class ExtraBarcodeDto {
+  @ApiProperty({ example: '8901234567890', minLength: 1, maxLength: BARCODE_MAX, description: 'Printable ASCII, trimmed, no ";"' })
+  @Trimmed()
+  @IsString()
+  @Length(1, BARCODE_MAX)
+  @BarcodeRule()
+  barcode!: string;
+
+  @ApiProperty({ example: 'case', maxLength: 32, description: 'The SKU\'s base uom (an extra base-level barcode) or one of its pack levels' })
+  @Trimmed()
+  @IsString()
+  @Length(1, 32)
+  uom!: string;
+}
+
+/** Story 1-4 — `PUT …/catalog/skus/{skuId}/packaging`: the full set of levels and non-primary barcodes. */
+export class ReplacePackagingDto {
+  @ApiProperty({ type: [PackLevelDto], maxItems: MAX_PACK_LEVELS, description: 'Every pack level the SKU carries afterwards (replace semantics)' })
+  @IsArray()
+  @ArrayMaxSize(MAX_PACK_LEVELS)
+  @ValidateNested({ each: true })
+  @Type(() => PackLevelDto)
+  levels!: PackLevelDto[];
+
+  @ApiProperty({
+    type: [ExtraBarcodeDto],
+    maxItems: MAX_EXTRA_BARCODES,
+    description: 'Every NON-primary barcode the SKU carries afterwards (the primary is edited through the SKU PATCH)',
+  })
+  @IsArray()
+  @ArrayMaxSize(MAX_EXTRA_BARCODES)
+  @ValidateNested({ each: true })
+  @Type(() => ExtraBarcodeDto)
+  barcodes!: ExtraBarcodeDto[];
+}
+
+/** Story 1-4 — the physical attributes on a create (the PATCH's fields, nested). */
+export class SkuAttributesDto {
+  @ApiProperty({ required: false, example: 500, minimum: 1, maximum: MAX_SKU_WEIGHT_GRAMS, description: 'Static catalog weight in grams' })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_SKU_WEIGHT_GRAMS)
+  weightGrams?: number;
+
+  @ApiProperty({ required: false, example: 200, minimum: 1, maximum: MAX_SKU_DIMENSION_MM })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_SKU_DIMENSION_MM)
+  lengthMm?: number;
+
+  @ApiProperty({ required: false, example: 150, minimum: 1, maximum: MAX_SKU_DIMENSION_MM })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_SKU_DIMENSION_MM)
+  widthMm?: number;
+
+  @ApiProperty({ required: false, example: 100, minimum: 1, maximum: MAX_SKU_DIMENSION_MM })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(MAX_SKU_DIMENSION_MM)
+  heightMm?: number;
+
+  @ApiProperty({ required: false, example: 'IN', description: 'ISO 3166-1 alpha-2 uppercase' })
+  @IsOptional()
+  @Trimmed()
+  @IsString()
+  @Matches(/^$|^[A-Z]{2}$/, { message: 'countryOfOrigin must be two uppercase ISO 3166-1 alpha-2 letters (e.g. IN, CN).' })
+  countryOfOrigin?: string;
+}
+
+/** Story 1-4 — `POST …/catalog/skus`: one import row's worth of fields, typed. */
+export class CreateSkuDto {
+  @ApiProperty({ example: 'TEA-1', minLength: 1, maxLength: SKU_CODE_MAX, description: 'Unique in the client; immutable' })
+  @Trimmed()
+  @IsString()
+  @Length(1, SKU_CODE_MAX)
+  code!: string;
+
+  @ApiProperty({ example: 'Assam tea 250g', minLength: 1, maxLength: SKU_NAME_MAX })
+  @Trimmed()
+  @IsString()
+  @Length(1, SKU_NAME_MAX)
+  name!: string;
+
+  @ApiProperty({ example: 'each', maxLength: 32, description: 'The base unit — the uom vocabulary; aliases such as `pcs` resolve. Immutable' })
+  @Trimmed()
+  @IsString()
+  @Length(1, 32)
+  uom!: string;
+
+  @ApiProperty({ example: 1800, minimum: 0, maximum: GST_RATE_BPS_MAX, description: 'GST in basis points (1800 = 18%)' })
+  @IsInt()
+  @Min(0)
+  @Max(GST_RATE_BPS_MAX)
+  gstRate!: number;
+
+  @ApiProperty({ required: false, maxLength: HSN_MAX, example: '09023020' })
+  @IsOptional()
+  @Trimmed()
+  @IsString()
+  @Length(0, HSN_MAX)
+  hsnCode?: string;
+
+  @ApiProperty({
+    required: false,
+    maxLength: BARCODE_MAX,
+    example: '8901234567890',
+    description: 'The primary (base-level) barcode. Omitted or blank → generated server-side, as the import does',
+  })
+  @IsOptional()
+  @Trimmed()
+  @IsString()
+  @Length(0, BARCODE_MAX)
+  @Matches(/^$|^[!-~]([ -~]*[!-~])?$/, { message: 'barcode must be printable ASCII with no leading or trailing space' })
+  @Matches(/^[^;]*$/, { message: 'barcode may not contain ";"' })
+  barcode?: string;
+
+  @ApiProperty({ example: false })
+  @IsBoolean()
+  batchTracked!: boolean;
+
+  @ApiProperty({ example: false })
+  @IsBoolean()
+  serialTracked!: boolean;
+
+  @ApiProperty({ example: false, description: 'Handled by unit, priced by weight. Mutually exclusive with serialTracked' })
+  @IsBoolean()
+  catchWeightTracked!: boolean;
+
+  @ApiProperty({ required: false, type: SkuAttributesDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => SkuAttributesDto)
+  attributes?: SkuAttributesDto;
+
+  @ApiProperty({ required: false, enum: STORAGE_CLASSES, example: 'ambient', description: 'Defaults to ambient' })
+  @IsOptional()
+  @IsIn(STORAGE_CLASSES)
+  storageClass?: string;
+
+  @ApiProperty({ required: false, enum: HAZARD_CLASSES, example: 'flammable' })
+  @IsOptional()
+  @IsIn(HAZARD_CLASSES)
+  hazardClass?: string;
+
+  @ApiProperty({ required: false, enum: ABC_CLASSES, example: 'a' })
+  @IsOptional()
+  @IsIn(ABC_CLASSES)
+  abcClass?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 0, maximum: MAX_QUANTITY_BASE, description: QUANTITY_FIELD_DESCRIPTION })
+  @IsOptional()
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0)
+  @Max(MAX_QUANTITY_BASE)
+  reorderPoint?: number;
+
+  @ApiProperty({ required: false, example: 100, minimum: 0, maximum: MAX_QUANTITY_BASE, description: QUANTITY_FIELD_DESCRIPTION })
+  @IsOptional()
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0)
+  @Max(MAX_QUANTITY_BASE)
+  reorderQty?: number;
+
+  @ApiProperty({
+    required: false,
+    example: 365,
+    minimum: MIN_SHELF_LIFE_DAYS,
+    maximum: MAX_SHELF_LIFE_DAYS,
+    description: 'Total shelf life in days from manufacture',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(MIN_SHELF_LIFE_DAYS)
+  @Max(MAX_SHELF_LIFE_DAYS)
+  shelfLifeDays?: number;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'The client the SKU belongs to. Required (400 client-required) once the tenant holds more than one client',
+  })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
+  @ApiProperty({ required: false, type: [PackLevelDto], maxItems: MAX_PACK_LEVELS })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_PACK_LEVELS)
+  @ValidateNested({ each: true })
+  @Type(() => PackLevelDto)
+  levels?: PackLevelDto[];
+
+  @ApiProperty({ required: false, type: [ExtraBarcodeDto], maxItems: MAX_EXTRA_BARCODES, description: 'Non-primary barcodes, each naming its level' })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_EXTRA_BARCODES)
+  @ValidateNested({ each: true })
+  @Type(() => ExtraBarcodeDto)
+  barcodes?: ExtraBarcodeDto[];
 }
 
 /** Story 21-2b — the client correction's response: every SKU it moved (the named one first). */
@@ -496,12 +779,31 @@ export class PatchSkuDto {
   @Max(MAX_QUANTITY_BASE)
   reorderQty?: number;
 
-  @ApiProperty({ required: false, minLength: 1, maxLength: 64 })
+  @ApiProperty({ required: false, minLength: 1, maxLength: 64, description: 'The primary barcode — printable ASCII, trimmed, no ";". A value that is this SKU\'s extra barcode is promoted' })
   @IsOptional()
   @Trimmed()
   @IsString()
   @Length(1, 64)
+  @BarcodeRule()
   barcode?: string;
+
+  // Story 1-4 — total shelf life in days from manufacture. Absent =
+  // unchanged, null = clear (`@IsOptional` lets null through; the command
+  // clears on it and re-checks the range behind its replay lookup).
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    example: 365,
+    minimum: MIN_SHELF_LIFE_DAYS,
+    maximum: MAX_SHELF_LIFE_DAYS,
+    description: 'Total shelf life in days from manufacture (1–3650). Omit to leave unchanged; null to clear.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(MIN_SHELF_LIFE_DAYS)
+  @Max(MAX_SHELF_LIFE_DAYS)
+  shelfLifeDays?: number | null;
 
   // Story 11.3 — the variant attach/detach fields. The `hsn` template again:
   // absent = unchanged, `null` (on productId) = detach and clear
@@ -611,6 +913,15 @@ export class CreateProductDto {
   @MinLength(1, { each: true })
   @MaxLength(AXIS_NAME_MAX, { each: true })
   axes!: string[];
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'Story 1-4 — the client the product belongs to. Required (400 client-required) once the tenant holds more than one client',
+  })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
 }
 
 /** PATCH fields on a product: name is always editable, axes only while empty. */
@@ -639,6 +950,15 @@ export class PatchProductDto {
   @MinLength(1, { each: true })
   @MaxLength(AXIS_NAME_MAX, { each: true })
   axes?: string[];
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'Story 1-4 — moves the product to another client; refused 409 `product-has-skus` while any SKU is attached',
+  })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
 }
 
 export class ProductResponse {
@@ -650,6 +970,9 @@ export class ProductResponse {
 
   @ApiProperty({ example: 'Oversized Tee' })
   name!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'Story 1-4 — the client the product belongs to; every attached SKU shares it' })
+  clientId!: string;
 
   @ApiProperty({ type: [String], example: ['size', 'colour'] })
   axes!: string[];

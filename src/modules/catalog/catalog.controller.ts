@@ -33,7 +33,7 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from '../tenancy/idempote
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ImportCommand, MAX_IMPORT_BYTES } from './import.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
-import { SkuCommand } from './sku.command';
+import { SkuCommand, type SkuSnapshot } from './sku.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ProductCommand } from './product.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -48,6 +48,9 @@ import {
   CatalogImportResponse,
   CorrectSkuClientDto,
   CreateProductDto,
+  CreateSkuDto,
+  ReplacePackagingDto,
+  SkuWriteResponse,
   SkuClientCorrectionResponse,
   KitListResponse,
   KitResponse,
@@ -228,9 +231,112 @@ export class CatalogController {
       query.productId,
     );
     return {
-      items: page.items.map((item) => ({ ...item, uomConversions: item.uomConversions.map((c) => ({ ...c })) })),
+      items: page.items.map(toSkuResponse),
       nextCursor: page.nextCursor,
     };
+  }
+
+  // ── Story 1-4 — the single-SKU create and the packaging PUT ───────────────
+
+  @Post(':tenantId/catalog/skus')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Creates one SKU — one import row\'s worth of typed fields, its pack levels and barcodes included, in one keyed transaction',
+  })
+  @ApiBody({ type: CreateSkuDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: SkuWriteResponse, description: 'The created SKU (a matching Idempotency-Key replays it)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key; an invalid field — unknown uom, GST, attributes, classes, shelf life, a level equal to the base uom or repeated, a factor outside 2–1,000,000, a barcode breaking the rule or equal to the primary (validation-failed); a barcode on a level the SKU does not declare (barcode-level-unknown); no clientId while the tenant holds more than one client (client-required)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('clientId names no client of this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The code is taken in the client (duplicate-sku-code); a barcode is taken in the client or listed twice (duplicate-barcode, naming the holder and its level); a barcode equals a SKU code of the client, or the code equals a barcode (barcode-is-code); the client has departed (client-departed); a concurrent same-key request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async createSku(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: CreateSkuDto,
+  ): Promise<SkuWriteResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const created = await this.skuCommand.create(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        code: dto.code,
+        name: dto.name,
+        uom: dto.uom,
+        gstRateBps: dto.gstRate,
+        hsn: dto.hsnCode,
+        barcode: dto.barcode,
+        batchTracked: dto.batchTracked,
+        serialTracked: dto.serialTracked,
+        catchWeightTracked: dto.catchWeightTracked,
+        weightGrams: dto.attributes?.weightGrams,
+        lengthMm: dto.attributes?.lengthMm,
+        widthMm: dto.attributes?.widthMm,
+        heightMm: dto.attributes?.heightMm,
+        countryOfOrigin: dto.attributes?.countryOfOrigin,
+        storageClass: dto.storageClass,
+        hazardClass: dto.hazardClass,
+        abcClass: dto.abcClass,
+        // Base units — converted inside the command, behind the replay (10.2).
+        reorderPoint: dto.reorderPoint,
+        reorderQty: dto.reorderQty,
+        shelfLifeDays: dto.shelfLifeDays,
+        clientId: dto.clientId,
+        levels: dto.levels?.map((level) => ({ uom: level.uom, factor: level.factor })),
+        barcodes: dto.barcodes?.map((entry) => ({ barcode: entry.barcode, uom: entry.uom })),
+      },
+      key,
+    );
+    return { sku: toSkuResponse(created.sku) };
+  }
+
+  @Put(':tenantId/catalog/skus/:skuId/packaging')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Replaces a SKU\'s pack levels (box, case, pallet — base units per level) and its non-primary barcodes, each naming its level',
+  })
+  @ApiBody({ type: ReplacePackagingDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: SkuWriteResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key; a level repeated or equal to the base uom, a factor outside 2–1,000,000, a barcode breaking the rule or equal to the primary (validation-failed); a barcode on a level that is neither the base uom nor in levels (barcode-level-unknown)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The SKU does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A barcode is listed twice or held by another SKU of the client (duplicate-barcode, naming the holder and its level); a barcode equals a SKU code of the client (barcode-is-code); the SKU\'s client has departed (client-departed); a concurrent same-key request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'skuId', format: 'uuid' })
+  async replacePackaging(
+    @Param('tenantId') tenantId: string,
+    @Param('skuId') skuId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: ReplacePackagingDto,
+  ): Promise<SkuWriteResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const result = await this.skuCommand.replacePackaging(
+      {
+        tenantId,
+        actorUserId: session.userId,
+        skuId,
+        levels: dto.levels.map((level) => ({ uom: level.uom, factor: level.factor })),
+        barcodes: dto.barcodes.map((entry) => ({ barcode: entry.barcode, uom: entry.uom })),
+      },
+      key,
+    );
+    return { sku: toSkuResponse(result.sku) };
   }
 
   // Story 12-7 — the segregation matrix as data (FR-41, the admin view): an
@@ -270,10 +376,11 @@ export class CatalogController {
   @ApiBody({ type: CreateProductDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.CREATED, type: ProductResponse, description: 'The created product (a matching Idempotency-Key replays it)' })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid name/axes (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid name/axes/clientId (validation-failed), or no clientId while the tenant holds more than one client (client-required)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Product name already exists in this tenant (duplicate-product-name)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('clientId names no client of this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Product name already exists for this client (duplicate-product-name), or the client has departed (client-departed)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async createProduct(
@@ -290,6 +397,7 @@ export class CatalogController {
         actorUserId: session.userId,
         name: dto.name,
         axes: dto.axes,
+        clientId: dto.clientId,
       },
       key,
     );
@@ -333,8 +441,8 @@ export class CatalogController {
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an empty body (empty-product-edit)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('Product does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Axes change with variants attached (product-has-variants), or the new name is taken (duplicate-product-name)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Product does not exist in this tenant, or clientId names no client of this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Axes change with variants attached (product-has-variants), a client change with SKUs attached (product-has-skus), the new name is taken in the client (duplicate-product-name), or the target client has departed (client-departed)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'productId', format: 'uuid' })
@@ -354,6 +462,7 @@ export class CatalogController {
         productId,
         name: dto.name,
         axes: dto.axes,
+        clientId: dto.clientId,
       },
       key,
     );
@@ -372,7 +481,7 @@ export class CatalogController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('SKU (or, on attach, the product) does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Barcode already belongs to another SKU (duplicate-barcode names it), another SKU of this product already carries identical variantValues (duplicate-variant-values), or a hazard-class change would strand stock co-located with an incompatible binmate (hazard-segregation-conflict names the bins and the parties)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Barcode already belongs to another SKU (duplicate-barcode names it and its level) or equals a SKU code (barcode-is-code), another SKU of this product already carries identical variantValues (duplicate-variant-values), the product belongs to another client (product-client-mismatch), a batch/serial/catch-weight change while the SKU has stock, a pending over-receipt or a pending adjustment (sku-has-stock), or a hazard-class change would strand stock co-located with an incompatible binmate (hazard-segregation-conflict names the bins and the parties)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'skuId', format: 'uuid' })
@@ -445,10 +554,12 @@ export class CatalogController {
         // twin): absent = unchanged, null = clear. The command is the
         // boundary (the vocabulary re-check).
         abcClass: dto.abcClass,
+        // Story 1-4 — absent = unchanged, null = clear.
+        shelfLifeDays: dto.shelfLifeDays,
       },
       key,
     );
-    return { ...sku, uomConversions: sku.uomConversions.map((c) => ({ ...c })) };
+    return toSkuResponse(sku);
   }
 
   // ── Story 21-2b — the owner's client correction (decision 3) ──────────────
@@ -468,7 +579,7 @@ export class CatalogController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks clients.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The SKU or the client does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The SKU, or a kit partner / product sibling that must move with it, already has history — ledger events, order/PO/transfer lines, pending adjustments, count tasks, batches, serials, reservations or channel mappings (sku-has-history, naming the SKU); or a concurrent kit/product change or same-key request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The SKU, or a kit partner / product sibling that must move with it, already has history — ledger events, order/PO/transfer lines, pending adjustments, count tasks, batches, serials, reservations or channel mappings (sku-has-history, naming the SKU); a code, barcode or product name of the moving group is taken in the target client (duplicate-sku-code / duplicate-barcode / duplicate-product-name) or a barcode equals a target SKU code (barcode-is-code); or a concurrent kit/product change or same-key request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'skuId', format: 'uuid' })
@@ -488,7 +599,7 @@ export class CatalogController {
       { tenantId, actorUserId: session.userId, skuId, clientId: dto.clientId },
       key,
     );
-    return { skus: corrected.skus.map((sku) => ({ ...sku, uomConversions: sku.uomConversions.map((c) => ({ ...c })) })) };
+    return { skus: corrected.skus.map(toSkuResponse) };
   }
 
   // ── Story 11.4 — kits and bundles (FR-38, AD-19): a kit IS a SKU ──────────
@@ -582,6 +693,15 @@ export class CatalogController {
       nextCursor: page.nextCursor,
     };
   }
+}
+
+/** The wire copy of a SKU snapshot — every array copied, the read-only domain shape never aliased. */
+function toSkuResponse(sku: SkuSnapshot): SkuResponse {
+  return {
+    ...sku,
+    uomConversions: sku.uomConversions.map((c) => ({ ...c })),
+    barcodes: sku.barcodes.map((b) => ({ ...b })),
+  };
 }
 
 function parseMode(raw: 'initial' | 'fix' | undefined): 'initial' | 'fix' {

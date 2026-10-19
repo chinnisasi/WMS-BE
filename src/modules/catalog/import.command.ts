@@ -11,6 +11,7 @@ import {
   kitCompositions,
   products,
   reservations,
+  skuBarcodes,
   skus,
   stockOnHand,
   uomConversions,
@@ -56,6 +57,22 @@ import {
 import { MAX_KIT_COMPONENTS, kitEventPayload } from './kit.command';
 import { getKitSkuIdsInTx } from './kit.store';
 import { ensureSelfClientInTx } from '../clients/ensure-self-client';
+// Story 1-4 — the SKU master's shared typed rules (the CSV cell parser stays here).
+import {
+  BARCODE_MAX as SHARED_BARCODE_MAX,
+  HSN_MAX as SHARED_HSN_MAX,
+  MAX_GST_RATE_BPS,
+  SKU_BARCODES_UNIQUE,
+  SKU_CODE_MAX as SHARED_SKU_CODE_MAX,
+  SKU_NAME_MAX,
+  barcodeRuleDetail,
+  duplicateBarcodeProblem,
+  shelfLifeDaysDetail,
+  validateExtraBarcodes,
+  validateLevels,
+  type ExtraBarcode,
+  type PackLevel,
+} from './sku-master';
 import { assertClientInTenantInTx, clientLabel, listClientsInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
 
 export const IMPORT_MODES = ['initial', 'fix'] as const;
@@ -65,13 +82,14 @@ export type ImportMode = (typeof IMPORT_MODES)[number];
 export const MAX_IMPORT_ROWS = 10_000;
 export const MAX_IMPORT_BYTES = MAX_SHEET_UPLOAD_BYTES;
 
-export const SKU_CODE_MAX = 64;
-export const NAME_MAX = 200;
+// Story 1-4 — the bounds live in `sku-master.ts` (shared with the create); re-exported here.
+export const SKU_CODE_MAX = SHARED_SKU_CODE_MAX;
+export const NAME_MAX = SKU_NAME_MAX;
 export const UOM_MAX = 32;
-export const HSN_MAX = 32;
-export const BARCODE_MAX = 64;
+export const HSN_MAX = SHARED_HSN_MAX;
+export const BARCODE_MAX = SHARED_BARCODE_MAX;
 /** GST as basis points: 0–10000 bps (0–100%). */
-export const GST_RATE_BPS_MAX = 10_000;
+export const GST_RATE_BPS_MAX = MAX_GST_RATE_BPS;
 /** Postgres `integer` ceiling — a bigger number would 500 on the column. */
 export const INT_MAX = 2_147_483_647;
 
@@ -174,12 +192,22 @@ const OPTIONAL_COLUMNS = [
   // from scheduled generation; on-demand still covers its bin). The
   // closed-header contract grows again (the 11.3 precedent).
   'abc_class',
+  // Story 1-4 — total shelf life in days from manufacture (blank → null,
+  // `^\d+$`, 1–3650), and the SKU's extra barcodes, each naming its level:
+  // `case:8901234567890;pallet:8901234567891;each:8900000000001` (split on
+  // `;`, then on the FIRST `:`; the level resolves through `resolveUom`; the
+  // base uom is an extra base-level barcode, any other level must be in the
+  // row's `uom_conversions` cell). The closed-header contract grows again.
+  'shelf_life_days',
+  'barcodes',
 ] as const;
 const KNOWN_COLUMNS: ReadonlySet<string> = new Set([...REQUIRED_COLUMNS, ...OPTIONAL_COLUMNS]);
 
 // Story 1-1 (0076) — code and barcode are unique per (tenant, client).
 const SKUS_TENANT_CODE = 'skus_tenant_client_code_unique';
 const SKUS_TENANT_BARCODE = 'skus_tenant_client_barcode_unique';
+// Story 1-4 — `sku_barcodes` is the barcode authority; both indexes are mapped.
+const SKU_BARCODES_TENANT_BARCODE = SKU_BARCODES_UNIQUE;
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 interface RawRow {
@@ -225,6 +253,10 @@ interface ValidRow {
   readonly hazardClass: string | null;
   /** Story 5-3 — the ABC class; a blank cell maps to null (null = not yet classified, OQ-1). */
   readonly abcClass: string | null;
+  /** Story 1-4 — total shelf life in days; a blank cell → null. */
+  readonly shelfLifeDays: number | null;
+  /** Story 1-4 — the `barcodes` cell: every non-primary barcode with its level. */
+  readonly extraBarcodes: readonly ExtraBarcode[];
 }
 
 type FieldResult<T> = { ok: true; value: T } | { ok: false; error: CatalogImportErrorDto };
@@ -420,39 +452,37 @@ export class ImportCommand {
           // `for('update')`: the same serialization the SKU edit command takes
           // — a concurrent ProductCommand.edit must not change a referenced
           // product's axes between this read and the rows' INSERT.
+          // Story 1-4 (decision 3) — product names are unique PER CLIENT: a
+          // row resolves its product within this run's client only.
           const referenced = await tx
             .select({ id: products.id, name: products.name, axes: products.axes })
             .from(products)
-            .where(and(eq(products.tenantId, command.tenantId), inArray(products.name, productNames)))
+            .where(
+              and(
+                eq(products.tenantId, command.tenantId),
+                eq(products.clientId, clientId),
+                inArray(products.name, productNames),
+              ),
+            )
             .for('update');
           for (const row of referenced) productByName.set(row.name, row);
         }
         const referencedIds = [...new Set([...productByName.values()].map((product) => product.id))];
         // Existing attached variants per referenced product, keyed by the
         // stable fingerprint (key-order independent) — one query for the
-        // whole file.
+        // whole file. (Story 1-4: the product is this client's, so its
+        // variants are too — the 21-2b `mixed-client` product arm is gone.)
         const tenantVariants = new Map<string, string>();
-        // Story 21-2b — the clients a referenced product's EXISTING variants
-        // belong to: a product's variants never span clients, so a row
-        // attaching this run's client to a product already holding another
-        // client's SKUs is refused per row (`mixed-client`).
-        const productClients = new Map<string, Set<string>>();
         if (referencedIds.length > 0) {
           const attached = await tx
             .select({
               productId: skus.productId,
               variantValues: skus.variantValues,
               code: skus.code,
-              clientId: skus.clientId,
             })
             .from(skus)
             .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.productId, referencedIds)));
           for (const row of attached) {
-            if (row.productId !== null) {
-              const set = productClients.get(row.productId) ?? new Set<string>();
-              set.add(row.clientId);
-              productClients.set(row.productId, set);
-            }
             if (row.productId !== null && row.variantValues !== null) {
               tenantVariants.set(
                 `${row.productId}|${variantValuesFingerprint(row.variantValues)}`,
@@ -474,20 +504,7 @@ export class ImportCommand {
                 row.rowNumber,
                 row.code,
                 'validation-failed',
-                `product "${row.productName}" does not exist in this tenant — import references products, it never creates them. Create the product first.`,
-              ),
-            );
-            continue;
-          }
-          const foreignClients = [...(productClients.get(product.id) ?? [])].filter((id) => id !== clientId);
-          if (foreignClients.length > 0) {
-            errors.push(
-              rowError(
-                row.rowNumber,
-                row.code,
-                'mixed-client',
-                `product "${row.productName}" already holds SKUs of client ${foreignClients.map(label).sort().join(', ')} — ` +
-                  `this import is for client ${label(clientId)}, and a product's variants never span clients.`,
+                `product "${row.productName}" does not exist for client ${label(clientId)} — import references products, it never creates them. Create the product for this client first.`,
               ),
             );
             continue;
@@ -514,6 +531,13 @@ export class ImportCommand {
         const seenCodes = new Map<string, number>();
         const seenBarcodes = new Map<string, string>();
         const conflicts = await findClientConflicts(tx, command.tenantId, clientId, valid);
+        // Story 1-4 — every code and barcode the file carries (decision 13
+        // compares them across rows; a refused row's are included, which can
+        // only refuse more, never admit a clash).
+        const fileCodes = new Set(valid.map((row) => row.code));
+        const fileBarcodes = new Set(
+          valid.flatMap((row) => [...(row.barcode === null ? [] : [row.barcode]), ...row.extraBarcodes.map((entry) => entry.barcode)]),
+        );
 
         const insertable: (ValidRow & { productId: string | null })[] = [];
         const seenVariants = new Map<string, number>();
@@ -529,9 +553,25 @@ export class ImportCommand {
             errors.push(rowError(row.rowNumber, row.code, 'duplicate-sku-code', `SKU code "${row.code}" already exists in this client's catalog (client ${label(clientId)}) — duplicates are rejected, never merged.`));
             continue;
           }
-          if (row.barcode !== null && (seenBarcodes.has(row.barcode) || conflicts.barcodes.has(row.barcode))) {
-            const conflictingSku = seenBarcodes.get(row.barcode) ?? conflicts.barcodes.get(row.barcode)!;
-            errors.push(rowError(row.rowNumber, row.code, 'duplicate-barcode', `Barcode "${row.barcode}" already belongs to SKU "${conflictingSku}".`));
+          // Story 1-4 — every barcode of the row (the primary and the
+          // `barcodes` cell) against the file's earlier rows and the client's
+          // `sku_barcodes` (the one authority), and decision 13: no barcode
+          // equals a SKU code of the client or of this file, and no code
+          // equals a barcode of either.
+          const rowBarcodes = [...(row.barcode === null ? [] : [row.barcode]), ...row.extraBarcodes.map((entry) => entry.barcode)];
+          const takenBarcode = rowBarcodes.find((barcode) => seenBarcodes.has(barcode) || conflicts.barcodes.has(barcode));
+          if (takenBarcode !== undefined) {
+            const conflictingSku = seenBarcodes.get(takenBarcode) ?? conflicts.barcodes.get(takenBarcode)!;
+            errors.push(rowError(row.rowNumber, row.code, 'duplicate-barcode', `Barcode "${takenBarcode}" already belongs to SKU "${conflictingSku}".`));
+            continue;
+          }
+          const barcodeAsCode = rowBarcodes.find((barcode) => barcode === row.code || fileCodes.has(barcode) || conflicts.barcodeCodes.has(barcode));
+          if (barcodeAsCode !== undefined) {
+            errors.push(rowError(row.rowNumber, row.code, 'barcode-is-code', `Barcode "${barcodeAsCode}" equals a SKU code in this client — a barcode may not equal any SKU code.`));
+            continue;
+          }
+          if (fileBarcodes.has(row.code) || conflicts.codeBarcodes.has(row.code)) {
+            errors.push(rowError(row.rowNumber, row.code, 'barcode-is-code', `SKU code "${row.code}" equals a barcode in this client — a barcode may not equal any SKU code.`));
             continue;
           }
           // Story 11.3 — duplicate variants are refused: a second SKU in one
@@ -553,7 +593,7 @@ export class ImportCommand {
             seenVariants.set(fingerprint, row.rowNumber);
           }
           seenCodes.set(row.code, row.rowNumber);
-          if (row.barcode !== null) seenBarcodes.set(row.barcode, row.code);
+          for (const barcode of rowBarcodes) seenBarcodes.set(barcode, row.code);
           insertable.push(row);
         }
 
@@ -606,16 +646,49 @@ export class ImportCommand {
             // Story 5-3 — the ABC class from the cell (blank → null; null =
             // not yet classified, excluded from scheduled generation, OQ-1).
             abcClass: row.abcClass,
+            // Story 1-4 — total shelf life (blank cell → null).
+            shelfLifeDays: row.shelfLifeDays,
           }));
+          // Story 1-4 — every SKU's primary `sku_barcodes` row (the generated
+          // default included) and the `barcodes` cell's extra rows, in the
+          // SKU insert's transaction.
+          const barcodeRows = insertable.flatMap((row, i) => [
+            {
+              id: uuidv7(),
+              tenantId: command.tenantId,
+              clientId,
+              skuId: skuRows[i]!.id,
+              barcode: skuRows[i]!.barcode,
+              uom: row.uom,
+              isPrimary: true,
+            },
+            ...row.extraBarcodes.map((entry) => ({
+              id: uuidv7(),
+              tenantId: command.tenantId,
+              clientId,
+              skuId: skuRows[i]!.id,
+              barcode: entry.barcode,
+              uom: entry.uom,
+              isPrimary: false,
+            })),
+          ]);
           try {
             for (const chunk of chunked(skuRows)) {
               await tx.insert(skus).values(chunk);
             }
+            for (const chunk of chunked(barcodeRows)) {
+              await tx.insert(skuBarcodes).values(chunk);
+            }
           } catch (err) {
             // A concurrent writer won the race between the pre-check and the
             // insert; the transaction aborts and the retry re-runs the checks.
-            if (isUniqueViolationOn(err, SKUS_TENANT_CODE) || isUniqueViolationOn(err, SKUS_TENANT_BARCODE)) {
+            if (isUniqueViolationOn(err, SKUS_TENANT_CODE)) {
               throw duplicateSkuCode(insertable[0]!.code);
+            }
+            if (isUniqueViolationOn(err, SKUS_TENANT_BARCODE) || isUniqueViolationOn(err, SKU_BARCODES_TENANT_BARCODE)) {
+              throw duplicateBarcodeProblem(
+                'A barcode in this file was taken in this client by a concurrent write — retry the import to see which row.',
+              );
             }
             throw err;
           }
@@ -978,26 +1051,52 @@ async function findClientConflicts(
   tenantId: string,
   clientId: string,
   rows: readonly ValidRow[],
-): Promise<{ codes: ReadonlySet<string>; barcodes: ReadonlyMap<string, string> }> {
+): Promise<{
+  codes: ReadonlySet<string>;
+  barcodes: ReadonlyMap<string, string>;
+  /** Story 1-4 — the file's barcodes that equal a SKU code of the client (decision 13). */
+  barcodeCodes: ReadonlySet<string>;
+  /** Story 1-4 — the file's codes that equal a barcode of the client (decision 13). */
+  codeBarcodes: ReadonlySet<string>;
+}> {
   const codes = [...new Set(rows.map((row) => row.code))];
-  const barcodes = [...new Set(rows.map((row) => row.barcode).filter((b): b is string => b !== null))];
+  const barcodes = [
+    ...new Set(
+      rows.flatMap((row) => [...(row.barcode === null ? [] : [row.barcode]), ...row.extraBarcodes.map((entry) => entry.barcode)]),
+    ),
+  ];
   const codesSet = new Set<string>();
   const barcodesMap = new Map<string, string>();
+  const barcodeCodes = new Set<string>();
+  const codeBarcodes = new Set<string>();
   if (codes.length > 0) {
     const rowsOut = await tx
       .select({ code: skus.code })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), eq(skus.clientId, clientId), inArray(skus.code, codes)));
     for (const row of rowsOut) codesSet.add(row.code);
+    // A code equal to a barcode the client already holds (any level).
+    const asBarcodes = await tx
+      .select({ barcode: skuBarcodes.barcode })
+      .from(skuBarcodes)
+      .where(and(eq(skuBarcodes.tenantId, tenantId), eq(skuBarcodes.clientId, clientId), inArray(skuBarcodes.barcode, codes)));
+    for (const row of asBarcodes) codeBarcodes.add(row.barcode);
   }
   if (barcodes.length > 0) {
+    // Story 1-4 — `sku_barcodes` is the authority (every level, every SKU).
     const rowsOut = await tx
-      .select({ code: skus.code, barcode: skus.barcode })
-      .from(skus)
-      .where(and(eq(skus.tenantId, tenantId), eq(skus.clientId, clientId), inArray(skus.barcode, barcodes)));
+      .select({ code: skus.code, barcode: skuBarcodes.barcode })
+      .from(skuBarcodes)
+      .innerJoin(skus, eq(skus.id, skuBarcodes.skuId))
+      .where(and(eq(skuBarcodes.tenantId, tenantId), eq(skuBarcodes.clientId, clientId), inArray(skuBarcodes.barcode, barcodes)));
     for (const row of rowsOut) barcodesMap.set(row.barcode, row.code);
+    const asCodes = await tx
+      .select({ code: skus.code })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), eq(skus.clientId, clientId), inArray(skus.code, barcodes)));
+    for (const row of asCodes) barcodeCodes.add(row.code);
   }
-  return { codes: codesSet, barcodes: barcodesMap };
+  return { codes: codesSet, barcodes: barcodesMap, barcodeCodes, codeBarcodes };
 }
 
 /**
@@ -1187,8 +1286,26 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
   const reorderPoint = pointResult.value;
   const reorderQty = qtyResult.value;
   const barcode = get('barcode');
-  if (barcode.length > BARCODE_MAX) {
-    return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', `barcode must be at most ${BARCODE_MAX} characters.`) };
+  // Story 1-4 (decision 12) — the one barcode rule (a blank cell is the
+  // generated default, so only a present value is checked).
+  if (barcode !== '') {
+    const barcodeDetail = barcodeRuleDetail(barcode, 'barcode');
+    if (barcodeDetail !== null) {
+      return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', barcodeDetail) };
+    }
+  }
+  // Story 1-4 — shelf life: blank → null, digits only, then the shared range.
+  const shelfLifeRaw = get('shelf_life_days');
+  let shelfLifeDays: number | null = null;
+  if (shelfLifeRaw !== '') {
+    if (!/^\d+$/.test(shelfLifeRaw)) {
+      return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', `shelf_life_days must be a whole number of days (got "${shelfLifeRaw}").`) };
+    }
+    const shelfDetail = shelfLifeDaysDetail(Number(shelfLifeRaw), 'shelf_life_days');
+    if (shelfDetail !== null) {
+      return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', shelfDetail) };
+    }
+    shelfLifeDays = Number(shelfLifeRaw);
   }
 
   // Story 11.2 — the physical attributes. Cells parse to WYSIWYG grams /
@@ -1306,6 +1423,7 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
   }
 
   const conversions: { uom: string; factor: number }[] = [];
+  let levels: PackLevel[] = [];
   const conversionsRaw = v['uom_conversions']?.trim() ?? '';
   if (conversionsRaw !== '') {
     const seenUoms = new Set<string>();
@@ -1319,7 +1437,7 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       }
       const targetRaw = match[1].trim();
       const factor = Number(match[2]);
-      if (!Number.isSafeInteger(factor) || factor < 1 || factor > INT_MAX) {
+      if (!Number.isSafeInteger(factor) || factor > INT_MAX) {
         return {
           ok: false,
           error: rowError(row.rowNumber, code, 'validation-failed', `uom_conversions factor must be a positive integer of at most ${INT_MAX} (got "${match[2]}").`),
@@ -1353,6 +1471,49 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       }
       seenUoms.add(target);
       conversions.push({ uom: target, factor });
+    }
+    // Story 1-4 (decision 8) — the typed rules (factor 2–1,000,000, the
+    // level ≠ base, no repeats) are the shared ones the packaging PUT runs.
+    try {
+      levels = validateLevels(uom, conversions, 'uom_conversions');
+    } catch (err) {
+      const response = (err as ProblemException).getResponse() as { detail?: string };
+      return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', response.detail ?? 'Invalid uom_conversions.') };
+    }
+  }
+
+  // Story 1-4 — the `barcodes` cell: split on `;`, each entry on its FIRST
+  // `:` (`level:barcode`); blank entries between separators are skipped. The
+  // typed rules — the barcode rule, not the row's primary, the level being the
+  // base uom or one of this row's `uom_conversions` levels, no repeats — are
+  // the shared ones (`validateExtraBarcodes`), their refusal code kept.
+  let extraBarcodes: ExtraBarcode[] = [];
+  const barcodesRaw = v['barcodes']?.trim() ?? '';
+  if (barcodesRaw !== '') {
+    const entries: { barcode: string; uom: string }[] = [];
+    for (const entry of barcodesRaw.split(';')) {
+      const trimmed = entry.trim();
+      if (trimmed === '') continue;
+      const colon = trimmed.indexOf(':');
+      if (colon === -1) {
+        return {
+          ok: false,
+          error: rowError(row.rowNumber, code, 'validation-failed', `barcodes entries must look like case:8901234567890 (level:barcode) — got "${trimmed}".`),
+        };
+      }
+      const level = trimmed.slice(0, colon).trim();
+      const value = trimmed.slice(colon + 1).trim();
+      if (resolveUom(level) === null) {
+        return { ok: false, error: rowError(row.rowNumber, code, 'validation-failed', unknownUomDetail('barcodes level', level)) };
+      }
+      entries.push({ barcode: value, uom: level });
+    }
+    try {
+      extraBarcodes = validateExtraBarcodes(uom, levels, barcode, entries, 'barcodes');
+    } catch (err) {
+      const problem = err as ProblemException;
+      const response = problem.getResponse() as { code?: string; detail?: string };
+      return { ok: false, error: rowError(row.rowNumber, code, response.code ?? 'validation-failed', response.detail ?? 'Invalid barcodes cell.') };
     }
   }
 
@@ -1422,6 +1583,8 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       // Story 5-3 — the parsed ABC class (blank → null; null = excluded
       // from scheduled generation, OQ-1).
       abcClass,
+      shelfLifeDays,
+      extraBarcodes,
     },
   };
 }

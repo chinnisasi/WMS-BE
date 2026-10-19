@@ -40,6 +40,10 @@ const STAMPED_TABLES: readonly string[] = [
   // an inbound document authored for one client (the purchase_orders shape —
   // reads AND writes carry the clause; 21-7's portal announces shipments).
   'advance_shipment_notices',
+  // Story 1-4 (0080) — every barcode of a SKU carries the SKU's client, and a
+  // product belongs to one client: both born (or reborn) with the clause.
+  'sku_barcodes',
+  'products',
 ];
 
 /** The five policies migration 0041 recreated with the client clause. */
@@ -49,6 +53,9 @@ const CLIENT_POLICIES: readonly { table: string; policy: string; column: string 
   { table: 'purchase_orders', policy: 'purchase_orders_tenant_isolation', column: 'client_id' },
   { table: 'orders', policy: 'orders_tenant_isolation', column: 'client_id' },
   { table: 'clients', policy: 'clients_tenant_isolation', column: 'id' },
+  // Story 1-4 (0080) — the two tables the SKU master stamps.
+  { table: 'sku_barcodes', policy: 'sku_barcodes_tenant_isolation', column: 'client_id' },
+  { table: 'products', policy: 'products_tenant_isolation', column: 'client_id' },
 ];
 
 /**
@@ -129,6 +136,16 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       values (${skuAId}, ${tenantId}, ${clientA}, 'CI-SKU-A', 'Isolation SKU A', 'each', 1800, ${ulid()})`;
     await sql`insert into skus (id, tenant_id, client_id, code, name, uom, gst_rate_bps, barcode)
       values (${skuBId}, ${tenantId}, ${clientB}, 'CI-SKU-B', 'Isolation SKU B', 'each', 1800, ${ulid()})`;
+    // Story 1-4 — each SKU's primary barcode row, and one product per client.
+    for (const [clientId, skuId] of [
+      [clientA, skuAId],
+      [clientB, skuBId],
+    ] as const) {
+      await sql`insert into sku_barcodes (id, tenant_id, client_id, sku_id, barcode, uom, is_primary)
+        select ${uuidv7()}, tenant_id, client_id, id, barcode, uom, true from skus where id = ${skuId}`;
+      await sql`insert into products (id, tenant_id, client_id, name, axes)
+        values (${uuidv7()}, ${tenantId}, ${clientId}, 'CI Product', ${sql.json(['size'])})`;
+    }
 
     await sql`insert into business_partners (id, tenant_id, code, name, roles) values (${vendorId}, ${tenantId}, 'CI-V', 'Isolation Vendor', array['vendor'])`;
     await sql`insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code, status)
@@ -598,6 +615,16 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
             tx`insert into advance_shipment_notices (id, tenant_id, client_id, warehouse_id, asn_code)
               values (${uuidv7()}, ${tenantId}, ${clientB}, ${warehouseId}, 'CI-ASN-FOREIGN')`,
           );
+        } else if (table === 'sku_barcodes') {
+          rejected = portal((tx) =>
+            tx`insert into sku_barcodes (id, tenant_id, client_id, sku_id, barcode, uom)
+              values (${uuidv7()}, ${tenantId}, ${clientB}, ${skuBId}, 'CI-FOREIGN-BC', 'each')`,
+          );
+        } else if (table === 'products') {
+          rejected = portal((tx) =>
+            tx`insert into products (id, tenant_id, client_id, name, axes)
+              values (${uuidv7()}, ${tenantId}, ${clientB}, 'CI Foreign Product', ${sql.json(['size'])})`,
+          );
         } else {
           rejected = portal((tx) =>
             tx`insert into ledger_events (
@@ -969,7 +996,10 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 1-3: + partner_client_links_tenant_isolation (0079, client-bound on
       // both arms); vendors_tenant_isolation was RENAMED to
       // business_partners_tenant_isolation (the plain tenant policy), not added.
-      expect(policies).toHaveLength(116);
+      // Story 1-4: + sku_barcodes_tenant_isolation (0080, client-bound on both
+      // arms); products_tenant_isolation was DROPPED and recreated with the
+      // client clause, not added.
+      expect(policies).toHaveLength(117);
       const linkPolicy = policies.find((row) => row.policyname === 'partner_client_links_tenant_isolation')!;
       expect(linkPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(linkPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

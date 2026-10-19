@@ -521,7 +521,8 @@ describe('story 10.2: UoM is a closed vocabulary with a declared precision (e2e)
       // `orders_status_check`. Adding a unit to the tuple without the
       // migration (or the reverse) is caught at build time, not at the first
       // import that uses it.
-      for (const constraint of ['skus_uom_check', 'uom_conversions_uom_check']) {
+      // Story 1-4 — `sku_barcodes_uom_check` (0080) is the third copy.
+      for (const constraint of ['skus_uom_check', 'uom_conversions_uom_check', 'sku_barcodes_uom_check']) {
         const rows = await sql`
           select pg_get_constraintdef(oid) as def from pg_constraint where conname = ${constraint}
         `;

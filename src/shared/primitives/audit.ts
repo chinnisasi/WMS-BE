@@ -136,6 +136,9 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'purchase_order.amended', targetType: 'purchase_order' },
   { action: 'purchase_order.closed', targetType: 'purchase_order' },
   { action: 'sku.edited', targetType: 'sku' },
+  // Story 1-4 — the single-SKU create and the packaging PUT (`SkuCommand`).
+  { action: 'sku.created', targetType: 'sku' },
+  { action: 'sku.packaging_replaced', targetType: 'sku' },
   { action: 'product.created', targetType: 'product' },
   { action: 'product.edited', targetType: 'product' },
   { action: 'kit.created', targetType: 'kit' },

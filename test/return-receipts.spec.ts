@@ -453,6 +453,43 @@ describe('return receipts (e2e, story 13-2)', () => {
     expect(reused.body.code).toBe('idempotency-key-reuse');
   });
 
+  // Story 1-4 — the posting reads its SKU facts FOR SHARE, so a tracking-
+  // flag flip (the SKU edit's FOR UPDATE) cannot interleave with it: with a
+  // raw holder on the SKU row, the post parks until the holder commits.
+  it('story 1-4: the posting takes the SKU row FOR SHARE — it parks behind a held FOR UPDATE and settles once released', async () => {
+    const { orderId, returnable } = await dispatchedOrder([{ skuId: sku('RR-A'), quantity: 1 }]);
+    const rma = await createRma(orderId, [{ orderLineId: lineOf(returnable, 'RR-A').orderLineId, qty: 1 }]);
+    const holder = postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+    const probe = postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+    let post: Promise<request.Response> | undefined;
+    try {
+      await holder.begin(async (tx) => {
+        const locked = (await tx`select pg_backend_pid() as pid from skus where id = ${sku('RR-A')} for update`) as unknown as { pid: number }[];
+        const holderPid = locked[0]!.pid;
+        post = (async () => receive({ rmaId: rma.id, entries: [{ rmaLineId: rma.lines[0]!.id, skuId: sku('RR-A'), qty: 1, condition: 'resaleable' }] }))();
+        let parked = false;
+        const deadline = Date.now() + 10_000;
+        while (!parked && Date.now() < deadline) {
+          const waiting = (await probe`
+            select a.pid from pg_stat_activity a
+            where a.wait_event_type = 'Lock' and a.state = 'active'
+              and a.query ilike '%"skus"%' and a.query ilike '%for share%'
+              and ${holderPid} = any(pg_blocking_pids(a.pid))
+          `) as unknown as { pid: number }[];
+          parked = waiting.length > 0;
+          if (!parked) await new Promise((r) => setTimeout(r, 25));
+        }
+        expect(parked).toBe(true);
+      });
+      const res = await post!;
+      expect(res.status).toBe(201);
+    } finally {
+      await Promise.allSettled([post]);
+      await holder.end();
+      await probe.end();
+    }
+  });
+
   it('partial: 1 of 2 → partially_received, and the device snapshot shows 1 open on the line', async () => {
     const { orderId, returnable } = await dispatchedOrder([{ skuId: sku('RR-B'), quantity: 2 }]);
     const rma = await createRma(orderId, [{ orderLineId: lineOf(returnable, 'RR-B').orderLineId, qty: 2 }]);
