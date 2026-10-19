@@ -27,6 +27,7 @@ import {
 } from './asn.command';
 import { ASN_IMPORT_ROW_ERROR_CODES, type AsnImportRowErrorCode } from './asn-import.parse';
 import { BooleanFlag } from '../../shared/primitives/instant-range';
+import { VendorSnapshotDto } from '../partners/partners.dto';
 
 /** Trim at the validation boundary (the tenancy DTO pattern). */
 function Trim() {
@@ -34,82 +35,6 @@ function Trim() {
   return Transform(({ value }: { value: any }) =>
     typeof value === 'string' ? value.trim() : value,
   );
-}
-
-// ── Vendor surfaces (Story 3.1) ─────────────────────────────────────────────
-
-/** POST /tenants/{tenantId}/vendors body. */
-export class CreateVendorDto {
-  @ApiProperty({ description: 'Vendor code — unique per tenant', minLength: 1, maxLength: 64 })
-  @Trim()
-  @IsString()
-  @Length(1, 64)
-  code!: string;
-
-  @ApiProperty({ description: 'Vendor name', minLength: 1, maxLength: 200 })
-  @Trim()
-  @IsString()
-  @Length(1, 200)
-  name!: string;
-
-  @ApiProperty({
-    required: false,
-    default: false,
-    description: 'The tenant’s default vendor (Epic 6 suggested-PO drafts read it)',
-  })
-  @IsOptional()
-  @IsBoolean()
-  isDefault?: boolean;
-}
-
-/** Query of the vendor list (keyset cursor pagination). */
-export class VendorListQuery {
-  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
-  @IsOptional()
-  @IsString()
-  cursor?: string;
-
-  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
-  @IsOptional()
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(200)
-  limit?: number;
-}
-
-/** One vendor row of the list / create responses. */
-export class VendorDto {
-  @ApiProperty({ format: 'uuid' })
-  id!: string;
-
-  @ApiProperty({ format: 'uuid' })
-  tenantId!: string;
-
-  @ApiProperty({ description: 'Vendor code (unique per tenant)' })
-  code!: string;
-
-  @ApiProperty()
-  name!: string;
-
-  @ApiProperty({ description: 'The tenant’s default vendor flag' })
-  isDefault!: boolean;
-
-  @ApiProperty({ description: 'ISO-8601 UTC creation time' })
-  createdAt!: string;
-}
-
-export class VendorResponse {
-  @ApiProperty({ type: VendorDto })
-  vendor!: VendorDto;
-}
-
-export class VendorListResponse {
-  @ApiProperty({ type: [VendorDto] })
-  items!: readonly VendorDto[];
-
-  @ApiProperty({ type: String, nullable: true, required: false })
-  nextCursor?: string | null;
 }
 
 // ── Purchase-order inputs ───────────────────────────────────────────────────
@@ -338,6 +263,15 @@ export class PurchaseOrderDto {
       'Story 21-2b — the client the PO is for, derived from its lines\' SKUs. Absent or null only on a replayed response stored before 21-2b',
   })
   clientId?: string | null;
+
+  @ApiProperty({
+    type: VendorSnapshotDto,
+    nullable: true,
+    required: false,
+    description:
+      'Story 1-3 — the vendor as it was when the PO was created (copied to a close successor; never rewritten by a later partner edit). Absent or null only on a replayed response stored before 1-3',
+  })
+  vendorSnapshot?: VendorSnapshotDto | null;
 
   @ApiProperty({ type: [PurchaseOrderLineDto], description: 'Per-line ordered / received / open (detail and mutations; headers only on the list)' })
   lines?: readonly PurchaseOrderLineDto[];

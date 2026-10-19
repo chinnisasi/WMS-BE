@@ -8,7 +8,6 @@ import {
   purchaseOrderLines,
   purchaseOrders,
   skus,
-  vendors,
 } from '../../shared/db/schema';
 import type { PurchaseOrderLine } from '../../shared/db/schema';
 import { uuidv7 } from '../../shared/primitives/ids';
@@ -25,6 +24,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
 import { uomPrecision } from '../catalog/uom';
 import { assertNoPendingOverReceiptsInTx } from './asn.command';
+import { assertVendorLinkedInTx, type VendorSnapshotV1 } from '../partners/partners.facade';
 
 export interface PoLineInput {
   readonly skuId: string;
@@ -102,6 +102,13 @@ export interface PurchaseOrderSnapshot {
      * snapshot built now sets it.
      */
     readonly clientId?: string | null;
+    /**
+     * Story 1-3 — the vendor as it was when the PO was created (shape v1,
+     * copied to a close successor). Optional and nullable: a stored snapshot
+     * written before 1-3 (an idempotent replay) does not carry it; every
+     * snapshot built now sets it.
+     */
+    readonly vendorSnapshot?: VendorSnapshotV1 | null;
     readonly createdAt: string;
     readonly updatedAt: string;
     readonly lines: readonly PurchaseOrderLineSnapshot[];
@@ -244,10 +251,11 @@ export class PurchaseOrderCommand {
     }
 
     // Master-data integrity in the write transaction (no FK repo
-    // convention): warehouse in tenant, vendor in tenant, every line's SKU
-    // in tenant — a foreign or nonexistent scope is 404 before any write.
+    // convention): warehouse in tenant, every line's SKU in tenant — a
+    // foreign or nonexistent scope is 404 before any write. Story 1-3: the
+    // vendor is checked LAST (below), once the PO's client is known — so
+    // with both an unknown vendor and an unknown SKU, the SKU's 404 wins.
     await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
-    await this.assertVendorInTenant(tx, command.tenantId, command.vendorId);
     const skuFacts = await this.assertSkuIdsInTenant(
       tx,
       command.tenantId,
@@ -268,6 +276,12 @@ export class PurchaseOrderCommand {
     // under FOR KEY SHARE so a departure cannot commit between here and the
     // insert. The first lock this transaction takes.
     await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
+    // Story 1-3 — the vendor guard (lock order client → partner → link): an
+    // active partner in the vendor role with an ACTIVE vendor link to this
+    // client, read `FOR KEY SHARE` so a deactivation serialises against this
+    // create. 404 / 409 `partner-not-vendor` / `vendor-inactive` /
+    // `vendor-not-linked`. Returns the v1 snapshot the PO freezes.
+    const vendorSnapshot = await assertVendorLinkedInTx(tx, command.tenantId, command.vendorId, clientId);
     const uomBySku = new Map([...skuFacts].map(([id, sku]) => [id, sku.uom]));
     // Story 10.2: conversion and the precision refusal, behind the replay
     // lookup above and with each line's unit in hand.
@@ -284,6 +298,7 @@ export class PurchaseOrderCommand {
           clientId,
           warehouseId: command.warehouseId,
           vendorId: command.vendorId,
+          vendorSnapshot,
           code: command.code,
           status: 'open',
         })
@@ -593,6 +608,10 @@ export class PurchaseOrderCommand {
           clientId: po.clientId,
           warehouseId: po.warehouseId,
           vendorId: po.vendorId,
+          // Story 1-3 — the successor copies the vendor AND its frozen
+          // snapshot without re-checking the guard (an open PO carries on
+          // whatever the partner's status or links are now).
+          vendorSnapshot: po.vendorSnapshot,
           code: successorCode,
           status: 'open',
           carriedFromPoId: po.id,
@@ -752,22 +771,6 @@ export class PurchaseOrderCommand {
     return po;
   }
 
-  private async assertVendorInTenant(tx: TenantTx, tenantId: string, vendorId: string): Promise<void> {
-    const rows = await tx
-      .select({ id: vendors.id })
-      .from(vendors)
-      .where(and(eq(vendors.id, vendorId), eq(vendors.tenantId, tenantId)))
-      .limit(1);
-    if (rows[0] === undefined) {
-      throw new ProblemException(
-        'not-found',
-        404,
-        'Vendor not found',
-        'No vendor with this id exists in this tenant.',
-      );
-    }
-  }
-
   /**
    * Every line's SKU must exist in the tenant (integrity-only read, 404
    * naming the unknown id). Story 21-2b: the read also hands back each SKU's
@@ -877,6 +880,7 @@ export class PurchaseOrderCommand {
         status: po.status as PoStatus,
         carriedFromPoId: po.carriedFromPoId,
         clientId: po.clientId,
+        vendorSnapshot: po.vendorSnapshot as VendorSnapshotV1 | null,
         createdAt: canonicalInstant(po.createdAt),
         updatedAt: canonicalInstant(po.updatedAt),
         lines,

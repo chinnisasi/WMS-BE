@@ -340,7 +340,18 @@ export class ReplenishmentFacade {
         )
         .orderBy(desc(suggestedPos.createdAt), desc(suggestedPos.id))
         .limit(pageSize + 1);
-      return this.pageOf(rows, pageSize, suggestedPoEntry);
+      const page = this.pageOf(rows, pageSize, suggestedPoEntry);
+      // Story 1-3 — each draft's client (its SKU's), one read over the page:
+      // the web vendor picker lists the vendors linked to that client.
+      const clientBySku = await this.catalog.skuClientIdsInTx(
+        tx,
+        tenantId,
+        page.items.map((item) => item.skuId),
+      );
+      return {
+        items: page.items.map((item) => ({ ...item, clientId: clientBySku.get(item.skuId) ?? '' })),
+        nextCursor: page.nextCursor,
+      };
     });
   }
 

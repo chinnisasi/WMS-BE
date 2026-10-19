@@ -27,6 +27,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor, linkVendor } from './support/linked-vendor';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -438,14 +439,7 @@ describe('story 21-2b: client admin and attribution', () => {
         ).body.id as string;
       binA = await bin('A-01-01');
       binB = await bin('A-01-02');
-      vendorId = (
-        await http()
-          .post(`${API}/${tenantId}/vendors`)
-          .set('Authorization', `Bearer ${ownerToken}`)
-          .set(KEY_HEADER, ulid())
-          .send({ code: 'VEND-CA', name: 'Client Admin Vendor' })
-          .expect(201)
-      ).body.vendor.id as string;
+      vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'VEND-CA', name: 'Client Admin Vendor' });
 
       // The floor device + its badge-in operator (receipt, putaway, picks).
       const minted = await http()
@@ -509,6 +503,8 @@ describe('story 21-2b: client admin and attribution', () => {
         const res = await createClient({ code: '  acme ', name: ' Acme Foods ' }, ownerToken, key).expect(201);
         expect(res.body.client).toMatchObject({ tenantId, code: 'ACME', name: 'Acme Foods', status: 'active', systemOwned: false });
         acmeId = res.body.client.id as string;
+        // Story 1-3 — the suite's vendor trades with ACME (a PO's vendor must be linked to its client).
+        await linkVendor(app, tenantId, ownerToken, vendorId, acmeId);
         const audit = await sql`select action, target_type, reference from audit_events where tenant_id = ${tenantId} and target_id = ${acmeId}`;
         expect(audit).toEqual([{ action: 'client.created', target_type: 'client', reference: key }]);
         // The same key replays the snapshot; a different payload on it is 422.

@@ -16,6 +16,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 // The e2e suite talks to the real Postgres + Valkey (docker-compose dev
 // containers by default; CI provides the service containers) and signs
@@ -241,14 +242,7 @@ describe('catch weight and handling units (e2e, story 10.3)', () => {
         .expect(201)
     ).body.id as string;
 
-    vendorId = (
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/vendors`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'VEND-CW', name: 'Prime Foods Pvt Ltd' })
-        .expect(201)
-    ).body.vendor.id as string;
+    vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'VEND-CW', name: 'Prime Foods Pvt Ltd' });
 
     const csv = [
       'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,catch_weight_tracked,reorder_point,reorder_qty,barcode',
@@ -345,7 +339,8 @@ describe('catch weight and handling units (e2e, story 10.3)', () => {
         'goods_receipt_notes',
         'purchase_order_lines',
         'purchase_orders',
-        'vendors',
+        'partner_client_links',
+        'business_partners',
       ]) {
         await cleaner.unsafe(`DELETE FROM ${table} WHERE tenant_id = ANY($1::uuid[])`, [createdTenantIds]);
       }

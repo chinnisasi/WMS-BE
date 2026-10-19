@@ -1918,37 +1918,127 @@ export const reservations = pgTable(
 export type Reservation = typeof reservations.$inferSelect;
 
 /**
- * Vendors (Story 3.1 — the inbound module's first tables): purchase-order
- * counterparties as a **real entity** (not a free-text field) — Epic 6's
- * suggested-PO drafts read default vendors (`is_default`). Codes are unique
- * per tenant (the SKU-code convention); a duplicate create is a 409 naming
- * the conflicting code. No editing beyond creation (vendor edit is a later
- * story).
+ * Business partners (story 1-3; the Story 3.1 `vendors` table renamed IN
+ * PLACE by migration 0079, so every id — and every `purchase_orders.vendor_id`
+ * / `suggested_pos.vendor_id` pointing at one — survives). One row is ONE GST
+ * registration of a real company (decision 5: a company registered in two
+ * states is two partners; PAN is not unique), carrying the roles it plays —
+ * `vendor`, `consignee`, `transporter` (`PARTNER_ROLES`). Tenant-wide master
+ * data: which clients trade with it is `partner_client_links`.
  *
- * RLS policy lives **only in the migration SQL** (0011, the 0005→0010
- * pattern). `vendors` is tenant-scoped, NOT warehouse-scoped — a vendor is
- * commercial master data; the PO carries the warehouse.
+ * Written ONLY by `src/modules/partners` (pinned by test/architecture.spec.ts).
+ * Every CHECK (code/name/GSTIN/PAN shapes, the PAN-GSTIN and GSTIN-state
+ * agreement, the two all-or-none address groups, the contact shapes, the
+ * roles vocabulary, the status/reason pairing) and the RLS policy live ONLY
+ * in the migration SQL (0079). Nothing is ever deleted — a partner is set
+ * `inactive` with an optional reason.
  */
-export const vendors = pgTable(
-  'vendors',
+export const businessPartners = pgTable(
+  'business_partners',
   {
     id: uuid('id')
       .primaryKey()
       .$defaultFn(() => uuidv7()),
     tenantId: uuid('tenant_id').notNull(),
     code: text('code').notNull(),
+    /** The display (trade) name — the old `vendors.name`. */
     name: text('name').notNull(),
+    legalName: text('legal_name'),
+    /** Uppercase; unique per tenant when present (the partial unique below). */
+    gstin: text('gstin'),
+    /** Derived from GSTIN characters 3–12 when absent and a GSTIN is present. */
+    pan: text('pan'),
+    /** Non-empty subset of `PARTNER_ROLES`, no duplicates (the 0079 CHECK). */
+    roles: text('roles').array().notNull(),
+    registeredLine1: text('registered_line1'),
+    registeredLine2: text('registered_line2'),
+    registeredCity: text('registered_city'),
+    registeredStateCode: text('registered_state_code'),
+    registeredPincode: text('registered_pincode'),
+    dispatchLine1: text('dispatch_line1'),
+    dispatchLine2: text('dispatch_line2'),
+    dispatchCity: text('dispatch_city'),
+    dispatchStateCode: text('dispatch_state_code'),
+    dispatchPincode: text('dispatch_pincode'),
+    contactName: text('contact_name'),
+    contactPhone: text('contact_phone'),
+    contactEmail: text('contact_email'),
+    /** `active | inactive` (`PARTNER_STATUSES`). */
+    status: text('status').notNull().default('active'),
+    /** Null whenever the partner is active (the 0079 CHECK). */
+    inactiveReason: text('inactive_reason'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('business_partners_tenant_id_code_unique').on(table.tenantId, table.code),
+    index('business_partners_created_at_id_idx').on(table.createdAt, table.id),
+    // One partner per GST registration per tenant (absent for unregistered suppliers).
+    uniqueIndex('business_partners_tenant_gstin_unique')
+      .on(table.tenantId, table.gstin)
+      .where(sql`gstin IS NOT NULL`),
+  ],
+);
+
+export type BusinessPartner = typeof businessPartners.$inferSelect;
+
+/** Story 1-3 — the roles a partner plays (the 0079 `business_partners_roles_check`). */
+export const PARTNER_ROLES = ['vendor', 'consignee', 'transporter'] as const;
+export type PartnerRole = (typeof PARTNER_ROLES)[number];
+/** Story 1-3 — the roles a client link carries; transporters are shared, never linked. */
+export const PARTNER_LINK_ROLES = ['vendor', 'consignee'] as const satisfies readonly PartnerRole[];
+export type PartnerLinkRole = (typeof PARTNER_LINK_ROLES)[number];
+/** Story 1-3 — a partner's status (`business_partners_status_check`). */
+export const PARTNER_STATUSES = ['active', 'inactive'] as const;
+export type PartnerStatus = (typeof PARTNER_STATUSES)[number];
+
+/**
+ * Story 1-3 — which clients trade with which partner, per role (vendor or
+ * consignee): the client's own code for the partner, an active flag (a link
+ * is switched off, never deleted) and — vendor links only — the client's
+ * DEFAULT vendor (at most one per client; the replenishment sweep drafts
+ * against it). Client-scoped: the RLS policy carries the 0041
+ * `app.client_id` clause (decision 8 — no portal route reads it yet).
+ * Written only by `src/modules/partners`. CHECKs and RLS in 0079 only.
+ */
+export const partnerClientLinks = pgTable(
+  'partner_client_links',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    partnerId: uuid('partner_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    /** `vendor | consignee` (`PARTNER_LINK_ROLES`). */
+    role: text('role').notNull(),
+    /** The client's own code for this partner — trimmed, case kept. */
+    clientCode: text('client_code'),
+    active: boolean('active').notNull().default(true),
+    /** Implies role = vendor AND active (the 0079 CHECK). */
     isDefault: boolean('is_default').notNull().default(false),
     ...tenantTimestamps,
   },
   (table) => [
-    uniqueIndex('vendors_tenant_id_code_unique').on(table.tenantId, table.code),
-    // Vendor-list keyset pagination (created_at + id, standard cursor).
-    index('vendors_created_at_id_idx').on(table.createdAt, table.id),
+    uniqueIndex('partner_client_links_partner_client_role_unique').on(
+      table.tenantId,
+      table.partnerId,
+      table.clientId,
+      table.role,
+    ),
+    // The client's own codes are unique per (client, role) — inactive links included.
+    uniqueIndex('partner_client_links_client_code_unique')
+      .on(table.tenantId, table.clientId, table.role, table.clientCode)
+      .where(sql`client_code IS NOT NULL`),
+    // At most one default vendor per client.
+    uniqueIndex('partner_client_links_one_default_unique')
+      .on(table.tenantId, table.clientId)
+      .where(sql`is_default`),
+    // The list's `clientId` filter (EXISTS over a client's active links in a role).
+    index('partner_client_links_tenant_client_role_idx').on(table.tenantId, table.clientId, table.role),
   ],
 );
 
-export type Vendor = typeof vendors.$inferSelect;
+export type PartnerClientLink = typeof partnerClientLinks.$inferSelect;
 
 /**
  * Purchase orders (Story 3.1): warehouse-scoped upstream documents —
@@ -1985,6 +2075,14 @@ export const purchaseOrders = pgTable(
     code: text('code').notNull(),
     status: text('status').notNull().default('open'),
     carriedFromPoId: uuid('carried_from_po_id'),
+    /**
+     * Story 1-3 — the vendor as it was when the PO was created (v1 shape:
+     * `{v:1, code, name, legalName, gstin, stateCode, registeredAddress,
+     * dispatchAddress}`, every key present, null where empty); copied to a
+     * close successor. Nullable in the schema; 0079 backfilled every PO, and
+     * every write sets it.
+     */
+    vendorSnapshot: jsonb('vendor_snapshot'),
     ...tenantTimestamps,
   },
   (table) => [

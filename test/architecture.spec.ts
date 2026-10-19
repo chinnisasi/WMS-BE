@@ -990,6 +990,61 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
   });
 });
 
+describe('architecture: business partners are partners-module-owned (story 1-3)', () => {
+  /**
+   * Story 1-3 renamed the Story 3.1 `vendors` table to `business_partners`
+   * in place and added `partner_client_links`; both belong to the new
+   * partners module alone. Inbound's PO guard and replenishment's default
+   * pick read them through `partners.facade.ts` (file-level `…InTx`
+   * functions on the caller's transaction) — never by writing them, and never
+   * past the facade / module / DTO.
+   */
+  const PARTNER_TABLES = ['businessPartners', 'partnerClientLinks'] as const;
+  const RAW_PARTNER_TABLES = 'business_partners|partner_client_links|vendors';
+  const partnersRoot = join(SRC_ROOT, 'modules', 'partners');
+
+  it('no partner-table write happens outside the partners module', () => {
+    const outside = files.filter((file) => !file.path.startsWith(partnersRoot));
+    const offenders: string[] = [];
+    for (const file of outside) {
+      for (const pattern of [
+        ...PARTNER_TABLES.map((table) => drizzleWriteOn(table)),
+        new RegExp(`\\b(insert into|update|delete from)\\s+"?(${RAW_PARTNER_TABLES})\\b`, 'i'),
+      ]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no other module reaches into the partners module past the facade, module or DTO', () => {
+    const internals = new RegExp('(?:modules/partners|\\.\\./partners)/(?!partners\\.(facade|module|dto)[\'"])');
+    expect(internals.test("from '../partners/partners.command'")).toBe(true);
+    expect(internals.test("from '../partners/partners.facade'")).toBe(false);
+    expect(internals.test("from '../partners/partners.dto'")).toBe(false);
+    const offenders = files
+      .filter((file) => file.path.startsWith(join(SRC_ROOT, 'modules')) && !file.path.startsWith(partnersRoot))
+      .filter((file) => internals.test(file.source))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+  });
+
+  it('the partners command really writes both tables, and the PO guard and the sweep read through the facade (the test is meaningful)', () => {
+    const command = readFileSync(join(partnersRoot, 'partners.command.ts'), 'utf8');
+    expect(/\.insert\(\s*businessPartners\b/.test(command)).toBe(true);
+    expect(/\.update\(\s*businessPartners\b/.test(command)).toBe(true);
+    expect(/\.insert\(\s*partnerClientLinks\b/.test(command)).toBe(true);
+    expect(/\.update\(\s*partnerClientLinks\b/.test(command)).toBe(true);
+    // Nothing is ever deleted (decision: deactivate, never delete).
+    for (const table of PARTNER_TABLES) expect(new RegExp(`\\.delete\\(\\s*${table}\\b`).test(command)).toBe(false);
+    const po = readFileSync(join(SRC_ROOT, 'modules', 'inbound', 'po.command.ts'), 'utf8');
+    expect(po).toContain("from '../partners/partners.facade'");
+    expect(po).toMatch(/await assertVendorLinkedInTx\(/);
+    const sweep = readFileSync(join(SRC_ROOT, 'modules', 'replenishment', 'replenishment.sweep.ts'), 'utf8');
+    expect(sweep).toMatch(/findDefaultVendorForClientInTx\(/);
+  });
+});
+
 describe('architecture: the transfer aggregate is movements-module-owned (story 5-1)', () => {
   /**
    * Story 5-1 populates the movements spine with the transfer aggregate
@@ -1183,7 +1238,7 @@ describe('architecture: the replenishment planning state is replenishment-module
     // table, the ATP numbers come from the inventory facade only, and the
     // scan's on-hand/batch facts from the facades' in-tx reads (never a
     // cross-module table reach — AD-6).
-    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'binStateEpochs', 'reservations', 'purchaseOrders', 'advanceShipmentNotices', 'asnLines', 'skus', 'vendors', 'batches'] as const) {
+    for (const table of ['stockOnHand', 'batchOnHand', 'ledgerEvents', 'binStateEpochs', 'reservations', 'purchaseOrders', 'advanceShipmentNotices', 'asnLines', 'skus', 'businessPartners', 'partnerClientLinks', 'batches'] as const) {
       expect(drizzleWriteOn(table).test(command)).toBe(false);
       expect(drizzleWriteOn(table).test(sweep)).toBe(false);
       expect(drizzleWriteOn(table).test(scan)).toBe(false);
@@ -2840,6 +2895,8 @@ describe('architecture: AUDIT_TARGET_TYPES is the audit vocabulary (story 9-3a)'
     [join(SRC_ROOT, 'modules', 'invoicing', 'eway.command.ts')]: ['eway_bill', 'eway_state_threshold', 'eway_gstin_setting'],
     // Story 13-2 — the receipt targets the receipt, or (nothing applied) the RMA.
     [join(SRC_ROOT, 'modules', 'returns', 'return-receipt.command.ts')]: ['return_receipt', 'return_authorization'],
+    // Story 1-3 — the partner commands' one audit helper takes the target type.
+    [join(SRC_ROOT, 'modules', 'partners', 'partners.command.ts')]: ['partner', 'partner_link'],
   };
 
   /** Literal `targetType: '…'` values, plus the e-way `audit(tx, …, '<action>', '<targetType>', …)` helper calls. */

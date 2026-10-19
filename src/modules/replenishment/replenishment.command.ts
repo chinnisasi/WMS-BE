@@ -112,6 +112,12 @@ export interface SuggestedPoEntry {
   readonly breachId: string;
   readonly warehouseId: string;
   readonly skuId: string;
+  /**
+   * Story 1-3 — the SKU's client (stitched in by the list read through
+   * `CatalogFacade.skuClientIdsInTx`): the web picker offers the vendors
+   * linked to THIS client. Not a stored snapshot — the list is the only reader.
+   */
+  readonly clientId: string;
   readonly vendorId: string | null;
   readonly quantityMilli: number;
   readonly status: (typeof SUGGESTED_PO_STATUSES)[number];
@@ -361,7 +367,7 @@ export function breachEntry(row: ReorderBreachRow): BreachEntry {
   };
 }
 
-export function suggestedPoEntry(row: SuggestedPoRow): SuggestedPoEntry {
+export function suggestedPoEntry(row: SuggestedPoRow): Omit<SuggestedPoEntry, 'clientId'> {
   return {
     id: row.id,
     breachId: row.breachId,
@@ -861,7 +867,7 @@ export class ReplenishmentCommand {
           'suggested-po-vendor-required',
           400,
           'Vendor required',
-          'This draft names no vendor (the tenant carried none at detection) — choose one to submit.',
+          "This draft names no vendor (its SKU's client had no default vendor at detection) — choose one of the client's vendors to submit.",
         );
       }
       const quantityMilli = command.quantityMilli ?? draft.quantityMilli;

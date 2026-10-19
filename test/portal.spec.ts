@@ -19,6 +19,7 @@ import { PortalSessionGuard, PORTAL_SURFACE_DETAIL } from '../src/modules/client
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn, signInAs } from './support/sign-in';
+import { createLinkedVendor, linkVendor } from './support/linked-vendor';
 
 // Story 21-7 — the client portal: the `client` role and its invite rules, the
 // portal token (AD-4 amended for the fence only), the central fence on every
@@ -130,14 +131,7 @@ describe('client portal (e2e, story 21-7)', () => {
     ).body.id as string;
     bin1 = await createBin(wh1, zone, 'A-01-01');
     bin1b = await createBin(wh1, zone, 'A-01-02');
-    vendorId = (
-      await http()
-        .post(`${API}/${tenantId}/vendors`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'V-PORTAL', name: 'Portal Vendor' })
-        .expect(201)
-    ).body.vendor.id as string;
+    vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'V-PORTAL', name: 'Portal Vendor' });
 
     const clients = await http().get(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
     selfClient = (clients.body.items as { id: string; systemOwned: boolean }[]).find((c) => c.systemOwned)!.id;
@@ -249,7 +243,7 @@ describe('client portal (e2e, story 21-7)', () => {
   }
 
   async function createClient(code: string, name: string): Promise<string> {
-    return (
+    const id = (
       await http()
         .post(`${API}/${tenantId}/clients`)
         .set('Authorization', `Bearer ${ownerToken}`)
@@ -257,6 +251,9 @@ describe('client portal (e2e, story 21-7)', () => {
         .send({ code, name })
         .expect(201)
     ).body.client.id as string;
+    // Story 1-3 — a PO's vendor must be linked to its client: the suite's vendor trades with every client it creates.
+    if (vendorId !== undefined) await linkVendor(app, tenantId, ownerToken, vendorId, id);
+    return id;
   }
 
   async function importCsv(rows: string[], clientId: string): Promise<void> {

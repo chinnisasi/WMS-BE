@@ -11,6 +11,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { importSecureSku } from './support/secure-sku';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -2284,8 +2285,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       request(app.getHttpServer())[method](`${API}/${tenantId}${path}`).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid());
 
     beforeAll(async () => {
-      vendor = (await owner('post', '/vendors').send({ code: `V-PX-${ulid().slice(18)}`, name: 'Excess Vendor' }).expect(201)).body.vendor
-        .id as string;
+      vendor = await createLinkedVendor(app, tenantId, ownerToken, { code: `V-PX-${ulid().slice(18)}`, name: 'Excess Vendor' });
     });
 
     beforeEach(async () => {
@@ -2389,7 +2389,7 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
       const zone = (await owner('post', `/warehouses/${whB}/zones`).send({ code: 'D', name: 'Doc' }).expect(201)).body.id as string;
       const bin = (await owner('post', `/warehouses/${whB}/zones/${zone}/bins`).send({ code: 'D-01', capacity: 1000, type: 'shelf' }).expect(201)).body
         .id as string;
-      const vendor = (await owner('post', '/vendors').send({ code: `V-DF-${ulid().slice(18)}`, name: 'Doc Vendor' }).expect(201)).body.vendor.id as string;
+      const vendor = await createLinkedVendor(app, tenantId, ownerToken, { code: `V-DF-${ulid().slice(18)}`, name: 'Doc Vendor' });
       const po = (
         await owner('post', '/inbound/purchase-orders')
           .send({

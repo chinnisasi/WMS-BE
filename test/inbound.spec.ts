@@ -9,6 +9,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -22,7 +23,7 @@ delete process.env.OUTBOX_RECONCILE_POLL_MS;
 const API = '/api/v1/tenants';
 const KEY_HEADER = 'Idempotency-Key';
 
-describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
+describe('inbound: purchase orders (e2e, story 3.1)', () => {
   let app: INestApplication;
   const createdTenantIds: string[] = [];
 
@@ -57,10 +58,11 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     try {
       // Children before parents (no FKs, but the order keeps the intent
-      // legible): PO lines → POs → vendors, then the shared spine rows.
+      // legible): PO lines → POs → partners, then the shared spine rows.
       await sql.unsafe('DELETE FROM purchase_order_lines WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM purchase_orders WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM vendors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await sql.unsafe('DELETE FROM partner_client_links WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await sql.unsafe('DELETE FROM business_partners WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM uom_conversions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
@@ -205,114 +207,14 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
     expect(skuIds.size).toBe(2);
 
     // The tenant's vendor (used by most PO tests below).
-    vendorId = (
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/vendors`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'VEND-001', name: 'Prime Foods Pvt Ltd' })
-        .expect(201)
-    ).body.vendor.id as string;
+    vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'VEND-001', name: 'Prime Foods Pvt Ltd' });
   });
 
   // ── Vendor surfaces ────────────────────────────────────────────────────────
-
-  it('vendor create: 201 with the snapshot; duplicate code is 409 conflict naming the code; the list walks the keyset', async () => {
-    const created = await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/vendors`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, ulid())
-      .send({ code: 'VEND-002', name: 'Spice Traders', isDefault: true })
-      .expect(201);
-    expect(created.body.vendor).toMatchObject({
-      tenantId,
-      code: 'VEND-002',
-      name: 'Spice Traders',
-      isDefault: true,
-    });
-
-    // The `vendor.created` outbox row exists exactly once, carrying the
-    // post-mutation vendor snapshot.
-    {
-      const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
-      try {
-        const events = await sql`
-          select payload from outbox_messages
-          where tenant_id = ${tenantId} and type = 'vendor.created'
-          and payload->'vendor'->>'id' = ${created.body.vendor.id as string}`;
-        const rows = events as unknown as { payload: { vendor: { code: string } } }[];
-        expect(rows).toHaveLength(1);
-        expect(rows[0]!.payload.vendor.code).toBe('VEND-002');
-      } finally {
-        await sql.end();
-      }
-    }
-
-    // A verbatim same-key resend replays the stored snapshot.
-    const vendorKey = ulid();
-    const vendorFirst = await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/vendors`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, vendorKey)
-      .send({ code: 'VEND-REPLAY', name: 'Replay Traders' })
-      .expect(201);
-    const vendorSecond = await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/vendors`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, vendorKey)
-      .send({ code: 'VEND-REPLAY', name: 'Replay Traders' })
-      .expect(201);
-    expect(vendorSecond.body).toEqual(vendorFirst.body);
-
-    const duplicate = await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/vendors`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, ulid())
-      .send({ code: 'VEND-001', name: 'Another Prime' })
-      .expect(409);
-    expect(duplicate.body).toMatchObject({ status: 409, code: 'conflict' });
-    expect(duplicate.body.detail).toContain('VEND-001');
-
-    // The list: both vendors, keyset cursor walks with no dup/miss.
-    const first = await get('/vendors?limit=1').expect(200);
-    expect(first.body.items).toHaveLength(1);
-    const seen = (first.body.items as { code: string }[]).map((item) => item.code);
-    let nextCursor = first.body.nextCursor as string | null;
-    let guard = 0;
-    while (nextCursor !== null && guard < 20) {
-      const page = await get(`/vendors?limit=1&cursor=${encodeURIComponent(nextCursor)}`).expect(200);
-      seen.push(...(page.body.items as { code: string }[]).map((item) => item.code));
-      nextCursor = page.body.nextCursor as null | string;
-      guard += 1;
-    }
-    expect(nextCursor).toBeNull();
-    expect(seen).toHaveLength(await dbCount('vendors'));
-    expect(new Set(seen).size).toBe(seen.length);
-  });
-
-  it('vendor create errors: an operator is 403 role-denied; a foreign tenant is 403; no token is 401', async () => {
-    const operator = await createMember('operator');
-    const denied = await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/vendors`)
-      .set('Authorization', `Bearer ${operator.token}`)
-      .set(KEY_HEADER, ulid())
-      .send({ code: 'VEND-NOPE', name: 'Blocked Traders' })
-      .expect(403);
-    expect(denied.body).toMatchObject({ status: 403, code: 'role-denied' });
-
-    await request(app.getHttpServer())
-      .post(`${API}/${uuidv7()}/vendors`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, ulid())
-      .send({ code: 'VEND-X', name: 'Foreign' })
-      .expect(403)
-      .then((res) => expect(res.body).toMatchObject({ code: 'permission-denied' }));
-
-    await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/vendors`)
-      .send({ code: 'VEND-X', name: 'No token' })
-      .expect(401);
-  });
+  // Story 1-3 retired `POST/GET /vendors` (no alias): the vendor master is the
+  // business partner master now, and its create / replay / duplicate-code /
+  // keyset-list / 403 / 401 arms — and the `vendor.created` outbox event —
+  // are pinned in test/business-partners.spec.ts against `/partners`.
 
   // ── PO create: happy path + every error arm ───────────────────────────────
 
@@ -731,23 +633,10 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
   // refused po-not-open before any replay could run. A raw holder locks the
   // PO row; two same-key requests park behind it; on release the loser must
   // re-serve the winner's snapshot.
-  it('story 9-3a — vendor create, PO create, amend and close each write one audit row naming the document and the requester; a replay writes none', async () => {
-    const vendorKey = ulid();
-    const vendorBody = { code: `VA-${ulid().slice(10, 16)}`, name: 'Audited Vendor' };
-    const vendor = await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/vendors`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, vendorKey)
-      .send(vendorBody)
-      .expect(201);
-    await request(app.getHttpServer())
-      .post(`${API}/${tenantId}/vendors`)
-      .set('Authorization', `Bearer ${ownerToken}`)
-      .set(KEY_HEADER, vendorKey)
-      .send(vendorBody)
-      .expect(201);
-    await expectAuditRow({ tenantId, key: vendorKey, action: 'vendor.created', targetType: 'vendor', targetId: vendor.body.vendor.id as string, actorUserId: ownerUserId });
-
+  it('story 9-3a — PO create, amend and close each write one audit row naming the document and the requester; a replay writes none', async () => {
+    // Story 1-3: the vendor create's `vendor.created` audit row is retired —
+    // the partner create's `partner.created` is pinned in
+    // test/business-partners.spec.ts.
     const body: PoBody = {
       warehouseId,
       vendorId,
@@ -953,8 +842,8 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
     const foreignTenantId = uuidv7();
     try {
       await sql`
-        insert into vendors (id, tenant_id, code, name)
-        values (${uuidv7()}, ${foreignTenantId}, 'FOREIGN-V', 'Foreign Vendor')`;
+        insert into business_partners (id, tenant_id, code, name, roles)
+        values (${uuidv7()}, ${foreignTenantId}, 'FOREIGN-V', 'Foreign Vendor', array['vendor'])`;
       // Story 21-1: the four client-stamped tables are NOT NULL — a fixture
       // tenant that never registered still needs its self client row.
       const foreignClientId = uuidv7();
@@ -974,7 +863,7 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
       const rls = postgres(url.toString(), { max: 1 });
       try {
         await rls.unsafe(`select set_config('app.tenant_id', '${tenantId}', false)`);
-        for (const table of ['vendors', 'purchase_orders', 'purchase_order_lines']) {
+        for (const table of ['business_partners', 'purchase_orders', 'purchase_order_lines']) {
           const foreign = await rls.unsafe(
             `select count(*)::int as n from ${table} where tenant_id = '${foreignTenantId}'::uuid`,
           );
@@ -983,7 +872,7 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
         // Control: scoped to the foreign tenant the rows ARE visible — the
         // isolation, not an empty store, is proven.
         await rls.unsafe(`select set_config('app.tenant_id', '${foreignTenantId}', false)`);
-        for (const table of ['vendors', 'purchase_orders', 'purchase_order_lines']) {
+        for (const table of ['business_partners', 'purchase_orders', 'purchase_order_lines']) {
           const own = await rls.unsafe(`select count(*)::int as n from ${table}`);
           expect(Number((own[0] as unknown as { n: number }).n)).toBe(1);
         }
@@ -1003,7 +892,7 @@ describe('inbound: vendors + purchase orders (e2e, story 3.1)', () => {
       await sql.unsafe('set session_replication_role = replica');
       await sql.unsafe(`delete from purchase_order_lines where tenant_id = '${foreignTenantId}'::uuid`);
       await sql.unsafe(`delete from purchase_orders where tenant_id = '${foreignTenantId}'::uuid`);
-      await sql.unsafe(`delete from vendors where tenant_id = '${foreignTenantId}'::uuid`);
+      await sql.unsafe(`delete from business_partners where tenant_id = '${foreignTenantId}'::uuid`);
       await sql.unsafe('set session_replication_role = DEFAULT');
       await sql.end();
     }

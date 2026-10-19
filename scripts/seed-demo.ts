@@ -23,7 +23,7 @@
  *   3. a catalog via the CSV import: plain units, a kg SKU, batch-tracked,
  *      serial-tracked, catch-weight, a product with variants, a kit, a
  *      hazard-classed SKU, HSN/GST and reorder points
- *   4. inbound: vendors, a PO, an enrolled handheld + operator badge-in,
+ *   4. inbound: business partners (vendors linked to the company, a consignee, a transporter), a PO, an enrolled handheld + operator badge-in,
  *      a GRN against the PO (batches, a partial line, an over-receipt left
  *      pending), a blind receipt (catch-weight cases), putaway, a QC hold
  *   5. inventory: serial and near-expiry batch intake, an immediate
@@ -314,7 +314,14 @@ const ADDRESSES = {
   ],
 };
 
-const GSTIN = { blr: '29AAACD7395K1Z4', mum: '27AAACD7395K1Z8', buyerMum: '27AABCS4412Q1Z3', client: '29AAGCG4321M1Z7' };
+const GSTIN = {
+  blr: '29AAACD7395K1Z4',
+  mum: '27AAACD7395K1Z8',
+  buyerMum: '27AABCS4412Q1Z3',
+  client: '29AAGCG4321M1Z7',
+  vendorKrishna: '29AAKCK4512R1Z2',
+  vendorVistara: '27AAFCV8834L1Z9',
+};
 
 // ── the catalog ────────────────────────────────────────────────────────────
 
@@ -577,10 +584,49 @@ async function main(): Promise<void> {
   // ── 4. inbound ───────────────────────────────────────────────────────────
   say('\n4. Inbound');
   let vendorId: string | undefined;
-  await step('Vendors', async () => {
-    vendorId = idOf((await as('owner', 'POST', '/vendors', { code: 'V-KRISHNA', name: 'Krishna Agro Foods Pvt Ltd', isDefault: true })).body, 'vendor');
-    await as('owner', 'POST', '/vendors', { code: 'V-VISTARA', name: 'Vistara Electronics Distributors' });
-    return '2 vendors';
+  let vistaraId: string | undefined;
+  await step('Business partners (2 vendors linked to the company, a consignee, a transporter)', async () => {
+    // Story 1-3 — one partner per GST registration; a PO's vendor must be
+    // linked to the PO's client, and the client's default vendor drafts the
+    // replenishment suggestions.
+    const selfClientId = need(((await as('owner', 'GET', '/clients')).body.items as Json[]).find((c) => c.systemOwned === true)?.id as string | undefined, 'self client');
+    vendorId = idOf(
+      (
+        await as('owner', 'POST', '/partners', {
+          code: 'V-KRISHNA',
+          name: 'Krishna Agro Foods',
+          legalName: 'Krishna Agro Foods Pvt Ltd',
+          roles: ['vendor'],
+          gstin: GSTIN.vendorKrishna,
+          registeredAddress: { line1: '14 APMC Yard, Yeshwanthpur', city: 'Bengaluru', stateCode: '29', pincode: '560022' },
+          contactName: 'Ravi Kumar',
+          contactPhone: '+91 98450 11111',
+          contactEmail: 'orders@krishna-agro.example',
+        })
+      ).body,
+      'partner',
+    );
+    await as('owner', 'POST', `/partners/${vendorId}/links`, { clientId: selfClientId, role: 'vendor', clientCode: 'SUP-001', isDefault: true });
+    vistaraId = idOf(
+      (
+        await as('owner', 'POST', '/partners', {
+          code: 'V-VISTARA',
+          name: 'Vistara Electronics Distributors',
+          roles: ['vendor'],
+          gstin: GSTIN.vendorVistara,
+          registeredAddress: { line1: 'Unit 7, Andheri Industrial Estate', city: 'Mumbai', stateCode: '27', pincode: '400053' },
+        })
+      ).body,
+      'partner',
+    );
+    await as('owner', 'POST', `/partners/${vistaraId}/links`, { clientId: selfClientId, role: 'vendor', clientCode: 'SUP-002' });
+    const consignee = idOf(
+      (await as('owner', 'POST', '/partners', { code: 'C-METRO', name: 'Metro Retail Stores', roles: ['consignee'], gstin: GSTIN.buyerMum })).body,
+      'partner',
+    );
+    await as('owner', 'POST', `/partners/${consignee}/links`, { clientId: selfClientId, role: 'consignee' });
+    await as('owner', 'POST', '/partners', { code: 'T-SAFEXPRESS', name: 'Safe Freight Carriers', roles: ['transporter'] });
+    return '4 partners, 3 links, 1 default';
   });
   let poId: string | undefined;
   let poLines = new Map<string, string>(); // sku id → po line id
@@ -1033,6 +1079,14 @@ async function main(): Promise<void> {
     });
   });
   await step('Client catalog import (3 GlowCo SKUs)', async () => importCatalog(CLIENT_CATALOG_ROWS, need(clientId, 'client')));
+  await step('GlowCo trades with Vistara (a shared vendor, its default for GlowCo)', async () => {
+    await as('owner', 'POST', `/partners/${need(vistaraId, 'Vistara vendor')}/links`, {
+      clientId: need(clientId, 'client'),
+      role: 'vendor',
+      clientCode: 'GLOW-V-01',
+      isDefault: true,
+    });
+  });
   await step('Rate card drafted and activated from today (IST)', async () => {
     const res = await as('owner', 'POST', `/clients/${need(clientId, 'client')}/rate-cards`, {
       lines: [

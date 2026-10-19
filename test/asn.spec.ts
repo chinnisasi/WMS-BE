@@ -13,6 +13,7 @@ import { BLIND_REASON_CODES } from '../src/modules/inbound/receiving.command';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 // Story 21-6 — advance shipment notices: the ASN lifecycle, receiving against
 // a PO OR an ASN in one `grn.submit` (through the device route AND the
@@ -97,14 +98,7 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
 
     wh1 = await createWarehouse('ASN-W1');
     wh2 = await createWarehouse('ASN-W2');
-    vendorId = (
-      await http()
-        .post(`${API}/${tenantId}/vendors`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'V-ASN', name: 'ASN Vendor' })
-        .expect(201)
-    ).body.vendor.id as string;
+    vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'V-ASN', name: 'ASN Vendor' });
 
     const clients = await http().get(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
     selfClient = (clients.body.items as { id: string; systemOwned: boolean }[]).find((c) => c.systemOwned)!.id;

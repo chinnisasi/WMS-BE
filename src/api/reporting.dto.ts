@@ -2,8 +2,8 @@ import { ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsIn, IsInt, IsOptional, IsString, Matches, Max, Min } from 'class-validator';
 import { UUID_RE } from '../shared/primitives/ids';
-import { AUDIT_TARGET_TYPES, SYSTEM_ACTOR_ID } from '../shared/primitives/audit';
-import type { AuditTargetType } from '../shared/primitives/audit';
+import { AUDIT_READ_TARGET_TYPES, SYSTEM_ACTOR_ID } from '../shared/primitives/audit';
+import type { AuditReadTargetType } from '../shared/primitives/audit';
 import { IsInstant } from '../shared/primitives/instant-range';
 import {
   AUDIT_ACTION_PREFIX_RE,
@@ -485,12 +485,12 @@ export class AuditFilterBaseDto {
 
   @ApiProperty({
     required: false,
-    enum: [...AUDIT_TARGET_TYPES],
-    description: 'Only actions on this kind of target',
+    enum: [...AUDIT_READ_TARGET_TYPES],
+    description: 'Only actions on this kind of target (`vendor` matches the rows written before story 1-3 — no writer stores it now)',
   })
   @IsOptional()
-  @IsIn([...AUDIT_TARGET_TYPES])
-  targetType?: AuditTargetType;
+  @IsIn([...AUDIT_READ_TARGET_TYPES])
+  targetType?: AuditReadTargetType;
 
   @ApiProperty({ required: false, format: 'uuid', description: 'Only actions on this target' })
   @IsOptional()
@@ -645,7 +645,7 @@ export function toAuditExportDto(snapshot: AuditExportSnapshot): AuditExportDto 
   const filters: AuditFilterBaseDto = {};
   if (snapshot.filters.actorUserId !== undefined) filters.actorUserId = snapshot.filters.actorUserId;
   if (snapshot.filters.actionPrefix !== undefined) filters.actionPrefix = snapshot.filters.actionPrefix;
-  if (snapshot.filters.targetType !== undefined) filters.targetType = snapshot.filters.targetType as AuditTargetType;
+  if (snapshot.filters.targetType !== undefined) filters.targetType = snapshot.filters.targetType as AuditReadTargetType;
   if (snapshot.filters.targetId !== undefined) filters.targetId = snapshot.filters.targetId;
   if (snapshot.filters.from !== undefined) filters.from = snapshot.filters.from;
   if (snapshot.filters.to !== undefined) filters.to = snapshot.filters.to;

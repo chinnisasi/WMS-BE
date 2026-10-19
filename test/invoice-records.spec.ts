@@ -334,7 +334,7 @@ describe('story 21-5b: the dispute drill-down', () => {
       let poId: string | null = null;
       if (options.poCode !== undefined) {
         poId = uuidv7();
-        const vendor = await sql<{ id: string }[]>`select id from vendors where tenant_id = ${tenantId} limit 1`;
+        const vendor = await sql<{ id: string }[]>`select id from business_partners where tenant_id = ${tenantId} limit 1`;
         const vendorId = vendor[0]?.id ?? uuidv7();
         const owner = await sql<{ client_id: string }[]>`select client_id from skus where id = ${lines[0]!.skuId}`;
         await sql`insert into purchase_orders (id, tenant_id, client_id, warehouse_id, vendor_id, code, status)

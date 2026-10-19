@@ -9,6 +9,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 // The e2e suite talks to the real Postgres (docker-compose dev DB by
 // default; CI provides the service container) and signs sessions.
@@ -74,14 +75,7 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
         .send({ origin: testAddress(), code: `RCV-${ulid().slice(10, 16).toUpperCase()}`, name: `Receiving Depot ${ulid()}` })
         .expect(201)
     ).body.id as string;
-    vendorId = (
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/vendors`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'VEND-001', name: 'Prime Foods Pvt Ltd' })
-        .expect(201)
-    ).body.vendor.id as string;
+    vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'VEND-001', name: 'Prime Foods Pvt Ltd' });
 
     // SKUs: one batch-tracked, one not.
     const csvHeader =
@@ -154,7 +148,8 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
       await sql.unsafe('DELETE FROM batches WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM purchase_order_lines WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM purchase_orders WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
-      await sql.unsafe('DELETE FROM vendors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await sql.unsafe('DELETE FROM partner_client_links WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
+      await sql.unsafe('DELETE FROM business_partners WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM outbox_messages WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM uom_conversions WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);
       await sql.unsafe('DELETE FROM catalog_import_errors WHERE tenant_id = ANY($1::uuid[])', [createdTenantIds]);

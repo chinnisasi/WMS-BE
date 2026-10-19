@@ -1,7 +1,7 @@
 import { eq, sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { auditEvents } from './schema';
-import type { AuditTargetType } from '../primitives/audit';
+import type { AuditReadTargetType } from '../primitives/audit';
 import { ProblemException } from '../problem-details/problem.exception';
 
 /**
@@ -27,7 +27,7 @@ export const AUDIT_ACTION_PREFIX_RE = /^[a-z][a-z_.-]{0,63}$/;
 export interface AuditFilters {
   readonly actorUserId?: string | undefined;
   readonly actionPrefix?: string | undefined;
-  readonly targetType?: AuditTargetType | undefined;
+  readonly targetType?: AuditReadTargetType | undefined;
   readonly targetId?: string | undefined;
   /** `created_at >= from` (inclusive). */
   readonly from?: string | undefined;

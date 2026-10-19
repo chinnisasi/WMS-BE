@@ -20,6 +20,7 @@ import { PACK_FAILURE_ENTRIES } from '../src/shared/db/schema';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -145,14 +146,7 @@ describe('reporting: the operational dashboard (e2e, story 9-1)', () => {
       skuIds.set(item.code, item.id);
     }
 
-    vendorId = (
-      await request(app.getHttpServer())
-        .post(`${API}/${tenantId}/vendors`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'VEND-RPT', name: 'Report Vendor' })
-        .expect(201)
-    ).body.vendor.id as string;
+    vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'VEND-RPT', name: 'Report Vendor' });
 
     // The floor device + its badge-in operator.
     const minted = await request(app.getHttpServer())

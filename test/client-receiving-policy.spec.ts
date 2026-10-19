@@ -29,6 +29,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
 import { expectAuditRow, noOpIdempotencyKey } from './support/audit-guard';
+import { createLinkedVendor, linkVendor } from './support/linked-vendor';
 
 // Story 1-2b — the client receiving policy: the policy on the client row
 // (read, full-replace write, the no-op, the field 400s), the receipt's
@@ -161,14 +162,7 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
         .send({ code: 'A-01', capacity: 100_000, type: 'shelf' })
         .expect(201)
     ).body.id as string;
-    vendorId = (
-      await http()
-        .post(`${API}/${tenantId}/vendors`)
-        .set('Authorization', `Bearer ${ownerToken}`)
-        .set(KEY_HEADER, ulid())
-        .send({ code: 'V-CRP', name: 'CRP Vendor' })
-        .expect(201)
-    ).body.vendor.id as string;
+    vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'V-CRP', name: 'CRP Vendor' });
 
     const clients = await http().get(`${API}/${tenantId}/clients`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
     selfClient = (clients.body.items as { id: string; systemOwned: boolean }[]).find((c) => c.systemOwned)!.id;
@@ -270,6 +264,8 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
       .set(KEY_HEADER, ulid())
       .send({ code, name })
       .expect(201);
+    // Story 1-3 — a PO's vendor must be linked to its client: the suite's vendor trades with every client it creates.
+    if (vendorId !== undefined) await linkVendor(app, tenantId, ownerToken, vendorId, res.body.client.id as string);
     return res.body.client.id as string;
   }
 

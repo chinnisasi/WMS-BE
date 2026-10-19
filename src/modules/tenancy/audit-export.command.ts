@@ -5,7 +5,7 @@ import type { Database } from '../../shared/db/db';
 import { auditEvents, auditExports, idempotencyKeys, type AuditExportRow } from '../../shared/db/schema';
 import type { AuditFilters } from '../../shared/db/audit-filter';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
-import type { AuditTargetType } from '../../shared/primitives/audit';
+import type { AuditReadTargetType } from '../../shared/primitives/audit';
 import { uuidv7 } from '../../shared/primitives/ids';
 import { canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
@@ -92,7 +92,7 @@ export function canonicalAuditFilters(filters: AuditFilters): StoredAuditFilters
 
 /** The stored filters back into the shared filter's shape. */
 export function auditFiltersOf(stored: StoredAuditFilters): AuditFilters {
-  return { ...stored, targetType: stored.targetType as AuditTargetType | undefined };
+  return { ...stored, targetType: stored.targetType as AuditReadTargetType | undefined };
 }
 
 export function toAuditExportSnapshot(row: AuditExportRow): AuditExportSnapshot {

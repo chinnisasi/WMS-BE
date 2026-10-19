@@ -31,14 +31,10 @@ import {
   ImportAsnsDto,
   ClosePurchaseOrderDto,
   CreatePurchaseOrderDto,
-  CreateVendorDto,
   PurchaseOrderCloseResponse,
   PurchaseOrderListQuery,
   PurchaseOrderListResponse,
   PurchaseOrderResponse,
-  VendorListQuery,
-  VendorListResponse,
-  VendorResponse,
 } from '../modules/inbound/inbound.dto';
 
 const ASN_WRITE_403 =
@@ -57,9 +53,10 @@ const IDEMPOTENCY_HEADER = [
 ];
 
 /**
- * The inbound HTTP surface (Story 3.1): vendor master data (create + list)
- * and the PO lifecycle (create / amend / close / list / detail) — the api
- * shell is the only HTTP surface of the monolith, and every PO/vendor
+ * The inbound HTTP surface (Story 3.1): the PO lifecycle (create / amend /
+ * close / list / detail) — the api shell is the only HTTP surface of the
+ * monolith (story 1-3 moved vendors to `partners.controller.ts`; there is no
+ * `/vendors` alias), and every PO
  * mutation goes through `InboundFacade` (the command services re-evaluate
  * the role against the DB at entry). This story is pure upstream: no GRN /
  * receipt path, no ledger events, no FE consumption yet (the Inbound web
@@ -70,67 +67,6 @@ const IDEMPOTENCY_HEADER = [
 @Controller('tenants')
 export class InboundController {
   constructor(@Inject(InboundFacade) private readonly inbound: InboundFacade) {}
-
-  @Post(':tenantId/vendors')
-  @HttpCode(HttpStatus.CREATED)
-  @UseGuards(TenantSessionGuard)
-  @ApiBearerAuth()
-  @ApiOperation({ summary: 'Creates a vendor (vendor.manage) — code unique per tenant' })
-  @ApiBody({ type: CreateVendorDto })
-  @ApiHeaders(IDEMPOTENCY_HEADER)
-  @ApiResponse({
-    status: HttpStatus.CREATED,
-    type: VendorResponse,
-    description: 'Vendor created (the idempotency snapshot)',
-  })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body') })
-  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
-  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks vendor.manage (role-denied)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Vendor code already in use (conflict, naming the code), or a concurrent idempotent request (conflict)') })
-  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
-  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
-  async createVendor(
-    @Param('tenantId') tenantId: string,
-    @IdempotencyKey() idempotencyKey: string | undefined,
-    @CurrentSession() session: TenantSession,
-    @Body() dto: CreateVendorDto,
-  ): Promise<VendorResponse> {
-    assertOwnTenant(session, tenantId);
-    const key = parseRequiredIdempotencyKey(idempotencyKey);
-    const snapshot = await this.inbound.createVendor(
-      {
-        tenantId,
-        actorUserId: session.userId,
-        code: dto.code,
-        name: dto.name,
-        isDefault: dto.isDefault ?? false,
-      },
-      key,
-    );
-    return { vendor: { ...snapshot.vendor } };
-  }
-
-  @Get(':tenantId/vendors')
-  @UseGuards(TenantSessionGuard)
-  @ApiBearerAuth()
-  @ApiOperation({ summary: "Lists the tenant's vendors (keyset cursor pagination — open to any member)" })
-  @ApiOkResponse({ type: VendorListResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor (invalid-cursor) or out-of-range limit (validation-failed)') })
-  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
-  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
-  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
-  async listVendors(
-    @Param('tenantId') tenantId: string,
-    @CurrentSession() session: TenantSession,
-    @Query() query: VendorListQuery,
-  ): Promise<VendorListResponse> {
-    assertOwnTenant(session, tenantId);
-    const page = await this.inbound.listVendors(tenantId, {
-      cursor: query.cursor,
-      limit: query.limit,
-    });
-    return { items: page.items, nextCursor: page.nextCursor };
-  }
 
   @Post(':tenantId/inbound/purchase-orders')
   @HttpCode(HttpStatus.CREATED)
@@ -149,8 +85,8 @@ export class InboundController {
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, or a non-positive qty / unit cost / malformed expectedDate (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks po.manage (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, vendor, or a line\'s SKU does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('PO code already in use (conflict, naming the code), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, a line\'s SKU, or the vendor does not exist in this tenant (not-found — the SKU\'s 404 wins over the vendor\'s)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('PO code already in use (conflict, naming the code); lines spanning clients (mixed-client); a departed client (client-departed); a partner without the vendor role (partner-not-vendor), an inactive vendor (vendor-inactive), or a vendor with no active link to the PO\'s client (vendor-not-linked, naming the client); or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async createPurchaseOrder(

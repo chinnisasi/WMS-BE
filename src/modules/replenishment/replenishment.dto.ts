@@ -232,7 +232,10 @@ export class SuggestedPoDto {
   @ApiProperty({ format: 'uuid' })
   skuId!: string;
 
-  @ApiProperty({ type: String, nullable: true, description: 'The suggested vendor, null when the tenant carried no default' })
+  @ApiProperty({ format: 'uuid', description: "Story 1-3 — the SKU's client: the draft's vendor must be an active vendor linked to it" })
+  clientId!: string;
+
+  @ApiProperty({ type: String, nullable: true, description: "The suggested vendor — the SKU's client's default vendor at detection; null when the client had none" })
   vendorId!: string | null;
 
   @ApiProperty({ description: 'The suggested quantity in milli-units (base UoM × 10³)' })

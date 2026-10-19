@@ -3,6 +3,7 @@ import { SharedModule } from '../../shared/shared.module';
 import { InventoryModule } from '../inventory/inventory.module';
 import { CatalogModule } from '../catalog/catalog.module';
 import { InboundModule } from '../inbound/inbound.module';
+import { PartnersModule } from '../partners/partners.module';
 import { ReplenishmentCommand } from './replenishment.command';
 import { ReplenishmentSweep } from './replenishment.sweep';
 import { ExpiryScan } from './replenishment.expiry.scan';
@@ -20,7 +21,7 @@ import { ReplenishmentFacade } from './replenishment.facade';
  * seam the architecture test pins.
  */
 @Module({
-  imports: [SharedModule, InventoryModule, CatalogModule, InboundModule],
+  imports: [SharedModule, InventoryModule, CatalogModule, InboundModule, PartnersModule],
   providers: [ReplenishmentCommand, ReplenishmentSweep, ExpiryScan, ReplenishmentFacade],
   exports: [ReplenishmentFacade],
 })

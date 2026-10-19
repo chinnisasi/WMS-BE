@@ -3,7 +3,7 @@ import { and, asc, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { warehouseFilter, type ClientCountScope } from '../../shared/db/warehouse-filter';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { advanceShipmentNotices, asnLines, purchaseOrderLines, purchaseOrders, vendors } from '../../shared/db/schema';
+import { advanceShipmentNotices, asnLines, purchaseOrderLines, purchaseOrders } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
@@ -22,6 +22,7 @@ import {
   type PortalPurchaseOrderDetail,
   type PortalPurchaseOrderRow,
 } from './portal-inbound';
+import type { VendorSnapshotV1 } from '../partners/partners.facade';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant, getMemberClientIdIn } from '../tenancy/tenancy.service';
 import { AsnCommand, asnPortalRefused, readAsnInTx } from './asn.command';
@@ -37,8 +38,6 @@ import type {
 } from './asn.command';
 import { AsnImportCommand } from './asn-import.command';
 import type { AsnImportResponse, ImportAsnsCommand } from './asn-import.command';
-import { VendorCommand } from './vendors.command';
-import type { CreateVendorCommand, VendorSnapshot } from './vendors.command';
 import { PurchaseOrderCommand, lineSnapshot } from './po.command';
 import type {
   AmendPoCommand,
@@ -59,16 +58,6 @@ export type {
   PortalPurchaseOrderRow,
 } from './portal-inbound';
 
-/** One vendor row of the vendor-list read. */
-export interface VendorEntry {
-  readonly id: string;
-  readonly tenantId: string;
-  readonly code: string;
-  readonly name: string;
-  readonly isDefault: boolean;
-  readonly createdAt: string;
-}
-
 /** One PO header row of the PO-list read (no lines — detail carries them). */
 export interface PurchaseOrderEntry {
   readonly id: string;
@@ -80,13 +69,10 @@ export interface PurchaseOrderEntry {
   readonly carriedFromPoId: string | null;
   /** Story 21-2b — the client the PO is for (derived from its lines' SKUs). */
   readonly clientId: string;
+  /** Story 1-3 — the vendor as the PO froze it (null only on a row the 0079 backfill could not have missed). */
+  readonly vendorSnapshot: VendorSnapshotV1 | null;
   readonly createdAt: string;
   readonly updatedAt: string;
-}
-
-export interface ListVendorsQuery {
-  readonly cursor?: string | undefined;
-  readonly limit?: number | undefined;
 }
 
 export interface ListPurchaseOrdersQuery {
@@ -138,17 +124,16 @@ function decodeCursorSafe(cursor: string): { createdAt: string; id: string } {
 }
 
 /**
- * The inbound module's public surface (Story 3.1): vendor master data and the
- * PO lifecycle — commands ride through the module's command services, reads
- * through here. Other modules (and the api shell) consume ONLY this facade;
- * the `vendors` / `purchase_orders` / `purchase_order_lines` tables are
- * module-exclusive.
+ * The inbound module's public surface (Story 3.1): the PO lifecycle —
+ * commands ride through the module's command services, reads through here.
+ * Other modules (and the api shell) consume ONLY this facade; the
+ * `purchase_orders` / `purchase_order_lines` tables are module-exclusive.
+ * (Story 1-3 moved the vendor master data to the partners module.)
  */
 @Injectable()
 export class InboundFacade {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
-    @Inject(VendorCommand) private readonly vendorCommand: VendorCommand,
     @Inject(PurchaseOrderCommand) private readonly poCommand: PurchaseOrderCommand,
     @Inject(AsnCommand) private readonly asnCommand: AsnCommand,
     // The ASN import (2026-10-17) — many ASNs from one CSV/XLSX file.
@@ -325,14 +310,6 @@ export class InboundFacade {
     });
   }
 
-  /** `vendor.created` — the vendor master data's first producer. */
-  async createVendor(
-    command: CreateVendorCommand,
-    idempotencyKey: string,
-  ): Promise<VendorSnapshot> {
-    return this.vendorCommand.create(command, idempotencyKey);
-  }
-
   /** The PO lifecycle's three mutations (create / amend / close). */
   async createPurchaseOrder(
     command: CreatePoCommand,
@@ -363,27 +340,6 @@ export class InboundFacade {
     return this.poCommand.createInTx(tx, command, idempotencyKey, payloadHash);
   }
 
-  /**
-   * Story 6.1 — the deterministic default-vendor read: the tenant's
-   * `is_default` vendor with the smallest `(created_at, id)` — the pick is
-   * stamped so two sweeps over the same vendor corpus draft identically
-   * (several defaults are possible; the `vendors` schema keeps no
-   * single-default unique). Null when the tenant carries none — the draft
-   * still mints with `vendorId: null` and the human submit names one.
-   */
-  async findDefaultVendorInTx(
-    tx: TenantTx,
-    tenantId: string,
-  ): Promise<{ id: string; code: string; name: string } | null> {
-    const rows = await tx
-      .select({ id: vendors.id, code: vendors.code, name: vendors.name })
-      .from(vendors)
-      .where(and(eq(vendors.tenantId, tenantId), eq(vendors.isDefault, true)))
-      .orderBy(asc(vendors.createdAt), asc(vendors.id))
-      .limit(1);
-    return rows[0] ?? null;
-  }
-
   async amendPurchaseOrder(
     command: AmendPoCommand,
     idempotencyKey: string,
@@ -396,45 +352,6 @@ export class InboundFacade {
     idempotencyKey: string,
   ): Promise<ClosePoSnapshot> {
     return this.poCommand.close(command, idempotencyKey);
-  }
-
-  /**
-   * Vendor-list read (Story 3.1): the tenant's vendors, newest first, keyset
-   * cursor pagination. A read — never capability-gated.
-   */
-  async listVendors(tenantId: string, query: ListVendorsQuery = {}): Promise<Page<VendorEntry>> {
-    // The route-level DTO already bounds `limit` (1..200) — pass it straight
-    // through; clamping here would silently rewrite a bad request instead of
-    // rejecting it.
-    const pageSize = query.limit ?? DEFAULT_INBOUND_PAGE_SIZE;
-    const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
-    return withTenantTransaction(this.db, tenantId, async (tx) => {
-      const rows = await tx
-        .select({
-          id: vendors.id,
-          tenantId: vendors.tenantId,
-          code: vendors.code,
-          name: vendors.name,
-          isDefault: vendors.isDefault,
-          createdAt: vendors.createdAt,
-        })
-        .from(vendors)
-        .where(
-          and(
-            eq(vendors.tenantId, tenantId),
-            before === undefined
-              ? undefined
-              : sql`(${vendors.createdAt}, ${vendors.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
-          ),
-        )
-        .orderBy(desc(vendors.createdAt), desc(vendors.id))
-        .limit(pageSize + 1);
-      const items = rows.map((row) => ({
-        ...row,
-        createdAt: canonicalInstant(row.createdAt),
-      }));
-      return buildPage(items, pageSize);
-    });
   }
 
   /**
@@ -463,6 +380,7 @@ export class InboundFacade {
           status: purchaseOrders.status,
           carriedFromPoId: purchaseOrders.carriedFromPoId,
           clientId: purchaseOrders.clientId,
+          vendorSnapshot: purchaseOrders.vendorSnapshot,
           createdAt: purchaseOrders.createdAt,
           updatedAt: purchaseOrders.updatedAt,
         })
@@ -482,6 +400,7 @@ export class InboundFacade {
       const items = rows.map((row) => ({
         ...row,
         status: row.status as PoStatus,
+        vendorSnapshot: row.vendorSnapshot as VendorSnapshotV1 | null,
         createdAt: canonicalInstant(row.createdAt),
         updatedAt: canonicalInstant(row.updatedAt),
       }));
@@ -525,6 +444,7 @@ export class InboundFacade {
         status: po.status as PoStatus,
         carriedFromPoId: po.carriedFromPoId,
         clientId: po.clientId,
+        vendorSnapshot: po.vendorSnapshot as VendorSnapshotV1 | null,
         createdAt: canonicalInstant(po.createdAt),
         updatedAt: canonicalInstant(po.updatedAt),
         lines: lines.map(lineSnapshot),
