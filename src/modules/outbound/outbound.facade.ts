@@ -15,6 +15,7 @@ import {
   wavePolicies,
   waves,
 } from '../../shared/db/schema';
+import { anyOrderOfClient } from '../../shared/db/client-filter';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
@@ -116,13 +117,23 @@ export interface ListOrdersQuery {
 }
 
 /**
+ * Story 1-5a — a list that takes the staff client filter (orders, waves,
+ * manifests). The wave-policy list keeps the bare {@link ListOrdersQuery}:
+ * a policy belongs to no client.
+ */
+export interface ListClientFilteredQuery extends ListOrdersQuery {
+  /** Only rows of one client's orders (waves, manifests: ANY order of the client). */
+  readonly clientId?: string | undefined;
+}
+
+/**
  * Story 9-1 — the order list's dashboard drill filters (all optional,
  * additive). The window is on `created_at` (server-stamped), `[from, to)`.
  * `backordered` asks whether ANY line of the order was created `backordered`
  * (the status is set only at acceptance) — counted per ORDER, so a kit's
  * backordered parent and children never count it twice.
  */
-export interface ListOrdersFilter extends ListOrdersQuery {
+export interface ListOrdersFilter extends ListClientFilteredQuery {
   readonly status?: OrderStatus | undefined;
   readonly source?: OrderSource | undefined;
   readonly backordered?: boolean | undefined;
@@ -132,6 +143,8 @@ export interface ListOrdersFilter extends ListOrdersQuery {
 
 /** Story 9-1 — the windowed fact-list reads (pack failures, refusals, picklist lines). */
 export interface ListWindowQuery {
+  /** Story 1-5a — only rows of one client's orders (refusals: of one client's SKUs). */
+  readonly clientId?: string | undefined;
   readonly from?: string | undefined;
   readonly to?: string | undefined;
   readonly cursor?: string | undefined;
@@ -726,6 +739,7 @@ export class OutboundFacade {
             eq(orders.warehouseId, warehouseId),
             query.status === undefined ? undefined : eq(orders.status, query.status),
             query.source === undefined ? undefined : eq(orders.source, query.source),
+            query.clientId === undefined ? undefined : eq(orders.clientId, query.clientId),
             query.backordered === undefined
               ? undefined
               : query.backordered
@@ -816,6 +830,7 @@ export class OutboundFacade {
 
   private windowFilter(query: ListWindowQuery): WindowFilter {
     return {
+      clientId: query.clientId,
       from: query.from,
       to: query.to,
       cursor: query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor),
@@ -889,7 +904,7 @@ export class OutboundFacade {
   async listWaves(
     tenantId: string,
     warehouseId: string,
-    query: ListOrdersQuery = {},
+    query: ListClientFilteredQuery = {},
   ): Promise<Page<WaveEntry>> {
     const pageSize = query.limit ?? DEFAULT_OUTBOUND_PAGE_SIZE;
     const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
@@ -922,6 +937,16 @@ export class OutboundFacade {
           and(
             eq(waves.tenantId, tenantId),
             eq(waves.warehouseId, warehouseId),
+            // Story 1-5a (decision 4): any order of the client on the wave's
+            // pick lines — a mixed wave appears under each of its clients; a
+            // wave with no lines matches none.
+            query.clientId === undefined
+              ? undefined
+              : anyOrderOfClient(
+                  sql`select pll.order_id from picklist_lines pll where pll.tenant_id = ${waves.tenantId} and pll.wave_id = ${waves.id}`,
+                  tenantId,
+                  query.clientId,
+                ),
             before === undefined
               ? undefined
               : sql`(${waves.createdAt}, ${waves.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -950,7 +975,7 @@ export class OutboundFacade {
   async listManifests(
     tenantId: string,
     warehouseId: string,
-    query: ListOrdersQuery = {},
+    query: ListClientFilteredQuery = {},
   ): Promise<Page<ManifestEntry>> {
     const pageSize = query.limit ?? DEFAULT_OUTBOUND_PAGE_SIZE;
     const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
@@ -973,6 +998,15 @@ export class OutboundFacade {
           and(
             eq(manifests.tenantId, tenantId),
             eq(manifests.warehouseId, warehouseId),
+            // Story 1-5a (decision 4): any order of the client among the
+            // manifest's shipments — a carrier pickup is never split by client.
+            query.clientId === undefined
+              ? undefined
+              : anyOrderOfClient(
+                  sql`select sh.order_id from shipments sh where sh.tenant_id = ${manifests.tenantId} and sh.manifest_id = ${manifests.id}`,
+                  tenantId,
+                  query.clientId,
+                ),
             before === undefined
               ? undefined
               : sql`(${manifests.createdAt}, ${manifests.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,

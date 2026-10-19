@@ -241,6 +241,7 @@ export class ReturnsController {
       warehouseId: query.warehouseId,
       status: query.status,
       orderId: query.orderId,
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     });

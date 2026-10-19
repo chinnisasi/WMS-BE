@@ -296,6 +296,7 @@ export class InventoryController {
     assertOwnTenant(session, tenantId);
     const page = await this.inventoryFacade.listAdjustmentPendings(tenantId, {
       status: query.status as 'pending' | 'approved' | 'rejected' | undefined,
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     });
@@ -635,6 +636,7 @@ export class InventoryController {
     assertInstantRange(query.from, query.to);
     const timelineQuery: LedgerTimelineQuery = {
       skuId: query.skuId,
+      clientId: query.clientId,
       binId: query.binId,
       types: query.type,
       from: query.from,
@@ -797,6 +799,7 @@ export class InventoryController {
     assertOwnTenant(session, tenantId);
     const page = await this.inventoryFacade.listStock(tenantId, warehouseId, {
       skuId: query.skuId,
+      clientId: query.clientId,
       binId: query.binId,
       cursor: query.cursor,
       limit: query.limit,

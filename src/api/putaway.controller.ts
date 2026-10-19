@@ -132,7 +132,7 @@ export class PutawayController {
   ): Promise<PutawayTaskListResponse> {
     assertOwnTenantToken(session.tenantId, tenantId);
     assertUuidParam(query.warehouseId, 'warehouseId');
-    const tasks = await this.putaway.getPutawayTasks(tenantId, query.warehouseId);
+    const tasks = await this.putaway.getPutawayTasks(tenantId, query.warehouseId, { clientId: query.clientId });
     return {
       items: tasks.map((task) => ({
         ...task,
@@ -167,6 +167,7 @@ export class PutawayController {
     }
     const page = await this.putaway.listPlacements(tenantId, {
       warehouseId: query.warehouseId,
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     });

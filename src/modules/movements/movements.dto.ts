@@ -221,6 +221,11 @@ export class CancelTransferDto {
 
 /** GET .../transfers query. */
 export class TransferListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only transfers with at least one line of one client's SKUs. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, enum: TRANSFER_STATUSES })
   @IsOptional()
   @IsIn(TRANSFER_STATUSES as unknown as string[])

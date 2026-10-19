@@ -914,6 +914,8 @@ export const skus = pgTable(
     // row whose client is not yet settled, a catalog read by code).
     index('skus_tenant_code_idx').on(table.tenantId, table.code),
     index('skus_created_at_id_idx').on(table.createdAt, table.id),
+    // Story 1-5a (0081) — the SKU and kit lists' client filter on their (created_at, id) keyset.
+    index('skus_tenant_client_created_at_id_idx').on(table.tenantId, table.clientId, table.createdAt, table.id),
     index('skus_tenant_id_idx').on(table.tenantId),
     // Story 11.3 — the product list's skuCount and the SKU list's productId
     // filter both resolve through this column (uuid + index, no FK).
@@ -971,6 +973,8 @@ export const products = pgTable(
     // Story 1-4 (0080) — names are unique per (tenant, client).
     uniqueIndex('products_tenant_client_name_unique').on(table.tenantId, table.clientId, table.name),
     index('products_created_at_id_idx').on(table.createdAt, table.id),
+    // Story 1-5a (0081) — the product list's client filter on its (created_at, id) keyset.
+    index('products_tenant_client_created_at_id_idx').on(table.tenantId, table.clientId, table.createdAt, table.id),
     index('products_tenant_id_idx').on(table.tenantId),
   ],
 );
@@ -1409,6 +1413,15 @@ export const ledgerEvents = pgTable(
     // timeline scans.
     index('ledger_events_tenant_warehouse_created_at_id_idx').on(
       table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+    // Story 1-5a (0081) — the timeline's client filter on the same
+    // (created_at, id) keyset (21-4's recorded_at indexes cannot serve it).
+    index('ledger_events_tenant_client_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.clientId,
       table.warehouseId,
       table.createdAt,
       table.id,
@@ -2158,6 +2171,14 @@ export const purchaseOrders = pgTable(
       table.createdAt,
       table.id,
     ),
+    // Story 1-5a (0081) — the list's client filter on the same keyset.
+    index('purchase_orders_tenant_client_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.clientId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
     // The carried-from chain: from a closed PO to its successor(s).
     index('purchase_orders_tenant_carried_from_idx').on(
       table.tenantId,
@@ -2346,6 +2367,21 @@ export const goodsReceiptNotes = pgTable(
     index('goods_receipt_notes_tenant_warehouse_created_at_id_idx').on(
       table.tenantId,
       table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+    // Story 1-5a (0081) — the list's client filter, with and without the
+    // warehouse filter (the list is tenant-wide when none is given).
+    index('goods_receipt_notes_tenant_client_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.clientId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+    index('goods_receipt_notes_tenant_client_created_at_id_idx').on(
+      table.tenantId,
+      table.clientId,
       table.createdAt,
       table.id,
     ),
@@ -2753,6 +2789,15 @@ export const orders = pgTable(
     // skus-index lesson — no offset pagination, no late migration).
     index('orders_tenant_warehouse_created_at_id_idx').on(
       table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+    // Story 1-5a (0081) — the list's client filter on the same keyset (also
+    // the waves', manifests', invoices' and picklist lines' `orders` probe).
+    index('orders_tenant_client_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.clientId,
       table.warehouseId,
       table.createdAt,
       table.id,
@@ -5440,6 +5485,15 @@ export const returnAuthorizations = pgTable(
     // The warehouse-scoped list's keyset.
     index('return_authorizations_tenant_warehouse_created_at_id_idx').on(
       table.tenantId,
+      table.warehouseId,
+      table.createdAt,
+      table.id,
+    ),
+    // Story 1-5a (0081) — the list's client filter, tenant-wide (no warehouseId) and warehouse-scoped.
+    index('return_authorizations_tenant_client_created_at_id_idx').on(table.tenantId, table.clientId, table.createdAt, table.id),
+    index('return_authorizations_tenant_client_warehouse_created_at_id_idx').on(
+      table.tenantId,
+      table.clientId,
       table.warehouseId,
       table.createdAt,
       table.id,

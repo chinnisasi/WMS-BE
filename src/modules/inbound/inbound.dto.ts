@@ -171,6 +171,11 @@ export class ClosePurchaseOrderDto {
 
 /** Query of the PO list (keyset cursor pagination, optional status filter). */
 export class PurchaseOrderListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only one client's purchase orders. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, enum: ['open', 'closed'], description: 'Only POs of one status' })
   @IsOptional()
   @IsIn(['open', 'closed'])

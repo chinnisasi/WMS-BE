@@ -7,6 +7,7 @@ import {
 } from '../../shared/db/schema';
 import type { PackFailureEntry as PackFailureEntryPath } from '../../shared/db/schema';
 import type { TenantTx } from '../../shared/db/tenant-scope';
+import { orderOfClient } from '../../shared/db/client-filter';
 import { encodeCursor } from '../../shared/primitives/pagination';
 import type { Page } from '../../shared/primitives/pagination';
 import { fromMilli } from '../../shared/primitives/quantity';
@@ -28,6 +29,8 @@ import type { PicklistLineStatus } from './wave.command';
  */
 
 export interface WindowFilter {
+  /** Story 1-5a — only rows of one client (see each list for the path). */
+  readonly clientId?: string | undefined;
   readonly from?: string | undefined;
   readonly to?: string | undefined;
   readonly cursor?: { readonly createdAt: string; readonly id: string } | undefined;
@@ -121,6 +124,8 @@ export async function listPackFailuresInTx(
       and(
         eq(t.tenantId, tenantId),
         eq(t.warehouseId, warehouseId),
+        // Story 1-5a: through the failed order.
+        filter.clientId === undefined ? undefined : orderOfClient(t.orderId, tenantId, filter.clientId),
         filter.from === undefined ? undefined : sql`${t.createdAt} >= ${filter.from}::timestamptz`,
         filter.to === undefined ? undefined : sql`${t.createdAt} < ${filter.to}::timestamptz`,
         filter.cursor === undefined
@@ -177,6 +182,15 @@ export async function listBackorderRefusalsInTx(
         // A refused event later redelivered and ACCEPTED became an order —
         // it was not prevented (the oversell tile excludes it identically).
         sql`not exists (select 1 from orders o where o.tenant_id = ${t.tenantId} and o.integration_id = ${t.integrationId} and o.external_event_id = ${t.externalEventId})`,
+        // Story 1-5a: a refusal made no order, so it matches through the SKUs
+        // of its stored lines (`[{skuId, …}]`) — any line of the client's.
+        filter.clientId === undefined
+          ? undefined
+          : sql`exists (
+              select 1 from jsonb_array_elements(${t.lines}) rl
+              join skus s on s.tenant_id = ${t.tenantId} and s.id::text = rl->>'skuId'
+              where s.client_id = ${filter.clientId}::uuid
+            )`,
         filter.from === undefined ? undefined : sql`${t.createdAt} >= ${filter.from}::timestamptz`,
         filter.to === undefined ? undefined : sql`${t.createdAt} < ${filter.to}::timestamptz`,
         filter.cursor === undefined
@@ -233,6 +247,8 @@ export async function listPicklistLinesInTx(
         eq(l.tenantId, tenantId),
         eq(picklists.warehouseId, warehouseId),
         filter.status === undefined ? undefined : eq(l.status, filter.status),
+        // Story 1-5a: through the line's own order.
+        filter.clientId === undefined ? undefined : orderOfClient(l.orderId, tenantId, filter.clientId),
         filter.from === undefined ? undefined : sql`${l.updatedAt} >= ${filter.from}::timestamptz`,
         filter.to === undefined ? undefined : sql`${l.updatedAt} < ${filter.to}::timestamptz`,
         filter.cursor === undefined

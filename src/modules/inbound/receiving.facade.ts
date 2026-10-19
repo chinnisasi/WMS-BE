@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -12,6 +12,7 @@ import {
   purchaseOrders,
 } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { skuOfClient } from '../../shared/db/client-filter';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
@@ -61,6 +62,11 @@ export interface GoodsReceiptEntry {
 export interface ListGoodsReceiptsQuery {
   readonly warehouseId?: string | undefined;
   /**
+   * Story 1-5a — only one client's receipts: its own `client_id`, or (a legacy
+   * receipt the 1-1 backfill left unattributed) any line of the client's SKUs.
+   */
+  readonly clientId?: string | undefined;
+  /**
    * Story 21-6 — `true`: blind receipts only (`blind_reason_code IS NOT
    * NULL` — no PO and no ASN); `false`: document-backed only. (9-1's
    * `poless` is its alias at the controller.)
@@ -75,6 +81,8 @@ export interface ListGoodsReceiptsQuery {
 
 export interface ListOverReceiptsQuery {
   readonly status?: 'pending' | 'approved' | 'rejected' | undefined;
+  /** Story 1-5a — only over-receipts of one client's SKUs. */
+  readonly clientId?: string | undefined;
   /** Story 9-1 — one warehouse (asserted in-tenant first). */
   readonly warehouseId?: string | undefined;
   /** Story 9-1 — `[from, to)` on `requested_at` (server time — stamped at the GRN's own commit). */
@@ -259,6 +267,61 @@ export class ReceivingFacade {
       if (query.warehouseId !== undefined) {
         await assertWarehouseInTenant(tx, tenantId, query.warehouseId);
       }
+      // The list's own filters + keyset, shared by the outer query and (with
+      // a client) by each client branch below.
+      const filters = and(
+        eq(goodsReceiptNotes.tenantId, tenantId),
+        query.warehouseId === undefined
+          ? undefined
+          : eq(goodsReceiptNotes.warehouseId, query.warehouseId),
+        // Story 21-6: blind is the REASON, not the absent PO — an ASN
+        // receipt has no PO and is not blind.
+        query.blind === undefined
+          ? undefined
+          : query.blind
+            ? sql`${goodsReceiptNotes.blindReasonCode} is not null`
+            : sql`${goodsReceiptNotes.blindReasonCode} is null`,
+        query.from === undefined ? undefined : sql`${goodsReceiptNotes.createdAt} >= ${query.from}::timestamptz`,
+        query.to === undefined ? undefined : sql`${goodsReceiptNotes.createdAt} < ${query.to}::timestamptz`,
+        before === undefined
+          ? undefined
+          : sql`(${goodsReceiptNotes.createdAt}, ${goodsReceiptNotes.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
+      );
+      // Story 1-5a (decision 9): a GRN is the client's when its own
+      // `client_id` is, OR (a legacy receipt the 1-1 backfill left with no
+      // client) any line's SKU is. One `OR … EXISTS` predicate cannot walk a
+      // client-led index, so each arm is its own keyset-ordered branch,
+      // limited to a page — the own-client arm walks 0081's
+      // `goods_receipt_notes_tenant_client_[warehouse_]created_at_id_idx` —
+      // and the outer page is taken over their union (at most 2 × (page + 1)
+      // ids, evaluated ONCE as an array — `= any(array(…))` is an InitPlan
+      // the outer probes as an index condition, never a per-row re-scan of
+      // the branches). The branches name the table unaliased, so `filters`
+      // resolves to the INNER row there.
+      const clientIds =
+        query.clientId === undefined
+          ? undefined
+          : sql`${goodsReceiptNotes.id} = any(array((${tx
+              .select({ id: goodsReceiptNotes.id })
+              .from(goodsReceiptNotes)
+              .where(and(filters, eq(goodsReceiptNotes.clientId, query.clientId)))
+              .orderBy(desc(goodsReceiptNotes.createdAt), desc(goodsReceiptNotes.id))
+              .limit(pageSize + 1)}) union all (${tx
+              .select({ id: goodsReceiptNotes.id })
+              .from(goodsReceiptNotes)
+              .where(
+                and(
+                  filters,
+                  isNull(goodsReceiptNotes.clientId),
+                  sql`exists (
+                    select 1 from goods_receipt_lines gl
+                    where gl.grn_id = ${goodsReceiptNotes.id}
+                      and ${skuOfClient(sql`gl.sku_id`, tenantId, query.clientId)}
+                  )`,
+                ),
+              )
+              .orderBy(desc(goodsReceiptNotes.createdAt), desc(goodsReceiptNotes.id))
+              .limit(pageSize + 1)})))`;
       const rows = await tx
         .select({
           id: goodsReceiptNotes.id,
@@ -286,26 +349,7 @@ export class ReceivingFacade {
             eq(advanceShipmentNotices.id, goodsReceiptNotes.asnId),
           ),
         )
-        .where(
-          and(
-            eq(goodsReceiptNotes.tenantId, tenantId),
-            query.warehouseId === undefined
-              ? undefined
-              : eq(goodsReceiptNotes.warehouseId, query.warehouseId),
-            // Story 21-6: blind is the REASON, not the absent PO — an ASN
-            // receipt has no PO and is not blind.
-            query.blind === undefined
-              ? undefined
-              : query.blind
-                ? sql`${goodsReceiptNotes.blindReasonCode} is not null`
-                : sql`${goodsReceiptNotes.blindReasonCode} is null`,
-            query.from === undefined ? undefined : sql`${goodsReceiptNotes.createdAt} >= ${query.from}::timestamptz`,
-            query.to === undefined ? undefined : sql`${goodsReceiptNotes.createdAt} < ${query.to}::timestamptz`,
-            before === undefined
-              ? undefined
-              : sql`(${goodsReceiptNotes.createdAt}, ${goodsReceiptNotes.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
-          ),
-        )
+        .where(and(filters, clientIds))
         .orderBy(desc(goodsReceiptNotes.createdAt), desc(goodsReceiptNotes.id))
         .limit(pageSize + 1);
       const ids = rows.map((row) => row.id);
@@ -400,6 +444,8 @@ export class ReceivingFacade {
             eq(overReceipts.tenantId, tenantId),
             query.status === undefined ? undefined : eq(overReceipts.status, query.status),
             query.warehouseId === undefined ? undefined : eq(overReceipts.warehouseId, query.warehouseId),
+            // Story 1-5a: through the SKU (never the GRN — a legacy receipt has no client).
+            query.clientId === undefined ? undefined : skuOfClient(overReceipts.skuId, tenantId, query.clientId),
             query.from === undefined ? undefined : sql`${overReceipts.requestedAt} >= ${query.from}::timestamptz`,
             query.to === undefined ? undefined : sql`${overReceipts.requestedAt} < ${query.to}::timestamptz`,
             before === undefined

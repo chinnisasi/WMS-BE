@@ -5,6 +5,7 @@ import type { Database } from '../../shared/db/db';
 import { batchOnHand, bins, ledgerEvents, skus, stockOnHand } from '../../shared/db/schema';
 import { skuCodeLabelsInTx } from '../clients/clients.facade';
 import type { LedgerEvent, UserRole } from '../../shared/db/schema';
+import { skuOfClient } from '../../shared/db/client-filter';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { KeysetWindow, Page } from '../../shared/primitives/pagination';
 import { UUID_RE } from '../../shared/primitives/ids';
@@ -182,6 +183,8 @@ export interface LedgerTimelineEntry {
 
 export interface LedgerTimelineQuery {
   readonly skuId?: string | undefined;
+  /** Story 1-5a — only one client's events (the event's own `client_id`). */
+  readonly clientId?: string | undefined;
   /**
    * Story 5-4 — narrow the timeline to one bin: fromBin = bin OR toBin = bin
    * (an event moved stock either through it). The approve-adjust resolver's
@@ -277,6 +280,8 @@ export interface StockOnHandEntry {
 /** Query of the Story 2.5 stock-list read (keyset cursor pagination). */
 export interface StockListQuery {
   readonly skuId?: string | undefined;
+  /** Story 1-5a — only rows of one client's SKUs (both orders). */
+  readonly clientId?: string | undefined;
   readonly binId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
@@ -617,6 +622,7 @@ export class InventoryFacade {
             eq(ledgerEvents.tenantId, tenantId),
             eq(ledgerEvents.warehouseId, warehouseId),
             query.skuId === undefined ? undefined : eq(ledgerEvents.skuId, query.skuId),
+            query.clientId === undefined ? undefined : eq(ledgerEvents.clientId, query.clientId),
             // Story 5-4 — the bin filter: an event touches the bin when it is
             // either the movement's source or its destination (the timeline's
             // fromBin = bin OR toBin = bin arm).
@@ -773,6 +779,8 @@ export class InventoryFacade {
             eq(stockOnHand.tenantId, tenantId),
             eq(stockOnHand.warehouseId, warehouseId),
             query.skuId === undefined ? undefined : eq(stockOnHand.skuId, query.skuId),
+            // Story 1-5a: the projection has no client — through its SKU.
+            query.clientId === undefined ? undefined : skuOfClient(stockOnHand.skuId, tenantId, query.clientId),
             query.binId === undefined ? undefined : eq(stockOnHand.binId, query.binId),
             // `quantity >= 0` is a CHECK (0026), so `> 0` is exactly "non-zero".
             query.nonZero === true ? sql`${stockOnHand.quantity} > 0` : undefined,
@@ -844,6 +852,8 @@ export class InventoryFacade {
             eq(stockOnHand.tenantId, tenantId),
             eq(stockOnHand.warehouseId, warehouseId),
             query.skuId === undefined ? undefined : eq(stockOnHand.skuId, query.skuId),
+            // Story 1-5a: the projection has no client — through its SKU.
+            query.clientId === undefined ? undefined : skuOfClient(stockOnHand.skuId, tenantId, query.clientId),
             query.binId === undefined ? undefined : eq(stockOnHand.binId, query.binId),
             query.nonZero === true ? sql`${stockOnHand.quantity} > 0` : undefined,
             after === undefined

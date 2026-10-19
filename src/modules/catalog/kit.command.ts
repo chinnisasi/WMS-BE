@@ -273,7 +273,13 @@ export class KitCommand {
    * components are stitched from ONE joined query over the page's kit ids,
    * never an N+1.
    */
-  async list(tenantId: string, cursor?: string, limit: number = DEFAULT_SKU_PAGE_SIZE): Promise<Page<KitSnapshot>> {
+  async list(
+    tenantId: string,
+    cursor?: string,
+    limit: number = DEFAULT_SKU_PAGE_SIZE,
+    // Story 1-5a — the staff client filter (the kit SKU's own client), a named option.
+    options: { readonly clientId?: string | undefined } = {},
+  ): Promise<Page<KitSnapshot>> {
     const pageSize = Math.min(Math.max(Math.trunc(limit) || DEFAULT_SKU_PAGE_SIZE, 1), MAX_SKU_PAGE_SIZE);
     const before = cursor === undefined ? undefined : decodeCursorSafe(cursor);
     const rows = await withTenantTransaction(this.db, tenantId, async (tx) => {
@@ -282,7 +288,11 @@ export class KitCommand {
         .select({ id: kitCompositions.kitSkuId })
         .from(kitCompositions)
         .where(eq(kitCompositions.tenantId, tenantId));
-      const scope = and(eq(skus.tenantId, tenantId), inArray(skus.id, kitSkuIds));
+      const scope = and(
+        eq(skus.tenantId, tenantId),
+        inArray(skus.id, kitSkuIds),
+        options.clientId === undefined ? undefined : eq(skus.clientId, options.clientId),
+      );
       const kitRows = await tx
         .select({ id: skus.id, tenantId: skus.tenantId, code: skus.code, name: skus.name, createdAt: skus.createdAt })
         .from(skus)

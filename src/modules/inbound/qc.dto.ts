@@ -113,6 +113,11 @@ export class QcHoldEntryDto extends QcHoldDto {
 }
 
 export class QcHoldListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only holds on one client's SKUs (manual holds included). An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, format: 'uuid', description: 'Filter by warehouse' })
   @IsOptional()
   @IsUUID()

@@ -282,6 +282,7 @@ export class ReceivingController {
     }
     const page = await this.receiving.listGoodsReceipts(tenantId, {
       warehouseId: query.warehouseId,
+      clientId: query.clientId,
       blind: query.blind ?? query.poless,
       from: query.from,
       to: query.to,
@@ -312,6 +313,7 @@ export class ReceivingController {
     assertInstantRange(query.from, query.to);
     const page = await this.receiving.listOverReceipts(tenantId, {
       status: query.status,
+      clientId: query.clientId,
       warehouseId: query.warehouseId,
       from: query.from,
       to: query.to,
@@ -532,6 +534,7 @@ export class ReceivingController {
       warehouseId: query.warehouseId,
       status: query.status,
       grnId: query.grnId,
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     });

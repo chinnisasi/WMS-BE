@@ -14,6 +14,7 @@ import {
   suggestedPos
 } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { skuOfClient } from '../../shared/db/client-filter';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
@@ -77,6 +78,8 @@ export const MAX_REPLENISHMENT_SCOPES_PER_TICK = 200;
 export const DEFAULT_REPLENISHMENT_PAGE_SIZE = 50;
 
 export interface ListReorderPoliciesQuery {
+  /** Story 1-5a — only rows of one client's SKUs. */
+  readonly clientId?: string | undefined;
   readonly warehouseId?: string | undefined;
   readonly skuId?: string | undefined;
   readonly cursor?: string | undefined;
@@ -84,6 +87,8 @@ export interface ListReorderPoliciesQuery {
 }
 
 export interface ListBreachesQuery {
+  /** Story 1-5a — only rows of one client's SKUs. */
+  readonly clientId?: string | undefined;
   readonly status?: (typeof REPLENISHMENT_BREACH_STATUSES)[number] | undefined;
   readonly warehouseId?: string | undefined;
   readonly cursor?: string | undefined;
@@ -91,6 +96,8 @@ export interface ListBreachesQuery {
 }
 
 export interface ListSuggestedPosQuery {
+  /** Story 1-5a — only rows of one client's SKUs. */
+  readonly clientId?: string | undefined;
   readonly status?: (typeof SUGGESTED_PO_STATUSES)[number] | undefined;
   readonly warehouseId?: string | undefined;
   readonly cursor?: string | undefined;
@@ -98,6 +105,8 @@ export interface ListSuggestedPosQuery {
 }
 
 export interface ListBatchAlertsQuery {
+  /** Story 1-5a — only rows of one client's SKUs. */
+  readonly clientId?: string | undefined;
   readonly kind?: (typeof BATCH_ALERT_KINDS)[number] | undefined;
   readonly status?: (typeof BATCH_ALERT_STATUSES)[number] | undefined;
   readonly warehouseId?: string | undefined;
@@ -259,6 +268,7 @@ export class ReplenishmentFacade {
             query.warehouseId === undefined
               ? undefined
               : eq(reorderPolicies.warehouseId, query.warehouseId),
+            query.clientId === undefined ? undefined : skuOfClient(reorderPolicies.skuId, tenantId, query.clientId),
             query.skuId === undefined ? undefined : eq(reorderPolicies.skuId, query.skuId),
             before === undefined
               ? undefined
@@ -298,6 +308,7 @@ export class ReplenishmentFacade {
             query.warehouseId === undefined
               ? undefined
               : eq(reorderBreaches.warehouseId, query.warehouseId),
+            query.clientId === undefined ? undefined : skuOfClient(reorderBreaches.skuId, tenantId, query.clientId),
             before === undefined
               ? undefined
               : sql`(${reorderBreaches.createdAt}, ${reorderBreaches.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -333,6 +344,7 @@ export class ReplenishmentFacade {
             query.warehouseId === undefined
               ? undefined
               : eq(suggestedPos.warehouseId, query.warehouseId),
+            query.clientId === undefined ? undefined : skuOfClient(suggestedPos.skuId, tenantId, query.clientId),
             before === undefined
               ? undefined
               : sql`(${suggestedPos.createdAt}, ${suggestedPos.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -398,6 +410,7 @@ export class ReplenishmentFacade {
             query.warehouseId === undefined
               ? undefined
               : eq(batchAlerts.warehouseId, query.warehouseId),
+            query.clientId === undefined ? undefined : skuOfClient(batchAlerts.skuId, tenantId, query.clientId),
             query.from === undefined ? undefined : sql`${batchAlerts.createdAt} >= ${query.from}::timestamptz`,
             query.to === undefined ? undefined : sql`${batchAlerts.createdAt} < ${query.to}::timestamptz`,
             before === undefined

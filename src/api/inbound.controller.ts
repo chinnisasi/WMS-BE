@@ -146,6 +146,7 @@ export class InboundController {
     assertUuidParam(warehouseId, 'warehouseId');
     const listQuery: ListPurchaseOrdersQuery = {
       status: query.status,
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     };

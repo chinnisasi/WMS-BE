@@ -4,6 +4,7 @@ import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, idempotencyKeys, stockAdjustmentPendings, stockAdjustmentPolicies } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { skuOfClient } from '../../shared/db/client-filter';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import type { Page } from '../../shared/primitives/pagination';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
@@ -103,6 +104,8 @@ export interface AdjustmentPendingEntry {
 
 export interface ListAdjustmentPendingsQuery {
   readonly status?: 'pending' | 'approved' | 'rejected' | undefined;
+  /** Story 1-5a — only pendings of one client's SKUs. */
+  readonly clientId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -330,7 +333,7 @@ export class AdjustmentApprovalCommand {
    */
   async listAdjustmentPendings(
     tenantId: string,
-    query: { status?: 'pending' | 'approved' | 'rejected' | undefined; cursor?: string | undefined; limit?: number | undefined } = {},
+    query: ListAdjustmentPendingsQuery = {},
   ): Promise<Page<AdjustmentPendingEntry>> {
     const pageSize = query.limit ?? DEFAULT_ADJUSTMENT_PAGE_SIZE;
     const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
@@ -350,6 +353,10 @@ export class AdjustmentApprovalCommand {
           and(
             eq(stockAdjustmentPendings.tenantId, tenantId),
             query.status === undefined ? undefined : eq(stockAdjustmentPendings.status, query.status),
+            // Story 1-5a: through the pend's SKU.
+            query.clientId === undefined
+              ? undefined
+              : skuOfClient(stockAdjustmentPendings.skuId, tenantId, query.clientId),
             before === undefined
               ? undefined
               : sql`(${stockAdjustmentPendings.createdAt}, ${stockAdjustmentPendings.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,

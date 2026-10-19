@@ -165,6 +165,8 @@ export interface PutawayPlacementEntry {
 }
 
 export interface ListPlacementsQuery {
+  /** Story 1-5a — only placements of one client's SKUs. */
+  readonly clientId?: string | undefined;
   readonly warehouseId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;

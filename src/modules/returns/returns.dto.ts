@@ -157,6 +157,11 @@ export class ReturnableQuery {
 
 /** GET /tenants/{tenantId}/returns query. */
 export class ReturnAuthorizationListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only one client's return authorizations. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, format: 'uuid', description: "Only one warehouse's authorizations (tenant-wide when absent)" })
   @IsOptional()
   @LowercaseUuid()

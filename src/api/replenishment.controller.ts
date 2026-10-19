@@ -161,6 +161,7 @@ export class ReplenishmentController {
     assertOwnTenant(session, tenantId);
     const listQuery: ListReorderPoliciesQuery = {
       warehouseId: query.warehouseId,
+      clientId: query.clientId,
       skuId: query.skuId,
       cursor: query.cursor,
       limit: query.limit,
@@ -188,6 +189,7 @@ export class ReplenishmentController {
     const listQuery: ListBreachesQuery = {
       status: query.status,
       warehouseId: query.warehouseId,
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     };
@@ -253,6 +255,7 @@ export class ReplenishmentController {
     const listQuery: ListSuggestedPosQuery = {
       status: query.status,
       warehouseId: query.warehouseId,
+      clientId: query.clientId,
       cursor: query.cursor,
       limit: query.limit,
     };
@@ -405,6 +408,7 @@ export class ReplenishmentController {
       kind: query.kind,
       status: query.status,
       warehouseId: query.warehouseId,
+      clientId: query.clientId,
       from: query.from,
       to: query.to,
       cursor: query.cursor,

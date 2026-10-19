@@ -451,6 +451,8 @@ export class ProductCommand {
     tenantId: string,
     cursor?: string,
     limit: number = DEFAULT_SKU_PAGE_SIZE,
+    // Story 1-5a — the staff client filter, a named option.
+    options: { readonly clientId?: string | undefined } = {},
   ): Promise<Page<ProductSnapshot>> {
     const pageSize = Math.min(
       Math.max(Math.trunc(limit) || DEFAULT_SKU_PAGE_SIZE, 1),
@@ -458,7 +460,10 @@ export class ProductCommand {
     );
     const before = cursor === undefined ? undefined : decodeCursorSafe(cursor);
     const rows = await withTenantTransaction(this.db, tenantId, async (tx) => {
-      const scope = eq(products.tenantId, tenantId);
+      const scope = and(
+        eq(products.tenantId, tenantId),
+        options.clientId === undefined ? undefined : eq(products.clientId, options.clientId),
+      );
       const productRows = await tx
         .select()
         .from(products)

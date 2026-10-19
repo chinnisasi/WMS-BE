@@ -25,6 +25,7 @@ import { UUID_RE } from '../../shared/primitives/ids';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
+import { skuOfClient } from '../../shared/db/client-filter';
 import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import {
@@ -75,6 +76,8 @@ export const DEFAULT_VARIANCE_PAGE_SIZE = 50;
 export interface ListCountVariancesQuery {
   readonly status?: (typeof COUNT_VARIANCE_STATUSES)[number] | undefined;
   readonly warehouseId?: string | undefined;
+  /** Story 1-5a — only variances of one client's SKUs. */
+  readonly clientId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -83,6 +86,8 @@ export interface ListTransfersQuery {
   readonly status?: string | undefined;
   readonly sourceWarehouseId?: string | undefined;
   readonly destWarehouseId?: string | undefined;
+  /** Story 1-5a — only transfers with ANY line of one client's SKUs (a mixed transfer appears under each). */
+  readonly clientId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
 }
@@ -482,6 +487,15 @@ export class MovementsFacade {
             query.destWarehouseId === undefined
               ? undefined
               : eq(transferOrders.destWarehouseId, query.destWarehouseId),
+            // Story 1-5a (decision 4): any line of the client's SKUs.
+            query.clientId === undefined
+              ? undefined
+              : sql`exists (
+                  select 1 from transfer_order_lines tol
+                  where tol.tenant_id = ${transferOrders.tenantId}
+                    and tol.transfer_id = ${transferOrders.id}
+                    and ${skuOfClient(sql`tol.sku_id`, tenantId, query.clientId)}
+                )`,
             before === undefined
               ? undefined
               : sql`(${transferOrders.createdAt}, ${transferOrders.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -708,6 +722,8 @@ export class MovementsFacade {
             query.warehouseId === undefined
               ? undefined
               : eq(countVariances.warehouseId, query.warehouseId),
+            // Story 1-5a: through the variance's SKU.
+            query.clientId === undefined ? undefined : skuOfClient(countVariances.skuId, tenantId, query.clientId),
             before === undefined
               ? undefined
               : sql`(${countVariances.createdAt}, ${countVariances.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,

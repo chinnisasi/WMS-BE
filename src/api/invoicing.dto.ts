@@ -60,6 +60,11 @@ export class GenerateInvoiceDto {
 }
 
 export class InvoiceListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: "Story 1-5a — only invoices of one client's orders. An unknown id is an empty page" })
+  @IsOptional()
+  @IsUUID()
+  clientId?: string;
+
   @ApiProperty({ required: false, format: 'uuid', description: "Story 9-1 — only this warehouse's invoices. 404 when the warehouse is not this tenant's" })
   @IsOptional()
   @IsUUID()
