@@ -575,6 +575,18 @@ describe('the async audit export (e2e, story 9-3b)', () => {
   // ── the runner ─────────────────────────────────────────────────────────────
 
   describe('the runner', () => {
+    it('story 1-3 — the retired `vendor` target still filters an export: a historical vendor.created row is in the file', async () => {
+      const requester = await invite('owner');
+      const targetId = uuidv7();
+      await seed([{ action: 'vendor.created', targetType: 'vendor', targetId, createdAt: '2026-09-01T00:00:00Z' }]);
+      const queued = (await postExport({ targetType: 'vendor' }, requester).expect(202)).body as ExportDto;
+      expect(await tenancy.runDueAuditExports(tenantId)).toMatchObject({ claimed: queued.id, outcome: 'ready' });
+      const file = csvRows((await storedFile(queued.id))!);
+      expect(file.length).toBeGreaterThanOrEqual(1);
+      expect(file.every((cells) => cells[6] === 'vendor')).toBe(true);
+      expect(file.some((cells) => cells[5]!.replace(/^'/, '') === 'vendor.created' && cells[7] === targetId)).toBe(true);
+    });
+
     it('the file equals the paged read for the same filters with to = the snapshot — across a tie group straddling a page boundary, rows after the request excluded', async () => {
       const requester = await invite('owner');
       const tie = '2026-10-10T10:00:00.123456Z';

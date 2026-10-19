@@ -187,20 +187,6 @@ export async function linksOfInTx(
   return byPartner;
 }
 
-/** One partner with its links on the caller's transaction, or null. */
-export async function getPartnerInTx(tx: TenantTx, tenantId: string, partnerId: string): Promise<PartnerSnapshot | null> {
-  if (!UUID_RE.test(partnerId)) return null;
-  const rows = await tx
-    .select()
-    .from(businessPartners)
-    .where(and(eq(businessPartners.tenantId, tenantId), eq(businessPartners.id, partnerId)))
-    .limit(1);
-  const row = rows[0];
-  if (row === undefined) return null;
-  const links = await linksOfInTx(tx, tenantId, [row.id]);
-  return toPartnerSnapshot(row, links.get(row.id) ?? []);
-}
-
 /**
  * Story 1-3 — THE vendor guard of a new purchase order (PO create and the
  * suggested-PO submit, through `createInTx`), on the caller's transaction,
@@ -209,7 +195,10 @@ export async function getPartnerInTx(tx: TenantTx, tenantId: string, partnerId: 
  * `FOR KEY SHARE`: that conflicts only with `FOR UPDATE`, which the status
  * flip and a link's active/default flip take — so a deactivation and a PO
  * create serialise (the PO commits first, or it reads the inactive row and
- * is refused), while a rename (`FOR NO KEY UPDATE`) never queues a PO.
+ * is refused). An edit of non-key columns (name, addresses, contact) takes
+ * `FOR NO KEY UPDATE` and never queues a PO; a CODE change rewrites a column
+ * of a unique index, which Postgres locks as `FOR UPDATE`, so a code rename
+ * does queue behind (and block) an in-flight PO create — briefly, by design.
  *
  * Refusals, in order: unknown vendor 404 · no vendor role 409
  * `partner-not-vendor` · inactive 409 `vendor-inactive` · no ACTIVE vendor
@@ -420,8 +409,4 @@ export class PartnersFacade {
     });
   }
 
-  /** One partner with its links, or null (404 at the shell). */
-  async get(tenantId: string, partnerId: string): Promise<PartnerSnapshot | null> {
-    return withTenantTransaction(this.db, tenantId, (tx) => getPartnerInTx(tx, tenantId, partnerId));
-  }
 }

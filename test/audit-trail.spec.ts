@@ -304,6 +304,15 @@ describe('the audit trail read (e2e, story 9-3a)', () => {
     }
   });
 
+  it('story 1-3 — the retired `vendor` target still filters: a historical vendor.created row is found by targetType=vendor', async () => {
+    const targetId = uuidv7();
+    await seed([{ action: 'vendor.created', targetType: 'vendor', targetId, createdAt: '2026-09-01T00:00:00Z' }]);
+    const res = await audit({ targetType: 'vendor', limit: 200 }).expect(200);
+    const items = res.body.items as { action: string; targetType: string; targetId: string }[];
+    expect(items.every((row) => row.targetType === 'vendor')).toBe(true);
+    expect(items).toContainEqual(expect.objectContaining({ action: 'vendor.created', targetType: 'vendor', targetId }));
+  });
+
   it('the dynamic audit guard names a key that committed without its audit row', async () => {
     const key = ulid();
     await sql`insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)

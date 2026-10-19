@@ -34,7 +34,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
 import { getMemberRoleIn } from '../tenancy/tenancy.service';
-import { assertClientTakesWorkInTx, clientNotFound, lockClientInTx } from '../clients/clients.facade';
+import { assertClientTakesWorkInTx, clientDeparted, clientNotFound, getClientLabelsInTx, lockClientInTx } from '../clients/clients.facade';
 import { linksOfInTx, toPartnerSnapshot, type PartnerMutationSnapshot } from './partners.facade';
 
 /** The PAN shape: five letters, four digits, a letter (the 0079 CHECK). */
@@ -296,9 +296,9 @@ export function assertPartnerFields(merged: PartnerFields): PartnerFields {
     }
   }
   const registeredAddress =
-    merged.registeredAddress === null ? null : assertRegisteredAddress(merged.registeredAddress, 'registeredAddress');
+    merged.registeredAddress === null ? null : assertRegisteredAddress(merged.registeredAddress, 'registeredAddress', 'Invalid address');
   const dispatchAddress =
-    merged.dispatchAddress === null ? null : assertRegisteredAddress(merged.dispatchAddress, 'dispatchAddress');
+    merged.dispatchAddress === null ? null : assertRegisteredAddress(merged.dispatchAddress, 'dispatchAddress', 'Invalid address');
   if (merged.gstin !== null && registeredAddress !== null && merged.gstin.slice(0, 2) !== registeredAddress.stateCode) {
     throw new ProblemException(
       'gstin-state-mismatch',
@@ -471,6 +471,19 @@ export class PartnersCommand {
       for (const field of PARTNER_FIELDS) {
         if (patch[field] !== undefined) (merged as Record<PartnerField, unknown>)[field] = patch[field];
       }
+      // A new GSTIN with no PAN in the patch: a stored PAN that was the OLD
+      // GSTIN's own (characters 3–12) follows the GSTIN — it is re-derived
+      // from the new one. A stored PAN that differed (none can today — the
+      // CHECK ties them) or a PAN the patch names is held to the rule.
+      if (
+        patch.gstin !== undefined &&
+        patch.gstin !== null &&
+        patch.pan === undefined &&
+        before.gstin !== null &&
+        before.pan === before.gstin.slice(2, 12)
+      ) {
+        merged.pan = null;
+      }
       const fields = assertPartnerFields(merged);
 
       const removed = before.roles.filter((role) => !fields.roles.includes(role));
@@ -546,10 +559,7 @@ export class PartnersCommand {
       assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'vendor.manage');
       const replayed = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replayed !== null) return replayed;
-      const current = await this.lockPartner(tx, command.tenantId, command.partnerId, 'update');
-      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
-      if (replayedUnderLock !== null) return replayedUnderLock;
-
+      // The pure shape checks, before the lock (they read no row).
       if (!(PARTNER_STATUSES as readonly string[]).includes(command.status)) {
         throw invalid(`status must be one of ${JSON.stringify(PARTNER_STATUSES)} (got ${JSON.stringify(command.status)}).`);
       }
@@ -560,14 +570,21 @@ export class PartnersCommand {
       if (reason !== null && codePoints(reason) > PARTNER_REASON_MAX) {
         throw invalid(`reason is at most ${PARTNER_REASON_MAX} characters.`);
       }
-      if (current.status === status && current.inactiveReason === reason) {
+      const current = await this.lockPartner(tx, command.tenantId, command.partnerId, 'update');
+      const replayedUnderLock = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) return replayedUnderLock;
+
+      // The same status with no reason given keeps the stored reason (a no-op);
+      // a different reason on an inactive partner replaces it.
+      const nextReason = status === 'active' ? null : reason ?? (current.status === status ? current.inactiveReason : null);
+      if (current.status === status && current.inactiveReason === nextReason) {
         const unchanged = await this.snapshotInTx(tx, command.tenantId, current);
         await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
         return unchanged;
       }
       const rows = await tx
         .update(businessPartners)
-        .set({ status, inactiveReason: status === 'active' ? null : reason, updatedAt: nowIso() })
+        .set({ status, inactiveReason: nextReason, updatedAt: nowIso() })
         .where(and(eq(businessPartners.tenantId, command.tenantId), eq(businessPartners.id, current.id)))
         .returning();
       if (status === 'inactive') {
@@ -710,9 +727,16 @@ export class PartnersCommand {
       }
 
       // An unlocked read learns the link's client (lock order: client first).
+      // The client is locked whenever the request COULD reactivate or set the
+      // default; whether it departed is judged after the link lock, on the
+      // real transition (a no-op on a departed client's link is not refused).
       const seen = await this.readLink(tx, command.tenantId, command.partnerId, command.linkId, null);
-      if (command.active === true) await assertClientTakesWorkInTx(tx, command.tenantId, seen.clientId);
-      if (command.isDefault === true) await lockClientInTx(tx, command.tenantId, seen.clientId);
+      const client =
+        command.isDefault === true
+          ? await lockClientInTx(tx, command.tenantId, seen.clientId)
+          : command.active === true
+            ? await lockClientInTx(tx, command.tenantId, seen.clientId, 'key share')
+            : null;
       const partner = await this.lockPartner(tx, command.tenantId, command.partnerId, 'no key update');
       const flips = command.active !== undefined || command.isDefault !== undefined;
       const link = await this.readLink(tx, command.tenantId, partner.id, command.linkId, flips ? 'update' : 'no key update');
@@ -726,6 +750,9 @@ export class PartnersCommand {
       const settingDefault = isDefault && !link.isDefault;
       if (reactivating && !partner.roles.includes(link.role)) {
         throw linkRoleInvalid(`Partner "${partner.code}" no longer has the ${link.role} role — add it back before reactivating the link.`);
+      }
+      if ((reactivating || settingDefault) && client !== null && client.status === 'departed') {
+        throw clientDeparted((await getClientLabelsInTx(tx, command.tenantId, [link.clientId])).get(link.clientId) ?? link.clientId);
       }
       if ((reactivating || settingDefault) && partner.status !== 'active') throw partnerInactive(partner.code);
       if (settingDefault && link.role !== 'vendor') {

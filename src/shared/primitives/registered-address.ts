@@ -59,13 +59,16 @@ export function normalizeRegisteredAddress(input: RegisteredAddressInput | null)
  * The shape rules: every field but line2 required, the ceilings, a GST
  * registration state code, a six-digit pincode. 400 `validation-failed`
  * naming `<label>.<field>` (`registeredAddress` unless the caller says).
+ * The title defaults to the clients' own ('Invalid registered address'),
+ * unchanged by the story 1-3 move; partners pass theirs.
  */
 export function assertRegisteredAddress(
   address: NormalizedRegisteredAddress,
   label = 'registeredAddress',
+  title = 'Invalid registered address',
 ): NormalizedRegisteredAddress {
   const invalid = (detail: string): ProblemException =>
-    new ProblemException('validation-failed', 400, 'Invalid address', detail);
+    new ProblemException('validation-failed', 400, title, detail);
   for (const field of ['line1', 'city', 'stateCode', 'pincode'] as const) {
     if (typeof address[field] !== 'string' || address[field] === '') {
       throw invalid(`${label}.${field} is required — an address is entered whole, never partial.`);

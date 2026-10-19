@@ -376,13 +376,16 @@ export async function lockClientInTx(
   tx: TenantTx,
   tenantId: string,
   clientId: string,
+  // Story 1-3 — a link reactivation reads status under `FOR KEY SHARE`
+  // (the "no new work" gate's mode); every other caller keeps the default.
+  mode: 'no key update' | 'key share' = 'no key update',
 ): Promise<LockedClientFacts> {
   const rows = await tx
     .select({ id: clients.id, code: clients.code, systemOwned: clients.systemOwned, status: clients.status })
     .from(clients)
     .where(and(eq(clients.tenantId, tenantId), eq(clients.id, clientId)))
     .limit(1)
-    .for('no key update');
+    .for(mode);
   const row = rows[0];
   if (row === undefined) {
     throw clientNotFound(clientId);

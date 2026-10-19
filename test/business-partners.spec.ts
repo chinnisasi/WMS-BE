@@ -535,6 +535,80 @@ describe('story 1-3: the business partner master (e2e)', () => {
     await asOwner('patch', `/partners/${a.id}/links/${aLink.id}`).send({ isDefault: true }).expect(400);
   });
 
+  it('code review — a new GSTIN with no PAN re-derives the PAN when the stored one was the old GSTIN\'s; naming the old PAN still refuses', async () => {
+    const p = await createPartner({ code: 'P-RD', name: 'Rederive Vendor', roles: ['vendor'], gstin: '27LMNOP2345R1Z1' });
+    expect(p.pan).toBe('LMNOP2345R');
+    const moved = (await asOwner('patch', `/partners/${p.id}`).send({ gstin: '27UVWXY6789S1Z4' }).expect(200)).body.partner as Partner;
+    expect(moved).toMatchObject({ gstin: '27UVWXY6789S1Z4', pan: 'UVWXY6789S' });
+    const named = await asOwner('patch', `/partners/${p.id}`).send({ gstin: '27LMNOP2345R1Z1', pan: 'UVWXY6789S' }).expect(400);
+    expect(named.body).toMatchObject({ code: 'pan-gstin-mismatch' });
+  });
+
+  it('code review — re-deactivating with no reason keeps the stored reason (a no-op that stores the key)', async () => {
+    const p = await createPartner({ code: 'P-RR2', name: 'Reason Vendor', roles: ['vendor'] });
+    await asOwner('patch', `/partners/${p.id}/status`).send({ status: 'inactive', reason: 'late deliveries' }).expect(200);
+    const key = noOpIdempotencyKey(tenantId, ulid(), 'partners.status:unchanged');
+    const again = (await asOwner('patch', `/partners/${p.id}/status`, key).send({ status: 'inactive' }).expect(200)).body.partner as Partner;
+    expect(again.inactiveReason).toBe('late deliveries');
+    expect(await auditCount(key)).toBe(0);
+  });
+
+  it('code review — a departed client\'s link: setting the default is 409 client-departed; active:true on an already-active link is the no-op', async () => {
+    const gone = (await asOwner('post', '/clients').send({ code: 'GONE-2', name: 'Gone Two' }).expect(201)).body.client.id as string;
+    const p = await createPartner({ code: 'P-GD', name: 'Gone-client Vendor', roles: ['vendor'] });
+    const linkId = linkOf(await link(p.id, { clientId: gone, role: 'vendor' }), gone).id;
+    await asOwner('patch', `/clients/${gone}/status`).send({ status: 'departed' }).expect(200);
+    const refused = await asOwner('patch', `/partners/${p.id}/links/${linkId}`).send({ isDefault: true }).expect(409);
+    expect(refused.body).toMatchObject({ code: 'client-departed' });
+    const key = noOpIdempotencyKey(tenantId, ulid(), 'partners.linkUpdate:unchanged');
+    const same = (await asOwner('patch', `/partners/${p.id}/links/${linkId}`, key).send({ active: true }).expect(200)).body.partner as Partner;
+    expect(linkOf(same, gone)).toMatchObject({ active: true, isDefault: false });
+    expect(await auditCount(key)).toBe(0);
+  });
+
+  it('code review — a new link created as the default takes over the client\'s default', async () => {
+    const client = (await asOwner('post', '/clients').send({ code: 'BRAND-E', name: 'Brand E' }).expect(201)).body.client.id as string;
+    const first = await createPartner({ code: 'P-E1', name: 'E one', roles: ['vendor'] });
+    const second = await createPartner({ code: 'P-E2', name: 'E two', roles: ['vendor'] });
+    await link(first.id, { clientId: client, role: 'vendor', isDefault: true });
+    const res = await asOwner('post', `/partners/${second.id}/links`).send({ clientId: client, role: 'vendor', isDefault: true }).expect(201);
+    expect(linkOf(res.body.partner as Partner, client).isDefault).toBe(true);
+    const old = (await asOwner('get', `/partners?q=P-E1`).expect(200)).body.items[0] as Partner;
+    expect(linkOf(old, client).isDefault).toBe(false);
+  });
+
+  it('code review — an inactive partner: neither a default nor a reactivation of its link; nothing changes', async () => {
+    const p = await createPartner({ code: 'P-IA', name: 'Inactive links', roles: ['vendor'] });
+    const linked = await link(p.id, { clientId: clientC, role: 'vendor', clientCode: 'IA-1' });
+    const linkId = linkOf(linked, clientC).id;
+    await asOwner('patch', `/partners/${p.id}/links/${linkId}`).send({ active: false }).expect(200);
+    await asOwner('patch', `/partners/${p.id}/status`).send({ status: 'inactive' }).expect(200);
+    const before = (await sql`select active, is_default, updated_at from partner_client_links where id = ${linkId}`) as unknown as Record<string, unknown>[];
+    expect((await asOwner('patch', `/partners/${p.id}/links/${linkId}`).send({ active: true }).expect(409)).body).toMatchObject({ code: 'partner-inactive' });
+    expect((await asOwner('patch', `/partners/${p.id}/links/${linkId}`).send({ active: true, isDefault: true }).expect(409)).body).toMatchObject({ code: 'partner-inactive' });
+    await asOwner('patch', `/partners/${p.id}/status`).send({ status: 'active' }).expect(200);
+    await asOwner('patch', `/partners/${p.id}/links/${linkId}`).send({ active: true }).expect(200);
+    await asOwner('patch', `/partners/${p.id}/status`).send({ status: 'inactive' }).expect(200);
+    const defaultRefused = await asOwner('patch', `/partners/${p.id}/links/${linkId}`).send({ isDefault: true }).expect(409);
+    expect(defaultRefused.body).toMatchObject({ code: 'partner-inactive' });
+    const after = (await sql`select active, is_default from partner_client_links where id = ${linkId}`) as unknown as Record<string, unknown>[];
+    expect(after[0]).toMatchObject({ active: true, is_default: false });
+    expect(before[0]).toMatchObject({ active: false, is_default: false });
+  });
+
+  it('code review — one partner the default of clients F and G: another vendor taking F\'s default leaves G\'s untouched', async () => {
+    const f = (await asOwner('post', '/clients').send({ code: 'BRAND-F', name: 'Brand F' }).expect(201)).body.client.id as string;
+    const g = (await asOwner('post', '/clients').send({ code: 'BRAND-G', name: 'Brand G' }).expect(201)).body.client.id as string;
+    const shared = await createPartner({ code: 'P-FG', name: 'Shared default', roles: ['vendor'] });
+    await link(shared.id, { clientId: f, role: 'vendor', isDefault: true });
+    await link(shared.id, { clientId: g, role: 'vendor', isDefault: true });
+    const other = await createPartner({ code: 'P-F2', name: 'F second', roles: ['vendor'] });
+    await link(other.id, { clientId: f, role: 'vendor', isDefault: true });
+    const after = (await asOwner('get', `/partners?q=P-FG`).expect(200)).body.items[0] as Partner;
+    expect(linkOf(after, f).isDefault).toBe(false);
+    expect(linkOf(after, g).isDefault).toBe(true);
+  });
+
   // ── the list ───────────────────────────────────────────────────────────────
 
   it('list: by code with links inline; role, clientId (active links only), status and an escaped q filter; the keyset walks with no dup or miss', async () => {
