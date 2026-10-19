@@ -734,6 +734,22 @@ export class CreateBinDto {
   @IsIn(STORAGE_CLASSES)
   storageClass?: string;
 
+  // Story 1-5b: the client the bin is dedicated to (decision 1 — bins only).
+  // Absent or null = shared (the default). A malformed id is a shape 400
+  // here; the client checks (unknown 404, departed 409 `client-departed`)
+  // run in the command, behind the replay lookup.
+  @ApiProperty({
+    required: false,
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    description:
+      'Story 1-5b: the client this bin is dedicated to — it then refuses any other client\'s stock in putaway, merge and transfer receive. Omit (or null) for a shared bin. Unknown client 404; a departed client 409 client-departed.',
+  })
+  @IsOptional()
+  @IsUUID()
+  dedicatedClientId?: string | null;
+
   // Story 12-4: the location type documents the bulk-asset create rules —
   // the DTO is the API contract; the weight requirement and the grid refusal
   // stay command-enforced (behind the replay lookup, the 10.2 rule).
@@ -856,6 +872,22 @@ export class GenerateBinsDto {
   @IsIn(STORAGE_CLASSES)
   storageClass?: string;
 
+  // Story 1-5b: the client the bin is dedicated to (decision 1 — bins only).
+  // Absent or null = shared (the default). A malformed id is a shape 400
+  // here; the client checks (unknown 404, departed 409 `client-departed`)
+  // run in the command, behind the replay lookup.
+  @ApiProperty({
+    required: false,
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    description:
+      'Story 1-5b: the client every generated bin is dedicated to (decision 1: the generator can dedicate a whole new grid) — it then refuses any other client\'s stock in putaway, merge and transfer receive. Omit (or null) for shared bins. Unknown client 404; a departed client 409 client-departed.',
+  })
+  @IsOptional()
+  @IsUUID()
+  dedicatedClientId?: string | null;
+
   // Story 12-4: the grid's enum narrows to the SIX grid-able types — a bulk
   // asset is operator-directed, never gridded, so the contract must not
   // advertise types the route always refuses. The command's runtime refusal
@@ -960,6 +992,22 @@ export class PatchBinDto {
   @IsOptional()
   @IsIn(STORAGE_CLASSES)
   storageClass?: string;
+
+  // Story 1-5b: the bin's dedicated client — absent = unchanged, `null` =
+  // clear (shared — unlike `storageClass: null`, which stays a 400), a uuid =
+  // dedicate. Routed to tenancy's `editBinCapacity` with the structure
+  // attributes; mutually exclusive with `blocked`.
+  @ApiProperty({
+    required: false,
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    description:
+      'Story 1-5b: the client this bin is dedicated to. Omit to leave unchanged; null to clear (shared — always allowed); a client id to dedicate. Refused on a system bin (400 validation-failed); an unknown client 404; a departed client 409 client-departed; a bin holding another client\'s stock or open QC holds 409 bin-client-conflict naming the SKUs. Mutually exclusive with blocked.',
+  })
+  @IsOptional()
+  @IsUUID()
+  dedicatedClientId?: string | null;
 }
 
 export class ZoneResponse {
@@ -1044,6 +1092,16 @@ export class BinResponse {
   // carries one; pre-12.1 rows read 'ambient').
   @ApiProperty({ enum: STORAGE_CLASSES, example: 'ambient' })
   storageClass!: string;
+
+  // Story 1-5b: the dedicated client (null = shared; a stored pre-1.5b
+  // snapshot replays null through `normalizeBin`).
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    description: 'Story 1-5b: the client this bin is dedicated to (null = shared)',
+  })
+  dedicatedClientId!: string | null;
 
   // `string` here (not the BinType union): the response echoes DB rows whose
   // column is text; the enum is still pinned in the OpenAPI schema below.

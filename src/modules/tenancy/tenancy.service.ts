@@ -74,6 +74,8 @@ export type BinRow = {
   maxWeightGrams: number | null;
   /** Story 12-1 — the controlled-vocabulary storage class (FR-40). */
   storageClass: string;
+  /** Story 1-5b — the client the bin is dedicated to (null = shared). */
+  dedicatedClientId: string | null;
   type: string;
   blocked: boolean;
   /** Story 3.6 — the retirement pair (null while the bin is live). */
@@ -953,6 +955,9 @@ export class TenancyService {
           heightMm: bins.heightMm,
           maxWeightGrams: bins.maxWeightGrams,
           storageClass: bins.storageClass,
+          // Story 1-5b: the dedicated client (null = shared) — the web's
+          // Client column.
+          dedicatedClientId: bins.dedicatedClientId,
           type: bins.type,
           blocked: bins.blocked,
           // Story 3.6: retired bins STAY listed (the zone bin list is the

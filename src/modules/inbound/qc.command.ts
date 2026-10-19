@@ -840,7 +840,16 @@ export class QcCommand {
           eq(bins.warehouseId, row.warehouseId),
         ),
       )
-      .limit(1);
+      .limit(1)
+      // Story 1-5b — the origin bin locks before the release writes (closing
+      // PENDING "releaseHold lacks .for('update')"): the bin edit's dedicate
+      // guard locks the same row and then counts the bin's open holds, so a
+      // release and a dedication serialise — one waits, and foreign units
+      // never land in a freshly dedicated bin. Lock order: the hold row(s)
+      // (the caller) → this bin row → the warehouse advisory inside the
+      // ledger append — the canonical bin-row → advisory chain; nothing
+      // locks a bin row and then a hold row.
+      .for('update');
     const origin = originRows[0];
     if (origin === undefined) {
       throw new ProblemException(

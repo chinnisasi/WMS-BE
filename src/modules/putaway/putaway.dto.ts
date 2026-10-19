@@ -281,4 +281,13 @@ export class PutawayBinDto {
       'Story 12.8 (UX-DR29): the bin\'s storage class (defaults to `ambient`). It rides the snapshot beside the SKU arm\'s class (the catalog snapshot) so the device\'s offline conformance mirror can refuse a non-conforming placement in the Rejected banner — before anything queues.',
   })
   storageClass!: string;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    description:
+      'Story 1-5b: the client this bin is dedicated to (null = shared). A dedicated bin refuses any other client\'s stock; the device mirrors the rule offline (the snapshot `clients` arm names the client), the server re-gates at placement and transfer receive.',
+  })
+  dedicatedClientId!: string | null;
 }

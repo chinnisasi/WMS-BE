@@ -13,7 +13,18 @@ import {
   stockOnHand,
   zones,
 } from '../../shared/db/schema';
-import { skuCodeLabelsInTx } from '../clients/clients.facade';
+import {
+  assertClientTakesWorkInTx,
+  getClientLabelsInTx,
+  skuCodeLabelsInTx,
+} from '../clients/clients.facade';
+// Story 1-5b — the ONE dedicated-client predicate + the refusal factories
+// (shared with the placement gate, `candidateFitsSku` and the transfer gate).
+import {
+  binClientAccepts,
+  binClientConflict,
+  binClientMismatch,
+} from '../../shared/primitives/client-bin';
 import { uuidv7 } from '../../shared/primitives/ids';
 import {
   MAX_QUANTITY_BASE,
@@ -102,6 +113,12 @@ export interface CreateBinCommand {
    * behind the replay lookup.
    */
   readonly storageClass?: string | undefined;
+  /**
+   * Story 1-5b — the client the new bin is dedicated to (absent or null =
+   * shared, the default). A non-null value runs the client checks behind the
+   * replay (404 unknown, 409 `client-departed`); hashed only when present.
+   */
+  readonly dedicatedClientId?: string | null | undefined;
   readonly type: string;
 }
 
@@ -124,6 +141,8 @@ export interface GenerateBinsCommand {
   readonly maxWeightGrams?: number | null | undefined;
   /** Story 12-1: the storage class, per bin (see `CreateBinCommand.storageClass`). */
   readonly storageClass?: string | undefined;
+  /** Story 1-5b: the dedicated client, per bin (see `CreateBinCommand.dedicatedClientId`). */
+  readonly dedicatedClientId?: string | null | undefined;
   readonly type: string;
 }
 
@@ -174,6 +193,14 @@ export interface EditBinCapacityCommand {
    * class, or the edit strands non-conforming stock.
    */
   readonly storageClass?: string | undefined;
+  /**
+   * Story 1-5b — the bin's dedicated client, PATCH semantics: absent =
+   * unchanged, `null` = clear (always allowed — decision 7), a uuid =
+   * dedicate. Refused on a system bin (400); the client must exist (404) and
+   * not be departed (409 `client-departed`); a CHANGE to a non-null client
+   * runs the client guard (409 `bin-client-conflict` — decision 3).
+   */
+  readonly dedicatedClientId?: string | null | undefined;
 }
 
 /** The API response body for a bin (the idempotency snapshot). */
@@ -192,6 +219,8 @@ export interface BinSnapshot {
     readonly maxWeightGrams: number | null;
     /** Story 12-1 — the controlled-vocabulary storage class (FR-40). */
     readonly storageClass: string;
+    /** Story 1-5b — the client the bin is dedicated to (null = shared). */
+    readonly dedicatedClientId: string | null;
     readonly type: string;
     readonly blocked: boolean;
     /** The Receiving/QC-hold system bins (never blockable/mergeable/retirable). */
@@ -315,6 +344,10 @@ export class BinCommand {
       // JSON (the 11-2 spread precedent), so a pre-12.1 request fingerprints
       // byte-identically and its replay key keeps replaying.
       storageClass: command.storageClass,
+      // Story 1-5b: the dedicated client joins the hash only when present —
+      // null (shared) and absent both drop out of the JSON, so a request
+      // without it fingerprints byte-identically to a pre-1.5b one.
+      dedicatedClientId: command.dedicatedClientId ?? undefined,
       type: command.type,
     });
 
@@ -368,6 +401,11 @@ export class BinCommand {
         // Story 12-4: a bulk asset is weight-defined — the same
         // behind-the-replay position, the command-side mirror of the DTO.
         assertBulkAssetWeightDefined(command.type, command.maxWeightGrams);
+        // Story 1-5b: a dedicated bin's client must exist (404) and take new
+        // work (409 `client-departed`; a suspended client is allowed).
+        if (command.dedicatedClientId !== undefined && command.dedicatedClientId !== null) {
+          await assertClientTakesWorkInTx(tx, command.tenantId, command.dedicatedClientId);
+        }
         const bin = await insertBin(tx, {
           ...command,
           capacity: assertWholeUnitCapacity(command.capacity),
@@ -445,6 +483,8 @@ export class BinCommand {
       maxWeightGrams: command.maxWeightGrams,
       // Story 12-1: the class (the createBin hash note).
       storageClass: command.storageClass,
+      // Story 1-5b: the dedicated client, only when present (the createBin note).
+      dedicatedClientId: command.dedicatedClientId ?? undefined,
       type: command.type,
     });
     // Story 10.2: BASE units (see the note on `createBin`'s payload hash).
@@ -490,6 +530,11 @@ export class BinCommand {
         // Story 12-4: bulk assets are unique, never gridded — same
         // behind-the-replay position, refused before the collision pre-check.
         refuseBulkAssetGrid(command.type);
+        // Story 1-5b: the grid can dedicate the whole run (decision 1) — the
+        // same client checks as a single create.
+        if (command.dedicatedClientId !== undefined && command.dedicatedClientId !== null) {
+          await assertClientTakesWorkInTx(tx, command.tenantId, command.dedicatedClientId);
+        }
         // Story 13-2: a generated code may not take the system returns bin's.
         for (const code of codes) assertNotReservedLocationCode(code, 'bin');
 
@@ -522,6 +567,8 @@ export class BinCommand {
           // Story 12-1: the same class on every generated bin (absent →
           // 'ambient', the column default spelled out).
           storageClass: command.storageClass ?? 'ambient',
+          // Story 1-5b: the same dedicated client on every generated bin.
+          dedicatedClientId: command.dedicatedClientId ?? null,
           type: command.type,
         }));
         try {
@@ -776,6 +823,32 @@ export class BinCommand {
               skuCode: row.skuCode,
               skuClass: row.storageClass,
             })),
+          );
+        }
+
+        // ── story 1-5b: the dedicated-client gate — beside the class gate,
+        // BEFORE any arm moves: every moved SKU must be accepted by the
+        // target (`binClientAccepts` — a shared target accepts all; a
+        // dedicated one only its own client's). Refused whole, 400
+        // `bin-client-mismatch` naming the target, its client and the first
+        // offending SKU (merge's other gates answer 400 — decision 5). Same
+        // predicate as the placement gate and `candidateFitsSku` (the SYNC
+        // HAZARD rule).
+        const foreign = onHandRows.find((row) => !binClientAccepts(target.dedicatedClientId, row.clientId));
+        if (foreign !== undefined) {
+          const labels = await getClientLabelsInTx(tx, command.tenantId, [
+            target.dedicatedClientId!,
+            foreign.clientId,
+          ]);
+          const [skuLabel] = await skuCodeLabelsInTx(tx, command.tenantId, [
+            { code: foreign.skuCode, clientId: foreign.clientId },
+          ]);
+          throw binClientMismatch(
+            400,
+            target.code,
+            labels.get(target.dedicatedClientId!) ?? 'another client',
+            skuLabel ?? foreign.skuCode,
+            labels.get(foreign.clientId) ?? 'another client',
           );
         }
 
@@ -1329,6 +1402,10 @@ export class BinCommand {
       maxWeightGrams: command.maxWeightGrams,
       // Story 12-1: the class rides the hash (same drop-absent precedent).
       storageClass: command.storageClass,
+      // Story 1-5b: the dedicated client — absent drops out of the JSON (an
+      // existing fingerprint is unchanged, pinned by a test); null (clear)
+      // and a uuid hash as given.
+      dedicatedClientId: command.dedicatedClientId,
     });
 
     const { snapshot } = await withTenantTransaction(
@@ -1384,6 +1461,33 @@ export class BinCommand {
         // arm). A SYSTEM bin stays editable: its limits are real.
         if (row.retiredAt !== null) {
           throw binRetired409(row.code);
+        }
+
+        // ── story 1-5b: the dedication's structural and client checks, in
+        // the spec's order: system bin → the client takes work. A system bin
+        // (Receiving, QC-HOLD, In-Transit, Returns) is never dedicated —
+        // its receipts stay ungated (decision 6); a null clear on one is a
+        // harmless no-op and passes. The client row is read `FOR KEY SHARE`
+        // AFTER the bin lock (`assertClientTakesWorkInTx`): unknown 404,
+        // departed 409 `client-departed`, suspended allowed (decision 8) —
+        // only when the value CHANGES to a non-null client, so an existing
+        // dedication to a since-departed client stays (and keeps refusing).
+        const dedicationChanges =
+          command.dedicatedClientId !== undefined && command.dedicatedClientId !== row.dedicatedClientId;
+        const newDedicatedClientId =
+          dedicationChanges && command.dedicatedClientId !== null && command.dedicatedClientId !== undefined
+            ? command.dedicatedClientId
+            : null;
+        if (command.dedicatedClientId !== undefined && command.dedicatedClientId !== null && row.systemOwned) {
+          throw new ProblemException(
+            'validation-failed',
+            400,
+            'A system bin cannot be dedicated',
+            `Bin "${row.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns) — it can never be dedicated to a client.`,
+          );
+        }
+        if (newDedicatedClientId !== null) {
+          await assertClientTakesWorkInTx(tx, command.tenantId, newDedicatedClientId);
         }
 
         // The one validator, behind the replay lookup (the 10.2 rule — see
@@ -1511,6 +1615,70 @@ export class BinCommand {
           }
         }
 
+        // ── story 1-5b: the client guard (decision 3 — the 12-1 class-edit
+        // rule) — only a CHANGE to a non-null client pays it; clearing is
+        // always allowed (decision 7). Behind the replay, after the class
+        // guard (a request changing both refuses on the class first). The
+        // bin row is locked `.for('update')`, and a QC release locks its
+        // origin bin the same way before writing (`qc.command.ts`), so a
+        // release cannot land another client's units here between these
+        // reads and the write. Open holds are read FIRST: a held unit sits in
+        // the QC-HOLD bin, attributed to this origin bin, and release would
+        // return it here — so a hold of another client's SKU blocks the
+        // dedication exactly as on-hand stock does. 409 `bin-client-conflict`
+        // naming up to 10 SKUs.
+        if (newDedicatedClientId !== null) {
+          const openHolds = await openQcHoldsForBinsInTx(tx, command.tenantId, command.warehouseId, [row.id]);
+          const heldSkus =
+            openHolds.length === 0
+              ? []
+              : await tx
+                  .select({ id: skus.id, code: skus.code, clientId: skus.clientId })
+                  .from(skus)
+                  .where(
+                    and(
+                      eq(skus.tenantId, command.tenantId),
+                      inArray(skus.id, [...new Set(openHolds.map((hold) => hold.skuId))]),
+                    ),
+                  )
+                  .orderBy(asc(skus.code));
+          const heldForeign = heldSkus.filter((sku) => !binClientAccepts(newDedicatedClientId, sku.clientId));
+          const onHand = await tx
+            .select({ id: skus.id, code: skus.code, clientId: skus.clientId })
+            .from(stockOnHand)
+            .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
+            .where(
+              and(
+                eq(stockOnHand.tenantId, command.tenantId),
+                eq(stockOnHand.binId, row.id),
+                gt(stockOnHand.quantity, 0),
+              ),
+            )
+            .orderBy(asc(skus.code));
+          const stockForeign = onHand.filter((sku) => !binClientAccepts(newDedicatedClientId, sku.clientId));
+          if (heldForeign.length > 0 || stockForeign.length > 0) {
+            // Distinct SKUs, holds first (the order the guard reads them).
+            const named = [...new Map([...heldForeign, ...stockForeign].map((sku) => [sku.id, sku])).values()];
+            const labels = await skuCodeLabelsInTx(
+              tx,
+              command.tenantId,
+              named.slice(0, 10).map((sku) => ({ code: sku.code, clientId: sku.clientId })),
+            );
+            const clientLabels = await getClientLabelsInTx(tx, command.tenantId, [newDedicatedClientId]);
+            const more = named.length > 10 ? ` and ${named.length - 10} more` : '';
+            const parts = [
+              heldForeign.length > 0 ? 'open QC holds that return to it' : null,
+              stockForeign.length > 0 ? 'stock on hand' : null,
+            ].filter((part): part is string => part !== null);
+            throw binClientConflict(
+              `Bin "${row.code}" cannot be dedicated to ${clientLabels.get(newDedicatedClientId) ?? 'that client'}: ` +
+                `it has another client's ${parts.join(' and ')} — ` +
+                `${labels.map((label) => `"${label}"`).join(', ')}${more}. ` +
+                'Move the stock (or release the holds) first.',
+            );
+          }
+        }
+
         const updatedRows = await tx
           .update(bins)
           .set({
@@ -1522,6 +1690,9 @@ export class BinCommand {
               command.maxWeightGrams === undefined ? row.maxWeightGrams : command.maxWeightGrams,
             // Story 12-1: absent = unchanged (no clear verb — NOT NULL).
             storageClass: command.storageClass === undefined ? row.storageClass : command.storageClass,
+            // Story 1-5b: absent = unchanged; null = clear (shared).
+            dedicatedClientId:
+              command.dedicatedClientId === undefined ? row.dedicatedClientId : command.dedicatedClientId,
             updatedAt: nowIso(),
           })
           .where(eq(bins.id, row.id))
@@ -1543,6 +1714,8 @@ export class BinCommand {
             maxWeightGrams: bin.maxWeightGrams,
             // Story 12-1: the (possibly changed) class rides the event.
             storageClass: bin.storageClass,
+            // Story 1-5b: the (possibly changed) dedicated client rides it too.
+            dedicatedClientId: bin.dedicatedClientId,
           },
         });
 
@@ -1784,6 +1957,8 @@ async function insertBin(
         // Story 12-1: absent stores 'ambient' (the column default, spelled
         // out — never an explicit null; the NOT NULL column has no clear verb).
         storageClass: command.storageClass ?? 'ambient',
+        // Story 1-5b: absent and null both store shared.
+        dedicatedClientId: command.dedicatedClientId ?? null,
         type: command.type,
       })
       .returning();
@@ -1825,6 +2000,8 @@ function binFromRow(row: typeof bins.$inferSelect): BinSnapshot['bin'] {
     maxWeightGrams: row.maxWeightGrams,
     // Story 12-1: the controlled-vocabulary class (required in the snapshot).
     storageClass: row.storageClass,
+    // Story 1-5b: the dedicated client (null = shared).
+    dedicatedClientId: row.dedicatedClientId,
     type: row.type,
     blocked: row.blocked,
     systemOwned: row.systemOwned,

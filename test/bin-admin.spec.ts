@@ -1032,6 +1032,11 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     // One outbox event + one audit row per mutation (three above), none per replay.
     const events = await outboxRows('bin.capacity_changed');
     expect(events.filter((row) => row.payload.binId === binA30)).toHaveLength(3);
+    // Story 1-5b: the event carries the (here unchanged, shared) dedicated
+    // client beside the structure attributes — present and null, never absent.
+    for (const row of events.filter((entry) => entry.payload.binId === binA30)) {
+      expect(row.payload).toHaveProperty('dedicatedClientId', null);
+    }
     const audits = await auditRows('bin.capacity_changed');
     expect(audits.filter((row) => row.target_id === binA30)).toHaveLength(3);
   });

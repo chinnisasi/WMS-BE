@@ -143,6 +143,8 @@ export class BinStateCommand {
           // Story 12-1: the controlled-vocabulary class (the snapshot is
           // required to carry it).
           storageClass: updated.storageClass,
+          // Story 1-5b: the dedicated client (null = shared).
+          dedicatedClientId: updated.dedicatedClientId,
           type: updated.type,
           blocked: updated.blocked,
           systemOwned: updated.systemOwned,

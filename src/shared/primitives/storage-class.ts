@@ -32,6 +32,14 @@
  * adjustment-bypasses-capacity gap), and `qc.released` stays class-free —
  * pinned indirectly by the bin/SKU class-edit guards, which attribute
  * open-QC-hold quantities to their origin bins.
+ *
+ * Story 1-5b adds a sibling gate with the same shape and the same four
+ * placement writers (placement, suggestion/task derivation, merge, transfer
+ * receive): the dedicated-client predicate `binClientAccepts`
+ * (`client-bin.ts`), run right after this class gate everywhere stock lands.
+ * Its named bypasses are this gate's (stock adjustments and the count
+ * corrections posting through them); its edit guard is the class-edit
+ * guard's (on-hand stock and open QC holds attributed to the bin).
  */
 
 import { ProblemException } from '../problem-details/problem.exception';

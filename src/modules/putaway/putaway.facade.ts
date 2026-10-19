@@ -30,7 +30,15 @@ import type {
   PutawayPlacementSnapshot,
   PlacePutawayCommand,
 } from './putaway.command';
-import { approvedExcessByLine, binCandidatesInTx, candidateFitsSku, openReceiptHoldQtyByLine } from './putaway.command';
+import {
+  approvedExcessByLine,
+  binCandidatesInTx,
+  dedicatedClientLabelsInTx,
+  openReceiptHoldQtyByLine,
+  pickPutawayCandidate,
+  putawayRationale,
+  type PutawayBinCandidate,
+} from './putaway.command';
 import { fromMilli } from '../../shared/primitives/quantity';
 
 export const DEFAULT_PUTAWAY_PAGE_SIZE = 50;
@@ -99,6 +107,12 @@ export interface PutawayBinSummary {
    * `ambient` (0035_storage_class.sql), so every bin reads a class.
    */
   readonly storageClass: string;
+  /**
+   * Story 1-5b: the bin's dedicated client (null = shared). The device's
+   * offline mirror of the client gate refuses another client's SKU before
+   * queueing; the server re-gates at placement either way.
+   */
+  readonly dedicatedClientId: string | null;
 }
 
 /**
@@ -339,6 +353,9 @@ export class PutawayFacade {
         // Story 12-2 — the hazard class the co-location arm rules on (null =
         // carries no rule).
         hazardClass: skus.hazardClass,
+        // Story 1-5b — the client: the client gate and the own-client
+        // preference of the shared ranking.
+        clientId: skus.clientId,
       })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, skuIds)));
@@ -383,7 +400,7 @@ export class PutawayFacade {
     // The suggestion candidates (capacity-only v1) — one read for the page.
     const candidates = await binCandidatesInTx(tx, tenantId, warehouseId);
 
-    const tasks: PutawayTask[] = [];
+    const picked: { row: (typeof lineRows)[number]; sku: (typeof skuRows)[number]; remaining: number; fit: PutawayBinCandidate | null }[] = [];
     for (const row of lineRows) {
       const sku = skuById.get(row.skuId);
       if (sku === undefined) {
@@ -401,25 +418,32 @@ export class PutawayFacade {
       // re-derivation use — a SKU without attributes still fits wherever the
       // unit gate passes (fail-open on missing attributes). Story 12-2: the
       // line's SKU id rides in so the hazard arm can skip its own occupant
-      // pairs (the same-SKU-consolidation rule).
-      const fit = candidates.find((candidate) => candidateFitsSku(candidate, sku, remaining, row.skuId));
-      tasks.push({
-        grnId: row.grnId,
-        grnCode: row.grnCode,
-        grnLineId: row.grnLineId,
-        skuId: row.skuId,
-        skuCode: sku.code,
-        batchId: row.batchId,
-        batchCode: row.batchId === null ? null : (batchCodeById.get(row.batchId) ?? null),
-        // Read model + operator-facing text — base units (story 10.1).
-        qty: fromMilli(remaining),
-        suggestedBin: fit === undefined ? null : { binId: fit.binId, binCode: fit.binCode },
-        rationale:
-          fit === undefined
-            ? 'No conforming storage bin has room for these units'
-            : `Lowest occupancy (${fromMilli(fit.occupancy)}/${fromMilli(fit.capacity)}) — room for ${fromMilli(fit.capacity - fit.occupancy)}`,
-      });
+      // pairs (the same-SKU-consolidation rule). Story 1-5b: the ONE shared
+      // ranking (`pickPutawayCandidate`, own-client preference) — the
+      // placement re-derives exactly this, so a followed suggestion needs no
+      // mismatch reason.
+      const fit = pickPutawayCandidate(candidates, sku, remaining, row.skuId, { preferOwn: true });
+      picked.push({ row, sku, remaining, fit });
     }
+    // Story 1-5b: the dedicated clients' labels for the rationale — one read.
+    const labels = await dedicatedClientLabelsInTx(
+      tx,
+      tenantId,
+      picked.map((entry) => entry.fit).filter((fit): fit is PutawayBinCandidate => fit !== null),
+    );
+    const tasks: PutawayTask[] = picked.map(({ row, sku, remaining, fit }) => ({
+      grnId: row.grnId,
+      grnCode: row.grnCode,
+      grnLineId: row.grnLineId,
+      skuId: row.skuId,
+      skuCode: sku.code,
+      batchId: row.batchId,
+      batchCode: row.batchId === null ? null : (batchCodeById.get(row.batchId) ?? null),
+      // Read model + operator-facing text — base units (story 10.1).
+      qty: fromMilli(remaining),
+      suggestedBin: fit === null ? null : { binId: fit.binId, binCode: fit.binCode },
+      rationale: fit === null ? 'No conforming storage bin has room for these units' : putawayRationale(fit, labels),
+    }));
     return tasks;
   }
 
@@ -456,6 +480,9 @@ export class PutawayFacade {
         // device's offline conformance mirror reads both arms (bin here, SKU
         // on the catalog facade) beside the fields it already gates on.
         storageClass: bins.storageClass,
+        // Story 1-5b: the dedicated client (null = shared) — the device
+        // refuses another client's SKU into it before queueing.
+        dedicatedClientId: bins.dedicatedClientId,
       })
       .from(bins)
       .innerJoin(zones, eq(zones.id, bins.zoneId))
