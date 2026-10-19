@@ -840,7 +840,9 @@ describe('story 1-2a: the client master record', () => {
           .post(`${API}/${tenantId}/catalog/products`)
           .set('Authorization', `Bearer ${ownerToken}`)
           .set(KEY_HEADER, ulid())
-          .send({ name: 'Gone Tee', axes: ['size'] })
+          // Story 1-4 — a product names its client (more than one exists here);
+          // the attach below still answers client-departed first.
+          .send({ name: 'Gone Tee', axes: ['size'], clientId: selfClientId })
           .expect(201);
         const products = await http().get(`${API}/${tenantId}/catalog/products`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
         const productId = (products.body.items as { id: string; name: string }[]).find((p) => p.name === 'Gone Tee')!.id;

@@ -1391,12 +1391,26 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
     expect(res.body.pendingAdjustment.serialIds).toBeNull();
 
     // The SKU flips to serial-tracked while the pend waits.
-    await request(app.getHttpServer())
+    // Story 1-4 (decision 7) RE-PINNED: the SKU PATCH now refuses this flip
+    // while the pend waits (409 sku-has-stock — a pending positive
+    // adjustment counts as stock). The approval's parity guard is still the
+    // backstop for a flag that moved anyway (a pre-1.4 flip, a direct
+    // write), so the flip is made below the API to keep pinning it.
+    const flip = await request(app.getHttpServer())
       .patch(`${API}/${tenantId}/catalog/skus/${sku('PLAIN-3')}`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
       .send({ serialTracked: true })
-      .expect(200);
+      .expect(409);
+    expect(flip.body.code).toBe('sku-has-stock');
+    {
+      const raw = postgres(process.env.DATABASE_URL!, { max: 1 });
+      try {
+        await raw`update skus set serial_tracked = true where id = ${sku('PLAIN-3')}`;
+      } finally {
+        await raw.end();
+      }
+    }
 
     // The approval rebuilds the command from the stored arms (no serials)
     // against a now-serial-tracked SKU — the arm-required parity guard
@@ -1417,12 +1431,26 @@ describe('stock adjustment approval thresholds (e2e, story 5-2)', () => {
     const pendingId = res.body.pendingAdjustment.id as string;
     expect(res.body.pendingAdjustment.batchId).toBeNull();
 
-    await request(app.getHttpServer())
+    // Story 1-4 (decision 7) RE-PINNED: the SKU PATCH now refuses this flip
+    // while the pend waits (409 sku-has-stock — a pending positive
+    // adjustment counts as stock). The approval's parity guard is still the
+    // backstop for a flag that moved anyway (a pre-1.4 flip, a direct
+    // write), so the flip is made below the API to keep pinning it.
+    const flip = await request(app.getHttpServer())
       .patch(`${API}/${tenantId}/catalog/skus/${sku('PLAIN-4')}`)
       .set('Authorization', `Bearer ${ownerToken}`)
       .set(KEY_HEADER, ulid())
       .send({ batchTracked: true })
-      .expect(200);
+      .expect(409);
+    expect(flip.body.code).toBe('sku-has-stock');
+    {
+      const raw = postgres(process.env.DATABASE_URL!, { max: 1 });
+      try {
+        await raw`update skus set batch_tracked = true where id = ${sku('PLAIN-4')}`;
+      } finally {
+        await raw.end();
+      }
+    }
 
     const refused = await approve(pendingId).expect(400);
     expect(refused.body.code).toBe('validation-failed');

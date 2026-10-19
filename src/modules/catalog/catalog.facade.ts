@@ -1,7 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
-import { batches, catalogImports, products, serials, skus } from '../../shared/db/schema';
+import { batches, catalogImports, products, serials, skuBarcodes, skus, uomConversions } from '../../shared/db/schema';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -221,6 +221,21 @@ export interface SkuSummary {
    * SKU reads a class.
    */
   readonly storageClass: string;
+  /**
+   * Story 1-4: every NON-primary barcode of the SKU with its level and the
+   * level's factor in base units (1 when the level is the base uom — an
+   * extra base-level barcode). The handheld counts a pack scan as `factor`
+   * units on receive, returns and pack; pick and putaway accept it as SKU
+   * confirmation. Empty when the SKU has none.
+   */
+  readonly packBarcodes: readonly SkuPackBarcode[];
+}
+
+/** Story 1-4 — one pack (or extra base-level) barcode as the device snapshot carries it. */
+export interface SkuPackBarcode {
+  readonly barcode: string;
+  readonly uom: string;
+  readonly factor: number;
 }
 
 /** One SKU as `getSkusByCodesInTx` returns it (the ASN import's resolution). */
@@ -529,10 +544,47 @@ export class CatalogFacade {
       .leftJoin(products, eq(products.id, skus.productId))
       .where(eq(skus.tenantId, tenantId))
       .orderBy(skus.code, skus.clientId, skus.id);
+    // Story 1-4: the pack barcodes — ONE batched read on the caller's
+    // transaction (never a nested one): every non-primary `sku_barcodes` row
+    // with its level's factor (the SKU's `uom_conversions` row for that uom;
+    // 1 when the level is the base uom). A level row with no conversion (an
+    // invariant break) is skipped — a scan must never count an unknown pack.
+    const packRows = await tx
+      .select({
+        skuId: skuBarcodes.skuId,
+        barcode: skuBarcodes.barcode,
+        uom: skuBarcodes.uom,
+        baseUom: skus.uom,
+        factor: uomConversions.factor,
+      })
+      .from(skuBarcodes)
+      .innerJoin(skus, and(eq(skus.id, skuBarcodes.skuId), eq(skus.tenantId, skuBarcodes.tenantId)))
+      .leftJoin(
+        uomConversions,
+        and(
+          eq(uomConversions.skuId, skuBarcodes.skuId),
+          eq(uomConversions.tenantId, skuBarcodes.tenantId),
+          eq(uomConversions.uom, skuBarcodes.uom),
+        ),
+      )
+      .where(and(eq(skuBarcodes.tenantId, tenantId), eq(skuBarcodes.isPrimary, false)))
+      .orderBy(skuBarcodes.skuId, skuBarcodes.uom, skuBarcodes.barcode);
+    const packBySku = new Map<string, SkuPackBarcode[]>();
+    for (const row of packRows) {
+      const factor = row.uom === row.baseUom ? 1 : row.factor;
+      if (factor === null) continue;
+      const list = packBySku.get(row.skuId) ?? [];
+      list.push({ barcode: row.barcode, uom: row.uom, factor });
+      packBySku.set(row.skuId, list);
+    }
     // Story 10.2: the unit's declared precision joins the scan identity. It is
     // a property of the UNIT, so it is looked up here rather than selected —
-    // still on the caller's transaction, still one query.
-    return rows.map((row) => ({ ...row, uomPrecision: uomPrecision(row.uom) }));
+    // still on the caller's transaction.
+    return rows.map((row) => ({
+      ...row,
+      uomPrecision: uomPrecision(row.uom),
+      packBarcodes: packBySku.get(row.id) ?? [],
+    }));
   }
 
   /** Batch identities of one SKU — the expiry half of the api layer's FEFO join. */
@@ -768,11 +820,12 @@ export class CatalogFacade {
     tx: TenantTx,
     tenantId: string,
     skuIds: readonly string[],
+    opts: { readonly lock?: 'share' } = {},
   ): Promise<ReadonlyMap<string, SkuFacts>> {
     if (skuIds.length === 0) {
       return new Map();
     }
-    const rows = await tx
+    const query = tx
       .select({
         id: skus.id,
         uom: skus.uom,
@@ -781,7 +834,12 @@ export class CatalogFacade {
         catchWeightTracked: skus.catchWeightTracked,
       })
       .from(skus)
-      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, [...new Set(skuIds)])));
+      .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, [...new Set(skuIds)])))
+      .orderBy(skus.id);
+    // Story 1-4 — `lock: 'share'` takes the SKU rows FOR SHARE (id order), so
+    // a tracking-flag flip (the SKU edit's `FOR UPDATE`, decision 7) cannot
+    // interleave with the caller's posting (the return receipt).
+    const rows = opts.lock === 'share' ? await query.for('share') : await query;
     return new Map(
       rows.map((row) => [
         row.id,

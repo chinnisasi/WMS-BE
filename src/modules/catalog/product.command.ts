@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { auditEvents, idempotencyKeys, products, skus } from '../../shared/db/schema';
@@ -14,7 +14,9 @@ import { getMemberRoleIn } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
-import { DEFAULT_SKU_PAGE_SIZE, MAX_SKU_PAGE_SIZE } from './sku.command';
+import { DEFAULT_SKU_PAGE_SIZE, MAX_SKU_PAGE_SIZE, clientRequired } from './sku.command';
+import { assertClientInTenantInTx, assertClientTakesWorkInTx, listClientsInTx } from '../clients/clients.facade';
+import { ensureSelfClientInTx } from '../clients/ensure-self-client';
 
 /** The product `name` cap — the SKU `name` bound (`NAME_MAX`, import.command). */
 export const PRODUCT_NAME_MAX = 200;
@@ -25,7 +27,8 @@ export const VARIANT_VALUE_MAX = 64;
 /** A product declares at most three axes (the I/O matrix's `1–3` bound). */
 export const MAX_PRODUCT_AXES = 3;
 
-const PRODUCTS_TENANT_NAME = 'products_tenant_id_name_unique';
+// Story 1-4 (0080) — product names are unique per (tenant, client).
+const PRODUCTS_TENANT_NAME = 'products_tenant_client_name_unique';
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 /** The API response body for a product (idempotency snapshot + list item). */
@@ -33,6 +36,12 @@ export interface ProductSnapshot {
   readonly id: string;
   readonly tenantId: string;
   readonly name: string;
+  /**
+   * Story 1-4 — the client this product belongs to; every attached SKU
+   * shares it. A pre-1.4 stored snapshot lacks it — its replay reads the
+   * product row's client (`normalizeStoredProduct`).
+   */
+  readonly clientId: string;
   /** The declared axes, 1–3 short names. Immutable while variants are attached. */
   readonly axes: readonly string[];
   /** How many SKUs in this tenant are attached to this product (derived, never stored). */
@@ -46,6 +55,12 @@ export interface CreateProductCommand {
   readonly actorUserId: string;
   readonly name: string;
   readonly axes: readonly string[];
+  /**
+   * Story 1-4 (decision 6) — the client the product belongs to. Omitted only
+   * while the tenant has one client (then its `self`); otherwise 400
+   * `client-required`. A departed client is refused (409 `client-departed`).
+   */
+  readonly clientId?: string | undefined;
 }
 
 export interface EditProductCommand {
@@ -54,6 +69,8 @@ export interface EditProductCommand {
   readonly productId: string;
   readonly name?: string | undefined;
   readonly axes?: readonly string[] | undefined;
+  /** Story 1-4 — moves the product to another client, only while it has no SKUs (409 `product-has-skus`). */
+  readonly clientId?: string | undefined;
 }
 
 /**
@@ -70,9 +87,10 @@ export interface EditProductCommand {
  * same family of edit the SKU PATCH already gates, and the story adds no new
  * capability (`SkuSummary`/the mirror are untouched — the 11-2 precedent).
  *
- * There is no delete command (the append-only philosophy) and no SKU create
- * command — import stays the only creator of SKUs; products are created
- * here, and SKUs attach to them through the existing SKU edit PATCH.
+ * There is no delete command (the append-only philosophy). Products are
+ * created here; SKUs (created by the import or, since 1-4, `SkuCommand.create`)
+ * attach to them through the SKU edit PATCH. Story 1-4: a product belongs to
+ * ONE client (names unique per client) and only SKUs of that client attach.
  */
 @Injectable()
 export class ProductCommand {
@@ -89,10 +107,13 @@ export class ProductCommand {
 
     // 1. Hash the payload BEFORE the transaction, fixed key order (the
     //    createOrder convention).
+    // Story 1-4: `clientId` joins the hash only when present (the 21-2b
+    // conditional-key precedent) — a pre-1.4 body hashes as before.
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       name,
       axes: [...axes],
+      ...(command.clientId === undefined ? {} : { clientId: command.clientId }),
     });
 
     const { snapshot } = await withTenantTransaction(
@@ -115,16 +136,31 @@ export class ProductCommand {
           if (existing[0].payloadHash !== payloadHash) {
             throw idempotencyKeyReuse();
           }
-          return { snapshot: existing[0].responseSnapshot as ProductSnapshot, replayed: true };
+          return { snapshot: await normalizeStoredProduct(tx, command.tenantId, existing[0].responseSnapshot as ProductSnapshot), replayed: true };
         }
 
-        // 4. Duplicate name per tenant → 409 naming it (the `skus.code`
-        //    precedent — import and the UI need an honest handle). The unique
-        //    index below is the concurrent-writer backstop.
+        // Story 1-4 — the client: the import's rule (decision 6). A named
+        // client must exist (404) and take work (409 `client-departed`).
+        let clientId: string;
+        if (command.clientId !== undefined) {
+          if (!UUID_RE.test(command.clientId)) {
+            throw new ProblemException('validation-failed', 400, 'Invalid client reference', 'clientId must be a uuid.');
+          }
+          await assertClientInTenantInTx(tx, command.tenantId, command.clientId);
+          clientId = command.clientId;
+        } else if ((await listClientsInTx(tx, command.tenantId)).length > 1) {
+          throw clientRequired('product');
+        } else {
+          clientId = await ensureSelfClientInTx(tx, command.tenantId);
+        }
+        await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
+
+        // 4. Duplicate name per client (story 1-4) → 409 naming it. The
+        //    unique index below is the concurrent-writer backstop.
         const collision = await tx
           .select({ id: products.id })
           .from(products)
-          .where(and(eq(products.tenantId, command.tenantId), eq(products.name, name)))
+          .where(and(eq(products.tenantId, command.tenantId), eq(products.clientId, clientId), eq(products.name, name)))
           .limit(1);
         if (collision[0]) {
           throw duplicateProductName(name);
@@ -134,13 +170,14 @@ export class ProductCommand {
         const productId = uuidv7();
         const inserted = await tx
           .insert(products)
-          .values({ id: productId, tenantId: command.tenantId, name, axes: [...axes] })
+          .values({ id: productId, tenantId: command.tenantId, clientId, name, axes: [...axes] })
           .returning();
         const row = inserted[0]!;
         const snapshot: ProductSnapshot = {
           id: row.id,
           tenantId: row.tenantId,
           name: row.name,
+          clientId: row.clientId,
           axes: row.axes,
           skuCount: 0,
           createdAt: row.createdAt,
@@ -210,21 +247,28 @@ export class ProductCommand {
     const fields = {
       name: command.name === undefined ? undefined : assertProductName(command.name),
       axes: command.axes === undefined ? undefined : assertAxes(command.axes),
+      clientId: command.clientId,
     };
-    if (fields.name === undefined && fields.axes === undefined) {
+    if (fields.name === undefined && fields.axes === undefined && fields.clientId === undefined) {
       throw new ProblemException(
         'empty-product-edit',
         400,
         'Empty product edit',
-        'At least one of name, axes is required.',
+        'At least one of name, axes, clientId is required.',
       );
     }
+    if (fields.clientId !== undefined && !UUID_RE.test(fields.clientId)) {
+      throw new ProblemException('validation-failed', 400, 'Invalid client reference', 'clientId must be a uuid.');
+    }
 
+    // Story 1-4: `clientId` drops out of the spread when absent, so a
+    // pre-1.4 body hashes as before.
     const payloadHash = hashCommandPayload({
       tenantId: command.tenantId,
       productId: command.productId,
       name: fields.name,
       axes: fields.axes === undefined ? undefined : [...fields.axes],
+      clientId: fields.clientId,
     });
 
     const { snapshot } = await withTenantTransaction(
@@ -244,7 +288,7 @@ export class ProductCommand {
           if (existing[0].payloadHash !== payloadHash) {
             throw idempotencyKeyReuse();
           }
-          return { snapshot: existing[0].responseSnapshot as ProductSnapshot, replayed: true };
+          return { snapshot: await normalizeStoredProduct(tx, command.tenantId, existing[0].responseSnapshot as ProductSnapshot), replayed: true };
         }
 
         const rows = await tx
@@ -280,21 +324,51 @@ export class ProductCommand {
           }
         }
 
-        // Duplicate name per tenant (the create pre-check's edit twin).
-        if (fields.name !== undefined && fields.name !== current.name) {
+        // Story 1-4 — the product's client moves only while it has no SKUs
+        // (409 `product-has-skus`); the target must exist and take work.
+        const clientChanges = fields.clientId !== undefined && fields.clientId !== current.clientId;
+        if (clientChanges) {
+          const attached = await tx
+            .select({ id: skus.id })
+            .from(skus)
+            .where(and(eq(skus.tenantId, command.tenantId), eq(skus.productId, current.id)))
+            .limit(1);
+          if (attached[0]) {
+            throw new ProblemException(
+              'product-has-skus',
+              409,
+              "The product's client cannot change while SKUs are attached",
+              `Product "${current.name}" has SKUs attached — its client follows theirs (an owner's SKU client correction moves both). Detach the SKUs first.`,
+            );
+          }
+          await assertClientTakesWorkInTx(tx, command.tenantId, fields.clientId!);
+        }
+        const resultingClientId = clientChanges ? fields.clientId! : current.clientId;
+
+        // Duplicate name per client (the create pre-check's edit twin).
+        const resultingName = fields.name ?? current.name;
+        if (resultingName !== current.name || clientChanges) {
           const collision = await tx
             .select({ id: products.id })
             .from(products)
-            .where(and(eq(products.tenantId, command.tenantId), eq(products.name, fields.name)))
+            .where(
+              and(
+                eq(products.tenantId, command.tenantId),
+                eq(products.clientId, resultingClientId),
+                eq(products.name, resultingName),
+                ne(products.id, current.id),
+              ),
+            )
             .limit(1);
           if (collision[0]) {
-            throw duplicateProductName(fields.name);
+            throw duplicateProductName(resultingName);
           }
         }
 
         const updates: Partial<typeof products.$inferInsert> = { updatedAt: nowIso() };
         if (fields.name !== undefined) updates.name = fields.name;
         if (fields.axes !== undefined) updates.axes = [...fields.axes];
+        if (clientChanges) updates.clientId = resultingClientId;
         let updatedRows;
         try {
           updatedRows = await tx
@@ -317,6 +391,7 @@ export class ProductCommand {
           id: row.id,
           tenantId: row.tenantId,
           name: row.name,
+          clientId: row.clientId,
           axes: row.axes,
           skuCount,
           createdAt: row.createdAt,
@@ -424,6 +499,7 @@ export class ProductCommand {
         id: row.id,
         tenantId: row.tenantId,
         name: row.name,
+        clientId: row.clientId,
         axes: row.axes,
         skuCount: 0,
         createdAt: row.createdAt,
@@ -588,6 +664,21 @@ function assertAxes(raw: readonly string[] | undefined): readonly string[] {
   return axes;
 }
 
+/**
+ * Story 1-4 — a pre-1.4 stored product snapshot has no `clientId`: the
+ * replay serves the product row's client (backfilled by 0080 from its SKUs).
+ */
+async function normalizeStoredProduct(tx: TenantTx, tenantId: string, stored: ProductSnapshot): Promise<ProductSnapshot> {
+  if (typeof stored.clientId === 'string') return stored;
+  const rows = await tx
+    .select({ clientId: products.clientId })
+    .from(products)
+    .where(and(eq(products.tenantId, tenantId), eq(products.id, stored.id)))
+    .limit(1);
+  if (rows[0] === undefined) throw productNotFound(stored.id);
+  return { ...stored, clientId: rows[0].clientId };
+}
+
 function sameAxes(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((axis, i) => axis === b[i]);
 }
@@ -601,7 +692,7 @@ export function duplicateProductName(name: string): ProblemException {
     'duplicate-product-name',
     409,
     'Product name already in use',
-    `Product name "${name}" already exists in this tenant — duplicates are rejected, never merged.`,
+    `Product name "${name}" already exists for this client — duplicates are rejected, never merged.`,
   );
 }
 

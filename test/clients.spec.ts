@@ -685,12 +685,19 @@ describe('story 21-2b: client admin and attribution', () => {
         );
       });
 
-      it("the product pass refuses a row attaching ACME to a product holding self variants (mixed-client row error)", async () => {
+      // Story 1-4 (decision 3) RE-PINNED: products belong to ONE client since
+      // 0080, so an ACME import cannot even see the self client's product —
+      // the 21-2b `mixed-client` product row error is gone (the row now
+      // reads "does not exist for client ACME"), and the SKU PATCH's attach
+      // refuses with `product-client-mismatch` instead of `mixed-client`.
+      // The invariant this test pinned — a product's variants never span
+      // clients — is unchanged.
+      it("the product pass cannot attach ACME to the self client's product (row error); the PATCH refuses product-client-mismatch", async () => {
         await http()
           .post(`${API}/${tenantId}/catalog/products`)
           .set('Authorization', `Bearer ${ownerToken}`)
           .set(KEY_HEADER, ulid())
-          .send({ name: 'Self Tee', axes: ['size'] })
+          .send({ name: 'Self Tee', axes: ['size'], clientId: selfClientId })
           .expect(201);
         const products = await http().get(`${API}/${tenantId}/catalog/products`).set('Authorization', `Bearer ${ownerToken}`).expect(200);
         const productId = (products.body.items as { id: string; name: string }[]).find((p) => p.name === 'Self Tee')!.id;
@@ -702,7 +709,7 @@ describe('story 21-2b: client admin and attribution', () => {
           .expect(200);
         const res = await importCsv(['ACME-TEE,Acme tee,pcs,1800,Self Tee,size=M,'], { clientId: acmeId }).expect(201);
         expect(res.body.errors).toEqual([
-          expect.objectContaining({ skuCode: 'ACME-TEE', code: 'mixed-client' }),
+          expect.objectContaining({ skuCode: 'ACME-TEE', code: 'validation-failed', detail: expect.stringContaining('does not exist for client') }),
         ]);
         expect(res.body.committedRows).toBe(0);
         // …and the SKU PATCH refuses the same attach (409).
@@ -713,7 +720,7 @@ describe('story 21-2b: client admin and attribution', () => {
             .set(KEY_HEADER, ulid())
             .send({ productId, variantValues: { size: 'L' } }),
           409,
-          'mixed-client',
+          'product-client-mismatch',
         );
       });
 
@@ -843,7 +850,7 @@ describe('story 21-2b: client admin and attribution', () => {
           .post(`${API}/${tenantId}/catalog/products`)
           .set('Authorization', `Bearer ${ownerToken}`)
           .set(KEY_HEADER, ulid())
-          .send({ name: 'Race Tee', axes: ['size'] })
+          .send({ name: 'Race Tee', axes: ['size'], clientId: selfClientId })
           .expect(201);
         const imported = await importCsv(
           ['RACE-V1,Race variant 1,pcs,1800,Race Tee,size=S,', 'RACE-V2,Race variant 2,pcs,1800,Race Tee,size=M,'],

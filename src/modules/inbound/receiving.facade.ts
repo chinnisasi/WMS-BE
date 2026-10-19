@@ -122,6 +122,11 @@ export interface CatalogSnapshot {
      * mirror of the `SkuSummary` arm.
      */
     readonly clientId: string;
+    /**
+     * Story 1-4: the SKU's non-primary barcodes with their level and factor
+     * (1 at the base uom). Sixth mirror of the `SkuSummary` arm.
+     */
+    readonly packBarcodes: readonly { readonly barcode: string; readonly uom: string; readonly factor: number }[];
   }[];
   readonly openPurchaseOrders: readonly {
     readonly id: string;

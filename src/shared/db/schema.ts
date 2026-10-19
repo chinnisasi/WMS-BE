@@ -892,6 +892,14 @@ export const skus = pgTable(
      * class would silently schedule every legacy SKU for counts).
      */
     abcClass: text('abc_class'),
+    /**
+     * Story 1-4 — the SKU's total shelf life in days from manufacture,
+     * nullable (unset). 1–3650 by the `skus_shelf_life_days_check` CHECK
+     * (`drizzle/0080_sku_master.sql`, migration-SQL-only). Distinct from the
+     * client receiving policy's `minShelfLifeDays` (minimum REMAINING life,
+     * 1-2b); roadmap 2.4 derives expiry from it.
+     */
+    shelfLifeDays: integer('shelf_life_days'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -947,10 +955,21 @@ export const products = pgTable(
      * nothing no consumer needs.
      */
     axes: jsonb('axes').$type<string[]>().notNull(),
+    /**
+     * Story 1-4 — the client this product belongs to (decision 3: product
+     * names are unique PER CLIENT). Backfilled by 0080 from the product's
+     * SKUs (a product's variants never span clients), else the tenant's
+     * `self` client. Every attached SKU shares it (409
+     * `product-client-mismatch`); only the SKU client correction moves it
+     * once SKUs are attached (architecture pin); while the product has no
+     * SKUs the product edit may change it.
+     */
+    clientId: uuid('client_id').notNull(),
     ...tenantTimestamps,
   },
   (table) => [
-    uniqueIndex('products_tenant_id_name_unique').on(table.tenantId, table.name),
+    // Story 1-4 (0080) — names are unique per (tenant, client).
+    uniqueIndex('products_tenant_client_name_unique').on(table.tenantId, table.clientId, table.name),
     index('products_created_at_id_idx').on(table.createdAt, table.id),
     index('products_tenant_id_idx').on(table.tenantId),
   ],
@@ -963,6 +982,9 @@ export type Product = typeof products.$inferSelect;
  * **positive integer** — one `uom` equals `factor` base units (a box of 12 is
  * factor 12 against base `pcs`). Owned by catalog; `sku_id` → `skus.id` by
  * uuid column (no FK, repo convention), validated in the command transaction.
+ * Story 1-4: these rows ARE the SKU's pack levels (box, case, pallet …) —
+ * editable through `PUT …/catalog/skus/{id}/packaging`; the factor is an
+ * integer of 2–1,000,000 (`uom_conversions_factor_check`, 0080).
  * One conversion per (sku, uom) — a repeated target UoM in the same file is a
  * row-level `validation-failed`.
  */
@@ -985,6 +1007,42 @@ export const uomConversions = pgTable(
 );
 
 export type UomConversion = typeof uomConversions.$inferSelect;
+
+/**
+ * Story 1-4 — every barcode of a SKU, each naming its LEVEL: the SKU's base
+ * `uom` (the primary barcode, or an extra base-level barcode) or one of the
+ * SKU's `uom_conversions` pack levels (a case, a pallet). This table is the
+ * ONE barcode-uniqueness authority per (tenant, client)
+ * (`sku_barcodes_tenant_client_barcode_unique`); `skus.barcode` stays as the
+ * primary base-level barcode and always has a matching `is_primary` row
+ * (every writer of `skus.barcode` keeps it in the same transaction). One
+ * primary per SKU (partial unique). `client_id` always equals the SKU's —
+ * only the SKU client correction updates it (architecture pin). The barcode
+ * rule and the uom vocabulary are CHECKs (migration SQL only); RLS is the
+ * tenant + `app.client_id` clause (0080). No FK (repo convention).
+ */
+export const skuBarcodes = pgTable(
+  'sku_barcodes',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id').notNull(),
+    skuId: uuid('sku_id').notNull(),
+    barcode: text('barcode').notNull(),
+    uom: text('uom').notNull(),
+    isPrimary: boolean('is_primary').notNull().default(false),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('sku_barcodes_tenant_client_barcode_unique').on(table.tenantId, table.clientId, table.barcode),
+    uniqueIndex('sku_barcodes_primary_unique').on(table.skuId).where(sql`is_primary`),
+    index('sku_barcodes_tenant_sku_idx').on(table.tenantId, table.skuId),
+  ],
+);
+
+export type SkuBarcode = typeof skuBarcodes.$inferSelect;
 
 /**
  * Kit compositions (Story 11.4 — FR-38, AD-19): one row per component of one

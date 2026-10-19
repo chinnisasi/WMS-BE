@@ -2,7 +2,17 @@ import { forwardRef, Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, gt, inArray, ne, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { auditEvents, bins, idempotencyKeys, products, skus, stockOnHand, uomConversions } from '../../shared/db/schema';
+import {
+  auditEvents,
+  bins,
+  idempotencyKeys,
+  overReceipts,
+  products,
+  skuBarcodes,
+  skus,
+  stockAdjustmentPendings,
+  stockOnHand,
+} from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
@@ -18,7 +28,7 @@ import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-sco
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
-import { isFractionalUom, serialTrackedFractionalUomDetail, uomPrecision } from './uom';
+import { isFractionalUom, resolveUom, serialTrackedFractionalUomDetail, unknownUomDetail, uomPrecision } from './uom';
 import { countLiveHandlingUnitsInTx } from './handling-unit.store';
 import { assertSkuAttributes } from './sku-attributes';
 // Story 12-1 — the vocabulary validator + the class-edit refusal factory,
@@ -48,12 +58,42 @@ import {
   normalizeVariantValues,
   productNotFound,
 } from './product.command';
-import { assertSingleClientInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
+import {
+  assertClientInTenantInTx,
+  assertClientTakesWorkInTx,
+  listClientsInTx,
+} from '../clients/clients.facade';
+import { ensureSelfClientInTx } from '../clients/ensure-self-client';
+// Story 1-4 — the SKU master's shared rules and barcode writers.
+import {
+  HSN_MAX,
+  SKU_BARCODES_UNIQUE,
+  SKU_CODE_MAX,
+  SKU_NAME_MAX,
+  assertGstRateBps,
+  SKUS_BARCODE_UNIQUE,
+  assertBarcodeRule,
+  assertBarcodesFreeInTx,
+  assertShelfLifeDays,
+  barcodeIsCode,
+  duplicateBarcodeProblem,
+  readPackagingInTx,
+  replacePackagingInTx,
+  sortBarcodes,
+  sortLevels,
+  validateExtraBarcodes,
+  validateLevels,
+  writePrimaryBarcodeInTx,
+  type SkuBarcodeView,
+} from './sku-master';
 
 export const DEFAULT_SKU_PAGE_SIZE = 50;
 export const MAX_SKU_PAGE_SIZE = 200;
-// Story 1-1 (0076) — a barcode is unique per (tenant, client).
-export const SKUS_TENANT_BARCODE = 'skus_tenant_client_barcode_unique';
+// Story 1-1 (0076) — a barcode is unique per (tenant, client). Story 1-4:
+// `sku_barcodes` is the uniqueness authority; this index stays a backstop and
+// every 23505 handler maps both (`isBarcodeViolation`).
+export const SKUS_TENANT_BARCODE = SKUS_BARCODE_UNIQUE;
+const SKUS_TENANT_CODE = 'skus_tenant_client_code_unique';
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 
 /** The API response body for a SKU (idempotency snapshot + list item). */
@@ -127,8 +167,101 @@ export interface SkuSnapshot {
   readonly reorderPoint: number;
   readonly reorderQty: number;
   readonly barcode: string;
+  /**
+   * Story 1-4 — the SKU's pack levels (box, case, pallet …): one unit of
+   * `uom` = `factor` base units. Sorted by uom.
+   */
   readonly uomConversions: readonly { readonly uom: string; readonly factor: number }[];
+  /**
+   * Story 1-4 — total shelf life in days from manufacture, null when unset.
+   * A replay of a pre-1.4 stored response serves `?? null`.
+   */
+  readonly shelfLifeDays: number | null;
+  /**
+   * Story 1-4 — every barcode of the SKU with its level: the primary first,
+   * then (uom, barcode). A replay of a pre-1.4 stored response serves `?? []`.
+   */
+  readonly barcodes: readonly SkuBarcodeView[];
   readonly createdAt: string;
+}
+
+/**
+ * Story 1-4 — a pre-1.4 stored SKU response lacks the 1-4 fields (and the
+ * 12-1/12-2/5-3 normalizers pin theirs): the edit replay and the client
+ * correction's replay both serve through this.
+ */
+export function normalizeStoredSku(stored: SkuSnapshot): SkuSnapshot {
+  const legacy = stored as SkuSnapshot & {
+    storageClass?: string;
+    hazardClass?: string | null;
+    abcClass?: string | null;
+    shelfLifeDays?: number | null;
+    barcodes?: readonly SkuBarcodeView[];
+  };
+  return {
+    ...legacy,
+    storageClass: legacy.storageClass ?? 'ambient',
+    hazardClass: legacy.hazardClass ?? null,
+    abcClass: legacy.abcClass ?? null,
+    shelfLifeDays: legacy.shelfLifeDays ?? null,
+    barcodes: legacy.barcodes ?? [],
+  };
+}
+
+/** Story 1-4 — the create's and the packaging PUT's response (and idempotency snapshot). */
+export interface SkuWriteSnapshot {
+  readonly sku: SkuSnapshot;
+}
+
+/** Story 1-4 — one pack level as a command receives it (uom spelled as sent). */
+export interface PackLevelInput {
+  readonly uom: string;
+  readonly factor: number;
+}
+
+/** Story 1-4 — one non-primary barcode as a command receives it. */
+export interface ExtraBarcodeInput {
+  readonly barcode: string;
+  readonly uom: string;
+}
+
+/** Story 1-4 — `POST …/catalog/skus`: one import row's worth of fields, typed. */
+export interface CreateSkuCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly code: string;
+  readonly name: string;
+  readonly uom: string;
+  readonly gstRateBps: number;
+  readonly hsn?: string | undefined;
+  readonly barcode?: string | undefined;
+  readonly batchTracked: boolean;
+  readonly serialTracked: boolean;
+  readonly catchWeightTracked: boolean;
+  readonly weightGrams?: number | undefined;
+  readonly lengthMm?: number | undefined;
+  readonly widthMm?: number | undefined;
+  readonly heightMm?: number | undefined;
+  readonly countryOfOrigin?: string | undefined;
+  readonly storageClass?: string | undefined;
+  readonly hazardClass?: string | undefined;
+  readonly abcClass?: string | undefined;
+  readonly reorderPoint?: number | undefined;
+  readonly reorderQty?: number | undefined;
+  readonly shelfLifeDays?: number | undefined;
+  readonly clientId?: string | undefined;
+  readonly levels?: readonly PackLevelInput[] | undefined;
+  readonly barcodes?: readonly ExtraBarcodeInput[] | undefined;
+}
+
+/** Story 1-4 — `PUT …/catalog/skus/{skuId}/packaging`. */
+export interface ReplacePackagingCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly skuId: string;
+  readonly levels: readonly PackLevelInput[];
+  /** Every NON-primary barcode the SKU should carry afterwards. */
+  readonly barcodes: readonly ExtraBarcodeInput[];
 }
 
 export interface EditSkuCommand {
@@ -219,15 +352,23 @@ export interface EditSkuCommand {
    * other class validators.
    */
   readonly abcClass?: string | null | undefined;
+  /**
+   * Story 1-4 — total shelf life in days from manufacture (1–3650). Absent =
+   * unchanged, null = clear. Joins the hash only when present (the spread).
+   */
+  readonly shelfLifeDays?: number | null | undefined;
 }
 
 /**
- * SKU list + edit (Story 1.4). Manual creation is out of scope per planning —
- * catalog entries enter through the import only, then are edited via PATCH.
- * The list is keyset-paginated on (created_at, id); the edit updates only the
- * PATCH fields (SKU code is immutable) and re-checks barcode uniqueness per
- * tenant (409 `duplicate-barcode` naming the conflicting SKU). Idempotency
- * de-dupe in the same transaction (AD-5).
+ * SKU list, create, edit and packaging. Story 1-4 adds the single-SKU create
+ * (`create` — the import's typed rules through `sku-master.ts`) and the
+ * packaging PUT (`replacePackaging` — pack levels and the non-primary
+ * barcodes). The list is keyset-paginated on (created_at, id); the edit
+ * updates only the PATCH fields (SKU code and uom are immutable).
+ * `sku_barcodes` is the barcode-uniqueness authority per (tenant, client):
+ * every writer of `skus.barcode` keeps the primary row in step in its
+ * transaction. Lock order: product → skus → sku_barcodes. Idempotency de-dupe
+ * in the same transaction (AD-5).
  */
 @Injectable()
 export class SkuCommand {
@@ -250,7 +391,7 @@ export class SkuCommand {
     const before = cursor === undefined ? undefined : decodeCursorSafe(cursor);
     // Page + conversions in one tenant-scoped transaction (RLS session state
     // set once; both queries app-filter on tenant_id as the authority).
-    const { rows, conversions } = await withTenantTransaction(this.db, tenantId, async (tx) => {
+    const { rows, packaging } = await withTenantTransaction(this.db, tenantId, async (tx) => {
       // Story 11.3: the optional product filter — the variants of ONE product
       // (the 11-6 matrix's data source), still keyset-paginated on the same
       // (created_at, id) sort.
@@ -272,34 +413,327 @@ export class SkuCommand {
         .orderBy(desc(skus.createdAt), desc(skus.id))
         .limit(pageSize + 1);
       const pageRows = skuRows.slice(0, pageSize);
-      const conversionRows =
-        pageRows.length === 0
-          ? []
-          : await tx
-              .select({ skuId: uomConversions.skuId, uom: uomConversions.uom, factor: uomConversions.factor })
-              .from(uomConversions)
-              .where(
-                and(
-                  eq(uomConversions.tenantId, tenantId),
-                  inArray(uomConversions.skuId, pageRows.map((row) => row.id)),
-                ),
-              );
-      return { rows: skuRows, conversions: conversionRows };
+      // Story 1-4 — the page's pack levels and barcodes, two batched reads.
+      const packagingBySku = await readPackagingInTx(tx, tenantId, pageRows.map((row) => row.id));
+      return { rows: skuRows, packaging: packagingBySku };
     });
     const page = buildPage(rows.map(toSnapshot), pageSize);
     if (page.items.length === 0) {
       return { items: [], nextCursor: page.nextCursor };
     }
-    const bySku = new Map<string, { uom: string; factor: number }[]>();
-    for (const row of conversions) {
-      const list = bySku.get(row.skuId) ?? [];
-      list.push({ uom: row.uom, factor: row.factor });
-      bySku.set(row.skuId, list);
-    }
     return {
-      items: page.items.map((item) => ({ ...item, uomConversions: bySku.get(item.id) ?? [] })),
+      items: page.items.map((item) => ({
+        ...item,
+        uomConversions: packaging.get(item.id)?.levels ?? [],
+        barcodes: packaging.get(item.id)?.barcodes ?? [],
+      })),
       nextCursor: page.nextCursor,
     };
+  }
+
+  /**
+   * Story 1-4 — `POST …/catalog/skus`: one SKU, created with one import
+   * row's worth of typed fields (pack levels and barcodes included) in one
+   * keyed transaction. The import's rules through the shared seam
+   * (`sku-master.ts`, `sku-attributes.ts`, the class validators, `resolveUom`
+   * with its aliases); the client is the import's rule exactly — omitted only
+   * while the tenant has one client (then its `self`), else 400
+   * `client-required`. Same-key concurrent creates: the loser hits the code
+   * index and answers 409 `duplicate-sku-code` rather than replaying
+   * (accepted — PENDING, cross-cutting).
+   */
+  async create(command: CreateSkuCommand, idempotencyKey: string): Promise<SkuWriteSnapshot> {
+    // 0. Request-SHAPE checks above the transaction (the DTO mirrors them).
+    const code = typeof command.code === 'string' ? command.code.trim() : '';
+    if (code === '' || code.length > SKU_CODE_MAX) {
+      throw new ProblemException('validation-failed', 400, 'Invalid SKU code', `code must be 1–${SKU_CODE_MAX} characters.`);
+    }
+    const name = typeof command.name === 'string' ? command.name.trim() : '';
+    if (name === '' || name.length > SKU_NAME_MAX) {
+      throw new ProblemException('validation-failed', 400, 'Invalid SKU name', `name must be 1–${SKU_NAME_MAX} characters.`);
+    }
+    const blankToUndefined = (value: string | undefined): string | undefined => {
+      const trimmed = value?.trim();
+      return trimmed === undefined || trimmed === '' ? undefined : trimmed;
+    };
+    const hsn = blankToUndefined(command.hsn);
+    const barcode = blankToUndefined(command.barcode);
+    const countryOfOrigin = blankToUndefined(command.countryOfOrigin);
+    const packaging = canonicalPackaging(command.levels, command.barcodes);
+
+    // 1. The hash — fixed key order, collections canonicalised (levels by
+    //    uom, barcodes by (uom, barcode)); `clientId` only when present (the
+    //    21-2b conditional-key precedent).
+    const payloadHash = hashCommandPayload({
+      command: 'sku.create',
+      tenantId: command.tenantId,
+      code,
+      name,
+      uom: String(command.uom).trim(),
+      gstRateBps: command.gstRateBps,
+      hsn: hsn ?? null,
+      barcode: barcode ?? null,
+      batchTracked: command.batchTracked,
+      serialTracked: command.serialTracked,
+      catchWeightTracked: command.catchWeightTracked,
+      weightGrams: command.weightGrams ?? null,
+      lengthMm: command.lengthMm ?? null,
+      widthMm: command.widthMm ?? null,
+      heightMm: command.heightMm ?? null,
+      countryOfOrigin: countryOfOrigin ?? null,
+      storageClass: command.storageClass ?? null,
+      hazardClass: command.hazardClass ?? null,
+      abcClass: command.abcClass ?? null,
+      reorderPoint: command.reorderPoint ?? null,
+      reorderQty: command.reorderQty ?? null,
+      shelfLifeDays: command.shelfLifeDays ?? null,
+      levels: packaging.levels,
+      barcodes: packaging.barcodes,
+      ...(command.clientId === undefined ? {} : { clientId: command.clientId }),
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      // 2. Authority first.
+      assertPermission(await this.tenancy.getMemberRole(command.tenantId, command.actorUserId, tx), 'sku.edit');
+      // 3. Replay.
+      const replayed = await replaySkuWrite(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) return replayed;
+
+      // 4. The client — the import's rule exactly (decision 6).
+      let clientId: string;
+      if (command.clientId !== undefined) {
+        if (!UUID_RE.test(command.clientId)) {
+          throw new ProblemException('validation-failed', 400, 'Invalid client reference', 'clientId must be a uuid.');
+        }
+        await assertClientInTenantInTx(tx, command.tenantId, command.clientId);
+        clientId = command.clientId;
+      } else if ((await listClientsInTx(tx, command.tenantId)).length > 1) {
+        throw clientRequired('SKU');
+      } else {
+        clientId = await ensureSelfClientInTx(tx, command.tenantId);
+      }
+      await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
+
+      // 5. The typed rules, behind the replay lookup (the 10.2 rule).
+      const uom = resolveUom(String(command.uom));
+      if (uom === null) {
+        throw new ProblemException('validation-failed', 400, 'Unknown unit of measure', unknownUomDetail('uom', String(command.uom)));
+      }
+      assertGstRateBps(command.gstRateBps);
+      if (hsn !== undefined && hsn.length > HSN_MAX) {
+        throw new ProblemException('validation-failed', 400, 'Invalid HSN', `hsnCode must be at most ${HSN_MAX} characters.`);
+      }
+      if (command.serialTracked && isFractionalUom(uom)) {
+        throw new ProblemException('validation-failed', 400, 'Serial tracking needs a whole-unit UoM', serialTrackedFractionalUomDetail(uom));
+      }
+      if (command.serialTracked && command.catchWeightTracked) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'A SKU cannot be both catch-weight and serial tracked',
+          `SKU "${code}" would be both serial-tracked and catch-weight tracked. Both systems claim to identify the same physical unit — a serial from the ledger, a handling unit from its own row — and nothing decides which one a scan names. Pick one.`,
+        );
+      }
+      assertSkuAttributes({
+        weightGrams: command.weightGrams,
+        lengthMm: command.lengthMm,
+        widthMm: command.widthMm,
+        heightMm: command.heightMm,
+        countryOfOrigin,
+      });
+      assertStorageClass({ storageClass: command.storageClass });
+      assertHazardClass({ hazardClass: command.hazardClass });
+      assertAbcClass({ abcClass: command.abcClass });
+      assertShelfLifeDays(command.shelfLifeDays);
+      const precision = uomPrecision(uom);
+      const reorderPointMilli =
+        command.reorderPoint === undefined ? 0 : assertRecordableQuantity(command.reorderPoint, 'reorderPoint', uom, precision);
+      const reorderQtyMilli =
+        command.reorderQty === undefined ? 0 : assertRecordableQuantity(command.reorderQty, 'reorderQty', uom, precision);
+      // A blank barcode gets the import's generated value.
+      const primary = barcode ?? uuidv7();
+      assertBarcodeRule(primary, 'barcode');
+      const levels = validateLevels(uom, command.levels ?? []);
+      const extras = validateExtraBarcodes(uom, levels, primary, command.barcodes ?? []);
+
+      // 6. Uniqueness in the client: the code, the code against the client's
+      //    barcodes (decision 13), every barcode against `sku_barcodes` and
+      //    the client's codes (this SKU's own code included).
+      const takenCode = await tx
+        .select({ id: skus.id })
+        .from(skus)
+        .where(and(eq(skus.tenantId, command.tenantId), eq(skus.clientId, clientId), eq(skus.code, code)))
+        .limit(1);
+      if (takenCode[0] !== undefined) {
+        throw duplicateSkuCodeProblem(code);
+      }
+      const codeAsBarcode = await tx
+        .select({ holder: skus.code })
+        .from(skuBarcodes)
+        .innerJoin(skus, eq(skus.id, skuBarcodes.skuId))
+        .where(and(eq(skuBarcodes.tenantId, command.tenantId), eq(skuBarcodes.clientId, clientId), eq(skuBarcodes.barcode, code)))
+        .limit(1);
+      if (codeAsBarcode[0] !== undefined) {
+        throw barcodeIsCode(code, code);
+      }
+      await assertBarcodesFreeInTx(tx, command.tenantId, clientId, [primary, ...extras.map((entry) => entry.barcode)], {
+        ownCode: code,
+      });
+
+      // 7. The writes: the SKU, its primary barcode row, its levels and extras.
+      let row: typeof skus.$inferSelect;
+      try {
+        const inserted = await tx
+          .insert(skus)
+          .values({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            clientId,
+            code,
+            name,
+            uom,
+            gstRateBps: command.gstRateBps,
+            hsn: hsn ?? null,
+            batchTracked: command.batchTracked,
+            serialTracked: command.serialTracked,
+            catchWeightTracked: command.catchWeightTracked,
+            weightGrams: command.weightGrams ?? null,
+            lengthMm: command.lengthMm ?? null,
+            widthMm: command.widthMm ?? null,
+            heightMm: command.heightMm ?? null,
+            countryOfOrigin: countryOfOrigin ?? null,
+            reorderPoint: reorderPointMilli,
+            reorderQty: reorderQtyMilli,
+            barcode: primary,
+            storageClass: command.storageClass ?? 'ambient',
+            hazardClass: command.hazardClass ?? null,
+            abcClass: command.abcClass ?? null,
+            shelfLifeDays: command.shelfLifeDays ?? null,
+          })
+          .returning();
+        row = inserted[0]!;
+        await writePrimaryBarcodeInTx(tx, row);
+        await replacePackagingInTx(tx, row, levels, extras);
+      } catch (err) {
+        if (isUniqueViolationOn(err, SKUS_TENANT_CODE)) throw duplicateSkuCodeProblem(code);
+        if (isBarcodeViolation(err)) {
+          throw duplicateBarcodeProblem('A barcode of this SKU was taken by a concurrent write in this client — retry to see which.');
+        }
+        throw err;
+      }
+      const snapshot: SkuWriteSnapshot = { sku: await withPackaging(tx, command.tenantId, row) };
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId: command.tenantId,
+        type: 'catalog.sku_created',
+        occurredAt: nowIso(),
+        payload: { skuId: row.id, code: row.code, clientId },
+      });
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'sku.created',
+        targetType: 'sku',
+        targetId: row.id,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
+      await storeKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /**
+   * Story 1-4 — `PUT …/catalog/skus/{skuId}/packaging`: replaces the SKU's
+   * pack levels (`uom_conversions`) and its NON-primary barcodes. Skeleton:
+   * the SKU row `FOR UPDATE` → the replay again under the lock → the guards
+   * → delete-and-insert. Equal sets (in any order) are the no-op arm
+   * `skus.packaging:unchanged`: the key is stored with `{ sku }`, nothing
+   * else is written or audited. Kit SKUs take packaging like any SKU.
+   */
+  async replacePackaging(command: ReplacePackagingCommand, idempotencyKey: string): Promise<SkuWriteSnapshot> {
+    const packaging = canonicalPackaging(command.levels, command.barcodes);
+    const payloadHash = hashCommandPayload({
+      command: 'sku.packaging',
+      tenantId: command.tenantId,
+      skuId: command.skuId,
+      levels: packaging.levels,
+      barcodes: packaging.barcodes,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await this.tenancy.getMemberRole(command.tenantId, command.actorUserId, tx), 'sku.edit');
+      const replayed = await replaySkuWrite(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) return replayed;
+
+      if (!UUID_RE.test(command.skuId)) throw skuNotFound();
+      // Lock, 404 when absent — and nothing else (guide §1: a lock helper
+      // never checks state, or the second replay is unreachable).
+      const locked = await tx
+        .select()
+        .from(skus)
+        .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
+        .limit(1)
+        .for('update');
+      const replayedUnderLock = await replaySkuWrite(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) return replayedUnderLock;
+      const sku = locked[0];
+      if (sku === undefined) throw skuNotFound();
+
+      // The guards, against the locked row.
+      const levels = validateLevels(sku.uom, command.levels);
+      const extras = validateExtraBarcodes(sku.uom, levels, sku.barcode, command.barcodes);
+      await assertClientTakesWorkInTx(tx, command.tenantId, sku.clientId);
+
+      // The no-op arm: both sets equal to the stored ones.
+      const stored = (await readPackagingInTx(tx, command.tenantId, [sku.id])).get(sku.id)!;
+      const sameLevels =
+        JSON.stringify(sortLevels(stored.levels).map((l) => [l.uom, l.factor])) ===
+        JSON.stringify(sortLevels(levels).map((l) => [l.uom, l.factor]));
+      const sameBarcodes =
+        JSON.stringify(sortBarcodes(stored.barcodes.filter((b) => !b.isPrimary)).map((b) => [b.uom, b.barcode])) ===
+        JSON.stringify(sortBarcodes(extras).map((b) => [b.uom, b.barcode]));
+      if (sameLevels && sameBarcodes) {
+        const unchanged: SkuWriteSnapshot = { sku: await withPackaging(tx, command.tenantId, sku) };
+        await storeKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
+        return unchanged;
+      }
+
+      await assertBarcodesFreeInTx(tx, command.tenantId, sku.clientId, extras.map((entry) => entry.barcode), {
+        exceptSkuId: sku.id,
+        ownCode: sku.code,
+      });
+      try {
+        await replacePackagingInTx(tx, sku, levels, extras);
+      } catch (err) {
+        if (isBarcodeViolation(err)) {
+          throw duplicateBarcodeProblem('A barcode in this request was taken by a concurrent write in this client — retry to see which.');
+        }
+        throw err;
+      }
+      await tx.update(skus).set({ updatedAt: nowIso() }).where(eq(skus.id, sku.id));
+      const snapshot: SkuWriteSnapshot = { sku: await withPackaging(tx, command.tenantId, sku) };
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId: command.tenantId,
+        type: 'catalog.sku_edited',
+        occurredAt: nowIso(),
+        payload: { skuId: sku.id, code: sku.code },
+      });
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'sku.packaging_replaced',
+        targetType: 'sku',
+        targetId: sku.id,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
+      await storeKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
   }
 
   async edit(command: EditSkuCommand, idempotencyKey: string): Promise<SkuSnapshot> {
@@ -335,13 +769,16 @@ export class SkuCommand {
       hazardClass: command.hazardClass,
       // Story 5-3 — the ABC class counts too (null = clear, a real value).
       abcClass: command.abcClass,
+      // Story 1-4 — shelf life counts too (null = clear); `undefined` drops
+      // out of the spread hash, so a pre-1.4 body hashes as before.
+      shelfLifeDays: command.shelfLifeDays,
     };
     if (Object.values(fields).every((value) => value === undefined)) {
       throw new ProblemException(
         'validation-failed',
         400,
         'Empty SKU edit',
-        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass, hazardClass, abcClass is required.',
+        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass, hazardClass, abcClass, shelfLifeDays is required.',
       );
     }
     // ── story 11.2: this hash did NOT break ──────────────────────────────────
@@ -379,54 +816,73 @@ export class SkuCommand {
           'sku.edit',
         );
 
-        const existing = await tx
-          .select()
-          .from(idempotencyKeys)
-          .where(
-            and(
-              eq(idempotencyKeys.tenantId, command.tenantId),
-              eq(idempotencyKeys.key, idempotencyKey),
-            ),
-          )
-          .limit(1);
-        if (existing[0]) {
-          if (existing[0].payloadHash !== payloadHash) {
-            throw idempotencyKeyReuse();
-          }
-          // Story 12-1 (code review): a snapshot stored by a pre-12.1 build
-          // has no `storageClass` — the column did not exist. Serve the
-          // migration DEFAULT the way `normalizeBin` serves the bins'
-          // (`?? 'ambient'`), so a replayed legacy key still satisfies the
-          // required `SkuResponse` field instead of omitting it. Story 12-2:
-          // the same normalizer pins `hazardClass` (nullable, so absence
-          // normalizes to null — the `?? 'ambient'` pattern's nullable
-          // twin).
-          const stored = existing[0].responseSnapshot as SkuSnapshot & {
-            storageClass?: string;
-            hazardClass?: string | null;
-            abcClass?: string | null;
-          };
-          return {
-            snapshot: {
-              ...stored,
-              storageClass: stored.storageClass ?? 'ambient',
-              hazardClass: stored.hazardClass ?? null,
-              // Story 5-3: the same normalizer pins `abcClass` (nullable, so
-              // absence normalizes to null — the hazardClass twin).
-              abcClass: stored.abcClass ?? null,
-            },
-            replayed: true,
-          };
+        // Story 12-1 (code review): a snapshot stored by a pre-12.1 build
+        // has no `storageClass` — the column did not exist. Serve the
+        // migration DEFAULT the way `normalizeBin` serves the bins'
+        // (`?? 'ambient'`); 12-2 / 5-3 pin `hazardClass` / `abcClass` the
+        // same way, and 1-4 `shelfLifeDays ?? null` / `barcodes ?? []`
+        // (`normalizeStoredSku`).
+        const replayed = await replaySku(tx, command.tenantId, idempotencyKey, payloadHash);
+        if (replayed !== null) {
+          return { snapshot: replayed, replayed: true };
         }
 
-        const currentRows = await tx
+        const unlockedRows = await tx
           .select()
           .from(skus)
           .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
           .limit(1);
-        const current = currentRows[0];
+        const unlocked = unlockedRows[0];
+        if (!unlocked) {
+          throw skuNotFound();
+        }
+        // ── Story 1-4: lock order product → skus → sku_barcodes. The attach
+        // (and the re-value) lock the product row BEFORE the SKU row, the
+        // client correction's order — the arms below re-read it under the
+        // lock they already hold. Then the SKU row `FOR UPDATE` (the flag
+        // guard, the barcode writer and the class arms all decide against
+        // it), then the replay again UNDER the lock (the same-key race fix,
+        // guide §1): a parked same-key duplicate re-serves the winner.
+        const productToLock =
+          fields.productId !== undefined
+            ? fields.productId !== null && UUID_RE.test(fields.productId)
+              ? fields.productId
+              : null
+            : fields.variantValues !== undefined && fields.variantValues !== null
+              ? unlocked.productId
+              : null;
+        if (productToLock !== null) {
+          await tx
+            .select({ id: products.id })
+            .from(products)
+            .where(and(eq(products.id, productToLock), eq(products.tenantId, command.tenantId)))
+            .limit(1)
+            .for('update');
+        }
+        const lockedSkuRows = await tx
+          .select()
+          .from(skus)
+          .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
+          .limit(1)
+          .for('update');
+        const replayedUnderLock = await replaySku(tx, command.tenantId, idempotencyKey, payloadHash);
+        if (replayedUnderLock !== null) {
+          return { snapshot: replayedUnderLock, replayed: true };
+        }
+        const current = lockedSkuRows[0];
         if (!current) {
           throw skuNotFound();
+        }
+        // The re-value arm locked the product the SKU carried BEFORE its lock;
+        // a concurrent attach/detach in between leaves us holding the wrong
+        // product — refuse rather than decide against it.
+        if (fields.productId === undefined && productToLock !== null && current.productId !== productToLock) {
+          throw new ProblemException(
+            'conflict',
+            409,
+            'The SKU\'s product changed during the edit',
+            'A concurrent edit attached or detached this SKU while it was being re-valued — retry.',
+          );
         }
 
         // Story 11.2: the physical attributes are validated HERE — behind the
@@ -451,6 +907,12 @@ export class SkuCommand {
         // `hazardClass` shape; absent/null skip, a present value must be in
         // the vocabulary).
         assertAbcClass({ abcClass: fields.abcClass });
+        // Story 1-4 — shelf life 1–3650 (null clears), and the barcode rule
+        // (decision 12) — both behind the replay lookup.
+        assertShelfLifeDays(fields.shelfLifeDays);
+        if (fields.barcode !== undefined) {
+          assertBarcodeRule(fields.barcode, 'barcode');
+        }
 
         // ── Story 12-1: the class-change arm. The SKU row takes `.for('update')`
         // whenever the storage-class FIELD is present — a change, a no-op
@@ -458,9 +920,8 @@ export class SkuCommand {
         // against the other SKU-row lockers — the +stock writers per fix-a2 —
         // but NOT against placement/pick, which read the SKU unlocked; that
         // residual race is the recorded 12-1 currency, PENDING.md
-        // putaway:57); the guard BODY still runs only on a change. Every
-        // other arm sees the plain read (a non-class patch locks nothing,
-        // exactly as before).
+        // putaway:57); the guard BODY still runs only on a change. (Since 1-4 every edit
+        // holds the SKU row lock taken above; this re-lock is a no-op.)
         if (fields.storageClass !== undefined) {
           const newClass = fields.storageClass;
           const lockedRows = await tx
@@ -713,29 +1174,17 @@ export class SkuCommand {
             // axis (the I/O matrix's `Variant values mismatch` arm).
             assertVariantValues(product.axes, fields.variantValues);
             const values = normalizeVariantValues(fields.variantValues as Record<string, string>);
-            // Story 21-2b — a product's variants never span clients: the
-            // product's OTHER attached SKUs (read under the product lock
-            // above) must all belong to this SKU's client, or the attach is
-            // refused 409 `mixed-client` naming the codes.
-            const siblingClients = await tx
-              .selectDistinct({ clientId: skus.clientId })
-              .from(skus)
-              .where(
-                and(
-                  eq(skus.tenantId, command.tenantId),
-                  eq(skus.productId, product.id),
-                  ne(skus.id, command.skuId),
-                ),
-              );
-            await assertSingleClientInTx(
-              tx,
-              command.tenantId,
-              [current.clientId, ...siblingClients.map((row) => row.clientId)],
-              `Product "${product.name}"`,
-            );
+            // Story 1-4 (decision 3) — a product belongs to one client and
+            // its variants share it: a SKU of another client is refused 409
+            // `product-client-mismatch` (it replaced 21-2b's sibling-based
+            // `mixed-client` for products).
             // Story 1-2a — a departed client's SKU joins no product (409
-            // `client-departed`).
+            // `client-departed`) — decided first: departure outranks the
+            // product's client.
             await assertClientTakesWorkInTx(tx, command.tenantId, current.clientId);
+            if (product.clientId !== current.clientId) {
+              throw productClientMismatch(product.name, current.code);
+            }
             // Duplicate variants are refused: two SKUs in one product
             // carrying identical values is the 409 the I/O matrix names,
             // checked in-transaction (the repo's no-FK convention — a
@@ -871,6 +1320,34 @@ export class SkuCommand {
           }
         }
 
+        // ── Story 1-4 (decision 7): the tracking flags lock once stock
+        // exists. CHANGING (value differs from the locked row) batch, serial
+        // or catch-weight tracking while the SKU has stock in any bin
+        // (system bins included), a pending over-receipt or a pending
+        // positive adjustment is 409 `sku-has-stock` — each of those becomes
+        // stock without reading the flags again. Runs under the SKU lock
+        // taken above, after the catch-weight live-unit guard; a patch that
+        // sends the flags unchanged never reaches it.
+        const flagChanges = (
+          [
+            ['batch', fields.batchTracked, current.batchTracked],
+            ['serial', fields.serialTracked, current.serialTracked],
+            ['catch-weight', fields.catchWeightTracked, current.catchWeightTracked],
+          ] as const
+        ).filter(([, next, now]) => next !== undefined && next !== now);
+        if (flagChanges.length > 0) {
+          const holdings = await skuStockHoldingsInTx(tx, command.tenantId, command.skuId);
+          if (holdings.length > 0) {
+            throw new ProblemException(
+              'sku-has-stock',
+              409,
+              'Tracking cannot change while the SKU has stock',
+              `SKU "${current.code}" has ${holdings.join(', ')} — ${flagChanges.map(([flag]) => flag).join(' and ')} tracking ` +
+                'cannot change until that stock is gone; existing units were recorded under the current tracking.',
+            );
+          }
+        }
+
         // Story 10.2: the reorder thresholds are UoM-denominated, so they are
         // converted HERE — behind the replay lookup, with the SKU's unit in
         // hand — and a value finer than that unit declares is refused rather
@@ -886,25 +1363,40 @@ export class SkuCommand {
             ? undefined
             : assertRecordableQuantity(fields.reorderQty, 'reorderQty', current.uom, precision);
 
-        // Barcode uniqueness per (tenant, client) — story 1-1: another SKU OF
-        // THIS SKU'S CLIENT already holding the new barcode is a 409 naming
-        // it (the same conflict code the import reports row-level); another
-        // client's SKU may carry the same GTIN.
-        if (fields.barcode !== undefined && fields.barcode !== current.barcode) {
-          const collision = await tx
-            .select({ code: skus.code })
-            .from(skus)
+        // Barcode uniqueness per (tenant, client) — story 1-1, read from
+        // `sku_barcodes` since 1-4 (the one authority): another SKU of this
+        // client holding the new barcode at any level is a 409 naming it and
+        // its level; a barcode equal to a SKU code of the client (this SKU's
+        // own included) is 409 `barcode-is-code`. This SKU's own rows are
+        // excluded — an extra barcode of its own is PROMOTED below.
+        const barcodeChanges = fields.barcode !== undefined && fields.barcode !== current.barcode;
+        if (barcodeChanges) {
+          // Promotion only re-uses an extra BASE-level barcode: a case or
+          // pallet barcode promoted to primary would silently become one unit.
+          const ownExtra = await tx
+            .select({ uom: skuBarcodes.uom })
+            .from(skuBarcodes)
             .where(
               and(
-                eq(skus.tenantId, command.tenantId),
-                eq(skus.clientId, current.clientId),
-                eq(skus.barcode, fields.barcode),
+                eq(skuBarcodes.tenantId, command.tenantId),
+                eq(skuBarcodes.skuId, command.skuId),
+                eq(skuBarcodes.isPrimary, false),
+                eq(skuBarcodes.barcode, fields.barcode!),
               ),
             )
             .limit(1);
-          if (collision[0]) {
-            throw duplicateBarcode(fields.barcode, collision[0].code);
+          if (ownExtra[0] !== undefined && ownExtra[0].uom !== current.uom) {
+            throw new ProblemException(
+              'validation-failed',
+              400,
+              'A pack-level barcode cannot become the primary',
+              `Barcode "${fields.barcode}" is this SKU's ${ownExtra[0].uom} barcode — only an extra ${current.uom} (base-level) barcode can be promoted to primary. Remove it from the packaging first.`,
+            );
           }
+          await assertBarcodesFreeInTx(tx, command.tenantId, current.clientId, [fields.barcode!], {
+            exceptSkuId: command.skuId,
+            ownCode: current.code,
+          });
         }
 
         const updates: Partial<typeof skus.$inferInsert> = { updatedAt: nowIso() };
@@ -934,6 +1426,8 @@ export class SkuCommand {
         // Story 5-3 — absent = unchanged, null = clear (the hazardClass
         // twin; null = not yet classified, OQ-1).
         if (fields.abcClass !== undefined) updates.abcClass = fields.abcClass;
+        // Story 1-4 — absent = unchanged, null = clear.
+        if (fields.shelfLifeDays !== undefined) updates.shelfLifeDays = fields.shelfLifeDays;
         // Story 11.3 — the variant columns move only when the patch moved
         // them (`undefined` = untouched; `null` = cleared with the detach).
         if (setProductId !== undefined) updates.productId = setProductId;
@@ -945,7 +1439,23 @@ export class SkuCommand {
             .where(eq(skus.id, command.skuId))
             .returning();
           const updated = updatedRows[0]!;
-          const snapshot = await withConversions(tx, command.tenantId, updated);
+          if (barcodeChanges) {
+            // Story 1-4 — the primary row follows `skus.barcode` in this
+            // transaction. A value that was this SKU's extra barcode is
+            // promoted: its extra row goes, the primary row takes it.
+            await tx
+              .delete(skuBarcodes)
+              .where(
+                and(
+                  eq(skuBarcodes.tenantId, command.tenantId),
+                  eq(skuBarcodes.skuId, command.skuId),
+                  eq(skuBarcodes.isPrimary, false),
+                  eq(skuBarcodes.barcode, updated.barcode),
+                ),
+              );
+            await writePrimaryBarcodeInTx(tx, updated);
+          }
+          const snapshot = await withPackaging(tx, command.tenantId, updated);
           // In-transaction outbox append (AD-7, story outbox-relay) — replaces
           // the old post-commit publish. The `!replayed` gate of the old
           // post-commit publish is structural here: the idempotent replay
@@ -991,10 +1501,7 @@ export class SkuCommand {
           }
           return { snapshot, replayed: false };
         } catch (err) {
-          if (
-            isUniqueViolationOn(err, SKUS_TENANT_BARCODE) &&
-            !(err instanceof ProblemException)
-          ) {
+          if (isBarcodeViolation(err) && !(err instanceof ProblemException)) {
             // Concurrent writer won the barcode race between the pre-check and
             // the update; the transaction is aborted — retry replays cleanly.
             throw duplicateBarcode(fields.barcode ?? '', '');
@@ -1051,20 +1558,172 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     reorderQty: fromMilli(row.reorderQty),
     barcode: row.barcode,
     uomConversions: [],
+    // Story 1-4 — set from the row; the barcodes are stitched by the caller
+    // (`withPackaging`, the list's batched read).
+    shelfLifeDays: row.shelfLifeDays ?? null,
+    barcodes: [],
     createdAt: row.createdAt,
   };
 }
 
-export async function withConversions(
+/** One SKU's response shape with its pack levels and barcodes (two reads). */
+export async function withPackaging(
   tx: TenantTx,
   tenantId: string,
   row: typeof skus.$inferSelect,
 ): Promise<SkuSnapshot> {
-  const conversions = await tx
-    .select({ uom: uomConversions.uom, factor: uomConversions.factor })
-    .from(uomConversions)
-    .where(and(eq(uomConversions.tenantId, tenantId), eq(uomConversions.skuId, row.id)));
-  return { ...toSnapshot(row), uomConversions: conversions };
+  const packaging = (await readPackagingInTx(tx, tenantId, [row.id])).get(row.id);
+  return {
+    ...toSnapshot(row),
+    uomConversions: packaging?.levels ?? [],
+    barcodes: packaging?.barcodes ?? [],
+  };
+}
+
+/** A 23505 on either barcode index (story 1-4 D6: both are mapped everywhere). */
+export function isBarcodeViolation(err: unknown): boolean {
+  return isUniqueViolationOn(err, SKU_BARCODES_UNIQUE) || isUniqueViolationOn(err, SKUS_BARCODE_UNIQUE);
+}
+
+/** The stored response under a key, normalized; null when the key is new; 422 on a different payload. */
+async function replaySku(
+  tx: TenantTx,
+  tenantId: string,
+  idempotencyKey: string,
+  payloadHash: string,
+): Promise<SkuSnapshot | null> {
+  const existing = await tx
+    .select()
+    .from(idempotencyKeys)
+    .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+    .limit(1);
+  if (existing[0] === undefined) return null;
+  if (existing[0].payloadHash !== payloadHash) throw idempotencyKeyReuse();
+  return normalizeStoredSku(existing[0].responseSnapshot as SkuSnapshot);
+}
+
+/** The `{ sku }` envelope (create, packaging) under a key, normalized. */
+async function replaySkuWrite(
+  tx: TenantTx,
+  tenantId: string,
+  idempotencyKey: string,
+  payloadHash: string,
+): Promise<SkuWriteSnapshot | null> {
+  const existing = await tx
+    .select()
+    .from(idempotencyKeys)
+    .where(and(eq(idempotencyKeys.tenantId, tenantId), eq(idempotencyKeys.key, idempotencyKey)))
+    .limit(1);
+  if (existing[0] === undefined) return null;
+  if (existing[0].payloadHash !== payloadHash) throw idempotencyKeyReuse();
+  const stored = existing[0].responseSnapshot as SkuWriteSnapshot;
+  return { sku: normalizeStoredSku(stored.sku) };
+}
+
+async function storeKey(
+  tx: TenantTx,
+  tenantId: string,
+  idempotencyKey: string,
+  payloadHash: string,
+  snapshot: unknown,
+): Promise<void> {
+  try {
+    await tx.insert(idempotencyKeys).values({
+      id: uuidv7(),
+      tenantId,
+      key: idempotencyKey,
+      payloadHash,
+      responseSnapshot: snapshot,
+    });
+  } catch (err) {
+    if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
+      throw new ProblemException(
+        'conflict',
+        409,
+        'Concurrent idempotent request',
+        'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * Story 1-4 (decision 7) — what makes a SKU "have stock" for the tracking
+ * flags: on-hand ≠ 0 in ANY bin (the system bins — Receiving, QC-HOLD,
+ * IN-TRANSIT — included), a pending over-receipt, a pending positive stock
+ * adjustment. Each becomes stock later without re-reading the flags. Empty
+ * when the SKU holds none of them; otherwise one phrase per kind.
+ */
+export async function skuStockHoldingsInTx(tx: TenantTx, tenantId: string, skuId: string): Promise<string[]> {
+  const found: string[] = [];
+  const onHand = await tx
+    .select({ one: stockOnHand.skuId })
+    .from(stockOnHand)
+    .where(and(eq(stockOnHand.tenantId, tenantId), eq(stockOnHand.skuId, skuId), ne(stockOnHand.quantity, 0)))
+    .limit(1);
+  if (onHand.length > 0) found.push('stock on hand');
+  const pendingExcess = await tx
+    .select({ one: overReceipts.skuId })
+    .from(overReceipts)
+    .where(and(eq(overReceipts.tenantId, tenantId), eq(overReceipts.skuId, skuId), eq(overReceipts.status, 'pending')))
+    .limit(1);
+  if (pendingExcess.length > 0) found.push('a pending over-receipt');
+  const pendingAdjustment = await tx
+    .select({ one: stockAdjustmentPendings.skuId })
+    .from(stockAdjustmentPendings)
+    .where(
+      and(
+        eq(stockAdjustmentPendings.tenantId, tenantId),
+        eq(stockAdjustmentPendings.skuId, skuId),
+        eq(stockAdjustmentPendings.status, 'pending'),
+        gt(stockAdjustmentPendings.quantityMilli, 0),
+      ),
+    )
+    .limit(1);
+  if (pendingAdjustment.length > 0) found.push('a pending stock adjustment');
+  return found;
+}
+
+export function duplicateSkuCodeProblem(code: string): ProblemException {
+  return new ProblemException(
+    'duplicate-sku-code',
+    409,
+    'SKU code already in use',
+    `SKU code "${code}" already exists in this client's catalog — duplicates are rejected, never merged.`,
+  );
+}
+
+/** The import's rule (21-2b), shared by the SKU and product creates (story 1-4 decision 6). */
+export function clientRequired(subject: 'SKU' | 'product'): ProblemException {
+  return new ProblemException(
+    'client-required',
+    400,
+    'Choose the client',
+    `This tenant holds more than one client, so a ${subject} create must name the client it belongs to (clientId) — there is no default.`,
+  );
+}
+
+export function productClientMismatch(productName: string, skuCode: string): ProblemException {
+  return new ProblemException(
+    'product-client-mismatch',
+    409,
+    'The product belongs to another client',
+    `Product "${productName}" belongs to another client than SKU "${skuCode}" — a product's variants share its client.`,
+  );
+}
+
+/** Story 1-4 — the packaging hash's canonical order: levels by uom, barcodes by (uom, barcode). */
+function canonicalPackaging(
+  levels: readonly PackLevelInput[] | undefined,
+  barcodes: readonly ExtraBarcodeInput[] | undefined,
+): { levels: { uom: string; factor: number }[]; barcodes: { barcode: string; uom: string }[] } {
+  return {
+    levels: sortLevels((levels ?? []).map((level) => ({ uom: String(level.uom).trim(), factor: level.factor }))),
+    barcodes: sortBarcodes(
+      (barcodes ?? []).map((entry) => ({ barcode: String(entry.barcode).trim(), uom: String(entry.uom).trim() })),
+    ).map((entry) => ({ barcode: entry.barcode, uom: entry.uom })),
+  };
 }
 
 export function duplicateBarcode(barcode: string, conflictingCode: string): ProblemException {

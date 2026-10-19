@@ -712,6 +712,26 @@ export class CatalogSnapshotQuery {
   warehouseId!: string;
 }
 
+/**
+ * Story 1-4 — one non-primary barcode of a snapshot SKU: a pack level's
+ * barcode (a case, a pallet) or an extra base-level barcode (factor 1).
+ */
+export class CatalogSnapshotPackBarcodeDto {
+  @ApiProperty({ example: '8901234567890' })
+  barcode!: string;
+
+  @ApiProperty({ example: 'case', enum: [...UOMS], description: 'The level this barcode names — the SKU\'s base uom, or one of its pack levels' })
+  uom!: string;
+
+  @ApiProperty({
+    example: 12,
+    minimum: 1,
+    description:
+      'Base units one scan of this barcode counts: the pack level\'s factor, or 1 at the base uom. The handheld adds it on receive, returns and pack; pick and putaway accept the barcode as SKU confirmation only.',
+  })
+  factor!: number;
+}
+
 /** One SKU of the device snapshot's barcode map. */
 export class CatalogSnapshotSkuDto {
   @ApiProperty({ format: 'uuid' })
@@ -782,6 +802,13 @@ export class CatalogSnapshotSkuDto {
       'Story 1-1: the client the SKU belongs to. Code and barcode are unique per (tenant, client), so one barcode may name several SKUs; the device resolves a scan through the work\'s own SKUs first, then the document\'s client (`clients` names each)',
   })
   clientId!: string;
+
+  @ApiProperty({
+    type: [CatalogSnapshotPackBarcodeDto],
+    description:
+      'Story 1-4: every non-primary barcode of the SKU with its level and factor (1 at the base uom). Empty when the SKU has none; an older device ignores it.',
+  })
+  packBarcodes!: CatalogSnapshotPackBarcodeDto[];
 }
 
 /**
