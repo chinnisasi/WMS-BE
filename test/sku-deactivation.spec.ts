@@ -359,6 +359,7 @@ describe('story 1-4b: SKU deactivation', () => {
         'PUB,Published SKU,pcs,1800,,,',
         'RO,Reorder SKU,pcs,1800,,,',
         'RMA,Returned SKU,pcs,1800,,,',
+        'SPO,Suggested-PO SKU,pcs,1800,,,',
       ],
       acme,
     ).expect(201);
@@ -649,6 +650,20 @@ describe('story 1-4b: SKU deactivation', () => {
       );
     });
 
+    it('an ASN-line receipt of the inactive SKU keeps receiving, unflagged', async () => {
+      const ina = asn.lines.find((line) => line.skuId === sku('INA'))!;
+      const res = await receive({
+        poId: null,
+        asnId: asn.id,
+        blindReasonCode: null,
+        lines: [grnLine(sku('INA'), 2, { poLineId: null, asnLineId: ina.id })],
+      }).expect(201);
+      expect(res.body.goodsReceipt.lines[0]).toMatchObject({ skuId: sku('INA'), appliedQty: 2, asnLineId: ina.id });
+      expect(res.body.goodsReceipt.unmatchedLines).toBeUndefined();
+      expect(res.body.goodsReceipt.inactiveSkuReviewOpId).toBeUndefined();
+      expect(await sql`select 1 from rejected_ops where tenant_id = ${tenantId} and op_type = 'grn.inactive-sku-received' and payload->>'grnId' = ${res.body.goodsReceipt.id}`).toHaveLength(0);
+    });
+
     it('the portal: portal/skus leaves out inactive SKUs, and an announce naming one is 409 sku-inactive', async () => {
       const portal = await invite('client', acme);
       const skus = await http().get(`${API}/${tenantId}/portal/skus`).query({ limit: 100 }).set('Authorization', `Bearer ${portal.token}`).expect(200);
@@ -680,19 +695,30 @@ describe('story 1-4b: SKU deactivation', () => {
       ]);
     });
 
-    it('the deactivate-vs-PO-create lock race: a PO create parked behind a committing deactivation is refused sku-inactive', async () => {
+    it('the deactivate-vs-PO-create lock race: the real status PATCH queues behind a PO create\'s KEY SHARE, and a PO create behind it reads inactive', async () => {
+      // The holder plays an in-flight PO create: the guard's FOR KEY SHARE on
+      // the SKU row. The status PATCH must park on it (its FOR UPDATE
+      // conflicts; a plain UPDATE would not take a lock that waits). Once the
+      // holder commits, the PATCH commits, and a PO create that reads after
+      // it is refused. (A second KEY SHARE is compatible with the holder's,
+      // so a concurrent PO create does not queue behind the parked PATCH.)
       const holder = handle();
+      let patched: Promise<request.Response> | undefined;
       let created: Promise<request.Response> | undefined;
       try {
         await holder.begin(async (tx) => {
-          const locked = (await tx`select pg_backend_pid() as pid from skus where id = ${sku('ACT3')} for update`) as unknown as { pid: number }[];
-          created = (async () => createPo([{ skuId: sku('ACT3'), orderedQty: 1 }]))();
+          const locked = (await tx`select pg_backend_pid() as pid from skus where id = ${sku('ACT3')} for key share`) as unknown as { pid: number }[];
+          patched = (async () => setSkuStatus(sku('ACT3'), { status: 'inactive' }))();
           await waitParked('skus', locked[0]!.pid, 1);
-          await tx`update skus set status = 'inactive' where id = ${sku('ACT3')}`;
+          // Still parked while the holder's transaction stays open.
+          await new Promise((r) => setTimeout(r, 200));
+          await waitParked('skus', locked[0]!.pid, 1);
         });
-        expectProblem(await created!, 409, 'sku-inactive');
+        expect((await patched!).status).toBe(200);
+        created = (async () => createPo([{ skuId: sku('ACT3'), orderedQty: 1 }]))();
+        expectProblem(await created, 409, 'sku-inactive');
       } finally {
-        await Promise.allSettled([created]);
+        await Promise.allSettled([patched, created]);
         await holder.end();
       }
       await setSkuStatus(sku('ACT3'), { status: 'active' }).expect(200);
@@ -1042,6 +1068,26 @@ describe('story 1-4b: SKU deactivation', () => {
       expect((await sql<{ status: string }[]>`select status from suggested_pos where tenant_id = ${tenantId} and sku_id = ${sku('RO')}`).map((row) => row.status)).toEqual(['dismissed']);
       await sweep.sweepScope(tenantId, warehouseId);
       expect(await sql`select 1 from reorder_breaches where tenant_id = ${tenantId} and sku_id = ${sku('RO')} and status = 'open'`).toHaveLength(0);
+    });
+
+    it('a suggested-PO submit for a SKU deactivated since its draft: 409 sku-inactive, the draft stays a draft, no PO', async () => {
+      await sql`update skus set reorder_point = 5000 where id = ${sku('SPO')}`;
+      await app.get(ReplenishmentSweep).sweepScope(tenantId, warehouseId);
+      const drafts = await sql<{ id: string; status: string }[]>`select id, status from suggested_pos where tenant_id = ${tenantId} and sku_id = ${sku('SPO')}`;
+      expect(drafts.map((row) => row.status)).toEqual(['draft']);
+      await deactivate('SPO');
+      // Before any sweep runs.
+      const before = (await sql`select count(*)::int as n from purchase_orders where tenant_id = ${tenantId}`) as unknown as { n: number }[];
+      const res = await http()
+        .post(`${API}/${tenantId}/replenishment/suggested-pos/${drafts[0]!.id}/submit`)
+        .set('Authorization', `Bearer ${opsToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ vendorId });
+      expectProblem(res, 409, 'sku-inactive');
+      expect(res.body.skuCodes).toEqual(['SPO']);
+      expect((await sql<{ status: string }[]>`select status from suggested_pos where id = ${drafts[0]!.id}`)[0]!.status).toBe('draft');
+      const after = (await sql`select count(*)::int as n from purchase_orders where tenant_id = ${tenantId}`) as unknown as { n: number }[];
+      expect(after[0]!.n).toBe(before[0]!.n);
     });
 
     it('an RMA for an old order line of an inactive SKU is created (returns ignore SKU status)', async () => {
