@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsBoolean, IsIn, IsOptional, IsString, IsUUID, MaxLength, ValidateIf } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, MaxLength, Min, ValidateIf } from 'class-validator';
 import {
   LICENCE_EXPIRY_STATES,
   LICENCE_KINDS,
@@ -190,12 +190,15 @@ export class SetLicencePolicyDto {
 
   @ApiProperty({
     required: false,
+    type: 'integer',
+    minimum: 0,
     description:
-      'Turning enforcement ON while known coverage gaps exist needs this to be true (else 409 licence-gaps-unacknowledged with gapCount). A precondition only — not part of the idempotency fingerprint. Ignored when turning off',
+      'The known coverage gap count the owner saw and accepted (absent = 0). Turning enforcement ON while the live count exceeds it is refused 409 licence-gaps-unacknowledged with the live gapCount — re-confirm with that count. A precondition only — not part of the idempotency fingerprint. Ignored when turning off',
   })
   @IsOptional()
-  @IsBoolean()
-  acknowledgeGaps?: boolean;
+  @IsInt()
+  @Min(0)
+  acknowledgedGapCount?: number;
 }
 
 /** Story 1-6d — the switch as the GET and the PUT answer it. */
@@ -207,4 +210,15 @@ export class LicencePolicyResponse {
       'Known coverage gaps today (IST) — the length of GET …/licences/coverage. A lower bound: a blind receipt, or an order of goods with no stock or open document anywhere, can be refused without having been a gap',
   })
   gapCount!: number;
+}
+
+/** Story 1-6d — the PUT's answer: `gapCount` only on an off→on transition (the one arm that scans the gaps). */
+export class SetLicencePolicyResponse {
+  @ApiProperty({ description: 'Whether licence enforcement is now on' }) enforce!: boolean;
+  @ApiProperty({
+    required: false,
+    minimum: 0,
+    description: 'The known coverage gaps when this PUT turned enforcement on; absent otherwise (read GET …/licence-policy for today\'s count)',
+  })
+  gapCount?: number;
 }

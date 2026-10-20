@@ -273,6 +273,9 @@ export class MissingLicenceDto {
 
   @ApiProperty({ enum: [...LICENCE_HOLDERS], description: '`client` — the brand holds no valid licence for this site (or for none); `site` — the site holds no valid licence' })
   holder!: LicenceHolder;
+
+  @ApiProperty({ required: false, description: 'The receipt\'s site code — the site a site licence is missing at, or a client licence is missing for' })
+  siteCode?: string;
 }
 
 /** One line the server refused to settle (naming the reason — the others settle). */

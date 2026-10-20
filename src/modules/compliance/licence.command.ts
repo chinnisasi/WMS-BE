@@ -27,6 +27,7 @@ import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.ser
 // seam functions (the `excursion.command.ts` precedent for tenancy's): no Nest
 // module import, so the tenancy → compliance import adds no cycle.
 import { assertClientInTenantInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
+import { licenceToday } from './licence-enforcement';
 
 // ── the clock and the events ─────────────────────────────────────────────────
 
@@ -37,7 +38,6 @@ import { assertClientInTenantInTx, assertClientTakesWorkInTx } from '../clients/
  * `licenceClock.now` through either path moves both.
  */
 export { licenceClock, licenceToday } from './licence-enforcement';
-import { licenceToday } from './licence-enforcement';
 
 /** Outbox: a warning opens an entry (`licence-expiry`); the clear resolves it. */
 export const LICENCE_EXPIRY_UPCOMING_EVENT = 'licence.expiry_upcoming';

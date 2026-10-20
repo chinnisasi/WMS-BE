@@ -16,6 +16,7 @@ import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow, noOpIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
+import { createLinkedVendor } from './support/linked-vendor';
 
 process.env.DATABASE_URL ??= 'postgres://wms:wms@localhost:55432/wms';
 process.env.JWT_SECRET ??= 'e2e-only-secret-0123456789abcdef';
@@ -238,7 +239,11 @@ describe('story 1-6d: licence enforcement', () => {
   }
 
   async function enforce(world: World, on: boolean): Promise<void> {
-    await putPolicy(world, { enforce: on, acknowledgeGaps: true }).expect(200);
+    // Acknowledge whatever the GET shows (the web sends the count it showed).
+    const shown = (await http().get(`${API}/${world.tenantId}/licence-policy`).set('Authorization', `Bearer ${world.ownerToken}`).expect(200)).body as {
+      gapCount: number;
+    };
+    await putPolicy(world, { enforce: on, acknowledgedGapCount: shown.gapCount }).expect(200);
   }
 
   function line(skuId: string, qty: number, extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -409,7 +414,7 @@ describe('story 1-6d: licence enforcement', () => {
     });
 
     it('Switch, not owner: an ops manager PUT is 403 role-denied; the GET is open to staff', async () => {
-      const res = await putPolicy(world, { enforce: true, acknowledgeGaps: true }, ulid(), world.opsToken);
+      const res = await putPolicy(world, { enforce: true, acknowledgedGapCount: 9 }, ulid(), world.opsToken);
       expectProblem(res, 403, 'role-denied');
     });
 
@@ -421,51 +426,56 @@ describe('story 1-6d: licence enforcement', () => {
       expect(res.body.detail).toContain('2 known coverage gaps');
       const policy = await http().get(`${API}/${world.tenantId}/licence-policy`).set('Authorization', `Bearer ${world.ownerToken}`).expect(200);
       expect(policy.body).toEqual({ enforce: false, gapCount: 2 });
+      // A stale acknowledgement (fewer gaps than now) is refused the same way, naming the live count.
+      const stale = await putPolicy(world, { enforce: true, acknowledgedGapCount: 1 });
+      expectProblem(stale, 409, 'licence-gaps-unacknowledged');
+      expect(stale.body.gapCount).toBe(2);
+      expectProblem(await putPolicy(world, { enforce: true, acknowledgedGapCount: -1 }), 400, 'validation-failed');
       expect(await sql`select 1 from licence_policies where tenant_id = ${world.tenantId}`).toHaveLength(0);
     });
 
-    it('Turn on, acknowledged: 200, audited licence.enforcement_changed; a same-key replay answers the same; the unchanged PUT is a no-op', async () => {
+    it('Turn on, acknowledged: 200, audited licence.enforcement_enabled; a same-key replay answers the same; the unchanged PUT is a no-op', async () => {
       const key = ulid();
-      const on = await putPolicy(world, { enforce: true, acknowledgeGaps: true }, key).expect(200);
+      const on = await putPolicy(world, { enforce: true, acknowledgedGapCount: 2 }, key).expect(200);
       expect(on.body).toEqual({ enforce: true, gapCount: 2 });
       const policyId = ((await sql`select id from licence_policies where tenant_id = ${world.tenantId}`) as unknown as { id: string }[])[0]!.id;
       await expectAuditRow({
         tenantId: world.tenantId,
         key,
-        action: 'licence.enforcement_changed',
+        action: 'licence.enforcement_enabled',
         targetType: 'licence_policy',
         targetId: policyId,
         actorUserId: world.ownerUserId,
       });
-      // acknowledgeGaps is a precondition, not hashed: the same key without it replays.
+      // acknowledgedGapCount is a precondition, not hashed: the same key without it replays.
       const replay = await putPolicy(world, { enforce: true }, key).expect(200);
       expect(replay.body).toEqual(on.body);
       await expectAuditRow({
         tenantId: world.tenantId,
         key,
-        action: 'licence.enforcement_changed',
+        action: 'licence.enforcement_enabled',
         targetType: 'licence_policy',
         targetId: policyId,
         actorUserId: world.ownerUserId,
       });
-      // Already on: a no-op that stores its key (no audit row) — no acknowledgement needed.
+      // Already on: a no-op that stores its key (no audit row, no gap scan) — no acknowledgement needed.
       const noOpKey = noOpIdempotencyKey(world.tenantId, ulid(), 'licencePolicy.put:unchanged');
       const unchanged = await putPolicy(world, { enforce: true }, noOpKey).expect(200);
-      expect(unchanged.body).toEqual({ enforce: true, gapCount: 2 });
+      expect(unchanged.body).toEqual({ enforce: true });
       expect(await sql`select 1 from audit_events where tenant_id = ${world.tenantId} and reference = ${noOpKey}`).toHaveLength(0);
       // A different payload under a used key is 422.
       expectProblem(await putPolicy(world, { enforce: false }, key), 422, 'idempotency-key-reuse');
     });
 
-    it('Turn off: 200, audited — always allowed, whatever the gaps', async () => {
+    it('Turn off: 200, audited licence.enforcement_disabled — always allowed, whatever the gaps, and scans none', async () => {
       const key = ulid();
       const off = await putPolicy(world, { enforce: false }, key).expect(200);
-      expect(off.body).toEqual({ enforce: false, gapCount: 2 });
+      expect(off.body).toEqual({ enforce: false });
       const policyId = ((await sql`select id from licence_policies where tenant_id = ${world.tenantId}`) as unknown as { id: string }[])[0]!.id;
       await expectAuditRow({
         tenantId: world.tenantId,
         key,
-        action: 'licence.enforcement_changed',
+        action: 'licence.enforcement_disabled',
         targetType: 'licence_policy',
         targetId: policyId,
         actorUserId: world.ownerUserId,
@@ -498,16 +508,25 @@ describe('story 1-6d: licence enforcement', () => {
       const w = await site(world, 'EM-W1');
       const c = await createClient(world, 'EMC');
       const rice = await createSku(world, c, 'RICE', { foodCategory: 'bakery-cereals' });
-      const on = await putPolicy(world, { enforce: true }).expect(200);
+      const onKey = ulid();
+      const on = await putPolicy(world, { enforce: true }, onKey).expect(200);
       expect(on.body).toEqual({ enforce: true, gapCount: 0 });
+      await expectAuditRow({
+        tenantId: world.tenantId,
+        key: onKey,
+        action: 'licence.enforcement_enabled',
+        targetType: 'licence_policy',
+        targetId: ((await sql`select id from licence_policies where tenant_id = ${world.tenantId}`) as unknown as { id: string }[])[0]!.id,
+        actorUserId: world.ownerUserId,
+      });
       const res = await receive(world, w.id, c, [line(rice.id, 2)]).expect(201);
       expect(res.body.goodsReceipt).toBeNull();
       expect(res.body.refusedReceipt.rejectedLines).toEqual([
         expect.objectContaining({
           code: 'licence-not-covered',
           missing: [
-            { need: 'fssai', holder: 'client' },
-            { need: 'fssai', holder: 'site' },
+            { need: 'fssai', holder: 'client', siteCode: 'EM-W1' },
+            { need: 'fssai', holder: 'site', siteCode: 'EM-W1' },
           ],
         }),
       ]);
@@ -563,8 +582,8 @@ describe('story 1-6d: licence enforcement', () => {
         reason: `SKU "${drug.code}" needs an NDPS licence (client); needs an NDPS licence (site "RC-COV")`,
         index: 0,
         missing: [
-          { need: 'ndps', holder: 'client' },
-          { need: 'ndps', holder: 'site' },
+          { need: 'ndps', holder: 'client', siteCode: 'RC-COV' },
+          { need: 'ndps', holder: 'site', siteCode: 'RC-COV' },
         ],
       });
     });
@@ -575,7 +594,7 @@ describe('story 1-6d: licence enforcement', () => {
       const grn = res.body.goodsReceipt as GoodsReceipt;
       expect(grn.lines).toEqual([expect.objectContaining({ skuId: shirt.id, appliedQty: 2 })]);
       expect(grn.rejectedLines).toEqual([
-        expect.objectContaining({ skuId: rice.id, qty: 5, code: 'licence-not-covered', index: 1, missing: [{ need: 'fssai', holder: 'site' }] }),
+        expect.objectContaining({ skuId: rice.id, qty: 5, code: 'licence-not-covered', index: 1, missing: [{ need: 'fssai', holder: 'site', siteCode: 'RC-BARE' }] }),
       ]);
       expect(grn.licenceReviewOpId).toBe(licenceRefusedOpId(key));
       expect(grn.reviewOpId).toBeUndefined();
@@ -590,9 +609,38 @@ describe('story 1-6d: licence enforcement', () => {
         occurredAt: RECEIPT_AT,
         grnId: grn.id,
         lines: [{ poLineId: null, skuId: rice.id, batchCode: null, mfgDate: null, qty: 5 }],
-        refusals: [expect.objectContaining({ lineIndex: 1, skuId: rice.id, skuClientId: c, reason: 'licence-not-covered', missing: [{ need: 'fssai', holder: 'site' }] })],
+        refusals: [expect.objectContaining({ lineIndex: 1, skuId: rice.id, skuClientId: c, reason: 'licence-not-covered', missing: [{ need: 'fssai', holder: 'site', siteCode: 'RC-BARE' }] })],
       });
       expect(row.payload).not.toHaveProperty('waivers');
+    });
+
+    it('a PO receipt with the refused line FIRST: the refusal names request index 0, the settling line index 1 (the settling-index remap)', async () => {
+      const vendorId = await createLinkedVendor(app, world.tenantId, world.ownerToken, { code: `V-${ulid().slice(20)}`, name: 'Remap Vendor', clientIds: [c] });
+      const po = await http()
+        .post(`${API}/${world.tenantId}/inbound/purchase-orders`)
+        .set('Authorization', `Bearer ${world.ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ warehouseId: bare.id, vendorId, code: `PO-${ulid().slice(14)}`, lines: [{ skuId: rice.id, orderedQty: 10, unitCostPaise: 100 }] })
+        .expect(201);
+      const poId = po.body.purchaseOrder.id as string;
+      const riceLineId = po.body.purchaseOrder.lines[0].id as string;
+      const res = await http()
+        .post(`${API}/${world.tenantId}/receiving/goods-receipts`)
+        .set('Authorization', `Bearer ${world.operatorToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({
+          warehouseId: bare.id,
+          occurredAt: RECEIPT_AT,
+          poId,
+          blindReasonCode: null,
+          // index 0: rice, uncovered at the bare site; index 1: the t-shirt, no line reference.
+          lines: [line(rice.id, 3, { poLineId: riceLineId }), line(shirt.id, 2)],
+        })
+        .expect(201);
+      const grn = res.body.goodsReceipt as GoodsReceipt & { unmatchedLines?: { index: number; reason: string }[] };
+      expect(grn.rejectedLines).toEqual([expect.objectContaining({ code: 'licence-not-covered', index: 0, poLineId: riceLineId })]);
+      expect(grn.unmatchedLines).toEqual([{ index: 1, reason: 'no-line-reference' }]);
+      expect(grn.lines).toEqual([expect.objectContaining({ skuId: shirt.id, appliedQty: 2 })]);
     });
 
     it('Client premises: C2’s FSSAI is for another site only — refused for the client', async () => {
@@ -600,7 +648,7 @@ describe('story 1-6d: licence enforcement', () => {
       await addLicence(world, fssai({ clientId: c2, warehouseId: w2.id }));
       const food = await createSku(world, c2, 'DAL', { foodCategory: 'bakery-cereals' });
       const res = await receive(world, covered.id, c2, [line(food.id, 1)]).expect(201);
-      expect(res.body.refusedReceipt.rejectedLines[0]).toMatchObject({ code: 'licence-not-covered', missing: [{ need: 'fssai', holder: 'client' }] });
+      expect(res.body.refusedReceipt.rejectedLines[0]).toMatchObject({ code: 'licence-not-covered', missing: [{ need: 'fssai', holder: 'client', siteCode: 'RC-COV' }] });
     });
 
     it('Expired / future: a client licence until 2026-10-31, or from 2026-11-02, does not cover 2026-11-01', async () => {
@@ -612,7 +660,7 @@ describe('story 1-6d: licence enforcement', () => {
         await addLicence(world, fssai({ clientId: client }, dates));
         const food = await createSku(world, client, code, { foodCategory: 'dairy' });
         const res = await receive(world, covered.id, client, [line(food.id, 1)]).expect(201);
-        expect(res.body.refusedReceipt.rejectedLines[0]).toMatchObject({ code: 'licence-not-covered', missing: [{ need: 'fssai', holder: 'client' }] });
+        expect(res.body.refusedReceipt.rejectedLines[0]).toMatchObject({ code: 'licence-not-covered', missing: [{ need: 'fssai', holder: 'client', siteCode: 'RC-COV' }] });
       }
     });
 
@@ -699,8 +747,12 @@ describe('story 1-6d: licence enforcement', () => {
 
       it('Waiver, ops: an ops manager’s Apply is 403 role-denied — with or without a note — and the row stays open', async () => {
         const row = await refusedRow(1);
-        expectProblem(await resolveRow(world, row.id, { decision: 'apply' }, world.opsToken), 403, 'role-denied');
-        expectProblem(await resolveRow(world, row.id, { decision: 'apply', note: 'please' }, world.opsToken), 403, 'role-denied');
+        const noNote = await resolveRow(world, row.id, { decision: 'apply' }, world.opsToken);
+        expectProblem(noNote, 403, 'role-denied');
+        expect(noNote.body.detail).toBe('Accepting goods without a valid licence is an owner decision.');
+        const withNote = await resolveRow(world, row.id, { decision: 'apply', note: 'please' }, world.opsToken);
+        expectProblem(withNote, 403, 'role-denied');
+        expect(withNote.body.detail).toBe('Accepting goods without a valid licence is an owner decision.');
         expect((await rejectedOp(world, row.opId)).status).toBe('open');
       });
 
@@ -798,6 +850,74 @@ describe('story 1-6d: licence enforcement', () => {
     });
 
     describe('Shelf-life first, then the licence — no loop', () => {
+      it('a CARRIED shelf-life waiver is not audited twice: two owners, a partly booked first re-run — one shelf_life_waived (the first owner), one licence_waived (the second)', async () => {
+        const email = `owner2-${ulid().toLowerCase()}@example.com`;
+        const invited = await http()
+          .post(`${API}/${world.tenantId}/users`)
+          .set('Authorization', `Bearer ${world.ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ email, role: 'owner' })
+          .expect(201);
+        await http()
+          .post(`${API}/${world.tenantId}/accept-invite`)
+          .set(KEY_HEADER, ulid())
+          .send({ token: invited.body.inviteToken as string, password: PASSWORD })
+          .expect(200);
+        const second = (await mintSignIn(app, { email, password: PASSWORD })).body as { accessToken: string; user: { id: string } };
+
+        const client = await createClient(world, 'RCW');
+        await http()
+          .put(`${API}/${world.tenantId}/clients/${client}/receiving-policy`)
+          .set('Authorization', `Bearer ${world.ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ receivingToleranceBps: 0, qcOnReceipt: false, expiryRequired: true, minShelfLifeDays: 90 })
+          .expect(200);
+        await addLicence(world, fssai({ clientId: client }));
+        // Both short-dated; only the cheese needs a licence (the bare site holds none).
+        const soap = await createSku(world, client, 'SOAPB', { batchTracked: true });
+        const cheese = await createSku(world, client, 'CHEESE', { foodCategory: 'dairy', batchTracked: true });
+        const key = ulid();
+        await receive(
+          world,
+          bare.id,
+          client,
+          [line(soap.id, 2, { batchCode: 'S-1', expiryDate: '2026-12-01' }), line(cheese.id, 3, { batchCode: 'C-1', expiryDate: '2026-12-01' })],
+          RECEIPT_AT,
+          key,
+        ).expect(201);
+        const shelfOpId = shelfLifeRefusedOpId(key);
+        const shelfRow = await rejectedOp(world, shelfOpId);
+        const first = await resolveRow(world, shelfRow.id, { decision: 'apply', note: 'first owner accepts the dates' }).expect(200);
+        const firstGrn = (first.body.outcome as { snapshot: { goodsReceipt: GoodsReceipt } }).snapshot.goodsReceipt;
+        expect(firstGrn.lines).toEqual([expect.objectContaining({ skuId: soap.id, appliedQty: 2 })]);
+        const licenceOpId = firstGrn.licenceReviewOpId!;
+        expect(licenceOpId).toBe(licenceRefusedOpId(shelfOpId));
+
+        const licenceRow = await rejectedOp(world, licenceOpId);
+        const secondApply = await resolveRow(world, licenceRow.id, { decision: 'apply', note: 'second owner waives the licence' }, second.accessToken).expect(200);
+        const secondGrn = (secondApply.body.outcome as { snapshot: { goodsReceipt: GoodsReceipt } }).snapshot.goodsReceipt;
+        expect(secondGrn.lines).toEqual([expect.objectContaining({ skuId: cheese.id, appliedQty: 3 })]);
+
+        const waivers = (await sql`
+          select action, actor_user_id, target_id from audit_events
+           where tenant_id = ${world.tenantId} and reference in (${shelfOpId}, ${licenceOpId})
+             and action in ('goods_receipt.shelf_life_waived', 'goods_receipt.licence_waived')
+           order by action`) as unknown as { action: string; actor_user_id: string; target_id: string }[];
+        expect(waivers).toEqual([
+          { action: 'goods_receipt.licence_waived', actor_user_id: second.user.id, target_id: secondGrn.id },
+          { action: 'goods_receipt.shelf_life_waived', actor_user_id: world.ownerUserId, target_id: firstGrn.id },
+        ]);
+        await expectAuditRow({
+          tenantId: world.tenantId,
+          key: licenceOpId,
+          action: 'goods_receipt.licence_waived',
+          targetType: 'goods_receipt',
+          targetId: secondGrn.id,
+          actorUserId: second.user.id,
+          alongside: [{ action: 'goods_receipt.submitted', targetType: 'goods_receipt', targetId: secondGrn.id, actorUserId: world.operatorUserId }],
+        });
+      });
+
       it('a short-dated, uncovered line: the shelf-life row only; its Apply raises a licence row storing the waiver; that Apply books once', async () => {
         const client = await createClient(world, 'RCS');
         await http()
@@ -839,10 +959,8 @@ describe('story 1-6d: licence enforcement', () => {
           targetType: 'goods_receipt',
           targetId: booked.id,
           actorUserId: world.ownerUserId,
-          alongside: [
-            { action: 'goods_receipt.shelf_life_waived', targetType: 'goods_receipt', targetId: booked.id, actorUserId: world.ownerUserId },
-            { action: 'goods_receipt.submitted', targetType: 'goods_receipt', targetId: booked.id, actorUserId: world.operatorUserId },
-          ],
+          // The carried shelf-life waiver writes no second row (it was granted on the first re-run).
+          alongside: [{ action: 'goods_receipt.submitted', targetType: 'goods_receipt', targetId: booked.id, actorUserId: world.operatorUserId }],
         });
       });
     });
@@ -866,6 +984,13 @@ describe('story 1-6d: licence enforcement', () => {
       rice = await createSku(world, c, 'RICE', { foodCategory: 'bakery-cereals' });
       await stock(world, w1.id, w1.bin, rice.id, 10);
       await enforce(world, true);
+    });
+
+    it('Self order: the tenant’s own food at a site holding FSSAI, no client licence — created', async () => {
+      const ownFood = await createSku(world, world.selfClientId, 'OWNTEA', { foodCategory: 'beverages' });
+      await stock(world, w1.id, w1.bin, ownFood.id, 3);
+      const res = await createOrder(world, w1.id, [{ skuId: ownFood.id, quantity: 1 }]).expect(201);
+      expect(res.body.order.status).toBe('accepted');
     });
 
     it('a covered order is created', async () => {

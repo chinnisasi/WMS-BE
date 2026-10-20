@@ -154,7 +154,20 @@ export interface SubmitGoodsReceiptCommand {
    * receipt). Set ONLY by the review queue's apply arm — never on the HTTP
    * DTO — and hashed when present.
    */
-  readonly shelfLifeWaiver?: { readonly byUserId: string; readonly note: string } | undefined;
+  readonly shelfLifeWaiver?:
+    | {
+        readonly byUserId: string;
+        readonly note: string;
+        /**
+         * Story 1-6d — CARRIED from a `grn.licence-refused` row's stored
+         * `waivers.shelfLife`: the waiver was granted (and audited) on the
+         * earlier re-run, so this receipt writes no second
+         * `goods_receipt.shelf_life_waived` row. Never hashed (the hash
+         * keeps only the fact `shelfLifeWaived: true`).
+         */
+        readonly carried?: true;
+      }
+    | undefined;
   /**
    * Story 1-6d (decision 9) — an owner accepted a `grn.licence-refused` row:
    * the licence check is SKIPPED for this re-run only (every other rule
@@ -275,6 +288,8 @@ interface ClientRefusedLine {
 export interface MissingLicence {
   readonly need: LicenceNeed;
   readonly holder: LicenceHolder;
+  /** The receipt's site code — on the response and the stored refusal, so a reader names the site. */
+  readonly siteCode?: string;
 }
 
 /**
@@ -1871,7 +1886,7 @@ export class ReceivingCommand {
       // Story 1-2b (decision 5) — a shelf-life refusal accepted from review:
       // the re-run records who waived the rule (the reviewer), against the
       // receipt it booked. The note rides the review row's resolved outcome.
-      if (command.shelfLifeWaiver !== undefined && command.shelfLifeWaiver !== null) {
+      if (command.shelfLifeWaiver !== undefined && command.shelfLifeWaiver !== null && command.shelfLifeWaiver.carried !== true) {
         await tx.insert(auditEvents).values({
           id: uuidv7(),
           tenantId: command.tenantId,
@@ -2636,7 +2651,7 @@ export class ReceivingCommand {
           code,
           reason: licenceRefusalReason(sku.code, missing, entry.siteCode ?? ''),
           index: entry.index,
-          missing: missing.map((item) => ({ need: item.need, holder: item.holder })),
+          missing: missing.map((item) => ({ need: item.need, holder: item.holder, ...(entry.siteCode === undefined ? {} : { siteCode: entry.siteCode }) })),
         };
       }
       if (EXPIRY_REFUSAL_CODES.has(code)) {
@@ -2735,7 +2750,13 @@ export class ReceivingCommand {
           : {}),
         // Story 1-6d — what no valid licence covers (the web and the handheld word it).
         ...(entry.code === 'licence-not-covered'
-          ? { missing: (entry.missing ?? []).map((item) => ({ need: item.need, holder: item.holder })) }
+          ? {
+              missing: (entry.missing ?? []).map((item) => ({
+                need: item.need,
+                holder: item.holder,
+                ...(entry.siteCode === undefined ? {} : { siteCode: entry.siteCode }),
+              })),
+            }
           : {}),
       };
     };

@@ -35,7 +35,12 @@ import {
   type WithdrawLicenceCommand,
 } from './licence.command';
 import { coverageGapsInTx, type CoverageGap, type CoverageGaps } from './licence-coverage';
-import { LicencePolicyCommand, type LicencePolicySnapshot, type SetLicencePolicyCommand } from './licence-policy.command';
+import {
+  LicencePolicyCommand,
+  type LicencePolicySnapshot,
+  type SetLicencePolicyCommand,
+  type SetLicencePolicySnapshot,
+} from './licence-policy.command';
 
 /** The list read's bound — a tenant's licences are tens, not thousands. */
 export const MAX_LICENCE_LIST = 500;
@@ -60,7 +65,6 @@ export interface LicenceList {
 }
 
 export type { CoverageGap, CoverageGaps };
-export { coverageGapsInTx };
 
 export interface LicenceSweepSummary {
   readonly raised: number;
@@ -94,7 +98,7 @@ export class LicenceFacade {
   }
 
   /** Story 1-6d — turn enforcement on or off (owner-only, `licences.manage`). */
-  setLicencePolicy(command: SetLicencePolicyCommand, idempotencyKey: string): Promise<LicencePolicySnapshot> {
+  setLicencePolicy(command: SetLicencePolicyCommand, idempotencyKey: string): Promise<SetLicencePolicySnapshot> {
     return this.policy.set(command, idempotencyKey);
   }
 

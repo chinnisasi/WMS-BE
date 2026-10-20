@@ -34,8 +34,22 @@ export interface SetLicencePolicyCommand {
   /** The session user — authority is re-read from the DB at command entry. */
   readonly actorUserId: string;
   readonly enforce: boolean;
-  /** A precondition for turning on with known gaps — never hashed. */
-  readonly acknowledgeGaps: boolean;
+  /**
+   * The gap count the owner saw and accepted (absent = 0). Turning on while
+   * the LIVE count exceeds it is refused, so a stale acknowledgement never
+   * covers gaps that appeared since. A precondition — never hashed.
+   */
+  readonly acknowledgedGapCount: number;
+}
+
+/**
+ * The PUT's answer (the idempotency snapshot). `gapCount` is present only on
+ * an off→on transition — the one arm that scans the gaps; read the GET for
+ * today's count otherwise.
+ */
+export interface SetLicencePolicySnapshot {
+  readonly enforce: boolean;
+  readonly gapCount?: number;
 }
 
 export function licenceGapsUnacknowledged(gapCount: number): ProblemException {
@@ -43,7 +57,7 @@ export function licenceGapsUnacknowledged(gapCount: number): ProblemException {
     'licence-gaps-unacknowledged',
     409,
     'Known licence coverage gaps',
-    `There ${gapCount === 1 ? 'is 1 known coverage gap' : `are ${gapCount} known coverage gaps`} — with enforcement on, uncovered receipts (including goods on open POs and ASNs) go to review and such orders are refused. Send acknowledgeGaps: true to turn it on anyway.`,
+    `There ${gapCount === 1 ? 'is 1 known coverage gap' : `are ${gapCount} known coverage gaps`} — with enforcement on, uncovered receipts (including goods on open POs and ASNs) go to review and such orders are refused. Confirm the count (acknowledgedGapCount) to turn it on anyway.`,
     { gapCount },
   );
 }
@@ -51,13 +65,15 @@ export function licenceGapsUnacknowledged(gapCount: number): ProblemException {
 /**
  * Story 1-6d — the per-tenant licence enforcement switch (decisions 1, 7,
  * 12). Off by default (no row). The PUT is owner-only (`licences.manage`):
- * hash `{tenantId, enforce}` (`acknowledgeGaps` is a precondition, not part
- * of the hash) → authority → replay → the row `FOR UPDATE` → replay again →
- * unchanged → a declared no-op that stores the key (`licencePolicy.put:
- * unchanged`, no audit) → turning ON with known gaps and no acknowledgement →
- * 409 `licence-gaps-unacknowledged` (`gapCount`) → the upsert → audit
- * `licence.enforcement_changed` (target `licence_policy`) → the key LAST.
- * Turning it off is always allowed.
+ * hash `{tenantId, enforce}` (`acknowledgedGapCount` is a precondition, not
+ * part of the hash) → authority → replay → the row `FOR UPDATE` → replay
+ * again → unchanged → a declared no-op that stores the key
+ * (`licencePolicy.put:unchanged`, no audit, no gap scan) → turning ON: the
+ * gap scan, and a live count above `acknowledgedGapCount` → 409
+ * `licence-gaps-unacknowledged` (`gapCount`) → the upsert → audit
+ * `licence.enforcement_enabled | licence.enforcement_disabled` (target
+ * `licence_policy`) → the key LAST. Turning it off is always allowed and
+ * scans nothing.
  */
 @Injectable()
 export class LicencePolicyCommand {
@@ -76,9 +92,12 @@ export class LicencePolicyCommand {
     });
   }
 
-  async set(command: SetLicencePolicyCommand, idempotencyKey: string): Promise<LicencePolicySnapshot> {
+  async set(command: SetLicencePolicyCommand, idempotencyKey: string): Promise<SetLicencePolicySnapshot> {
     if (typeof command.enforce !== 'boolean') {
       throw new ProblemException('validation-failed', 400, 'Invalid licence policy', 'enforce must be true or false.');
+    }
+    if (!Number.isSafeInteger(command.acknowledgedGapCount) || command.acknowledgedGapCount < 0) {
+      throw new ProblemException('validation-failed', 400, 'Invalid licence policy', 'acknowledgedGapCount must be a whole number ≥ 0.');
     }
     const payloadHash = hashCommandPayload({ tenantId: command.tenantId, enforce: command.enforce });
 
@@ -92,15 +111,18 @@ export class LicencePolicyCommand {
       if (replayedUnderLock !== null) return replayedUnderLock;
 
       const enforcedNow = current?.enforce === true;
-      const gapCount = (await coverageGapsInTx(tx, command.tenantId, licenceToday())).gaps.length;
       if (enforcedNow === command.enforce) {
-        // A declared no-op (`licencePolicy.put:unchanged`): nothing written or audited; the key is stored.
-        const snapshot: LicencePolicySnapshot = { enforce: enforcedNow, gapCount };
+        // A declared no-op (`licencePolicy.put:unchanged`): nothing written,
+        // audited or scanned; the key is stored.
+        const snapshot: SetLicencePolicySnapshot = { enforce: enforcedNow };
         await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
         return snapshot;
       }
-      if (command.enforce && gapCount > 0 && command.acknowledgeGaps !== true) {
-        throw licenceGapsUnacknowledged(gapCount);
+      // Only the off→on transition scans the gaps (under the row lock).
+      let gapCount: number | undefined;
+      if (command.enforce) {
+        gapCount = (await coverageGapsInTx(tx, command.tenantId, licenceToday())).gaps.length;
+        if (gapCount > command.acknowledgedGapCount) throw licenceGapsUnacknowledged(gapCount);
       }
 
       let policyId: string;
@@ -129,12 +151,13 @@ export class LicencePolicyCommand {
           .where(and(eq(licencePolicies.tenantId, command.tenantId), eq(licencePolicies.id, current.id)));
         policyId = current.id;
       }
-      const snapshot: LicencePolicySnapshot = { enforce: command.enforce, gapCount };
+      const snapshot: SetLicencePolicySnapshot =
+        gapCount === undefined ? { enforce: command.enforce } : { enforce: command.enforce, gapCount };
       await tx.insert(auditEvents).values({
         id: uuidv7(),
         tenantId: command.tenantId,
         actorUserId: command.actorUserId,
-        action: 'licence.enforcement_changed',
+        action: command.enforce ? 'licence.enforcement_enabled' : 'licence.enforcement_disabled',
         targetType: 'licence_policy',
         targetId: policyId,
         reference: idempotencyKey,
@@ -166,7 +189,7 @@ export class LicencePolicyCommand {
     tenantId: string,
     idempotencyKey: string,
     payloadHash: string,
-  ): Promise<LicencePolicySnapshot | null> {
+  ): Promise<SetLicencePolicySnapshot | null> {
     const existing = await tx
       .select()
       .from(idempotencyKeys)
@@ -175,7 +198,7 @@ export class LicencePolicyCommand {
     const row = existing[0];
     if (row === undefined) return null;
     if (row.payloadHash !== payloadHash) throw idempotencyKeyReuse();
-    return row.responseSnapshot as LicencePolicySnapshot;
+    return row.responseSnapshot as SetLicencePolicySnapshot;
   }
 
   private async writeIdempotencyKey(
@@ -183,7 +206,7 @@ export class LicencePolicyCommand {
     tenantId: string,
     idempotencyKey: string,
     payloadHash: string,
-    snapshot: LicencePolicySnapshot,
+    snapshot: SetLicencePolicySnapshot,
   ): Promise<void> {
     try {
       await tx.insert(idempotencyKeys).values({ id: uuidv7(), tenantId, key: idempotencyKey, payloadHash, responseSnapshot: snapshot });

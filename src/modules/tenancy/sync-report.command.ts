@@ -183,6 +183,9 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   'grn.licence-refused': ['apply', 'discard'],
 };
 
+/** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
+export const LICENCE_APPLY_OWNER_ONLY = 'Accepting goods without a valid licence is an owner decision.';
+
 /** Story 1-2b — the resolve note's ceiling (code points), trimmed. */
 export const RESOLVE_NOTE_MAX = 500;
 
@@ -1106,7 +1109,16 @@ export class SyncReportCommand {
         // 403, not 400). A replayed Apply re-served its stored answer above —
         // a deliberate exception to fail-closed. Discard keeps `review.decide`.
         if (row.opType === 'grn.licence-refused' && command.decision === 'apply') {
-          assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'licences.manage');
+          try {
+            assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'licences.manage');
+          } catch (err) {
+            // The same 403 `role-denied`, worded for the reviewer (the queue
+            // shows this type's detail verbatim).
+            if (err instanceof ProblemException && err.getStatus() === 403) {
+              throw new ProblemException('role-denied', 403, 'Role lacks the required capability', LICENCE_APPLY_OWNER_ONLY);
+            }
+            throw err;
+          }
           if (note === undefined) {
             throw new ProblemException(
               'validation-failed',
@@ -1472,7 +1484,8 @@ export class SyncReportCommand {
             ...(typeof payload.clientId === 'string' ? { clientId: payload.clientId } : {}),
             occurredAt: opTime,
             lines: payload.lines as unknown as GrnCommand['lines'],
-            ...(shelfLife === null ? {} : { shelfLifeWaiver: shelfLife }),
+            // Carried: audited when it was granted — never a second row here.
+            ...(shelfLife === null ? {} : { shelfLifeWaiver: { ...shelfLife, carried: true as const } }),
             licenceWaiver: { byUserId: resolver.actorUserId, note: resolver.note ?? '' },
           },
           idempotencyKey,

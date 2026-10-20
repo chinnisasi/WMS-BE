@@ -29,6 +29,7 @@ import {
   LicencePolicyResponse,
   LicenceResponse,
   SetLicencePolicyDto,
+  SetLicencePolicyResponse,
 } from './licences.dto';
 import type { LicenceDto, LicenceListItemDto } from './licences.dto';
 
@@ -82,18 +83,18 @@ export class LicencesController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'Turns licence enforcement on or off (owner-only, licences.manage). While on, a goods-receipt line of drug or food goods not covered by a valid client and site licence on the receipt date is held in review (grn.licence-refused), and an order of such goods is refused (409 licence-not-covered). Turning on with known gaps needs acknowledgeGaps: true; turning off is always allowed. An unchanged PUT is a no-op (nothing written or audited; the key is stored)',
+      'Turns licence enforcement on or off (owner-only, licences.manage). While on, a goods-receipt line of drug or food goods not covered by a valid client and site licence on the receipt date is held in review (grn.licence-refused), and an order of such goods is refused (409 licence-not-covered). Turning on needs acknowledgedGapCount ≥ the live known gap count; turning off is always allowed and scans nothing. An unchanged PUT is a no-op (nothing written or audited; the key is stored)',
   })
   @ApiBody({ type: SetLicencePolicyDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
-  @ApiOkResponse({ type: LicencePolicyResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or enforce/acknowledgeGaps not a boolean (validation-failed)') })
+  @ApiOkResponse({ type: SetLicencePolicyResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, enforce not a boolean, or acknowledgedGapCount not a whole number ≥ 0 (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse(WRITE_403) })
   @ApiResponse({
     status: 409,
     ...problemJsonResponse(
-      `Turning on while known coverage gaps exist without acknowledgeGaps: true (licence-gaps-unacknowledged, member gapCount), or ${CONFLICT_409}`,
+      `Turning on while the live known gap count exceeds acknowledgedGapCount (licence-gaps-unacknowledged, member gapCount), or ${CONFLICT_409}`,
     ),
   })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
@@ -103,14 +104,14 @@ export class LicencesController {
     @IdempotencyKey() idempotencyKey: string | undefined,
     @CurrentSession() session: TenantSession,
     @Body() dto: SetLicencePolicyDto,
-  ): Promise<LicencePolicyResponse> {
+  ): Promise<SetLicencePolicyResponse> {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
     const policy = await this.licences.setLicencePolicy(
-      { tenantId, actorUserId: session.userId, enforce: dto.enforce, acknowledgeGaps: dto.acknowledgeGaps === true },
+      { tenantId, actorUserId: session.userId, enforce: dto.enforce, acknowledgedGapCount: dto.acknowledgedGapCount ?? 0 },
       key,
     );
-    return { enforce: policy.enforce, gapCount: policy.gapCount };
+    return { enforce: policy.enforce, ...(policy.gapCount === undefined ? {} : { gapCount: policy.gapCount }) };
   }
 
   // The literal `coverage` segment is declared before every `:licenceId`

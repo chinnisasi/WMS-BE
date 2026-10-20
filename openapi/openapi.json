@@ -15077,13 +15077,13 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/LicencePolicyResponse"
+                  "$ref": "#/components/schemas/SetLicencePolicyResponse"
                 }
               }
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or enforce/acknowledgeGaps not a boolean (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, enforce not a boolean, or acknowledgedGapCount not a whole number ≥ 0 (validation-failed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -15113,7 +15113,7 @@
             }
           },
           "409": {
-            "description": "Turning on while known coverage gaps exist without acknowledgeGaps: true (licence-gaps-unacknowledged, member gapCount), or a concurrent request with the same Idempotency-Key (conflict)",
+            "description": "Turning on while the live known gap count exceeds acknowledgedGapCount (licence-gaps-unacknowledged, member gapCount), or a concurrent request with the same Idempotency-Key (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -15138,7 +15138,7 @@
             "bearer": []
           }
         ],
-        "summary": "Turns licence enforcement on or off (owner-only, licences.manage). While on, a goods-receipt line of drug or food goods not covered by a valid client and site licence on the receipt date is held in review (grn.licence-refused), and an order of such goods is refused (409 licence-not-covered). Turning on with known gaps needs acknowledgeGaps: true; turning off is always allowed. An unchanged PUT is a no-op (nothing written or audited; the key is stored)",
+        "summary": "Turns licence enforcement on or off (owner-only, licences.manage). While on, a goods-receipt line of drug or food goods not covered by a valid client and site licence on the receipt date is held in review (grn.licence-refused), and an order of such goods is refused (409 licence-not-covered). Turning on needs acknowledgedGapCount ≥ the live known gap count; turning off is always allowed and scans nothing. An unchanged PUT is a no-op (nothing written or audited; the key is stored)",
         "tags": [
           "compliance"
         ]
@@ -37622,6 +37622,10 @@
               "site"
             ],
             "description": "`client` — the brand holds no valid licence for this site (or for none); `site` — the site holds no valid licence"
+          },
+          "siteCode": {
+            "type": "string",
+            "description": "The receipt's site code — the site a site licence is missing at, or a client licence is missing for"
           }
         },
         "required": [
@@ -40608,9 +40612,27 @@
             "type": "boolean",
             "description": "On: an uncovered drug or food receipt line goes to review (grn.licence-refused) and such an order is refused (409 licence-not-covered). Off by default"
           },
-          "acknowledgeGaps": {
+          "acknowledgedGapCount": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The known coverage gap count the owner saw and accepted (absent = 0). Turning enforcement ON while the live count exceeds it is refused 409 licence-gaps-unacknowledged with the live gapCount — re-confirm with that count. A precondition only — not part of the idempotency fingerprint. Ignored when turning off"
+          }
+        },
+        "required": [
+          "enforce"
+        ]
+      },
+      "SetLicencePolicyResponse": {
+        "type": "object",
+        "properties": {
+          "enforce": {
             "type": "boolean",
-            "description": "Turning enforcement ON while known coverage gaps exist needs this to be true (else 409 licence-gaps-unacknowledged with gapCount). A precondition only — not part of the idempotency fingerprint. Ignored when turning off"
+            "description": "Whether licence enforcement is now on"
+          },
+          "gapCount": {
+            "type": "number",
+            "minimum": 0,
+            "description": "The known coverage gaps when this PUT turned enforcement on; absent otherwise (read GET …/licence-policy for today's count)"
           }
         },
         "required": [
