@@ -23,6 +23,8 @@ export const SKU_NAMING_OP_TYPES = [
   'grn.lines-refused',
   // Story 1-2b — the short-dated lines of a receipt (`lines[*].skuId`).
   'grn.shelf-life-refused',
+  // Story 1-4b — the booked lines of an inactive SKU (`lines[*].skuId`).
+  'grn.inactive-sku-received',
   'putaway.place',
   'pick.record',
   'pack.execute',

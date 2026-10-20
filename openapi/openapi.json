@@ -3332,6 +3332,19 @@
               "format": "uuid",
               "type": "string"
             }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Story 1-4b — only active or only inactive SKUs; absent lists every SKU",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "inactive"
+              ]
+            }
           }
         ],
         "responses": {
@@ -3629,6 +3642,135 @@
           }
         ],
         "summary": "Replaces a SKU's pack levels (box, case, pallet — base units per level) and its non-primary barcodes, each naming its level",
+        "tags": [
+          "catalog"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/catalog/skus/{skuId}/status": {
+      "patch": {
+        "operationId": "CatalogController_updateSkuStatus",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "skuId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSkuStatusDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkuWriteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key; an unknown status, a reason with `active`, or a reason over 500 characters (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The SKU does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent same-key request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Deactivates (with an optional reason) or reactivates a SKU (sku.edit). Inactive: refused on new POs, ASNs, kits and channel mappings; orders sell down only what stock covers in full; channels publish 0; every existing document keeps it. Reactivating clears the reason. The same status is a no-op that stores the key",
         "tags": [
           "catalog"
         ]
@@ -4394,7 +4536,7 @@
             }
           },
           "409": {
-            "description": "The SKU is already a kit (kit-already-composed), a component appears twice (duplicate-kit-component), a component is itself a kit (kit-component-is-kit — flat BOM), or the SKU already holds stock or a live reservation — making it a kit would strand that stock (kit-sku-holds-stock)",
+            "description": "The SKU is already a kit (kit-already-composed), a component appears twice (duplicate-kit-component), a component is itself a kit (kit-component-is-kit — flat BOM), or the SKU already holds stock or a live reservation — making it a kit would strand that stock (kit-sku-holds-stock); the kit or a component is inactive (sku-inactive)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4522,7 +4664,7 @@
             }
           },
           "409": {
-            "description": "A component appears twice (duplicate-kit-component), or a component is itself a kit (kit-component-is-kit — flat BOM)",
+            "description": "A component appears twice (duplicate-kit-component), or a component is itself a kit (kit-component-is-kit — flat BOM); a component the stored composition did not hold is inactive (sku-inactive)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7860,7 +8002,7 @@
             }
           },
           "409": {
-            "description": "PO code already in use (conflict, naming the code); lines spanning clients (mixed-client); a departed client (client-departed); a partner without the vendor role (partner-not-vendor), an inactive vendor (vendor-inactive), or a vendor with no active link to the PO's client (vendor-not-linked, naming the client); or a concurrent idempotent request (conflict)",
+            "description": "PO code already in use (conflict, naming the code); lines spanning clients (mixed-client); a departed client (client-departed); a partner without the vendor role (partner-not-vendor), an inactive vendor (vendor-inactive), or a vendor with no active link to the PO's client (vendor-not-linked, naming the client); or a concurrent idempotent request (conflict); a line of an inactive SKU (sku-inactive, naming extensions.skuCodes)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8204,7 +8346,7 @@
             }
           },
           "409": {
-            "description": "The PO is not open (po-not-open, naming the status), a line that has received stock would be removed, change SKU or order less than it received (po-line-received), or a concurrent idempotent request (conflict)",
+            "description": "The PO is not open (po-not-open, naming the status), a line that has received stock would be removed, change SKU or order less than it received (po-line-received), or a concurrent idempotent request (conflict); a line that adds inbound for an inactive SKU — a SKU not on the PO, or a raised ordered total (sku-inactive)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8453,7 +8595,7 @@
             }
           },
           "409": {
-            "description": "The lines span clients (mixed-client), their client is not clientId (sku-client-mismatch), a line names a kit SKU, which can never be received (kit-cannot-hold-stock, naming it), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)",
+            "description": "The lines span clients (mixed-client), their client is not clientId (sku-client-mismatch), a line names a kit SKU, which can never be received (kit-cannot-hold-stock, naming it), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict); a line of an inactive SKU (sku-inactive, naming extensions.skuCodes)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8964,7 +9106,7 @@
             }
           },
           "409": {
-            "description": "The ASN is received, closed or cancelled (asn-not-open), a line that has received stock would be removed, change SKU or announce less than it received (asn-line-received), a SKU of another client (sku-client-mismatch), a line names a kit SKU (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)",
+            "description": "The ASN is received, closed or cancelled (asn-not-open), a line that has received stock would be removed, change SKU or announce less than it received (asn-line-received), a SKU of another client (sku-client-mismatch), a line names a kit SKU (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict); a line that adds inbound for an inactive SKU — a SKU not on the ASN, or a raised announced total (sku-inactive)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9342,7 +9484,7 @@
             }
           },
           "409": {
-            "description": "A concurrent idempotent request (conflict), or a concurrent first delivery of the same channel payload (conflict — retry to read the settled result)",
+            "description": "A concurrent idempotent request (conflict), or a concurrent first delivery of the same channel payload (conflict — retry to read the settled result); a line of an inactive SKU that stock does not cover in full — an inactive SKU sells down, never backorders (sku-inactive, naming extensions.skuCodes); a line SKU became a kit while the order was placed (order-catalog-changed — retry)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -17226,7 +17368,7 @@
             }
           },
           "409": {
-            "description": "The draft is not a draft (suggested-po-submitted), the PO code is already in use (conflict), or a concurrent idempotent request (conflict)",
+            "description": "The draft is not a draft (suggested-po-submitted), the PO code is already in use (conflict), the SKU is inactive (sku-inactive — the draft stays a draft), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -18593,7 +18735,7 @@
             }
           },
           "409": {
-            "description": "The same Idempotency-Key is being processed concurrently (conflict), or the mapped SKUs belong to more than one client (mixed-client, story 21-2b — names the clients)",
+            "description": "The same Idempotency-Key is being processed concurrently (conflict), or the mapped SKUs belong to more than one client (mixed-client, story 21-2b — names the clients); a new mapping to an inactive SKU — a stored pair re-sent is kept (sku-inactive)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -26086,7 +26228,7 @@
             }
           },
           "409": {
-            "description": "A line names a kit SKU (kit-cannot-hold-stock), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)",
+            "description": "A line names a kit SKU (kit-cannot-hold-stock) or an inactive SKU (sku-inactive), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -27798,7 +27940,7 @@
             }
           },
           "422": {
-            "description": "A divergent payload on a known order ref (order-source-conflict), no ingest warehouse set (ingest-warehouse-unset), or config referencing deleted master data (ingest-config-invalid)",
+            "description": "A divergent payload on a known order ref (order-source-conflict), no ingest warehouse set (ingest-warehouse-unset), config referencing deleted master data (ingest-config-invalid), or a line of an inactive SKU that stock does not cover in full (sku-inactive)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -29877,6 +30019,19 @@
               "$ref": "#/components/schemas/SkuBarcodeResponse"
             }
           },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ],
+            "description": "Story 1-4b — `inactive`: the SKU takes no new POs, ASNs, kits or channel mappings, sells down only what stock covers in full, and publishes 0 to its channels. `active` on every response stored before 1-4b"
+          },
+          "inactiveReason": {
+            "type": "string",
+            "nullable": true,
+            "description": "Story 1-4b — why it was deactivated; null unless inactive (and optional then)"
+          },
           "createdAt": {
             "type": "string",
             "example": "2026-09-08T00:00:00.000Z"
@@ -29910,6 +30065,8 @@
           "uomConversions",
           "shelfLifeDays",
           "barcodes",
+          "status",
+          "inactiveReason",
           "createdAt"
         ]
       },
@@ -30189,6 +30346,28 @@
         "required": [
           "levels",
           "barcodes"
+        ]
+      },
+      "UpdateSkuStatusDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ],
+            "description": "`inactive` stops new inbound, kits and channel listings and sells down what is left; `active` restores it and clears the reason"
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 500,
+            "description": "Why it was deactivated — only with `inactive`; trimmed, at most 500 characters"
+          }
+        },
+        "required": [
+          "status"
         ]
       },
       "SegregationPairResponse": {
@@ -31107,7 +31286,8 @@
               "count.submit",
               "return.receive",
               "grn.lines-refused",
-              "grn.shelf-life-refused"
+              "grn.shelf-life-refused",
+              "grn.inactive-sku-received"
             ]
           },
           "classification": {
@@ -31257,7 +31437,8 @@
               "count.submit",
               "return.receive",
               "grn.lines-refused",
-              "grn.shelf-life-refused"
+              "grn.shelf-life-refused",
+              "grn.inactive-sku-received"
             ]
           },
           "classification": {
@@ -33540,6 +33721,7 @@
               "mixed-client",
               "client-required",
               "client-departed",
+              "sku-inactive",
               "kit-cannot-hold-stock",
               "duplicate-asn-code",
               "invalid-asn-code",
@@ -36413,6 +36595,10 @@
             "type": "string",
             "description": "Story 1-2b — the op id of the review row raised for the `shelf-life-short` lines (type `grn.shelf-life-refused` — Accept anyway with a note, or Discard); present only when one was raised"
           },
+          "inactiveSkuReviewOpId": {
+            "type": "string",
+            "description": "Story 1-4b — the op id of the review row raised for the blind or unmatched lines of an INACTIVE SKU this receipt booked (type `grn.inactive-sku-received` — Discard only, labelled Acknowledge; it books nothing); present only when one was raised"
+          },
           "qcHeldLines": {
             "type": "number",
             "minimum": 1,
@@ -36696,6 +36882,14 @@
             "items": {
               "$ref": "#/components/schemas/CatalogSnapshotPackBarcodeDto"
             }
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "inactive"
+            ],
+            "description": "Story 1-4b: `inactive` — the SKU takes no new inbound. A receive scan of it that is not on the document is still booked and flagged for review; the handheld warns at scan time. An older device ignores it."
           }
         },
         "required": [
@@ -36712,7 +36906,8 @@
           "axes",
           "storageClass",
           "clientId",
-          "packBarcodes"
+          "packBarcodes",
+          "status"
         ]
       },
       "CatalogSnapshotPoDto": {

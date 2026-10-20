@@ -26,6 +26,7 @@ import {
   cancellationUnresolved,
   validationFailedIngest,
   ingestClientDeparted,
+  ingestSkuInactive,
 } from './channels.errors';
 import type { ParsedChannelCancellation, ParsedChannelOrder } from './channel-registry';
 
@@ -387,6 +388,16 @@ export class ChannelsIngestCommand {
       // `validation-failed` (the mixed-client arm's shape), never `failed`.
       status = 'validation-failed';
       mapped = ingestClientDeparted(connectionId, (err.getResponse() as { detail?: string }).detail ?? err.message);
+    } else if (code === 'sku-inactive') {
+      // Story 1-4b (decision 12): an inactive SKU's line could not be
+      // reserved in full — a catalog fact, not a transient: a typed 422,
+      // metered `validation-failed` (the client-departed arm's shape).
+      status = 'validation-failed';
+      const body = err.getResponse() as { detail?: string; extensions?: { skuCodes?: unknown } };
+      const skuCodes = Array.isArray(body.extensions?.skuCodes)
+        ? body.extensions.skuCodes.filter((entry): entry is string => typeof entry === 'string')
+        : [];
+      mapped = ingestSkuInactive(connectionId, body.detail ?? err.message, skuCodes);
     } else if (code === 'validation-failed') {
       status = 'validation-failed';
     } else if (err.getStatus() === 503) {

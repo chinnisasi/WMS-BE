@@ -900,8 +900,11 @@ describe('return receipts (e2e, story 13-2)', () => {
   // `grn.shelf-life-refused` row: apply (with a note) and discard, no recount.
   // The property this test pins — every pre-13-2 type keeps all three — is
   // unchanged; the new type is named here explicitly rather than folded in.
-  it('the per-type decision rule: every pre-13-2 op type keeps all three decisions; return.receive and grn.lines-refused only discard; grn.shelf-life-refused apply + discard', () => {
-    const discardOnly = new Set(['return.receive', 'grn.lines-refused']);
+  // Story 1-4b adds a fourth server-raised type, `grn.inactive-sku-received`
+  // (booked lines of an inactive SKU, flagged): Discard only (the web's
+  // Acknowledge). Named explicitly, the same way.
+  it('the per-type decision rule: every pre-13-2 op type keeps all three decisions; return.receive, grn.lines-refused and grn.inactive-sku-received only discard; grn.shelf-life-refused apply + discard', () => {
+    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received']);
     for (const type of REJECTED_OP_TYPES) {
       const expected =
         type === 'grn.shelf-life-refused'

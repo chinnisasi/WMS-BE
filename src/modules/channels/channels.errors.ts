@@ -232,6 +232,24 @@ export function ingestClientDeparted(connectionId: string, why: string): Problem
 }
 
 /**
+ * Story 1-4b (decision 12) — 422 `sku-inactive`: the channel order names an
+ * inactive SKU (or a kit with one) that stock does not cover in full. An
+ * inactive SKU sells down only — the shortfall is a catalog fact the
+ * channel's retry cannot fix, so it is a validation failure (metered
+ * `validation-failed`, never redelivered as a transient `failed`), not a
+ * backorder refusal: no `ingest_backorder_refusals` row is written.
+ */
+export function ingestSkuInactive(connectionId: string, why: string, skuCodes: readonly string[]): ProblemException {
+  return new ProblemException(
+    'sku-inactive',
+    422,
+    'Channel order refused — an inactive SKU is short',
+    `Connection ${connectionId}'s order could not be accepted: ${why}`,
+    { skuCodes: [...skuCodes] },
+  );
+}
+
+/**
  * 409 `order-backorder-rejected` — RD-3's whole-order post-grant refusal
  * under `backorder_policy: 'reject'`: any line whose grant came back short
  * (zero-grant included) releases everything and refuses the order. No order

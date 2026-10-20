@@ -28,6 +28,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { DEFAULT_SKU_PAGE_SIZE, MAX_SKU_PAGE_SIZE } from './sku.command';
 import { assertSingleClientInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
 import { getKitSkuIdsInTx } from './kit.store';
+import { assertSkusTakeWorkInTx } from './sku-status';
 import { uomPrecision } from './uom';
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
@@ -159,6 +160,9 @@ export class KitCommand {
       assertSelfReference(command.skuId, componentIds);
       await assertComponentsAreNotKits(tx, command.tenantId, componentIds, componentById);
       await assertKitSharesOneClient(tx, command.tenantId, kit, componentIds, componentById);
+      // Story 1-4b — an inactive SKU is composed into no new kit, as the kit
+      // or as a component (409 `sku-inactive`), after the client checks.
+      await assertSkusTakeWorkInTx(tx, command.tenantId, [kit.id, ...componentIds]);
       const qtyBySku = await assertComponentQuantities(command.components, componentById);
 
       // 3. The write + snapshot + outbox, one transaction (AD-7).
@@ -228,18 +232,28 @@ export class KitCommand {
       // Replace is an EDIT of an existing kit, never an entry into kit-ness:
       // a non-kit SKU answers 404 rather than silently becoming one (create
       // is the only door into kit-ness).
+      // Story 1-4b — the FULL stored composition (not a one-row probe): the
+      // inactive guard below judges "new" against it (decision 9).
       const existing = await tx
-        .select({ id: kitCompositions.id })
+        .select({ componentSkuId: kitCompositions.componentSkuId })
         .from(kitCompositions)
-        .where(and(eq(kitCompositions.tenantId, command.tenantId), eq(kitCompositions.kitSkuId, kit.id)))
-        .limit(1);
-      if (existing[0] === undefined) {
+        .where(and(eq(kitCompositions.tenantId, command.tenantId), eq(kitCompositions.kitSkuId, kit.id)));
+      if (existing.length === 0) {
         throw kitNotFound(command.skuId);
       }
 
       assertSelfReference(command.skuId, componentIds);
       await assertComponentsAreNotKits(tx, command.tenantId, componentIds, componentById);
       await assertKitSharesOneClient(tx, command.tenantId, kit, componentIds, componentById);
+      // Story 1-4b (decisions 8, 9) — a component the stored composition did
+      // not already hold must be active (409 `sku-inactive`); a stored
+      // component that has since been deactivated stays.
+      const stored = new Set(existing.map((row) => row.componentSkuId));
+      await assertSkusTakeWorkInTx(
+        tx,
+        command.tenantId,
+        componentIds.filter((id) => !stored.has(id)),
+      );
       const qtyBySku = await assertComponentQuantities(command.components, componentById);
 
       const snapshot = await this.replaceComposition(tx, command.tenantId, kit, qtyBySku);

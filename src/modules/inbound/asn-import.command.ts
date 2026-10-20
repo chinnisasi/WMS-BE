@@ -20,7 +20,7 @@ import {
   getClientsInTx,
   assertClientTakesWorkInTx,
 } from '../clients/clients.facade';
-import { CatalogFacade, type SkuByCode } from '../catalog/catalog.facade';
+import { CatalogFacade, assertSkusTakeWorkInTx, type SkuByCode } from '../catalog/catalog.facade';
 import { kitCannotHoldStock } from '../catalog/kit.store';
 import {
   assertAsnAuthorityInTx,
@@ -104,6 +104,14 @@ interface AcceptedGroup {
   readonly clientLabel: string;
   readonly expectedAt: string | null;
   readonly lines: readonly { readonly skuId: string; readonly announcedQty: number }[];
+}
+
+/** Story 1-4b — the `extensions.skuCodes` of a `sku-inactive` refusal. */
+function skuCodesOf(error: unknown): string[] {
+  if (!(error instanceof ProblemException)) return [];
+  const body = error.getResponse() as { extensions?: { skuCodes?: unknown } };
+  const codes = body.extensions?.skuCodes;
+  return Array.isArray(codes) ? codes.filter((code): code is string => typeof code === 'string') : [];
 }
 
 function problemOf(error: unknown): { code: string; detail: string } | null {
@@ -354,6 +362,30 @@ export class AsnImportCommand {
             const problem = problemOf(error);
             if (problem === null || problem.code !== 'client-departed') throw error;
             groupErrors.push(rowError(firstRow.rowNumber, group.asnCode, 'client-departed', problem.detail));
+          }
+        }
+
+        // Story 1-4b — an inactive SKU takes no new ASN: every row of the
+        // group naming one gets `sku-inactive` (the client-departed
+        // precedent), after the client checks (decision 13), under the SKU
+        // rows' FOR KEY SHARE.
+        if (known.length > 0) {
+          try {
+            await assertSkusTakeWorkInTx(tx, command.tenantId, known.map((entry) => entry.sku.id));
+          } catch (error) {
+            const problem = problemOf(error);
+            if (problem === null || problem.code !== 'sku-inactive') throw error;
+            const inactiveCodes = new Set(skuCodesOf(error));
+            for (const entry of known.filter((candidate) => inactiveCodes.has(candidate.sku.code))) {
+              groupErrors.push(
+                rowError(
+                  entry.row.rowNumber,
+                  group.asnCode,
+                  'sku-inactive',
+                  `SKU "${entry.sku.code}" is inactive — an inactive SKU takes no new ASNs. Reactivate it first.`,
+                ),
+              );
+            }
           }
         }
 

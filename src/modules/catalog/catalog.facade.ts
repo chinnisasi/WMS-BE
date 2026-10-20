@@ -1,7 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
-import { batches, catalogImports, products, serials, skuBarcodes, skus, uomConversions } from '../../shared/db/schema';
+import { batches, catalogImports, products, serials, skuBarcodes, skus, uomConversions, type SkuStatus } from '../../shared/db/schema';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -33,6 +33,15 @@ import { portalSkusInTx, type PortalSkuRow } from './portal-skus';
 import type { Page } from '../../shared/primitives/pagination';
 import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
 export type { PortalSkuRow } from './portal-skus';
+// Story 1-4b — the SKU takes-work guard and the order create's phase-3 status read.
+export {
+  assertSkusTakeWorkInTx,
+  lockSkuStatusesInTx,
+  skuInactive,
+  skusGainingInbound,
+  type InboundLineQty,
+  type LockedSkuStatus,
+} from './sku-status';
 import type {
   CreateHandlingUnitInput,
   HandlingUnitIdentity,
@@ -137,6 +146,8 @@ export interface SkuReorderDefaults {
   readonly reorderQty: number;
   /** Story 1-2a — the SKU's client (the sweep skips a departed client's SKUs). */
   readonly clientId: string;
+  /** Story 1-4b — `active | inactive` (the sweep raises nothing for an inactive SKU). */
+  readonly status: SkuStatus;
 }
 
 /** The hazard segregation matrix as the story 12-7 admin read carries it. */
@@ -229,6 +240,11 @@ export interface SkuSummary {
    * confirmation. Empty when the SKU has none.
    */
   readonly packBarcodes: readonly SkuPackBarcode[];
+  /**
+   * Story 1-4b — `active | inactive`. The handheld warns at a receive scan of
+   * an inactive SKU that is not on the document (it is booked and flagged).
+   */
+  readonly status: SkuStatus;
 }
 
 /** Story 1-4 — one pack (or extra base-level) barcode as the device snapshot carries it. */
@@ -423,10 +439,12 @@ export class CatalogFacade {
         reorderPoint: skus.reorderPoint,
         reorderQty: skus.reorderQty,
         clientId: skus.clientId,
+        status: skus.status,
       })
       .from(skus)
       .where(eq(skus.tenantId, tenantId))
-      .orderBy(skus.code);
+      .orderBy(skus.code)
+      .then((rows) => rows.map((row) => ({ ...row, status: row.status as SkuStatus })));
   }
 
   /**
@@ -539,6 +557,8 @@ export class CatalogFacade {
         // clients, so the device needs it to resolve within a document's
         // client.
         clientId: skus.clientId,
+        // Story 1-4b — the receive scan's inactive warning.
+        status: skus.status,
       })
       .from(skus)
       .leftJoin(products, eq(products.id, skus.productId))
@@ -582,9 +602,27 @@ export class CatalogFacade {
     // still on the caller's transaction.
     return rows.map((row) => ({
       ...row,
+      status: row.status as SkuStatus,
       uomPrecision: uomPrecision(row.uom),
       packBarcodes: packBySku.get(row.id) ?? [],
     }));
+  }
+
+  /**
+   * Story 1-4b — the statuses of `skuIds` (id → status; an unknown id is
+   * absent), in its own transaction: the channel publish reads it once per
+   * cycle, outside any transaction, beside its ATP reads.
+   */
+  async skuStatuses(tenantId: string, skuIds: readonly string[]): Promise<Map<string, SkuStatus>> {
+    const ids = [...new Set(skuIds)];
+    if (ids.length === 0) return new Map();
+    const rows = await withTenantTransaction(this.db, tenantId, (tx) =>
+      tx
+        .select({ id: skus.id, status: skus.status })
+        .from(skus)
+        .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, ids))),
+    );
+    return new Map(rows.map((row) => [row.id, row.status as SkuStatus]));
   }
 
   /** Batch identities of one SKU — the expiry half of the api layer's FEFO join. */

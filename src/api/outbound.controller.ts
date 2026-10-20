@@ -93,7 +93,7 @@ export class OutboundController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks orders.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or a line\'s SKU does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict), or a concurrent first delivery of the same channel payload (conflict — retry to read the settled result)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict), or a concurrent first delivery of the same channel payload (conflict — retry to read the settled result); a line of an inactive SKU that stock does not cover in full — an inactive SKU sells down, never backorders (sku-inactive, naming extensions.skuCodes); a line SKU became a kit while the order was placed (order-catalog-changed — retry)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or the channel ref already created a DIFFERENT payload (order-source-conflict)') })
   @ApiResponse({ status: 503, ...problemJsonResponse('The atomic-decision store is unreachable — the creation fails closed, nothing written (reservation-store-unavailable)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })

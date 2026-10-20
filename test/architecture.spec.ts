@@ -1025,6 +1025,43 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
     expect(order.match(/await assertClientTakesWorkInTx\(/g)?.length).toBe(2);
   });
 
+  /**
+   * Story 1-4b — "no new inbound, kits or listings for an inactive SKU":
+   * every path that creates such work runs the one guard,
+   * `assertSkusTakeWorkInTx`. The catalog import's kit pass is the one file
+   * that decides against rows it already holds `FOR UPDATE` (a stronger lock
+   * than the guard's), so it is pinned by its row-error code instead.
+   */
+  const SKU_TAKES_WORK_CALLERS = [
+    ['inbound', 'po.command.ts'],
+    ['inbound', 'asn.command.ts'],
+    ['inbound', 'asn-import.command.ts'],
+    ['catalog', 'kit.command.ts'],
+    ['channels', 'channels.command.ts'],
+    ['channels', 'channels.publish.ts'],
+  ] as const;
+
+  it('story 1-4b: every new-inbound, kit and mapping path calls assertSkusTakeWorkInTx', () => {
+    const missing = SKU_TAKES_WORK_CALLERS.map(([module, file]) => join(SRC_ROOT, 'modules', module, file)).filter(
+      (path) => !/assertSkusTakeWorkInTx\(/.test(readFileSync(path, 'utf8')),
+    );
+    expect(missing).toEqual([]);
+    // PO create + amend, ASN create + announce + amend, kit create + PUT,
+    // and the mapping PUT and seed arm.
+    const count = (module: string, file: string) =>
+      readFileSync(join(SRC_ROOT, 'modules', module, file), 'utf8').match(/await assertSkusTakeWorkInTx\(/g)?.length ?? 0;
+    expect(count('inbound', 'po.command.ts')).toBe(2);
+    expect(count('inbound', 'asn.command.ts')).toBe(3);
+    expect(count('catalog', 'kit.command.ts')).toBe(2);
+    // The catalog import's kit pass: the row error, decided on its FOR UPDATE rows.
+    const catalogImport = readFileSync(join(SRC_ROOT, 'modules', 'catalog', 'import.command.ts'), 'utf8');
+    expect(catalogImport).toContain("'sku-inactive'");
+    expect(catalogImport).toMatch(/status: skus\.status[\s\S]*\.for\('update'\)/);
+    // The order create re-reads status and kit-ness under KEY SHARE in phase 3.
+    const order = readFileSync(join(SRC_ROOT, 'modules', 'outbound', 'order.command.ts'), 'utf8');
+    expect(order.match(/await lockSkuStatusesInTx\(/g)?.length).toBe(1);
+  });
+
   it('the correction command really is the writer (the guard is meaningful)', () => {
     const correction = readFileSync(CORRECTION_FILE, 'utf8');
     expect(SKU_CLIENT_UPDATE.test(correction)).toBe(true);

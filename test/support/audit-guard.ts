@@ -91,6 +91,8 @@ export const AUDIT_NO_OP_ARMS = {
   'partners.linkUpdate:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'partner'),
   /** Story 1-4 — `SkuCommand.replacePackaging` with both sets equal to the stored ones (stores the key with `{ sku }`). */
   'skus.packaging:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'sku'),
+  /** Story 1-4b — `SkuCommand.updateStatus` to the status (and reason) already in place (stores the key with `{ sku }`). */
+  'skus.status:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'sku'),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

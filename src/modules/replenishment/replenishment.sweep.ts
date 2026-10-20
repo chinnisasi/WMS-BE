@@ -57,6 +57,12 @@ export interface EffectiveCandidate {
    */
   readonly departed: boolean;
   /**
+   * Story 1-4b (decision 7) — the SKU is inactive: treated like a departed
+   * client's (no breach opens, a standing one is recovered), and its
+   * standing suggested-PO draft is dismissed — an inactive SKU takes no PO.
+   */
+  readonly inactive: boolean;
+  /**
    * Story 1-3 — the SKU's client: the draft's default vendor is THAT
    * client's (decision 2), never a tenant-wide one.
    */
@@ -140,11 +146,28 @@ export class ReplenishmentSweep {
           continue;
         }
         const breach = await this.loadOpenBreach(tx, tenantId, warehouseId, candidate.skuId);
-        if (candidate.departed) {
+        if (candidate.departed || candidate.inactive) {
           // Story 1-2a — never raise for a departed client; close what stands.
+          // Story 1-4b (decision 7) — an inactive SKU the same way, and its
+          // standing draft is dismissed (a submit would be refused
+          // `sku-inactive` anyway). The expiry scan is unchanged: the stock
+          // still exists.
           if (breach !== null) {
             await this.recoverBreach(tx, tenantId, breach);
             recovered += 1;
+          }
+          if (candidate.inactive) {
+            await tx
+              .update(suggestedPos)
+              .set({ status: 'dismissed', updatedAt: nowIso() })
+              .where(
+                and(
+                  eq(suggestedPos.tenantId, tenantId),
+                  eq(suggestedPos.warehouseId, warehouseId),
+                  eq(suggestedPos.skuId, candidate.skuId),
+                  eq(suggestedPos.status, 'draft'),
+                ),
+              );
           }
           continue;
         }
@@ -213,6 +236,7 @@ export class ReplenishmentSweep {
           pointMilli,
           qtyMilli,
           departed: departed.has(sku.clientId),
+          inactive: sku.status !== 'active',
           clientId: sku.clientId,
         });
       }

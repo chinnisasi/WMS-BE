@@ -30,7 +30,7 @@ import type { TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
-import { CatalogFacade } from '../catalog/catalog.facade';
+import { CatalogFacade, assertSkusTakeWorkInTx } from '../catalog/catalog.facade';
 import { ChannelsPublishService } from './channels.publish';
 import { knownChannelProviderCodes, requireChannelAdapterOrNull } from './channel-registry';
 import type { ChannelAdapter } from './channel-registry';
@@ -1227,6 +1227,27 @@ export class ChannelsCommandService {
         // (409 `client-departed`). An empty set (unmapping) is always allowed.
         await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
       }
+      // Story 1-4b (decision 9) — a NEW mapping to an inactive SKU is refused
+      // (409 `sku-inactive`); a stored pair re-sent is kept (an inactive SKU
+      // publishes 0 through it). "New" is judged against the stored set, read
+      // here under the connection lock, before the delete.
+      const storedPairs = await tx
+        .select({ externalRef: channelMappings.externalRef, skuId: channelMappings.skuId })
+        .from(channelMappings)
+        .where(
+          and(
+            eq(channelMappings.tenantId, command.tenantId),
+            eq(channelMappings.integrationId, command.connectionId),
+          ),
+        );
+      const storedKeys = new Set(storedPairs.map((pair) => `${pair.externalRef}\u0000${pair.skuId}`));
+      await assertSkusTakeWorkInTx(
+        tx,
+        command.tenantId,
+        command.items
+          .filter((item) => !storedKeys.has(`${item.externalRef.trim()}\u0000${item.skuId}`))
+          .map((item) => item.skuId),
+      );
 
       // The scope-ceiling arithmetic (row 5's 400): distinct SKUs × ACTIVE
       // tenant warehouses against the publish's per-cycle cap.

@@ -135,6 +135,8 @@ export interface CatalogSnapshot {
      * (1 at the base uom). Sixth mirror of the `SkuSummary` arm.
      */
     readonly packBarcodes: readonly { readonly barcode: string; readonly uom: string; readonly factor: number }[];
+    /** Story 1-4b: `active | inactive` — the handheld's inactive receive-scan warning. Seventh mirror. */
+    readonly status: 'active' | 'inactive';
   }[];
   readonly openPurchaseOrders: readonly {
     readonly id: string;

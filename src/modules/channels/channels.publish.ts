@@ -13,7 +13,7 @@ import { openCredential } from './channel-credentials';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
-import { CatalogFacade } from '../catalog/catalog.facade';
+import { CatalogFacade, assertSkusTakeWorkInTx } from '../catalog/catalog.facade';
 import { TenancyService } from '../tenancy/tenancy.service';
 import { MAX_WAREHOUSE_PAGE_SIZE } from '../tenancy/tenancy.service';
 import { BREAKER_FAILURE_THRESHOLD, CONNECTION_COLUMNS } from './channels.view';
@@ -120,11 +120,20 @@ export class ChannelsPublishService {
       }
       cursor = page.nextCursor;
     }
+    // Story 1-4b (decision 3) — an inactive SKU publishes 0 at every
+    // warehouse with no ATP read: the mapping is kept, the marketplace stops
+    // selling it, and reactivation resumes the real quantity on the next
+    // tick. One batched status read for the mapped SKUs.
+    const statuses = await this.catalog.skuStatuses(tenantId, skuRefs.map((ref) => ref.skuId));
     const scopes: PublishedScope[] = [];
     for (const { skuId, externalRef } of skuRefs) {
       for (const warehouseId of warehouseIds) {
         if (scopes.length >= MAX_SYNC_SCOPES_PER_PUBLISH) {
           return scopes;
+        }
+        if (statuses.get(skuId) === 'inactive') {
+          scopes.push({ warehouseId, skuId, externalRef, visibleMilli: 0 });
+          continue;
         }
         const pool = await this.inventory.channelVisibleQuantity(
           tenantId,
@@ -751,6 +760,19 @@ export class ChannelsPublishService {
       for (const clientId of [...mappedClientIds].sort()) {
         await assertClientTakesWorkInTx(tx, tenantId, clientId);
       }
+      // Story 1-4b (decision 9) — a NEW `(externalRef, skuId)` pair naming an
+      // inactive SKU is refused (409 `sku-inactive`); a stored pair re-sent
+      // is kept. Judged against the stored set, after the client checks.
+      const storedPairs = await tx
+        .select({ externalRef: channelMappings.externalRef, skuId: channelMappings.skuId })
+        .from(channelMappings)
+        .where(and(eq(channelMappings.tenantId, tenantId), eq(channelMappings.integrationId, connectionId)));
+      const storedKeys = new Set(storedPairs.map((pair) => `${pair.externalRef}\u0000${pair.skuId}`));
+      await assertSkusTakeWorkInTx(
+        tx,
+        tenantId,
+        items.filter((item) => !storedKeys.has(`${item.externalRef}\u0000${item.skuId}`)).map((item) => item.skuId),
+      );
       let written = 0;
       for (const item of items) {
         const inserted = await tx

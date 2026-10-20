@@ -228,7 +228,7 @@ export class PortalController {
   @ApiResponse({
     status: 409,
     ...problemJsonResponse(
-      'A line names a kit SKU (kit-cannot-hold-stock), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)',
+      'A line names a kit SKU (kit-cannot-hold-stock) or an inactive SKU (sku-inactive), the client already has this code (duplicate-asn-code), or a concurrent idempotent request (conflict)',
     ),
   })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })

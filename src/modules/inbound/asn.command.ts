@@ -36,7 +36,7 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
 import { uomPrecision } from '../catalog/uom';
-import { CatalogFacade } from '../catalog/catalog.facade';
+import { CatalogFacade, assertSkusTakeWorkInTx, skusGainingInbound } from '../catalog/catalog.facade';
 import { kitCannotHoldStock } from '../catalog/kit.store';
 import { portalAsnInTx, type PortalAsnDetail } from './portal-inbound';
 
@@ -716,6 +716,9 @@ export class AsnCommand {
         asnCode,
         [...skuFacts.values()].map((sku) => sku.clientId),
       );
+      // Story 1-4b — no new inbound for an inactive SKU (409 `sku-inactive`),
+      // after the client checks (decision 13).
+      await assertSkusTakeWorkInTx(tx, command.tenantId, command.lines.map((line) => line.skuId));
       // The ASN import story closed the PENDING kit gap: the operator create
       // refuses a kit line too (after the client checks, before the scale —
       // the portal announce's position).
@@ -833,6 +836,9 @@ export class AsnCommand {
           command.clientId,
           command.lines.map((line) => line.skuId),
         );
+        // Story 1-4b — an inactive SKU takes no new ASN (409 `sku-inactive`;
+        // `portal/skus` never lists one either).
+        await assertSkusTakeWorkInTx(tx, command.tenantId, command.lines.map((line) => line.skuId));
         // FR-38: receiving refuses a kit line, so a kit announced here could
         // never be received (`portal/skus` never lists one either).
         await assertNoKitLinesInTx(
@@ -934,6 +940,17 @@ export class AsnCommand {
           foreign.map((clientId) => labels.get(clientId) ?? clientId),
         );
       }
+      // Story 1-4b (decision 9) — an inactive SKU gains no inbound: a SKU the
+      // stored lines do not carry (a re-pointed line included), or one whose
+      // announced total rises, is refused 409 `sku-inactive`.
+      await assertSkusTakeWorkInTx(
+        tx,
+        command.tenantId,
+        skusGainingInbound(
+          existing.map((line) => ({ skuId: line.skuId, qtyMilli: line.announcedQty })),
+          command.lines.map((line) => ({ skuId: line.skuId, qtyBase: line.announcedQty })),
+        ),
+      );
       // The ASN import story: amend refuses a kit line too (after the client
       // check, before the scale), so an amend cannot add what create refuses.
       await assertNoKitLinesInTx(
