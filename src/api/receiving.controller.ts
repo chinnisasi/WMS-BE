@@ -234,7 +234,12 @@ export class ReceivingController {
     return {
       ...snapshot,
       // Story 1-4 — the pack barcodes, copied key by key (a mutable DTO array).
-      skus: snapshot.skus.map((sku) => ({ ...sku, packBarcodes: sku.packBarcodes.map((entry) => ({ ...entry })) })),
+      // Story 1-6a — and the DG arm, its subsidiary list copied too.
+      skus: snapshot.skus.map((sku) => ({
+        ...sku,
+        packBarcodes: sku.packBarcodes.map((entry) => ({ ...entry })),
+        dg: sku.dg === null ? null : { ...sku.dg, subsidiaryClasses: [...sku.dg.subsidiaryClasses] },
+      })),
       pickTasks: pickTasks.map((task) => ({ ...task })),
       packTasks: packWork.packTasks.map((task) => ({ ...task })),
       handlingUnits: packWork.handlingUnits.map((unit) => ({ ...unit })),

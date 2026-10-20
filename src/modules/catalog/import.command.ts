@@ -47,6 +47,18 @@ import { assertHazardClass } from '../../shared/primitives/hazard';
 // Story 5-3 — the ABC class vocabulary validator (the same shape, skipping
 // null — the blank cell IS the null verb on this column).
 import { assertAbcClass } from '../../shared/primitives/abc-class';
+// Story 1-6a — the goods-type rule set the create and the edit also call.
+import {
+  ALLERGENS,
+  DG_CLASSES,
+  DG_PACKING_GROUPS,
+  DRUG_SCHEDULES,
+  FOOD_CATEGORIES,
+  canonicalGoodsType,
+  goodsTypeProblem,
+  hazardResolution,
+  type GoodsTypeFields,
+} from '../../shared/primitives/goods-type';
 import {
   AXIS_NAME_MAX,
   PRODUCT_NAME_MAX,
@@ -141,6 +153,32 @@ export interface ImportCatalogCommand {
 }
 
 const REQUIRED_COLUMNS = ['sku_code', 'name', 'uom', 'gst_rate'] as const;
+
+/** Story 1-6a — the ten goods-type columns, in header order, each naming its API field. */
+const GOODS_TYPE_COLUMN_FIELDS = {
+  drug_schedules: 'drugSchedules',
+  food_category: 'foodCategory',
+  allergens: 'allergens',
+  dg_un_number: 'dgUnNumber',
+  dg_class: 'dgClass',
+  dg_subsidiary_classes: 'dgSubsidiaryClasses',
+  dg_packing_group: 'dgPackingGroup',
+  high_value: 'highValue',
+  fragile: 'fragile',
+  max_stack_layers: 'maxStackLayers',
+} as const satisfies Record<string, keyof GoodsTypeFields>;
+const GOODS_TYPE_COLUMNS = [
+  'drug_schedules',
+  'food_category',
+  'allergens',
+  'dg_un_number',
+  'dg_class',
+  'dg_subsidiary_classes',
+  'dg_packing_group',
+  'high_value',
+  'fragile',
+  'max_stack_layers',
+] as const satisfies readonly (keyof typeof GOODS_TYPE_COLUMN_FIELDS)[];
 const OPTIONAL_COLUMNS = [
   'uom_conversions',
   'hsn',
@@ -200,6 +238,11 @@ const OPTIONAL_COLUMNS = [
   // row's `uom_conversions` cell). The closed-header contract grows again.
   'shelf_life_days',
   'barcodes',
+  // Story 1-6a — the goods-type columns, appended after `barcodes`. Cells
+  // are trimmed and case-insensitive; lists split on `;` with blanks and
+  // duplicates folded; `UN1203` and `1203` both read 1203; the flags take
+  // `parseTracked`'s grammar. The closed-header contract grows again.
+  ...GOODS_TYPE_COLUMNS,
 ] as const;
 const KNOWN_COLUMNS: ReadonlySet<string> = new Set([...REQUIRED_COLUMNS, ...OPTIONAL_COLUMNS]);
 
@@ -257,6 +300,8 @@ interface ValidRow {
   readonly shelfLifeDays: number | null;
   /** Story 1-4 — the `barcodes` cell: every non-primary barcode with its level. */
   readonly extraBarcodes: readonly ExtraBarcode[];
+  /** Story 1-6a — the goods-type cells, canonical and ruled on (blank → the default). */
+  readonly goods: GoodsTypeFields;
 }
 
 type FieldResult<T> = { ok: true; value: T } | { ok: false; error: CatalogImportErrorDto };
@@ -648,6 +693,11 @@ export class ImportCommand {
             abcClass: row.abcClass,
             // Story 1-4 — total shelf life (blank cell → null).
             shelfLifeDays: row.shelfLifeDays,
+            // Story 1-6a — the goods-type cells (blank → the column defaults).
+            ...row.goods,
+            drugSchedules: [...row.goods.drugSchedules],
+            allergens: [...row.goods.allergens],
+            dgSubsidiaryClasses: [...row.goods.dgSubsidiaryClasses],
           }));
           // Story 1-4 — every SKU's primary `sku_barcodes` row (the generated
           // default included) and the `barcodes` cell's extra rows, in the
@@ -1024,10 +1074,15 @@ function rowError(
  * Bulk inserts are chunked: Postgres binds at most 65,535 parameters per
  * statement, and a cap-admitting file (10,000 rows × 12 sku columns ≈ 120k
  * params, or 10,000 error rows × 7 columns) would exceed it and 500 the whole
- * import despite passing the row cap. 2,000 rows/chunk keeps every statement
+ * import despite passing the row cap. A bounded chunk keeps every statement
  * far below the ceiling.
  */
-const INSERT_CHUNK_ROWS = 2_000;
+//
+// Story 1-6a: the `skus` insert binds one parameter per COLUMN per row, and
+// the goods-type columns took it from ~27 to ~37 — 2,000 rows would bind
+// ~74k and 500 the import (the 5,000-row acceptance test caught it). 1,000
+// rows keeps the widest table near 37k, with room for the next columns.
+const INSERT_CHUNK_ROWS = 1_000;
 
 function chunked<T>(rows: readonly T[]): T[][] {
   const chunks: T[][] = [];
@@ -1386,10 +1441,15 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
   // rules on every present value beside the 12-1 validator — a cell outside
   // the controlled vocabulary is a per-row error naming the value, so the
   // rest of the file still commits and `fix` mode can re-submit this row.
+  // Story 1-6a (decision 7) — a blank cell is ABSENT (a mapped dg_class
+  // derives the class; without one it stays null, as before) and `none` is
+  // the explicit none (DG class 8's third choice). The resolution runs once
+  // the goods-type cells are parsed, below.
   const hazardClassRaw = v['hazard_class']?.trim() ?? '';
-  const hazardClass = hazardClassRaw === '' ? null : hazardClassRaw;
+  const requestedHazard: string | null | undefined =
+    hazardClassRaw === '' ? undefined : hazardClassRaw.toLowerCase() === 'none' ? null : hazardClassRaw;
   try {
-    assertHazardClass({ hazardClass });
+    assertHazardClass({ hazardClass: requestedHazard });
   } catch (err) {
     const response = (err as ProblemException).getResponse() as { detail?: string };
     // The shared validator names the command field (`hazardClass`); the CSV
@@ -1558,6 +1618,19 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
   const kitComponentsParsed = parseKitComponentsCell(v['kit_components']?.trim() ?? '', row.rowNumber);
   if (!kitComponentsParsed.ok) return { ok: false, error: { ...kitComponentsParsed.error, skuCode: code } };
 
+  // Story 1-6a — the goods-type cells, then the DG → hazard derivation with
+  // no stored state (decision 7: blank derives, class 8 must name its choice
+  // — `none` included). The same rule set the create runs, so an import row
+  // and a create with the same values store the same fields.
+  const goodsParsed = parseGoodsTypeCells(v, row.rowNumber);
+  if (!goodsParsed.ok) return { ok: false, error: { ...goodsParsed.error, skuCode: code } };
+  const goods = goodsParsed.value;
+  const resolution = hazardResolution(goods.dgClass, null, requestedHazard);
+  if ('code' in resolution) {
+    return { ok: false, error: rowError(row.rowNumber, code, resolution.code, toColumnNames(resolution.detail)) };
+  }
+  const hazardClass = resolution.hazardClass;
+
   return {
     ok: true,
     row: {
@@ -1595,8 +1668,74 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       abcClass,
       shelfLifeDays,
       extraBarcodes,
+      goods,
     },
   };
+}
+
+/** Story 1-6a — every goods-type API field name in a sentence replaced by its CSV column (plus hazard_class). */
+function toColumnNames(detail: string): string {
+  let out = detail.replace(/\bhazardClass\b/g, 'hazard_class');
+  for (const [column, field] of Object.entries(GOODS_TYPE_COLUMN_FIELDS)) {
+    out = out.replace(new RegExp(`\\b${field}\\b`, 'g'), column);
+  }
+  return out;
+}
+
+/** A cell matched case-insensitively against a vocabulary — its canonical spelling, else the cell as given (for the rule to refuse). */
+function vocabularyCell(vocabulary: readonly string[], cell: string): string {
+  const lower = cell.toLowerCase();
+  return vocabulary.find((entry) => entry.toLowerCase() === lower) ?? cell;
+}
+
+/** A `;`-list cell: trimmed entries, blanks dropped, each matched case-insensitively (duplicates fold in the canonicalisation). */
+function listCell(vocabulary: readonly string[], cell: string): string[] {
+  return cell
+    .split(';')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '')
+    .map((entry) => vocabularyCell(vocabulary, entry));
+}
+
+/**
+ * Story 1-6a — the ten goods-type cells as one canonical record, ruled on by
+ * the shared `goodsTypeProblem` (the row error names the CSV column). Blank
+ * reads the default: `[]`, null, false.
+ */
+function parseGoodsTypeCells(v: Readonly<Record<string, string>>, rowNumber: number): FieldResult<GoodsTypeFields> {
+  const cell = (column: string): string => v[column]?.trim() ?? '';
+  const highValue = parseTracked(cell('high_value'), 'high_value', rowNumber);
+  if (!highValue.ok) return highValue;
+  const fragile = parseTracked(cell('fragile'), 'fragile', rowNumber);
+  if (!fragile.ok) return fragile;
+  const stackRaw = cell('max_stack_layers');
+  if (stackRaw !== '' && !/^\d+$/.test(stackRaw)) {
+    return {
+      ok: false,
+      error: rowError(rowNumber, null, 'validation-failed', `max_stack_layers must be a whole number 1–100 (got "${stackRaw}").`),
+    };
+  }
+  const blankToNull = (value: string): string | null => (value === '' ? null : value);
+  const foodRaw = cell('food_category');
+  const dgClassRaw = cell('dg_class');
+  const packingRaw = cell('dg_packing_group');
+  const goods = canonicalGoodsType({
+    drugSchedules: listCell(DRUG_SCHEDULES, cell('drug_schedules')),
+    foodCategory: foodRaw === '' ? null : vocabularyCell(FOOD_CATEGORIES, foodRaw),
+    allergens: listCell(ALLERGENS, cell('allergens')),
+    dgUnNumber: blankToNull(cell('dg_un_number')),
+    dgClass: dgClassRaw === '' ? null : vocabularyCell(DG_CLASSES, dgClassRaw),
+    dgSubsidiaryClasses: listCell(DG_CLASSES, cell('dg_subsidiary_classes')),
+    dgPackingGroup: packingRaw === '' ? null : vocabularyCell(DG_PACKING_GROUPS, packingRaw),
+    highValue: highValue.value,
+    fragile: fragile.value,
+    maxStackLayers: stackRaw === '' ? null : Number(stackRaw),
+  });
+  const problem = goodsTypeProblem(goods);
+  if (problem !== null) {
+    return { ok: false, error: rowError(rowNumber, null, 'validation-failed', toColumnNames(problem.detail)) };
+  }
+  return { ok: true, value: goods as GoodsTypeFields };
 }
 
 /**

@@ -3447,7 +3447,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key; an invalid field — unknown uom, GST, attributes, classes, shelf life, a level equal to the base uom or repeated, a factor outside 2–1,000,000, a barcode breaking the rule or equal to the primary (validation-failed); a barcode on a level the SKU does not declare (barcode-level-unknown); no clientId while the tenant holds more than one client (client-required)",
+            "description": "Missing or malformed Idempotency-Key; an invalid field — unknown uom, GST, attributes, classes, shelf life, a level equal to the base uom or repeated, a factor outside 2–1,000,000, a barcode breaking the rule or equal to the primary (validation-failed); a barcode on a level the SKU does not declare (barcode-level-unknown); no clientId while the tenant holds more than one client (client-required); a goods-type field breaking its vocabulary or a pairing rule, or an explicit null for highValue, fragile, drugSchedules, allergens or dgSubsidiaryClasses (validation-failed); a hazardClass that disagrees with the dgClass (dg-hazard-mismatch); dgClass 8 without hazardClass corrosive-acid, corrosive-base or null (dg-hazard-required)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4237,7 +4237,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or invalid/empty body, or variantValues not covering the product's axes (names the axis)",
+            "description": "Missing or malformed Idempotency-Key, or invalid/empty body, or variantValues not covering the product's axes (names the axis); a goods-type field breaking its vocabulary or a pairing rule over the resulting SKU, or an explicit null for storageClass, highValue, fragile, drugSchedules, allergens or dgSubsidiaryClasses (validation-failed); a hazardClass that disagrees with the resulting dgClass (dg-hazard-mismatch); a change into dgClass 8 from a non-corrosive hazard without hazardClass corrosive-acid, corrosive-base or null (dg-hazard-required)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -29627,7 +29627,7 @@
           "code": {
             "type": "string",
             "example": "duplicate-sku-code",
-            "description": "validation-failed | duplicate-sku-code | duplicate-barcode"
+            "description": "validation-failed | duplicate-sku-code | duplicate-barcode | … ; story 1-6a adds dg-hazard-mismatch (a hazard_class cell disagreeing with dg_class) and dg-hazard-required (dg_class 8 with a blank hazard_class — write corrosive-acid, corrosive-base or none)"
           },
           "detail": {
             "type": "string",
@@ -30032,6 +30032,160 @@
             "nullable": true,
             "description": "Story 1-4b — why it was deactivated; null unless inactive (and optional then)"
           },
+          "drugSchedules": {
+            "type": "array",
+            "example": [
+              "H"
+            ],
+            "description": "Story 1-6a — drug schedules, sorted; empty when not a scheduled drug",
+            "items": {
+              "type": "string",
+              "enum": [
+                "G",
+                "H",
+                "H1",
+                "X",
+                "C",
+                "C1",
+                "NDPS"
+              ]
+            }
+          },
+          "foodCategory": {
+            "type": "string",
+            "enum": [
+              "dairy",
+              "meat-poultry-seafood",
+              "fresh-produce",
+              "bakery-cereals",
+              "ready-to-eat",
+              "beverages",
+              "oils-fats",
+              "spices-condiments",
+              "confectionery",
+              "packaged-dry-grocery",
+              "infant-food",
+              "other-food",
+              "non-food"
+            ],
+            "nullable": true,
+            "example": "dairy",
+            "description": "Story 1-6a — the food category; `non-food` declares the SKU not food, null means not set"
+          },
+          "allergens": {
+            "type": "array",
+            "example": [
+              "milk"
+            ],
+            "description": "Story 1-6a — FSSAI allergens, sorted; only with a food category that is not non-food",
+            "items": {
+              "type": "string",
+              "enum": [
+                "gluten-cereals",
+                "crustaceans",
+                "milk",
+                "eggs",
+                "fish",
+                "peanuts",
+                "tree-nuts",
+                "soybean",
+                "sulphite"
+              ]
+            }
+          },
+          "dgUnNumber": {
+            "type": "string",
+            "nullable": true,
+            "example": "1203",
+            "description": "Story 1-6a — the UN number, four digits without the \"UN\" prefix; set together with dgClass"
+          },
+          "dgClass": {
+            "type": "string",
+            "enum": [
+              "1.1",
+              "1.2",
+              "1.3",
+              "1.4",
+              "1.5",
+              "1.6",
+              "2.1",
+              "2.2",
+              "2.3",
+              "3",
+              "4.1",
+              "4.2",
+              "4.3",
+              "5.1",
+              "5.2",
+              "6.1",
+              "6.2",
+              "7",
+              "8",
+              "9"
+            ],
+            "nullable": true,
+            "example": "3",
+            "description": "Story 1-6a — the primary dangerous-goods class; a mapped class sets hazardClass"
+          },
+          "dgSubsidiaryClasses": {
+            "type": "array",
+            "example": [
+              "6.1"
+            ],
+            "description": "Story 1-6a — up to two subsidiary DG classes, sorted, never the primary",
+            "items": {
+              "type": "string",
+              "enum": [
+                "1.1",
+                "1.2",
+                "1.3",
+                "1.4",
+                "1.5",
+                "1.6",
+                "2.1",
+                "2.2",
+                "2.3",
+                "3",
+                "4.1",
+                "4.2",
+                "4.3",
+                "5.1",
+                "5.2",
+                "6.1",
+                "6.2",
+                "7",
+                "8",
+                "9"
+              ]
+            }
+          },
+          "dgPackingGroup": {
+            "type": "string",
+            "enum": [
+              "I",
+              "II",
+              "III"
+            ],
+            "nullable": true,
+            "example": "II",
+            "description": "Story 1-6a — the UN packing group; none for classes 1, 2, 5.2, 6.2 and 7"
+          },
+          "highValue": {
+            "type": "boolean",
+            "example": false,
+            "description": "Story 1-6a — a handling and insurance marker; placement stays governed by storage class"
+          },
+          "fragile": {
+            "type": "boolean",
+            "example": false,
+            "description": "Story 1-6a — handle with care"
+          },
+          "maxStackLayers": {
+            "type": "number",
+            "nullable": true,
+            "example": 4,
+            "description": "Story 1-6a — how many of the SKU's outermost received units may stand on one another (1 = do not stack); shown, not enforced"
+          },
           "createdAt": {
             "type": "string",
             "example": "2026-09-08T00:00:00.000Z"
@@ -30067,6 +30221,16 @@
           "barcodes",
           "status",
           "inactiveReason",
+          "drugSchedules",
+          "foodCategory",
+          "allergens",
+          "dgUnNumber",
+          "dgClass",
+          "dgSubsidiaryClasses",
+          "dgPackingGroup",
+          "highValue",
+          "fragile",
+          "maxStackLayers",
           "createdAt"
         ]
       },
@@ -30172,6 +30336,162 @@
       "CreateSkuDto": {
         "type": "object",
         "properties": {
+          "drugSchedules": {
+            "type": "array",
+            "example": [
+              "H"
+            ],
+            "description": "Drug schedules (a drug may carry several, e.g. C and H)",
+            "items": {
+              "type": "string",
+              "enum": [
+                "G",
+                "H",
+                "H1",
+                "X",
+                "C",
+                "C1",
+                "NDPS"
+              ]
+            }
+          },
+          "foodCategory": {
+            "type": "string",
+            "enum": [
+              "dairy",
+              "meat-poultry-seafood",
+              "fresh-produce",
+              "bakery-cereals",
+              "ready-to-eat",
+              "beverages",
+              "oils-fats",
+              "spices-condiments",
+              "confectionery",
+              "packaged-dry-grocery",
+              "infant-food",
+              "other-food",
+              "non-food"
+            ],
+            "nullable": true,
+            "example": "dairy",
+            "description": "`non-food` declares the SKU not food; null clears"
+          },
+          "allergens": {
+            "type": "array",
+            "example": [
+              "milk"
+            ],
+            "description": "FSSAI allergens — only with a food category that is not non-food",
+            "items": {
+              "type": "string",
+              "enum": [
+                "gluten-cereals",
+                "crustaceans",
+                "milk",
+                "eggs",
+                "fish",
+                "peanuts",
+                "tree-nuts",
+                "soybean",
+                "sulphite"
+              ]
+            }
+          },
+          "dgUnNumber": {
+            "type": "string",
+            "nullable": true,
+            "example": "UN1203",
+            "pattern": "^([Uu][Nn])?\\d{4}$",
+            "description": "The UN number 0001–3599, with or without the \"UN\" prefix (any case; stored without it). Set together with dgClass; null clears"
+          },
+          "dgClass": {
+            "type": "string",
+            "enum": [
+              "1.1",
+              "1.2",
+              "1.3",
+              "1.4",
+              "1.5",
+              "1.6",
+              "2.1",
+              "2.2",
+              "2.3",
+              "3",
+              "4.1",
+              "4.2",
+              "4.3",
+              "5.1",
+              "5.2",
+              "6.1",
+              "6.2",
+              "7",
+              "8",
+              "9"
+            ],
+            "nullable": true,
+            "example": "3",
+            "description": "The primary DG class. 1.x → explosive, 2.x → gas, 3 → flammable, 5.1 → oxidizer, 6.1 → toxic set hazardClass; 8 needs hazardClass corrosive-acid, corrosive-base or null; null clears"
+          },
+          "dgSubsidiaryClasses": {
+            "type": "array",
+            "maxItems": 2,
+            "example": [
+              "6.1"
+            ],
+            "description": "Up to two subsidiary DG classes, never the primary, only with a primary",
+            "items": {
+              "type": "string",
+              "enum": [
+                "1.1",
+                "1.2",
+                "1.3",
+                "1.4",
+                "1.5",
+                "1.6",
+                "2.1",
+                "2.2",
+                "2.3",
+                "3",
+                "4.1",
+                "4.2",
+                "4.3",
+                "5.1",
+                "5.2",
+                "6.1",
+                "6.2",
+                "7",
+                "8",
+                "9"
+              ]
+            }
+          },
+          "dgPackingGroup": {
+            "type": "string",
+            "enum": [
+              "I",
+              "II",
+              "III"
+            ],
+            "nullable": true,
+            "example": "II",
+            "description": "I, II or III; none for classes 1, 2, 5.2, 6.2 and 7; null clears"
+          },
+          "highValue": {
+            "type": "boolean",
+            "example": false
+          },
+          "fragile": {
+            "type": "boolean",
+            "example": false
+          },
+          "maxStackLayers": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100,
+            "example": 4,
+            "description": "How many of the SKU's outermost received units may stand on one another (1 = do not stack); null clears"
+          },
           "code": {
             "type": "string",
             "example": "TEA-1",
@@ -30249,7 +30569,9 @@
               "toxic",
               "gas"
             ],
-            "example": "flammable"
+            "nullable": true,
+            "example": "flammable",
+            "description": "Story 1-6a — omitted, a mapped dgClass derives it; with dgClass 8 send corrosive-acid, corrosive-base or null (none). A value that disagrees with the DG class is 400 dg-hazard-mismatch"
           },
           "abcClass": {
             "type": "string",
@@ -30575,6 +30897,162 @@
       "PatchSkuDto": {
         "type": "object",
         "properties": {
+          "drugSchedules": {
+            "type": "array",
+            "example": [
+              "H"
+            ],
+            "description": "Drug schedules (a drug may carry several, e.g. C and H)",
+            "items": {
+              "type": "string",
+              "enum": [
+                "G",
+                "H",
+                "H1",
+                "X",
+                "C",
+                "C1",
+                "NDPS"
+              ]
+            }
+          },
+          "foodCategory": {
+            "type": "string",
+            "enum": [
+              "dairy",
+              "meat-poultry-seafood",
+              "fresh-produce",
+              "bakery-cereals",
+              "ready-to-eat",
+              "beverages",
+              "oils-fats",
+              "spices-condiments",
+              "confectionery",
+              "packaged-dry-grocery",
+              "infant-food",
+              "other-food",
+              "non-food"
+            ],
+            "nullable": true,
+            "example": "dairy",
+            "description": "`non-food` declares the SKU not food; null clears"
+          },
+          "allergens": {
+            "type": "array",
+            "example": [
+              "milk"
+            ],
+            "description": "FSSAI allergens — only with a food category that is not non-food",
+            "items": {
+              "type": "string",
+              "enum": [
+                "gluten-cereals",
+                "crustaceans",
+                "milk",
+                "eggs",
+                "fish",
+                "peanuts",
+                "tree-nuts",
+                "soybean",
+                "sulphite"
+              ]
+            }
+          },
+          "dgUnNumber": {
+            "type": "string",
+            "nullable": true,
+            "example": "UN1203",
+            "pattern": "^([Uu][Nn])?\\d{4}$",
+            "description": "The UN number 0001–3599, with or without the \"UN\" prefix (any case; stored without it). Set together with dgClass; null clears"
+          },
+          "dgClass": {
+            "type": "string",
+            "enum": [
+              "1.1",
+              "1.2",
+              "1.3",
+              "1.4",
+              "1.5",
+              "1.6",
+              "2.1",
+              "2.2",
+              "2.3",
+              "3",
+              "4.1",
+              "4.2",
+              "4.3",
+              "5.1",
+              "5.2",
+              "6.1",
+              "6.2",
+              "7",
+              "8",
+              "9"
+            ],
+            "nullable": true,
+            "example": "3",
+            "description": "The primary DG class. 1.x → explosive, 2.x → gas, 3 → flammable, 5.1 → oxidizer, 6.1 → toxic set hazardClass; 8 needs hazardClass corrosive-acid, corrosive-base or null; null clears"
+          },
+          "dgSubsidiaryClasses": {
+            "type": "array",
+            "maxItems": 2,
+            "example": [
+              "6.1"
+            ],
+            "description": "Up to two subsidiary DG classes, never the primary, only with a primary",
+            "items": {
+              "type": "string",
+              "enum": [
+                "1.1",
+                "1.2",
+                "1.3",
+                "1.4",
+                "1.5",
+                "1.6",
+                "2.1",
+                "2.2",
+                "2.3",
+                "3",
+                "4.1",
+                "4.2",
+                "4.3",
+                "5.1",
+                "5.2",
+                "6.1",
+                "6.2",
+                "7",
+                "8",
+                "9"
+              ]
+            }
+          },
+          "dgPackingGroup": {
+            "type": "string",
+            "enum": [
+              "I",
+              "II",
+              "III"
+            ],
+            "nullable": true,
+            "example": "II",
+            "description": "I, II or III; none for classes 1, 2, 5.2, 6.2 and 7; null clears"
+          },
+          "highValue": {
+            "type": "boolean",
+            "example": false
+          },
+          "fragile": {
+            "type": "boolean",
+            "example": false
+          },
+          "maxStackLayers": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100,
+            "example": 4,
+            "description": "How many of the SKU's outermost received units may stand on one another (1 = do not stack); null clears"
+          },
           "name": {
             "type": "string",
             "minLength": 1,
@@ -30712,7 +31190,7 @@
             ],
             "nullable": true,
             "example": "flammable",
-            "description": "The SKU's hazard class (FR-41): explosive, oxidizer, flammable, corrosive-acid, corrosive-base, toxic or gas. Omit to leave unchanged; null clears the class (always succeeds — null carries no rule)."
+            "description": "The SKU's hazard class (FR-41): explosive, oxidizer, flammable, corrosive-acid, corrosive-base, toxic or gas. Omit to leave unchanged — or, when the SKU's resulting dgClass is mapped (1.x, 2.x, 3, 5.1, 6.1), to take the derived class. null clears it unless the DG class sets one (400 dg-hazard-mismatch); with dgClass 8 only corrosive-acid, corrosive-base or null are accepted, and changing into class 8 from a non-corrosive needs one of them (400 dg-hazard-required). A change to a non-null class runs the co-location guard."
           },
           "abcClass": {
             "type": "string",
@@ -36763,6 +37241,92 @@
           "factor"
         ]
       },
+      "CatalogSnapshotDgDto": {
+        "type": "object",
+        "properties": {
+          "unNumber": {
+            "type": "string",
+            "example": "1230",
+            "description": "The UN number, four digits without the \"UN\" prefix"
+          },
+          "class": {
+            "type": "string",
+            "example": "3",
+            "enum": [
+              "1.1",
+              "1.2",
+              "1.3",
+              "1.4",
+              "1.5",
+              "1.6",
+              "2.1",
+              "2.2",
+              "2.3",
+              "3",
+              "4.1",
+              "4.2",
+              "4.3",
+              "5.1",
+              "5.2",
+              "6.1",
+              "6.2",
+              "7",
+              "8",
+              "9"
+            ],
+            "description": "The primary DG class"
+          },
+          "subsidiaryClasses": {
+            "type": "array",
+            "example": [
+              "6.1"
+            ],
+            "description": "Up to two subsidiary DG classes, sorted",
+            "items": {
+              "type": "string",
+              "enum": [
+                "1.1",
+                "1.2",
+                "1.3",
+                "1.4",
+                "1.5",
+                "1.6",
+                "2.1",
+                "2.2",
+                "2.3",
+                "3",
+                "4.1",
+                "4.2",
+                "4.3",
+                "5.1",
+                "5.2",
+                "6.1",
+                "6.2",
+                "7",
+                "8",
+                "9"
+              ]
+            }
+          },
+          "packingGroup": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "I",
+              "II",
+              "III"
+            ],
+            "example": "II",
+            "description": "The UN packing group, or null"
+          }
+        },
+        "required": [
+          "unNumber",
+          "class",
+          "subsidiaryClasses",
+          "packingGroup"
+        ]
+      },
       "CatalogSnapshotSkuDto": {
         "type": "object",
         "properties": {
@@ -36890,6 +37454,31 @@
               "inactive"
             ],
             "description": "Story 1-4b: `inactive` — the SKU takes no new inbound. A receive scan of it that is not on the document is still booked and flagged for review; the handheld warns at scan time. An older device ignores it."
+          },
+          "fragile": {
+            "type": "boolean",
+            "description": "Story 1-6a: handle with care — the handheld notes it on receive, pick, pack and putaway"
+          },
+          "highValue": {
+            "type": "boolean",
+            "description": "Story 1-6a: a handling and insurance marker — noted on the handheld, never a placement rule"
+          },
+          "maxStackLayers": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 1,
+            "maximum": 100,
+            "description": "Story 1-6a: how many of the SKU's outermost received units may stand on one another (1 = do not stack); shown, not enforced"
+          },
+          "dg": {
+            "nullable": true,
+            "description": "Story 1-6a: the dangerous-goods identity, null when the SKU is not a dangerous good",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/CatalogSnapshotDgDto"
+              }
+            ]
           }
         },
         "required": [
@@ -36907,7 +37496,11 @@
           "storageClass",
           "clientId",
           "packBarcodes",
-          "status"
+          "status",
+          "fragile",
+          "highValue",
+          "maxStackLayers",
+          "dg"
         ]
       },
       "CatalogSnapshotPoDto": {

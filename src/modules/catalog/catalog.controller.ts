@@ -35,6 +35,8 @@ import { IdempotencyKey, parseRequiredIdempotencyKey } from '../tenancy/idempote
 import { ImportCommand, MAX_IMPORT_BYTES } from './import.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { SkuCommand, type SkuSnapshot } from './sku.command';
+import type { GoodsTypeInput } from '../../shared/primitives/goods-type';
+import type { GoodsTypeFieldsDto } from './catalog.dto';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import { ProductCommand } from './product.command';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
@@ -274,7 +276,7 @@ export class CatalogController {
   @ApiBody({ type: CreateSkuDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.CREATED, type: SkuWriteResponse, description: 'The created SKU (a matching Idempotency-Key replays it)' })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key; an invalid field — unknown uom, GST, attributes, classes, shelf life, a level equal to the base uom or repeated, a factor outside 2–1,000,000, a barcode breaking the rule or equal to the primary (validation-failed); a barcode on a level the SKU does not declare (barcode-level-unknown); no clientId while the tenant holds more than one client (client-required)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key; an invalid field — unknown uom, GST, attributes, classes, shelf life, a level equal to the base uom or repeated, a factor outside 2–1,000,000, a barcode breaking the rule or equal to the primary (validation-failed); a barcode on a level the SKU does not declare (barcode-level-unknown); no clientId while the tenant holds more than one client (client-required); a goods-type field breaking its vocabulary or a pairing rule, or an explicit null for highValue, fragile, drugSchedules, allergens or dgSubsidiaryClasses (validation-failed); a hazardClass that disagrees with the dgClass (dg-hazard-mismatch); dgClass 8 without hazardClass corrosive-acid, corrosive-base or null (dg-hazard-required)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('clientId names no client of this tenant (not-found)') })
@@ -289,6 +291,7 @@ export class CatalogController {
   ): Promise<SkuWriteResponse> {
     assertOwnTenant(session, tenantId);
     const key = parseRequiredIdempotencyKey(idempotencyKey);
+    assertNoNullGoodsTypeFlags(dto);
     const created = await this.skuCommand.create(
       {
         tenantId,
@@ -315,6 +318,10 @@ export class CatalogController {
         reorderQty: dto.reorderQty,
         shelfLifeDays: dto.shelfLifeDays,
         clientId: dto.clientId,
+        // Story 1-6a — the goods-type fields pass through; the command
+        // canonicalises them before hashing and rules on them behind the
+        // replay lookup.
+        ...goodsTypeOfDto(dto),
         levels: dto.levels?.map((level) => ({ uom: level.uom, factor: level.factor })),
         barcodes: dto.barcodes?.map((entry) => ({ barcode: entry.barcode, uom: entry.uom })),
       },
@@ -539,7 +546,7 @@ export class CatalogController {
   @ApiBody({ type: PatchSkuDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: SkuResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid/empty body, or variantValues not covering the product\'s axes (names the axis)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid/empty body, or variantValues not covering the product\'s axes (names the axis); a goods-type field breaking its vocabulary or a pairing rule over the resulting SKU, or an explicit null for storageClass, highValue, fragile, drugSchedules, allergens or dgSubsidiaryClasses (validation-failed); a hazardClass that disagrees with the resulting dgClass (dg-hazard-mismatch); a change into dgClass 8 from a non-corrosive hazard without hazardClass corrosive-acid, corrosive-base or null (dg-hazard-required)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('SKU (or, on attach, the product) does not exist in this tenant (not-found)') })
@@ -569,6 +576,7 @@ export class CatalogController {
         'The PATCH body carries `storageClass: null` — the storage class has no clear verb (the column is NOT NULL); omit `storageClass` to leave the SKU\'s class unchanged.',
       );
     }
+    assertNoNullGoodsTypeFlags(dto);
     const sku = await this.skuCommand.edit(
       {
         tenantId,
@@ -618,6 +626,9 @@ export class CatalogController {
         abcClass: dto.abcClass,
         // Story 1-4 — absent = unchanged, null = clear.
         shelfLifeDays: dto.shelfLifeDays,
+        // Story 1-6a — absent = unchanged, null clears a nullable field; the
+        // command merges onto the locked row and derives the hazard class.
+        ...goodsTypeOfDto(dto),
       },
       key,
     );
@@ -764,6 +775,44 @@ function toSkuResponse(sku: SkuSnapshot): SkuResponse {
     ...sku,
     uomConversions: sku.uomConversions.map((c) => ({ ...c })),
     barcodes: sku.barcodes.map((b) => ({ ...b })),
+    drugSchedules: [...sku.drugSchedules],
+    allergens: [...sku.allergens],
+    dgSubsidiaryClasses: [...sku.dgSubsidiaryClasses],
+  };
+}
+
+/**
+ * Story 1-6a — the DTO's `@IsOptional` skips null as well as undefined, and
+ * the command reads only `undefined` as absent: an explicit null on a NOT
+ * NULL goods-type field would reach the column. 400 here, the `storageClass`
+ * precedent (these fields have no clear verb — send `false` or `[]`).
+ */
+function assertNoNullGoodsTypeFlags(dto: GoodsTypeFieldsDto): void {
+  for (const field of ['highValue', 'fragile', 'drugSchedules', 'allergens', 'dgSubsidiaryClasses'] as const) {
+    if ((dto[field] as unknown) === null) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        `${field} must not be null`,
+        `The body carries \`${field}: null\` — ${field} has no clear verb; send ${field === 'highValue' || field === 'fragile' ? 'false' : '[]'}, or omit it to leave it unchanged.`,
+      );
+    }
+  }
+}
+
+/** Story 1-6a — the goods-type fields of a create or edit body, as the command takes them. */
+function goodsTypeOfDto(dto: GoodsTypeFieldsDto): GoodsTypeInput {
+  return {
+    drugSchedules: dto.drugSchedules,
+    foodCategory: dto.foodCategory,
+    allergens: dto.allergens,
+    dgUnNumber: dto.dgUnNumber,
+    dgClass: dto.dgClass,
+    dgSubsidiaryClasses: dto.dgSubsidiaryClasses,
+    dgPackingGroup: dto.dgPackingGroup,
+    highValue: dto.highValue,
+    fragile: dto.fragile,
+    maxStackLayers: dto.maxStackLayers,
   };
 }
 
