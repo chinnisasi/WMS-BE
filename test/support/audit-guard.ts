@@ -95,6 +95,9 @@ export const AUDIT_NO_OP_ARMS = {
   'skus.status:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'sku'),
   /** Story 1-6c — `LicenceCommand.edit` with nothing changed (stores the key with `{ licence }`). */
   'licences.edit:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'licence'),
+  /** Story 1-6d — `LicencePolicyCommand.set` to the state already in force (stores the key with `{ enforce }` — no gap scan). */
+  'licencePolicy.put:unchanged': (snapshot: unknown) =>
+    isRecord(snapshot) && sameKeys(snapshot, ['enforce']) && typeof snapshot.enforce === 'boolean',
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

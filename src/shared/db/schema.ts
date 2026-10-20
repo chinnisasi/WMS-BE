@@ -3417,6 +3417,32 @@ export const licences = pgTable(
 export type LicenceRow = typeof licences.$inferSelect;
 
 /**
+ * Story 1-6d — the per-tenant licence enforcement switch (the
+ * `expiry_alert_policies` precedent): one row per tenant, last-write-wins.
+ * A MISSING row means enforcement is off. Owned by the compliance module
+ * (written only by `LicencePolicyCommand`; read by the receipt and the order
+ * create through `licenceEnforcedInTx`). The RLS policy lives ONLY in
+ * `drizzle/0085_licence_policies.sql`.
+ */
+export const licencePolicies = pgTable(
+  'licence_policies',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    /** On: an uncovered drug or food receipt line goes to review and such an order is refused. */
+    enforce: boolean('enforce').notNull(),
+    /** The owner who last changed the switch. */
+    updatedBy: uuid('updated_by').notNull(),
+    ...tenantTimestamps,
+  },
+  (table) => [uniqueIndex('licence_policies_tenant_unique').on(table.tenantId)],
+);
+
+export type LicencePolicyRow = typeof licencePolicies.$inferSelect;
+
+/**
  * Shipments (Story 4.6c): one label per order — the outbound module's
  * record of the carrier's adapter-issued label. A shipment is created by
  * `createShipmentLabel` (the label command) when a `ready_to_dispatch`

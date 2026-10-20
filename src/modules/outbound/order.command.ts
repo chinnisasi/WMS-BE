@@ -18,7 +18,16 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
-import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
+import { assertWarehouseInTenant, getMemberRoleIn, getWarehouseCodeInTx } from '../tenancy/tenancy.service';
+// Story 1-6d — licence enforcement: compliance's FREE functions (never its
+// Nest module — compliance forward-references outbound, so it would cycle).
+import {
+  licenceCoverageInTx,
+  licenceEnforcedInTx,
+  licenceNotCovered,
+  licenceToday,
+} from '../compliance/licence-enforcement';
+import { needsOf, type LicenceGoodsProfile } from '../../shared/primitives/licence';
 import { normalizeGstinInput, GSTIN_RE, gstinPrefixProblem } from '../../shared/primitives/gstin';
 import { nicText } from '../../shared/primitives/nic-text';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -316,6 +325,9 @@ export class OrderCommandService {
    * A reservation-store failure fails the WHOLE creation closed.
    */
   async createOrder(command: CreateOrderCommand, idempotencyKey: string): Promise<OrderSnapshot> {
+    // Story 1-6d (D18) — ONE IST date for the licence check, captured here and
+    // used by both phases, so an order straddling IST midnight is judged once.
+    const licenceDate = licenceToday();
     // A manual order carrying channel refs would be silently stripped below —
     // a believing client would get an order with no dedup protection on
     // redelivery. 400 before anything else.
@@ -623,7 +635,17 @@ export class OrderCommandService {
       // Story 1-2a — an early exit for a departed client (409
       // `client-departed`) before any grant moves. NOT the guard: this phase
       // commits before phase 3 writes, so the check runs again there.
-      await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
+      const orderClient = await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
+      // Story 1-6d (decisions 4, 10) — the EARLY licence check, before any
+      // grant moves: with enforcement on, every SKU of the order — each line
+      // SKU, a kit parent and its components, backordered or not — must be
+      // covered at this site on the captured IST date, or the WHOLE order is
+      // refused 409 `licence-not-covered`. NOT the guard: phase 3 re-checks.
+      await this.assertLicencesCoverInTx(tx, command.tenantId, command.warehouseId, licenceDate, {
+        clientId,
+        systemOwned: orderClient.systemOwned,
+        skus: [...lineSkus.values(), ...componentSkus.values()],
+      });
       return {
         replayed: null,
         destination,
@@ -776,7 +798,7 @@ export class OrderCommandService {
         // UPDATE) either committed first — refused here, 409
         // `client-departed`, and the grants released by the rollback path
         // below — or waits for this order, whose open status then blocks it.
-        await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
+        const orderClient = await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
         // Story 1-4b — the SKU rows `FOR KEY SHARE` in id order (after the
         // client: the lock order client → SKU), re-reading status and
         // kit-ness. A deactivation committed since phase 1 refuses a short
@@ -798,6 +820,15 @@ export class OrderCommandService {
         if (becameKits.length > 0) {
           throw orderCatalogChanged([...new Set(becameKits.map((skuId) => locked.get(skuId)!.code))]);
         }
+        // Story 1-6d — the licence RE-CHECK under the locks, on the same IST
+        // date: the switch re-read, and each SKU's goods attributes as the
+        // locked read sees them (an edit since phase 1 is caught). A refusal
+        // throws into the catch below, which releases every grant.
+        await this.assertLicencesCoverInTx(tx, command.tenantId, command.warehouseId, licenceDate, {
+          clientId,
+          systemOwned: orderClient.systemOwned,
+          skus: [...locked.values()],
+        });
         try {
           await tx.insert(orders).values({
             id: orderId,
@@ -1561,13 +1592,31 @@ export class OrderCommandService {
     // Story 21-2b: the same read hands back each SKU's client — the order
     // derives its own from them.
     const rows = await tx
-      .select({ id: skus.id, uom: skus.uom, clientId: skus.clientId, code: skus.code, status: skus.status })
+      .select({
+        id: skus.id,
+        uom: skus.uom,
+        clientId: skus.clientId,
+        code: skus.code,
+        status: skus.status,
+        foodCategory: skus.foodCategory,
+        drugSchedules: skus.drugSchedules,
+      })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)));
     // Story 1-4b — the code and status ride the same read (the phase-2.5
     // sell-down refusal names the SKU; phase 3 re-reads the status locked).
     const byId = new Map(
-      rows.map((row) => [row.id, { uom: row.uom, clientId: row.clientId, code: row.code, status: row.status as SkuStatus }]),
+      rows.map((row) => [
+        row.id,
+        {
+          uom: row.uom,
+          clientId: row.clientId,
+          code: row.code,
+          status: row.status as SkuStatus,
+          foodCategory: row.foodCategory,
+          drugSchedules: row.drugSchedules,
+        },
+      ]),
     );
     for (const skuId of distinct) {
       if (!byId.has(skuId)) {
@@ -1580,6 +1629,42 @@ export class OrderCommandService {
       }
     }
     return byId;
+  }
+
+  /**
+   * Story 1-6d — with licence enforcement on, every SKU of the order must be
+   * covered at the warehouse on `date` (1-6c's rule: a client licence for the
+   * site or for none, AND a site licence; the `self` client the site licence
+   * only) — else 409 `licence-not-covered` naming each SKU, its missing need
+   * and the holder. Off → nothing read but the switch.
+   */
+  private async assertLicencesCoverInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    date: string,
+    order: {
+      readonly clientId: string;
+      readonly systemOwned: boolean;
+      readonly skus: readonly (LicenceGoodsProfile & { readonly code: string })[];
+    },
+  ): Promise<void> {
+    const goods = order.skus.filter((sku) => needsOf(sku).length > 0);
+    if (goods.length === 0 || !(await licenceEnforcedInTx(tx, tenantId))) return;
+    const uncovered = await licenceCoverageInTx(tx, {
+      tenantId,
+      warehouseId,
+      date,
+      parties: goods.map((sku) => ({
+        clientId: order.clientId,
+        systemOwned: order.systemOwned,
+        skuCode: sku.code,
+        needs: needsOf(sku),
+      })),
+    });
+    if (uncovered.length > 0) {
+      throw licenceNotCovered(uncovered, await getWarehouseCodeInTx(tx, tenantId, warehouseId));
+    }
   }
 
   /** Line-shape validation (400 before any write). */
@@ -1622,12 +1707,14 @@ export class OrderCommandService {
   }
 }
 
-/** Story 21-2b — one SKU's existence facts: its base UoM and its client (1-4b: code and status). */
+/** Story 21-2b — one SKU's existence facts: its base UoM and its client (1-4b: code and status; 1-6d: the goods attributes). */
 interface SkuFacts {
   readonly uom: string;
   readonly clientId: string;
   readonly code: string;
   readonly status: SkuStatus;
+  readonly foodCategory: string | null;
+  readonly drugSchedules: readonly string[];
 }
 
 function uomsOf(facts: ReadonlyMap<string, SkuFacts>): Map<string, string> {

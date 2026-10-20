@@ -402,6 +402,8 @@ describe('story 1-2a: the client master record', () => {
       // The review-item read covers every SKU-naming op type the queue holds.
       const opTypes = Object.keys(REJECTED_OP_DECISIONS_BY_TYPE);
       expect(SKU_NAMING_OP_TYPES.every((type) => opTypes.includes(type))).toBe(true);
+      // Story 1-6d — the licence-refused row names its SKUs too.
+      expect(SKU_NAMING_OP_TYPES).toContain('grn.licence-refused');
       expect(opTypes.filter((type) => !(SKU_NAMING_OP_TYPES as readonly string[]).includes(type)).sort()).toEqual([
         'excursion.record',
         'transfer.confirm',

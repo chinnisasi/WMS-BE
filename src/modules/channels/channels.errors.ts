@@ -250,6 +250,25 @@ export function ingestSkuInactive(connectionId: string, why: string, skuCodes: r
 }
 
 /**
+ * Story 1-6d (decision 10) — 422 `licence-not-covered`: licence enforcement
+ * is on and no valid client and site licence covers the channel order's drug
+ * or food goods today. A licence fact the channel's retry cannot fix, so a
+ * validation failure (metered `validation-failed`, never redelivered as a
+ * transient `failed`) — deliberately: the merchant resends once the licence
+ * is fixed. `skuCodes` names the uncovered SKUs (the `ingestSkuInactive`
+ * precedent). An operator-visible list of refused ingests is PENDING.
+ */
+export function ingestLicenceNotCovered(connectionId: string, why: string, skuCodes: readonly string[]): ProblemException {
+  return new ProblemException(
+    'licence-not-covered',
+    422,
+    'Channel order refused — no valid licence covers the goods',
+    `Connection ${connectionId}'s order could not be accepted: ${why}`,
+    { skuCodes: [...skuCodes] },
+  );
+}
+
+/**
  * 409 `order-backorder-rejected` — RD-3's whole-order post-grant refusal
  * under `backorder_policy: 'reject'`: any line whose grant came back short
  * (zero-grant included) releases everything and refuses the order. No order

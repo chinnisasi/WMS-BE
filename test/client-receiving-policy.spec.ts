@@ -929,6 +929,23 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
       expect(REJECTED_OP_DECISIONS_BY_TYPE['grn.shelf-life-refused']).toEqual(['apply', 'discard']);
       expect(REJECTED_OP_DECISIONS_BY_TYPE['grn.lines-refused']).toEqual(['discard']);
       expect(SKU_NAMING_OP_TYPES).toContain('grn.shelf-life-refused');
+      // Story 1-6d — the per-line vocabulary is exact (the licence code joins
+      // last), and the licence row is waivable like the shelf-life one.
+      expect([...REJECTED_GRN_LINE_CODES]).toEqual([
+        'po-line-not-found',
+        'po-line-not-open',
+        'asn-line-not-found',
+        'sku-client-mismatch',
+        'client-departed',
+        'expiry-on-untracked',
+        'expiry-before-mfg',
+        'batch-expiry-mismatch',
+        'expiry-required',
+        'shelf-life-short',
+        'licence-not-covered',
+      ]);
+      expect(REJECTED_OP_DECISIONS_BY_TYPE['grn.licence-refused']).toEqual(['apply', 'discard']);
+      expect(SKU_NAMING_OP_TYPES).toContain('grn.licence-refused');
     });
   });
 

@@ -6128,7 +6128,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, unknown decision, or the payload refusing an arm (validation-failed — including a payload recount cannot re-plan; story 1-2b: Apply on a grn.shelf-life-refused row without a note, or a note over 500 characters)",
+            "description": "Missing or malformed Idempotency-Key, unknown decision, or the payload refusing an arm (validation-failed — including a payload recount cannot re-plan; story 1-2b: Apply on a grn.shelf-life-refused row without a note, or a note over 500 characters; story 1-6d: Apply on a grn.licence-refused row without a note)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6148,7 +6148,7 @@
             }
           },
           "403": {
-            "description": "Session belongs to another tenant (permission-denied), or the caller lacks review.decide (role-denied), or the apply re-execution's own guards refused (device-revoked, verbatim)",
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks review.decide (role-denied) — story 1-6d: Apply on a grn.licence-refused row also needs licences.manage, owner-only (role-denied) — or the apply re-execution's own guards refused (device-revoked, verbatim)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6168,7 +6168,7 @@
             }
           },
           "409": {
-            "description": "Row already resolved (rejected-op-resolved), a decision the op type does not admit — story 13-2: a return.receive row is Discard only; story 1-2b: a grn.shelf-life-refused row admits Apply and Discard (decision-not-available, member decisions), a pending count task on the bin (count-task-open), or the re-executed command's own conflict (verbatim)",
+            "description": "Row already resolved (rejected-op-resolved), a decision the op type does not admit — story 13-2: a return.receive row is Discard only; story 1-2b: a grn.shelf-life-refused row admits Apply and Discard; story 1-6d: so does a grn.licence-refused row (decision-not-available, member decisions), a pending count task on the bin (count-task-open), or the re-executed command's own conflict (verbatim)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9484,7 +9484,7 @@
             }
           },
           "409": {
-            "description": "A concurrent idempotent request (conflict), or a concurrent first delivery of the same channel payload (conflict — retry to read the settled result); a line of an inactive SKU that stock does not cover in full — an inactive SKU sells down, never backorders (sku-inactive, naming extensions.skuCodes); a line SKU became a kit while the order was placed (order-catalog-changed — retry)",
+            "description": "A concurrent idempotent request (conflict), or a concurrent first delivery of the same channel payload (conflict — retry to read the settled result); a line of an inactive SKU that stock does not cover in full — an inactive SKU sells down, never backorders (sku-inactive, naming extensions.skuCodes); a line SKU became a kit while the order was placed (order-catalog-changed — retry); story 1-6d: licence enforcement is on and no valid client and site licence covers a SKU (a line, a kit or a kit component) of drug or food goods at the warehouse today — nothing is created and every grant is released (licence-not-covered, the detail naming each SKU, its missing need and the holder, separated by \"; \", and extensions.skuCodes)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -14973,6 +14973,172 @@
           }
         ],
         "summary": "Reconstructs a dispatched order’s cold-chain trace (FR-45) from the ledger alone — per order line, every picked scope’s complete batch/serial ledger chain annotated with each bin’s current storage class, plus the excursions whose reading fell inside a scope dwell window at a chain bin",
+        "tags": [
+          "compliance"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/licence-policy": {
+      "get": {
+        "operationId": "LicencesController_getPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicencePolicyResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — an operator surface (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "The licence enforcement switch and the known coverage gaps today (IST). Any staff session; off for a tenant that never set it",
+        "tags": [
+          "compliance"
+        ]
+      },
+      "put": {
+        "operationId": "LicencesController_setPolicy",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetLicencePolicyDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetLicencePolicyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, enforce not a boolean, or acknowledgedGapCount not a whole number ≥ 0 (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks licences.manage — owner-only (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Turning on while the live known gap count exceeds acknowledgedGapCount (licence-gaps-unacknowledged, member gapCount), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Turns licence enforcement on or off (owner-only, licences.manage). While on, a goods-receipt line of drug or food goods not covered by a valid client and site licence on the receipt date is held in review (grn.licence-refused), and an order of such goods is refused (409 licence-not-covered). Turning on needs acknowledgedGapCount ≥ the live known gap count; turning off is always allowed and scans nothing. An unchanged PUT is a no-op (nothing written or audited; the key is stored)",
         "tags": [
           "compliance"
         ]
@@ -21365,6 +21531,7 @@
                 "kit",
                 "ledger_chain_break",
                 "licence",
+                "licence_policy",
                 "ledger_event",
                 "manifest",
                 "order",
@@ -28465,7 +28632,7 @@
             }
           },
           "422": {
-            "description": "A divergent payload on a known order ref (order-source-conflict), no ingest warehouse set (ingest-warehouse-unset), config referencing deleted master data (ingest-config-invalid), or a line of an inactive SKU that stock does not cover in full (sku-inactive)",
+            "description": "A divergent payload on a known order ref (order-source-conflict), no ingest warehouse set (ingest-warehouse-unset), config referencing deleted master data (ingest-config-invalid), a line of an inactive SKU that stock does not cover in full (sku-inactive), or (story 1-6d) licence enforcement refused the order — no valid licence covers its drug or food goods (licence-not-covered, naming skuCodes; not retried — resend once the licence is fixed)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -32317,7 +32484,8 @@
               "return.receive",
               "grn.lines-refused",
               "grn.shelf-life-refused",
-              "grn.inactive-sku-received"
+              "grn.inactive-sku-received",
+              "grn.licence-refused"
             ]
           },
           "classification": {
@@ -32468,7 +32636,8 @@
               "return.receive",
               "grn.lines-refused",
               "grn.shelf-life-refused",
-              "grn.inactive-sku-received"
+              "grn.inactive-sku-received",
+              "grn.licence-refused"
             ]
           },
           "classification": {
@@ -32601,7 +32770,7 @@
           "note": {
             "type": "string",
             "maxLength": 500,
-            "description": "Story 1-2b — the reviewer's note (trimmed, at most 500 characters). REQUIRED to apply a `grn.shelf-life-refused` row — accepting short-dated goods (400 without one; the row stays open); recorded in the outcome on any decision"
+            "description": "Story 1-2b — the reviewer's note (trimmed, at most 500 characters). REQUIRED to apply a `grn.shelf-life-refused` row — accepting short-dated goods — and (story 1-6d) a `grn.licence-refused` row — accepting goods without a valid licence (400 without one; the row stays open); recorded in the outcome on any decision"
           }
         },
         "required": [
@@ -37432,6 +37601,38 @@
           "excessQty"
         ]
       },
+      "MissingLicenceDto": {
+        "type": "object",
+        "properties": {
+          "need": {
+            "type": "string",
+            "enum": [
+              "drug-20b",
+              "drug-21b",
+              "drug-20g",
+              "ndps",
+              "fssai"
+            ],
+            "description": "What the goods need: drug-20b (G/H/H1), drug-21b (C/C1), drug-20g (X), ndps, or fssai (food)"
+          },
+          "holder": {
+            "type": "string",
+            "enum": [
+              "client",
+              "site"
+            ],
+            "description": "`client` — the brand holds no valid licence for this site (or for none); `site` — the site holds no valid licence"
+          },
+          "siteCode": {
+            "type": "string",
+            "description": "The receipt's site code — the site a site licence is missing at, or a client licence is missing for"
+          }
+        },
+        "required": [
+          "need",
+          "holder"
+        ]
+      },
       "RejectedGrnLineDto": {
         "type": "object",
         "properties": {
@@ -37466,9 +37667,10 @@
               "expiry-before-mfg",
               "batch-expiry-mismatch",
               "expiry-required",
-              "shelf-life-short"
+              "shelf-life-short",
+              "licence-not-covered"
             ],
-            "description": "Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt's line whose SKU belongs to another client than the receipt's; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU's client has departed; also to review (Discard only — re-receive after an owner reactivates the client). Story 1-2b — the expiry rules, each per line: `expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required` (review, Discard only) and `shelf-life-short` (its own review row — Accept anyway with a note, or Discard)"
+            "description": "Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt's line whose SKU belongs to another client than the receipt's; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU's client has departed; also to review (Discard only — re-receive after an owner reactivates the client). Story 1-2b — the expiry rules, each per line: `expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required` (review, Discard only) and `shelf-life-short` (its own review row — Accept anyway with a note, or Discard). Story 1-6d: `licence-not-covered` — licence enforcement is on and no valid client and site licence covers the line's drug or food goods on the receipt's IST date; its own review row (`grn.licence-refused` — an owner may accept it anyway with a note, or discard it)"
           },
           "reason": {
             "type": "string",
@@ -37477,7 +37679,7 @@
           "index": {
             "type": "integer",
             "minimum": 0,
-            "description": "Story 1-2b — the line's index in the request (present on an expiry refusal only)"
+            "description": "Story 1-2b — the line's index in the request (present on an expiry refusal and — 1-6d — a licence refusal only)"
           },
           "batchCode": {
             "type": "string",
@@ -37493,6 +37695,13 @@
             "type": "integer",
             "minimum": 0,
             "description": "Story 1-2b — `shelf-life-short` only: the client's minimum remaining shelf life in days (0 when the client sets none — the batch had expired)"
+          },
+          "missing": {
+            "description": "Story 1-6d — `licence-not-covered` only: each need no valid licence covers on the receipt's IST date, and which holder lacks it (the entry also carries `index`)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MissingLicenceDto"
+            }
           }
         },
         "required": [
@@ -37625,6 +37834,10 @@
             "type": "string",
             "description": "Story 1-2b — the op id of the review row raised for the `shelf-life-short` lines (type `grn.shelf-life-refused` — Accept anyway with a note, or Discard); present only when one was raised"
           },
+          "licenceReviewOpId": {
+            "type": "string",
+            "description": "Story 1-6d — the op id of the review row raised for the `licence-not-covered` lines (type `grn.licence-refused` — an owner may accept them anyway with a note, or discard them); present only when one was raised"
+          },
           "inactiveSkuReviewOpId": {
             "type": "string",
             "description": "Story 1-4b — the op id of the review row raised for the blind or unmatched lines of an INACTIVE SKU this receipt booked (type `grn.inactive-sku-received` — Discard only, labelled Acknowledge; it books nothing); present only when one was raised"
@@ -37682,7 +37895,7 @@
             "description": "Device time of the receipt (ISO-8601 UTC)"
           },
           "rejectedLines": {
-            "description": "Every request line, each `sku-client-mismatch` or (story 1-2a) `client-departed` or (story 1-2b) one of the expiry codes (`expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required`, `shelf-life-short`)",
+            "description": "Every request line, each `sku-client-mismatch` or (story 1-2a) `client-departed` or (story 1-2b) one of the expiry codes (`expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required`, `shelf-life-short`) or (story 1-6d) `licence-not-covered`",
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RejectedGrnLineDto"
@@ -37695,6 +37908,10 @@
           "shelfLifeReviewOpId": {
             "type": "string",
             "description": "Story 1-2b — the op id of the `grn.shelf-life-refused` review row, when one was raised"
+          },
+          "licenceReviewOpId": {
+            "type": "string",
+            "description": "Story 1-6d — the op id of the `grn.licence-refused` review row, when one was raised"
           }
         },
         "required": [
@@ -40368,6 +40585,58 @@
           "order",
           "bins",
           "lines"
+        ]
+      },
+      "LicencePolicyResponse": {
+        "type": "object",
+        "properties": {
+          "enforce": {
+            "type": "boolean",
+            "description": "Whether licence enforcement is on (a tenant that never set it is off)"
+          },
+          "gapCount": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Known coverage gaps today (IST) — the length of GET …/licences/coverage. A lower bound: a blind receipt, or an order of goods with no stock or open document anywhere, can be refused without having been a gap"
+          }
+        },
+        "required": [
+          "enforce",
+          "gapCount"
+        ]
+      },
+      "SetLicencePolicyDto": {
+        "type": "object",
+        "properties": {
+          "enforce": {
+            "type": "boolean",
+            "description": "On: an uncovered drug or food receipt line goes to review (grn.licence-refused) and such an order is refused (409 licence-not-covered). Off by default"
+          },
+          "acknowledgedGapCount": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The known coverage gap count the owner saw and accepted (absent = 0). Turning enforcement ON while the live count exceeds it is refused 409 licence-gaps-unacknowledged with the live gapCount — re-confirm with that count. A precondition only — not part of the idempotency fingerprint. Ignored when turning off"
+          }
+        },
+        "required": [
+          "enforce"
+        ]
+      },
+      "SetLicencePolicyResponse": {
+        "type": "object",
+        "properties": {
+          "enforce": {
+            "type": "boolean",
+            "description": "Whether licence enforcement is now on"
+          },
+          "gapCount": {
+            "type": "number",
+            "minimum": 0,
+            "description": "The known coverage gaps when this PUT turned enforcement on; absent otherwise (read GET …/licence-policy for today's count)"
+          }
+        },
+        "required": [
+          "enforce"
         ]
       },
       "CoverageGapDto": {
@@ -44733,6 +45002,7 @@
               "kit",
               "ledger_chain_break",
               "licence",
+              "licence_policy",
               "ledger_event",
               "manifest",
               "order",
@@ -44823,6 +45093,7 @@
               "kit",
               "ledger_chain_break",
               "licence",
+              "licence_policy",
               "ledger_event",
               "manifest",
               "order",

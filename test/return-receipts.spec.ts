@@ -903,11 +903,11 @@ describe('return receipts (e2e, story 13-2)', () => {
   // Story 1-4b adds a fourth server-raised type, `grn.inactive-sku-received`
   // (booked lines of an inactive SKU, flagged): Discard only (the web's
   // Acknowledge). Named explicitly, the same way.
-  it('the per-type decision rule: every pre-13-2 op type keeps all three decisions; return.receive, grn.lines-refused and grn.inactive-sku-received only discard; grn.shelf-life-refused apply + discard', () => {
+  it('the per-type decision rule: every pre-13-2 op type keeps all three decisions; return.receive, grn.lines-refused and grn.inactive-sku-received only discard; grn.shelf-life-refused and (1-6d) grn.licence-refused apply + discard', () => {
     const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received']);
     for (const type of REJECTED_OP_TYPES) {
       const expected =
-        type === 'grn.shelf-life-refused'
+        type === 'grn.shelf-life-refused' || type === 'grn.licence-refused'
           ? ['apply', 'discard']
           : discardOnly.has(type)
             ? ['discard']

@@ -100,6 +100,12 @@ export type RejectedOpType =
   // SERVER-RAISED only. Apply (with a mandatory note) re-runs exactly those
   // lines with the shelf-life rule waived for that receipt only; or Discard.
   | 'grn.shelf-life-refused'
+  // Story 1-6d (decision 3) — a goods receipt's lines refused
+  // `licence-not-covered` (enforcement on, no valid client and site licence
+  // on the receipt date). SERVER-RAISED only. Apply — OWNER only
+  // (`licences.manage` on top of `review.decide`), with a mandatory note —
+  // re-runs exactly those lines with the licence check waived; or Discard.
+  | 'grn.licence-refused'
   // Story 1-4b (decision 2) — a goods receipt BOOKED blind or unmatched
   // lines of an inactive SKU; the row flags them for a look. SERVER-RAISED
   // only; Discard ONLY (the web labels it Acknowledge) — it books nothing.
@@ -117,6 +123,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.lines-refused',
   'grn.shelf-life-refused',
   'grn.inactive-sku-received',
+  'grn.licence-refused',
 ];
 
 /**
@@ -128,6 +135,7 @@ const SERVER_RAISED_ONLY_OP_TYPES: readonly RejectedOpType[] = [
   'grn.lines-refused',
   'grn.shelf-life-refused',
   'grn.inactive-sku-received',
+  'grn.licence-refused',
 ];
 
 /**
@@ -170,7 +178,13 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   // Story 1-4b — the lines were already booked; the row is a flag, so its
   // only decision is Discard (the web's Acknowledge), which books nothing.
   'grn.inactive-sku-received': ['discard'],
+  // Story 1-6d — the licence-refused lines: Apply (owner only, with a note)
+  // re-runs them with the licence check waived, or Discard. No recount.
+  'grn.licence-refused': ['apply', 'discard'],
 };
+
+/** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
+export const LICENCE_APPLY_OWNER_ONLY = 'Accepting goods without a valid licence is an owner decision.';
 
 /** Story 1-2b — the resolve note's ceiling (code points), trimmed. */
 export const RESOLVE_NOTE_MAX = 500;
@@ -350,6 +364,18 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
   // Story 1-2b — server-raised: the ORIGINAL receipt's header (what Apply
   // re-runs) plus only the short-dated lines, aligned with `refusals`.
   'grn.shelf-life-refused': [
+    ['warehouseId', 'uuid'],
+    ['poId', 'uuid-or-null'],
+    ['asnId', 'uuid-or-null'],
+    ['blindReasonCode', 'string-or-null'],
+    ['lines', 'array'],
+    ['refusals', 'array'],
+  ],
+  // Story 1-6d — server-raised, the shelf-life row's shape: the ORIGINAL
+  // receipt's header (what Apply re-runs) plus only the licence-refused
+  // lines, aligned with `refusals`; `waivers` (an object) only on a row
+  // raised during a waived re-run.
+  'grn.licence-refused': [
     ['warehouseId', 'uuid'],
     ['poId', 'uuid-or-null'],
     ['asnId', 'uuid-or-null'],
@@ -1067,11 +1093,40 @@ export class SyncReportCommand {
                   ? " Receive these units again on a receipt for their own client."
                   : row.opType === 'grn.shelf-life-refused'
                     ? ' Accept the short-dated lines anyway (with a note), or discard them.'
-                    : row.opType === 'grn.inactive-sku-received'
-                      ? ' The lines were already booked — acknowledge the row.'
-                      : ''),
+                    : row.opType === 'grn.licence-refused'
+                      ? ' Accept the lines without a valid licence anyway (an owner, with a note), or discard them.'
+                      : row.opType === 'grn.inactive-sku-received'
+                        ? ' The lines were already booked — acknowledge the row.'
+                        : ''),
             { decisions: [...admitted] },
           );
+        }
+
+        // Story 1-6d (decision 11) — accepting goods without a valid
+        // licence is the OWNER's call: `licences.manage` on top of
+        // `review.decide`, checked on the locked open row AFTER the decision
+        // rule and BEFORE the note check (an ops manager without a note gets
+        // 403, not 400). A replayed Apply re-served its stored answer above —
+        // a deliberate exception to fail-closed. Discard keeps `review.decide`.
+        if (row.opType === 'grn.licence-refused' && command.decision === 'apply') {
+          try {
+            assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'licences.manage');
+          } catch (err) {
+            // The same 403 `role-denied`, worded for the reviewer (the queue
+            // shows this type's detail verbatim).
+            if (err instanceof ProblemException && err.getStatus() === 403) {
+              throw new ProblemException('role-denied', 403, 'Role lacks the required capability', LICENCE_APPLY_OWNER_ONLY);
+            }
+            throw err;
+          }
+          if (note === undefined) {
+            throw new ProblemException(
+              'validation-failed',
+              400,
+              'A note is required',
+              'Accepting goods without a valid licence needs a note saying why (note) — the row stays open.',
+            );
+          }
         }
 
         // Story 1-2b (decision 5) — accepting short-dated goods is a
@@ -1409,6 +1464,33 @@ export class SyncReportCommand {
           idempotencyKey,
         )) as unknown as Record<string, unknown>;
       }
+      case 'grn.licence-refused': {
+        // Story 1-6d (decision 9) — re-run ONLY the licence-refused lines of
+        // the original receipt with the licence check waived (every other
+        // rule applies). D1 — no loop: a row raised during a shelf-life-
+        // waived re-run stores that waiver (`waivers.shelfLife`), passed on
+        // here, so the re-run does not refuse the line short-dated again.
+        // The key is the row's own op id, so a re-apply after a crash replays.
+        const shelfLife = storedShelfLifeWaiver(payload.waivers);
+        return (await this.receiving.submitGoodsReceipt(
+          {
+            tenantId,
+            deviceId,
+            operatorUserId,
+            warehouseId: payload.warehouseId as string,
+            poId: (payload.poId ?? null) as string | null,
+            ...(typeof payload.asnId === 'string' ? { asnId: payload.asnId } : {}),
+            blindReasonCode: (payload.blindReasonCode ?? null) as string | null,
+            ...(typeof payload.clientId === 'string' ? { clientId: payload.clientId } : {}),
+            occurredAt: opTime,
+            lines: payload.lines as unknown as GrnCommand['lines'],
+            // Carried: audited when it was granted — never a second row here.
+            ...(shelfLife === null ? {} : { shelfLifeWaiver: { ...shelfLife, carried: true as const } }),
+            licenceWaiver: { byUserId: resolver.actorUserId, note: resolver.note ?? '' },
+          },
+          idempotencyKey,
+        )) as unknown as Record<string, unknown>;
+      }
       case 'putaway.place':
         return (await this.putaway.placePutaway(
           {
@@ -1533,6 +1615,20 @@ export class SyncReportCommand {
 type GrnCommand = Parameters<ReceivingFacade['submitGoodsReceipt']>[0];
 type PackCommand = Parameters<OutboundFacade['packOrder']>[0];
 type CountSubmitCommand = Parameters<MovementsFacade['submitCount']>[0];
+
+/**
+ * Story 1-6d — the shelf-life waiver a `grn.licence-refused` row stored
+ * (`waivers.shelfLife`), or null when none (or not well-formed — the row was
+ * server-raised, so a malformed one never reaches here in practice).
+ */
+function storedShelfLifeWaiver(waivers: unknown): { byUserId: string; note: string } | null {
+  if (typeof waivers !== 'object' || waivers === null) return null;
+  const shelfLife = (waivers as { shelfLife?: unknown }).shelfLife;
+  if (typeof shelfLife !== 'object' || shelfLife === null) return null;
+  const { byUserId, note } = shelfLife as { byUserId?: unknown; note?: unknown };
+  if (typeof byUserId !== 'string' || typeof note !== 'string') return null;
+  return { byUserId, note };
+}
 
 /** Story 1-2b — a resolve note, trimmed; blank or absent = undefined. */
 function normalizeResolveNote(note: string | undefined): string | undefined {

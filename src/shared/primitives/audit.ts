@@ -71,6 +71,8 @@ export const AUDIT_TARGET_TYPES = [
   // withdrawn`, and the expiry sweep's `licence.expiry_upcoming_raised |
   // expired_raised`, system actor).
   'licence',
+  // Story 1-6d — the tenant's licence enforcement switch (`licence.enforcement_enabled | disabled`).
+  'licence_policy',
   'ledger_event',
   'manifest',
   'order',
@@ -226,4 +228,10 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'licence.added', targetType: 'licence' },
   { action: 'licence.edited', targetType: 'licence' },
   { action: 'licence.withdrawn', targetType: 'licence' },
+  // Story 1-6d — the enforcement switch flipped (an unchanged PUT is a
+  // declared no-op, `licencePolicy.put:unchanged`), and a licence refusal
+  // accepted from review (the re-run receipt, actor the owner who applied).
+  { action: 'licence.enforcement_enabled', targetType: 'licence_policy' },
+  { action: 'licence.enforcement_disabled', targetType: 'licence_policy' },
+  { action: 'goods_receipt.licence_waived', targetType: 'goods_receipt' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

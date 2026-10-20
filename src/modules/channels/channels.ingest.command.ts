@@ -26,6 +26,7 @@ import {
   cancellationUnresolved,
   validationFailedIngest,
   ingestClientDeparted,
+  ingestLicenceNotCovered,
   ingestSkuInactive,
 } from './channels.errors';
 import type { ParsedChannelCancellation, ParsedChannelOrder } from './channel-registry';
@@ -398,6 +399,16 @@ export class ChannelsIngestCommand {
         ? body.extensions.skuCodes.filter((entry): entry is string => typeof entry === 'string')
         : [];
       mapped = ingestSkuInactive(connectionId, body.detail ?? err.message, skuCodes);
+    } else if (code === 'licence-not-covered') {
+      // Story 1-6d (decision 10): licence enforcement refused the order —
+      // a licence fact, not a transient: a typed 422, metered
+      // `validation-failed` (the sku-inactive arm's shape), never retried.
+      status = 'validation-failed';
+      const body = err.getResponse() as { detail?: string; extensions?: { skuCodes?: unknown } };
+      const skuCodes = Array.isArray(body.extensions?.skuCodes)
+        ? body.extensions.skuCodes.filter((entry): entry is string => typeof entry === 'string')
+        : [];
+      mapped = ingestLicenceNotCovered(connectionId, body.detail ?? err.message, skuCodes);
     } else if (code === 'validation-failed') {
       status = 'validation-failed';
     } else if (err.getStatus() === 503) {

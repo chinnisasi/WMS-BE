@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Patch, Post, Put, Query, UseGuards } from '@nestjs/common';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -26,7 +26,10 @@ import {
   EditLicenceDto,
   LicenceListQuery,
   LicenceListResponse,
+  LicencePolicyResponse,
   LicenceResponse,
+  SetLicencePolicyDto,
+  SetLicencePolicyResponse,
 } from './licences.dto';
 import type { LicenceDto, LicenceListItemDto } from './licences.dto';
 
@@ -55,6 +58,61 @@ const CONFLICT_409 = 'a concurrent request with the same Idempotency-Key (confli
 @Controller('tenants')
 export class LicencesController {
   constructor(@Inject(LicenceFacade) private readonly licences: LicenceFacade) {}
+
+  // ── story 1-6d: the enforcement switch ──────────────────────────────────
+  @Get(':tenantId/licence-policy')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'The licence enforcement switch and the known coverage gaps today (IST). Any staff session; off for a tenant that never set it',
+  })
+  @ApiOkResponse({ type: LicencePolicyResponse })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(READ_403) })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async getPolicy(@Param('tenantId') tenantId: string, @CurrentSession() session: TenantSession): Promise<LicencePolicyResponse> {
+    assertOwnTenant(session, tenantId);
+    const policy = await this.licences.getLicencePolicy(tenantId);
+    return { enforce: policy.enforce, gapCount: policy.gapCount };
+  }
+
+  @Put(':tenantId/licence-policy')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Turns licence enforcement on or off (owner-only, licences.manage). While on, a goods-receipt line of drug or food goods not covered by a valid client and site licence on the receipt date is held in review (grn.licence-refused), and an order of such goods is refused (409 licence-not-covered). Turning on needs acknowledgedGapCount ≥ the live known gap count; turning off is always allowed and scans nothing. An unchanged PUT is a no-op (nothing written or audited; the key is stored)',
+  })
+  @ApiBody({ type: SetLicencePolicyDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: SetLicencePolicyResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, enforce not a boolean, or acknowledgedGapCount not a whole number ≥ 0 (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse(WRITE_403) })
+  @ApiResponse({
+    status: 409,
+    ...problemJsonResponse(
+      `Turning on while the live known gap count exceeds acknowledgedGapCount (licence-gaps-unacknowledged, member gapCount), or ${CONFLICT_409}`,
+    ),
+  })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async setPolicy(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: SetLicencePolicyDto,
+  ): Promise<SetLicencePolicyResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const policy = await this.licences.setLicencePolicy(
+      { tenantId, actorUserId: session.userId, enforce: dto.enforce, acknowledgedGapCount: dto.acknowledgedGapCount ?? 0 },
+      key,
+    );
+    return { enforce: policy.enforce, ...(policy.gapCount === undefined ? {} : { gapCount: policy.gapCount }) };
+  }
 
   // The literal `coverage` segment is declared before every `:licenceId`
   // route (IMPLEMENTATION-GUIDE §6, route declaration order).
