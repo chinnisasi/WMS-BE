@@ -589,6 +589,13 @@
       "when": 1792475456875,
       "tag": "0083_sku_goods_type",
       "breakpoints": true
+    },
+    {
+      "idx": 84,
+      "version": "7",
+      "when": 1792506026012,
+      "tag": "0084_licences",
+      "breakpoints": true
     }
   ]
 }

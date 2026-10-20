@@ -33,10 +33,17 @@ import { NotificationsDeliveryHandler } from '../src/modules/notifications/notif
 import {
   NOTIFICATION_SOURCES,
   NOTIFICATION_SOURCE_TYPES,
+  SOURCE_AUDIENCE,
   SOURCE_RESOLUTIONS,
   visibleSourceTypes,
   type NotificationSourceType,
 } from '../src/modules/notifications/notification-sources';
+import {
+  LICENCE_EXPIRED_EVENT,
+  LICENCE_EXPIRY_UPCOMING_EVENT,
+  LICENCE_WARNING_CLEARED_EVENT,
+  LICENCE_WARNING_OUTCOMES,
+} from '../src/modules/compliance/licence.command';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { testAddress } from './support/shipment-address';
 import { mintSignIn } from './support/sign-in';
@@ -372,8 +379,11 @@ describe('notifications (e2e, story 9-2)', () => {
       // `audit-export`, is pinned in test/audit-export.spec.ts; the tenth
       // (story 9-3c), the owner-only `ledger-chain-break`, in
       // test/ledger-integrity.spec.ts; the eleventh (story 1-2b), the
-      // qc.manage-routed `qc-receipt`, in test/client-receiving-policy.spec.ts.
-      expect([...CASES.map((c) => c.sourceType), 'audit-export', 'ledger-chain-break', 'qc-receipt']).toEqual([...NOTIFICATION_SOURCE_TYPES]);
+      // qc.manage-routed `qc-receipt`, in test/client-receiving-policy.spec.ts;
+      // the twelfth (story 1-6c), the owner-only `licence-expiry`, in
+      // test/licences.spec.ts (raise, supersede, resolve) and below (the
+      // vocabulary, resolutions and audience pins).
+      expect([...CASES.map((c) => c.sourceType), 'audit-export', 'ledger-chain-break', 'qc-receipt', 'licence-expiry']).toEqual([...NOTIFICATION_SOURCE_TYPES]);
     });
 
     it('the subscriber listens for exactly the emitters’ event types (the new events pinned to their constants)', () => {
@@ -396,10 +406,18 @@ describe('notifications (e2e, story 9-2)', () => {
       expect(sorted(SOURCE_RESOLUTIONS['channel-sync'])).toEqual(sorted(CHANNEL_SYNC_RECOVERED_REASONS));
       expect(sorted(SOURCE_RESOLUTIONS['rejected-op'])).toEqual(sorted(REJECTED_OP_STATUSES.filter((s) => s !== 'open')));
       expect(sorted(SOURCE_RESOLUTIONS['count-variance'])).toEqual(sorted(COUNT_VARIANCE_STATUSES.filter((s) => s !== 'open')));
+      // Story 1-6c — the licence warning's outcomes, and its three event types, pinned to the compliance emitter.
+      expect(sorted(SOURCE_RESOLUTIONS['licence-expiry'])).toEqual(sorted(LICENCE_WARNING_OUTCOMES));
+      expect(NOTIFICATION_SOURCES['licence-expiry'].raise.type).toBe(LICENCE_EXPIRY_UPCOMING_EVENT);
+      expect(NOTIFICATION_SOURCES['licence-expiry'].moreRaises!.map((r) => r.type)).toEqual([LICENCE_EXPIRED_EVENT]);
+      expect(NOTIFICATION_SOURCES['licence-expiry'].resolves.map((r) => r.type)).toEqual([LICENCE_WARNING_CLEARED_EVENT]);
     });
 
     it('routes by the capability that acts — never the payloads’ notifyRole hints', () => {
       expect(visibleSourceTypes('owner')).toEqual([...NOTIFICATION_SOURCE_TYPES]);
+      // Story 1-6c — the licence warning goes to who renews or withdraws a licence (owner-only).
+      expect(SOURCE_AUDIENCE['licence-expiry']).toEqual({ capability: 'licences.manage' });
+      expect(visibleSourceTypes('owner')).toContain('licence-expiry');
       // Story 1-2b — `qc-receipt` is routed by `qc.manage`, which the Ops Manager holds.
       expect(visibleSourceTypes('ops_manager')).toEqual(['over-receipt', 'rejected-op', 'reorder-breach', 'batch-alert', 'qc-hold', 'channel-sync', 'qc-receipt']);
       expect(visibleSourceTypes('operator')).toEqual([]);

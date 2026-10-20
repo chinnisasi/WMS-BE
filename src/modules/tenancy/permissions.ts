@@ -285,6 +285,15 @@ export const CAPABILITIES = [
   // returns (reads are never gated). Mirrored into wms-fe `src/lib/users.ts`
   // (CAPABILITIES only — ops_manager is derived there).
   'returns.manage',
+  // Story 1-6c — the drug and FSSAI licences: add a client or site licence,
+  // edit it, withdraw it (`LicenceCommand`). OWNER-ONLY (decision 11): a
+  // statutory licence is the legal basis for holding scheduled drugs and
+  // food — the `clients.manage` rationale, the person who answers for the
+  // business. Every staff session READS licences and the coverage gaps
+  // (reads are never gated); a client-portal session is refused at the
+  // guard. Mirrored into wms-fe `src/lib/users.ts` (CAPABILITIES +
+  // OWNER_ONLY_CAPABILITIES).
+  'licences.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];

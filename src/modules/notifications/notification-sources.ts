@@ -1,4 +1,6 @@
 import { UUID_RE } from '../../shared/primitives/ids';
+import { isIsoDate } from '../../shared/primitives/time';
+import { LICENCE_KINDS, type LicenceKind } from '../../shared/primitives/licence';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { ROLE_CAPABILITIES, type Capability } from '../tenancy/permissions';
 import { COUNT_VARIANCE_STATUSES, REJECTED_OP_STATUSES, type UserRole } from '../../shared/db/schema';
@@ -38,6 +40,10 @@ export const NOTIFICATION_SOURCE_TYPES = [
   // Story 1-2b — QC on receipt: ONE entry per receipt (or approved excess)
   // placed on holds, resolved when none of its holds remains open.
   'qc-receipt',
+  // Story 1-6c — a drug or FSSAI licence nearing or past its expiry (the
+  // compliance sweep). Owner only (`licences.manage`), one entry per
+  // warning — each raise a fresh warning id — never pushed.
+  'licence-expiry',
 ] as const;
 
 export type NotificationSourceType = (typeof NOTIFICATION_SOURCE_TYPES)[number];
@@ -76,6 +82,11 @@ export const SOURCE_RESOLUTIONS = {
   'ledger-chain-break': ['acknowledged'],
   // Story 1-2b — open until every hold of the placement is released.
   'qc-receipt': ['released'],
+  // Story 1-6c — an edit moved `validUntil` out of the warned state
+  // (`renewed`), the licence was withdrawn, or the expired raise superseded
+  // the open upcoming entry (`expired`). Pinned to the emitter's
+  // `LICENCE_WARNING_OUTCOMES` by test/licences.spec.ts.
+  'licence-expiry': ['renewed', 'withdrawn', 'expired'],
 } as const satisfies Record<NotificationSourceType, readonly string[]>;
 
 // ── the summaries — a per-source allowlist, built key by key ────────────────
@@ -128,6 +139,32 @@ export interface QcReceiptSummary {
   /** How many lines were held. */
   readonly count: number;
 }
+/**
+ * Story 1-6c — the compliance sweep's three event types (compliance's
+ * `LICENCE_EXPIRY_UPCOMING_EVENT`, `LICENCE_EXPIRED_EVENT`,
+ * `LICENCE_WARNING_CLEARED_EVENT`), repeated as literals (AD-6) and pinned
+ * equal by test/licences.spec.ts.
+ */
+export const LICENCE_EXPIRY_UPCOMING_EVENT_TYPE = 'licence.expiry_upcoming';
+export const LICENCE_EXPIRED_EVENT_TYPE = 'licence.expired';
+export const LICENCE_WARNING_CLEARED_EVENT_TYPE = 'licence.expiry_warning_cleared';
+
+/** Story 1-6c — one licence expiry warning. */
+export interface LicenceExpirySummary {
+  readonly licenceId: string;
+  readonly kind: LicenceKind;
+  readonly number: string;
+  /** `client` — a brand's licence (head office or premises); `site` — the 3PL's own site. */
+  readonly holder: 'client' | 'site';
+  /** The client's name, or the site's name. */
+  readonly holderName: string;
+  /** The site's code — a site licence, or a client licence for one premises. */
+  readonly siteCode?: string;
+  /** `YYYY-MM-DD` (IST calendar date). */
+  readonly validUntil: string;
+  readonly state: 'upcoming' | 'expired';
+}
+
 export interface ChannelSyncSummary {
   readonly connectionId: string;
 }
@@ -182,7 +219,8 @@ export type NotificationSummary =
   | ChannelSyncSummary
   | AuditExportSummary
   | LedgerChainBreakSummary
-  | QcReceiptSummary;
+  | QcReceiptSummary
+  | LicenceExpirySummary;
 
 /** A raise decoded: the entry's identity, its warehouse, its summary and (9-3b) its recipient. */
 export interface DecodedRaise {
@@ -263,6 +301,33 @@ function oneOf<T extends string>(payload: Payload, key: string, allowed: readonl
 type RaiseDecoder = (
   payload: Payload,
 ) => { sourceId: string; warehouseId: string | null; summary: NotificationSummary; recipientUserId?: string } | null;
+
+/** Story 1-6c — both expiry raises decode the same summary; the state is the event's. */
+function licenceExpiryRaise(state: 'upcoming' | 'expired'): RaiseDecoder {
+  return (payload) => {
+    const sourceId = uuid(payload, 'warningId');
+    const licenceId = uuid(payload, 'licenceId');
+    const kind = oneOf(payload, 'kind', LICENCE_KINDS);
+    const number = text(payload, 'number');
+    const holder = oneOf(payload, 'holder', ['client', 'site'] as const);
+    const holderName = text(payload, 'holderName');
+    const validUntil = text(payload, 'validUntil');
+    if (sourceId === null || licenceId === null || kind === null || number === null) return null;
+    if (holder === null || holderName === null || validUntil === null || !isIsoDate(validUntil)) return null;
+    if (payload.state !== state) return null;
+    let siteCode: { siteCode: string } | Record<string, never> = {};
+    if (payload.siteCode !== undefined && payload.siteCode !== null) {
+      const code = text(payload, 'siteCode');
+      if (code === null) return null;
+      siteCode = { siteCode: code };
+    }
+    return withWarehouse(payload, (warehouseId) => ({
+      sourceId,
+      warehouseId,
+      summary: { licenceId, kind, number, holder, holderName, ...siteCode, validUntil, state } satisfies LicenceExpirySummary,
+    }));
+  };
+}
 
 /** Builds a resolve (null = malformed). */
 type ResolveDecoder = (
@@ -505,6 +570,19 @@ export const NOTIFICATION_SOURCES: Readonly<Record<NotificationSourceType, Sourc
     },
     resolves: [{ type: 'qc_hold.receipt_cleared', decode: fixedResolve('placementId', 'released') }],
   },
+  'licence-expiry': {
+    // Story 1-6c (compliance's expiry sweep). The entry is the WARNING's own
+    // id — a fresh one per raise, so each term warns once and an expired
+    // raise is a new entry beside the upcoming one it supersedes.
+    raise: { type: LICENCE_EXPIRY_UPCOMING_EVENT_TYPE, decode: licenceExpiryRaise('upcoming') },
+    moreRaises: [{ type: LICENCE_EXPIRED_EVENT_TYPE, decode: licenceExpiryRaise('expired') }],
+    resolves: [
+      {
+        type: LICENCE_WARNING_CLEARED_EVENT_TYPE,
+        decode: fieldResolve('warningId', 'outcome', SOURCE_RESOLUTIONS['licence-expiry']),
+      },
+    ],
+  },
   'channel-sync': {
     raise: {
       type: 'channel.sync.degraded',
@@ -674,6 +752,8 @@ export const SOURCE_AUDIENCE: Readonly<Record<NotificationSourceType, SourceAudi
   'ledger-chain-break': { capability: 'ledger.acknowledge' },
   // Story 1-2b — who releases receipt holds (`qc.manage`).
   'qc-receipt': { capability: 'qc.manage' },
+  // Story 1-6c — who renews or withdraws a licence (`licences.manage`): owner-only.
+  'licence-expiry': { capability: 'licences.manage' },
 };
 
 /** The source types a role sees — an allowlist; an unknown role sees none. */

@@ -6,6 +6,8 @@ import { OutboundModule } from '../outbound/outbound.module';
 import { ExcursionCommand } from './excursion.command';
 import { ExcursionFacade } from './excursion.facade';
 import { ColdChainFacade } from './cold-chain.facade';
+import { LicenceCommand } from './licence.command';
+import { LicenceFacade } from './licence.facade';
 
 /**
  * Compliance module — temperature excursions (Story 12-5, FR-44): the
@@ -30,10 +32,17 @@ import { ColdChainFacade } from './cold-chain.facade';
  * made TenancyModule import this module (the sync-report apply arm), closing
  * catalog → tenancy → compliance → {inbound, outbound} → catalog cycles, so
  * the in-cycle imports are lazy decorators (the catalog↔tenancy pattern).
+ *
+ * Story 1-6c adds the drug and FSSAI licences: `LicenceFacade` (the master's
+ * writes through `LicenceCommand`, the list, the coverage gaps and the expiry
+ * sweep — exported for the api shell and the jobs shell's
+ * `LicenceExpiryWorker`). It owns `licences` and READS the clients,
+ * warehouses, SKU, stock and inbound-document tables directly — no new module
+ * import (tenancy imports this module, so catalog or tenancy would cycle).
  */
 @Module({
   imports: [SharedModule, InventoryModule, forwardRef(() => InboundModule), forwardRef(() => OutboundModule)],
-  providers: [ExcursionCommand, ExcursionFacade, ColdChainFacade],
-  exports: [ExcursionFacade, ColdChainFacade],
+  providers: [ExcursionCommand, ExcursionFacade, ColdChainFacade, LicenceCommand, LicenceFacade],
+  exports: [ExcursionFacade, ColdChainFacade, LicenceFacade],
 })
 export class ComplianceModule {}
