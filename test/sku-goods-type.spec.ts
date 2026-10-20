@@ -13,10 +13,12 @@ import {
   ALLERGENS,
   DG_CLASSES,
   DG_CLASSES_WITHOUT_PACKING_GROUP,
+  DG_HAZARD_MAP,
   DG_PACKING_GROUPS,
   DRUG_SCHEDULES,
   FOOD_CATEGORIES,
 } from '../src/shared/primitives/goods-type';
+import { HAZARD_CLASSES } from '../src/shared/primitives/hazard';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { mintSignIn } from './support/sign-in';
 import { expectAuditRow, seededIdempotencyKey } from './support/audit-guard';
@@ -210,6 +212,22 @@ describe('story 1-6a: SKU goods-type attributes (e2e)', () => {
       });
     });
 
+    it('skus_dg_hazard_derived agrees with DG_HAZARD_MAP for every mapped class: the mapped value is admitted, every other class refused', async () => {
+      const sku = await newSku();
+      const entries = Object.entries(DG_HAZARD_MAP);
+      expect(entries).toHaveLength(12);
+      for (const [dgClass, mapped] of entries) {
+        await sql`update skus set dg_un_number = '1203', dg_class = ${dgClass}, hazard_class = ${mapped} where id = ${sku.id}`;
+        expect(await stored(sku.id)).toMatchObject({ dg_class: dgClass, hazard_class: mapped });
+        for (const other of [...HAZARD_CLASSES.filter((h) => h !== mapped), null]) {
+          await expect(
+            sql`update skus set dg_un_number = '1203', dg_class = ${dgClass}, hazard_class = ${other} where id = ${sku.id}`,
+          ).rejects.toMatchObject({ constraint_name: 'skus_dg_hazard_derived' });
+        }
+      }
+      await sql`update skus set dg_un_number = null, dg_class = null, hazard_class = null where id = ${sku.id}`;
+    });
+
     it('the committed OpenAPI carries the fields, the snapshot DG arm and the two new codes', () => {
       const committed = JSON.parse(readFileSync(resolve(process.cwd(), 'openapi/openapi.json'), 'utf8')) as {
         paths: Record<string, Record<string, { responses: Record<string, { description: string }> }>>;
@@ -375,7 +393,13 @@ describe('story 1-6a: SKU goods-type attributes (e2e)', () => {
       expect(String(pg.body.detail)).toContain('dgPackingGroup');
       // Clearing the class alone leaves the UN number orphaned — refused against the MERGED state.
       const dg = await newSku({ dgClass: '3', dgUnNumber: '1203' });
-      expectProblem(await patchSku(dg.id, { dgClass: null }).expect(400), 400, 'validation-failed');
+      const orphan = await patchSku(dg.id, { dgClass: null }).expect(400);
+      expectProblem(orphan, 400, 'validation-failed');
+      // The detail names what to clear, not only what is missing.
+      expect(orphan.body.detail).toBe(
+        'A dangerous good needs both its UN number and its DG class — dgClass is missing. Set dgClass, or clear dgUnNumber (and dgPackingGroup and dgSubsidiaryClasses) to stop marking the SKU a dangerous good.',
+      );
+      expect((await patchSku(dg.id, { dgClass: null, dgUnNumber: null }).expect(200)).body.dgClass).toBeNull();
     });
 
     it('Create: an absent hazard derives; class 8 must name its choice; null is explicit none', async () => {
@@ -529,18 +553,54 @@ describe('story 1-6a: SKU goods-type attributes (e2e)', () => {
         row(`${p}-FOOD`, { food_category: 'Dairy', allergens: 'MILK; eggs;milk', drug_schedules: 'h;c;H', high_value: 'TRUE', fragile: '1', max_stack_layers: '4' }),
         row(`${p}-MIS`, { dg_un_number: '1230', dg_class: '6.1', hazard_class: 'flammable' }),
         row(`${p}-STK`, { max_stack_layers: '0' }),
+        row(`${p}-CA`, { dg_un_number: '1789', dg_class: '8', hazard_class: 'Corrosive-Acid' }),
+        row(`${p}-FL`, { dg_un_number: '1203', dg_class: '3', hazard_class: 'FLAMMABLE' }),
+        row(`${p}-NF`, { food_category: 'non-food', allergens: 'milk' }),
+        row(`${p}-NOCAT`, { allergens: 'milk' }),
+        row(`${p}-PG`, { dg_un_number: '1950', dg_class: '2.1', dg_packing_group: 'II' }),
+        row(`${p}-ORPH`, { dg_un_number: '1203' }),
+        row(`${p}-C8X`, { dg_un_number: '1830', dg_class: '8', hazard_class: 'toxic' }),
       ]).expect(201);
       const errors = res.body.errors as { skuCode: string; code: string; detail: string }[];
       const byCode = new Map(errors.map((error) => [error.skuCode, error]));
-      expect(byCode.get(`${p}-C8`)).toMatchObject({ code: 'dg-hazard-required' });
-      expect(byCode.get(`${p}-C8`)!.detail).toContain('hazard_class');
+      expect(byCode.get(`${p}-C8`)).toMatchObject({
+        code: 'dg-hazard-required',
+        detail: 'dg_class 8 (corrosives) needs its hazard class — write hazard_class corrosive-acid, corrosive-base or none.',
+      });
+      expect(byCode.get(`${p}-C8X`)).toMatchObject({
+        code: 'dg-hazard-mismatch',
+        detail: 'dg_class 8 (corrosives) takes hazard_class corrosive-acid, corrosive-base or none — not "toxic".',
+      });
+      expect(byCode.get(`${p}-NF`)).toMatchObject({
+        code: 'validation-failed',
+        detail: 'allergens cannot be declared on a non-food SKU — leave the allergens cell blank.',
+      });
+      expect(byCode.get(`${p}-NOCAT`)).toMatchObject({
+        code: 'validation-failed',
+        detail: 'allergens need a food category — fill food_category, or leave the allergens cell blank.',
+      });
+      expect(byCode.get(`${p}-PG`)).toMatchObject({
+        code: 'validation-failed',
+        detail: 'dg_class 2.1 takes no packing group — leave dg_packing_group blank.',
+      });
+      expect(byCode.get(`${p}-ORPH`)).toMatchObject({
+        code: 'validation-failed',
+        detail:
+          'A dangerous good needs both dg_un_number and dg_class — dg_class is missing. Fill dg_class, or leave dg_un_number, dg_packing_group and dg_subsidiary_classes blank.',
+      });
       expect(byCode.get(`${p}-BAD`)).toMatchObject({ code: 'validation-failed' });
       expect(byCode.get(`${p}-BAD`)!.detail).toContain('allergens');
       expect(byCode.get(`${p}-BAD`)!.detail).toContain('peanut');
-      expect(byCode.get(`${p}-MIS`)).toMatchObject({ code: 'dg-hazard-mismatch' });
+      expect(byCode.get(`${p}-MIS`)).toMatchObject({
+        code: 'dg-hazard-mismatch',
+        detail: 'dg_class 6.1 sets hazard_class to "toxic" — leave hazard_class blank or write toxic (got "flammable").',
+      });
       expect(byCode.get(`${p}-STK`)).toMatchObject({ code: 'validation-failed' });
       expect(byCode.get(`${p}-STK`)!.detail).toContain('max_stack_layers');
-      expect(res.body).toMatchObject({ committedRows: 3, failedRows: 4 });
+      expect(res.body).toMatchObject({ committedRows: 5, failedRows: 9 });
+      // The hazard_class cell is case-insensitive like every goods-type cell.
+      expect(await skuByCode(`${p}-CA`)).toMatchObject({ dgClass: '8', hazardClass: 'corrosive-acid' });
+      expect(await skuByCode(`${p}-FL`)).toMatchObject({ dgClass: '3', hazardClass: 'flammable' });
 
       expect(await skuByCode(`${p}-DG`)).toMatchObject({
         dgUnNumber: '1203',
@@ -582,6 +642,65 @@ describe('story 1-6a: SKU goods-type attributes (e2e)', () => {
   // ── the device snapshot ────────────────────────────────────────────────────
 
   describe('the device snapshot', () => {
+    async function badgeInOperator(): Promise<string> {
+      const auth = (t: request.Test) => t.set('Authorization', `Bearer ${ownerToken}`);
+      const minted = await auth(http().post(`${API}/${tenantId}/devices/enrollment-codes`)).set(KEY_HEADER, ulid()).expect(201);
+      const enrolled = await http()
+        .post(`${API}/${tenantId}/devices/enroll`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: minted.body.code, label: 'Goods scanner', pin: '1357' })
+        .expect(201);
+      const operatorEmail = `operator-${ulid().toLowerCase()}@example.com`;
+      const invited = await auth(http().post(`${API}/${tenantId}/users`))
+        .set(KEY_HEADER, ulid())
+        .send({ email: operatorEmail, role: 'operator' })
+        .expect(201);
+      await http()
+        .post(`${API}/${tenantId}/accept-invite`)
+        .set(KEY_HEADER, ulid())
+        .send({ token: invited.body.inviteToken as string, password: 'correct-horse-battery' })
+        .expect(200);
+      const badged = await http()
+        .post(`${API}/${tenantId}/devices/badge-in`)
+        .set('Authorization', `Bearer ${enrolled.body.deviceToken as string}`)
+        .send({ operatorEmail, pin: '1357' })
+        .expect(200);
+      return badged.body.accessToken as string;
+    }
+
+    it('GET …/devices/catalog-snapshot (device session) carries the handling arm; a plain SKU\'s dg is null', async () => {
+      const dg = await newSku({ highValue: true, maxStackLayers: 3, dgClass: '6.1', dgUnNumber: '1230', dgSubsidiaryClasses: ['3'], dgPackingGroup: 'I' });
+      const plain = await newSku();
+      const warehouseId = (
+        await http()
+          .post(`${API}/${tenantId}/warehouses`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ origin: testAddress(), code: `SN-${ulid().slice(10, 16).toUpperCase()}`, name: `Snapshot Depot ${ulid()}` })
+          .expect(201)
+      ).body.id as string;
+      const token = await badgeInOperator();
+      const res = await http()
+        .get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${warehouseId}`)
+        .set('Authorization', `Bearer ${token}`)
+        .expect(200);
+      const skus = res.body.skus as Record<string, unknown>[];
+      const dgSku = skus.find((s) => s['id'] === dg.id)!;
+      expect({ fragile: dgSku['fragile'], highValue: dgSku['highValue'], maxStackLayers: dgSku['maxStackLayers'], dg: dgSku['dg'] }).toEqual({
+        fragile: false,
+        highValue: true,
+        maxStackLayers: 3,
+        dg: { unNumber: '1230', class: '6.1', subsidiaryClasses: ['3'], packingGroup: 'I' },
+      });
+      const plainSku = skus.find((s) => s['id'] === plain.id)!;
+      expect({ fragile: plainSku['fragile'], highValue: plainSku['highValue'], maxStackLayers: plainSku['maxStackLayers'], dg: plainSku['dg'] }).toEqual({
+        fragile: false,
+        highValue: false,
+        maxStackLayers: null,
+        dg: null,
+      });
+    });
+
     it('Handheld: fragile, highValue, maxStackLayers and dg ride the snapshot; a SKU without DG carries dg null', async () => {
       const dg = await newSku({ fragile: true, maxStackLayers: 1, dgClass: '3', dgUnNumber: '1230', dgSubsidiaryClasses: ['6.1'], dgPackingGroup: 'II' });
       const plain = await newSku();

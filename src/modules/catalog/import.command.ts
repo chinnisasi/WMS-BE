@@ -54,9 +54,11 @@ import {
   DG_PACKING_GROUPS,
   DRUG_SCHEDULES,
   FOOD_CATEGORIES,
+  DG_HAZARD_MAP,
   canonicalGoodsType,
   goodsTypeProblem,
   hazardResolution,
+  type DgClass,
   type GoodsTypeFields,
 } from '../../shared/primitives/goods-type';
 import {
@@ -1072,16 +1074,14 @@ function rowError(
 
 /**
  * Bulk inserts are chunked: Postgres binds at most 65,535 parameters per
- * statement, and a cap-admitting file (10,000 rows × 12 sku columns ≈ 120k
- * params, or 10,000 error rows × 7 columns) would exceed it and 500 the whole
- * import despite passing the row cap. A bounded chunk keeps every statement
- * far below the ceiling.
+ * statement, and a multi-row insert binds one parameter per COLUMN per row,
+ * so a cap-admitting file (10,000 rows) inserted whole would exceed it and
+ * 500 the import despite passing the row cap. The widest table decides the
+ * chunk: since story 1-6a a `skus` row binds ~37 parameters (the goods-type
+ * columns took it from ~27), so 2,000 rows would bind ~74k — the 5,000-row
+ * acceptance test caught it. 1,000 rows keeps it near 37k, with room for the
+ * next columns. Adding a `skus` column re-opens this arithmetic.
  */
-//
-// Story 1-6a: the `skus` insert binds one parameter per COLUMN per row, and
-// the goods-type columns took it from ~27 to ~37 — 2,000 rows would bind
-// ~74k and 500 the import (the 5,000-row acceptance test caught it). 1,000
-// rows keeps the widest table near 37k, with room for the next columns.
 const INSERT_CHUNK_ROWS = 1_000;
 
 function chunked<T>(rows: readonly T[]): T[][] {
@@ -1447,7 +1447,7 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
   // the goods-type cells are parsed, below.
   const hazardClassRaw = v['hazard_class']?.trim() ?? '';
   const requestedHazard: string | null | undefined =
-    hazardClassRaw === '' ? undefined : hazardClassRaw.toLowerCase() === 'none' ? null : hazardClassRaw;
+    hazardClassRaw === '' ? undefined : hazardClassRaw.toLowerCase() === 'none' ? null : hazardClassRaw.toLowerCase();
   try {
     assertHazardClass({ hazardClass: requestedHazard });
   } catch (err) {
@@ -1627,7 +1627,7 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
   const goods = goodsParsed.value;
   const resolution = hazardResolution(goods.dgClass, null, requestedHazard);
   if ('code' in resolution) {
-    return { ok: false, error: rowError(row.rowNumber, code, resolution.code, toColumnNames(resolution.detail)) };
+    return { ok: false, error: rowError(row.rowNumber, code, resolution.code, hazardCellDetail(resolution.code, goods.dgClass, hazardClassRaw)) };
   }
   const hazardClass = resolution.hazardClass;
 
@@ -1671,6 +1671,20 @@ function validateRow(row: RawRow): { ok: true; row: ValidRow } | { ok: false; er
       goods,
     },
   };
+}
+
+/**
+ * Story 1-6a — decision 7's two refusals in the import's words: a CSV cell
+ * says `none`, never `null`, and "omit" is "leave blank".
+ */
+function hazardCellDetail(code: 'dg-hazard-mismatch' | 'dg-hazard-required', dgClass: string | null, cell: string): string {
+  if (code === 'dg-hazard-required') {
+    return 'dg_class 8 (corrosives) needs its hazard class — write hazard_class corrosive-acid, corrosive-base or none.';
+  }
+  const mapped = dgClass === null ? undefined : DG_HAZARD_MAP[dgClass as DgClass];
+  return mapped === undefined
+    ? `dg_class 8 (corrosives) takes hazard_class corrosive-acid, corrosive-base or none — not "${cell}".`
+    : `dg_class ${dgClass} sets hazard_class to "${mapped}" — leave hazard_class blank or write ${mapped} (got "${cell}").`;
 }
 
 /** Story 1-6a — every goods-type API field name in a sentence replaced by its CSV column (plus hazard_class). */
@@ -1733,7 +1747,7 @@ function parseGoodsTypeCells(v: Readonly<Record<string, string>>, rowNumber: num
   });
   const problem = goodsTypeProblem(goods);
   if (problem !== null) {
-    return { ok: false, error: rowError(rowNumber, null, 'validation-failed', toColumnNames(problem.detail)) };
+    return { ok: false, error: rowError(rowNumber, null, 'validation-failed', problem.cellDetail ?? toColumnNames(problem.detail)) };
   }
   return { ok: true, value: goods as GoodsTypeFields };
 }

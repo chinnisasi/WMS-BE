@@ -272,6 +272,12 @@ export function mergeGoodsType(current: GoodsTypeFields, fields: GoodsTypeInput)
 export interface GoodsTypeProblem {
   readonly field: keyof GoodsTypeFields;
   readonly detail: string;
+  /**
+   * The same refusal in the import's words, where the API sentence names an
+   * API remedy (`send allergens: []`) that makes no sense in a CSV cell.
+   * Absent: the import maps the field names in `detail` to their columns.
+   */
+  readonly cellDetail?: string;
 }
 
 function inVocabulary(vocabulary: readonly string[], value: unknown): boolean {
@@ -314,13 +320,17 @@ export function goodsTypeProblem(merged: GoodsTypeInput): GoodsTypeProblem | nul
     }
   }
   if (allergens.length > 0 && (foodCategory === null || foodCategory === NON_FOOD_CATEGORY)) {
-    return {
-      field: 'allergens',
-      detail:
-        foodCategory === null
-          ? 'allergens need a food category — set foodCategory, or send allergens: [].'
-          : 'allergens cannot be declared on a non-food SKU — send allergens: [] with foodCategory "non-food".',
-    };
+    return foodCategory === null
+      ? {
+          field: 'allergens',
+          detail: 'allergens need a food category — set foodCategory, or send allergens: [].',
+          cellDetail: 'allergens need a food category — fill food_category, or leave the allergens cell blank.',
+        }
+      : {
+          field: 'allergens',
+          detail: 'allergens cannot be declared on a non-food SKU — send allergens: [] with foodCategory "non-food".',
+          cellDetail: 'allergens cannot be declared on a non-food SKU — leave the allergens cell blank.',
+        };
   }
 
   const dgClass = merged.dgClass ?? null;
@@ -340,8 +350,18 @@ export function goodsTypeProblem(merged: GoodsTypeInput): GoodsTypeProblem | nul
   }
   if ((dgUnNumber === null) !== (dgClass === null)) {
     return dgClass === null
-      ? { field: 'dgClass', detail: 'A dangerous good needs both its UN number and its DG class — dgClass is missing.' }
-      : { field: 'dgUnNumber', detail: 'A dangerous good needs both its UN number and its DG class — dgUnNumber is missing.' };
+      ? {
+          field: 'dgClass',
+          detail:
+            'A dangerous good needs both its UN number and its DG class — dgClass is missing. Set dgClass, or clear dgUnNumber (and dgPackingGroup and dgSubsidiaryClasses) to stop marking the SKU a dangerous good.',
+          cellDetail:
+            'A dangerous good needs both dg_un_number and dg_class — dg_class is missing. Fill dg_class, or leave dg_un_number, dg_packing_group and dg_subsidiary_classes blank.',
+        }
+      : {
+          field: 'dgUnNumber',
+          detail: 'A dangerous good needs both its UN number and its DG class — dgUnNumber is missing.',
+          cellDetail: 'A dangerous good needs both dg_un_number and dg_class — dg_un_number is missing.',
+        };
   }
 
   const subsidiaries = merged.dgSubsidiaryClasses === undefined ? [] : merged.dgSubsidiaryClasses;
@@ -372,7 +392,11 @@ export function goodsTypeProblem(merged: GoodsTypeInput): GoodsTypeProblem | nul
       return { field: 'dgPackingGroup', detail: 'dgPackingGroup needs a DG class (dgClass).' };
     }
     if ((DG_CLASSES_WITHOUT_PACKING_GROUP as readonly string[]).includes(dgClass)) {
-      return { field: 'dgPackingGroup', detail: `DG class ${dgClass} takes no packing group — send dgPackingGroup: null.` };
+      return {
+        field: 'dgPackingGroup',
+        detail: `DG class ${dgClass} takes no packing group — send dgPackingGroup: null.`,
+        cellDetail: `dg_class ${dgClass} takes no packing group — leave dg_packing_group blank.`,
+      };
     }
   }
 
