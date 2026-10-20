@@ -353,6 +353,13 @@ export interface GoodsReceiptSnapshot {
      * salt); present only when one was raised.
      */
     readonly shelfLifeReviewOpId?: string;
+    /**
+     * Story 1-4b — the `grn.inactive-sku-received` review row raised for the
+     * blind or unmatched lines of an inactive SKU this receipt BOOKED (its op
+     * id, derived from the key with its own salt); present only when one was
+     * raised, so an older snapshot is byte-identical.
+     */
+    readonly inactiveSkuReviewOpId?: string;
     /** Story 1-2b — how many booked lines were put on receipt QC holds (present only when > 0). */
     readonly qcHeldLines?: number;
     /**
@@ -1559,6 +1566,52 @@ export class ReceivingCommand {
         shelfLifeReviewOpId = review.shelfLifeReviewOpId;
       }
 
+      // ── story 1-4b (decision 2): ONE flag row for inactive-SKU lines ────
+      // A blind or unmatched line of an inactive SKU is BOOKED as on any
+      // receipt (zero-scan-loss), and the receipt raises one server-raised
+      // `grn.inactive-sku-received` row listing those lines, in this
+      // transaction. A line against an existing PO/ASN line is unflagged
+      // (that inbound was ordered before the SKU was retired); a line refused
+      // (client, expiry) never reaches `settled`, so nothing is listed twice.
+      // The status is the SKU row this command holds `FOR UPDATE`. Discard
+      // only (the web's Acknowledge).
+      let inactiveSkuReviewOpId: string | null = null;
+      const inactiveBooked = settled.filter(
+        (entry) =>
+          entry.applied > 0 &&
+          entry.poLineId === null &&
+          entry.asnLineId === null &&
+          skuById.get(entry.input.skuId)!.status !== 'active',
+      );
+      if (inactiveBooked.length > 0) {
+        inactiveSkuReviewOpId = inactiveSkuGrnLinesOpId(idempotencyKey);
+        const codes = [...new Set(inactiveBooked.map((entry) => skuById.get(entry.input.skuId)!.code))].sort();
+        const raised = await recordServerRejectedOpInTx(tx, this.outbox, {
+          tenantId: command.tenantId,
+          deviceId: command.deviceId,
+          operatorUserId: command.operatorUserId,
+          opId: inactiveSkuReviewOpId,
+          opType: 'grn.inactive-sku-received',
+          problemCode: 'sku-inactive',
+          problemDetail:
+            `Goods receipt "${code}" booked ${inactiveBooked.length} line(s) of inactive SKU(s) ` +
+            `${codes.map((entry) => `"${entry}"`).join(', ')} — not on the document. The units are in stock; check why they arrived.`,
+          payload: {
+            grnId,
+            grnCode: code,
+            // Base units, as booked.
+            lines: inactiveBooked.map((entry) => {
+              const sku = skuById.get(entry.input.skuId)!;
+              return { skuId: sku.id, skuCode: sku.code, qty: fromMilli(entry.applied), uom: sku.uom };
+            }),
+          },
+          occurredAt,
+        });
+        if (raised === null) {
+          throw new Error(`grn.inactive-sku-received review row ${inactiveSkuReviewOpId} already existed for a new key`);
+        }
+      }
+
       // ── the snapshot (the outbox payload and idempotency replay carry it) ─
       const snapshot: GoodsReceiptSnapshot = {
         goodsReceipt: {
@@ -1610,6 +1663,7 @@ export class ReceivingCommand {
           ...(unmatched.length === 0 ? {} : { unmatchedLines: unmatched }),
           ...(reviewOpId === null ? {} : { reviewOpId }),
           ...(shelfLifeReviewOpId === null ? {} : { shelfLifeReviewOpId }),
+          ...(inactiveSkuReviewOpId === null ? {} : { inactiveSkuReviewOpId }),
           ...(qcHeld.length === 0 ? {} : { qcHeldLines: qcHeld.length }),
           ...(qcSkippedLines === 0 ? {} : { qcSkippedLines }),
         },
@@ -2663,6 +2717,21 @@ export function refusedGrnLinesOpId(idempotencyKey: string): string {
  */
 export function shelfLifeRefusedOpId(idempotencyKey: string): string {
   const digest = createHash('sha256').update(`${idempotencyKey}:grn-shelf-life-refused`).digest();
+  let tail = '';
+  for (let i = 0; i < 16; i++) tail += ULID_ALPHABET.charAt(digest[i]! & 31);
+  const derived = idempotencyKey.slice(0, 10).toUpperCase() + tail;
+  if (derived !== idempotencyKey) return derived;
+  const last = derived.charAt(25);
+  return derived.slice(0, 25) + (last === '0' ? '1' : '0');
+}
+
+/**
+ * Story 1-4b — the `grn.inactive-sku-received` row's op id: derived from the
+ * key like `refusedGrnLinesOpId`, with its OWN salt — so it never shares an
+ * id with the other rows a receipt may raise.
+ */
+export function inactiveSkuGrnLinesOpId(idempotencyKey: string): string {
+  const digest = createHash('sha256').update(`${idempotencyKey}:grn-inactive-sku-received`).digest();
   let tail = '';
   for (let i = 0; i < 16; i++) tail += ULID_ALPHABET.charAt(digest[i]! & 31);
   const derived = idempotencyKey.slice(0, 10).toUpperCase() + tail;

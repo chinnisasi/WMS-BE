@@ -3,7 +3,8 @@ import { FileInterceptor } from '@nestjs/platform-express';
 // Pulls in @types/multer's `Express.Multer.File` namespace augmentation.
 import type {} from 'multer';
 import { Type } from 'class-transformer';
-import { IsInt, IsOptional, IsString, IsUUID, Max, Min } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, IsUUID, Max, Min } from 'class-validator';
+import { SKU_STATUSES, type SkuStatus } from '../../shared/db/schema';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -62,6 +63,7 @@ import {
   SegregationMatrixResponse,
   SkuListResponse,
   SkuResponse,
+  UpdateSkuStatusDto,
 } from './catalog.dto';
 
 export class SkuListQuery {
@@ -89,6 +91,13 @@ export class SkuListQuery {
   @IsOptional()
   @IsUUID()
   productId?: string;
+
+  // Story 1-4b — the optional status filter. Absent lists every SKU (display
+  // lookups depend on that).
+  @ApiProperty({ required: false, enum: [...SKU_STATUSES], description: 'Story 1-4b — only active or only inactive SKUs; absent lists every SKU' })
+  @IsOptional()
+  @IsIn(SKU_STATUSES)
+  status?: SkuStatus;
 }
 
 export class ProductListQuery {
@@ -244,7 +253,7 @@ export class CatalogController {
       query.cursor,
       query.limit === undefined ? undefined : query.limit,
       query.productId,
-      { clientId: query.clientId },
+      { clientId: query.clientId, status: query.status },
     );
     return {
       items: page.items.map(toSkuResponse),
@@ -350,6 +359,42 @@ export class CatalogController {
         levels: dto.levels.map((level) => ({ uom: level.uom, factor: level.factor })),
         barcodes: dto.barcodes.map((entry) => ({ barcode: entry.barcode, uom: entry.uom })),
       },
+      key,
+    );
+    return { sku: toSkuResponse(result.sku) };
+  }
+
+  // Story 1-4b — deactivate / reactivate a SKU (the partners status route).
+  @Patch(':tenantId/catalog/skus/:skuId/status')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Deactivates (with an optional reason) or reactivates a SKU (sku.edit). Inactive: refused on new POs, ASNs, kits and channel mappings; orders sell down only what stock covers in full; channels publish 0; every existing document keeps it. Reactivating clears the reason. The same status is a no-op that stores the key',
+  })
+  @ApiBody({ type: UpdateSkuStatusDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiOkResponse({ type: SkuWriteResponse })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key; an unknown status, a reason with `active`, or a reason over 500 characters (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The SKU does not exist in this tenant (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent same-key request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'skuId', format: 'uuid' })
+  async updateSkuStatus(
+    @Param('tenantId') tenantId: string,
+    @Param('skuId') skuId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+    @Body() dto: UpdateSkuStatusDto,
+  ): Promise<SkuWriteResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const result = await this.skuCommand.updateStatus(
+      { tenantId, actorUserId: session.userId, skuId, status: dto.status, reason: dto.reason },
       key,
     );
     return { sku: toSkuResponse(result.sku) };
@@ -633,7 +678,7 @@ export class CatalogController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The kit SKU (or a component SKU) does not exist in this tenant (not-found / kit-component-not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The SKU is already a kit (kit-already-composed), a component appears twice (duplicate-kit-component), a component is itself a kit (kit-component-is-kit — flat BOM), or the SKU already holds stock or a live reservation — making it a kit would strand that stock (kit-sku-holds-stock)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The SKU is already a kit (kit-already-composed), a component appears twice (duplicate-kit-component), a component is itself a kit (kit-component-is-kit — flat BOM), or the SKU already holds stock or a live reservation — making it a kit would strand that stock (kit-sku-holds-stock); the kit or a component is inactive (sku-inactive)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'skuId', format: 'uuid', description: 'The SKU that becomes a kit' })
@@ -665,7 +710,7 @@ export class CatalogController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The SKU does not exist — or is not a kit (replace never creates kit-ness) — or a component SKU is unknown (not-found / kit-component-not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('A component appears twice (duplicate-kit-component), or a component is itself a kit (kit-component-is-kit — flat BOM)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A component appears twice (duplicate-kit-component), or a component is itself a kit (kit-component-is-kit — flat BOM); a component the stored composition did not hold is inactive (sku-inactive)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'skuId', format: 'uuid', description: 'The kit SKU whose composition is replaced' })

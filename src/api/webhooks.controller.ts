@@ -89,7 +89,7 @@ export class WebhooksController {
   @ApiResponse({ status: 403, ...problemJsonResponse('The connection’s ingest actor has lost orders.manage (order-actor-unprivileged) — NACK; retry heals after a reconnect') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Unknown or foreign connection (not-found), or an unregistered provider') })
   @ApiResponse({ status: 409, ...problemJsonResponse('backorder_policy reject and some line could not fully reserve (order-backorder-rejected) — nothing written, every hold released') })
-  @ApiResponse({ status: 422, ...problemJsonResponse('A divergent payload on a known order ref (order-source-conflict), no ingest warehouse set (ingest-warehouse-unset), or config referencing deleted master data (ingest-config-invalid)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('A divergent payload on a known order ref (order-source-conflict), no ingest warehouse set (ingest-warehouse-unset), config referencing deleted master data (ingest-config-invalid), or a line of an inactive SKU that stock does not cover in full (sku-inactive)') })
   @ApiResponse({ status: 501, ...problemJsonResponse('The provider declares no webhook transport on this deployment (channel-transport-unconfigured)') })
   @ApiResponse({ status: 503, ...problemJsonResponse('The grant store failed closed (reservation-store-unavailable) — nothing written, the channel retries') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'The owning tenant path' })

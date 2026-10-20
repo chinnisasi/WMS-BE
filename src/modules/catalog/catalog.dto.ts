@@ -23,8 +23,10 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateIf,
   ValidateNested,
 } from 'class-validator';
+import { SKU_STATUSES, type SkuStatus } from '../../shared/db/schema';
 import { IMPORT_MODES, GST_RATE_BPS_MAX } from './import.command';
 // Story 12-1: the storage-class vocabulary — the DTO mirror of the shared
 // primitive's tuple (the three-layer pattern: TS tuple / DB CHECK / @IsIn).
@@ -344,8 +346,43 @@ export class SkuResponse {
   })
   barcodes!: SkuBarcodeResponse[];
 
+  @ApiProperty({
+    enum: [...SKU_STATUSES],
+    description:
+      'Story 1-4b — `inactive`: the SKU takes no new POs, ASNs, kits or channel mappings, sells down only what stock covers in full, and publishes 0 to its channels. `active` on every response stored before 1-4b',
+  })
+  status!: SkuStatus;
+
+  @ApiProperty({ type: String, nullable: true, description: 'Story 1-4b — why it was deactivated; null unless inactive (and optional then)' })
+  inactiveReason!: string | null;
+
   @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
   createdAt!: string;
+}
+
+/** Story 1-4b — `PATCH …/catalog/skus/{skuId}/status`. */
+export class UpdateSkuStatusDto {
+  @ApiProperty({
+    enum: [...SKU_STATUSES],
+    description: '`inactive` stops new inbound, kits and channel listings and sells down what is left; `active` restores it and clears the reason',
+  })
+  @IsIn(SKU_STATUSES)
+  status!: SkuStatus;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    type: String,
+    maxLength: 500,
+    description: 'Why it was deactivated — only with `inactive`; trimmed, at most 500 characters',
+  })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsString()
+  // The 500-code-point rule is the command's (behind the replay, trimmed);
+  // this edge cap (UTF-16 units) only bounds the body — the partners shape.
+  @MaxLength(2000)
+  reason?: string | null;
 }
 
 /** Story 1-4 — the create's and the packaging PUT's response. */

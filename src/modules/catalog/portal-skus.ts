@@ -76,6 +76,8 @@ export async function portalSkusInTx(
     from skus s
     where s.tenant_id = ${tenantId}::uuid
       and s.client_id = ${clientId}::uuid
+      -- Story 1-4b — an inactive SKU takes no new ASN, so the announce form never offers one.
+      and s.status = 'active'
       and not exists (
         select 1 from kit_compositions k
         where k.tenant_id = s.tenant_id and k.kit_sku_id = s.id

@@ -99,7 +99,11 @@ export type RejectedOpType =
   // (`shelf-life-short`), refused per line into their own row.
   // SERVER-RAISED only. Apply (with a mandatory note) re-runs exactly those
   // lines with the shelf-life rule waived for that receipt only; or Discard.
-  | 'grn.shelf-life-refused';
+  | 'grn.shelf-life-refused'
+  // Story 1-4b (decision 2) — a goods receipt BOOKED blind or unmatched
+  // lines of an inactive SKU; the row flags them for a look. SERVER-RAISED
+  // only; Discard ONLY (the web labels it Acknowledge) — it books nothing.
+  | 'grn.inactive-sku-received';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -112,6 +116,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'return.receive',
   'grn.lines-refused',
   'grn.shelf-life-refused',
+  'grn.inactive-sku-received',
 ];
 
 /**
@@ -119,7 +124,11 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
  * refused part, §7g). A device upload naming one is refused like
  * `self-test.echo`: nothing on the device produces it.
  */
-const SERVER_RAISED_ONLY_OP_TYPES: readonly RejectedOpType[] = ['grn.lines-refused', 'grn.shelf-life-refused'];
+const SERVER_RAISED_ONLY_OP_TYPES: readonly RejectedOpType[] = [
+  'grn.lines-refused',
+  'grn.shelf-life-refused',
+  'grn.inactive-sku-received',
+];
 
 /**
  * The resolve arms (the spec's human-judgment vocabulary — the DB statuses
@@ -158,13 +167,16 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   // the shelf-life rule waived (needs a note — 400 without one), or Discard.
   // No recount: the refusal is about the goods' dates, not a bin.
   'grn.shelf-life-refused': ['apply', 'discard'],
+  // Story 1-4b — the lines were already booked; the row is a flag, so its
+  // only decision is Discard (the web's Acknowledge), which books nothing.
+  'grn.inactive-sku-received': ['discard'],
 };
 
 /** Story 1-2b — the resolve note's ceiling (code points), trimmed. */
 export const RESOLVE_NOTE_MAX = 500;
 
 /** The op types the apply arm can re-execute (every type admitting `apply`). */
-type ApplicableOpType = Exclude<RejectedOpType, 'return.receive' | 'grn.lines-refused'>;
+type ApplicableOpType = Exclude<RejectedOpType, 'return.receive' | 'grn.lines-refused' | 'grn.inactive-sku-received'>;
 
 function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
   return REJECTED_OP_DECISIONS_BY_TYPE[opType].includes('apply');
@@ -344,6 +356,13 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['blindReasonCode', 'string-or-null'],
     ['lines', 'array'],
     ['refusals', 'array'],
+  ],
+  // Story 1-4b — server-raised: the receipt and its booked lines of an
+  // inactive SKU (base units).
+  'grn.inactive-sku-received': [
+    ['grnId', 'uuid'],
+    ['grnCode', 'string-or-null'],
+    ['lines', 'array'],
   ],
   // Story 1-1 — server-raised: the receipt, its client and the refused lines
   // aligned with `refusals`.
@@ -1048,7 +1067,9 @@ export class SyncReportCommand {
                   ? " Receive these units again on a receipt for their own client."
                   : row.opType === 'grn.shelf-life-refused'
                     ? ' Accept the short-dated lines anyway (with a note), or discard them.'
-                    : ''),
+                    : row.opType === 'grn.inactive-sku-received'
+                      ? ' The lines were already booked — acknowledge the row.'
+                      : ''),
             { decisions: [...admitted] },
           );
         }

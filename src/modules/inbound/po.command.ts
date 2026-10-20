@@ -25,6 +25,7 @@ import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/qua
 import { uomPrecision } from '../catalog/uom';
 import { assertNoPendingOverReceiptsInTx } from './asn.command';
 import { assertVendorLinkedInTx, type VendorSnapshotV1 } from '../partners/partners.facade';
+import { assertSkusTakeWorkInTx, skusGainingInbound } from '../catalog/catalog.facade';
 
 export interface PoLineInput {
   readonly skuId: string;
@@ -276,6 +277,11 @@ export class PurchaseOrderCommand {
     // under FOR KEY SHARE so a departure cannot commit between here and the
     // insert. The first lock this transaction takes.
     await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
+    // Story 1-4b — no new inbound for an inactive SKU (409 `sku-inactive`),
+    // after the client checks and before the vendor (decision 13); the SKU
+    // rows `FOR KEY SHARE`, so a deactivation serialises against this create.
+    // The suggested-PO submit rides this path.
+    await assertSkusTakeWorkInTx(tx, command.tenantId, command.lines.map((line) => line.skuId));
     // Story 1-3 — the vendor guard (lock order client → partner → link): an
     // active partner in the vendor role with an ACTIVE vendor link to this
     // client, read `FOR KEY SHARE` so a deactivation serialises against this
@@ -415,6 +421,18 @@ export class PurchaseOrderCommand {
           [po.clientId, ...foreign].map((clientId) => codes.get(clientId) ?? clientId),
         );
       }
+      // Story 1-4b (decision 9) — an inactive SKU gains no inbound: a SKU the
+      // PO's stored lines do not carry (a re-pointed line included), or one
+      // whose ordered total rises, is refused 409 `sku-inactive`. Keeping or
+      // lowering an inactive line amends.
+      await assertSkusTakeWorkInTx(
+        tx,
+        command.tenantId,
+        skusGainingInbound(
+          existingLines.map((line) => ({ skuId: line.skuId, qtyMilli: line.orderedQty })),
+          command.lines.map((line) => ({ skuId: line.skuId, qtyBase: line.orderedQty })),
+        ),
+      );
       const uomBySku = new Map([...skuFacts].map(([id, sku]) => [id, sku.uom]));
       // Story 10.2: same position, same reason — behind the replay lookup.
       const lines = this.scaleLines(command.lines, uomBySku);

@@ -400,6 +400,13 @@ export class GoodsReceiptDto {
   })
   shelfLifeReviewOpId?: string;
 
+  @ApiProperty({
+    required: false,
+    description:
+      'Story 1-4b — the op id of the review row raised for the blind or unmatched lines of an INACTIVE SKU this receipt booked (type `grn.inactive-sku-received` — Discard only, labelled Acknowledge; it books nothing); present only when one was raised',
+  })
+  inactiveSkuReviewOpId?: string;
+
   @ApiProperty({ required: false, minimum: 1, description: "Story 1-2b — how many booked lines were put on receipt QC holds (the client's QC on receipt); present only when > 0" })
   qcHeldLines?: number;
 
@@ -819,6 +826,13 @@ export class CatalogSnapshotSkuDto {
       'Story 1-4: every non-primary barcode of the SKU with its level and factor (1 at the base uom). Empty when the SKU has none; an older device ignores it.',
   })
   packBarcodes!: CatalogSnapshotPackBarcodeDto[];
+
+  @ApiProperty({
+    enum: ['active', 'inactive'],
+    description:
+      'Story 1-4b: `inactive` — the SKU takes no new inbound. A receive scan of it that is not on the document is still booked and flagged for review; the handheld warns at scan time. An older device ignores it.',
+  })
+  status!: 'active' | 'inactive';
 }
 
 /**

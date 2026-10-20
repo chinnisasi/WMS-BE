@@ -139,6 +139,10 @@ export const AUDIT_NEW_ACTIONS = [
   // Story 1-4 — the single-SKU create and the packaging PUT (`SkuCommand`).
   { action: 'sku.created', targetType: 'sku' },
   { action: 'sku.packaging_replaced', targetType: 'sku' },
+  // Story 1-4b — the SKU status route (`SkuCommand.updateStatus`); a new
+  // reason on an inactive SKU writes the existing `sku.edited`.
+  { action: 'sku.deactivated', targetType: 'sku' },
+  { action: 'sku.reactivated', targetType: 'sku' },
   { action: 'product.created', targetType: 'product' },
   { action: 'product.edited', targetType: 'product' },
   { action: 'kit.created', targetType: 'kit' },

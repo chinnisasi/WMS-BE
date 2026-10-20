@@ -55,6 +55,8 @@ export const ASN_IMPORT_ROW_ERROR_CODES = [
   'client-required',
   // Story 1-2a — the ASN's client has departed (it takes no new work).
   'client-departed',
+  // Story 1-4b — the row's SKU is inactive (it takes no new inbound).
+  'sku-inactive',
   'kit-cannot-hold-stock',
   'duplicate-asn-code',
   'invalid-asn-code',

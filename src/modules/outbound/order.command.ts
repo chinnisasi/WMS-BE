@@ -11,7 +11,7 @@ import {
   picklistLines,
   skus,
 } from '../../shared/db/schema';
-import type { Order, OrderLine } from '../../shared/db/schema';
+import type { Order, OrderLine, SkuStatus } from '../../shared/db/schema';
 import { MAX_EXTERNAL_ID_LENGTH, UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
@@ -27,6 +27,7 @@ import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import { CatalogFacade } from '../catalog/catalog.facade';
 import type { KitCompositionLine } from '../catalog/catalog.facade';
+import { lockSkuStatusesInTx, skuInactive } from '../catalog/catalog.facade';
 import { picklistLineDrewUnits } from './wave.command';
 import type { ReservationSnapshot } from '../inventory/inventory.facade';
 import {
@@ -415,6 +416,7 @@ export class OrderCommandService {
           lines: [] as OrderLineInput[],
           explosions: new Map(),
           clientId: null,
+          skuFacts: new Map<string, SkuFacts>(),
         };
       }
 
@@ -601,6 +603,7 @@ export class OrderCommandService {
             lines,
             explosions: new Map(),
             clientId: null,
+            skuFacts: new Map<string, SkuFacts>(),
           };
         }
       }
@@ -621,7 +624,16 @@ export class OrderCommandService {
       // `client-departed`) before any grant moves. NOT the guard: this phase
       // commits before phase 3 writes, so the check runs again there.
       await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
-      return { replayed: null, destination, consigneeGstin, lines: linesWithRates, explosions, clientId };
+      return {
+        replayed: null,
+        destination,
+        consigneeGstin,
+        lines: linesWithRates,
+        explosions,
+        clientId,
+        // Story 1-4b — every line and component SKU's code and status.
+        skuFacts: new Map<string, SkuFacts>([...lineSkus, ...componentSkus]),
+      };
     });
     if (preflight.replayed !== null) {
       return preflight.replayed;
@@ -723,6 +735,23 @@ export class OrderCommandService {
     // the kit CHILDREN are the entries. The release is the exact machinery
     // the 503 path already runs — fail-safe toward understated ATP, never
     // oversold.
+    // ── phase 2.5 (story 1-4b, decision 1): an inactive SKU sells down ─────
+    // An order line of an inactive SKU (a kit line: its kit SKU or any
+    // component) is accepted only when it reserved IN FULL — a shortfall
+    // would wait for inbound an inactive SKU never takes, so it refuses the
+    // whole order (409 `sku-inactive`, whatever the backorder policy; the
+    // ingest maps it to a typed 422), after every grant is released. Before
+    // the policy arm, so a channel refusal for an inactive SKU writes no
+    // backorder-refusal fact (decision 12).
+    const inactiveRefusal = inactiveShortRefusal(lines, explosions, plainHolds, childHolds, (skuId) => {
+      const facts = preflight.skuFacts.get(skuId);
+      return facts === undefined ? undefined : { code: facts.code, status: facts.status };
+    });
+    if (inactiveRefusal !== null) {
+      await this.releaseAll(command.tenantId, granted, 'sku-inactive');
+      throw inactiveRefusal;
+    }
+
     const shortLines =
       command.backorderPolicy === 'reject' ? this.policyShortLines(lines, explosions, plainHolds, childHolds) : [];
     if (shortLines.length > 0) {
@@ -748,6 +777,27 @@ export class OrderCommandService {
         // `client-departed`, and the grants released by the rollback path
         // below — or waits for this order, whose open status then blocks it.
         await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
+        // Story 1-4b — the SKU rows `FOR KEY SHARE` in id order (after the
+        // client: the lock order client → SKU), re-reading status and
+        // kit-ness. A deactivation committed since phase 1 refuses a short
+        // line exactly as phase 2.5 does; a plain line (or component) whose
+        // SKU became a kit since phase 1 is 409 `order-catalog-changed` (the
+        // PENDING kit race — its grant holds a kit's stock). Both throw into
+        // the catch below, which releases every grant.
+        const locked = await lockSkuStatusesInTx(tx, command.tenantId, [...preflight.skuFacts.keys()]);
+        const lockedRefusal = inactiveShortRefusal(lines, explosions, plainHolds, childHolds, (skuId) => locked.get(skuId));
+        if (lockedRefusal !== null) {
+          throw lockedRefusal;
+        }
+        const becameKits = lines
+          .flatMap((line, index) => {
+            const bom = explosions.get(index);
+            return bom === undefined ? [line.skuId] : bom.map((component) => component.componentSkuId);
+          })
+          .filter((skuId) => locked.get(skuId)?.isKit === true);
+        if (becameKits.length > 0) {
+          throw orderCatalogChanged([...new Set(becameKits.map((skuId) => locked.get(skuId)!.code))]);
+        }
         try {
           await tx.insert(orders).values({
             id: orderId,
@@ -1511,10 +1561,14 @@ export class OrderCommandService {
     // Story 21-2b: the same read hands back each SKU's client — the order
     // derives its own from them.
     const rows = await tx
-      .select({ id: skus.id, uom: skus.uom, clientId: skus.clientId })
+      .select({ id: skus.id, uom: skus.uom, clientId: skus.clientId, code: skus.code, status: skus.status })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)));
-    const byId = new Map(rows.map((row) => [row.id, { uom: row.uom, clientId: row.clientId }]));
+    // Story 1-4b — the code and status ride the same read (the phase-2.5
+    // sell-down refusal names the SKU; phase 3 re-reads the status locked).
+    const byId = new Map(
+      rows.map((row) => [row.id, { uom: row.uom, clientId: row.clientId, code: row.code, status: row.status as SkuStatus }]),
+    );
     for (const skuId of distinct) {
       if (!byId.has(skuId)) {
         throw new ProblemException(
@@ -1568,10 +1622,12 @@ export class OrderCommandService {
   }
 }
 
-/** Story 21-2b — one SKU's existence facts: its base UoM and its client. */
+/** Story 21-2b — one SKU's existence facts: its base UoM and its client (1-4b: code and status). */
 interface SkuFacts {
   readonly uom: string;
   readonly clientId: string;
+  readonly code: string;
+  readonly status: SkuStatus;
 }
 
 function uomsOf(facts: ReadonlyMap<string, SkuFacts>): Map<string, string> {
@@ -1721,4 +1777,75 @@ export class BackorderRejectedError extends ProblemException {
       "The order's backorder policy is REJECT and some line could not fully reserve at grant time — the whole order was refused and every reservation it moved was released.",
     );
   }
+}
+
+/**
+ * Story 1-4b (decision 1) — the sell-down refusal: every order line of an
+ * inactive SKU that did not reserve in full. A plain line is short when its
+ * hold is below its quantity; a kit line is short when its kit could not be
+ * reserved in full (a failed kit released its holds, so no per-component
+ * numbers are given) and its kit SKU or any component is inactive. `statusOf`
+ * reads the phase-1 facts or the phase-3 locked rows. Null when nothing is
+ * short. The refusal is 409 `sku-inactive` naming the inactive codes in
+ * `extensions.skuCodes`; the available quantity excludes buffered units.
+ */
+export function inactiveShortRefusal(
+  lines: readonly OrderLineInput[],
+  explosions: ReadonlyMap<number, readonly KitCompositionLine[]>,
+  plainHolds: ReadonlyMap<number, ReservationSnapshot>,
+  childHolds: ReadonlyMap<string, ReservationSnapshot>,
+  statusOf: (skuId: string) => { readonly code: string; readonly status: SkuStatus } | undefined,
+): ProblemException | null {
+  const codes: string[] = [];
+  const parts: string[] = [];
+  const inactiveCode = (skuId: string): string | null => {
+    const facts = statusOf(skuId);
+    return facts !== undefined && facts.status !== 'active' ? facts.code : null;
+  };
+  for (const [index, line] of lines.entries()) {
+    const bom = explosions.get(index);
+    if (bom === undefined) {
+      const code = inactiveCode(line.skuId);
+      if (code === null) continue;
+      const available = plainHolds.get(index)?.quantity ?? 0;
+      if (available >= line.quantity) continue;
+      codes.push(code);
+      parts.push(`SKU "${code}" — ordered ${fromMilli(line.quantity)}, available ${fromMilli(available)}`);
+      continue;
+    }
+    const kitReserved = bom.every((component, childIndex) => {
+      const hold = childHolds.get(`${index}:${childIndex}`);
+      return hold !== undefined && hold.quantity >= component.qty;
+    });
+    if (kitReserved) continue;
+    const inactive = [line.skuId, ...bom.map((component) => component.componentSkuId)]
+      .map(inactiveCode)
+      .filter((code): code is string => code !== null);
+    if (inactive.length === 0) continue;
+    const kitCode = statusOf(line.skuId)?.code ?? line.skuId;
+    codes.push(...inactive);
+    parts.push(
+      `kit "${kitCode}" (inactive: ${[...new Set(inactive)].map((code) => `"${code}"`).join(', ')}) — the kit could not be reserved in full`,
+    );
+  }
+  if (codes.length === 0) return null;
+  return skuInactive(
+    codes,
+    `An inactive SKU sells existing stock only — its order line is accepted only when stock covers it in full, never backordered: ${parts.join('; ')}.`,
+  );
+}
+
+/**
+ * Story 1-4b — 409 `order-catalog-changed`: a line's SKU became a kit while
+ * the order was placed (the PENDING kit race), so its grant would hold a
+ * kit's stock. Nothing was written; every grant is released. Retry.
+ */
+export function orderCatalogChanged(skuCodes: readonly string[]): ProblemException {
+  return new ProblemException(
+    'order-catalog-changed',
+    409,
+    'The catalog changed while the order was placed',
+    `The catalog changed while the order was placed — ${skuCodes.map((code) => `"${code}"`).join(', ')} became a kit. Nothing was written; retry.`,
+    { skuCodes: [...skuCodes].sort() },
+  );
 }

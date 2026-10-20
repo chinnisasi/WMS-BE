@@ -901,6 +901,16 @@ export const skus = pgTable(
      * 1-2b); roadmap 2.4 derives expiry from it.
      */
     shelfLifeDays: integer('shelf_life_days'),
+    /**
+     * Story 1-4b — `active | inactive` (`SKU_STATUSES`). An inactive SKU takes
+     * no new inbound, kits or channel mappings, sells down only what stock
+     * covers in full, and publishes 0 to its channels; every existing
+     * document, list and stock read still shows it. Master records
+     * deactivate, never delete. CHECKs in `drizzle/0082_sku_status.sql` only.
+     */
+    status: text('status').notNull().default('active'),
+    /** Story 1-4b — null unless the SKU is inactive; 1–500 code points, trimmed by the command. */
+    inactiveReason: text('inactive_reason'),
     ...tenantTimestamps,
   },
   (table) => [
@@ -929,6 +939,10 @@ export const skus = pgTable(
 );
 
 export type Sku = typeof skus.$inferSelect;
+
+/** Story 1-4b — a SKU's status (`skus_status_check`, 0082). */
+export const SKU_STATUSES = ['active', 'inactive'] as const;
+export type SkuStatus = (typeof SKU_STATUSES)[number];
 
 /**
  * Product identity (Story 11.3 — AD-19): the grouping layer ABOVE `skus`. A

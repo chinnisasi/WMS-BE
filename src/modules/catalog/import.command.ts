@@ -730,7 +730,7 @@ export class ImportCommand {
             // code may be held by several clients, and a kit cell names THIS
             // run's client's SKUs — only those rows are locked.
             const referencedSkuRows = await tx
-              .select({ id: skus.id, code: skus.code, uom: skus.uom, clientId: skus.clientId })
+              .select({ id: skus.id, code: skus.code, uom: skus.uom, clientId: skus.clientId, status: skus.status })
               .from(skus)
               .where(
                 and(
@@ -750,7 +750,7 @@ export class ImportCommand {
             const missingCodes = referencedCodes.filter((code) => !skuRowByCode.has(code));
             if (missingCodes.length > 0) {
               const elsewhere = await tx
-                .select({ id: skus.id, code: skus.code, uom: skus.uom, clientId: skus.clientId })
+                .select({ id: skus.id, code: skus.code, uom: skus.uom, clientId: skus.clientId, status: skus.status })
                 .from(skus)
                 .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.code, missingCodes)))
                 .orderBy(skus.clientId);
@@ -833,6 +833,16 @@ export class ImportCommand {
                 // another client is refused per row.
                 if (componentRow.clientId !== clientId) {
                   errors.push(rowError(row.rowNumber, row.code, 'mixed-client', `kit_components names component "${component.code}" of client ${label(componentRow.clientId)} — this kit is for client ${label(clientId)}, and a kit's components share its client.`));
+                  rowFailed = true;
+                  break;
+                }
+                // Story 1-4b — an inactive SKU is composed into no new kit:
+                // a row error `sku-inactive`, after the client check
+                // (decision 13). The status is read from the row this pass
+                // already holds `FOR UPDATE` (the guard's lock, stronger), so
+                // a deactivation cannot commit between the read and the insert.
+                if (componentRow.status !== 'active') {
+                  errors.push(rowError(row.rowNumber, row.code, 'sku-inactive', `kit_components names component "${component.code}", which is inactive — an inactive SKU is composed into no new kit. Reactivate it first.`));
                   rowFailed = true;
                   break;
                 }

@@ -12,6 +12,8 @@ import {
   skus,
   stockAdjustmentPendings,
   stockOnHand,
+  SKU_STATUSES,
+  type SkuStatus,
 } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { nowIso } from '../../shared/primitives/time';
@@ -182,6 +184,13 @@ export interface SkuSnapshot {
    * then (uom, barcode). A replay of a pre-1.4 stored response serves `?? []`.
    */
   readonly barcodes: readonly SkuBarcodeView[];
+  /**
+   * Story 1-4b — `active | inactive`. A replay of a pre-1.4b stored response
+   * serves `?? 'active'` (`normalizeStoredSku`).
+   */
+  readonly status: SkuStatus;
+  /** Story 1-4b — the deactivation reason, null unless inactive (and optional then). */
+  readonly inactiveReason: string | null;
   readonly createdAt: string;
 }
 
@@ -197,6 +206,8 @@ export function normalizeStoredSku(stored: SkuSnapshot): SkuSnapshot {
     abcClass?: string | null;
     shelfLifeDays?: number | null;
     barcodes?: readonly SkuBarcodeView[];
+    status?: SkuStatus;
+    inactiveReason?: string | null;
   };
   return {
     ...legacy,
@@ -205,6 +216,9 @@ export function normalizeStoredSku(stored: SkuSnapshot): SkuSnapshot {
     abcClass: legacy.abcClass ?? null,
     shelfLifeDays: legacy.shelfLifeDays ?? null,
     barcodes: legacy.barcodes ?? [],
+    // Story 1-4b — every SKU stored before 1-4b was active.
+    status: legacy.status ?? 'active',
+    inactiveReason: legacy.inactiveReason ?? null,
   };
 }
 
@@ -252,6 +266,19 @@ export interface CreateSkuCommand {
   readonly clientId?: string | undefined;
   readonly levels?: readonly PackLevelInput[] | undefined;
   readonly barcodes?: readonly ExtraBarcodeInput[] | undefined;
+}
+
+/** Story 1-4b — the deactivation reason's limit, in code points (decision 14). */
+export const SKU_INACTIVE_REASON_MAX = 500;
+
+/** Story 1-4b — `PATCH …/catalog/skus/{skuId}/status`. */
+export interface UpdateSkuStatusCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly skuId: string;
+  readonly status: string;
+  /** Optional; trimmed in the command, blank = absent. Only with `inactive`. */
+  readonly reason?: string | null | undefined;
 }
 
 /** Story 1-4 — `PUT …/catalog/skus/{skuId}/packaging`. */
@@ -388,7 +415,7 @@ export class SkuCommand {
     productId?: string,
     // Story 1-5a — the staff client filter, a named option (never a further
     // positional argument).
-    options: { readonly clientId?: string | undefined } = {},
+    options: { readonly clientId?: string | undefined; readonly status?: SkuStatus | undefined } = {},
   ): Promise<Page<SkuSnapshot>> {
     const pageSize = Math.min(Math.max(Math.trunc(limit) || DEFAULT_SKU_PAGE_SIZE, 1), MAX_SKU_PAGE_SIZE);
     const before = cursor === undefined ? undefined : decodeCursorSafe(cursor);
@@ -402,6 +429,8 @@ export class SkuCommand {
         eq(skus.tenantId, tenantId),
         productId === undefined ? undefined : eq(skus.productId, productId),
         options.clientId === undefined ? undefined : eq(skus.clientId, options.clientId),
+        // Story 1-4b — the optional status filter; absent lists every SKU.
+        options.status === undefined ? undefined : eq(skus.status, options.status),
       );
       const skuRows = await tx
         .select()
@@ -732,6 +761,115 @@ export class SkuCommand {
         action: 'sku.packaging_replaced',
         targetType: 'sku',
         targetId: sku.id,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
+      await storeKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
+      return snapshot;
+    });
+  }
+
+  /**
+   * Story 1-4b — `PATCH …/catalog/skus/{skuId}/status`: deactivate (with an
+   * optional reason) or reactivate — the partners `updateStatus` order: hash
+   * (discriminator `command: 'sku.status'`) → `sku.edit` → replay → the shape
+   * checks (they read no row) → the SKU `FOR UPDATE` (a plain `UPDATE` takes
+   * only `NO KEY UPDATE`, which does not conflict with the takes-work guard's
+   * `FOR KEY SHARE` — so the lock is explicit, and a deactivation and a PO
+   * create serialise) → replay again under the lock → apply. Allowed whatever
+   * stock or open work the SKU has (decision 1). Reactivating clears the
+   * reason; a new reason on an inactive SKU replaces the old one (an audited
+   * `sku.edited`). The same status with the same reason, or with no reason
+   * (the stored one is kept), stores the key and writes nothing else
+   * (`skus.status:unchanged`).
+   */
+  async updateStatus(command: UpdateSkuStatusCommand, idempotencyKey: string): Promise<SkuWriteSnapshot> {
+    // Decision 14 — trimmed in the command; blank after trimming is absent.
+    const trimmed = typeof command.reason === 'string' ? command.reason.trim() : command.reason;
+    const reason = trimmed === undefined || trimmed === null || trimmed === '' ? null : trimmed;
+    const payloadHash = hashCommandPayload({
+      command: 'sku.status',
+      tenantId: command.tenantId,
+      skuId: command.skuId,
+      status: command.status,
+      reason,
+    });
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(await this.tenancy.getMemberRole(command.tenantId, command.actorUserId, tx), 'sku.edit');
+      const replayed = await replaySkuWrite(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayed !== null) return replayed;
+
+      // The pure shape checks, before the lock.
+      if (!(SKU_STATUSES as readonly string[]).includes(command.status)) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'Invalid SKU status',
+          `status must be one of ${JSON.stringify(SKU_STATUSES)} (got ${JSON.stringify(command.status)}).`,
+        );
+      }
+      const status = command.status as SkuStatus;
+      if (reason !== null && (typeof reason !== 'string' || status === 'active')) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'Invalid SKU status',
+          'reason is given only when deactivating — reactivating clears it.',
+        );
+      }
+      if (reason !== null && [...reason].length > SKU_INACTIVE_REASON_MAX) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'Invalid SKU status',
+          `reason is at most ${SKU_INACTIVE_REASON_MAX} characters.`,
+        );
+      }
+      if (!UUID_RE.test(command.skuId)) throw skuNotFound();
+      // Lock, 404 when absent — nothing else (guide §1).
+      const locked = await tx
+        .select()
+        .from(skus)
+        .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
+        .limit(1)
+        .for('update');
+      const replayedUnderLock = await replaySkuWrite(tx, command.tenantId, idempotencyKey, payloadHash);
+      if (replayedUnderLock !== null) return replayedUnderLock;
+      const current = locked[0];
+      if (current === undefined) throw skuNotFound();
+
+      // The same status with no reason keeps the stored reason (a no-op); a
+      // different reason on an inactive SKU replaces it.
+      const nextReason =
+        status === 'active' ? null : reason ?? (current.status === status ? current.inactiveReason : null);
+      if (current.status === status && (current.inactiveReason ?? null) === nextReason) {
+        const unchanged: SkuWriteSnapshot = { sku: await withPackaging(tx, command.tenantId, current) };
+        await storeKey(tx, command.tenantId, idempotencyKey, payloadHash, unchanged);
+        return unchanged;
+      }
+      const rows = await tx
+        .update(skus)
+        .set({ status, inactiveReason: nextReason, updatedAt: nowIso() })
+        .where(and(eq(skus.tenantId, command.tenantId), eq(skus.id, current.id)))
+        .returning();
+      const snapshot: SkuWriteSnapshot = { sku: await withPackaging(tx, command.tenantId, rows[0]!) };
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId: command.tenantId,
+        type: 'catalog.sku_edited',
+        occurredAt: nowIso(),
+        payload: { skuId: current.id, code: current.code },
+      });
+      const action =
+        current.status === status ? 'sku.edited' : status === 'inactive' ? 'sku.deactivated' : 'sku.reactivated';
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action,
+        targetType: 'sku',
+        targetId: current.id,
         reference: idempotencyKey,
         occurredAt: nowIso(),
       });
@@ -1566,6 +1704,9 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     // (`withPackaging`, the list's batched read).
     shelfLifeDays: row.shelfLifeDays ?? null,
     barcodes: [],
+    // Story 1-4b — the status and its reason (null unless inactive).
+    status: row.status as SkuStatus,
+    inactiveReason: row.inactiveReason ?? null,
     createdAt: row.createdAt,
   };
 }
