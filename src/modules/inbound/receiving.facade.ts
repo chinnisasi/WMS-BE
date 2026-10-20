@@ -169,6 +169,8 @@ export interface CatalogSnapshot {
     readonly systemOwned: boolean;
     /** Story 12.8 (UX-DR29): the bin's storage class — the device's offline conformance mirror. Never null on the wire (the column defaults to `ambient`). */
     readonly storageClass: string;
+    /** Story 1-5b: the bin's dedicated client (null = shared) — the device's offline client-gate mirror. */
+    readonly dedicatedClientId: string | null;
   }[];
   /** The derived putaway tasks (suggestions baked in are advisory — the server re-derives and re-gates at placement). */
   readonly putawayTasks: readonly {

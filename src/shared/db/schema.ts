@@ -651,8 +651,9 @@ export const bins = pgTable(
      * Story 21-1 — the dedicated-storage attribute (AD-23): null = commingled
      * (the default — most 3PLs commingle); set = this bin holds only that
      * client's goods. Nullable BY DESIGN: this is an attribute, not a scoping
-     * column, and pre-21.1 bins (all commingled) read null. Inert until 21-2+
-     * give it a consumer.
+     * column, and pre-21.1 bins (all commingled) read null. Story 1-5b gates
+     * on it: a dedicated bin accepts only its client's SKUs
+     * (`shared/primitives/client-bin.ts`).
      */
     dedicatedClientId: uuid('dedicated_client_id'),
     /** Milli-units — base UoM × 10³ (AD-9 as amended by story 10.1). */

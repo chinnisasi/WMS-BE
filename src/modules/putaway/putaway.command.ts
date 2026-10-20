@@ -19,7 +19,7 @@ import {
   skus,
   stockOnHand,
 } from '../../shared/db/schema';
-import { skuCodeLabelsInTx } from '../clients/clients.facade';
+import { getClientLabelsInTx, skuCodeLabelsInTx } from '../clients/clients.facade';
 import { uuidv7 } from '../../shared/primitives/ids';
 import {
   MAX_QUANTITY_MILLI,
@@ -38,6 +38,9 @@ import {
   binStorageMismatch,
   storageClassSatisfies,
 } from '../../shared/primitives/storage-class';
+// Story 1-5b — the ONE dedicated-client predicate + the refusal factory
+// (shared with merge and the transfer gate runner).
+import { binClientAccepts, binClientMismatch } from '../../shared/primitives/client-bin';
 // Story 12-4 — the ONE bulk-asset occupancy predicate + the refusal factory,
 // and the type arm-key + the exclusion list behind the never-suggested rule.
 // Same one-source rule as the class/hazard predicates above.
@@ -534,6 +537,8 @@ export class PutawayCommand {
           storageClass: bins.storageClass,
           // Story 12-4 — the location type: the bulk-asset occupancy arm's key.
           type: bins.type,
+          // Story 1-5b — the dedicated client the client gate rules on.
+          dedicatedClientId: bins.dedicatedClientId,
         })
         .from(bins)
         .where(
@@ -580,6 +585,27 @@ export class PutawayCommand {
           sku.code,
           targetBin.storageClass,
           sku.storageClass,
+        );
+      }
+      // ── story 1-5b: the dedicated-client gate — beside the class gate, on
+      // the same locked row and the SKU read already in hand (no extra query
+      // unless it refuses): a bin dedicated to another client refuses this
+      // SKU. 400 `bin-client-mismatch` naming the bin, its client and the
+      // SKU's code and client — device-fault, the handheld keeps the op
+      // re-plannable (decision 11). Same predicate, same position as
+      // `candidateFitsSku`'s client arm (the SYNC HAZARD rule).
+      if (!binClientAccepts(targetBin.dedicatedClientId, sku.clientId)) {
+        const labels = await getClientLabelsInTx(tx, command.tenantId, [
+          targetBin.dedicatedClientId!,
+          sku.clientId,
+        ]);
+        const [skuLabel] = await skuCodeLabelsInTx(tx, command.tenantId, [{ code: sku.code, clientId: sku.clientId }]);
+        throw binClientMismatch(
+          400,
+          targetBin.code,
+          labels.get(targetBin.dedicatedClientId!) ?? 'another client',
+          skuLabel ?? sku.code,
+          labels.get(sku.clientId) ?? 'another client',
         );
       }
       // ── story 12-3: the secure-bin authority gate (FR-42) — immediately
@@ -680,7 +706,10 @@ export class PutawayCommand {
       // SYNC HAZARD: this arm list exists in THREE places that must never
       // diverge — here, `candidateFitsSku` (the suggestion + the task
       // derivation) and `mergeBin`'s target gates — because the suggestion
-      // must never point at a bin the gates refuse. A fourth arm (the
+      // must never point at a bin the gates refuse. (The rule arms above —
+      // class, story 1-5b's client, secure, bulk, hazard — are listed the
+      // same way, plus the transfer gate runner
+      // `InventoryFacade.assertPlacementGatesInTx`.) A fourth arm (the
       // spec's Epic 19/20 extension note predicts FR-71 ones) lands in all
       // three, in the same order.
       if (targetBin.maxWeightGrams !== null) {
@@ -734,9 +763,29 @@ export class PutawayCommand {
           // moving SKU's own occupant pairs, so a top-up of the same SKU is
           // never refused for co-locating with itself.
           hazardClass: sku.hazardClass,
+          // Story 1-5b — the client: the client gate and the own-client
+          // preference (the task derivation's ranking, shared).
+          clientId: sku.clientId,
         },
       );
-      const suggestedBinId = suggestion?.binId ?? null;
+      // Story 1-5b (decision 10): a target equal to the suggestion WITHOUT
+      // the own-client preference also counts as followed — a handheld that
+      // placed against a task suggested before a bin was dedicated (a shared
+      // bin the preferred walk now skips) needs no mismatch reason. The
+      // recorded suggestion is then that unpreferred one, so a stored row's
+      // "reason is null iff target = suggestion" invariant holds. Only when
+      // NO reason was given: a placement there WITH a reason is a deliberate
+      // skip of the client's own bin — the preferred suggestion and the
+      // reason are recorded.
+      const recordedSuggestion =
+        suggestion === null
+          ? null
+          : command.reasonCode === null &&
+              suggestion.unpreferred !== null &&
+              suggestion.unpreferred.binId === command.toBinId
+            ? suggestion.unpreferred
+            : { binId: suggestion.binId, binCode: suggestion.binCode };
+      const suggestedBinId = recordedSuggestion?.binId ?? null;
       // ── story 12-4: the operator-directed BULK placement reason ──────────
       // A tank/silo is never auto-suggested (the candidate list excludes the
       // type), so targeting one is ALWAYS a mismatch and the operator must
@@ -881,7 +930,7 @@ export class PutawayCommand {
           toBinId: targetBin.id,
           toBinCode: targetBin.code,
           suggestedBinId,
-          suggestedBinCode: suggestion?.binCode ?? null,
+          suggestedBinCode: recordedSuggestion?.binCode ?? null,
           reasonCode: recordedReason,
           placedBy: command.operatorUserId,
           placedAt,
@@ -984,6 +1033,16 @@ export function isMismatchReason(value: string): value is PutawayMismatchReasonC
  * dim-fit gates together — `candidateFitsSku`), the LOWEST occupancy wins,
  * then bin code order. No velocity class, no zone affinity, no nightly job
  * (those ship with the deferred report story).
+ *
+ * Story 1-5b: the walk is `pickPutawayCandidate` with the own-client
+ * preference — the SKU's client's dedicated bins first, then shared bins —
+ * the ONE ranking the task derivation also uses, so a followed task
+ * suggestion equals the placement's re-derivation. `unpreferred` is the
+ * same walk WITHOUT the preference (one stable pass over every bin that
+ * accepts the client): decision 10 — a target equal to either needs no
+ * mismatch reason, so a dedication never strands a putaway queued against an
+ * older (shared-bin) suggestion. Both walks cover the same eligible set, so
+ * they are null together.
  */
 export async function suggestBinInTx(
   tx: TenantTx,
@@ -992,22 +1051,95 @@ export async function suggestBinInTx(
   skuId: string,
   qty: number,
   skuAttrs: SkuPhysicalAttributes,
-): Promise<{ binId: string; binCode: string; rationale: string } | null> {
+): Promise<{
+  binId: string;
+  binCode: string;
+  unpreferred: { binId: string; binCode: string } | null;
+} | null> {
   const candidates = await binCandidatesInTx(tx, tenantId, warehouseId);
-  for (const candidate of candidates) {
-    // Story 12-2: the hazard arm needs the moving SKU's identity to skip its
-    // own occupant pairs (the same-SKU-consolidation rule).
-    if (candidateFitsSku(candidate, skuAttrs, qty, skuId)) {
-      const room = candidate.capacity - candidate.occupancy;
-      return {
-        binId: candidate.binId,
-        binCode: candidate.binCode,
-        // The rationale is operator-facing text: it speaks base units.
-        rationale: `Lowest occupancy (${fromMilli(candidate.occupancy)}/${fromMilli(candidate.capacity)}) — room for ${fromMilli(room)}`,
-      };
-    }
+  const preferred = pickPutawayCandidate(candidates, skuAttrs, qty, skuId, { preferOwn: true });
+  if (preferred === null) {
+    return null;
   }
-  return null;
+  const unpreferred = pickPutawayCandidate(candidates, skuAttrs, qty, skuId, { preferOwn: false });
+  // No rationale here: the placement (the only caller) never reads one, and
+  // the client labels would be an extra query inside the bin-row lock.
+  return {
+    binId: preferred.binId,
+    binCode: preferred.binCode,
+    unpreferred: unpreferred === null ? null : { binId: unpreferred.binId, binCode: unpreferred.binCode },
+  };
+}
+
+/**
+ * Story 1-5b — the ONE putaway ranking (the suggestion, the placement's
+ * re-derivation and the task derivation all call it). `candidates` arrives
+ * in the `binCandidatesInTx` SQL order (lowest occupancy, then code); every
+ * pass is stable over that order and runs each candidate through
+ * `candidateFitsSku` (which carries the client gate).
+ *
+ * - `preferOwn: true` — two passes: first the bins dedicated to the SKU's
+ *   client, then the shared bins (decision 2: dedicated racks fill before
+ *   shared space, and nothing is stranded when they are full).
+ * - `preferOwn: false` — one pass over every bin that accepts the SKU's
+ *   client (own or shared) — the pre-1.5b order, restricted by the gate.
+ */
+export function pickPutawayCandidate(
+  candidates: readonly PutawayBinCandidate[],
+  sku: SkuPhysicalAttributes,
+  qtyMilli: number,
+  skuId: string,
+  options: { readonly preferOwn: boolean },
+): PutawayBinCandidate | null {
+  if (!options.preferOwn) {
+    return candidates.find((candidate) => candidateFitsSku(candidate, sku, qtyMilli, skuId)) ?? null;
+  }
+  const own = candidates.find(
+    (candidate) =>
+      candidate.dedicatedClientId !== null &&
+      candidate.dedicatedClientId === sku.clientId &&
+      candidateFitsSku(candidate, sku, qtyMilli, skuId),
+  );
+  if (own !== undefined) {
+    return own;
+  }
+  return (
+    candidates.find(
+      (candidate) => candidate.dedicatedClientId === null && candidateFitsSku(candidate, sku, qtyMilli, skuId),
+    ) ?? null
+  );
+}
+
+/**
+ * Story 1-5b — the ONE operator-facing rationale for a picked candidate (the
+ * task derivation's; base units). A dedicated bin
+ * names its client: `Dedicated to GLOWCO — lowest occupancy (o/c) — room for
+ * r`; a shared bin keeps the pre-1.5b text. `clientLabels` maps a dedicated
+ * client id to its refusal label (`getClientLabelsInTx`); an unknown id falls
+ * back to "its client".
+ */
+export function putawayRationale(
+  candidate: PutawayBinCandidate,
+  clientLabels: ReadonlyMap<string, string>,
+): string {
+  const occupancy = `(${fromMilli(candidate.occupancy)}/${fromMilli(candidate.capacity)}) — room for ${fromMilli(candidate.capacity - candidate.occupancy)}`;
+  if (candidate.dedicatedClientId === null) {
+    return `Lowest occupancy ${occupancy}`;
+  }
+  const label = clientLabels.get(candidate.dedicatedClientId) ?? 'its client';
+  return `Dedicated to ${label} — lowest occupancy ${occupancy}`;
+}
+
+/** Story 1-5b — the refusal labels of the picked candidates' dedicated clients (one read). */
+export async function dedicatedClientLabelsInTx(
+  tx: TenantTx,
+  tenantId: string,
+  picked: readonly PutawayBinCandidate[],
+): Promise<Map<string, string>> {
+  const ids = picked
+    .map((candidate) => candidate.dedicatedClientId)
+    .filter((id): id is string => id !== null);
+  return getClientLabelsInTx(tx, tenantId, ids);
 }
 
 export interface PutawayBinCandidate {
@@ -1030,6 +1162,10 @@ export interface PutawayBinCandidate {
   // `candidateFitsSku` (a tank/silo is never auto-suggested; the WHERE arm in
   // `binCandidatesInTx` excludes the type first — this is the second layer).
   readonly type: string;
+  // ── story 1-5b: the bin's dedicated client (null = shared) — the client
+  // gate in `candidateFitsSku` and the own-client preference in
+  // `pickPutawayCandidate` read it.
+  readonly dedicatedClientId: string | null;
   // ── story 12-2: the bin's hazardous occupants as (skuId, hazardClass)
   // PAIRS — not a class list (a class-only aggregate cannot skip the moving
   // SKU's own pairs, and counts drained residue). Aggregated over `quantity >
@@ -1059,6 +1195,11 @@ export interface SkuPhysicalAttributes {
    * carries no rule in either direction of the segregation matrix.
    */
   readonly hazardClass: string | null;
+  /**
+   * Story 1-5b — the SKU's client (`skus.client_id`, NOT NULL): the client
+   * gate (`binClientAccepts`) and the own-client preference read it.
+   */
+  readonly clientId: string;
 }
 
 /**
@@ -1098,6 +1239,9 @@ export interface SkuPhysicalAttributes {
  * universal rule). The same arm exists in the placement command's own
  * locked-row guard and `mergeBin`'s target gate — the SYNC HAZARD rule.
  *
+ * Story 1-5b adds the CLIENT arm — right after the class gate: a bin
+ * dedicated to another client refuses the SKU (`binClientAccepts`).
+ *
  * Story 12-4 adds the BULK-ASSET arm — SECOND, before the hazard walk: a tank
  * or a silo is NEVER auto-suggested (Design Note 3 — its suitability depends
  * on measured fill, Epic 20), so the arm returns false unconditionally,
@@ -1119,6 +1263,12 @@ export function candidateFitsSku(
   movingSkuId: string,
 ): boolean {
   if (!storageClassSatisfies(sku.storageClass, candidate.storageClass)) {
+    return false;
+  }
+  // Story 1-5b — the client gate, beside the class gate (the placement
+  // command's own locked-row guard and `mergeBin` carry the same arm — the
+  // SYNC HAZARD rule): a bin dedicated to another client is never suggested.
+  if (!binClientAccepts(candidate.dedicatedClientId, sku.clientId)) {
     return false;
   }
   if (isBulkAssetType(candidate.type)) {
@@ -1192,6 +1342,10 @@ export async function binCandidatesInTx(
       // tank/silo is never auto-suggested; excluded in the WHERE below, this
       // is the arm's second layer).
       type: bins.type,
+      // Story 1-5b — the dedicated client rides the candidate (the client
+      // gate + the own-client preference); no WHERE arm, the list stays
+      // SKU-agnostic.
+      dedicatedClientId: bins.dedicatedClientId,
       // Story 12-2 — the bin's hazardous occupants as (skuId, hazardClass)
       // pairs, one aggregate through the join below (no second query, no
       // N+1). The FILTER carries `quantity > 0` (drained rows persist —
@@ -1241,6 +1395,7 @@ export async function binCandidatesInTx(
       bins.maxWeightGrams,
       bins.storageClass,
       bins.type,
+      bins.dedicatedClientId,
     )
     .orderBy(asc(sql`coalesce(sum(${stockOnHand.quantity}), 0)`), asc(bins.code));
   return rows.map((row) => ({
@@ -1253,6 +1408,7 @@ export async function binCandidatesInTx(
     maxWeightGrams: row.maxWeightGrams,
     storageClass: row.storageClass,
     type: row.type,
+    dedicatedClientId: row.dedicatedClientId,
     // The aggregate is `::text`d jsonb — parsed at the boundary, mapped to
     // the pair objects the fit predicate walks.
     occupants: (JSON.parse(row.occupants) as [string, string][]).map(

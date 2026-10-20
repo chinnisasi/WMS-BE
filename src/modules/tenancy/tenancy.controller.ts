@@ -422,8 +422,8 @@ export class TenancyController {
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.create (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or zone does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Bin code already exists in this warehouse (duplicate-bin-code names the code), or the code is RETURNS — reserved for the system returns bin (reserved-location-code, story 13-2)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or zone does not exist in this tenant, or the dedicated client does not exist (not-found, story 1-5b)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Bin code already exists in this warehouse (duplicate-bin-code names the code), the code is RETURNS — reserved for the system returns bin (reserved-location-code, story 13-2), or the dedicated client has departed (client-departed, story 1-5b)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'warehouseId', format: 'uuid' })
@@ -458,6 +458,8 @@ export class TenancyController {
         maxWeightGrams: dto.maxWeightGrams,
         // Story 12-1: the storage class (FR-40) — absent = 'ambient'.
         storageClass: dto.storageClass,
+        // Story 1-5b: the dedicated client — absent/null = shared.
+        dedicatedClientId: dto.dedicatedClientId,
         type: dto.type,
       },
       key,
@@ -481,8 +483,8 @@ export class TenancyController {
   @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, or a descending aisle range (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.create (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or zone does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('A generated code collides (duplicate-bin-code names the first conflicting code; nothing committed), or a generated code is RETURNS (reserved-location-code, story 13-2)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or zone does not exist in this tenant, or the dedicated client does not exist (not-found, story 1-5b)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A generated code collides (duplicate-bin-code names the first conflicting code; nothing committed), a generated code is RETURNS (reserved-location-code, story 13-2), or the dedicated client has departed (client-departed, story 1-5b)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Grid exceeds 500 bins (grid-too-large), or idempotency-key-reuse') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'warehouseId', format: 'uuid' })
@@ -516,6 +518,8 @@ export class TenancyController {
         maxWeightGrams: dto.maxWeightGrams,
         // Story 12-1: the storage class, per generated bin — absent = 'ambient'.
         storageClass: dto.storageClass,
+        // Story 1-5b: the dedicated client, per generated bin — absent/null = shared.
+        dedicatedClientId: dto.dedicatedClientId,
         type: dto.type,
       },
       key,
@@ -558,16 +562,16 @@ export class TenancyController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'Blocks or unblocks a bin (Story 3.6: never a system or retired bin), or edits its capacity attributes (Story 11-5: dimensions and max weight — tenancy owns the structure)',
+      'Blocks or unblocks a bin (Story 3.6: never a system or retired bin), or edits its structure (Story 11-5: dimensions and max weight; 12-1: storage class; 1-5b: dedicated client — tenancy owns the structure)',
   })
   @ApiBody({ type: PatchBinDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: BinResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, a system bin on the blocked arm (validation-failed names the bin — the capacity arm deliberately permits system bins), a body mixing blocked with capacity attributes, a body carrying neither (validation-failed), or a non-boolean blocked (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, a system bin on the blocked arm (validation-failed names the bin — the capacity arm deliberately permits system bins), a system bin given a dedicated client (validation-failed, story 1-5b), a body mixing blocked with capacity attributes or a dedicated client, a body carrying neither (validation-failed), or a non-boolean blocked (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.block (role-denied) or bin.create (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('Bin does not exist in this warehouse (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The bin is retired (bin-retired — retirement is terminal)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('Bin does not exist in this warehouse, or the dedicated client does not exist (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The bin is retired (bin-retired — retirement is terminal), a storage-class change would strand stock (storage-class-conflict), the dedicated client has departed (client-departed, story 1-5b), or the bin holds another client\'s stock or open QC holds (bin-client-conflict names up to 10 SKUs, story 1-5b)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'warehouseId', format: 'uuid' })
@@ -623,13 +627,16 @@ export class TenancyController {
       dto.widthMm !== undefined ||
       dto.heightMm !== undefined ||
       dto.maxWeightGrams !== undefined ||
-      dto.storageClass !== undefined;
+      dto.storageClass !== undefined ||
+      // Story 1-5b: the dedicated client rides the structure arm too — and
+      // `null` (a clear) counts as present, unlike `storageClass: null`.
+      dto.dedicatedClientId !== undefined;
     if (hasBlocked && hasCapacity) {
       throw new ProblemException(
         'validation-failed',
         400,
         'blocked and capacity attributes cannot change together',
-        'A blocked change and a structure-attribute change (the capacity fields or the storage class) are two different operations on this bin — send them as separate PATCH requests (one idempotency key per request).',
+        'A blocked change and a structure-attribute change (the capacity fields, the storage class or the dedicated client) are two different operations on this bin — send them as separate PATCH requests (one idempotency key per request).',
       );
     }
     if (hasCapacity) {
@@ -644,6 +651,7 @@ export class TenancyController {
           heightMm: dto.heightMm,
           maxWeightGrams: dto.maxWeightGrams,
           storageClass: dto.storageClass,
+          dedicatedClientId: dto.dedicatedClientId,
         },
         key,
       );
@@ -654,7 +662,7 @@ export class TenancyController {
         'validation-failed',
         400,
         'Nothing to change',
-        'Send `blocked` (the bin\'s operational state) or a structure attribute (lengthMm, widthMm, heightMm, maxWeightGrams, storageClass) — the body carries neither.',
+        'Send `blocked` (the bin\'s operational state) or a structure attribute (lengthMm, widthMm, heightMm, maxWeightGrams, storageClass, dedicatedClientId) — the body carries neither.',
       );
     }
     // Story 3.6: delegated to the re-homed command — the putaway module owns
@@ -678,7 +686,7 @@ export class TenancyController {
   @ApiBody({ type: MergeBinDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiOkResponse({ type: BinMergeResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a structural guard (validation-failed / bin-retired / bin-blocked — a blocked SOURCE is allowed, the only way to empty a blocked bin; only the target must be live), a target overflow (bin-full names capacity and occupancy), the target over its physical limits (bin-overweight / bin-volume-exceeded / bin-item-oversize, story 11-5), a source SKU the target bin\'s class cannot satisfy (bin-storage-mismatch naming both classes — story 12-1), or an incompatible co-located pair (bin-segregation-conflict naming both SKUs and both classes — story 12-2; nothing committed in any arm)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a structural guard (validation-failed / bin-retired / bin-blocked — a blocked SOURCE is allowed, the only way to empty a blocked bin; only the target must be live), a target overflow (bin-full names capacity and occupancy), the target over its physical limits (bin-overweight / bin-volume-exceeded / bin-item-oversize, story 11-5), a source SKU the target bin\'s class cannot satisfy (bin-storage-mismatch naming both classes — story 12-1), an incompatible co-located pair (bin-segregation-conflict naming both SKUs and both classes — story 12-2), or a source SKU of another client than the target\'s dedicated client (bin-client-mismatch naming the bin, its client and the SKU — story 1-5b; nothing committed in any arm)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks bin.retire (role-denied — Owner and Ops Manager only)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Source or target bin does not exist in this warehouse (not-found)') })
@@ -783,6 +791,7 @@ function normalizeBin(bin: {
   heightMm?: number | null;
   maxWeightGrams?: number | null;
   storageClass?: string;
+  dedicatedClientId?: string | null;
 }): BinResponse {
   return {
     ...bin,
@@ -800,6 +809,9 @@ function normalizeBin(bin: {
     // reads 'ambient' (the migration's DEFAULT, which is what every
     // pre-12.1 row is; NOT NULL, so never null).
     storageClass: bin.storageClass ?? 'ambient',
+    // Story 1-5b: stored pre-1.5b snapshots lack the dedicated client — an
+    // absent field reads null (shared — what every pre-1.5b bin was).
+    dedicatedClientId: bin.dedicatedClientId ?? null,
   } as BinResponse;
 }
 

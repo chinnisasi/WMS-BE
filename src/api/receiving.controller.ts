@@ -227,6 +227,9 @@ export class ReceivingController {
       ...snapshot.openPurchaseOrders.map((po) => po.clientId),
       ...snapshot.openAsns.map((asn) => asn.clientId),
       ...openReturns.map((rma) => rma.clientId),
+      // Story 1-5b: every bin's dedicated client, so the device can name the
+      // client a dedicated bin belongs to when it refuses a scan against it.
+      ...snapshot.bins.map((bin) => bin.dedicatedClientId).filter((id): id is string => id !== null),
     ]);
     return {
       ...snapshot,

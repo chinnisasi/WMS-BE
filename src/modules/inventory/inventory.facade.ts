@@ -3,7 +3,7 @@ import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import { batchOnHand, bins, ledgerEvents, skus, stockOnHand } from '../../shared/db/schema';
-import { skuCodeLabelsInTx } from '../clients/clients.facade';
+import { getClientLabelsInTx, skuCodeLabelsInTx } from '../clients/clients.facade';
 import type { LedgerEvent, UserRole } from '../../shared/db/schema';
 import { skuOfClient } from '../../shared/db/client-filter';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
@@ -26,6 +26,8 @@ import {
   isBulkAssetType,
 } from '../../shared/primitives/location-type';
 import { storageClassSatisfies } from '../../shared/primitives/storage-class';
+// Story 1-5b — the ONE dedicated-client predicate + the refusal factory.
+import { binClientAccepts, binClientMismatch } from '../../shared/primitives/client-bin';
 import { fullPrecisionInstant } from '../../shared/primitives/time';
 import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
 import { portalStockInTx, type PortalStockRow } from './portal-stock';
@@ -2236,7 +2238,8 @@ export class InventoryFacade {
    * module reuses, not re-implements, the 12-1/12-2/12-3/12-4 + 11-5 gates:
    *
    *   bin-row `.for('update')` (the capacity mutex) → system-owned → retired
-   *   → blocked → storage class (12-1) → secure authority (12-3) → bulk-asset
+   *   → blocked → storage class (12-1) → dedicated client (1-5b) → secure
+   *   authority (12-3) → bulk-asset
    *   occupancy (12-4) → hazard co-location (12-2) → the load gates —
    *   capacity → weight → volume → per-axis dim fit (11-5).
    *
@@ -2287,6 +2290,8 @@ export class InventoryFacade {
         storageClass: bins.storageClass,
         // Story 12-4 — the location type: the bulk-asset occupancy arm's key.
         type: bins.type,
+        // Story 1-5b — the dedicated client the client gate rules on.
+        dedicatedClientId: bins.dedicatedClientId,
       })
       .from(bins)
       .where(
@@ -2385,6 +2390,25 @@ export class InventoryFacade {
           `Bin "${bin.code}" is ${bin.storageClass}; SKU "${sku.code}" requires ${sku.storageClass} storage — a non-conforming intake is refused by rule (FR-40).`,
         );
       }
+    }
+    // The dedicated-client gate (story 1-5b), beside the class gate: every
+    // landing SKU must be accepted by the bin (`binClientAccepts` — shared
+    // accepts all; a dedicated bin only its own client's). 409
+    // `bin-client-mismatch` (this gate runner's status — decision 5), naming
+    // the bin, its client and the first offending SKU. Transfers are gated
+    // HERE, at receive, never at create (decision 12): the receive-time
+    // landing-bin override or a handheld re-plan recovers a refused one.
+    const foreign = skuIds.map((id) => skuById.get(id)!).find((sku) => !binClientAccepts(bin.dedicatedClientId, sku.clientId));
+    if (foreign !== undefined) {
+      const labels = await getClientLabelsInTx(tx, args.tenantId, [bin.dedicatedClientId!, foreign.clientId]);
+      const [skuLabel] = await skuCodeLabelsInTx(tx, args.tenantId, [{ code: foreign.code, clientId: foreign.clientId }]);
+      throw binClientMismatch(
+        409,
+        bin.code,
+        labels.get(bin.dedicatedClientId!) ?? 'another client',
+        skuLabel ?? foreign.code,
+        labels.get(foreign.clientId) ?? 'another client',
+      );
     }
     assertSecureBinAuthority(args.role, [bin]);
     // The bulk-asset occupancy gate (12-4): a tank/silo holds exactly ONE

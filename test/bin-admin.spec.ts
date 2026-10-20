@@ -876,6 +876,8 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       systemOwned: false,
       retiredAt: null,
       retiredBy: null,
+      // Story 1-5b: a pre-1.5b snapshot replays shared (`normalizeBin`).
+      dedicatedClientId: null,
     });
   });
 
@@ -1032,6 +1034,11 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     // One outbox event + one audit row per mutation (three above), none per replay.
     const events = await outboxRows('bin.capacity_changed');
     expect(events.filter((row) => row.payload.binId === binA30)).toHaveLength(3);
+    // Story 1-5b: the event carries the (here unchanged, shared) dedicated
+    // client beside the structure attributes — present and null, never absent.
+    for (const row of events.filter((entry) => entry.payload.binId === binA30)) {
+      expect(row.payload).toHaveProperty('dedicatedClientId', null);
+    }
     const audits = await auditRows('bin.capacity_changed');
     expect(audits.filter((row) => row.target_id === binA30)).toHaveLength(3);
   });
@@ -1615,7 +1622,8 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
       .set(KEY_HEADER, key)
       .send({ code: 'A-92-04', capacity: 100, type: 'shelf' })
       .expect(201);
-    expect(replay.body).toMatchObject({ code: 'A-92-04', storageClass: 'ambient' });
+    // Story 1-5b: the pre-1.5b snapshot also lacks the dedicated client.
+    expect(replay.body).toMatchObject({ code: 'A-92-04', storageClass: 'ambient', dedicatedClientId: null });
   });
 
   // ── Story 12-2 — the merge hazard gate (FR-41) ─────────────────────────────
