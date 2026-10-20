@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsIn, IsOptional, IsString, IsUUID, MaxLength, ValidateIf } from 'class-validator';
+import { IsBoolean, IsIn, IsOptional, IsString, IsUUID, MaxLength, ValidateIf } from 'class-validator';
 import {
   LICENCE_EXPIRY_STATES,
   LICENCE_KINDS,
@@ -180,4 +180,31 @@ export class CoverageGapDto {
 export class CoverageGapsResponse {
   @ApiProperty({ format: 'date', description: 'The IST date the gaps were judged for' }) asOfDate!: string;
   @ApiProperty({ type: [CoverageGapDto], description: 'Empty when every drug and food good is covered' }) gaps!: CoverageGapDto[];
+}
+
+/** Story 1-6d — the enforcement switch's PUT. */
+export class SetLicencePolicyDto {
+  @ApiProperty({ description: 'On: an uncovered drug or food receipt line goes to review (grn.licence-refused) and such an order is refused (409 licence-not-covered). Off by default' })
+  @IsBoolean()
+  enforce!: boolean;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Turning enforcement ON while known coverage gaps exist needs this to be true (else 409 licence-gaps-unacknowledged with gapCount). A precondition only — not part of the idempotency fingerprint. Ignored when turning off',
+  })
+  @IsOptional()
+  @IsBoolean()
+  acknowledgeGaps?: boolean;
+}
+
+/** Story 1-6d — the switch as the GET and the PUT answer it. */
+export class LicencePolicyResponse {
+  @ApiProperty({ description: 'Whether licence enforcement is on (a tenant that never set it is off)' }) enforce!: boolean;
+  @ApiProperty({
+    minimum: 0,
+    description:
+      'Known coverage gaps today (IST) — the length of GET …/licences/coverage. A lower bound: a blind receipt, or an order of goods with no stock or open document anywhere, can be refused without having been a gap',
+  })
+  gapCount!: number;
 }

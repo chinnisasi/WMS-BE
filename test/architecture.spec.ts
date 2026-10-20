@@ -991,6 +991,29 @@ describe('architecture: clients are clients-module-owned (story 21-1)', () => {
     }
   });
 
+  it('story 1-6d: compliance/licence-enforcement.ts imports only drizzle-orm and shared/ — receiving and orders import it, never the compliance module', () => {
+    const path = join(SRC_ROOT, 'modules', 'compliance', 'licence-enforcement.ts');
+    const source = readFileSync(path, 'utf8');
+    expect(source).toMatch(/export async function licenceCoverageInTx\(/);
+    expect(source).toMatch(/export async function licenceEnforcedInTx\(/);
+    const offenders: string[] = [];
+    for (const match of source.matchAll(/from '([^']+)'/g)) {
+      const target = match[1]!;
+      if (target !== 'drizzle-orm' && !target.startsWith('../../shared/')) offenders.push(`imports ${target}`);
+    }
+    expect(offenders).toEqual([]);
+    // Meaningful: both enforcement callers import the free functions — and
+    // neither imports the compliance Nest module (it would cycle).
+    for (const [module, file] of [
+      ['inbound', 'receiving.command.ts'],
+      ['outbound', 'order.command.ts'],
+    ] as const) {
+      const caller = readFileSync(join(SRC_ROOT, 'modules', module, file), 'utf8');
+      expect(caller).toContain(`from '../compliance/licence-enforcement'`);
+      expect(caller).not.toContain(`from '../compliance/compliance.module'`);
+    }
+  });
+
   /**
    * Story 1-2a — "no new work": every path that creates work for a client
    * runs the one gate, `assertClientTakesWorkInTx`. A path that dropped it

@@ -67,6 +67,9 @@ export interface LockedSkuStatus {
   readonly code: string;
   readonly status: SkuStatus;
   readonly isKit: boolean;
+  /** Story 1-6d — the goods attributes the licence re-check reads (1-6a's columns), under the same lock. */
+  readonly foodCategory: string | null;
+  readonly drugSchedules: readonly string[];
 }
 
 /**
@@ -74,7 +77,8 @@ export interface LockedSkuStatus {
  * id order, with their status and whether each is a kit NOW. Kit create locks
  * the kit SKU `FOR UPDATE`, so a composition committed after phase 1 is seen
  * here (the PENDING kit race), and a deactivation committed after phase 1 is
- * seen too. An unknown id is absent.
+ * seen too. An unknown id is absent. Story 1-6d: the goods attributes ride
+ * the same read, so the order's licence re-check sees an edit since phase 1.
  */
 export async function lockSkuStatusesInTx(
   tx: TenantTx,
@@ -84,7 +88,7 @@ export async function lockSkuStatusesInTx(
   const ids = [...new Set(skuIds)].sort();
   if (ids.length === 0) return new Map();
   const rows = await tx
-    .select({ id: skus.id, code: skus.code, status: skus.status })
+    .select({ id: skus.id, code: skus.code, status: skus.status, foodCategory: skus.foodCategory, drugSchedules: skus.drugSchedules })
     .from(skus)
     .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, ids)))
     .orderBy(asc(skus.id))
@@ -95,7 +99,16 @@ export async function lockSkuStatusesInTx(
     .where(and(eq(kitCompositions.tenantId, tenantId), inArray(kitCompositions.kitSkuId, ids)));
   const kits = new Set(kitRows.map((row) => row.kitSkuId));
   return new Map(
-    rows.map((row) => [row.id, { code: row.code, status: row.status as SkuStatus, isKit: kits.has(row.id) }]),
+    rows.map((row) => [
+      row.id,
+      {
+        code: row.code,
+        status: row.status as SkuStatus,
+        isKit: kits.has(row.id),
+        foodCategory: row.foodCategory,
+        drugSchedules: row.drugSchedules,
+      },
+    ]),
   );
 }
 

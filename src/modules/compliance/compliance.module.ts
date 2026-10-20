@@ -8,6 +8,7 @@ import { ExcursionFacade } from './excursion.facade';
 import { ColdChainFacade } from './cold-chain.facade';
 import { LicenceCommand } from './licence.command';
 import { LicenceFacade } from './licence.facade';
+import { LicencePolicyCommand } from './licence-policy.command';
 
 /**
  * Compliance module — temperature excursions (Story 12-5, FR-44): the
@@ -39,10 +40,15 @@ import { LicenceFacade } from './licence.facade';
  * `LicenceExpiryWorker`). It owns `licences` and READS the clients,
  * warehouses, SKU, stock and inbound-document tables directly — no new module
  * import (tenancy imports this module, so catalog or tenancy would cycle).
+ *
+ * Story 1-6d adds enforcement: the switch (`LicencePolicyCommand`, owning
+ * `licence_policies`, through `LicenceFacade`) and the free functions in
+ * `licence-enforcement.ts` that receiving and orders import directly (never
+ * this module — it would cycle).
  */
 @Module({
   imports: [SharedModule, InventoryModule, forwardRef(() => InboundModule), forwardRef(() => OutboundModule)],
-  providers: [ExcursionCommand, ExcursionFacade, ColdChainFacade, LicenceCommand, LicenceFacade],
+  providers: [ExcursionCommand, ExcursionFacade, ColdChainFacade, LicenceCommand, LicencePolicyCommand, LicenceFacade],
   exports: [ExcursionFacade, ColdChainFacade, LicenceFacade],
 })
 export class ComplianceModule {}

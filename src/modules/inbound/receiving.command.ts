@@ -22,11 +22,16 @@ import {
   DEFAULT_RECEIVING_POLICY,
   departedClientsInTx,
   getClientLabelsInTx,
+  getClientsInTx,
   receivingPoliciesInTx,
   shareLockClientInTx,
   type ClientReceivingPolicy,
 } from '../clients/clients.facade';
 import { QC_RECEIPT_PLACED_EVENT, QcCommand } from './qc.command';
+// Story 1-6d — licence enforcement: compliance's FREE functions (never its
+// Nest module — compliance forward-references inbound, so it would cycle).
+import { licenceCoverageInTx, licenceEnforcedInTx, type LicenceParty } from '../compliance/licence-enforcement';
+import { missingLicencePhrase, needsOf, type LicenceHolder, type LicenceNeed } from '../../shared/primitives/licence';
 import {
   MAX_QUANTITY_MILLI,
   QUANTITY_SCALE,
@@ -47,7 +52,7 @@ import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertDeviceOperatorInTx } from '../tenancy/device-operator';
 import { ensureReceivingBinInTx } from '../tenancy/receiving-bin';
-import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
+import { assertWarehouseInTenant, getMemberRoleIn, getWarehouseCodeInTx } from '../tenancy/tenancy.service';
 import { assertPermission } from '../tenancy/permissions';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
@@ -150,6 +155,13 @@ export interface SubmitGoodsReceiptCommand {
    * DTO — and hashed when present.
    */
   readonly shelfLifeWaiver?: { readonly byUserId: string; readonly note: string } | undefined;
+  /**
+   * Story 1-6d (decision 9) — an owner accepted a `grn.licence-refused` row:
+   * the licence check is SKIPPED for this re-run only (every other rule
+   * applies). Set ONLY by the review queue's apply arm — never on the HTTP
+   * DTO — and hashed (as the fact, `licenceWaived: true`) when present.
+   */
+  readonly licenceWaiver?: { readonly byUserId: string; readonly note: string } | undefined;
 }
 
 export interface DecideOverReceiptCommand {
@@ -216,6 +228,10 @@ export const REJECTED_GRN_LINE_CODES = [
   'batch-expiry-mismatch',
   'expiry-required',
   'shelf-life-short',
+  // Story 1-6d — enforcement on, and no valid client and site licence
+  // covers the line's drug or food goods on the receipt's IST date. Its own
+  // review row (`grn.licence-refused` — an owner may Apply with a note).
+  'licence-not-covered',
 ] as const;
 export type RejectedGrnLineCode = (typeof REJECTED_GRN_LINE_CODES)[number];
 
@@ -233,7 +249,8 @@ type LineRefusalCode =
   | 'expiry-before-mfg'
   | 'batch-expiry-mismatch'
   | 'expiry-required'
-  | 'shelf-life-short';
+  | 'shelf-life-short'
+  | 'licence-not-covered';
 interface ClientRefusedLine {
   readonly index: number;
   readonly line: GrnLineInput;
@@ -248,6 +265,16 @@ interface ClientRefusedLine {
   readonly minShelfLifeDays?: number;
   /** Story 1-2b — `shelf-life-short` only: IST days from the receipt's date to the expiry. */
   readonly remainingDays?: number;
+  /** Story 1-6d — `licence-not-covered` only: each need no valid licence covers, and which holder lacks it. */
+  readonly missing?: readonly MissingLicence[];
+  /** Story 1-6d — `licence-not-covered` only: the receipt's site code (the refusal names it). */
+  readonly siteCode?: string;
+}
+
+/** Story 1-6d — one need of a refused line that no valid licence covers, and the holder lacking it. */
+export interface MissingLicence {
+  readonly need: LicenceNeed;
+  readonly holder: LicenceHolder;
 }
 
 /**
@@ -292,6 +319,12 @@ export interface RejectedGrnLine {
   readonly batchCode?: string | null;
   readonly expiryDate?: string | null;
   readonly minShelfLifeDays?: number;
+  /**
+   * Story 1-6d — present only on a `licence-not-covered` refusal (which also
+   * carries `index`): each need no valid licence covers on the receipt's IST
+   * date, and which holder — the client brand or the site — lacks it.
+   */
+  readonly missing?: readonly MissingLicence[];
 }
 
 /**
@@ -354,6 +387,12 @@ export interface GoodsReceiptSnapshot {
      */
     readonly shelfLifeReviewOpId?: string;
     /**
+     * Story 1-6d — the `grn.licence-refused` review row raised for the
+     * `licence-not-covered` lines (its op id, derived from the key with its
+     * own salt); present only when one was raised.
+     */
+    readonly licenceReviewOpId?: string;
+    /**
      * Story 1-4b — the `grn.inactive-sku-received` review row raised for the
      * blind or unmatched lines of an inactive SKU this receipt BOOKED (its op
      * id, derived from the key with its own salt); present only when one was
@@ -391,6 +430,8 @@ export interface RefusedReceiptSnapshot {
     readonly reviewOpId?: string;
     /** Story 1-2b — the `grn.shelf-life-refused` row's op id, when one was raised. */
     readonly shelfLifeReviewOpId?: string;
+    /** Story 1-6d — the `grn.licence-refused` row's op id, when one was raised. */
+    readonly licenceReviewOpId?: string;
   };
 }
 
@@ -562,6 +603,12 @@ export class ReceivingCommand {
       // another reviewer (or with an edited note) after the re-run committed
       // replays rather than answering 422 forever.
       shelfLifeWaived: command.shelfLifeWaiver === undefined || command.shelfLifeWaiver === null ? undefined : true,
+      // ── story 1-6d: ADDITIVE, the same `?? undefined` rule ─────────────
+      // Set only by the `grn.licence-refused` apply arm: every device op and
+      // every shelf-life Apply hashes exactly as before; only the FACT of
+      // the waiver is hashed, so a retried Apply by another owner (or with
+      // another note) after the re-run committed replays.
+      licenceWaived: command.licenceWaiver === undefined || command.licenceWaiver === null ? undefined : true,
       occurredAt: command.occurredAt,
       lines: command.lines.map((line) => ({
         poLineId: line.poLineId,
@@ -842,13 +889,84 @@ export class ReceivingCommand {
       // Behind the replay lookup and with each line's unit in hand. Below
       // this point every quantity is milli-units; `command.lines` is not read
       // for a quantity again.
-      const lines: readonly GrnLineInput[] = receivableInput.map((line) => {
+      const convertedLines: readonly GrnLineInput[] = receivableInput.map((line) => {
         const uom = skuById.get(line.skuId)!.uom;
         return {
           ...line,
           qty: assertRecordableQuantity(line.qty, 'qty', uom, uomPrecision(uom)),
         };
       });
+
+      // ── story 1-6d: the licence phase (decisions 3, 9) ──────────────────
+      // AFTER every whole-op shape check (kit, catch weight, precision), so
+      // a malformed line still fails the whole op as today and a licence-
+      // refused line has passed every shape check — its Apply cannot fail on
+      // shape. BEFORE the batch ensure: a refused line creates no batch. It
+      // judges only the lines still receivable (every client- or expiry-
+      // refused line is skipped — one line is never in two rows), each by its
+      // SKU's client and this receipt's site, on the receipt's IST date (the
+      // 1-2b precedent: a receipt is judged when it happened). Skipped when
+      // enforcement is off (the response is byte-identical to before) and on
+      // a re-run under an owner's licence waiver.
+      const licenceRefusedIndexes = new Set<number>();
+      if (
+        (command.licenceWaiver === undefined || command.licenceWaiver === null) &&
+        receivableIndexes.some((index) => needsOf(skuById.get(inputLines[index]!.skuId)!).length > 0) &&
+        (await licenceEnforcedInTx(tx, command.tenantId))
+      ) {
+        const goodsSkuIds = [...new Set(receivableIndexes.map((index) => inputLines[index]!.skuId))].filter(
+          (skuId) => needsOf(skuById.get(skuId)!).length > 0,
+        );
+        const clientFacts = await getClientsInTx(
+          tx,
+          command.tenantId,
+          goodsSkuIds.map((skuId) => skuById.get(skuId)!.clientId),
+        );
+        const parties: LicenceParty[] = goodsSkuIds.map((skuId) => {
+          const sku = skuById.get(skuId)!;
+          return {
+            clientId: sku.clientId,
+            systemOwned: clientFacts.get(sku.clientId)?.systemOwned === true,
+            skuCode: sku.code,
+            needs: needsOf(sku),
+          };
+        });
+        const uncovered = await licenceCoverageInTx(tx, {
+          tenantId: command.tenantId,
+          warehouseId: command.warehouseId,
+          date: istDateOf(occurredAt),
+          parties,
+        });
+        if (uncovered.length > 0) {
+          const missingBySku = new Map<string, MissingLicence[]>();
+          for (const item of uncovered) {
+            const key = `${item.clientId}|${item.skuCode}`;
+            missingBySku.set(key, [...(missingBySku.get(key) ?? []), { need: item.need, holder: item.holder }]);
+          }
+          const siteCode = await getWarehouseCodeInTx(tx, command.tenantId, command.warehouseId);
+          for (const index of receivableIndexes) {
+            const line = inputLines[index]!;
+            const sku = skuById.get(line.skuId)!;
+            const missing = missingBySku.get(`${sku.clientId}|${sku.code}`);
+            if (missing === undefined) continue;
+            licenceRefusedIndexes.add(index);
+            clientRefused.push({ index, line, code: 'licence-not-covered', missing, siteCode });
+          }
+          clientRefused.sort((a, b) => a.index - b.index);
+          clientLabels = await getClientLabelsInTx(tx, command.tenantId, [
+            ...(namedBlindClientId === null ? [] : [namedBlindClientId]),
+            ...clientRefused.map((entry) => skuById.get(entry.line.skuId)!.clientId),
+          ]);
+          refusalClientId ??= skuById.get(clientRefused[0]!.line.skuId)!.clientId;
+        }
+      }
+      // The request index of each line that settles from here on, aligned with `lines`.
+      const settlingIndexes =
+        licenceRefusedIndexes.size === 0 ? receivableIndexes : receivableIndexes.filter((index) => !licenceRefusedIndexes.has(index));
+      const lines: readonly GrnLineInput[] =
+        licenceRefusedIndexes.size === 0
+          ? convertedLines
+          : convertedLines.filter((_, receivableIndex) => !licenceRefusedIndexes.has(receivableIndexes[receivableIndex]!));
 
       // ── story 1-1 (decision 6): EVERY line client-refused → no receipt ──
       // No GRN code is consumed, no `goods_receipt_notes` row, no
@@ -887,6 +1005,8 @@ export class ReceivingCommand {
             // receipt refused only for client reasons is byte-identical).
             ...(review.reviewOpId === null ? {} : { reviewOpId: review.reviewOpId }),
             ...(review.shelfLifeReviewOpId === null ? {} : { shelfLifeReviewOpId: review.shelfLifeReviewOpId }),
+            // Story 1-6d — present only when the licence row was raised.
+            ...(review.licenceReviewOpId === null ? {} : { licenceReviewOpId: review.licenceReviewOpId }),
           },
         };
         // The audit row targets the review row: nothing else was written.
@@ -1066,7 +1186,7 @@ export class ReceivingCommand {
         }
         const resolved = batchIdentity.get(key)?.expiryDate ?? null;
         if (resolved === null || istDateOf(canonicalInstant(resolved)) !== expected) {
-          const index = receivableIndexes[receivableIndex]!;
+          const index = settlingIndexes[receivableIndex]!;
           racedLineIndexes.add(index);
           clientRefused.push({ index, line: inputLines[index]!, code: 'batch-expiry-mismatch', expiryDate: input.expiryDate ?? expected });
         }
@@ -1080,7 +1200,7 @@ export class ReceivingCommand {
         refusalClientId ??= skuById.get(clientRefused[0]!.line.skuId)!.clientId;
         // Story 1-2b — the race refused every remaining line: the same
         // all-refused arm, never an empty GRN header.
-        if (lines.every((_, receivableIndex) => racedLineIndexes.has(receivableIndexes[receivableIndex]!))) {
+        if (lines.every((_, receivableIndex) => racedLineIndexes.has(settlingIndexes[receivableIndex]!))) {
           return settleAllRefused(refusalClientId);
         }
       }
@@ -1153,7 +1273,7 @@ export class ReceivingCommand {
        */
       const ceilingRemaining = new Map<string, number>();
       for (const [receivableIndex, input] of lines.entries()) {
-        const index = receivableIndexes[receivableIndex]!;
+        const index = settlingIndexes[receivableIndex]!;
         if (racedLineIndexes.has(index)) {
           continue; // story 1-2b — refused per line after the ensure (above)
         }
@@ -1551,6 +1671,7 @@ export class ReceivingCommand {
       // replay re-serves it and inserts nothing. Discard only.
       let reviewOpId: string | null = null;
       let shelfLifeReviewOpId: string | null = null;
+      let licenceReviewOpId: string | null = null;
       if (clientRefused.length > 0 && refusalClientId !== null) {
         const review = await this.raiseRefusalReviewsInTx(tx, command, idempotencyKey, {
           grnId,
@@ -1564,6 +1685,7 @@ export class ReceivingCommand {
         });
         reviewOpId = review.reviewOpId;
         shelfLifeReviewOpId = review.shelfLifeReviewOpId;
+        licenceReviewOpId = review.licenceReviewOpId;
       }
 
       // ── story 1-4b (decision 2): ONE flag row for inactive-SKU lines ────
@@ -1663,6 +1785,7 @@ export class ReceivingCommand {
           ...(unmatched.length === 0 ? {} : { unmatchedLines: unmatched }),
           ...(reviewOpId === null ? {} : { reviewOpId }),
           ...(shelfLifeReviewOpId === null ? {} : { shelfLifeReviewOpId }),
+          ...(licenceReviewOpId === null ? {} : { licenceReviewOpId }),
           ...(inactiveSkuReviewOpId === null ? {} : { inactiveSkuReviewOpId }),
           ...(qcHeld.length === 0 ? {} : { qcHeldLines: qcHeld.length }),
           ...(qcSkippedLines === 0 ? {} : { qcSkippedLines }),
@@ -1754,6 +1877,21 @@ export class ReceivingCommand {
           tenantId: command.tenantId,
           actorUserId: command.shelfLifeWaiver.byUserId,
           action: 'goods_receipt.shelf_life_waived',
+          targetType: 'goods_receipt',
+          targetId: grnId,
+          reference: idempotencyKey,
+          occurredAt: nowIso(),
+        });
+      }
+      // Story 1-6d (decision 3) — a licence refusal accepted from review by
+      // an owner: the re-run records who waived the check, against the
+      // receipt it booked. The note rides the review row's resolved outcome.
+      if (command.licenceWaiver !== undefined && command.licenceWaiver !== null) {
+        await tx.insert(auditEvents).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.licenceWaiver.byUserId,
+          action: 'goods_receipt.licence_waived',
           targetType: 'goods_receipt',
           targetId: grnId,
           reference: idempotencyKey,
@@ -2487,6 +2625,20 @@ export class ReceivingCommand {
       const { line, code } = entry;
       const sku = skuById.get(line.skuId)!;
       const skuClient = clientLabels.get(sku.clientId) ?? sku.clientId;
+      if (code === 'licence-not-covered') {
+        // Story 1-6d — the full entry: the line's identity plus what is missing.
+        const missing = entry.missing ?? [];
+        return {
+          poLineId: line.poLineId,
+          ...(line.asnLineId === null || line.asnLineId === undefined ? {} : { asnLineId: line.asnLineId }),
+          skuId: line.skuId,
+          qty: line.qty,
+          code,
+          reason: licenceRefusalReason(sku.code, missing, entry.siteCode ?? ''),
+          index: entry.index,
+          missing: missing.map((item) => ({ need: item.need, holder: item.holder })),
+        };
+      }
       if (EXPIRY_REFUSAL_CODES.has(code)) {
         return {
           poLineId: line.poLineId,
@@ -2544,11 +2696,22 @@ export class ReceivingCommand {
       readonly clientRefused: readonly ClientRefusedLine[];
       readonly skuById: Map<string, typeof skus.$inferSelect>;
     },
-  ): Promise<{ reviewOpId: string | null; shelfLifeReviewOpId: string | null; rejectedOpId: string }> {
-    const linesRefused = args.clientRefused.filter((entry) => entry.code !== 'shelf-life-short');
+  ): Promise<{
+    reviewOpId: string | null;
+    shelfLifeReviewOpId: string | null;
+    licenceReviewOpId: string | null;
+    rejectedOpId: string;
+  }> {
+    // Story 1-6d — three ways: short-dated → the shelf-life row; uncovered
+    // by a licence → the licence row; every other refusal → lines-refused.
+    const linesRefused = args.clientRefused.filter(
+      (entry) => entry.code !== 'shelf-life-short' && entry.code !== 'licence-not-covered',
+    );
     const shelfLifeRefused = args.clientRefused.filter((entry) => entry.code === 'shelf-life-short');
+    const licenceRefused = args.clientRefused.filter((entry) => entry.code === 'licence-not-covered');
     let reviewOpId: string | null = null;
     let shelfLifeReviewOpId: string | null = null;
+    let licenceReviewOpId: string | null = null;
     let firstRejectedOpId: string | null = null;
     const clientLabel = args.clientLabels.get(args.clientId) ?? args.clientId;
     const refusalEntry = (entry: ClientRefusedLine): Record<string, unknown> => {
@@ -2569,6 +2732,10 @@ export class ReceivingCommand {
               ...(entry.minShelfLifeDays === undefined ? {} : { minShelfLifeDays: entry.minShelfLifeDays }),
               ...(entry.remainingDays === undefined ? {} : { remainingDays: entry.remainingDays }),
             }
+          : {}),
+        // Story 1-6d — what no valid licence covers (the web and the handheld word it).
+        ...(entry.code === 'licence-not-covered'
+          ? { missing: (entry.missing ?? []).map((item) => ({ need: item.need, holder: item.holder })) }
           : {}),
       };
     };
@@ -2662,7 +2829,72 @@ export class ReceivingCommand {
       }
       firstRejectedOpId ??= rejectedOpId;
     }
-    return { reviewOpId, shelfLifeReviewOpId, rejectedOpId: firstRejectedOpId! };
+
+    if (licenceRefused.length > 0) {
+      licenceReviewOpId = licenceRefusedOpId(idempotencyKey);
+      // D16 — the row's client is the first refused line's own (each line's
+      // `refusals[]` entry carries its `skuClientId`).
+      const licenceClientId = args.skuById.get(licenceRefused[0]!.line.skuId)!.clientId;
+      const licenceClientLabel = args.clientLabels.get(licenceClientId) ?? licenceClientId;
+      const shelfLifeWaiver =
+        command.shelfLifeWaiver === undefined || command.shelfLifeWaiver === null ? null : command.shelfLifeWaiver;
+      const rejectedOpId = await recordServerRejectedOpInTx(tx, this.outbox, {
+        tenantId: command.tenantId,
+        deviceId: command.deviceId,
+        operatorUserId: command.operatorUserId,
+        opId: licenceReviewOpId,
+        opType: 'grn.licence-refused',
+        problemCode: 'licence-not-covered',
+        problemDetail:
+          (args.grnCode === null
+            ? `No goods receipt was recorded — ${licenceRefused.length} line(s) were refused`
+            : `${licenceRefused.length} line(s) of goods receipt "${args.grnCode}" were not booked`) +
+          ` — no valid licence covers their drug or food goods on ${istDateOf(args.occurredAt)}: ` +
+          licenceRefused
+            .map((entry) => licenceRefusalReason(args.skuById.get(entry.line.skuId)!.code, entry.missing ?? [], entry.siteCode ?? ''))
+            .join('; ') +
+          '. An owner may accept them anyway with a note (they book as on any receipt), or discard them.',
+        // The ORIGINAL receipt's header plus only these lines — exactly what
+        // Apply re-runs (under the licence waiver, with the row's own op id
+        // as key) — the 1-2b shape.
+        payload: {
+          warehouseId: command.warehouseId,
+          poId: command.poId,
+          ...(command.asnId === null || command.asnId === undefined ? {} : { asnId: command.asnId }),
+          blindReasonCode: args.blindReasonCode,
+          ...(command.clientId === null || command.clientId === undefined ? {} : { clientId: command.clientId }),
+          occurredAt: args.occurredAt,
+          grnId: args.grnId,
+          grnCode: args.grnCode,
+          // NOT `clientId`: that key is the blind receipt's NAMED client,
+          // which Apply carries through (above, only when the op named one).
+          clientLabel: licenceClientLabel,
+          lines: licenceRefused.map(({ line }) => ({
+            poLineId: line.poLineId,
+            ...(line.asnLineId === null || line.asnLineId === undefined ? {} : { asnLineId: line.asnLineId }),
+            skuId: line.skuId,
+            batchCode: line.batchCode,
+            mfgDate: line.mfgDate,
+            ...(line.expiryDate === null || line.expiryDate === undefined ? {} : { expiryDate: line.expiryDate }),
+            qty: line.qty,
+            ...(line.weightsGrams === null ? {} : { weightsGrams: [...line.weightsGrams] }),
+          })),
+          refusals: licenceRefused.map(refusalEntry),
+          // D1 — no loop: a row raised during a re-run under a shelf-life
+          // waiver keeps it, and its Apply passes it on — a short-dated,
+          // uncovered line books after one shelf-life Apply and one licence Apply.
+          ...(shelfLifeWaiver === null
+            ? {}
+            : { waivers: { shelfLife: { byUserId: shelfLifeWaiver.byUserId, note: shelfLifeWaiver.note } } }),
+        },
+        occurredAt: args.occurredAt,
+      });
+      if (rejectedOpId === null) {
+        throw new Error(`grn.licence-refused review row ${licenceReviewOpId} already existed for a new key`);
+      }
+      firstRejectedOpId ??= rejectedOpId;
+    }
+    return { reviewOpId, shelfLifeReviewOpId, licenceReviewOpId, rejectedOpId: firstRejectedOpId! };
   }
 
   /**
@@ -2723,6 +2955,29 @@ export function shelfLifeRefusedOpId(idempotencyKey: string): string {
   if (derived !== idempotencyKey) return derived;
   const last = derived.charAt(25);
   return derived.slice(0, 25) + (last === '0' ? '1' : '0');
+}
+
+/**
+ * Story 1-6d — the `grn.licence-refused` row's op id: derived from the key
+ * like `refusedGrnLinesOpId`, with its OWN salt — so it never shares an id
+ * with the other rows a receipt may raise.
+ */
+export function licenceRefusedOpId(idempotencyKey: string): string {
+  const digest = createHash('sha256').update(`${idempotencyKey}:grn-licence-refused`).digest();
+  let tail = '';
+  for (let i = 0; i < 16; i++) tail += ULID_ALPHABET.charAt(digest[i]! & 31);
+  const derived = idempotencyKey.slice(0, 10).toUpperCase() + tail;
+  if (derived !== idempotencyKey) return derived;
+  const last = derived.charAt(25);
+  return derived.slice(0, 25) + (last === '0' ? '1' : '0');
+}
+
+/**
+ * Story 1-6d — a licence refusal's reason: `SKU "RICE" needs an FSSAI
+ * licence (site "W1")`; several needs are joined with "; ".
+ */
+export function licenceRefusalReason(skuCode: string, missing: readonly MissingLicence[], siteCode: string): string {
+  return `SKU "${skuCode}" ${missing.map((item) => missingLicencePhrase(item.need, item.holder, siteCode)).join('; ')}`;
 }
 
 /**

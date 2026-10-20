@@ -11,7 +11,8 @@ import { windDownBlockerInTx, type WindDownBlocker } from '../../shared/primitiv
  * Bounded (it runs under the client row's FOR UPDATE): only the op types
  * whose stored payload carries SKU ids are read, through their own JSON paths
  * — `skuId` (putaway, pick), `lines[*].skuId` (GRN submit, count submit, the
- * server-raised `grn.lines-refused` and — 1-2b — `grn.shelf-life-refused`),
+ * server-raised `grn.lines-refused` and — 1-2b — `grn.shelf-life-refused`,
+ * 1-6d — `grn.licence-refused`),
  * `scanned[*].skuId` (pack) and
  * `entries[*].skuId` (return receive) — each id joined to `skus` by its
  * primary key (a value that is not a uuid matches nothing). No text scan of
@@ -25,6 +26,8 @@ export const SKU_NAMING_OP_TYPES = [
   'grn.shelf-life-refused',
   // Story 1-4b — the booked lines of an inactive SKU (`lines[*].skuId`).
   'grn.inactive-sku-received',
+  // Story 1-6d — the licence-refused lines of a receipt (`lines[*].skuId`).
+  'grn.licence-refused',
   'putaway.place',
   'pick.record',
   'pack.execute',

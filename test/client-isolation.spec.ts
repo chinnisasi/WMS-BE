@@ -1025,7 +1025,8 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // client clause, not added.
       // Story 1-6c: + licences_tenant_isolation (0084, client-bound on both
       // arms; a site licence — null client_id — is invisible to a portal stamp).
-      expect(policies).toHaveLength(118);
+      // Story 1-6d: + licence_policies_tenant_isolation (0085, the plain tenant policy).
+      expect(policies).toHaveLength(119);
       const licencePolicy = policies.find((row) => row.policyname === 'licences_tenant_isolation')!;
       expect(licencePolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(licencePolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
@@ -1047,6 +1048,7 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
         'ledger_chain_breaks_tenant_isolation',
         'ledger_anchor_worm_copies_tenant_isolation',
         'business_partners_tenant_isolation',
+        'licence_policies_tenant_isolation',
       ]) {
         expect(policies.find((row) => row.policyname === name)!.qual).toBe(
           "(tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::uuid)",

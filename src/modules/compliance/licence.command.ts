@@ -6,7 +6,7 @@ import { auditEvents, idempotencyKeys, licences, type LicenceRow } from '../../s
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { OUTBOX_SINK, type OutboxSink } from '../../shared/events/outbox.seam';
 import { uuidv7 } from '../../shared/primitives/ids';
-import { canonicalInstant, isIsoDate, istDateOf, nowIso } from '../../shared/primitives/time';
+import { canonicalInstant, isIsoDate, nowIso } from '../../shared/primitives/time';
 import {
   KINDS_REQUIRING_VALID_UNTIL,
   LICENCE_NOTE_MAX,
@@ -31,16 +31,13 @@ import { assertClientInTenantInTx, assertClientTakesWorkInTx } from '../clients/
 // ── the clock and the events ─────────────────────────────────────────────────
 
 /**
- * The licence clock (IMPLEMENTATION-GUIDE §7c): "today" for the edit's
- * warning comparison and every read's `asOfDate`. Tests ASSIGN `now` (jest's
- * `restoreMocks` would undo a spy) and restore it after.
+ * The licence clock (IMPLEMENTATION-GUIDE §7c) — story 1-6d moved it to
+ * `licence-enforcement.ts` (the order create captures its IST date from it
+ * too); re-exported here, the SAME object, so a test assigning
+ * `licenceClock.now` through either path moves both.
  */
-export const licenceClock = { now: (): number => Date.now() };
-
-/** The IST calendar date the licence clock reads. */
-export function licenceToday(): string {
-  return istDateOf(new Date(licenceClock.now()).toISOString());
-}
+export { licenceClock, licenceToday } from './licence-enforcement';
+import { licenceToday } from './licence-enforcement';
 
 /** Outbox: a warning opens an entry (`licence-expiry`); the clear resolves it. */
 export const LICENCE_EXPIRY_UPCOMING_EVENT = 'licence.expiry_upcoming';

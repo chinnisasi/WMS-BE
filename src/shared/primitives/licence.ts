@@ -228,3 +228,52 @@ export function daysLeftOf(validUntil: string | null, istToday: string): number 
   if (validUntil === null) return null;
   return Math.round((Date.parse(`${validUntil}T00:00:00Z`) - Date.parse(`${istToday}T00:00:00Z`)) / 86_400_000);
 }
+
+/**
+ * A licence row's validity and coverage facts (story 1-6c's private
+ * `licenceFacts`, moved here by 1-6d so the enforcement check and the
+ * coverage read share one mapping). Structural: a `licences` row, or any
+ * read of its six columns.
+ */
+export function licenceFacts(row: {
+  readonly clientId: string | null;
+  readonly warehouseId: string | null;
+  readonly kind: string;
+  readonly status: string;
+  readonly validFrom: string | null;
+  readonly validUntil: string | null;
+}): LicenceFacts {
+  return {
+    clientId: row.clientId,
+    warehouseId: row.warehouseId,
+    kind: row.kind as LicenceKind,
+    status: row.status as LicenceStatus,
+    validFrom: row.validFrom,
+    validUntil: row.validUntil,
+  };
+}
+
+/**
+ * Story 1-6d — the licence a need calls for, as a refusal names it
+ * (`SKU "RICE" needs an FSSAI licence (site "W1")`). A `Record` over
+ * `LICENCE_NEEDS`, so a new need fails the compile until it is named.
+ */
+export const LICENCE_NEED_NAME: Readonly<Record<LicenceNeed, string>> = {
+  'drug-20b': 'a Form 20B licence',
+  'drug-21b': 'a Form 21B licence',
+  'drug-20g': 'a Form 20G licence',
+  ndps: 'an NDPS licence',
+  fssai: 'an FSSAI licence',
+};
+
+/** Story 1-6d — which holder lacks a covering licence: the client brand, or the site. */
+export const LICENCE_HOLDERS = ['client', 'site'] as const;
+export type LicenceHolder = (typeof LICENCE_HOLDERS)[number];
+
+/**
+ * Story 1-6d — one missing licence, worded for a refusal: `needs an FSSAI
+ * licence (client)` or `needs an FSSAI licence (site "W1")`.
+ */
+export function missingLicencePhrase(need: LicenceNeed, holder: LicenceHolder, siteCode: string): string {
+  return `needs ${LICENCE_NEED_NAME[need]} (${holder === 'client' ? 'client' : `site "${siteCode}"`})`;
+}

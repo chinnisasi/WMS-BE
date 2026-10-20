@@ -6,6 +6,7 @@ import {
   } from '../../shared/primitives/quantity';
 import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
 import { DG_CLASSES, DG_PACKING_GROUPS } from '../../shared/primitives/goods-type';
+import { LICENCE_HOLDERS, LICENCE_NEEDS, type LicenceHolder, type LicenceNeed } from '../../shared/primitives/licence';
 import { UOMS } from '../catalog/uom';
 import {
   ArrayMaxSize,
@@ -265,6 +266,15 @@ export class GrnLineDto {
   handlingUnitIds?: readonly string[];
 }
 
+/** Story 1-6d — one need of a `licence-not-covered` line that no valid licence covers. */
+export class MissingLicenceDto {
+  @ApiProperty({ enum: [...LICENCE_NEEDS], description: 'What the goods need: drug-20b (G/H/H1), drug-21b (C/C1), drug-20g (X), ndps, or fssai (food)' })
+  need!: LicenceNeed;
+
+  @ApiProperty({ enum: [...LICENCE_HOLDERS], description: '`client` — the brand holds no valid licence for this site (or for none); `site` — the site holds no valid licence' })
+  holder!: LicenceHolder;
+}
+
 /** One line the server refused to settle (naming the reason — the others settle). */
 export class RejectedGrnLineDto {
   @ApiProperty({ format: 'uuid', type: String, nullable: true, description: 'The PO line named — null on an ASN line rejection' })
@@ -282,14 +292,14 @@ export class RejectedGrnLineDto {
   @ApiProperty({
     enum: [...REJECTED_GRN_LINE_CODES],
     description:
-      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt\'s line whose SKU belongs to another client than the receipt\'s; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU\'s client has departed; also to review (Discard only — re-receive after an owner reactivates the client). Story 1-2b — the expiry rules, each per line: `expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required` (review, Discard only) and `shelf-life-short` (its own review row — Accept anyway with a note, or Discard)',
+      'Machine reason. Only an OPEN document rejects a line. `po-line-not-open` is defensive since story 21-9 (an open PO has no cancelled or carried line) and stays in the enum for older clients. Story 1-1: `sku-client-mismatch` — a BLIND receipt\'s line whose SKU belongs to another client than the receipt\'s; it goes to the review queue (Discard only). Story 1-2a: `client-departed` — a line of ANY receipt whose SKU\'s client has departed; also to review (Discard only — re-receive after an owner reactivates the client). Story 1-2b — the expiry rules, each per line: `expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required` (review, Discard only) and `shelf-life-short` (its own review row — Accept anyway with a note, or Discard). Story 1-6d: `licence-not-covered` — licence enforcement is on and no valid client and site licence covers the line\'s drug or food goods on the receipt\'s IST date; its own review row (`grn.licence-refused` — an owner may accept it anyway with a note, or discard it)',
   })
   code!: string;
 
   @ApiProperty({ description: 'Human-readable reason naming the line state' })
   reason!: string;
 
-  @ApiProperty({ required: false, type: 'integer', minimum: 0, description: "Story 1-2b — the line's index in the request (present on an expiry refusal only)" })
+  @ApiProperty({ required: false, type: 'integer', minimum: 0, description: "Story 1-2b — the line's index in the request (present on an expiry refusal and — 1-6d — a licence refusal only)" })
   index?: number;
 
   @ApiProperty({ required: false, type: String, nullable: true, description: "Story 1-2b — the line's batch code (present on an expiry refusal only)" })
@@ -306,6 +316,14 @@ export class RejectedGrnLineDto {
 
   @ApiProperty({ required: false, type: 'integer', minimum: 0, description: "Story 1-2b — `shelf-life-short` only: the client's minimum remaining shelf life in days (0 when the client sets none — the batch had expired)" })
   minShelfLifeDays?: number;
+
+  @ApiProperty({
+    required: false,
+    type: [MissingLicenceDto],
+    description:
+      'Story 1-6d — `licence-not-covered` only: each need no valid licence covers on the receipt\'s IST date, and which holder lacks it (the entry also carries `index`)',
+  })
+  missing?: readonly MissingLicenceDto[];
 }
 
 /** Story 21-6 — one request line that settled unmatched (applied in full, no line credited). */
@@ -404,6 +422,13 @@ export class GoodsReceiptDto {
   @ApiProperty({
     required: false,
     description:
+      'Story 1-6d — the op id of the review row raised for the `licence-not-covered` lines (type `grn.licence-refused` — an owner may accept them anyway with a note, or discard them); present only when one was raised',
+  })
+  licenceReviewOpId?: string;
+
+  @ApiProperty({
+    required: false,
+    description:
       'Story 1-4b — the op id of the review row raised for the blind or unmatched lines of an INACTIVE SKU this receipt booked (type `grn.inactive-sku-received` — Discard only, labelled Acknowledge; it books nothing); present only when one was raised',
   })
   inactiveSkuReviewOpId?: string;
@@ -440,7 +465,7 @@ export class RefusedReceiptDto {
   @ApiProperty({
     type: [RejectedGrnLineDto],
     description:
-      'Every request line, each `sku-client-mismatch` or (story 1-2a) `client-departed` or (story 1-2b) one of the expiry codes (`expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required`, `shelf-life-short`)',
+      'Every request line, each `sku-client-mismatch` or (story 1-2a) `client-departed` or (story 1-2b) one of the expiry codes (`expiry-on-untracked`, `expiry-before-mfg`, `batch-expiry-mismatch`, `expiry-required`, `shelf-life-short`) or (story 1-6d) `licence-not-covered`',
   })
   rejectedLines!: readonly RejectedGrnLineDto[];
 
@@ -453,6 +478,9 @@ export class RefusedReceiptDto {
 
   @ApiProperty({ required: false, description: 'Story 1-2b — the op id of the `grn.shelf-life-refused` review row, when one was raised' })
   shelfLifeReviewOpId?: string;
+
+  @ApiProperty({ required: false, description: 'Story 1-6d — the op id of the `grn.licence-refused` review row, when one was raised' })
+  licenceReviewOpId?: string;
 }
 
 export class GoodsReceiptResponse {
