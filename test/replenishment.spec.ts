@@ -2069,6 +2069,113 @@ describe('Replenishment: reorder policies, breach alerts, suggested POs (e2e, st
       await putExpiry({ expiryLeadDays: LEAD_DAYS, agingThresholdDays: AGING_DAYS }).expect(200);
     });
   });
+
+  // ── story 2-1: a draft for a SKU that became a kit ────────────────────────
+  // A kit can never be received, so the PO create refuses it (409
+  // `kit-cannot-hold-stock`). A suggested-PO draft drafted BEFORE its SKU
+  // became a kit must not be stuck: a submit is refused with the draft kept,
+  // and the next sweep treats the kit like an inactive SKU — the breach
+  // recovers and the standing draft is dismissed. Its own tenant, so the
+  // main arms' candidate counts are untouched.
+  describe('story 2-1 — a kit SKU\'s suggested-PO draft', () => {
+    let kTenant: string;
+    let kToken: string;
+    let kWarehouse: string;
+    let kVendor: string;
+    const kSku = new Map<string, string>();
+
+    beforeAll(async () => {
+      const kEmail = `owner-k-${ulid().toLowerCase()}@example.com`;
+      const registered = await request(app.getHttpServer())
+        .post(API)
+        .set(KEY_HEADER, ulid())
+        .send({ name: `Kit Draft Co ${ulid()}`, ownerEmail: kEmail, password: 'correct-horse-battery' })
+        .expect(201);
+      kTenant = registered.body.tenant.id as string;
+      createdTenantIds.push(kTenant);
+      kToken = (await mintSignIn(app, { email: kEmail, password: 'correct-horse-battery' })).body.accessToken as string;
+      kWarehouse = (
+        await request(app.getHttpServer())
+          .post(`${API}/${kTenant}/warehouses`)
+          .set('Authorization', `Bearer ${kToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ origin: testAddress(), code: `RP-K-${ulid().slice(10, 14).toUpperCase()}`, name: 'Kit Draft WH' })
+          .expect(201)
+      ).body.id as string;
+      const csv = [
+        'sku_code,name,uom,uom_conversions,gst_rate,hsn,batch_tracked,serial_tracked,catch_weight_tracked,reorder_point,reorder_qty,barcode,abc_class',
+        'RK-SUB,Kit Draft Submit,pcs,,1800,,false,false,false,4,5,,',
+        'RK-SWP,Kit Draft Sweep,pcs,,1800,,false,false,false,4,5,,',
+        'RK-COMP,Kit Component,pcs,,1800,,false,false,false,,,,',
+      ].join('\n');
+      await request(app.getHttpServer())
+        .post(`${API}/${kTenant}/catalog/imports`)
+        .set('Authorization', `Bearer ${kToken}`)
+        .set(KEY_HEADER, ulid())
+        .field('mode', 'initial')
+        .attach('file', Buffer.from(csv, 'utf8'), { filename: 'catalog-k.csv', contentType: 'text/csv' })
+        .expect(201);
+      const items = (
+        await request(app.getHttpServer()).get(`${API}/${kTenant}/catalog/skus`).set('Authorization', `Bearer ${kToken}`).expect(200)
+      ).body.items as { code: string; id: string }[];
+      for (const item of items) kSku.set(item.code, item.id);
+      kVendor = await createLinkedVendor(app, kTenant, kToken, { code: 'RK-VEND', name: 'RK vendor', isDefault: true });
+      await app.get(InventoryFacade).rebuildReservationCounters(kTenant, kWarehouse);
+      // No stock anywhere: both reorder SKUs breach on the first sweep, each
+      // with a vendor-named draft.
+      await replenishment.sweepScope(kTenant, kWarehouse);
+      for (const code of ['RK-SUB', 'RK-SWP']) {
+        expect((await draftRows(kTenant, kWarehouse, kSku.get(code)!)).map((row) => row.status)).toEqual(['draft']);
+        expect((await breachRows(kTenant, kWarehouse, kSku.get(code)!)).map((row) => row.status)).toEqual(['open']);
+      }
+      // Both become kits AFTER they were drafted (no stock, so kit create
+      // admits them).
+      for (const code of ['RK-SUB', 'RK-SWP']) {
+        await request(app.getHttpServer())
+          .post(`${API}/${kTenant}/catalog/skus/${kSku.get(code)!}/kit`)
+          .set('Authorization', `Bearer ${kToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ components: [{ skuId: kSku.get('RK-COMP')!, quantity: 1 }] })
+          .expect(201);
+      }
+    });
+
+    it('a submit before the next sweep: 409 kit-cannot-hold-stock naming the kit, the draft stays a draft, no PO', async () => {
+      const draft = (await draftRows(kTenant, kWarehouse, kSku.get('RK-SUB')!))[0]!;
+      const before = (await sql`select count(*)::int as n from purchase_orders where tenant_id = ${kTenant}::uuid`) as unknown as { n: number }[];
+      const res = await request(app.getHttpServer())
+        .post(`${API}/${kTenant}/replenishment/suggested-pos/${draft.id}/submit`)
+        .set('Authorization', `Bearer ${kToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ vendorId: kVendor })
+        .expect(409);
+      expect(res.body).toMatchObject({ status: 409, code: 'kit-cannot-hold-stock' });
+      expect(res.body.detail as string).toContain('Purchase order line names kit SKU(s) "RK-SUB"');
+      expect((await draftRows(kTenant, kWarehouse, kSku.get('RK-SUB')!)).map((row) => row.status)).toEqual(['draft']);
+      expect((await breachRows(kTenant, kWarehouse, kSku.get('RK-SUB')!)).map((row) => row.status)).toEqual(['open']);
+      const after = (await sql`select count(*)::int as n from purchase_orders where tenant_id = ${kTenant}::uuid`) as unknown as { n: number }[];
+      expect(after[0]!.n).toBe(before[0]!.n);
+    });
+
+    it('the next sweep treats a kit like an inactive SKU: the breach recovers, the standing draft is dismissed, and nothing re-opens', async () => {
+      const report = await replenishment.sweepScope(kTenant, kWarehouse);
+      // Both kit SKUs' breaches recover (the submit arm's too — its draft
+      // was kept by the refused submit).
+      expect(report).toMatchObject({ tenantId: kTenant, warehouseId: kWarehouse, opened: 0, recovered: 2 });
+      for (const code of ['RK-SUB', 'RK-SWP']) {
+        expect((await breachRows(kTenant, kWarehouse, kSku.get(code)!)).map((row) => row.status)).toEqual(['recovered']);
+        expect((await draftRows(kTenant, kWarehouse, kSku.get(code)!)).map((row) => row.status)).toEqual(['dismissed']);
+      }
+      // A later sweep opens nothing for a kit: ATP 0 stays below the point,
+      // yet no breach and no draft is raised.
+      const again = await replenishment.sweepScope(kTenant, kWarehouse);
+      expect(again).toMatchObject({ opened: 0, recovered: 0 });
+      for (const code of ['RK-SUB', 'RK-SWP']) {
+        expect(await sql`select 1 from reorder_breaches where tenant_id = ${kTenant}::uuid and sku_id = ${kSku.get(code)!}::uuid and status = 'open'`).toHaveLength(0);
+        expect(await sql`select 1 from suggested_pos where tenant_id = ${kTenant}::uuid and sku_id = ${kSku.get(code)!}::uuid and status = 'draft'`).toHaveLength(0);
+      }
+    });
+  });
 });
 
 // ── the worker shell (unit, the count scheduler's plumbing pattern) ─────────

@@ -8002,7 +8002,7 @@
             }
           },
           "409": {
-            "description": "PO code already in use (conflict, naming the code); lines spanning clients (mixed-client); a departed client (client-departed); a partner without the vendor role (partner-not-vendor), an inactive vendor (vendor-inactive), or a vendor with no active link to the PO's client (vendor-not-linked, naming the client); or a concurrent idempotent request (conflict); a line of an inactive SKU (sku-inactive, naming extensions.skuCodes)",
+            "description": "PO code already in use (conflict, naming the code); lines spanning clients (mixed-client); a departed client (client-departed); a partner without the vendor role (partner-not-vendor), an inactive vendor (vendor-inactive), or a vendor with no active link to the PO's client (vendor-not-linked, naming the client); or a concurrent idempotent request (conflict); a line of an inactive SKU (sku-inactive, naming extensions.skuCodes); a line names a kit SKU, which can never be received (kit-cannot-hold-stock, naming it)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8346,7 +8346,7 @@
             }
           },
           "409": {
-            "description": "The PO is not open (po-not-open, naming the status), a line that has received stock would be removed, change SKU or order less than it received (po-line-received), or a concurrent idempotent request (conflict); a line that adds inbound for an inactive SKU — a SKU not on the PO, or a raised ordered total (sku-inactive)",
+            "description": "The PO is not open (po-not-open, naming the status), a line that has received stock would be removed, change SKU or order less than it received (po-line-received), or a concurrent idempotent request (conflict); a line that adds inbound for an inactive SKU — a SKU not on the PO, or a raised ordered total (sku-inactive); a line that adds inbound for a kit SKU — a kit not on the PO, a raised ordered total or a second line of it — which can never be received (kit-cannot-hold-stock, naming it; a stale kit line resent unchanged or lowered still amends)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8475,7 +8475,7 @@
             }
           },
           "409": {
-            "description": "The PO is already closed (po-not-open, naming the status), an over-receipt of it awaits a decision (over-receipt-pending), or a concurrent idempotent request (conflict)",
+            "description": "The PO is already closed (po-not-open, naming the status), an over-receipt of it awaits a decision (over-receipt-pending), a carried line is a kit SKU, which could never be received on the successor — mark it cancelled instead (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -18058,7 +18058,7 @@
             }
           },
           "409": {
-            "description": "The draft is not a draft (suggested-po-submitted), the PO code is already in use (conflict), the SKU is inactive (sku-inactive — the draft stays a draft), or a concurrent idempotent request (conflict)",
+            "description": "The draft is not a draft (suggested-po-submitted), the PO code is already in use (conflict), the SKU is inactive (sku-inactive — the draft stays a draft), the SKU is a kit, which can never be received (kit-cannot-hold-stock — the draft stays a draft), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {

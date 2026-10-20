@@ -63,6 +63,14 @@ export interface EffectiveCandidate {
    */
   readonly inactive: boolean;
   /**
+   * Story 2-1 — the SKU is a kit (it has a composition): a kit can never be
+   * received, so the PO create refuses it (409 `kit-cannot-hold-stock`).
+   * Treated exactly like `inactive` — no breach opens, a standing one is
+   * recovered and its standing draft dismissed — so a draft for a SKU that
+   * became a kit after it was drafted is never stuck.
+   */
+  readonly isKit: boolean;
+  /**
    * Story 1-3 — the SKU's client: the draft's default vendor is THAT
    * client's (decision 2), never a tenant-wide one.
    */
@@ -146,17 +154,18 @@ export class ReplenishmentSweep {
           continue;
         }
         const breach = await this.loadOpenBreach(tx, tenantId, warehouseId, candidate.skuId);
-        if (candidate.departed || candidate.inactive) {
+        if (candidate.departed || candidate.inactive || candidate.isKit) {
           // Story 1-2a — never raise for a departed client; close what stands.
           // Story 1-4b (decision 7) — an inactive SKU the same way, and its
           // standing draft is dismissed (a submit would be refused
           // `sku-inactive` anyway). The expiry scan is unchanged: the stock
-          // still exists.
+          // still exists. Story 2-1 — a kit the same way as an inactive SKU
+          // (its submit would be refused `kit-cannot-hold-stock`).
           if (breach !== null) {
             await this.recoverBreach(tx, tenantId, breach);
             recovered += 1;
           }
-          if (candidate.inactive) {
+          if (candidate.inactive || candidate.isKit) {
             await tx
               .update(suggestedPos)
               .set({ status: 'dismissed', updatedAt: nowIso() })
@@ -223,7 +232,7 @@ export class ReplenishmentSweep {
     // open at departure.
     const departed = await departedClientIdsInTx(tx, tenantId);
 
-    const candidates: EffectiveCandidate[] = [];
+    const candidates: Omit<EffectiveCandidate, 'isKit'>[] = [];
     for (const sku of skuDefaults) {
       const override = policyBySku.get(sku.id);
       const pointMilli = override !== undefined ? override.reorderPointMilli : sku.reorderPoint;
@@ -241,7 +250,14 @@ export class ReplenishmentSweep {
         });
       }
     }
-    return candidates.sort((a, b) => (a.skuId < b.skuId ? -1 : a.skuId > b.skuId ? 1 : 0));
+    // Story 2-1 — kit-ness, one batch read over the candidates (catalog
+    // facade, in-tx): a kit candidate is handled like an inactive one.
+    const kits = new Set(
+      await this.catalog.getKitSkuIdsInTx(tx, tenantId, candidates.map((candidate) => candidate.skuId)),
+    );
+    return candidates
+      .map((candidate) => ({ ...candidate, isKit: kits.has(candidate.skuId) }))
+      .sort((a, b) => (a.skuId < b.skuId ? -1 : a.skuId > b.skuId ? 1 : 0));
   }
 
   /** The open breach for the scope, locked (none → null; the re-point/absorb decisions read it). */

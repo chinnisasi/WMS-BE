@@ -27,6 +27,7 @@ import {
   assertAsnClientInTx,
   assertAsnCodeShape,
   assertLineShape,
+  ASN_LINE_KIND,
   duplicateAsnCode,
   emitAsnEvent,
   insertAsnInTx,
@@ -283,7 +284,7 @@ export class AsnImportCommand {
           }
           if (sku.isKit) {
             // The create's refusal words (`assertNoKitLinesInTx` → kitCannotHoldStock).
-            refuse(row, 'kit-cannot-hold-stock', problemOf(kitCannotHoldStock('Advance shipment notice line', [sku.code]))!.detail);
+            refuse(row, 'kit-cannot-hold-stock', problemOf(kitCannotHoldStock(ASN_LINE_KIND, [sku.code]))!.detail);
             continue;
           }
           const quantity = quantityToMilli(row.quantity, sku.uom, sku.uomPrecision);

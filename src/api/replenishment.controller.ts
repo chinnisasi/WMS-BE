@@ -282,7 +282,7 @@ export class ReplenishmentController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks replenishment.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No draft with this id exists in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The draft is not a draft (suggested-po-submitted), the PO code is already in use (conflict), the SKU is inactive (sku-inactive — the draft stays a draft), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The draft is not a draft (suggested-po-submitted), the PO code is already in use (conflict), the SKU is inactive (sku-inactive — the draft stays a draft), the SKU is a kit, which can never be received (kit-cannot-hold-stock — the draft stays a draft), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'draftId', format: 'uuid' })

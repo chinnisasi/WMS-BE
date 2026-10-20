@@ -189,6 +189,11 @@ describe('inbound: purchase orders (e2e, story 3.1)', () => {
       csvHeader,
       'INB-A,Inbound Item A,pcs,,1800,,false,false,,,',
       'INB-B,Inbound Item B,pcs,,1800,,false,false,,,',
+      // Story 2-1 — the kit-guard arms: two SKUs that become kits (K2 only
+      // after a PO already holds it) and their component.
+      'INB-K1,Inbound Kit One,pcs,,1800,,false,false,,,',
+      'INB-K2,Inbound Kit Two,pcs,,1800,,false,false,,,',
+      'INB-C,Inbound Kit Component,pcs,,1800,,false,false,,,',
     ].join('\n');
     await request(app.getHttpServer())
       .post(`${API}/${tenantId}/catalog/imports`)
@@ -204,7 +209,7 @@ describe('inbound: purchase orders (e2e, story 3.1)', () => {
     for (const item of skus.body.items as { code: string; id: string }[]) {
       skuIds.set(item.code, item.id);
     }
-    expect(skuIds.size).toBe(2);
+    expect(skuIds.size).toBe(5);
 
     // The tenant's vendor (used by most PO tests below).
     vendorId = await createLinkedVendor(app, tenantId, ownerToken, { code: 'VEND-001', name: 'Prime Foods Pvt Ltd' });
@@ -896,6 +901,130 @@ describe('inbound: purchase orders (e2e, story 3.1)', () => {
       await sql.unsafe('set session_replication_role = DEFAULT');
       await sql.end();
     }
+  });
+
+  // ── Story 2-1: the kit guards on PO create, amend and close ──────────────
+  // Receiving refuses a kit line (FR-38), so a PO line naming a kit could
+  // never be received. Create refuses every kit line; amend refuses exactly
+  // the SKUs gaining inbound (a stale kit line may be resent unchanged or
+  // lowered); close refuses carrying a kit line onto the successor.
+
+  describe('story 2-1 — kit SKUs on a purchase order', () => {
+    let stalePo: { id: string; code: string; lines: { id: string; skuId: string; orderedQty: number; unitCostPaise: number }[] };
+
+    function makeKit(kitSkuId: string): SupertestTest {
+      return request(app.getHttpServer())
+        .post(`${API}/${tenantId}/catalog/skus/${kitSkuId}/kit`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ components: [{ skuId: skuIds.get('INB-C')!, quantity: 1 }] });
+    }
+
+    beforeAll(async () => {
+      // The kits.spec.ts:918 shape: a PO holds INB-K2 while it is still an
+      // ordinary SKU; INB-K2 becomes a kit afterwards (kit composition does
+      // not refuse a SKU sitting on an open PO), and so does INB-K1.
+      stalePo = (
+        await createPo({
+          warehouseId,
+          vendorId,
+          code: `PO-KIT-${ulid().slice(10, 18).toUpperCase()}`,
+          lines: [
+            { skuId: skuIds.get('INB-A')!, orderedQty: 4, unitCostPaise: 1000 },
+            { skuId: skuIds.get('INB-K2')!, orderedQty: 5, unitCostPaise: 2000 },
+          ],
+        }).expect(201)
+      ).body.purchaseOrder;
+      await makeKit(skuIds.get('INB-K1')!).expect(201);
+      await makeKit(skuIds.get('INB-K2')!).expect(201);
+    });
+
+    function lineOf(skuCode: string): { id: string; skuId: string; orderedQty: number; unitCostPaise: number } {
+      return stalePo.lines.find((line) => line.skuId === skuIds.get(skuCode))!;
+    }
+
+    function asLine(line: { id: string; skuId: string; orderedQty: number; unitCostPaise: number }): PoLineInput & { id: string } {
+      return { id: line.id, skuId: line.skuId, orderedQty: line.orderedQty, unitCostPaise: line.unitCostPaise };
+    }
+
+    it('create: a kit line is 409 kit-cannot-hold-stock naming the kit code — no PO, no outbox row', async () => {
+      const posBefore = await dbCount('purchase_orders');
+      const outboxBefore = await dbCount('outbox_messages', "and type = 'po.created'");
+      const code = `PO-${ulid().slice(10, 18).toUpperCase()}`;
+      const res = await createPo({
+        warehouseId,
+        vendorId,
+        code,
+        lines: [
+          { skuId: skuIds.get('INB-A')!, orderedQty: 2, unitCostPaise: 100 },
+          { skuId: skuIds.get('INB-K1')!, orderedQty: 1, unitCostPaise: 100 },
+        ],
+      }).expect(409);
+      expect(res.body).toMatchObject({ status: 409, code: 'kit-cannot-hold-stock' });
+      expect(res.body.detail).toBe(
+        'Purchase order line names kit SKU(s) "INB-K1" — a kit\'s stock IS its components\'. Move stock on the component SKUs; the kit explodes into them at order acceptance.',
+      );
+      expect(await dbCount('purchase_orders')).toBe(posBefore);
+      expect(await dbCount('outbox_messages', "and type = 'po.created'")).toBe(outboxBefore);
+    });
+
+    it('amend: adding a kit, raising a stale kit line and adding a second line of it are each 409; resending it unchanged or lowered amends (200)', async () => {
+      const a = asLine(lineOf('INB-A'));
+      const k2 = asLine(lineOf('INB-K2'));
+
+      const added = await amendPo(stalePo.id, [a, k2, { skuId: skuIds.get('INB-K1')!, orderedQty: 1, unitCostPaise: 100 }]).expect(409);
+      expect(added.body).toMatchObject({ status: 409, code: 'kit-cannot-hold-stock' });
+      expect(added.body.detail).toContain('Purchase order line names kit SKU(s) "INB-K1"');
+
+      const raised = await amendPo(stalePo.id, [a, { ...k2, orderedQty: 6 }]).expect(409);
+      expect(raised.body).toMatchObject({ status: 409, code: 'kit-cannot-hold-stock' });
+      expect(raised.body.detail).toContain('"INB-K2"');
+
+      const second = await amendPo(stalePo.id, [a, k2, { skuId: skuIds.get('INB-K2')!, orderedQty: 1, unitCostPaise: 2000 }]).expect(409);
+      expect(second.body).toMatchObject({ status: 409, code: 'kit-cannot-hold-stock' });
+      expect(second.body.detail).toContain('"INB-K2"');
+
+      // Nothing written by the refusals: the stored line set is unchanged.
+      const detail = await get(`/inbound/purchase-orders/${stalePo.id}`).expect(200);
+      expect((detail.body.purchaseOrder.lines as { skuId: string; orderedQty: number }[]).map((line) => [line.skuId, line.orderedQty]).sort()).toEqual(
+        [[skuIds.get('INB-A')!, 4], [skuIds.get('INB-K2')!, 5]].sort(),
+      );
+
+      // Unchanged (and a non-kit line raised beside it) → 200.
+      const unchanged = await amendPo(stalePo.id, [{ ...a, orderedQty: 7 }, k2]).expect(200);
+      expect((unchanged.body.purchaseOrder.lines as { skuId: string; orderedQty: number }[]).find((line) => line.skuId === skuIds.get('INB-K2'))!.orderedQty).toBe(5);
+      // Lowered → 200.
+      const lowered = await amendPo(stalePo.id, [{ ...a, orderedQty: 7 }, { ...k2, orderedQty: 3 }]).expect(200);
+      stalePo = lowered.body.purchaseOrder;
+      expect(lineOf('INB-K2').orderedQty).toBe(3);
+    });
+
+    it('close: carrying a kit line is 409 kit-cannot-hold-stock and writes nothing; cancelling it closes (200) and carries only the ordinary line', async () => {
+      const posBefore = await dbCount('purchase_orders');
+      const closedEventsBefore = await dbCount('outbox_messages', "and type = 'po.closed'");
+      const createdEventsBefore = await dbCount('outbox_messages', "and type = 'po.created'");
+      const carriedKit = await closePo(stalePo.id, [
+        { lineId: lineOf('INB-A').id, disposition: 'carried' },
+        { lineId: lineOf('INB-K2').id, disposition: 'carried' },
+      ]).expect(409);
+      expect(carriedKit.body).toMatchObject({ status: 409, code: 'kit-cannot-hold-stock' });
+      expect(carriedKit.body.detail).toContain('Purchase order line names kit SKU(s) "INB-K2"');
+      expect(await dbCount('purchase_orders')).toBe(posBefore);
+      expect(await dbCount('outbox_messages', "and type = 'po.closed'")).toBe(closedEventsBefore);
+      expect(await dbCount('outbox_messages', "and type = 'po.created'")).toBe(createdEventsBefore);
+      const still = await get(`/inbound/purchase-orders/${stalePo.id}`).expect(200);
+      expect(still.body.purchaseOrder.status).toBe('open');
+      expect((still.body.purchaseOrder.lines as { status: string }[]).every((line) => line.status === 'open')).toBe(true);
+
+      const closed = await closePo(stalePo.id, [
+        { lineId: lineOf('INB-A').id, disposition: 'carried' },
+        { lineId: lineOf('INB-K2').id, disposition: 'cancelled' },
+      ]).expect(200);
+      expect(closed.body.purchaseOrder.status).toBe('closed');
+      expect((closed.body.successor.lines as { skuId: string; orderedQty: number }[]).map((line) => [line.skuId, line.orderedQty])).toEqual([
+        [skuIds.get('INB-A')!, 7],
+      ]);
+    });
   });
 
   // ── Deployment parity: the hand-appended 0011 CHECKs are DB-enforced ──────
