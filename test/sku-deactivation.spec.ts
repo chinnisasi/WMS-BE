@@ -938,6 +938,71 @@ describe('story 1-4b: SKU deactivation', () => {
       expect(((refused.payload.lines as { skuId: string }[]) ?? []).map((line) => line.skuId)).toEqual([sku('BETA-A')]);
     });
 
+    it('the full mixed receipt (matrix row): inactive line booked + flagged; another client\'s line → grn.lines-refused; an INACTIVE short-dated line → grn.shelf-life-refused and NOT listed again on the inactive row', async () => {
+      // An inactive, batch-tracked SKU of ACME for the short-dated line.
+      const created = await http()
+        .post(`${API}/${tenantId}/catalog/skus`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'INA-BATCH', name: 'Inactive batch SKU', uom: 'each', gstRate: 1800, batchTracked: true, serialTracked: false, catchWeightTracked: false, clientId: acme })
+        .expect(201);
+      const batchSku = created.body.sku.id as string;
+      await setSkuStatus(batchSku, { status: 'inactive' }).expect(200);
+      const policyPath = `${API}/${tenantId}/clients/${acme}/receiving-policy`;
+      const original = (await http().get(policyPath).set('Authorization', `Bearer ${ownerToken}`).expect(200)).body as Record<string, unknown>;
+      const restore = {
+        receivingToleranceBps: original.receivingToleranceBps,
+        qcOnReceipt: original.qcOnReceipt,
+        expiryRequired: original.expiryRequired,
+        minShelfLifeDays: original.minShelfLifeDays,
+      };
+      await http()
+        .put(policyPath)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ ...restore, expiryRequired: true, minShelfLifeDays: 90 })
+        .expect(200);
+      try {
+        // 10 days left against a 90-day minimum: short-dated.
+        const shortExpiry = new Date(Date.now() + 10 * 86_400_000).toISOString().slice(0, 10);
+        const res = await receive({
+          poId: null,
+          blindReasonCode: 'other',
+          clientId: acme,
+          lines: [
+            grnLine(sku('INA2'), 2),
+            grnLine(sku('BETA-A'), 1),
+            grnLine(batchSku, 4, { batchCode: 'B-SHORT-INA', expiryDate: shortExpiry }),
+          ],
+        }).expect(201);
+        const grn = res.body.goodsReceipt;
+        // Only the inactive unrefused line is booked.
+        expect((grn.lines as { skuId: string }[]).map((line) => line.skuId)).toEqual([sku('INA2')]);
+        expect((grn.rejectedLines as { skuId: string; code: string }[]).map((line) => [line.skuId, line.code])).toEqual([
+          [sku('BETA-A'), 'sku-client-mismatch'],
+          [batchSku, 'shelf-life-short'],
+        ]);
+        // Three distinct rows, each listing only its own line.
+        const flag = await rejectedOp(grn.inactiveSkuReviewOpId as string);
+        expect(flag.opType).toBe('grn.inactive-sku-received');
+        expect(flag.payload.lines).toEqual([{ skuId: sku('INA2'), skuCode: 'INA2', qty: 2, uom: 'each' }]);
+        const refused = await rejectedOp(grn.reviewOpId as string);
+        expect(refused.opType).toBe('grn.lines-refused');
+        expect((refused.payload.lines as { skuId: string }[]).map((line) => line.skuId)).toEqual([sku('BETA-A')]);
+        const shelf = await rejectedOp(grn.shelfLifeReviewOpId as string);
+        expect(shelf.opType).toBe('grn.shelf-life-refused');
+        expect((shelf.payload.lines as { skuId: string }[]).map((line) => line.skuId)).toEqual([batchSku]);
+        // The refused inactive line appears on no inactive-SKU row anywhere.
+        expect(
+          await sql`select 1 from rejected_ops where tenant_id = ${tenantId} and op_type = 'grn.inactive-sku-received'
+            and payload -> 'lines' @> ${sql.json([{ skuId: batchSku }] as never)}`,
+        ).toHaveLength(0);
+        expect(await onHand(batchSku)).toBe(0);
+      } finally {
+        await http().put(policyPath).set('Authorization', `Bearer ${ownerToken}`).set(KEY_HEADER, ulid()).send(restore).expect(200);
+      }
+    });
+
     it('an unmatched line of an inactive SKU on a PO receipt is booked and flagged', async () => {
       const po = (await createPo([{ skuId: sku('ACT'), orderedQty: 5 }]).expect(201)).body.purchaseOrder;
       const res = await receive({
