@@ -24,11 +24,13 @@
  * class's (SKU × bin) rule: the gate reads the TARGET bin's occupants'
  * hazard classes, so a hazard-capable SKU may still enter an empty bin of
  * the right storage class. The matrix is encoded ONCE — in this TS
- * predicate, not copied into SQL; every gate (`candidateFitsSku`, the
- * placement guard, `mergeBin`, the SKU hazard-edit guard) imports
- * `hazardClassesCompatible`. The candidate list the suggestion walks is
- * shared and SKU-agnostic, so the per-(SKU, occupants) rule can only live
- * here.
+ * predicate, not copied into SQL. Since story 1-6b the gates
+ * (`candidateFitsSku`, the placement guard, `mergeBin`, the transfer gate
+ * runner, the SKU edit guard) call `goodsConflict` in `segregation.ts`,
+ * whose first rule (`hazard-pair`) asks THIS predicate of every pair across
+ * the two SKUs' hazard sets (the hazard class plus its mapped DG
+ * subsidiaries); the goods-type rules (explosives vs any DG, food and drugs
+ * vs chemicals, allergens, raw vs ready-to-eat) live there.
  *
  * **Conformance is a command-layer rule** (AD-18): nothing in this file runs
  * outside a command transaction. The gated writers are putaway placement,
@@ -157,29 +159,4 @@ export function assertHazardClass(
       );
     }
   }
-}
-
-/** 400 `bin-segregation-conflict` — a placement/merge refusal naming both parties and both classes. */
-export function segregationConflict(detail: string): ProblemException {
-  return new ProblemException(
-    'bin-segregation-conflict',
-    400,
-    'Target bin holds a segregated hazard class',
-    detail,
-  );
-}
-
-/**
- * 409 `hazard-segregation-conflict` — a hazard-class edit that would strand
- * existing stock co-located with an incompatible class. Names the conflicting
- * parties (SKUs, bins and the pinning hold, where one exists) so the operator
- * can relocate or release first.
- */
-export function segregationStateConflict(detail: string): ProblemException {
-  return new ProblemException(
-    'hazard-segregation-conflict',
-    409,
-    'Hazard class conflicts with co-located stock',
-    detail,
-  );
 }

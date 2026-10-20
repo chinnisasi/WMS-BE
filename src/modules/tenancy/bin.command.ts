@@ -68,12 +68,17 @@ import {
   occupantHazardClassesInTx,
   occupantSkusInTx,
 } from '../putaway/putaway.command';
-// Story 12-2 — the ONE segregation predicate + the co-location refusal
-// factory (shared with the placement gate; the detail is merge-worded).
+// Story 12-2 / 1-6b — the ONE goods-type segregation predicate + the
+// co-location refusal factory (shared with the placement gate; the detail
+// is merge-worded over the primitive's facts).
 import {
-  hazardClassesCompatible,
-  segregationConflict,
-} from '../../shared/primitives/hazard';
+  SEGREGATION_PROFILE_COLUMNS,
+  binGoodsConflict,
+  conflictFacts,
+  goodsConflict,
+  isEmptyProfile,
+  profileOf,
+} from '../../shared/primitives/segregation';
 // Story 12-4 — the ONE bulk-asset occupancy predicate + the refusal factory
 // (shared with the placement gate and `candidateFitsSku`; the detail is
 // merge-worded here) and the type arm-key (`isBulkAssetType`) behind the
@@ -791,9 +796,9 @@ export class BinCommand {
             heightMm: skus.heightMm,
             // Story 12-1 — the class the target's class gate consumes (FR-40).
             storageClass: skus.storageClass,
-            // Story 12-2 — the hazard class the target's co-location gate
-            // consumes (FR-41; null = carries no rule).
-            hazardClass: skus.hazardClass,
+            // Story 12-2 / 1-6b — the segregation profile the target's
+            // co-location gate consumes (an empty profile carries no rule).
+            ...SEGREGATION_PROFILE_COLUMNS,
           })
           .from(stockOnHand)
           .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
@@ -905,22 +910,27 @@ export class BinCommand {
           }
         }
 
-        // ── story 12-2: the hazard co-location gate (FR-41) — after the
-        // class gate, BEFORE any arm moves: a merge that would park a SKU
-        // beside an incompatible target occupant is refused whole, naming
-        // both parties. The gate reads the TARGET bin's occupants via the
-        // putaway helper (the `binBlocked` precedent for importing it); each
-        // moved SKU's own pairs are SKIPPED (the same-SKU-consolidation rule
-        // — merging stock into a bin already holding that SKU is legitimate,
-        // explosive included), rows whose class is null skip (null carries
-        // no rule), and moved-vs-moved is NOT re-checked (the source bin
-        // already co-locates them) — a premise that holds while `stock.adjust`
-        // is the named bypass: it is the only writer able to FORM incompatible
-        // co-location in a source bin (recorded in PENDING). Same factory as
-        // the placement gate (400 `bin-segregation-conflict`). Its read is
-        // the HAZARD-filtered occupant list (null-class occupants carry no
-        // rule there) — the class-free occupancy read the 12-4 gate above
-        // consumes is a separate one (`occupantSkusInTx`).
+        // ── story 12-2 / 1-6b: the co-location gate (FR-41, widened to the
+        // goods-type rules) — after the class gate, BEFORE any arm moves: a
+        // merge that would park a SKU beside a conflicting target occupant
+        // is refused whole, naming both parties and the rule. The gate reads
+        // the TARGET bin's occupants via the putaway helper (the `binBlocked`
+        // precedent for importing it); each moved SKU's own pairs are
+        // SKIPPED (the same-SKU-consolidation rule — merging stock into a bin
+        // already holding that SKU is legitimate, explosive included), rows
+        // whose profile is empty skip (an empty profile carries no rule), and
+        // moved-vs-moved is NOT re-checked (the source bin already co-locates
+        // them). A source bin can hold a conflicting pair: segregation is not
+        // retroactive (a bin mixed before 1-6b stays mixed until its next
+        // gated write), and the named bypasses — `stock.adjust`, count-variance
+        // corrections, `qc.released` — can form one (recorded in PENDING);
+        // merging such a source carries the pair along unchanged, which is
+        // the accepted containment (`scripts/segregation-conflicts.ts` lists
+        // mixed bins). Same factory as the
+        // placement gate (400 `bin-segregation-conflict`). Its read is the
+        // profile-filtered occupant list (empty-profile occupants carry no
+        // rule there) — the occupancy read the 12-4 gate above consumes is a
+        // separate one (`occupantSkusInTx`).
         const targetOccupants = await occupantHazardClassesInTx(
           tx,
           command.tenantId,
@@ -929,17 +939,21 @@ export class BinCommand {
         );
         if (targetOccupants.length > 0) {
           for (const row of onHandRows) {
-            if (row.hazardClass === null) {
+            const moved = profileOf(row);
+            if (isEmptyProfile(moved)) {
               continue;
             }
             for (const occupant of targetOccupants) {
               if (occupant.skuId === row.skuId) {
                 continue;
               }
-              if (!hazardClassesCompatible(row.hazardClass, occupant.hazardClass)) {
-                throw segregationConflict(
+              const conflict = goodsConflict(moved, occupant.profile);
+              if (conflict !== null) {
+                const facts = conflictFacts(conflict, moved, occupant.profile);
+                throw binGoodsConflict(
+                  conflict.rule,
                   `Merge refused — target bin "${target.code}" holds SKU "${occupant.skuCode}" ` +
-                    `(${occupant.hazardClass}); moved SKU "${row.skuCode}" (${row.hazardClass}) is segregated from it (FR-41).`,
+                    `(${facts.b}); moved SKU "${row.skuCode}" (${facts.a}) ${facts.verdict}.`,
                 );
               }
             }

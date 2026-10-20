@@ -1755,6 +1755,71 @@ describe('bin administration: block / merge / retire (e2e, story 3.6)', () => {
     expect(await plainOnHand(togetherTarget, flId)).toBe(1);
   });
 
+  // ── Story 1-6b — the merge gate over the goods-type rules ─────────────────
+
+  it('story 1-6b merge: rice merged onto a DG 9 target is refused whole (food-chemical); an allergen mismatch is refused; an empty-profile row and spirits beside juice merge', async () => {
+    const createSku = async (code: string, extra: Record<string, unknown>): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/catalog/skus`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, name: `Goods ${code}`, uom: 'pcs', gstRate: 1800, batchTracked: false, serialTracked: false, catchWeightTracked: false, ...extra })
+          .expect(201)
+      ).body.sku.id as string;
+    const rice = await createSku('MG-RICE', { foodCategory: 'packaged-dry-grocery' });
+    const battery = await createSku('MG-BATT', { dgClass: '9', dgUnNumber: '3480' });
+    const milkSweet = await createSku('MG-MILK', { foodCategory: 'confectionery', allergens: ['milk'] });
+    const plainSweet = await createSku('MG-SWEET', { foodCategory: 'confectionery' });
+    const whisky = await createSku('MG-WHSK', { foodCategory: 'beverages', dgClass: '3', dgUnNumber: '3065' });
+    const juice = await createSku('MG-JUICE', { foodCategory: 'beverages' });
+    const goodsBin = async (code: string): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf' })
+          .expect(201)
+      ).body.id as string;
+
+    // Refused whole: the source keeps its rows and is not retired.
+    const refused: [string, string, string, string, string[]][] = [
+      ['A-1B-01', 'A-1B-02', battery, rice, ['MG-BATT', 'MG-RICE', 'chemical: DG 9', 'food never shares a bin with a chemical']],
+      ['A-1B-03', 'A-1B-04', milkSweet, plainSweet, ['MG-MILK', 'MG-SWEET', 'the same allergens']],
+    ];
+    for (const [targetCode, sourceCode, occupant, moved, phrases] of refused) {
+      const target = await goodsBin(targetCode);
+      const source = await goodsBin(sourceCode);
+      await fill(target, occupant, 1);
+      await fill(source, moved, 1);
+      // An empty-profile row rides along in the source — it never decides.
+      await fill(source, plainSkuId, 1);
+      const res = await merge(source, target).expect(400);
+      expect(res.body).toMatchObject({ status: 400, code: 'bin-segregation-conflict' });
+      expect(String(res.body.detail)).toContain(`"${targetCode}"`);
+      for (const phrase of phrases) {
+        expect(String(res.body.detail)).toContain(phrase);
+      }
+      expect(await plainOnHand(source, moved)).toBe(1);
+      expect((await zoneBins(zoneId)).find((bin) => bin.id === source)!.retiredAt).toBeNull();
+    }
+
+    // Allowed: an empty-profile row onto a DG 9 target, and spirits beside juice (decision 8).
+    const dgTarget = await goodsBin('A-1B-05');
+    const plainSource = await goodsBin('A-1B-06');
+    await fill(dgTarget, battery, 1);
+    await fill(plainSource, plainSkuId, 1);
+    await merge(plainSource, dgTarget).expect(200);
+    expect(await plainOnHand(dgTarget, plainSkuId)).toBe(1);
+    const juiceTarget = await goodsBin('A-1B-07');
+    const whiskySource = await goodsBin('A-1B-08');
+    await fill(juiceTarget, juice, 1);
+    await fill(whiskySource, whisky, 1);
+    await merge(whiskySource, juiceTarget).expect(200);
+    expect(await plainOnHand(juiceTarget, whisky)).toBe(1);
+  });
+
   // ── Story 12-3 — the secure-bin authority gate on merge (FR-42) ────────────
 
   it('secure merge: a holder merges cage-to-cage with byte-identical behavior (the gate fires and passes; the operator-less 403 shape is unit-pinned in users.spec)', async () => {

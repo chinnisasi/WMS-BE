@@ -418,7 +418,7 @@ export class CatalogController {
   @UseGuards(TenantSessionGuard)
   @ApiBearerAuth()
   @ApiOperation({
-    summary: 'Returns the hazard segregation matrix — the vocabulary plus every incompatible unordered pair, fully expanded from the server\'s own predicate',
+    summary: 'Returns the segregation matrix — the hazard vocabulary plus every incompatible unordered pair, fully expanded from the server\'s own predicate, and (1-6b) every goods-type co-location rule in check order',
   })
   @ApiOkResponse({ type: SegregationMatrixResponse })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
@@ -433,6 +433,7 @@ export class CatalogController {
     return {
       classes: [...matrix.classes],
       incompatible: matrix.incompatible.map((pair) => ({ ...pair })),
+      rules: matrix.rules.map((rule) => ({ code: rule.code, description: rule.description })),
     };
   }
 
@@ -550,7 +551,7 @@ export class CatalogController {
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks sku.edit (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('SKU (or, on attach, the product) does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('Barcode already belongs to another SKU (duplicate-barcode names it and its level) or equals a SKU code (barcode-is-code), another SKU of this product already carries identical variantValues (duplicate-variant-values), the product belongs to another client (product-client-mismatch), a batch/serial/catch-weight change while the SKU has stock, a pending over-receipt or a pending adjustment (sku-has-stock), or a hazard-class change would strand stock co-located with an incompatible binmate (hazard-segregation-conflict names the bins and the parties)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('Barcode already belongs to another SKU (duplicate-barcode names it and its level) or equals a SKU code (barcode-is-code), another SKU of this product already carries identical variantValues (duplicate-variant-values), the product belongs to another client (product-client-mismatch), a batch/serial/catch-weight change while the SKU has stock, a pending over-receipt or a pending adjustment (sku-has-stock), or a change to the SKU\'s segregation profile (hazard class, DG classes, drug schedules, food category, allergens) would newly conflict with stock it shares a bin with (hazard-segregation-conflict names each bin, binmate and hold, and the rule that fires)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   @ApiParam({ name: 'skuId', format: 'uuid' })
