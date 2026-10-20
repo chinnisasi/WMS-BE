@@ -12,6 +12,7 @@ import {
   CHAIN_BREAK_KINDS,
   SOURCE_RESOLUTIONS,
 } from '../modules/notifications/notification-sources';
+import { LICENCE_KINDS, type LicenceKind } from '../shared/primitives/licence';
 
 /**
  * Story 9-2 — the notification panel's wire shapes. Each entry is one arm of
@@ -104,6 +105,18 @@ export class LedgerChainBreakSummaryDto {
   @ApiProperty({ enum: CHAIN_BREAK_DETECTORS }) detectedBy!: (typeof CHAIN_BREAK_DETECTORS)[number];
 }
 
+/** Story 1-6c — one licence expiry warning (owner-only; resolved by a renewal, a withdrawal, or the expired warning). */
+export class LicenceExpirySummaryDto {
+  @ApiProperty({ format: 'uuid' }) licenceId!: string;
+  @ApiProperty({ enum: [...LICENCE_KINDS] }) kind!: LicenceKind;
+  @ApiProperty() number!: string;
+  @ApiProperty({ enum: ['client', 'site'], description: '`client` — a brand’s licence; `site` — the 3PL’s own site' }) holder!: 'client' | 'site';
+  @ApiProperty({ description: 'The client’s name, or the site’s name' }) holderName!: string;
+  @ApiProperty({ required: false, description: 'The site’s code — a site licence, or a client licence for one premises' }) siteCode?: string;
+  @ApiProperty({ format: 'date', description: 'YYYY-MM-DD (IST)' }) validUntil!: string;
+  @ApiProperty({ enum: ['upcoming', 'expired'] }) state!: 'upcoming' | 'expired';
+}
+
 // ── entries ──────────────────────────────────────────────────────────────────
 
 abstract class NotificationEntryBaseDto {
@@ -183,6 +196,13 @@ export class QcReceiptNotificationDto extends NotificationEntryBaseDto {
   @ApiProperty({ type: String, nullable: true, enum: [...SOURCE_RESOLUTIONS['qc-receipt'], null] }) resolution!: (typeof SOURCE_RESOLUTIONS)['qc-receipt'][number] | null;
 }
 
+/** Story 1-6c — one warning per term; never pushed. */
+export class LicenceExpiryNotificationDto extends NotificationEntryBaseDto {
+  @ApiProperty({ enum: ['licence-expiry'] }) sourceType!: 'licence-expiry';
+  @ApiProperty({ type: LicenceExpirySummaryDto }) summary!: LicenceExpirySummaryDto;
+  @ApiProperty({ type: String, nullable: true, enum: [...SOURCE_RESOLUTIONS['licence-expiry'], null] }) resolution!: (typeof SOURCE_RESOLUTIONS)['licence-expiry'][number] | null;
+}
+
 export const NOTIFICATION_ENTRY_DTOS = [
   StockAdjustmentNotificationDto,
   CountVarianceNotificationDto,
@@ -195,6 +215,7 @@ export const NOTIFICATION_ENTRY_DTOS = [
   AuditExportNotificationDto,
   LedgerChainBreakNotificationDto,
   QcReceiptNotificationDto,
+  LicenceExpiryNotificationDto,
 ] as const;
 
 export type NotificationEntryDto = InstanceType<(typeof NOTIFICATION_ENTRY_DTOS)[number]>;
@@ -219,6 +240,7 @@ export class NotificationListResponse {
           'audit-export': getSchemaPath(AuditExportNotificationDto),
           'ledger-chain-break': getSchemaPath(LedgerChainBreakNotificationDto),
           'qc-receipt': getSchemaPath(QcReceiptNotificationDto),
+          'licence-expiry': getSchemaPath(LicenceExpiryNotificationDto),
         },
       },
     },

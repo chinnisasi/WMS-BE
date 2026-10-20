@@ -3374,6 +3374,49 @@ export const temperatureExcursions = pgTable(
 export type TemperatureExcursion = typeof temperatureExcursions.$inferSelect;
 
 /**
+ * Story 1-6c — the statutory licences that make holding scheduled drugs and
+ * food legal (Drugs & Cosmetics Act forms 20B/21B/20G, NDPS, FSSAI). Owned by
+ * the compliance module (written only by `LicenceCommand` and the expiry
+ * sweep in `licence.facade.ts`). The HOLDER is a client brand when
+ * `client_id` is set — optionally for one site (`warehouse_id`, the
+ * premises) — else the 3PL's own site, which needs `warehouse_id`. Never
+ * deleted, only withdrawn; kind, client and site are fixed after the add.
+ * `upcoming_warned_on`, `expired_warned_on` and `open_warning_id` are the
+ * expiry sweep's state (decision 8: one warning per term, each raise a fresh
+ * id). The CHECKs, the family-unique index on the number (all FSSAI tiers
+ * one family) and the RLS policy — the tenant arm plus the 0041
+ * `app.client_id` clause on `client_id` — live ONLY in
+ * `drizzle/0084_licences.sql`.
+ */
+export const licences = pgTable(
+  'licences',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    clientId: uuid('client_id'),
+    warehouseId: uuid('warehouse_id'),
+    kind: text('kind').notNull(),
+    number: text('number').notNull(),
+    validFrom: date('valid_from', { mode: 'string' }),
+    validUntil: date('valid_until', { mode: 'string' }),
+    note: text('note'),
+    status: text('status').notNull().default('active'),
+    upcomingWarnedOn: date('upcoming_warned_on', { mode: 'string' }),
+    expiredWarnedOn: date('expired_warned_on', { mode: 'string' }),
+    openWarningId: uuid('open_warning_id'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    index('licences_tenant_client_idx').on(table.tenantId, table.clientId),
+    index('licences_tenant_warehouse_idx').on(table.tenantId, table.warehouseId),
+  ],
+);
+
+export type LicenceRow = typeof licences.$inferSelect;
+
+/**
  * Shipments (Story 4.6c): one label per order — the outbound module's
  * record of the carrier's adapter-issued label. A shipment is created by
  * `createShipmentLabel` (the label command) when a `ready_to_dispatch`

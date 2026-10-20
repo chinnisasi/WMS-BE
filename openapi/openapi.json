@@ -14978,6 +14978,530 @@
         ]
       }
     },
+    "/tenants/{tenantId}/licences/coverage": {
+      "get": {
+        "operationId": "LicencesController_coverage",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoverageGapsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — an operator surface (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Coverage gaps — wherever a client has drug or food goods at a site (on hand, or on an open PO or ASN), each need requires a client licence (for that site or for no site) and a site licence, valid today (IST). The tenant’s own goods need only the site licence",
+        "tags": [
+          "compliance"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/licences": {
+      "get": {
+        "operationId": "LicencesController_list",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "Only this client’s licences",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": false,
+            "in": "query",
+            "description": "Only licences of this site (site licences and client premises licences)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "withdrawn"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenceListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A malformed clientId or warehouseId, or a status off the list (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — an operator surface (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists the tenant's drug and FSSAI licences — active first, then by validUntil — each with the server's expiry badge for today (IST). At most 500",
+        "tags": [
+          "compliance"
+        ]
+      },
+      "post": {
+        "operationId": "LicencesController_add",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddLicenceDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The added licence (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, no holder, the tenant’s own client as holder, a kind off the list, a number that breaks its kind’s rule, a malformed date, no validUntil on an FSSAI or NDPS licence, validUntil before validFrom, or a note over 200 characters (validation-failed, naming the field)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks licences.manage — owner-only (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client, or no warehouse, with this id in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "An active licence of the same family already carries this number (licence-number-taken), the client has departed (client-departed), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Adds a licence (owner-only, licences.manage): a client licence (clientId, optionally a warehouseId — its premises) or a site licence (warehouseId only)",
+        "tags": [
+          "compliance"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/licences/{licenceId}": {
+      "patch": {
+        "operationId": "LicencesController_edit",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "licenceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EditLicenceDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed licenceId, a null number, a field that breaks its rule on the merged licence — clearing validUntil on an FSSAI or NDPS licence included — or a kind, clientId or warehouseId in the body (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks licences.manage — owner-only (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No licence with this id in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The licence is withdrawn (licence-withdrawn), another active licence of the family carries the number (licence-number-taken), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Edits a licence (owner-only, licences.manage): an absent field is kept, null clears it (never the number). Kind, client and site are fixed — a correction is a withdraw plus a new add. A changed validUntil that leaves the warned state resolves the open expiry warning (renewed). An unchanged edit is a no-op (nothing written or audited; the key is stored)",
+        "tags": [
+          "compliance"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/licences/{licenceId}/withdraw": {
+      "post": {
+        "operationId": "LicencesController_withdraw",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "licenceId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The withdrawn licence (a matching Idempotency-Key replays it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LicenceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a malformed licenceId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), the caller lacks licences.manage — owner-only (role-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No licence with this id in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The licence is already withdrawn (licence-withdrawn), or a concurrent request with the same Idempotency-Key (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Withdraws a licence (owner-only, licences.manage) — never deleted; its number is free again and its open expiry warning resolves (withdrawn)",
+        "tags": [
+          "compliance"
+        ]
+      }
+    },
     "/tenants/{tenantId}/movements/transfers": {
       "post": {
         "operationId": "MovementsController_createTransfer",
@@ -20840,6 +21364,7 @@
                 "goods_receipt",
                 "kit",
                 "ledger_chain_break",
+                "licence",
                 "ledger_event",
                 "manifest",
                 "order",
@@ -39845,6 +40370,398 @@
           "lines"
         ]
       },
+      "CoverageGapDto": {
+        "type": "object",
+        "properties": {
+          "holder": {
+            "type": "string",
+            "enum": [
+              "client",
+              "site"
+            ],
+            "description": "`client` — the brand’s licence for this site is missing; `site` — the site’s own"
+          },
+          "clientId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The client of a client gap"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "need": {
+            "type": "string",
+            "enum": [
+              "drug-20b",
+              "drug-21b",
+              "drug-20g",
+              "ndps",
+              "fssai"
+            ]
+          },
+          "coveredBy": {
+            "type": "array",
+            "description": "The kinds that would close the gap",
+            "items": {
+              "type": "string",
+              "enum": [
+                "drug-20b",
+                "drug-21b",
+                "drug-20g",
+                "ndps",
+                "fssai-registration",
+                "fssai-state",
+                "fssai-central"
+              ]
+            }
+          },
+          "skuCount": {
+            "type": "number",
+            "minimum": 1,
+            "description": "Distinct SKUs needing it there — on hand, or on an open PO or ASN"
+          }
+        },
+        "required": [
+          "holder",
+          "warehouseId",
+          "need",
+          "coveredBy",
+          "skuCount"
+        ]
+      },
+      "CoverageGapsResponse": {
+        "type": "object",
+        "properties": {
+          "asOfDate": {
+            "type": "string",
+            "format": "date",
+            "description": "The IST date the gaps were judged for"
+          },
+          "gaps": {
+            "description": "Empty when every drug and food good is covered",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CoverageGapDto"
+            }
+          }
+        },
+        "required": [
+          "asOfDate",
+          "gaps"
+        ]
+      },
+      "LicenceListItemDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "holder": {
+            "type": "string",
+            "enum": [
+              "client",
+              "site"
+            ],
+            "description": "`client` — a brand’s licence (head office when warehouseId is null, else for that premises); `site` — the 3PL’s own site licence"
+          },
+          "clientId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "drug-20b",
+              "drug-21b",
+              "drug-20g",
+              "ndps",
+              "fssai-registration",
+              "fssai-state",
+              "fssai-central"
+            ]
+          },
+          "number": {
+            "type": "string"
+          },
+          "validFrom": {
+            "type": "string",
+            "nullable": true,
+            "format": "date"
+          },
+          "validUntil": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "description": "On a drug form: the retention due date"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "withdrawn"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "expiryState": {
+            "type": "string",
+            "enum": [
+              "valid",
+              "upcoming",
+              "expired",
+              "withdrawn"
+            ],
+            "description": "On asOfDate (IST): upcoming from 60 days before validUntil, expired after it"
+          },
+          "daysLeft": {
+            "type": "number",
+            "nullable": true,
+            "description": "Days from asOfDate to validUntil (negative once expired); null without a date or once withdrawn"
+          }
+        },
+        "required": [
+          "id",
+          "holder",
+          "clientId",
+          "warehouseId",
+          "kind",
+          "number",
+          "validFrom",
+          "validUntil",
+          "note",
+          "status",
+          "createdAt",
+          "updatedAt",
+          "expiryState",
+          "daysLeft"
+        ]
+      },
+      "LicenceListResponse": {
+        "type": "object",
+        "properties": {
+          "asOfDate": {
+            "type": "string",
+            "format": "date",
+            "description": "The IST date the badges were computed for (the server’s clock)"
+          },
+          "items": {
+            "description": "Active first, then by validUntil (soonest first, none last); at most 500",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LicenceListItemDto"
+            }
+          }
+        },
+        "required": [
+          "asOfDate",
+          "items"
+        ]
+      },
+      "AddLicenceDto": {
+        "type": "object",
+        "properties": {
+          "clientId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The client brand holding it. Omit (or null) for a site licence — the 3PL’s own. Never the tenant’s own (`self`) client: its goods are covered by the site licence"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The site of a site licence (required then), or the premises of a client licence. A client licence without one is a head-office or central licence, valid at every site"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "drug-20b",
+              "drug-21b",
+              "drug-20g",
+              "ndps",
+              "fssai-registration",
+              "fssai-state",
+              "fssai-central"
+            ],
+            "description": "The statutory form: drug-20b (G/H/H1), drug-21b (C/C1), drug-20g (X), ndps, or an FSSAI tier"
+          },
+          "number": {
+            "type": "string",
+            "example": "MH/PUN/20B-12",
+            "maxLength": 100,
+            "description": "Stored trimmed, spaces collapsed, upper-cased. FSSAI: 14 digits (a registration starts with 2, a state or central licence with 1). Drug and NDPS: 1–50 of A–Z 0–9 space / . -"
+          },
+          "validFrom": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "maxLength": 10,
+            "description": "YYYY-MM-DD; omit or null for none"
+          },
+          "validUntil": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "maxLength": 10,
+            "description": "YYYY-MM-DD. Required for FSSAI and NDPS; optional on a drug form, where it is the retention due date"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "Trimmed; blank is none. At most 200 characters"
+          }
+        },
+        "required": [
+          "kind",
+          "number"
+        ]
+      },
+      "LicenceDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "holder": {
+            "type": "string",
+            "enum": [
+              "client",
+              "site"
+            ],
+            "description": "`client` — a brand’s licence (head office when warehouseId is null, else for that premises); `site` — the 3PL’s own site licence"
+          },
+          "clientId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "drug-20b",
+              "drug-21b",
+              "drug-20g",
+              "ndps",
+              "fssai-registration",
+              "fssai-state",
+              "fssai-central"
+            ]
+          },
+          "number": {
+            "type": "string"
+          },
+          "validFrom": {
+            "type": "string",
+            "nullable": true,
+            "format": "date"
+          },
+          "validUntil": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "description": "On a drug form: the retention due date"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "withdrawn"
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          },
+          "updatedAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC"
+          }
+        },
+        "required": [
+          "id",
+          "holder",
+          "clientId",
+          "warehouseId",
+          "kind",
+          "number",
+          "validFrom",
+          "validUntil",
+          "note",
+          "status",
+          "createdAt",
+          "updatedAt"
+        ]
+      },
+      "LicenceResponse": {
+        "type": "object",
+        "properties": {
+          "licence": {
+            "$ref": "#/components/schemas/LicenceDto"
+          }
+        },
+        "required": [
+          "licence"
+        ]
+      },
+      "EditLicenceDto": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string",
+            "maxLength": 100,
+            "description": "The corrected number (same rules as the add); cannot be null"
+          },
+          "validFrom": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "maxLength": 10,
+            "description": "YYYY-MM-DD; null clears it"
+          },
+          "validUntil": {
+            "type": "string",
+            "nullable": true,
+            "format": "date",
+            "maxLength": 10,
+            "description": "YYYY-MM-DD; null clears it (refused on FSSAI and NDPS)"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "Null or blank clears it"
+          }
+        }
+      },
       "TransferLineDto": {
         "type": "object",
         "properties": {
@@ -43815,6 +44732,7 @@
               "goods_receipt",
               "kit",
               "ledger_chain_break",
+              "licence",
               "ledger_event",
               "manifest",
               "order",
@@ -43904,6 +44822,7 @@
               "goods_receipt",
               "kit",
               "ledger_chain_break",
+              "licence",
               "ledger_event",
               "manifest",
               "order",
@@ -48827,6 +49746,127 @@
           "resolution"
         ]
       },
+      "LicenceExpirySummaryDto": {
+        "type": "object",
+        "properties": {
+          "licenceId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "drug-20b",
+              "drug-21b",
+              "drug-20g",
+              "ndps",
+              "fssai-registration",
+              "fssai-state",
+              "fssai-central"
+            ]
+          },
+          "number": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string",
+            "enum": [
+              "client",
+              "site"
+            ],
+            "description": "`client` — a brand’s licence; `site` — the 3PL’s own site"
+          },
+          "holderName": {
+            "type": "string",
+            "description": "The client’s name, or the site’s name"
+          },
+          "siteCode": {
+            "type": "string",
+            "description": "The site’s code — a site licence, or a client licence for one premises"
+          },
+          "validUntil": {
+            "type": "string",
+            "format": "date",
+            "description": "YYYY-MM-DD (IST)"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "upcoming",
+              "expired"
+            ]
+          }
+        },
+        "required": [
+          "licenceId",
+          "kind",
+          "number",
+          "holder",
+          "holderName",
+          "validUntil",
+          "state"
+        ]
+      },
+      "LicenceExpiryNotificationDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sourceId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The source occurrence’s own id (the pending adjustment, the over-receipt, the episode…)"
+          },
+          "warehouseId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The warehouse the source belongs to; null for a device op or a channel"
+          },
+          "raisedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the source raised it (the list orders by this, newest first)"
+          },
+          "resolvedAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the source cleared; null while open"
+          },
+          "sourceType": {
+            "type": "string",
+            "enum": [
+              "licence-expiry"
+            ]
+          },
+          "summary": {
+            "$ref": "#/components/schemas/LicenceExpirySummaryDto"
+          },
+          "resolution": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "renewed",
+              "withdrawn",
+              "expired",
+              null
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "sourceId",
+          "warehouseId",
+          "raisedAt",
+          "resolvedAt",
+          "sourceType",
+          "summary",
+          "resolution"
+        ]
+      },
       "NotificationListResponse": {
         "type": "object",
         "properties": {
@@ -48867,6 +49907,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/QcReceiptNotificationDto"
+                },
+                {
+                  "$ref": "#/components/schemas/LicenceExpiryNotificationDto"
                 }
               ],
               "discriminator": {
@@ -48882,7 +49925,8 @@
                   "channel-sync": "#/components/schemas/ChannelSyncNotificationDto",
                   "audit-export": "#/components/schemas/AuditExportNotificationDto",
                   "ledger-chain-break": "#/components/schemas/LedgerChainBreakNotificationDto",
-                  "qc-receipt": "#/components/schemas/QcReceiptNotificationDto"
+                  "qc-receipt": "#/components/schemas/QcReceiptNotificationDto",
+                  "licence-expiry": "#/components/schemas/LicenceExpiryNotificationDto"
                 }
               }
             }

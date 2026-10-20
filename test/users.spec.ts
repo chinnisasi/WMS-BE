@@ -896,7 +896,10 @@ describe('users, roles, and permission gating (e2e)', () => {
     // Story 13-1 grows it to 44 with `returns.manage` — authorize and cancel
     // return authorizations: owner + ops_manager (decision 1 — operators
     // only, never a client-held capability).
-    expect([...CAPABILITIES]).toHaveLength(44);
+    // Story 1-6c grows it to 45 with `licences.manage` — add, edit and
+    // withdraw the drug and FSSAI licences: OWNER-ONLY (decision 11).
+    expect([...CAPABILITIES]).toHaveLength(45);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('licences.manage'))).toEqual(['owner']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('returns.manage'))).toEqual(['owner', 'ops_manager']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('ledger.acknowledge'))).toEqual(['owner']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('audit.view'))).toEqual(['owner']);

@@ -67,6 +67,10 @@ export const AUDIT_TARGET_TYPES = [
   'kit',
   // Story 9-3c — a ledger chain break (`ledger_chain_break.acknowledged`).
   'ledger_chain_break',
+  // Story 1-6c — a drug or FSSAI licence (`licence.added | edited |
+  // withdrawn`, and the expiry sweep's `licence.expiry_upcoming_raised |
+  // expired_raised`, system actor).
+  'licence',
   'ledger_event',
   'manifest',
   'order',
@@ -216,4 +220,10 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'partner.link_updated', targetType: 'partner_link' },
   { action: 'partner.link_deactivated', targetType: 'partner_link' },
   { action: 'partner.link_reactivated', targetType: 'partner_link' },
+  // Story 1-6c — the licence master (`LicenceCommand`); an unchanged edit is
+  // a declared no-op (`licences.edit:unchanged`). The expiry sweep's raises
+  // are unkeyed system rows (`SYSTEM_ACTOR_ID`), outside this list.
+  { action: 'licence.added', targetType: 'licence' },
+  { action: 'licence.edited', targetType: 'licence' },
+  { action: 'licence.withdrawn', targetType: 'licence' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

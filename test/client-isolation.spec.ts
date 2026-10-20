@@ -554,6 +554,30 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       expect(byClient.get(clientB)).toBeGreaterThan(0);
     });
 
+    it('story 1-6c: a SITE licence (null client_id) is invisible to a portal stamp and its insert refused; the own client licence is visible, the sibling’s is not', async () => {
+      const own = uuidv7();
+      const sibling = uuidv7();
+      const site = uuidv7();
+      await sql`insert into licences (id, tenant_id, client_id, warehouse_id, kind, number) values
+        (${own}, ${tenantId}, ${clientA}, null, 'drug-20b', ${'P-OWN-' + ulid().slice(-6)}),
+        (${sibling}, ${tenantId}, ${clientB}, null, 'drug-20b', ${'P-SIB-' + ulid().slice(-6)}),
+        (${site}, ${tenantId}, null, ${warehouseId}, 'drug-20b', ${'P-SITE-' + ulid().slice(-6)})`;
+      try {
+        // Positive control: the operator shape sees all three.
+        expect(countOf(await operator((tx) => tx`select count(*)::int as n from licences where id in (${own}, ${sibling}, ${site})`))).toBe(3);
+        // The portal shape: its own client licence only — never the site row, never the sibling's.
+        const seen = (await portal((tx) => tx`select id from licences where tenant_id = ${tenantId}`)) as unknown as { id: string }[];
+        expect(seen.map((row) => row.id)).toEqual([own]);
+        // …and a stamped session cannot write a site licence (null client_id never equals the stamp).
+        await expect(
+          portal((tx) => tx`insert into licences (id, tenant_id, client_id, warehouse_id, kind, number)
+            values (${uuidv7()}, ${tenantId}, null, ${warehouseId}, 'drug-21b', 'P-SITE-W')`),
+        ).rejects.toMatchObject({ code: '42501' });
+      } finally {
+        await sql`delete from licences where id in (${own}, ${sibling}, ${site})`;
+      }
+    });
+
     it('the WITH CHECK arm rejects a foreign-client INSERT with 42501, on every stamped table (rate-card lines: the freeze trigger fails closed first)', async () => {
       for (const table of STAMPED_TABLES) {
         let rejected: Promise<unknown>;
@@ -999,7 +1023,12 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
       // Story 1-4: + sku_barcodes_tenant_isolation (0080, client-bound on both
       // arms); products_tenant_isolation was DROPPED and recreated with the
       // client clause, not added.
-      expect(policies).toHaveLength(117);
+      // Story 1-6c: + licences_tenant_isolation (0084, client-bound on both
+      // arms; a site licence — null client_id — is invisible to a portal stamp).
+      expect(policies).toHaveLength(118);
+      const licencePolicy = policies.find((row) => row.policyname === 'licences_tenant_isolation')!;
+      expect(licencePolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
+      expect(licencePolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       const linkPolicy = policies.find((row) => row.policyname === 'partner_client_links_tenant_isolation')!;
       expect(linkPolicy.qual).toContain("(client_id = (NULLIF(current_setting('app.client_id'");
       expect(linkPolicy.with_check).toContain("(client_id = (NULLIF(current_setting('app.client_id'");

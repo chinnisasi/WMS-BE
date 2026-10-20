@@ -11,6 +11,7 @@ import { CarriersController } from './carriers.controller';
 import { ChannelsController } from './channels.controller';
 import { WebhooksController } from './webhooks.controller';
 import { ComplianceController } from './compliance.controller';
+import { LicencesController } from './licences.controller';
 import { InvoicingController } from './invoicing.controller';
 import { EwayController } from './eway.controller';
 import { MovementsController } from './movements.controller';
@@ -100,6 +101,9 @@ import { SharedModule } from '../shared/shared.module';
     // rides the same shape: `ComplianceModule` is a spine-singleton already
     // imported by the root; every mutation goes through `ExcursionFacade`.
     ComplianceController,
+    // Story 1-6c — the drug and FSSAI licences (list, coverage gaps, add,
+    // edit, withdraw) through `LicenceFacade` (compliance).
+    LicencesController,
     // Story 5-1 — the movements surface (the transfer-order lifecycle) rides
     // the same shape: `MovementsModule` is a spine-singleton already imported
     // by the root; every mutation goes through `MovementsFacade`.

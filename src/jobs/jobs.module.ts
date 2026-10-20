@@ -26,6 +26,11 @@ import { AUDIT_EXPORT_STALE_MINUTES } from '../modules/tenancy/audit-export.runn
 import { purgeEndedSessions } from '../modules/tenancy/sessions';
 import { purgeAuthCounters } from '../modules/tenancy/auth-attempts';
 import { purgeSecondFactorState } from '../modules/tenancy/second-factor';
+import { ComplianceModule } from '../modules/compliance/compliance.module';
+import { LicenceFacade } from '../modules/compliance/licence.facade';
+import { licenceToday } from '../modules/compliance/licence.command';
+import { LICENCE_WARNING_LEAD_DAYS } from '../shared/primitives/licence';
+import { addIsoDays } from '../shared/primitives/time';
 
 /** The problem code a failed ATP read fails closed with (A8's store split). */
 function codeOf(error: ProblemException): string | null {
@@ -995,6 +1000,11 @@ export function parseWaveCutoffSweepPollMs(raw: string | undefined): number {
   return parsePollMs('WAVE_CUTOFF_SWEEP_POLL_MS', raw);
 }
 
+/** `LICENCE_EXPIRY_POLL_MS` (story 1-6c): the licence expiry sweep's poll; unset/`0` = OFF. */
+export function parseLicenceExpiryPollMs(raw: string | undefined): number {
+  return parsePollMs('LICENCE_EXPIRY_POLL_MS', raw);
+}
+
 /**
  * Story 9-2b — the push sender worker. Each tick finds the tenants with due
  * push rows — `pending` past `next_attempt_at`, or `sending` past the
@@ -1474,6 +1484,83 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, OnApplication
   }
 }
 
+/**
+ * Story 1-6c — the licence expiry sweep worker (the `WaveCutoffSweepWorker`
+ * shape). Each tick finds the tenants with an active licence whose
+ * `validUntil` falls inside the 60-day warning window and is not yet warned
+ * for every state (cross-tenant, read-only, `AUTH_DATABASE`), and calls
+ * `LicenceFacade.sweepExpiry(tenantId, today)` — which raises
+ * `licence.expiry_upcoming` / `licence.expired` once per term (IST dates).
+ * A failing tenant is logged and retried next tick. Env-gated OFF when
+ * `LICENCE_EXPIRY_POLL_MS` is unset/`0`; single-flight; `unref`'d timer.
+ */
+@Injectable()
+export class LicenceExpiryWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+  private readonly logger = new Logger('LicenceExpiryWorker');
+  private readonly pollMs: number;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private running = false;
+
+  constructor(
+    @Inject(AUTH_DATABASE) private readonly authDb: Database,
+    @Inject(LicenceFacade) private readonly licences: LicenceFacade,
+  ) {
+    this.pollMs = parseLicenceExpiryPollMs(process.env.LICENCE_EXPIRY_POLL_MS);
+  }
+
+  onApplicationBootstrap(): void {
+    if (this.pollMs === 0) {
+      return; // env-gated off
+    }
+    this.logger.log(`Licence expiry worker started (poll every ${this.pollMs}ms)`);
+    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer.unref?.();
+  }
+
+  onApplicationShutdown(): void {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /** One cycle for the IST date `today` (the licence clock's by default); returns the tenants it swept. */
+  async tick(today: string = licenceToday()): Promise<string[]> {
+    if (this.running) {
+      return [];
+    }
+    this.running = true;
+    try {
+      const tenants = (await this.authDb.execute(sql`
+        select distinct tenant_id as "tenantId"
+          from licences
+         where status = 'active' and valid_until is not null
+           and valid_until <= ${addIsoDays(today, LICENCE_WARNING_LEAD_DAYS)}::date
+           and (upcoming_warned_on is null or expired_warned_on is null)
+         order by tenant_id asc
+      `)) as unknown as { tenantId: string }[];
+      const swept: string[] = [];
+      for (const { tenantId } of tenants) {
+        try {
+          await this.licences.sweepExpiry(tenantId, today);
+          swept.push(tenantId);
+        } catch (error) {
+          this.logger.error(
+            `Licence expiry sweep failed for tenant ${tenantId} — retried next tick: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      return swept;
+    } catch (error) {
+      this.logger.error(`Licence expiry sweep cycle failed: ${error instanceof Error ? error.message : String(error)}`);
+      return [];
+    } finally {
+      this.running = false;
+    }
+  }
+}
+
 @Module({
   imports: [
     SharedModule,
@@ -1487,6 +1574,8 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, OnApplication
     NotificationsModule,
     // Story 9-3b — the audit export runner (tenancy).
     TenancyModule,
+    // Story 1-6c — the licence expiry sweep (compliance).
+    ComplianceModule,
   ],
   providers: [
     OutboxRelayWorker,
@@ -1508,6 +1597,8 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, OnApplication
     LedgerIntegrityWorker,
     // Story 6-1a — the session / attempt-counter purge (env-gated OFF by default).
     SessionPurgeWorker,
+    // Story 1-6c — the licence expiry sweep (env-gated OFF by default).
+    LicenceExpiryWorker,
   ],
   exports: [],
 })

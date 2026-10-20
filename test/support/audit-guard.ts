@@ -93,6 +93,8 @@ export const AUDIT_NO_OP_ARMS = {
   'skus.packaging:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'sku'),
   /** Story 1-4b — `SkuCommand.updateStatus` to the status (and reason) already in place (stores the key with `{ sku }`). */
   'skus.status:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'sku'),
+  /** Story 1-6c — `LicenceCommand.edit` with nothing changed (stores the key with `{ licence }`). */
+  'licences.edit:unchanged': (snapshot: unknown) => entitySnapshot(snapshot, 'licence'),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&
