@@ -20,7 +20,17 @@ import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
 // putaway command cannot be imported: it imports THIS facade — a module
 // evaluation cycle), reusing the same primitives so the rules stay single-
 // sourced even where the read is duplicated.
-import { hazardClassesCompatible } from '../../shared/primitives/hazard';
+// Story 1-6b — the ONE goods-type segregation predicate (12-2's hazard
+// matrix widened to the SKU's profile), its refusal factory and facts.
+import {
+  EMPTY_PROFILE_SQL,
+  SEGREGATION_PROFILE_COLUMNS,
+  binGoodsConflict,
+  conflictFacts,
+  goodsConflict,
+  goodsConflictDetail,
+  profileOf,
+} from '../../shared/primitives/segregation';
 import {
   bulkAssetOccupancyHolds,
   isBulkAssetType,
@@ -2357,7 +2367,8 @@ export class InventoryFacade {
         // Story 1-1 — the client labels a refusal that names codes.
         clientId: skus.clientId,
         storageClass: skus.storageClass,
-        hazardClass: skus.hazardClass,
+        // Story 1-6b — the segregation profile (was the hazard class alone).
+        ...SEGREGATION_PROFILE_COLUMNS,
         weightGrams: skus.weightGrams,
         lengthMm: skus.lengthMm,
         widthMm: skus.widthMm,
@@ -2457,10 +2468,12 @@ export class InventoryFacade {
         );
       }
     }
-    // The hazard co-location gate (12-2): the bin's classed occupants, the
-    // moving SKUs' own pairs skipped (the same-SKU-consolidation rule).
+    // The co-location gate (12-2, widened by 1-6b to the goods-type rules):
+    // the bin's occupants with a non-empty segregation profile, the moving
+    // SKUs' own pairs skipped (the same-SKU-consolidation rule). 409
+    // `bin-segregation-conflict` naming both SKUs, the facts and the rule.
     const hazardOccupants = await tx
-      .select({ skuId: stockOnHand.skuId, skuCode: skus.code, hazardClass: skus.hazardClass })
+      .select({ skuId: stockOnHand.skuId, skuCode: skus.code, ...SEGREGATION_PROFILE_COLUMNS })
       .from(stockOnHand)
       .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
       .where(
@@ -2469,28 +2482,35 @@ export class InventoryFacade {
           eq(stockOnHand.warehouseId, args.warehouseId),
           eq(stockOnHand.binId, args.binId),
           sql`${stockOnHand.quantity} > 0`,
-          sql`${skus.hazardClass} is not null`,
+          EMPTY_PROFILE_SQL,
         ),
       );
     for (const occupant of hazardOccupants) {
       if (skuIds.includes(occupant.skuId)) {
         continue;
       }
+      const occupantProfile = profileOf(occupant);
       for (const skuId of skuIds) {
         const sku = skuById.get(skuId)!;
-        if (!hazardClassesCompatible(sku.hazardClass, occupant.hazardClass)) {
-          throw new ProblemException(
-            'bin-segregation-conflict',
+        const incoming = profileOf(sku);
+        const conflict = goodsConflict(incoming, occupantProfile);
+        if (conflict !== null) {
+          throw binGoodsConflict(
+            conflict.rule,
+            goodsConflictDetail(conflict, {
+              binCode: bin.code,
+              incomingCode: sku.code,
+              incoming,
+              occupantCode: occupant.skuCode,
+              occupant: occupantProfile,
+            }),
             409,
-            'Target bin holds a segregated hazard class',
-            `Bin "${bin.code}" holds SKU "${occupant.skuCode}" (${occupant.hazardClass}) — SKU "${sku.code}" ` +
-              `(${sku.hazardClass ?? 'no hazard class'}) is segregated from it (FR-41).`,
           );
         }
       }
     }
     // The moving SKUs against EACH OTHER (story 5-1 review): the occupants
-    // loop skips a moving SKU's own rows, so two mutually segregated SKUs
+    // loop skips a moving SKU's own rows, so two mutually conflicting SKUs
     // landing in one bin within a single confirm would pass against empty
     // occupants — and the transfer inbound confirm is the FIRST writer that
     // can create such a pair in one transaction (no prior writer lands two
@@ -2499,15 +2519,15 @@ export class InventoryFacade {
       for (let j = i + 1; j < skuIds.length; j++) {
         const a = skuById.get(skuIds[i]!)!;
         const b = skuById.get(skuIds[j]!)!;
-        if (!hazardClassesCompatible(a.hazardClass, b.hazardClass)) {
-          throw new ProblemException(
-            'bin-segregation-conflict',
-            409,
-            'Landing SKUs are segregated from each other',
-            `SKUs "${a.code}" (${a.hazardClass ?? 'no hazard class'}) and "${b.code}" ` +
-              `(${b.hazardClass ?? 'no hazard class'}) are segregated from each other and cannot ` +
-              `land in bin "${bin.code}" together (FR-41).`,
-          );
+        const conflict = goodsConflict(profileOf(a), profileOf(b));
+        if (conflict !== null) {
+          const facts = conflictFacts(conflict, profileOf(a), profileOf(b));
+          // The hazard-pair wording stays 12-2's byte for byte (`(FR-41)` last).
+          const verdict =
+            conflict.rule === 'hazard-pair'
+              ? `are segregated from each other and cannot land in bin "${bin.code}" together (FR-41).`
+              : `${facts.pairVerdict} and cannot land in bin "${bin.code}" together.`;
+          throw binGoodsConflict(conflict.rule, `SKUs "${a.code}" (${facts.a}) and "${b.code}" (${facts.b}) ${verdict}`, 409);
         }
       }
     }

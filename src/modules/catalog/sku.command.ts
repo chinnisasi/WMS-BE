@@ -42,15 +42,21 @@ import {
   storageClassConflict,
   storageClassSatisfies,
 } from '../../shared/primitives/storage-class';
-// Story 12-2 — the vocabulary validator + the segregation-state refusal
-// factory, and the ONE compatibility predicate the binmates' gate walks;
-// the co-location read is imported from putaway (the tenancy merge gate's
-// `binBlocked` precedent).
+// Story 12-2 — the hazard vocabulary validator; the co-location read is
+// imported from putaway (the tenancy merge gate's `binBlocked` precedent).
+import { assertHazardClass } from '../../shared/primitives/hazard';
+// Story 1-6b — the goods-type segregation predicate the edit guard walks
+// (`conflictKeys` — refuse only what the edit makes worse) and its refusal.
 import {
-  assertHazardClass,
-  hazardClassesCompatible,
-  segregationStateConflict,
-} from '../../shared/primitives/hazard';
+  conflictFacts,
+  goodsStateConflict,
+  isEmptyProfile,
+  newGoodsConflict,
+  profileOf,
+  sameProfile,
+  type GoodsSegregationRule,
+  type SegregationProfile,
+} from '../../shared/primitives/segregation';
 // Story 5-3 — the ABC class vocabulary validator (the hazard shape).
 import { assertAbcClass } from '../../shared/primitives/abc-class';
 // Story 1-6a — the goods-type rule set (canonicalisation, the pairing rules,
@@ -1226,113 +1232,119 @@ export class SkuCommand {
           }
         }
 
-        // ── Story 12-2: the hazard-edit arm. The SKU row takes `.for('update')`
-        // whenever the hazard-class FIELD is present (a change, a no-op edit
-        // and a clear all lock — the same over-lock-is-harmless shape as the
-        // 12-1 arm above), and the co-location guard BODY runs only on a
-        // CHANGE to a non-null class: a null clear carries no rule in either
-        // direction, so it always succeeds (the spec's acceptance arm).
+        // ── Story 12-2 / 1-6b: the segregation-edit arm. Every edit already
+        // holds the SKU row `FOR UPDATE` (since 1-4, above), so the guard
+        // decides against the locked row. The guard BODY runs when the
+        // edit changes the SKU's segregation PROFILE (decision 3 — arrays
+        // compared as sorted sets, the hazard class being `effectiveHazard`,
+        // so a DG-only PATCH that derives one is guarded like a hazard PATCH)
+        // to a non-empty one: an empty profile carries no rule in either
+        // direction, so a clear always succeeds.
         //
         // The guard (409 `hazard-segregation-conflict`): for every non-system
-        // bin where the SKU holds stock tenant-wide, the bin's OTHER
-        // occupants must all be compatible with the new class — the
-        // co-location rule is SKU × SKU-in-bin, so the binmates are the
-        // parties. The open-QC-hold quantities are attributed to their
-        // ORIGIN bins (a later `qc.released` would return those units there;
-        // release itself stays class-free — pinned indirectly, the 12-1
-        // pattern), and the party message names the pinning hold's id so the
-        // operator can find it.
-        if (hazardChanges) {
-          const hazardLockedRows = await tx
-            .select()
-            .from(skus)
-            .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
-            .limit(1)
-            .for('update');
-          const hazardLocked = hazardLockedRows[0]!;
-          const newHazardClass = effectiveHazard;
-          if (newHazardClass !== null && hazardLocked.hazardClass !== newHazardClass) {
-            const stockBins = await tx
-              .select({
-                binId: bins.id,
-                binCode: bins.code,
-                warehouseId: bins.warehouseId,
-              })
-              .from(stockOnHand)
-              .innerJoin(bins, eq(bins.id, stockOnHand.binId))
-              .where(
-                and(
-                  eq(stockOnHand.tenantId, command.tenantId),
-                  eq(stockOnHand.skuId, command.skuId),
-                  gt(stockOnHand.quantity, 0),
-                  eq(bins.systemOwned, false),
-                ),
-              );
-            // The SKU could hold several stock rows in one bin (the batch
-            // arms fold into separate projection rows) — one candidate bin.
-            const binById = new Map(stockBins.map((row) => [row.binId, row]));
-            const holds = await openQcHoldsForSkuInTx(tx, command.tenantId, command.skuId);
-            const originBinIds = [...new Set(holds.map((hold) => hold.binId))];
-            const originRows =
-              originBinIds.length === 0
-                ? []
-                : await tx
-                    .select({
-                      id: bins.id,
-                      code: bins.code,
-                      warehouseId: bins.warehouseId,
-                      systemOwned: bins.systemOwned,
-                    })
-                    .from(bins)
-                    .where(and(eq(bins.tenantId, command.tenantId), inArray(bins.id, originBinIds)));
-            // Non-system origins only (staging attributes nothing — as
-            // before), now decided BEFORE the ONE grouped occupant read.
-            const originById = new Map(
-              originRows.filter((row) => !row.systemOwned).map((row) => [row.id, row]),
+        // bin where the SKU holds stock tenant-wide, and every non-system
+        // origin of its open QC holds (a later `qc.released` would return
+        // those units there; release itself stays ungated — pinned
+        // indirectly, the 12-1 pattern), each OTHER occupant (the binmate)
+        // is judged by `conflictKeys`: the edit is refused when the new
+        // profile's keys against the binmate are not a subset of the stored
+        // profile's — refuse only what the edit makes worse. So 12-2's
+        // explosive → flammable beside an oxidizer is still refused, and a
+        // rename (or any profile change) in a bin that was already mixed
+        // passes. The detail lists every newly conflicting bin, binmate and
+        // hold, naming the rule the edit newly fires.
+        const storedProfile = profileOf(current);
+        const nextProfile: SegregationProfile = {
+          hazardClass: effectiveHazard,
+          dgClass: mergedGoods.dgClass ?? null,
+          dgSubsidiaryClasses: mergedGoods.dgSubsidiaryClasses ?? [],
+          drugSchedules: mergedGoods.drugSchedules ?? [],
+          foodCategory: mergedGoods.foodCategory ?? null,
+          allergens: mergedGoods.allergens ?? [],
+        };
+        if (!sameProfile(nextProfile, storedProfile) && !isEmptyProfile(nextProfile)) {
+          const stockBins = await tx
+            .select({
+              binId: bins.id,
+              binCode: bins.code,
+              warehouseId: bins.warehouseId,
+            })
+            .from(stockOnHand)
+            .innerJoin(bins, eq(bins.id, stockOnHand.binId))
+            .where(
+              and(
+                eq(stockOnHand.tenantId, command.tenantId),
+                eq(stockOnHand.skuId, command.skuId),
+                gt(stockOnHand.quantity, 0),
+                eq(bins.systemOwned, false),
+              ),
             );
-            // ONE grouped occupant read over EVERY candidate bin — the
-            // stocked bins and the hold origins together, no per-bin queries
-            // inside the row lock. One row per (bin, binmate): a bin that is
-            // both a stock bin and a hold origin yields ONE party row, and
-            // the dedupe falls out of the read — the hold-origin copy
-            // carries the richer hold-naming message whenever the bin is a
-            // hold origin.
-            const occupants = await binOccupantHazardPairsInTx(tx, command.tenantId, [
-              ...binById.keys(),
-              ...originById.keys(),
-            ]);
-            const holdIdByBin = new Map(holds.map((hold) => [hold.binId, hold.holdId]));
-            const parties: string[] = [];
-            for (const occupant of occupants) {
-              // The SKU's own units are not binmates — they move with the
-              // edit (the same-SKU-consolidation rule).
-              if (occupant.skuId === command.skuId) {
-                continue;
-              }
-              if (hazardClassesCompatible(newHazardClass, occupant.hazardClass)) {
-                continue;
-              }
-              const origin = originById.get(occupant.binId);
-              if (origin !== undefined) {
-                parties.push(
-                  `origin bin "${origin.code}" (warehouse ${origin.warehouseId}) co-locates with ` +
-                    `"${occupant.skuCode}" (${occupant.hazardClass}, hold "${holdIdByBin.get(occupant.binId)}")`,
-                );
-              } else {
-                const bin = binById.get(occupant.binId)!;
-                parties.push(
-                  `bin "${bin.binCode}" (warehouse ${bin.warehouseId}) co-locates with ` +
-                    `"${occupant.skuCode}" (${occupant.hazardClass})`,
-                );
-              }
+          // The SKU could hold several stock rows in one bin (the batch
+          // arms fold into separate projection rows) — one candidate bin.
+          const binById = new Map(stockBins.map((row) => [row.binId, row]));
+          const holds = await openQcHoldsForSkuInTx(tx, command.tenantId, command.skuId);
+          const originBinIds = [...new Set(holds.map((hold) => hold.binId))];
+          const originRows =
+            originBinIds.length === 0
+              ? []
+              : await tx
+                  .select({
+                    id: bins.id,
+                    code: bins.code,
+                    warehouseId: bins.warehouseId,
+                    systemOwned: bins.systemOwned,
+                  })
+                  .from(bins)
+                  .where(and(eq(bins.tenantId, command.tenantId), inArray(bins.id, originBinIds)));
+          // Non-system origins only (staging attributes nothing — as
+          // before), decided BEFORE the ONE grouped occupant read.
+          const originById = new Map(
+            originRows.filter((row) => !row.systemOwned).map((row) => [row.id, row]),
+          );
+          // ONE grouped occupant read over EVERY candidate bin — the
+          // stocked bins and the hold origins together, no per-bin queries
+          // inside the row lock. One row per (bin, binmate): a bin that is
+          // both a stock bin and a hold origin yields ONE party row, and
+          // the dedupe falls out of the read — the hold-origin copy carries
+          // the richer hold-naming message whenever the bin is a hold
+          // origin.
+          const occupants = await binOccupantHazardPairsInTx(tx, command.tenantId, [
+            ...binById.keys(),
+            ...originById.keys(),
+          ]);
+          const holdIdByBin = new Map(holds.map((hold) => [hold.binId, hold.holdId]));
+          const parties: string[] = [];
+          let firstRule: GoodsSegregationRule | null = null;
+          for (const occupant of occupants) {
+            // The SKU's own units are not binmates — they move with the
+            // edit (the same-SKU-consolidation rule).
+            if (occupant.skuId === command.skuId) {
+              continue;
             }
-            if (parties.length > 0) {
-              throw segregationStateConflict(
-                `SKU "${current.code}" would carry the "${newHazardClass}" hazard class, but its bins ` +
-                  `co-locate with segregated classes: ${parties.join('; ')} — relocate the stock ` +
-                  'or release the holds first.',
+            const conflict = newGoodsConflict(nextProfile, storedProfile, occupant.profile);
+            if (conflict === null) {
+              continue;
+            }
+            firstRule ??= conflict.rule;
+            const facts = conflictFacts(conflict, nextProfile, occupant.profile);
+            const why = `"${occupant.skuCode}" (${facts.b}) — "${current.code}" (${facts.a}) ${facts.verdict}`;
+            const origin = originById.get(occupant.binId);
+            if (origin !== undefined) {
+              parties.push(
+                `origin bin "${origin.code}" (warehouse ${origin.warehouseId}, hold "${holdIdByBin.get(occupant.binId)}") ` +
+                  `co-locates with ${why}`,
               );
+            } else {
+              const bin = binById.get(occupant.binId)!;
+              parties.push(`bin "${bin.binCode}" (warehouse ${bin.warehouseId}) co-locates with ${why}`);
             }
+          }
+          if (firstRule !== null) {
+            throw goodsStateConflict(
+              firstRule,
+              `SKU "${current.code}" would conflict with stock it shares bins with: ${parties.join('; ')} — ` +
+                'relocate the stock or release the holds first.',
+            );
           }
         }
 

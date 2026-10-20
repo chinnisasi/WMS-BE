@@ -130,6 +130,47 @@ describe('segregation matrix (e2e, story 12-7)', () => {
     );
   });
 
+  test('story 1-6b: serves the six goods-type rules verbatim, in check order, beside the unchanged grid', async () => {
+    const res = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/catalog/segregation-matrix`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(200);
+    // Written out word for word (the spec's table) — not read back from the
+    // primitive, so a reworded or reordered rule fails here.
+    expect(res.body.rules).toEqual([
+      {
+        code: 'hazard-pair',
+        description:
+          'Hazard classes that react — the grid above — never share a bin. A DG subsidiary risk counts like its primary class.',
+      },
+      {
+        code: 'explosive-dg',
+        description:
+          'An explosive never shares a bin with any dangerous good, including DG classes with no hazard class (4, 5.2, 6.2, 7, 9, 8 none).',
+      },
+      {
+        code: 'food-chemical',
+        description:
+          'Food never shares a bin with a chemical — any SKU with a hazard class or a DG class that is not itself a food or drug.',
+      },
+      { code: 'drug-chemical', description: 'A scheduled drug never shares a bin with a chemical.' },
+      {
+        code: 'allergen-mismatch',
+        description:
+          'Two foods share a bin only when they declare the same allergens. No allergens entered counts as allergen-free.',
+      },
+      {
+        code: 'raw-ready-to-eat',
+        description:
+          'Raw meat, poultry and seafood never share a bin with dairy, ready-to-eat food, fresh produce, bakery and cereals, or infant food.',
+      },
+    ]);
+    // The grid is unchanged beside it (1-6b decision 6).
+    expect(res.body.classes).toEqual([...HAZARD_CLASSES]);
+    expect(res.body.incompatible).toEqual(enumerateIncompatiblePairs());
+    expect(Object.keys(res.body).sort()).toEqual(['classes', 'incompatible', 'rules']);
+  });
+
   test('agrees with the predicate over all 28 unordered pairs (the drift pin)', async () => {
     const res = await request(app.getHttpServer())
       .get(`${API}/${tenantId}/catalog/segregation-matrix`)

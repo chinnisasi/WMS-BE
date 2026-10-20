@@ -782,6 +782,145 @@ describe('Transfer Orders: two-leg state machine, ledger legs, in-transit parkin
       }).expect(400);
     });
 
+    it('story 1-6b: landing rice in a bin holding a DG 6.1 SKU is 409 bin-segregation-conflict naming both and the rule; the order stays in_transit and lands in a clean bin', async () => {
+      const createSku = async (code: string, extra: Record<string, unknown>): Promise<string> =>
+        (
+          await request(app.getHttpServer())
+            .post(`${API}/${tenantId}/catalog/skus`)
+            .set('Authorization', `Bearer ${ownerToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({ code, name: `Goods ${code}`, uom: 'pcs', gstRate: 1800, batchTracked: false, serialTracked: false, catchWeightTracked: false, ...extra })
+            .expect(201)
+        ).body.sku.id as string;
+      const rice = await createSku('TR-RICE', { foodCategory: 'packaged-dry-grocery' });
+      const toxic = await createSku('TR-TOX', { dgClass: '6.1', dgUnNumber: '1230' });
+      const zoneId = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${destWarehouseId}/zones`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code: 'G', name: 'Goods zone' })
+          .expect(201)
+      ).body.id as string;
+      const mkGoodsBin = async (code: string): Promise<string> =>
+        (
+          await request(app.getHttpServer())
+            .post(`${API}/${tenantId}/warehouses/${destWarehouseId}/zones/${zoneId}/bins`)
+            .set('Authorization', `Bearer ${ownerToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({ code, capacity: 100, type: 'shelf' })
+            .expect(201)
+        ).body.id as string;
+      const toxicBin = await mkGoodsBin('G-01');
+      const cleanBin = await mkGoodsBin('G-02');
+      const seed = async (warehouseId: string, skuId: string, binId: string): Promise<void> => {
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/inventory/adjustments`)
+          .set('Authorization', `Bearer ${opsToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ warehouseId, skuId, binId, quantityDelta: 2, reasonCode: 'stock-count', note: 'segregation seed' })
+          .expect(201);
+      };
+      await seed(destWarehouseId, toxic, toxicBin);
+      await seed(sourceWarehouseId, rice, binSrc);
+
+      const created = await createTransfer({
+        sourceWarehouseId,
+        destWarehouseId,
+        lines: [{ skuId: rice, quantity: 1, fromBinId: binSrc, toBinId: toxicBin }],
+      }).expect(201);
+      const transferId = created.body.transfer.id as string;
+      await outboundConfirm(transferId).expect(200);
+      const refused = await inboundConfirm(transferId, {}).expect(409);
+      expect(refused.body).toMatchObject({ status: 409, code: 'bin-segregation-conflict' });
+      expect(String(refused.body.detail)).toContain('"G-01"');
+      expect(String(refused.body.detail)).toContain('TR-RICE');
+      expect(String(refused.body.detail)).toContain('TR-TOX');
+      expect(String(refused.body.detail)).toContain('food never shares a bin with a chemical');
+      expect(await onHandMilli(destWarehouseId, rice, toxicBin)).toBeNull();
+      const detail = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/movements/transfers/${transferId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      expect(detail.body.transfer.status).toBe('in_transit');
+
+      // The receive-time landing override recovers it.
+      await inboundConfirm(transferId, { destBinId: cleanBin }).expect(200);
+      expect(await onHandMilli(destWarehouseId, rice, cleanBin)).toBe(1000);
+    });
+
+    it('story 1-6b: rice and a DG 9 SKU landing in ONE clean bin in one confirm is 409 bin-segregation-conflict (landing vs landing); the order stays in_transit and nothing lands', async () => {
+      const createSku = async (code: string, extra: Record<string, unknown>): Promise<string> =>
+        (
+          await request(app.getHttpServer())
+            .post(`${API}/${tenantId}/catalog/skus`)
+            .set('Authorization', `Bearer ${ownerToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({ code, name: `Goods ${code}`, uom: 'pcs', gstRate: 1800, batchTracked: false, serialTracked: false, catchWeightTracked: false, ...extra })
+            .expect(201)
+        ).body.sku.id as string;
+      const rice = await createSku('TR-RICE2', { foodCategory: 'packaged-dry-grocery' });
+      const battery = await createSku('TR-BATT', { dgClass: '9', dgUnNumber: '3480' });
+      const zoneId = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${destWarehouseId}/zones`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code: 'L', name: 'Landing zone' })
+          .expect(201)
+      ).body.id as string;
+      const landingBin = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${destWarehouseId}/zones/${zoneId}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code: 'L-01', capacity: 100, type: 'shelf' })
+          .expect(201)
+      ).body.id as string;
+      for (const skuId of [rice, battery]) {
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/inventory/adjustments`)
+          .set('Authorization', `Bearer ${opsToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ warehouseId: sourceWarehouseId, skuId, binId: binSrc, quantityDelta: 2, reasonCode: 'stock-count', note: 'landing seed' })
+          .expect(201);
+      }
+      const created = await createTransfer({
+        sourceWarehouseId,
+        destWarehouseId,
+        lines: [
+          { skuId: rice, quantity: 1, fromBinId: binSrc, toBinId: landingBin },
+          { skuId: battery, quantity: 1, fromBinId: binSrc, toBinId: landingBin },
+        ],
+      }).expect(201);
+      const transferId = created.body.transfer.id as string;
+      await outboundConfirm(transferId).expect(200);
+      const refused = await inboundConfirm(transferId, {}).expect(409);
+      expect(refused.body).toMatchObject({ status: 409, code: 'bin-segregation-conflict' });
+      expect(String(refused.body.detail)).toContain('"L-01"');
+      expect(String(refused.body.detail)).toContain('TR-RICE2');
+      expect(String(refused.body.detail)).toContain('TR-BATT');
+      expect(String(refused.body.detail)).toContain('food never shares a bin with a chemical');
+      expect(await onHandMilli(destWarehouseId, rice, landingBin)).toBeNull();
+      expect(await onHandMilli(destWarehouseId, battery, landingBin)).toBeNull();
+      const detail = await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/movements/transfers/${transferId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200);
+      expect(detail.body.transfer.status).toBe('in_transit');
+
+      // Not left in_transit (the snapshot arm below counts the open tasks):
+      // with the rice declared non-food (an empty profile) the same confirm lands.
+      await request(app.getHttpServer())
+        .patch(`${API}/${tenantId}/catalog/skus/${rice}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ foodCategory: 'non-food' })
+        .expect(200);
+      await inboundConfirm(transferId, {}).expect(200);
+      expect(await onHandMilli(destWarehouseId, rice, landingBin)).toBe(1000);
+    });
+
     it('403 for a member without the capability (accountant)', async () => {
       await createTransfer(
         {

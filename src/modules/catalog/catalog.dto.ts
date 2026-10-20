@@ -794,6 +794,19 @@ export class SegregationPairResponse {
 }
 
 /**
+ * Story 1-6b — one co-location rule as the matrix read serves it. `code` is
+ * a plain string (not an OpenAPI enum): a client renders the list keyed on
+ * it, and a new rule must not break an older client's types.
+ */
+export class SegregationRuleDto {
+  @ApiProperty({ example: 'food-chemical', description: 'The rule\'s machine code (hazard-pair, explosive-dg, food-chemical, drug-chemical, allergen-mismatch, raw-ready-to-eat today)' })
+  code!: string;
+
+  @ApiProperty({ example: 'A scheduled drug never shares a bin with a chemical.', description: 'The rule in one sentence, for display verbatim' })
+  description!: string;
+}
+
+/**
  * The hazard segregation matrix as data: the closed vocabulary and the FULLY
  * EXPANDED incompatible unordered-pair set — the explosive universal rule
  * enumerated as pairs (incl. `explosive|explosive`) plus the explicit pairs.
@@ -807,6 +820,13 @@ export class SegregationMatrixResponse {
 
   @ApiProperty({ type: [SegregationPairResponse], description: 'Every incompatible unordered pair, fully expanded (11 today: the 7 explosive pairs incl. self + the 4 explicit ones)' })
   incompatible!: SegregationPairResponse[];
+
+  @ApiProperty({
+    type: [SegregationRuleDto],
+    description:
+      'Story 1-6b — every co-location rule, in the order the gates check them: the hazard grid above (with DG subsidiaries), explosives vs any dangerous good, food and scheduled drugs vs chemicals, allergens, raw vs ready-to-eat',
+  })
+  rules!: SegregationRuleDto[];
 }
 
 /** PATCH fields (spec 1.4): SKU code is immutable; barcode is changeable. */

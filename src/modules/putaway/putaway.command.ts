@@ -1,5 +1,5 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNull, notInArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -50,13 +50,19 @@ import {
   bulkAssetOccupancyHolds,
   isBulkAssetType,
 } from '../../shared/primitives/location-type';
-// Story 12-2 — the ONE segregation predicate + the co-location refusal
-// factory. Same one-source rule as the storage-class predicate: the matrix
-// is encoded exactly once, in TS.
+// Story 1-6b — the ONE goods-type segregation predicate (12-2's hazard
+// matrix widened to the SKU's whole profile) + the co-location refusal
+// factory and the detail template. Same one-source rule as the
+// storage-class predicate: the rules are encoded exactly once, in TS.
 import {
-  hazardClassesCompatible,
-  segregationConflict,
-} from '../../shared/primitives/hazard';
+  EMPTY_PROFILE_SQL,
+  SEGREGATION_PROFILE_COLUMNS,
+  binGoodsConflict,
+  goodsConflict,
+  goodsConflictDetail,
+  profileOf,
+  type SegregationProfile,
+} from '../../shared/primitives/segregation';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
@@ -391,9 +397,10 @@ export class PutawayCommand {
           // Story 12-1 — the class the placement gate and the re-derived
           // suggestion both consume.
           storageClass: skus.storageClass,
-          // Story 12-2 — the hazard class the co-location gate and the
-          // re-derived suggestion consume (null = carries no rule).
-          hazardClass: skus.hazardClass,
+          // Story 1-6b — the segregation profile (12-2's hazard class
+          // widened) the co-location gate and the re-derived suggestion
+          // consume (an empty profile carries no rule).
+          ...SEGREGATION_PROFILE_COLUMNS,
         })
         .from(skus)
         .where(and(eq(skus.id, command.skuId), eq(skus.tenantId, command.tenantId)))
@@ -653,16 +660,18 @@ export class PutawayCommand {
           );
         }
       }
-      // ── story 12-2: the hazard co-location gate (FR-41) — after the class
-      // gate, before the load read, inside the bin-row `.for('update')` window
-      // (a concurrent placement cannot slip an incompatible unit between the
-      // scan and the write). Unlike the class rule this is SKU × SKU-in-bin:
-      // the gate reads the TARGET bin's occupants' classes, so an empty bin
-      // of the right class always takes hazard-capable stock. Null carries no
-      // rule in either direction (the predicate's first arm). Own-sku pairs
-      // are SKIPPED — the same-SKU-consolidation rule (an explosive may top
-      // up its own bin), identical to merge's arm. 400
-      // `bin-segregation-conflict` naming both SKU codes and both classes.
+      // ── story 12-2 / 1-6b: the co-location gate (FR-41, widened to the
+      // goods-type rules) — after the class gate, before the load read,
+      // inside the bin-row `.for('update')` window (a concurrent placement
+      // cannot slip a conflicting unit between the scan and the write).
+      // Unlike the class rule this is SKU × SKU-in-bin: the gate reads the
+      // TARGET bin's occupants' profiles, so an empty bin of the right class
+      // always takes any stock. An empty profile carries no rule in either
+      // direction (the read filters empty occupants; the predicate returns
+      // null for an empty incoming SKU). Own-sku pairs are SKIPPED — the
+      // same-SKU-consolidation rule (an explosive may top up its own bin),
+      // identical to merge's arm. 400 `bin-segregation-conflict` naming both
+      // SKU codes, the facts that fired and the rule (only the first rule).
       const occupants = await occupantHazardClassesInTx(
         tx,
         command.tenantId,
@@ -673,13 +682,18 @@ export class PutawayCommand {
         if (occupant.skuId === command.skuId) {
           continue;
         }
-        if (!hazardClassesCompatible(sku.hazardClass, occupant.hazardClass)) {
-          throw binSegregationConflict(
-            targetBin.code,
-            sku.code,
-            sku.hazardClass,
-            occupant.skuCode,
-            occupant.hazardClass,
+        const incoming = profileOf(sku);
+        const conflict = goodsConflict(incoming, occupant.profile);
+        if (conflict !== null) {
+          throw binGoodsConflict(
+            conflict.rule,
+            goodsConflictDetail(conflict, {
+              binCode: targetBin.code,
+              incomingCode: sku.code,
+              incoming,
+              occupantCode: occupant.skuCode,
+              occupant: occupant.profile,
+            }),
           );
         }
       }
@@ -758,11 +772,12 @@ export class PutawayCommand {
           widthMm: sku.widthMm,
           heightMm: sku.heightMm,
           storageClass: sku.storageClass,
-          // Story 12-2 — the hazard class rides the walk; with `command.skuId`
-          // (in hand at this call site) it lets `candidateFitsSku` skip the
-          // moving SKU's own occupant pairs, so a top-up of the same SKU is
-          // never refused for co-locating with itself.
-          hazardClass: sku.hazardClass,
+          // Story 12-2 / 1-6b — the segregation profile rides the walk; with
+          // `command.skuId` (in hand at this call site) it lets
+          // `candidateFitsSku` skip the moving SKU's own occupant pairs, so a
+          // top-up of the same SKU is never refused for co-locating with
+          // itself.
+          ...profileOf(sku),
           // Story 1-5b — the client: the client gate and the own-client
           // preference (the task derivation's ranking, shared).
           clientId: sku.clientId,
@@ -1166,14 +1181,15 @@ export interface PutawayBinCandidate {
   // gate in `candidateFitsSku` and the own-client preference in
   // `pickPutawayCandidate` read it.
   readonly dedicatedClientId: string | null;
-  // ── story 12-2: the bin's hazardous occupants as (skuId, hazardClass)
-  // PAIRS — not a class list (a class-only aggregate cannot skip the moving
-  // SKU's own pairs, and counts drained residue). Aggregated over `quantity >
-  // 0` occupants with a non-null class (drained rows persist — `addToOnHand`
-  // upserts, never deletes — so a stale class would refuse placements the
-  // gate admits); the list stays SKU-agnostic (no WHERE arm — the projection
-  // is richer, the rule still runs per-candidate on the SKU side).
-  readonly occupants: readonly { readonly skuId: string; readonly hazardClass: string }[];
+  // ── story 12-2 / 1-6b: the bin's occupants with a NON-EMPTY segregation
+  // profile, as (skuId, profile) PAIRS — not a class list (a class-only
+  // aggregate cannot skip the moving SKU's own pairs, and counts drained
+  // residue). Over `quantity > 0` occupants (drained rows persist —
+  // `addToOnHand` upserts, never deletes — so a stale profile would refuse
+  // placements the gate admits); the list stays SKU-agnostic (no WHERE arm —
+  // the rule still runs per-candidate on the SKU side). The aggregate
+  // carries only sku ids; the profiles come from one keyed read (1-6b D8).
+  readonly occupants: readonly { readonly skuId: string; readonly profile: SegregationProfile }[];
 }
 
 /**
@@ -1183,18 +1199,16 @@ export interface PutawayBinCandidate {
  * missing attributes). `storageClass` (story 12-1) is NOT nullable — the
  * column is NOT NULL DEFAULT 'ambient', so every read has it.
  */
-export interface SkuPhysicalAttributes {
+export interface SkuPhysicalAttributes extends SegregationProfile {
   readonly weightGrams: number | null;
   readonly lengthMm: number | null;
   readonly widthMm: number | null;
   readonly heightMm: number | null;
   /** Story 12-1 — the SKU's class from the controlled vocabulary. */
   readonly storageClass: string;
-  /**
-   * Story 12-2 — the SKU's hazard class (FR-41), nullable: a null class
-   * carries no rule in either direction of the segregation matrix.
-   */
-  readonly hazardClass: string | null;
+  // Story 12-2 / 1-6b — the SKU's segregation profile (the six fields of
+  // `SegregationProfile`, inherited): an empty profile carries no rule in
+  // either direction.
   /**
    * Story 1-5b — the SKU's client (`skus.client_id`, NOT NULL): the client
    * gate (`binClientAccepts`) and the own-client preference read it.
@@ -1230,14 +1244,16 @@ export interface SkuPhysicalAttributes {
  * locked-row guard and `mergeBin`'s target loop — the SYNC HAZARD rule.
  *
  * Story 12-2 adds the HAZARD co-location arm (FR-41) — SECOND, after the
- * class gate: for each of the bin's hazardous-occupant PAIRS, skip the
- * moving SKU's OWN pair (`skuId === movingSkuId` — the same-SKU-consolidation
- * rule the placement and merge gates carry; an explosive may top up its own
- * bin) and refuse the candidate when any other occupant's class is
- * incompatible with the moving SKU's (`hazardClassesCompatible` — null
- * carries no rule in either direction, checked before the explosive
- * universal rule). The same arm exists in the placement command's own
- * locked-row guard and `mergeBin`'s target gate — the SYNC HAZARD rule.
+ * class gate: for each of the bin's occupant PAIRS, skip the moving SKU's
+ * OWN pair (`skuId === movingSkuId` — the same-SKU-consolidation rule the
+ * placement and merge gates carry; an explosive may top up its own bin) and
+ * refuse the candidate when any other occupant conflicts with the moving
+ * SKU. Story 1-6b widens the rule from the hazard class to the segregation
+ * profile (`goodsConflict` — the hazard pairs, explosives vs any DG, food
+ * and drugs vs chemicals, allergens, raw vs ready-to-eat; an empty profile
+ * carries no rule). The same arm exists in the placement command's own
+ * locked-row guard, `mergeBin`'s target gate and the transfer gate runner —
+ * the SYNC HAZARD rule.
  *
  * Story 1-5b adds the CLIENT arm — right after the class gate: a bin
  * dedicated to another client refuses the SKU (`binClientAccepts`).
@@ -1278,7 +1294,7 @@ export function candidateFitsSku(
     if (occupant.skuId === movingSkuId) {
       continue;
     }
-    if (!hazardClassesCompatible(sku.hazardClass, occupant.hazardClass)) {
+    if (goodsConflict(sku, occupant.profile) !== null) {
       return false;
     }
   }
@@ -1346,14 +1362,15 @@ export async function binCandidatesInTx(
       // gate + the own-client preference); no WHERE arm, the list stays
       // SKU-agnostic.
       dedicatedClientId: bins.dedicatedClientId,
-      // Story 12-2 — the bin's hazardous occupants as (skuId, hazardClass)
-      // pairs, one aggregate through the join below (no second query, no
-      // N+1). The FILTER carries `quantity > 0` (drained rows persist —
-      // `addToOnHand` upserts, never deletes — and a stale class would
-      // refuse placements the gate admits) and a non-null class (a null
-      // carries no rule). Bins with no hazardous occupants aggregate to
-      // '[]'.
-      occupants: sql<string>`coalesce(jsonb_agg(jsonb_build_array(${stockOnHand.skuId}, ${skus.hazardClass})) filter (where ${stockOnHand.quantity} > 0 and ${skus.hazardClass} is not null), '[]'::jsonb)::text`,
+      // Story 12-2 / 1-6b — the bin's occupants with a non-empty
+      // segregation profile, as sku ids, one aggregate through the join
+      // below. The FILTER carries `quantity > 0` (drained rows persist —
+      // `addToOnHand` upserts, never deletes — and a stale profile would
+      // refuse placements the gate admits) and `EMPTY_PROFILE_SQL` (an
+      // empty profile carries no rule). Bins with no such occupants
+      // aggregate to '[]'. The profiles come from ONE keyed read over the
+      // distinct ids below — never a jsonb blob per row (1-6b D8).
+      occupants: sql<string>`coalesce(jsonb_agg(distinct ${stockOnHand.skuId}) filter (where ${stockOnHand.quantity} > 0 and ${EMPTY_PROFILE_SQL}), '[]'::jsonb)::text`,
       occupancy: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint`,
       weightLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * coalesce(${skus.weightGrams}, 0)), 0)::numeric`,
       volumeLoad: sql<string>`coalesce(sum(${stockOnHand.quantity}::numeric * (coalesce(${skus.lengthMm}, 0) * coalesce(${skus.widthMm}, 0) * coalesce(${skus.heightMm}, 0))), 0)::numeric`,
@@ -1398,6 +1415,9 @@ export async function binCandidatesInTx(
       bins.dedicatedClientId,
     )
     .orderBy(asc(sql`coalesce(sum(${stockOnHand.quantity}), 0)`), asc(bins.code));
+  // The aggregate is `::text`d jsonb — parsed at the boundary.
+  const occupantIdsByBin = new Map(rows.map((row) => [row.binId, JSON.parse(row.occupants) as string[]]));
+  const profileById = await skuProfilesInTx(tx, tenantId, [...new Set([...occupantIdsByBin.values()].flat())]);
   return rows.map((row) => ({
     binId: row.binId,
     binCode: row.binCode,
@@ -1409,11 +1429,15 @@ export async function binCandidatesInTx(
     storageClass: row.storageClass,
     type: row.type,
     dedicatedClientId: row.dedicatedClientId,
-    // The aggregate is `::text`d jsonb — parsed at the boundary, mapped to
-    // the pair objects the fit predicate walks.
-    occupants: (JSON.parse(row.occupants) as [string, string][]).map(
-      ([skuId, hazardClass]) => ({ skuId, hazardClass }),
-    ),
+    // The (skuId, profile) pairs the fit predicate walks. The transaction is
+    // READ COMMITTED, so the keyed read may see a commit the aggregate did
+    // not (a profile emptied or changed in between) — an id it does not
+    // return is skipped, never invented. The walk is only a suggestion: the
+    // placement gate re-reads the occupants under the bin-row lock.
+    occupants: (occupantIdsByBin.get(row.binId) ?? []).flatMap((skuId) => {
+      const profile = profileById.get(skuId);
+      return profile === undefined ? [] : [{ skuId, profile }];
+    }),
     occupancy: Number(row.occupancy),
     weightLoad: BigInt(row.weightLoad ?? 0),
     volumeLoad: BigInt(row.volumeLoad ?? 0),
@@ -1482,20 +1506,43 @@ export async function binOccupancyInTx(
 }
 
 /**
- * Story 12-2 — the hazard co-location read: one bin's DISTINCT hazardous
- * occupants as (skuId, skuCode, hazardClass) rows, `quantity > 0` and a
- * non-null class only (drained rows and null-class stock carry no rule).
- * The same join shape as `binOccupancyInTx` above — one grouped query, no
- * N+1. Consumed by the placement's co-location gate (inside the bin-row
- * `.for('update')` window, with the moving SKU's own pairs skipped at the
- * call site) and by `mergeBin`'s hazard gate (target occupants, moved
- * pairs skipped per moved SKU at the call site — the helper excludes
- * nothing, so both sites own their own-sku arm).
+ * Story 12-2 — the co-location read: one bin's DISTINCT occupants with a
+ * NON-EMPTY segregation profile (story 1-6b widened the 12-2 `hazard_class
+ * is not null` filter to `EMPTY_PROFILE_SQL`) as (skuId, skuCode, profile)
+ * rows, `quantity > 0` only (drained rows and empty-profile stock carry no
+ * rule). The same join shape as `binOccupancyInTx` above — one grouped
+ * query, no N+1. Consumed by the placement's co-location gate (inside the
+ * bin-row `.for('update')` window, with the moving SKU's own pairs skipped
+ * at the call site) and by `mergeBin`'s gate (target occupants, moved pairs
+ * skipped per moved SKU at the call site — the helper excludes nothing, so
+ * both sites own their own-sku arm).
  */
 export interface OccupantHazard {
   readonly skuId: string;
   readonly skuCode: string;
-  readonly hazardClass: string;
+  readonly profile: SegregationProfile;
+}
+
+/**
+ * Story 1-6b — the segregation profiles of a set of SKUs, keyed by id, in
+ * ONE read (the `binCandidatesInTx` aggregate carries only ids; D8). An
+ * unknown id is absent.
+ */
+export async function skuProfilesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  skuIds: readonly string[],
+): Promise<Map<string, SegregationProfile>> {
+  if (skuIds.length === 0) {
+    return new Map();
+  }
+  const rows = await tx
+    .select({ id: skus.id, ...SEGREGATION_PROFILE_COLUMNS })
+    .from(skus)
+    // ONE uuid[] parameter, never one bind per id (`inArray`) — a warehouse
+    // can stock past the 65,535-parameter limit of distinct SKUs.
+    .where(and(eq(skus.tenantId, tenantId), sql`${skus.id} = any(${sql.param([...skuIds])}::uuid[])`));
+  return new Map(rows.map((row) => [row.id, profileOf(row)]));
 }
 
 /**
@@ -1538,13 +1585,13 @@ export async function occupantHazardClassesInTx(
     .select({
       skuId: stockOnHand.skuId,
       skuCode: skus.code,
-      hazardClass: skus.hazardClass,
+      ...SEGREGATION_PROFILE_COLUMNS,
     })
     .from(stockOnHand)
-    // INNER join deliberately: a hazardous class is a SKU attribute — a
-    // stock row with no sku row cannot name a class, and the gates that
-    // consume this read rule on pairs of named classes (contrast the
-    // units-sum reads, which stay LEFT-joined for capacity truth).
+    // INNER join deliberately: a segregation profile is a SKU attribute — a
+    // stock row with no sku row cannot name one, and the gates that consume
+    // this read rule on pairs of profiles (contrast the units-sum reads,
+    // which stay LEFT-joined for capacity truth).
     .innerJoin(skus, eq(skus.id, stockOnHand.skuId))
     .where(
       and(
@@ -1552,23 +1599,24 @@ export async function occupantHazardClassesInTx(
         eq(stockOnHand.warehouseId, warehouseId),
         eq(stockOnHand.binId, binId),
         gt(stockOnHand.quantity, 0),
-        isNotNull(skus.hazardClass),
+        EMPTY_PROFILE_SQL,
       ),
     )
-    .groupBy(stockOnHand.skuId, skus.code, skus.hazardClass);
-  // The `isNotNull` filter above is the authority, but drizzle's inferred
-  // row type stays `string | null` (no SQL-side narrowing) — the boundary
-  // narrows it once, here.
+    // `skus.id` is the primary key, so every other sku column is
+    // functionally dependent on it (the batch arms fold into separate
+    // projection rows — one occupant per SKU).
+    .groupBy(stockOnHand.skuId, skus.id);
   return rows.map((row) => ({
     skuId: row.skuId,
     skuCode: row.skuCode,
-    hazardClass: row.hazardClass as string,
+    profile: profileOf(row),
   }));
 }
 
 /**
- * Story 12-2 — the SKU-edit guard's grouped read: MANY bins' hazardous
- * occupants in ONE query (the single-bin read above runs per bin — too many
+ * Story 12-2 — the SKU-edit guard's grouped read: MANY bins' non-empty-
+ * profile occupants (1-6b: `EMPTY_PROFILE_SQL`, was a non-null class) in ONE
+ * query (the single-bin read above runs per bin — too many
  * round-trips inside the edit's `.for('update')` window). One row per
  * (binId, skuId) — the group key widens with `binId`, so a (bin, binmate)
  * pair can never come back twice and the guard's party dedupe falls out of
@@ -1580,7 +1628,7 @@ export interface OccupantHazardPair {
   readonly binId: string;
   readonly skuId: string;
   readonly skuCode: string;
-  readonly hazardClass: string;
+  readonly profile: SegregationProfile;
 }
 
 export async function binOccupantHazardPairsInTx(
@@ -1596,7 +1644,7 @@ export async function binOccupantHazardPairsInTx(
       binId: stockOnHand.binId,
       skuId: stockOnHand.skuId,
       skuCode: skus.code,
-      hazardClass: skus.hazardClass,
+      ...SEGREGATION_PROFILE_COLUMNS,
     })
     .from(stockOnHand)
     // The same deliberate INNER join as the single-bin read above.
@@ -1606,13 +1654,17 @@ export async function binOccupantHazardPairsInTx(
         eq(stockOnHand.tenantId, tenantId),
         inArray(stockOnHand.binId, [...binIds]),
         gt(stockOnHand.quantity, 0),
-        isNotNull(skus.hazardClass),
+        EMPTY_PROFILE_SQL,
       ),
     )
-    .groupBy(stockOnHand.binId, stockOnHand.skuId, skus.code, skus.hazardClass);
-  // The `isNotNull` filter above is the authority — the same one-time
-  // boundary narrowing as the single-bin read.
-  return rows.map((row) => ({ ...row, hazardClass: row.hazardClass as string }));
+    // One row per (bin, SKU) — `skus.id` is the key the other sku columns hang on.
+    .groupBy(stockOnHand.binId, stockOnHand.skuId, skus.id);
+  return rows.map((row) => ({
+    binId: row.binId,
+    skuId: row.skuId,
+    skuCode: row.skuCode,
+    profile: profileOf(row),
+  }));
 }
 
 /**
@@ -1794,26 +1846,6 @@ export function binBlocked(binCode: string): ProblemException {
     400,
     'Target bin is blocked',
     `Bin "${binCode}" is blocked — placements into it are refused until it is unblocked.`,
-  );
-}
-
-/**
- * The co-location rejection (FR-41, story 12-2): 400
- * `bin-segregation-conflict` naming the bin, BOTH SKU codes and BOTH
- * classes — device-fault, non-retryable. Wraps the hazard primitive's
- * `segregationConflict` (the one refusal factory for the placement/merge
- * family); `mergeBin` builds its merge-worded detail on the same factory.
- */
-export function binSegregationConflict(
-  binCode: string,
-  incomingSkuCode: string,
-  incomingClass: string | null,
-  occupantSkuCode: string,
-  occupantClass: string,
-): ProblemException {
-  return segregationConflict(
-    `Bin "${binCode}" holds SKU "${occupantSkuCode}" (${occupantClass}) — SKU "${incomingSkuCode}" ` +
-      `(${incomingClass ?? 'no hazard class'}) is segregated from it (FR-41).`,
   );
 }
 

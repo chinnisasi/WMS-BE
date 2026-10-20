@@ -13,6 +13,7 @@ import {
   enumerateIncompatiblePairs,
   HAZARD_CLASSES,
 } from '../../shared/primitives/hazard';
+import { GOODS_SEGREGATION_RULES } from '../../shared/primitives/segregation';
 import type { HazardClass, SegregationPair } from '../../shared/primitives/hazard';
 import type { ImportMode } from './import.command';
 import { uomPrecision } from './uom';
@@ -150,10 +151,12 @@ export interface SkuReorderDefaults {
   readonly status: SkuStatus;
 }
 
-/** The hazard segregation matrix as the story 12-7 admin read carries it. */
+/** The hazard segregation matrix as the story 12-7 admin read carries it — plus (1-6b) the goods-type rules. */
 export interface CatalogSegregationMatrix {
   readonly classes: readonly HazardClass[];
   readonly incompatible: readonly SegregationPair[];
+  /** Story 1-6b — every co-location rule in check order, served from `GOODS_SEGREGATION_RULES`. */
+  readonly rules: readonly { readonly code: string; readonly description: string }[];
 }
 
 /**
@@ -431,6 +434,8 @@ export class CatalogFacade {
     return {
       classes: [...HAZARD_CLASSES],
       incompatible: enumerateIncompatiblePairs().map((pair) => ({ ...pair })),
+      // Story 1-6b — the goods-type rules, in check order, verbatim.
+      rules: GOODS_SEGREGATION_RULES.map((rule) => ({ code: rule.code, description: rule.description })),
     };
   }
 

@@ -40,6 +40,7 @@ import {
   type PutawayBinCandidate,
 } from './putaway.command';
 import { fromMilli } from '../../shared/primitives/quantity';
+import { SEGREGATION_PROFILE_COLUMNS } from '../../shared/primitives/segregation';
 
 export const DEFAULT_PUTAWAY_PAGE_SIZE = 50;
 
@@ -350,9 +351,9 @@ export class PutawayFacade {
         // Story 12-1 — the class the class gate rules on (the row object is
         // passed straight to `candidateFitsSku`, so the shape must match).
         storageClass: skus.storageClass,
-        // Story 12-2 — the hazard class the co-location arm rules on (null =
-        // carries no rule).
-        hazardClass: skus.hazardClass,
+        // Story 12-2 / 1-6b — the segregation profile the co-location arm
+        // rules on (an empty profile carries no rule).
+        ...SEGREGATION_PROFILE_COLUMNS,
         // Story 1-5b — the client: the client gate and the own-client
         // preference of the shared ranking.
         clientId: skus.clientId,

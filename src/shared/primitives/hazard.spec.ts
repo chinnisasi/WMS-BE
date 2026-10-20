@@ -2,8 +2,6 @@ import {
   HAZARD_CLASSES,
   assertHazardClass,
   hazardClassesCompatible,
-  segregationConflict,
-  segregationStateConflict,
 } from './hazard';
 import { ProblemException } from '../problem-details/problem.exception';
 
@@ -79,15 +77,5 @@ describe('hazard segregation matrix (story 12-2)', () => {
     for (const cls of HAZARD_CLASSES) {
       expect(() => assertHazardClass({ hazardClass: cls })).not.toThrow();
     }
-  });
-
-  it('the refusal factories split the 400 device-facing refusal from the 409 state conflict', () => {
-    const placement = segregationConflict('bin "A-01" holds SKU "OXY" (oxidizer) — SKU "FLM" (flammable) is segregated from it (FR-41).');
-    expect(placement.getStatus()).toBe(400);
-    expect((placement.getResponse() as { code: string }).code).toBe('bin-segregation-conflict');
-
-    const edit = segregationStateConflict('SKU "X" would carry the "explosive" hazard class …');
-    expect(edit.getStatus()).toBe(409);
-    expect((edit.getResponse() as { code: string }).code).toBe('hazard-segregation-conflict');
   });
 });

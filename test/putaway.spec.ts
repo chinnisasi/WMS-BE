@@ -1836,6 +1836,159 @@ describe('putaway: directed placement (e2e, story 3.5)', () => {
     expect(await plainOnHand(bin0H3, plainSkuId)).toBe(1);
   });
 
+  // ── Story 1-6b — goods-type segregation (food, allergens, drugs, chemicals) ──
+
+  it('story 1-6b: every rule refuses a placement naming both SKUs and the rule; the suggestion and the device snapshot skip every conflicting bin; spirits sit beside juice; an empty profile places anywhere', async () => {
+    // The goods-type SKUs through the single-SKU create (1-4).
+    const createSku = async (code: string, extra: Record<string, unknown>): Promise<string> =>
+      (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/catalog/skus`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, name: `Goods ${code}`, uom: 'pcs', gstRate: 1800, batchTracked: false, serialTracked: false, catchWeightTracked: false, ...extra })
+          .expect(201)
+      ).body.sku.id as string;
+    const acid = await createSku('GS-ACID', { dgClass: '8', dgUnNumber: '1830', hazardClass: 'corrosive-acid' });
+    const battery = await createSku('GS-BATT', { dgClass: '9', dgUnNumber: '3480' });
+    const legacyToxic = await createSku('GS-TOX', { hazardClass: 'toxic' });
+    const corrosiveNone = await createSku('GS-COR0', { dgClass: '8', dgUnNumber: '1830', hazardClass: null });
+    const milkSweet = await createSku('GS-MILK', { foodCategory: 'confectionery', allergens: ['milk'] });
+    const salad = await createSku('GS-SALAD', { foodCategory: 'ready-to-eat' });
+    const juice = await createSku('GS-JUICE', { foodCategory: 'beverages' });
+    // The incoming side.
+    const toxicSub = await createSku('GS-FLTX', { dgClass: '3', dgUnNumber: '1992', dgSubsidiaryClasses: ['6.1'] });
+    const explosive = await createSku('GS-EXPL', { dgClass: '1.1', dgUnNumber: '0004' });
+    const rice = await createSku('GS-RICE', { foodCategory: 'packaged-dry-grocery' });
+    const drug = await createSku('GS-DRUG', { drugSchedules: ['H'] });
+    const plainSweet = await createSku('GS-SWEET', { foodCategory: 'confectionery' });
+    const chicken = await createSku('GS-CHICK', { foodCategory: 'meat-poultry-seafood' });
+    const whisky = await createSku('GS-WHSK', { foodCategory: 'beverages', dgClass: '3', dgUnNumber: '3065' });
+
+    // An OWN warehouse: G-1..G-7 each hold one occupant (one unit, via the
+    // adjustment bypass), so the occupancy ranking is the bin code alone.
+    const goodsWarehouseId = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ origin: testAddress(), code: `PUT6-${ulid().slice(10, 16).toUpperCase()}`, name: `Goods Putaway Depot ${ulid()}` })
+        .expect(201)
+    ).body.id as string;
+    const zoneG = (
+      await request(app.getHttpServer())
+        .post(`${API}/${tenantId}/warehouses/${goodsWarehouseId}/zones`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ code: 'G', name: 'Goods zone' })
+        .expect(201)
+    ).body.id as string;
+    const binIds = new Map<string, string>();
+    for (const [code, occupant] of [
+      ['G-1', acid],
+      ['G-2', battery],
+      ['G-3', legacyToxic],
+      ['G-4', corrosiveNone],
+      ['G-5', milkSweet],
+      ['G-6', salad],
+      ['G-7', juice],
+    ] as const) {
+      const binId = (
+        await request(app.getHttpServer())
+          .post(`${API}/${tenantId}/warehouses/${goodsWarehouseId}/zones/${zoneG}/bins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code, capacity: 100, type: 'shelf' })
+          .expect(201)
+      ).body.id as string;
+      binIds.set(code, binId);
+      await adjust({ warehouseId: goodsWarehouseId, skuId: occupant, binId, quantityDelta: 1, reasonCode: 'stock-count', note: `seed ${code}` }).expect(201);
+    }
+    const bin = (code: string): string => binIds.get(code)!;
+
+    // One blind receipt carrying every incoming SKU (and an empty-profile one).
+    const grn = await request(app.getHttpServer())
+      .post(`${API}/${tenantId}/receiving/goods-receipts`)
+      .set('Authorization', `Bearer ${operatorToken}`)
+      .set(KEY_HEADER, ulid())
+      .send({
+        warehouseId: goodsWarehouseId,
+        poId: null,
+        blindReasonCode: 'unannounced-delivery',
+        occurredAt: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+        lines: [toxicSub, explosive, rice, drug, plainSweet, chicken, whisky, plainSkuId].map((skuId) => ({
+          poLineId: null,
+          skuId,
+          batchCode: null,
+          mfgDate: null,
+          qty: 1,
+        })),
+      })
+      .expect(201);
+    const goodsGrn = grn.body.goodsReceipt as { id: string; lines: { id: string; skuId: string; batchId: string | null; qty: number }[] };
+    const lineOf = (skuId: string) => ({ ...goodsGrn.lines.find((line) => line.skuId === skuId)!, grnId: goodsGrn.id });
+
+    // THE SUGGESTION SKIP (web tasks and the device snapshot alike): rice
+    // conflicts with G-1..G-5 (four chemicals, one allergen mismatch) — the
+    // walk reaches G-6 (salad) on segregation alone; no task names a bin the
+    // placement gate would refuse.
+    const webTasks = (
+      await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/putaway/tasks?warehouseId=${goodsWarehouseId}`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .expect(200)
+    ).body.items as { grnLineId: string; skuId: string; suggestedBin: { binId: string; binCode: string } | null }[];
+    const snapshotTasks = (
+      await request(app.getHttpServer())
+        .get(`${API}/${tenantId}/devices/catalog-snapshot?warehouseId=${goodsWarehouseId}`)
+        .set('Authorization', `Bearer ${operatorToken}`)
+        .expect(200)
+    ).body.putawayTasks as typeof webTasks;
+    const expectedSuggestion: Record<string, string | null> = {
+      [rice]: 'G-6',
+      [toxicSub]: 'G-2', // G-1: its toxic subsidiary vs the acid; chemical beside chemical is no rule
+      [explosive]: null, // G-1/G-3 hazard pairs, G-2/G-4 any DG, G-5..G-7 food vs a chemical — no bin at all
+      [drug]: 'G-5', // G-1..G-4 hold chemicals; no drug-vs-food rule
+      [plainSweet]: 'G-6', // G-1..G-4 chemicals, G-5 [milk] ≠ []
+      [chicken]: 'G-7', // G-1..G-4 chemicals, G-5 allergens differ, G-6 ready-to-eat
+      [whisky]: 'G-6', // food (decision 8): G-1..G-4 chemicals, G-5 allergens differ
+      [plainSkuId]: 'G-1', // an empty profile carries no rule
+    };
+    for (const tasks of [webTasks, snapshotTasks]) {
+      for (const [skuId, binCode] of Object.entries(expectedSuggestion)) {
+        const task = tasks.find((entry) => entry.grnLineId === lineOf(skuId).id)!;
+        expect({ skuId, suggested: task.suggestedBin?.binCode ?? null }).toEqual({ skuId, suggested: binCode });
+      }
+    }
+
+    // THE GATE, one refusal per rule — 400 `bin-segregation-conflict`, the
+    // detail naming the bin, both SKU codes, the facts and the rule.
+    const refusals: [string, string, string[]][] = [
+      [toxicSub, 'G-1', ['GS-ACID', 'GS-FLTX', 'toxic, DG subsidiary 6.1', 'corrosive-acid', 'is segregated from it (FR-41)']],
+      [explosive, 'G-2', ['GS-BATT', 'GS-EXPL', 'DG 9', 'an explosive never shares a bin with a dangerous good']],
+      [rice, 'G-2', ['GS-BATT', 'GS-RICE', 'food never shares a bin with a chemical']],
+      [rice, 'G-3', ['GS-TOX', 'GS-RICE', 'chemical: toxic', 'food never shares a bin with a chemical']],
+      [drug, 'G-4', ['GS-COR0', 'GS-DRUG', 'drug: schedule H', 'a scheduled drug never shares a bin with a chemical']],
+      [plainSweet, 'G-5', ['GS-MILK', 'GS-SWEET', 'allergens: milk', 'no allergens', 'the same allergens']],
+      [chicken, 'G-6', ['GS-SALAD', 'GS-CHICK', 'meat-poultry-seafood', 'ready-to-eat', 'raw meat, poultry and seafood never share a bin']],
+    ];
+    for (const [skuId, binCode, phrases] of refusals) {
+      const refused = await placeForLine(lineOf(skuId), bin(binCode), { warehouseId: goodsWarehouseId }).expect(400);
+      expect(refused.body).toMatchObject({ status: 400, code: 'bin-segregation-conflict' });
+      expect(refused.body.detail).toContain(`"${binCode}"`);
+      for (const phrase of phrases) {
+        expect(refused.body.detail).toContain(phrase);
+      }
+    }
+    expect(await placementRowCount(goodsGrn.id)).toBe(0);
+
+    // ALLOWED: spirits beside juice (decision 8 — a food that is DG is no
+    // chemical), and an empty-profile SKU beside a dangerous good.
+    await placeForLine(lineOf(whisky), bin('G-7'), { warehouseId: goodsWarehouseId, reasonCode: 'operator-preference' }).expect(201);
+    await placeForLine(lineOf(plainSkuId), bin('G-2'), { warehouseId: goodsWarehouseId, reasonCode: 'operator-preference' }).expect(201);
+    expect(await placementRowCount(goodsGrn.id)).toBe(2);
+  });
+
   it('RLS: a non-superuser session scoped to one tenant sees no putaway rows of another tenant and cannot write foreign rows', async () => {
     const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
     const foreignTenantId = uuidv7();

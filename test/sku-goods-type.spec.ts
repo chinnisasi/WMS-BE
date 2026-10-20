@@ -19,6 +19,16 @@ import {
   FOOD_CATEGORIES,
 } from '../src/shared/primitives/goods-type';
 import { HAZARD_CLASSES } from '../src/shared/primitives/hazard';
+import { spawnSync } from 'node:child_process';
+import { eq, sql as dsql } from 'drizzle-orm';
+import type { Database } from '../src/shared/db/db';
+import { skus as skusTable } from '../src/shared/db/schema';
+import {
+  EMPTY_PROFILE_SQL,
+  SEGREGATION_PROFILE_COLUMNS,
+  isEmptyProfile,
+  profileOf,
+} from '../src/shared/primitives/segregation';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { mintSignIn } from './support/sign-in';
 import { expectAuditRow, seededIdempotencyKey } from './support/audit-guard';
@@ -719,6 +729,245 @@ describe('story 1-6a: SKU goods-type attributes (e2e)', () => {
         maxStackLayers: null,
         dg: null,
       });
+    });
+  });
+
+  // ── story 1-6b: goods-type segregation — the edit guard, the SQL pin, the listing ──
+
+  describe('story 1-6b: goods-type segregation', () => {
+    /** A warehouse of its own with the named storage bins (the 12-1/12-2 guard tests' shape). */
+    async function depot(prefix: string, binCodes: string[]): Promise<{ warehouseId: string; warehouseCode: string; bins: Map<string, string> }> {
+      const warehouseCode = `${prefix}-${ulid().slice(10, 16).toUpperCase()}`;
+      const warehouseId = (
+        await http()
+          .post(`${API}/${tenantId}/warehouses`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ origin: testAddress(), code: warehouseCode, name: `Segregation Depot ${ulid()}` })
+          .expect(201)
+      ).body.id as string;
+      const zoneId = (
+        await http()
+          .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ code: 'S', name: 'Segregation aisle' })
+          .expect(201)
+      ).body.id as string;
+      const bins = new Map<string, string>();
+      for (const code of binCodes) {
+        bins.set(
+          code,
+          (
+            await http()
+              .post(`${API}/${tenantId}/warehouses/${warehouseId}/zones/${zoneId}/bins`)
+              .set('Authorization', `Bearer ${ownerToken}`)
+              .set(KEY_HEADER, ulid())
+              .send({ code, capacity: 1000, type: 'shelf' })
+              .expect(201)
+          ).body.id as string,
+        );
+      }
+      return { warehouseId, warehouseCode, bins };
+    }
+
+    /** Park stock directly — the named `stock.adjust` bypass shape (a mixed bin can pre-exist). */
+    async function park(warehouseId: string, binId: string, ...skuIds: string[]): Promise<void> {
+      for (const id of skuIds) {
+        await sql`insert into stock_on_hand (id, tenant_id, warehouse_id, sku_id, bin_id, quantity)
+                  values (${uuidv7()}, ${tenantId}, ${warehouseId}, ${id}, ${binId}, ${toMilli(1)})`;
+      }
+    }
+
+    it('EMPTY_PROFILE_SQL agrees with isEmptyProfile on every stored SKU (the arrays default to {}, never null)', async () => {
+      // One of each shape the predicate distinguishes, beside everything the suite created.
+      await newSku();
+      await newSku({ foodCategory: 'non-food' });
+      await newSku({ foodCategory: 'dairy', allergens: ['milk'] });
+      await newSku({ drugSchedules: ['H'] });
+      await newSku({ dgClass: '9', dgUnNumber: '3480' });
+      await newSku({ dgClass: '9', dgUnNumber: '3480', dgSubsidiaryClasses: ['8'] });
+      await newSku({ hazardClass: 'toxic' });
+      await newSku({ foodCategory: 'non-food', dgClass: '8', dgUnNumber: '1830', hazardClass: null });
+      const db = app.get<Database>(DATABASE);
+      const rows = await db
+        .select({ id: skusTable.id, nonEmpty: dsql<boolean>`${EMPTY_PROFILE_SQL}`, ...SEGREGATION_PROFILE_COLUMNS })
+        .from(skusTable)
+        .where(eq(skusTable.tenantId, tenantId));
+      expect(rows.length).toBeGreaterThan(8);
+      const verdicts = new Set<boolean>();
+      for (const row of rows) {
+        expect({ id: row.id, nonEmpty: row.nonEmpty }).toEqual({ id: row.id, nonEmpty: !isEmptyProfile(profileOf(row)) });
+        verdicts.add(row.nonEmpty);
+      }
+      expect(verdicts).toEqual(new Set([true, false])); // both arms exercised
+    });
+
+    it('Edit: food added / schedule added beside DG 8 none → 409, nothing written', async () => {
+      const { warehouseId, bins } = await depot('SG1', ['S-01']);
+      const sku = await newSku();
+      const corrosive = await newSku({ dgClass: '8', dgUnNumber: '1830', hazardClass: null });
+      await park(warehouseId, bins.get('S-01')!, sku.id, corrosive.id);
+      const food = await patchSku(sku.id, { foodCategory: 'dairy' }).expect(409);
+      expectProblem(food, 409, 'hazard-segregation-conflict');
+      expect(String(food.body.detail)).toContain('S-01');
+      expect(String(food.body.detail)).toContain(corrosive.code);
+      expect(String(food.body.detail)).toContain('food never shares a bin with a chemical');
+      const drug = await patchSku(sku.id, { drugSchedules: ['H'] }).expect(409);
+      expectProblem(drug, 409, 'hazard-segregation-conflict');
+      expect(String(drug.body.detail)).toContain('a scheduled drug never shares a bin with a chemical');
+      expect(await stored(sku.id)).toMatchObject({ food_category: null, drug_schedules: [] });
+    });
+
+    it('Edit: a flammable drug beside rice that drops its schedule becomes a chemical → 409', async () => {
+      const { warehouseId, bins } = await depot('SG2', ['S-01']);
+      const drug = await newSku({ drugSchedules: ['H'], hazardClass: 'flammable' });
+      const rice = await newSku({ foodCategory: 'packaged-dry-grocery' });
+      await park(warehouseId, bins.get('S-01')!, drug.id, rice.id);
+      const res = await patchSku(drug.id, { drugSchedules: [] }).expect(409);
+      expectProblem(res, 409, 'hazard-segregation-conflict');
+      expect(String(res.body.detail)).toContain(rice.code);
+      expect(await stored(drug.id)).toMatchObject({ drug_schedules: ['H'] });
+    });
+
+    it('Edit: allergens removed beside a [milk] food, and a DG 3 beverage turned non-food beside juice → 409', async () => {
+      const { warehouseId, bins } = await depot('SG3', ['S-01', 'S-02']);
+      const milkA = await newSku({ foodCategory: 'confectionery', allergens: ['milk'] });
+      const milkB = await newSku({ foodCategory: 'confectionery', allergens: ['milk'] });
+      await park(warehouseId, bins.get('S-01')!, milkA.id, milkB.id);
+      const allergen = await patchSku(milkA.id, { allergens: [] }).expect(409);
+      expectProblem(allergen, 409, 'hazard-segregation-conflict');
+      expect(String(allergen.body.detail)).toContain('two foods share a bin only when they declare the same allergens');
+      expect(await stored(milkA.id)).toMatchObject({ allergens: ['milk'] });
+
+      const whisky = await newSku({ foodCategory: 'beverages', dgClass: '3', dgUnNumber: '3065' });
+      const juice = await newSku({ foodCategory: 'beverages' });
+      await park(warehouseId, bins.get('S-02')!, whisky.id, juice.id);
+      const nonFood = await patchSku(whisky.id, { foodCategory: 'non-food' }).expect(409);
+      expectProblem(nonFood, 409, 'hazard-segregation-conflict');
+      expect(String(nonFood.body.detail)).toContain(juice.code);
+      expect(await stored(whisky.id)).toMatchObject({ food_category: 'beverages' });
+    });
+
+    it('Edit: an already-mixed bin passes an unrelated edit and an edit that keeps the same conflict keys', async () => {
+      const { warehouseId, bins } = await depot('SG4', ['S-01']);
+      const rice = await newSku({ foodCategory: 'packaged-dry-grocery' });
+      const battery = await newSku({ dgClass: '9', dgUnNumber: '3480' });
+      await park(warehouseId, bins.get('S-01')!, rice.id, battery.id);
+      expect((await patchSku(rice.id, { name: 'Basmati rice' }).expect(200)).body.name).toBe('Basmati rice');
+      // {food-chemical} before and after — no worse.
+      expect((await patchSku(rice.id, { allergens: ['milk'] }).expect(200)).body.allergens).toEqual(['milk']);
+    });
+
+    it('Edit: 12-2 regress — explosive → flammable beside an oxidizer is still refused', async () => {
+      const { warehouseId, bins } = await depot('SG5', ['S-01']);
+      const sku = await newSku({ hazardClass: 'explosive' });
+      const oxidizer = await newSku({ hazardClass: 'oxidizer' });
+      await park(warehouseId, bins.get('S-01')!, sku.id, oxidizer.id);
+      expectProblem(await patchSku(sku.id, { hazardClass: 'flammable' }).expect(409), 409, 'hazard-segregation-conflict');
+      expect(await stored(sku.id)).toMatchObject({ hazard_class: 'explosive' });
+    });
+
+    it('Edit: the 409 lists every newly conflicting bin and binmate', async () => {
+      const { warehouseId, bins } = await depot('SG6', ['S-01', 'S-02', 'S-03']);
+      const sku = await newSku();
+      const battery = await newSku({ dgClass: '9', dgUnNumber: '3480' });
+      const toxic = await newSku({ hazardClass: 'toxic' });
+      const tshirt = await newSku({ foodCategory: 'non-food' });
+      await park(warehouseId, bins.get('S-01')!, sku.id, battery.id);
+      await park(warehouseId, bins.get('S-02')!, sku.id, toxic.id);
+      await park(warehouseId, bins.get('S-03')!, sku.id, tshirt.id);
+      const res = await patchSku(sku.id, { foodCategory: 'other-food' }).expect(409);
+      const detail = String(res.body.detail);
+      expect(detail).toContain('"S-01"');
+      expect(detail).toContain(battery.code);
+      expect(detail).toContain('"S-02"');
+      expect(detail).toContain(toxic.code);
+      expect(detail).not.toContain('"S-03"');
+      expect(detail).not.toContain(tshirt.code);
+    });
+
+    it('Edit: a DG-only PATCH whose derived hazard (5.1 → oxidizer) conflicts with a flammable binmate → 409', async () => {
+      const { warehouseId, bins } = await depot('SG7', ['S-01']);
+      const sku = await newSku();
+      const flammable = await newSku({ hazardClass: 'flammable' });
+      await park(warehouseId, bins.get('S-01')!, sku.id, flammable.id);
+      const res = await patchSku(sku.id, { dgClass: '5.1', dgUnNumber: '1479' }).expect(409);
+      expectProblem(res, 409, 'hazard-segregation-conflict');
+      expect(String(res.body.detail)).toContain('oxidizer');
+      expect(String(res.body.detail)).toContain(flammable.code);
+      expect(await stored(sku.id)).toMatchObject({ dg_class: null, hazard_class: null });
+    });
+
+    it('Edit: a goods-type conflict against an open QC hold\'s origin bin → 409 naming the origin bin and the hold', async () => {
+      const { warehouseId, bins } = await depot('SG8', ['S-01']);
+      const sku = await newSku();
+      const battery = await newSku({ dgClass: '9', dgUnNumber: '3480' });
+      await park(warehouseId, bins.get('S-01')!, sku.id, battery.id);
+      // The hold moves the SKU's units out to the QC-HOLD bin; S-01 is now only its ORIGIN.
+      const hold = (
+        await http()
+          .post(`${API}/${tenantId}/receiving/qc-holds`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ warehouseId, skuId: sku.id, binId: bins.get('S-01')!, reason: 'damaged carton' })
+          .expect(201)
+      ).body.qcHold as { id: string };
+      const res = await patchSku(sku.id, { foodCategory: 'dairy' }).expect(409);
+      expectProblem(res, 409, 'hazard-segregation-conflict');
+      const detail = String(res.body.detail);
+      expect(detail).toContain('origin bin "S-01"');
+      expect(detail).toContain(hold.id);
+      expect(detail).toContain(battery.code);
+      expect(detail).toContain('food never shares a bin with a chemical');
+    });
+
+    it('Edit: an edit to an EMPTY profile beside conflicting stock → 200 (an empty profile carries no rule)', async () => {
+      const { warehouseId, bins } = await depot('SG9', ['S-01']);
+      const rice = await newSku({ foodCategory: 'packaged-dry-grocery' });
+      const battery = await newSku({ dgClass: '9', dgUnNumber: '3480' });
+      await park(warehouseId, bins.get('S-01')!, rice.id, battery.id);
+      expect((await patchSku(rice.id, { foodCategory: 'non-food' }).expect(200)).body.foodCategory).toBe('non-food');
+    });
+
+    it('scripts/segregation-conflicts.ts exits 2 (never a false all-clear) for a --tenant that does not exist', async () => {
+      const run = spawnSync('bun', ['scripts/segregation-conflicts.ts', '--tenant', uuidv7(), '--json'], {
+        cwd: resolve(__dirname, '..'),
+        env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL, DATABASE_AUTH_URL: process.env.DATABASE_URL },
+        encoding: 'utf8',
+      });
+      expect(run.status).toBe(2);
+      expect(run.stdout).toBe('');
+      expect(run.stderr).toContain('does not exist');
+    });
+
+    it('scripts/segregation-conflicts.ts lists exactly the two seeded mixed bins and the rule for each; a clean bin is not listed', async () => {
+      const { warehouseId, warehouseCode, bins } = await depot('SGL', ['M-01', 'M-02', 'C-01']);
+      const rice = await newSku({ foodCategory: 'packaged-dry-grocery' });
+      const battery = await newSku({ dgClass: '9', dgUnNumber: '3480' });
+      const milkSweet = await newSku({ foodCategory: 'confectionery', allergens: ['milk'] });
+      const plainSweet = await newSku({ foodCategory: 'confectionery' });
+      const tshirt = await newSku({ foodCategory: 'non-food' });
+      await park(warehouseId, bins.get('M-01')!, rice.id, battery.id);
+      await park(warehouseId, bins.get('M-02')!, milkSweet.id, plainSweet.id);
+      await park(warehouseId, bins.get('C-01')!, rice.id, tshirt.id);
+      const run = spawnSync('bun', ['scripts/segregation-conflicts.ts', '--tenant', tenantId, '--json'], {
+        cwd: resolve(__dirname, '..'),
+        env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL, DATABASE_AUTH_URL: process.env.DATABASE_URL },
+        encoding: 'utf8',
+      });
+      expect(run.stderr).toBe('');
+      expect(run.status).toBe(1); // mixed bins exist
+      const listed = run.stdout
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { warehouseCode: string; binCode: string; rule: string; skuA: string; skuB: string; detail: string })
+        .filter((row) => row.warehouseCode === warehouseCode)
+        .map(({ binCode, rule }) => ({ binCode, rule }));
+      expect(listed).toEqual([
+        { binCode: 'M-01', rule: 'food-chemical' },
+        { binCode: 'M-02', rule: 'allergen-mismatch' },
+      ]);
     });
   });
 });
