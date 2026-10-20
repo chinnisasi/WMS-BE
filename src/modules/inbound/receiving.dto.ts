@@ -5,6 +5,7 @@ import {
   QUANTITY_FIELD_DESCRIPTION,
   } from '../../shared/primitives/quantity';
 import { STORAGE_CLASSES } from '../../shared/primitives/storage-class';
+import { DG_CLASSES, DG_PACKING_GROUPS } from '../../shared/primitives/goods-type';
 import { UOMS } from '../catalog/uom';
 import {
   ArrayMaxSize,
@@ -749,6 +750,21 @@ export class CatalogSnapshotPackBarcodeDto {
   factor!: number;
 }
 
+/** Story 1-6a — a snapshot SKU's dangerous-goods identity. */
+export class CatalogSnapshotDgDto {
+  @ApiProperty({ example: '1230', description: 'The UN number, four digits without the "UN" prefix' })
+  unNumber!: string;
+
+  @ApiProperty({ example: '3', enum: [...DG_CLASSES], description: 'The primary DG class' })
+  class!: string;
+
+  @ApiProperty({ type: [String], enum: [...DG_CLASSES], example: ['6.1'], description: 'Up to two subsidiary DG classes, sorted' })
+  subsidiaryClasses!: string[];
+
+  @ApiProperty({ type: String, nullable: true, enum: [...DG_PACKING_GROUPS], example: 'II', description: 'The UN packing group, or null' })
+  packingGroup!: string | null;
+}
+
 /** One SKU of the device snapshot's barcode map. */
 export class CatalogSnapshotSkuDto {
   @ApiProperty({ format: 'uuid' })
@@ -833,7 +849,30 @@ export class CatalogSnapshotSkuDto {
       'Story 1-4b: `inactive` — the SKU takes no new inbound. A receive scan of it that is not on the document is still booked and flagged for review; the handheld warns at scan time. An older device ignores it.',
   })
   status!: 'active' | 'inactive';
+
+  @ApiProperty({ description: 'Story 1-6a: handle with care — the handheld notes it on receive, pick, pack and putaway' })
+  fragile!: boolean;
+
+  @ApiProperty({ description: 'Story 1-6a: a handling and insurance marker — noted on the handheld, never a placement rule' })
+  highValue!: boolean;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    minimum: 1,
+    maximum: 100,
+    description: 'Story 1-6a: how many of the SKU\'s outermost received units may stand on one another (1 = do not stack); shown, not enforced',
+  })
+  maxStackLayers!: number | null;
+
+  @ApiProperty({
+    type: CatalogSnapshotDgDto,
+    nullable: true,
+    description: 'Story 1-6a: the dangerous-goods identity, null when the SKU is not a dangerous good',
+  })
+  dg!: CatalogSnapshotDgDto | null;
 }
+
 
 /**
  * Story 1-2b — a client's receiving policy as the device snapshot carries it

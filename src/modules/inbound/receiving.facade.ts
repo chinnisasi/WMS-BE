@@ -137,6 +137,16 @@ export interface CatalogSnapshot {
     readonly packBarcodes: readonly { readonly barcode: string; readonly uom: string; readonly factor: number }[];
     /** Story 1-4b: `active | inactive` — the handheld's inactive receive-scan warning. Seventh mirror. */
     readonly status: 'active' | 'inactive';
+    /** Story 1-6a: the handling warnings (fragile, high value, stack limit, DG). Eighth mirror. */
+    readonly fragile: boolean;
+    readonly highValue: boolean;
+    readonly maxStackLayers: number | null;
+    readonly dg: {
+      readonly unNumber: string;
+      readonly class: string;
+      readonly subsidiaryClasses: readonly string[];
+      readonly packingGroup: string | null;
+    } | null;
   }[];
   readonly openPurchaseOrders: readonly {
     readonly id: string;

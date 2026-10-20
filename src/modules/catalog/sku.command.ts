@@ -53,6 +53,18 @@ import {
 } from '../../shared/primitives/hazard';
 // Story 5-3 — the ABC class vocabulary validator (the hazard shape).
 import { assertAbcClass } from '../../shared/primitives/abc-class';
+// Story 1-6a — the goods-type rule set (canonicalisation, the pairing rules,
+// the DG → hazard derivation).
+import {
+  DEFAULT_GOODS_TYPE,
+  assertGoodsType,
+  canonicalGoodsType,
+  mergeGoodsType,
+  presentGoodsTypeKeys,
+  resolveHazardClass,
+  type GoodsTypeFields,
+  type GoodsTypeInput,
+} from '../../shared/primitives/goods-type';
 import { binOccupantHazardPairsInTx } from '../putaway/putaway.command';
 import { openQcHoldsForSkuInTx } from '../inbound/qc.command';
 import {
@@ -191,6 +203,21 @@ export interface SkuSnapshot {
   readonly status: SkuStatus;
   /** Story 1-4b — the deactivation reason, null unless inactive (and optional then). */
   readonly inactiveReason: string | null;
+  /**
+   * Story 1-6a — the goods-type attributes (`goods-type.ts`). A replay of a
+   * pre-1-6a stored response serves `[]`, `null` and `false`
+   * (`normalizeStoredSku`).
+   */
+  readonly drugSchedules: readonly string[];
+  readonly foodCategory: string | null;
+  readonly allergens: readonly string[];
+  readonly dgUnNumber: string | null;
+  readonly dgClass: string | null;
+  readonly dgSubsidiaryClasses: readonly string[];
+  readonly dgPackingGroup: string | null;
+  readonly highValue: boolean;
+  readonly fragile: boolean;
+  readonly maxStackLayers: number | null;
   readonly createdAt: string;
 }
 
@@ -208,7 +235,7 @@ export function normalizeStoredSku(stored: SkuSnapshot): SkuSnapshot {
     barcodes?: readonly SkuBarcodeView[];
     status?: SkuStatus;
     inactiveReason?: string | null;
-  };
+  } & Partial<GoodsTypeFields>;
   return {
     ...legacy,
     storageClass: legacy.storageClass ?? 'ambient',
@@ -219,6 +246,17 @@ export function normalizeStoredSku(stored: SkuSnapshot): SkuSnapshot {
     // Story 1-4b — every SKU stored before 1-4b was active.
     status: legacy.status ?? 'active',
     inactiveReason: legacy.inactiveReason ?? null,
+    // Story 1-6a — every SKU stored before 1-6a carried no goods-type data.
+    drugSchedules: legacy.drugSchedules ?? DEFAULT_GOODS_TYPE.drugSchedules,
+    foodCategory: legacy.foodCategory ?? null,
+    allergens: legacy.allergens ?? DEFAULT_GOODS_TYPE.allergens,
+    dgUnNumber: legacy.dgUnNumber ?? null,
+    dgClass: legacy.dgClass ?? null,
+    dgSubsidiaryClasses: legacy.dgSubsidiaryClasses ?? DEFAULT_GOODS_TYPE.dgSubsidiaryClasses,
+    dgPackingGroup: legacy.dgPackingGroup ?? null,
+    highValue: legacy.highValue ?? false,
+    fragile: legacy.fragile ?? false,
+    maxStackLayers: legacy.maxStackLayers ?? null,
   };
 }
 
@@ -239,8 +277,12 @@ export interface ExtraBarcodeInput {
   readonly uom: string;
 }
 
-/** Story 1-4 — `POST …/catalog/skus`: one import row's worth of fields, typed. */
-export interface CreateSkuCommand {
+/**
+ * Story 1-4 — `POST …/catalog/skus`: one import row's worth of fields, typed.
+ * Story 1-6a — plus the goods-type fields (`GoodsTypeInput`: absent = the
+ * default).
+ */
+export interface CreateSkuCommand extends GoodsTypeInput {
   readonly tenantId: string;
   readonly actorUserId: string;
   readonly code: string;
@@ -258,7 +300,13 @@ export interface CreateSkuCommand {
   readonly heightMm?: number | undefined;
   readonly countryOfOrigin?: string | undefined;
   readonly storageClass?: string | undefined;
-  readonly hazardClass?: string | undefined;
+  /**
+   * Story 1-6a — `null` is explicit none (DG class 8's third choice);
+   * absent lets a mapped DG class derive it. Both hash as `null` (the
+   * pre-1-6a key shape): wherever both commit they leave the same class —
+   * absent with class 8 is refused, null with a mapped class is refused.
+   */
+  readonly hazardClass?: string | null | undefined;
   readonly abcClass?: string | undefined;
   readonly reorderPoint?: number | undefined;
   readonly reorderQty?: number | undefined;
@@ -291,7 +339,7 @@ export interface ReplacePackagingCommand {
   readonly barcodes: readonly ExtraBarcodeInput[];
 }
 
-export interface EditSkuCommand {
+export interface EditSkuCommand extends GoodsTypeInput {
   readonly tenantId: string;
   /** The session user — authority is re-read from the DB at command entry. */
   readonly actorUserId: string;
@@ -493,10 +541,15 @@ export class SkuCommand {
     const barcode = blankToUndefined(command.barcode);
     const countryOfOrigin = blankToUndefined(command.countryOfOrigin);
     const packaging = canonicalPackaging(command.levels, command.barcodes);
+    // Story 1-6a (decision 10) — canonical before hashing: the UN prefix
+    // stripped, the arrays sorted and de-duplicated.
+    const goods = canonicalGoodsType(pickGoodsType(command));
 
     // 1. The hash — fixed key order, collections canonicalised (levels by
     //    uom, barcodes by (uom, barcode)); `clientId` only when present (the
-    //    21-2b conditional-key precedent).
+    //    21-2b conditional-key precedent). Story 1-6a: each goods-type key
+    //    joins only when present, after `barcodes` — a pre-1-6a body hashes
+    //    byte for byte as before (pinned by a golden in the suite).
     const payloadHash = hashCommandPayload({
       command: 'sku.create',
       tenantId: command.tenantId,
@@ -522,6 +575,7 @@ export class SkuCommand {
       shelfLifeDays: command.shelfLifeDays ?? null,
       levels: packaging.levels,
       barcodes: packaging.barcodes,
+      ...presentGoodsTypeKeys(goods),
       ...(command.clientId === undefined ? {} : { clientId: command.clientId }),
     });
 
@@ -578,6 +632,11 @@ export class SkuCommand {
       assertHazardClass({ hazardClass: command.hazardClass });
       assertAbcClass({ abcClass: command.abcClass });
       assertShelfLifeDays(command.shelfLifeDays);
+      // Story 1-6a — the goods-type rules over the request (absent = the
+      // default), then the DG → hazard derivation with no stored state
+      // (decision 7: an absent hazard derives; class 8 must name its choice).
+      assertGoodsType(goods);
+      const hazardClass = resolveHazardClass(goods.dgClass ?? null, null, command.hazardClass);
       const precision = uomPrecision(uom);
       const reorderPointMilli =
         command.reorderPoint === undefined ? 0 : assertRecordableQuantity(command.reorderPoint, 'reorderPoint', uom, precision);
@@ -639,9 +698,10 @@ export class SkuCommand {
             reorderQty: reorderQtyMilli,
             barcode: primary,
             storageClass: command.storageClass ?? 'ambient',
-            hazardClass: command.hazardClass ?? null,
+            hazardClass,
             abcClass: command.abcClass ?? null,
             shelfLifeDays: command.shelfLifeDays ?? null,
+            ...goodsTypeColumns(goods),
           })
           .returning();
         row = inserted[0]!;
@@ -914,13 +974,19 @@ export class SkuCommand {
       // Story 1-4 — shelf life counts too (null = clear); `undefined` drops
       // out of the spread hash, so a pre-1.4 body hashes as before.
       shelfLifeDays: command.shelfLifeDays,
+      // Story 1-6a — the goods-type fields, canonical (decision 10) and LAST,
+      // so a pre-1-6a body's hash is unchanged (absent keys drop out). The
+      // derived hazard class is NOT here: `fields` is hashed, and a value
+      // derived from stored state would make one request hash differently
+      // depending on the row (Design Notes).
+      ...canonicalGoodsType(pickGoodsType(command)),
     };
     if (Object.values(fields).every((value) => value === undefined)) {
       throw new ProblemException(
         'validation-failed',
         400,
         'Empty SKU edit',
-        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass, hazardClass, abcClass, shelfLifeDays is required.',
+        'At least one of name, gstRate, hsn, batchTracked, serialTracked, catchWeightTracked, weightGrams, lengthMm, widthMm, heightMm, countryOfOrigin, reorderPoint, reorderQty, barcode, productId, variantValues, storageClass, hazardClass, abcClass, shelfLifeDays, drugSchedules, foodCategory, allergens, dgUnNumber, dgClass, dgSubsidiaryClasses, dgPackingGroup, highValue, fragile, maxStackLayers is required.',
       );
     }
     // ── story 11.2: this hash did NOT break ──────────────────────────────────
@@ -1055,6 +1121,22 @@ export class SkuCommand {
         if (fields.barcode !== undefined) {
           assertBarcodeRule(fields.barcode, 'barcode');
         }
+        // ── Story 1-6a: the goods-type pipeline (decision 7), behind the
+        // replay and the SKU `FOR UPDATE`: merge each field onto the locked
+        // row with `!== undefined` (never `??` — a clear is not absent), rule
+        // on the RESULTING state, then derive the hazard class the edit
+        // leaves behind. `effectiveHazard` is held apart from `fields` (and
+        // the hash); when it differs from the stored class it drives both the
+        // co-location guard and the write below — a DG-only PATCH that
+        // derives `explosive` is guarded exactly as a hazard PATCH is.
+        const mergedGoods = mergeGoodsType(goodsTypeOf(current), fields);
+        assertGoodsType(mergedGoods);
+        const effectiveHazard = resolveHazardClass(
+          mergedGoods.dgClass ?? null,
+          { dgClass: current.dgClass, hazardClass: current.hazardClass },
+          fields.hazardClass,
+        );
+        const hazardChanges = effectiveHazard !== current.hazardClass;
 
         // ── Story 12-1: the class-change arm. The SKU row takes `.for('update')`
         // whenever the storage-class FIELD is present — a change, a no-op
@@ -1160,7 +1242,7 @@ export class SkuCommand {
         // release itself stays class-free — pinned indirectly, the 12-1
         // pattern), and the party message names the pinning hold's id so the
         // operator can find it.
-        if (fields.hazardClass !== undefined) {
+        if (hazardChanges) {
           const hazardLockedRows = await tx
             .select()
             .from(skus)
@@ -1168,7 +1250,7 @@ export class SkuCommand {
             .limit(1)
             .for('update');
           const hazardLocked = hazardLockedRows[0]!;
-          const newHazardClass = fields.hazardClass;
+          const newHazardClass = effectiveHazard;
           if (newHazardClass !== null && hazardLocked.hazardClass !== newHazardClass) {
             const stockBins = await tx
               .select({
@@ -1563,8 +1645,12 @@ export class SkuCommand {
         // NOT NULL, a SKU always carries a class).
         if (fields.storageClass !== undefined) updates.storageClass = fields.storageClass;
         // Story 12-2 — absent = unchanged, null = clear (the 11.2 attribute
-        // template; the column is nullable, the clear verb exists).
-        if (fields.hazardClass !== undefined) updates.hazardClass = fields.hazardClass;
+        // template; the column is nullable, the clear verb exists). Story
+        // 1-6a: the RESOLVED class (decision 7) — derived from the DG class
+        // when one is mapped — written only when it changes.
+        if (hazardChanges) updates.hazardClass = effectiveHazard;
+        // Story 1-6a — the goods-type fields, absent = unchanged.
+        Object.assign(updates, goodsTypeColumns(fields));
         // Story 5-3 — absent = unchanged, null = clear (the hazardClass
         // twin; null = not yet classified, OQ-1).
         if (fields.abcClass !== undefined) updates.abcClass = fields.abcClass;
@@ -1707,8 +1793,66 @@ function toSnapshot(row: typeof skus.$inferSelect): SkuSnapshot {
     // Story 1-4b — the status and its reason (null unless inactive).
     status: row.status as SkuStatus,
     inactiveReason: row.inactiveReason ?? null,
+    // Story 1-6a — the goods-type attributes (every pre-1-6a row reads the
+    // column defaults).
+    ...goodsTypeOf(row),
     createdAt: row.createdAt,
   };
+}
+
+/** Story 1-6a — a SKU row's goods-type fields, in the fixed field order. */
+export function goodsTypeOf(row: typeof skus.$inferSelect): GoodsTypeFields {
+  return {
+    drugSchedules: row.drugSchedules ?? [],
+    foodCategory: row.foodCategory ?? null,
+    allergens: row.allergens ?? [],
+    dgUnNumber: row.dgUnNumber ?? null,
+    dgClass: row.dgClass ?? null,
+    dgSubsidiaryClasses: row.dgSubsidiaryClasses ?? [],
+    dgPackingGroup: row.dgPackingGroup ?? null,
+    highValue: row.highValue ?? false,
+    fragile: row.fragile ?? false,
+    maxStackLayers: row.maxStackLayers ?? null,
+  };
+}
+
+/** Story 1-6a — the goods-type keys of a command, nothing else (absent stays absent). */
+function pickGoodsType(command: GoodsTypeInput): GoodsTypeInput {
+  return {
+    drugSchedules: command.drugSchedules,
+    foodCategory: command.foodCategory,
+    allergens: command.allergens,
+    dgUnNumber: command.dgUnNumber,
+    dgClass: command.dgClass,
+    dgSubsidiaryClasses: command.dgSubsidiaryClasses,
+    dgPackingGroup: command.dgPackingGroup,
+    highValue: command.highValue,
+    fragile: command.fragile,
+    maxStackLayers: command.maxStackLayers,
+  };
+}
+
+/**
+ * Story 1-6a — the present goods-type fields as column values. `assertGoodsType`
+ * has already refused null on the NOT NULL ones, so a present value is the
+ * column's type; an absent key is not written (the create's column defaults,
+ * the edit's "unchanged").
+ */
+export function goodsTypeColumns(input: GoodsTypeInput): Partial<typeof skus.$inferInsert> {
+  const out: Partial<typeof skus.$inferInsert> = {};
+  if (input.drugSchedules !== undefined && input.drugSchedules !== null) out.drugSchedules = [...input.drugSchedules];
+  if (input.foodCategory !== undefined) out.foodCategory = input.foodCategory;
+  if (input.allergens !== undefined && input.allergens !== null) out.allergens = [...input.allergens];
+  if (input.dgUnNumber !== undefined) out.dgUnNumber = input.dgUnNumber;
+  if (input.dgClass !== undefined) out.dgClass = input.dgClass;
+  if (input.dgSubsidiaryClasses !== undefined && input.dgSubsidiaryClasses !== null) {
+    out.dgSubsidiaryClasses = [...input.dgSubsidiaryClasses];
+  }
+  if (input.dgPackingGroup !== undefined) out.dgPackingGroup = input.dgPackingGroup;
+  if (input.highValue !== undefined && input.highValue !== null) out.highValue = input.highValue;
+  if (input.fragile !== undefined && input.fragile !== null) out.fragile = input.fragile;
+  if (input.maxStackLayers !== undefined) out.maxStackLayers = input.maxStackLayers;
+  return out;
 }
 
 /** One SKU's response shape with its pack levels and barcodes (two reads). */

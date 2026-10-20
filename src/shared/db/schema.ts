@@ -911,6 +911,24 @@ export const skus = pgTable(
     status: text('status').notNull().default('active'),
     /** Story 1-4b — null unless the SKU is inactive; 1–500 code points, trimmed by the command. */
     inactiveReason: text('inactive_reason'),
+    /**
+     * Story 1-6a — the goods-type attributes (`shared/primitives/goods-type.ts`
+     * holds the vocabularies and the one rule set; every CHECK lives only in
+     * `drizzle/0083_sku_goods_type.sql`). Arrays are stored sorted and unique.
+     * `dg_class` derives `hazard_class` (decision 3, `skus_dg_hazard_derived`).
+     * Captured and shown as handling warnings; nothing here is enforced.
+     */
+    drugSchedules: text('drug_schedules').array().notNull().default(sql`'{}'::text[]`),
+    foodCategory: text('food_category'),
+    allergens: text('allergens').array().notNull().default(sql`'{}'::text[]`),
+    dgUnNumber: text('dg_un_number'),
+    dgClass: text('dg_class'),
+    dgSubsidiaryClasses: text('dg_subsidiary_classes').array().notNull().default(sql`'{}'::text[]`),
+    dgPackingGroup: text('dg_packing_group'),
+    highValue: boolean('high_value').notNull().default(false),
+    fragile: boolean('fragile').notNull().default(false),
+    /** How many of the SKU's outermost received units may stand on one another (1–100; 1 = do not stack). */
+    maxStackLayers: integer('max_stack_layers'),
     ...tenantTimestamps,
   },
   (table) => [

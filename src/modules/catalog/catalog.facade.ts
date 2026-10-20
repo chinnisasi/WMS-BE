@@ -245,6 +245,24 @@ export interface SkuSummary {
    * an inactive SKU that is not on the document (it is booked and flagged).
    */
   readonly status: SkuStatus;
+  /**
+   * Story 1-6a — the handling warnings the handheld notes on receive, pick,
+   * pack and putaway (text only; nothing is enforced). `dg` is null unless
+   * the SKU is a dangerous good. Drug schedule, food category and allergens
+   * are not sent — captured only, for 1-6b and 1-6c.
+   */
+  readonly fragile: boolean;
+  readonly highValue: boolean;
+  readonly maxStackLayers: number | null;
+  readonly dg: SkuDangerousGoods | null;
+}
+
+/** Story 1-6a — a dangerous good as the device snapshot carries it. */
+export interface SkuDangerousGoods {
+  readonly unNumber: string;
+  readonly class: string;
+  readonly subsidiaryClasses: readonly string[];
+  readonly packingGroup: string | null;
 }
 
 /** Story 1-4 — one pack (or extra base-level) barcode as the device snapshot carries it. */
@@ -559,6 +577,14 @@ export class CatalogFacade {
         clientId: skus.clientId,
         // Story 1-4b — the receive scan's inactive warning.
         status: skus.status,
+        // Story 1-6a — the handling warnings.
+        fragile: skus.fragile,
+        highValue: skus.highValue,
+        maxStackLayers: skus.maxStackLayers,
+        dgUnNumber: skus.dgUnNumber,
+        dgClass: skus.dgClass,
+        dgSubsidiaryClasses: skus.dgSubsidiaryClasses,
+        dgPackingGroup: skus.dgPackingGroup,
       })
       .from(skus)
       .leftJoin(products, eq(products.id, skus.productId))
@@ -600,11 +626,17 @@ export class CatalogFacade {
     // Story 10.2: the unit's declared precision joins the scan identity. It is
     // a property of the UNIT, so it is looked up here rather than selected —
     // still on the caller's transaction.
-    return rows.map((row) => ({
+    return rows.map(({ dgUnNumber, dgClass, dgSubsidiaryClasses, dgPackingGroup, ...row }) => ({
       ...row,
       status: row.status as SkuStatus,
       uomPrecision: uomPrecision(row.uom),
       packBarcodes: packBySku.get(row.id) ?? [],
+      // Story 1-6a — the DG arm, null unless both halves are set (the
+      // `skus_dg_un_class_pairing` CHECK makes that every DG SKU).
+      dg:
+        dgUnNumber !== null && dgClass !== null
+          ? { unNumber: dgUnNumber, class: dgClass, subsidiaryClasses: dgSubsidiaryClasses ?? [], packingGroup: dgPackingGroup }
+          : null,
     }));
   }
 

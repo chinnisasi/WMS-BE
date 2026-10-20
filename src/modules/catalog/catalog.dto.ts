@@ -37,6 +37,17 @@ import { HAZARD_CLASSES } from '../../shared/primitives/hazard';
 // primitive's tuple (the three-layer pattern).
 import { ABC_CLASSES } from '../../shared/primitives/abc-class';
 import { UOMS } from './uom';
+// Story 1-6a — the goods-type vocabularies (the three-layer pattern).
+import {
+  ALLERGENS,
+  DG_CLASSES,
+  DG_PACKING_GROUPS,
+  DRUG_SCHEDULES,
+  FOOD_CATEGORIES,
+  MAX_DG_SUBSIDIARY_CLASSES,
+  MAX_STACK_LAYERS,
+  MIN_STACK_LAYERS,
+} from '../../shared/primitives/goods-type';
 import { MAX_SKU_DIMENSION_MM, MAX_SKU_WEIGHT_GRAMS } from './sku-attributes';
 import { AXIS_NAME_MAX, MAX_PRODUCT_AXES, PRODUCT_NAME_MAX } from './product.command';
 import { MAX_KIT_COMPONENTS } from './kit.command';
@@ -106,7 +117,7 @@ export class CatalogImportErrorResponse {
   @ApiProperty({ type: String, nullable: true, example: 'MAS-CHILI-100', description: 'Absent when the row failed shape validation before a code could be read' })
   skuCode!: string | null;
 
-  @ApiProperty({ example: 'duplicate-sku-code', description: 'validation-failed | duplicate-sku-code | duplicate-barcode' })
+  @ApiProperty({ example: 'duplicate-sku-code', description: 'validation-failed | duplicate-sku-code | duplicate-barcode | … ; story 1-6a adds dg-hazard-mismatch (a hazard_class cell disagreeing with dg_class) and dg-hazard-required (dg_class 8 with a blank hazard_class — write corrosive-acid, corrosive-base or none)' })
   code!: string;
 
   @ApiProperty({ example: 'SKU code "MAS-CHILI-100" already exists in this tenant\'s catalog — duplicates are rejected, never merged.' })
@@ -356,6 +367,43 @@ export class SkuResponse {
   @ApiProperty({ type: String, nullable: true, description: 'Story 1-4b — why it was deactivated; null unless inactive (and optional then)' })
   inactiveReason!: string | null;
 
+  // Story 1-6a — the goods-type attributes. A replay of a response stored
+  // before 1-6a serves `[]`, `null` and `false` (`normalizeStoredSku`).
+  @ApiProperty({ type: [String], enum: DRUG_SCHEDULES, example: ['H'], description: 'Story 1-6a — drug schedules, sorted; empty when not a scheduled drug' })
+  drugSchedules!: string[];
+
+  @ApiProperty({ enum: FOOD_CATEGORIES, nullable: true, example: 'dairy', description: 'Story 1-6a — the food category; `non-food` declares the SKU not food, null means not set' })
+  foodCategory!: string | null;
+
+  @ApiProperty({ type: [String], enum: ALLERGENS, example: ['milk'], description: 'Story 1-6a — FSSAI allergens, sorted; only with a food category that is not non-food' })
+  allergens!: string[];
+
+  @ApiProperty({ type: String, nullable: true, example: '1203', description: 'Story 1-6a — the UN number, four digits without the "UN" prefix; set together with dgClass' })
+  dgUnNumber!: string | null;
+
+  @ApiProperty({ enum: DG_CLASSES, nullable: true, example: '3', description: 'Story 1-6a — the primary dangerous-goods class; a mapped class sets hazardClass' })
+  dgClass!: string | null;
+
+  @ApiProperty({ type: [String], enum: DG_CLASSES, example: ['6.1'], description: 'Story 1-6a — up to two subsidiary DG classes, sorted, never the primary' })
+  dgSubsidiaryClasses!: string[];
+
+  @ApiProperty({ enum: DG_PACKING_GROUPS, nullable: true, example: 'II', description: 'Story 1-6a — the UN packing group; none for classes 1, 2, 5.2, 6.2 and 7' })
+  dgPackingGroup!: string | null;
+
+  @ApiProperty({ example: false, description: 'Story 1-6a — a handling and insurance marker; placement stays governed by storage class' })
+  highValue!: boolean;
+
+  @ApiProperty({ example: false, description: 'Story 1-6a — handle with care' })
+  fragile!: boolean;
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    example: 4,
+    description: 'Story 1-6a — how many of the SKU\'s outermost received units may stand on one another (1 = do not stack); shown, not enforced',
+  })
+  maxStackLayers!: number | null;
+
   @ApiProperty({ example: '2026-09-08T00:00:00.000Z' })
   createdAt!: string;
 }
@@ -485,8 +533,100 @@ export class SkuAttributesDto {
   countryOfOrigin?: string;
 }
 
+/**
+ * Story 1-6a — the goods-type fields the create and the edit PATCH share.
+ * Absent = not sent (the edit leaves the field unchanged); `null` clears a
+ * nullable field. An explicit `null` for `highValue`, `fragile` or one of the
+ * arrays is refused 400 by the controller (`@IsOptional` skips null — the
+ * `storageClass` precedent). The command is the boundary: canonicalisation
+ * (the `UN` prefix stripped, arrays sorted and de-duplicated) and every
+ * pairing rule (`assertGoodsType`) run there, behind the replay lookup.
+ */
+export class GoodsTypeFieldsDto {
+  @ApiProperty({ required: false, type: [String], enum: DRUG_SCHEDULES, example: ['H'], description: 'Drug schedules (a drug may carry several, e.g. C and H)' })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(DRUG_SCHEDULES.length)
+  @IsIn(DRUG_SCHEDULES, { each: true })
+  drugSchedules?: string[];
+
+  @ApiProperty({ required: false, enum: FOOD_CATEGORIES, nullable: true, example: 'dairy', description: '`non-food` declares the SKU not food; null clears' })
+  @IsOptional()
+  @IsIn(FOOD_CATEGORIES)
+  foodCategory?: string | null;
+
+  @ApiProperty({ required: false, type: [String], enum: ALLERGENS, example: ['milk'], description: 'FSSAI allergens — only with a food category that is not non-food' })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(ALLERGENS.length)
+  @IsIn(ALLERGENS, { each: true })
+  allergens?: string[];
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    example: 'UN1203',
+    pattern: '^([Uu][Nn])?\\d{4}$',
+    description: 'The UN number 0001–3599, with or without the "UN" prefix (any case; stored without it). Set together with dgClass; null clears',
+  })
+  @IsOptional()
+  @Trimmed()
+  @IsString()
+  @Matches(/^(UN)?\d{4}$/i, { message: 'dgUnNumber must be four digits, optionally prefixed "UN"' })
+  dgUnNumber?: string | null;
+
+  @ApiProperty({
+    required: false,
+    enum: DG_CLASSES,
+    nullable: true,
+    example: '3',
+    description: 'The primary DG class. 1.x → explosive, 2.x → gas, 3 → flammable, 5.1 → oxidizer, 6.1 → toxic set hazardClass; 8 needs hazardClass corrosive-acid, corrosive-base or null; null clears',
+  })
+  @IsOptional()
+  @IsIn(DG_CLASSES)
+  dgClass?: string | null;
+
+  @ApiProperty({ required: false, type: [String], enum: DG_CLASSES, maxItems: MAX_DG_SUBSIDIARY_CLASSES, example: ['6.1'], description: 'Up to two subsidiary DG classes, never the primary, only with a primary' })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(DG_CLASSES.length)
+  @IsIn(DG_CLASSES, { each: true })
+  dgSubsidiaryClasses?: string[];
+
+  @ApiProperty({ required: false, enum: DG_PACKING_GROUPS, nullable: true, example: 'II', description: 'I, II or III; none for classes 1, 2, 5.2, 6.2 and 7; null clears' })
+  @IsOptional()
+  @IsIn(DG_PACKING_GROUPS)
+  dgPackingGroup?: string | null;
+
+  @ApiProperty({ required: false, example: false })
+  @IsOptional()
+  @IsBoolean()
+  highValue?: boolean;
+
+  @ApiProperty({ required: false, example: false })
+  @IsOptional()
+  @IsBoolean()
+  fragile?: boolean;
+
+  @ApiProperty({
+    required: false,
+    type: Number,
+    nullable: true,
+    minimum: MIN_STACK_LAYERS,
+    maximum: MAX_STACK_LAYERS,
+    example: 4,
+    description: 'How many of the SKU\'s outermost received units may stand on one another (1 = do not stack); null clears',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(MIN_STACK_LAYERS)
+  @Max(MAX_STACK_LAYERS)
+  maxStackLayers?: number | null;
+}
+
 /** Story 1-4 — `POST …/catalog/skus`: one import row's worth of fields, typed. */
-export class CreateSkuDto {
+export class CreateSkuDto extends GoodsTypeFieldsDto {
   @ApiProperty({ example: 'TEA-1', minLength: 1, maxLength: SKU_CODE_MAX, description: 'Unique in the client; immutable' })
   @Trimmed()
   @IsString()
@@ -555,10 +695,17 @@ export class CreateSkuDto {
   @IsIn(STORAGE_CLASSES)
   storageClass?: string;
 
-  @ApiProperty({ required: false, enum: HAZARD_CLASSES, example: 'flammable' })
+  @ApiProperty({
+    required: false,
+    enum: HAZARD_CLASSES,
+    nullable: true,
+    example: 'flammable',
+    description:
+      'Story 1-6a — omitted, a mapped dgClass derives it; with dgClass 8 send corrosive-acid, corrosive-base or null (none). A value that disagrees with the DG class is 400 dg-hazard-mismatch',
+  })
   @IsOptional()
   @IsIn(HAZARD_CLASSES)
-  hazardClass?: string;
+  hazardClass?: string | null;
 
   @ApiProperty({ required: false, enum: ABC_CLASSES, example: 'a' })
   @IsOptional()
@@ -663,7 +810,7 @@ export class SegregationMatrixResponse {
 }
 
 /** PATCH fields (spec 1.4): SKU code is immutable; barcode is changeable. */
-export class PatchSkuDto {
+export class PatchSkuDto extends GoodsTypeFieldsDto {
   @ApiProperty({ required: false, minLength: 1, maxLength: 200 })
   @IsOptional()
   @Trimmed()
@@ -894,14 +1041,16 @@ export class PatchSkuDto {
   // `storageClass`). The vocabulary is pinned HERE with `@IsIn` and
   // re-checked in the command (`assertHazardClass`, which skips null — the
   // clear verb — behind the replay lookup; the mirror is not the boundary).
-  // A change runs the co-location guard (409 `hazard-segregation-conflict`).
+  // Story 1-6a: a mapped DG class decides it (`resolveHazardClass`,
+  // decision 7) — null no longer always succeeds. A change runs the
+  // co-location guard (409 `hazard-segregation-conflict`).
   @ApiProperty({
     required: false,
     enum: HAZARD_CLASSES,
     nullable: true,
     example: 'flammable',
     description:
-      'The SKU\'s hazard class (FR-41): explosive, oxidizer, flammable, corrosive-acid, corrosive-base, toxic or gas. Omit to leave unchanged; null clears the class (always succeeds — null carries no rule).',
+      'The SKU\'s hazard class (FR-41): explosive, oxidizer, flammable, corrosive-acid, corrosive-base, toxic or gas. Omit to leave unchanged — or, when the SKU\'s resulting dgClass is mapped (1.x, 2.x, 3, 5.1, 6.1), to take the derived class. null clears it unless the DG class sets one (400 dg-hazard-mismatch); with dgClass 8 only corrosive-acid, corrosive-base or null are accepted, and changing into class 8 from a non-corrosive needs one of them (400 dg-hazard-required). A change to a non-null class runs the co-location guard.',
   })
   @IsOptional()
   @IsIn(HAZARD_CLASSES)
