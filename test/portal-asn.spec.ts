@@ -322,7 +322,8 @@ describe('portal ASN entry (e2e, story 21-7b)', () => {
     it('a kit SKU is 409 kit-cannot-hold-stock naming the kit (receiving could never book it)', async () => {
       const res = await announce({ warehouseId: whMain, asnCode: 'ASN-KIT', lines: [{ skuId: sku.get('A-KIT')!, announcedQty: 1 }] }).expect(409);
       expect(res.body.code).toBe('kit-cannot-hold-stock');
-      expect(res.body.detail).toContain('"A-KIT"');
+      // Story 2-1 — the shared ASN_LINE_KIND label, not just the code.
+      expect(res.body.detail).toContain('Advance shipment notice line names kit SKU(s) "A-KIT"');
       const rows = await sql`select count(*)::int as n from advance_shipment_notices where tenant_id = ${tenantId} and asn_code = 'ASN-KIT'`;
       expect(rows[0]!.n).toBe(0);
     });

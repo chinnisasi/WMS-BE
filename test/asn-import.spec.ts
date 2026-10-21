@@ -427,7 +427,8 @@ describe('ASN import (e2e, 2026-10-17)', () => {
       [14, `MANY-${t}`, 'too-many-lines'],
     ]);
     expect(body.errors.find((e) => e.code === 'asn-rows-disagree')!.detail).toContain('warehouse');
-    expect(body.errors.find((e) => e.code === 'kit-cannot-hold-stock')!.detail).toContain('"GLOW-KIT"');
+    // Story 2-1 — the shared ASN_LINE_KIND label: the import's row error words are unchanged.
+    expect(body.errors.find((e) => e.code === 'kit-cannot-hold-stock')!.detail).toContain('Advance shipment notice line names kit SKU(s) "GLOW-KIT"');
     expect(body.errors.find((e) => e.code === 'duplicate-asn-code')!.detail).toBe(`Client GLOWCO already has an advance shipment notice "USED-${t}".`);
     expect(body.errors.find((e) => e.code === 'quantity-precision')!.detail).toContain('whole number');
     // Every reason this suite raises is in the closed vocabulary the DTO publishes.

@@ -509,13 +509,18 @@ describe('advance shipment notices (e2e, story 21-6)', () => {
       const created = await createAsn({ clientId: acme, warehouseId: wh1, asnCode: 'KIT-1', lines: [{ skuId: acme1, announcedQty: 1 }, { skuId: kit, announcedQty: 2 }] }).expect(409);
       expect(created.body.code).toBe('kit-cannot-hold-stock');
       expect(created.body.detail).toContain('"ACME-KIT"');
+      // Story 2-1 — the label became a `kind` parameter shared with the PO
+      // guards (ASN_LINE_KIND / PO_LINE_KIND): the ASN wording is unchanged.
+      expect(created.body.detail).toBe(
+        'Advance shipment notice line names kit SKU(s) "ACME-KIT" — a kit\'s stock IS its components\'. Move stock on the component SKUs; the kit explodes into them at order acceptance.',
+      );
       // The client rule runs first: a kit of the right client on another client's ASN is a mismatch.
       expect((await createAsn({ clientId: beta, warehouseId: wh1, asnCode: 'KIT-2', lines: [{ skuId: kit, announcedQty: 1 }] }).expect(409)).body.code).toBe('sku-client-mismatch');
 
       const asn = await newAsn([{ skuId: acme1, announcedQty: 3 }]);
       const amended = await amendAsn(asn.id, { lines: [{ id: asn.lines[0]!.id, skuId: acme1, announcedQty: 3 }, { skuId: kit, announcedQty: 1 }] }).expect(409);
       expect(amended.body.code).toBe('kit-cannot-hold-stock');
-      expect(amended.body.detail).toContain('"ACME-KIT"');
+      expect(amended.body.detail).toContain('Advance shipment notice line names kit SKU(s) "ACME-KIT"');
       expect((await getAsn(asn.id).expect(200)).body.asn.lines).toHaveLength(1);
     });
 

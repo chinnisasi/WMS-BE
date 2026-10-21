@@ -475,11 +475,21 @@ export async function assertAsnClientInTx(
 }
 
 /**
- * FR-38 — a kit never holds stock, and receiving refuses a kit line, so an
- * ASN line naming a kit could never be received: 409 `kit-cannot-hold-stock`
- * naming the codes. Runs after the client checks and before the scale, on
- * every write that sets lines — create, amend, the portal announce and (per
- * group) the ASN import.
+ * The document-line labels the kit refusal names (story 2-1). Shared so the
+ * ASN create / amend / announce, the ASN import's row error and the PO
+ * guards cannot drift apart — the ASN wording is unchanged byte for byte.
+ */
+export const ASN_LINE_KIND = 'Advance shipment notice line';
+export const PO_LINE_KIND = 'Purchase order line';
+
+/**
+ * FR-38 — a kit never holds stock, and receiving refuses a kit line, so a
+ * document line naming a kit could never be received: 409
+ * `kit-cannot-hold-stock` naming the codes. Runs after the client checks and
+ * before the scale, on every write that sets lines — the ASN create, amend,
+ * the portal announce and (per group) the ASN import; since story 2-1 also
+ * the PO create, amend (the SKUs gaining inbound) and close carry-forward,
+ * with `kind` = `PO_LINE_KIND`.
  */
 export async function assertNoKitLinesInTx(
   catalog: CatalogFacade,
@@ -487,10 +497,11 @@ export async function assertNoKitLinesInTx(
   tenantId: string,
   skuIds: readonly string[],
   codeOf: (skuId: string) => string,
+  kind: string,
 ): Promise<void> {
   const kitSkuIds = await catalog.getKitSkuIdsInTx(tx, tenantId, skuIds);
   if (kitSkuIds.length > 0) {
-    throw kitCannotHoldStock('Advance shipment notice line', [...new Set(kitSkuIds)].map(codeOf));
+    throw kitCannotHoldStock(kind, [...new Set(kitSkuIds)].map(codeOf));
   }
 }
 
@@ -728,6 +739,7 @@ export class AsnCommand {
         command.tenantId,
         command.lines.map((line) => line.skuId),
         (skuId) => skuFacts.get(skuId)!.code,
+        ASN_LINE_KIND,
       );
       const lines = scaleAsnLines(command.lines, skuFacts);
 
@@ -847,6 +859,7 @@ export class AsnCommand {
           command.tenantId,
           command.lines.map((line) => line.skuId),
           (skuId) => skuFacts.get(skuId)!.code,
+          ASN_LINE_KIND,
         );
         const lines = scaleAsnLines(command.lines, skuFacts);
 
@@ -959,6 +972,7 @@ export class AsnCommand {
         command.tenantId,
         command.lines.map((line) => line.skuId),
         (skuId) => skuFacts.get(skuId)!.code,
+        ASN_LINE_KIND,
       );
       const lines = scaleAsnLines(command.lines, skuFacts);
 

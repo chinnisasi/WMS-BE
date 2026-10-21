@@ -23,9 +23,9 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { assertRecordableQuantity, fromMilli } from '../../shared/primitives/quantity';
 import { uomPrecision } from '../catalog/uom';
-import { assertNoPendingOverReceiptsInTx } from './asn.command';
+import { PO_LINE_KIND, assertNoKitLinesInTx, assertNoPendingOverReceiptsInTx } from './asn.command';
 import { assertVendorLinkedInTx, type VendorSnapshotV1 } from '../partners/partners.facade';
-import { assertSkusTakeWorkInTx, skusGainingInbound } from '../catalog/catalog.facade';
+import { CatalogFacade, assertSkusTakeWorkInTx, skusGainingInbound } from '../catalog/catalog.facade';
 
 export interface PoLineInput {
   readonly skuId: string;
@@ -183,6 +183,10 @@ export class PurchaseOrderCommand {
   constructor(
     @Inject(DATABASE) private readonly db: Database,
     @Inject(OUTBOX_SINK) private readonly outbox: OutboxSink,
+    // Story 2-1 — the kit lookup for the PO kit guards (catalog owns
+    // `kit_compositions`; the `AsnCommand` seam — `inbound.module.ts`
+    // imports `CatalogModule` via `forwardRef`).
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
   ) {}
 
   /**
@@ -282,6 +286,20 @@ export class PurchaseOrderCommand {
     // rows `FOR KEY SHARE`, so a deactivation serialises against this create.
     // The suggested-PO submit rides this path.
     await assertSkusTakeWorkInTx(tx, command.tenantId, command.lines.map((line) => line.skuId));
+    // Story 2-1 — FR-38: receiving refuses a kit line, so a PO line naming a
+    // kit could never be received (409 `kit-cannot-hold-stock` naming the
+    // codes). DO NOT REORDER: the kit read takes no lock and is race-safe
+    // only because it runs after `assertSkusTakeWorkInTx`'s `FOR KEY SHARE`
+    // on the same SKU set, which conflicts with kit create's `FOR UPDATE`.
+    // The suggested-PO submit rides this path.
+    await assertNoKitLinesInTx(
+      this.catalog,
+      tx,
+      command.tenantId,
+      command.lines.map((line) => line.skuId),
+      (skuId) => skuFacts.get(skuId)!.code,
+      PO_LINE_KIND,
+    );
     // Story 1-3 — the vendor guard (lock order client → partner → link): an
     // active partner in the vendor role with an ACTIVE vendor link to this
     // client, read `FOR KEY SHARE` so a deactivation serialises against this
@@ -425,13 +443,23 @@ export class PurchaseOrderCommand {
       // PO's stored lines do not carry (a re-pointed line included), or one
       // whose ordered total rises, is refused 409 `sku-inactive`. Keeping or
       // lowering an inactive line amends.
-      await assertSkusTakeWorkInTx(
+      const gainingInbound = skusGainingInbound(
+        existingLines.map((line) => ({ skuId: line.skuId, qtyMilli: line.orderedQty })),
+        command.lines.map((line) => ({ skuId: line.skuId, qtyBase: line.orderedQty })),
+      );
+      await assertSkusTakeWorkInTx(tx, command.tenantId, gainingInbound);
+      // Story 2-1 — a kit gains no inbound either (409
+      // `kit-cannot-hold-stock`), over EXACTLY the set locked above: a stale
+      // kit line may be resent unchanged or lowered, while raising it or
+      // adding a second line of it is refused. Same lock reliance as create
+      // — do not reorder or check a different set.
+      await assertNoKitLinesInTx(
+        this.catalog,
         tx,
         command.tenantId,
-        skusGainingInbound(
-          existingLines.map((line) => ({ skuId: line.skuId, qtyMilli: line.orderedQty })),
-          command.lines.map((line) => ({ skuId: line.skuId, qtyBase: line.orderedQty })),
-        ),
+        gainingInbound,
+        (skuId) => skuFacts.get(skuId)!.code,
+        PO_LINE_KIND,
       );
       const uomBySku = new Map([...skuFacts].map(([id, sku]) => [id, sku.uom]));
       // Story 10.2: same position, same reason — behind the replay lookup.
@@ -610,6 +638,22 @@ export class PurchaseOrderCommand {
             `Line "${line.id}" has no open quantity to carry — cancel it instead.`,
           );
         }
+      }
+      // Story 2-1 — a carry-forward CREATES a line on the successor, and a
+      // kit line could never be received there (409 `kit-cannot-hold-stock`,
+      // before the successor insert). Close is total, so the operator marks
+      // that line `cancelled` instead.
+      if (carried.length > 0) {
+        const carriedSkuIds = carried.map((line) => line.skuId);
+        const carriedSkus = await this.assertSkuIdsInTenant(tx, command.tenantId, carriedSkuIds);
+        await assertNoKitLinesInTx(
+          this.catalog,
+          tx,
+          command.tenantId,
+          carriedSkuIds,
+          (skuId) => carriedSkus.get(skuId)?.code ?? skuId,
+          PO_LINE_KIND,
+        );
       }
 
       let successor: ClosePoSnapshot['successor'] = null;
@@ -798,9 +842,9 @@ export class PurchaseOrderCommand {
     tx: TenantTx,
     tenantId: string,
     skuIds: readonly string[],
-  ): Promise<Map<string, { uom: string; clientId: string }>> {
+  ): Promise<Map<string, { uom: string; clientId: string; code: string }>> {
     const distinct = [...new Set(skuIds)];
-    const byId = new Map<string, { uom: string; clientId: string }>();
+    const byId = new Map<string, { uom: string; clientId: string; code: string }>();
     if (distinct.length === 0) {
       return byId;
     }
@@ -808,11 +852,12 @@ export class PurchaseOrderCommand {
       // Story 10.2: the existence check also carries each SKU's base UoM
       // back — the unit is what says how precise an ordered quantity may be,
       // and one query answers both questions.
-      .select({ id: skus.id, uom: skus.uom, clientId: skus.clientId })
+      // Story 2-1: and the code, which the kit refusal names.
+      .select({ id: skus.id, uom: skus.uom, clientId: skus.clientId, code: skus.code })
       .from(skus)
       .where(and(eq(skus.tenantId, tenantId), inArray(skus.id, distinct)));
     for (const row of rows) {
-      byId.set(row.id, { uom: row.uom, clientId: row.clientId });
+      byId.set(row.id, { uom: row.uom, clientId: row.clientId, code: row.code });
     }
     for (const skuId of distinct) {
       if (!byId.has(skuId)) {
