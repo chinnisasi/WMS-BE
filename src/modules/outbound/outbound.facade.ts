@@ -28,6 +28,13 @@ import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/
 import { PORTAL_PAGE_DEFAULT_LIMIT } from '../../shared/primitives/portal-page';
 import { portalOrderInTx, portalOrdersInTx, type PortalOrderDetail, type PortalOrderRow } from './portal-orders';
 import {
+  outboundRegisterInTx as outboundRegisterInTxImpl,
+  type OutboundRegisterRow,
+  type OutboundRegisterScope,
+} from './outbound-register';
+// Story 5-3a — the register row shapes cross the seam here (reporting reads them).
+export type { OutboundRegisterRow, OutboundRegisterScope } from './outbound-register';
+import {
   listBackorderRefusalsInTx,
   listPackFailuresInTx,
   listPicklistLinesInTx,
@@ -402,6 +409,16 @@ export class OutboundFacade {
     @Inject(ManifestCommandService) private readonly manifestCommand: ManifestCommandService,
     @Inject(RateService) private readonly rateService: RateService,
   ) {}
+
+  /**
+   * Story 5-3a — the outbound register (`outbound-register.ts`): one row per
+   * order line of the warehouse's orders received in `[from, to)`, filtered by
+   * the order's own client; the latest shipment by `(labelled_at, id)`. In
+   * the caller's repeatable-read transaction, at most `limit` rows.
+   */
+  async outboundRegisterInTx(tx: TenantTx, scope: OutboundRegisterScope, limit: number, pageSize?: number): Promise<OutboundRegisterRow[]> {
+    return outboundRegisterInTxImpl(tx, scope, limit, pageSize);
+  }
 
   /** `POST .../outbound/orders/{orderId}/label` — the 4.6c label command. */
   async createShipmentLabel(

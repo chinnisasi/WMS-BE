@@ -6,7 +6,8 @@ import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { uuidv7 } from '../../shared/primitives/ids';
+import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
+import { rearmTxDeadline } from '../../shared/db/tx-deadline';
 // Story 12-7 — the segregation matrix is code in the shared primitive, not
 // a table this module owns; the facade read enumerates it (see the method).
 import {
@@ -78,6 +79,15 @@ export interface CatalogSkuIdentity {
   readonly catchWeightTracked: boolean;
   /** Story 21-2b — the client the SKU belongs to (the channel ingest's mixed-client check). */
   readonly clientId: string;
+}
+
+/** Story 5-3a — one batch's register facts (`batchFactsByIdsInTx`); instants canonical ISO, null when unset. */
+export interface BatchFacts {
+  readonly id: string;
+  readonly code: string;
+  readonly mfgDate: string | null;
+  readonly expiryDate: string | null;
+  readonly createdAt: string;
 }
 
 /** Batch identity (catalog-owned) — location/quantity live in inventory (AD-6). */
@@ -382,6 +392,30 @@ export class CatalogFacade {
       .from(batches)
       .where(and(eq(batches.tenantId, tenantId), inArray(batches.id, [...batchIds])));
     return new Map(rows.map((row) => [row.id, row.code]));
+  }
+
+  /**
+   * Story 5-3a — the batch facts a register prints, for a set of ids, in the
+   * caller's transaction (unknown or malformed ids absent): the code, the
+   * mfg and expiry dates (calendar dates stored as the instant their IST day
+   * begins) and `createdAt` — when the batch first appeared in the TENANT
+   * (a batch is per (tenant, SKU, code), so it is not per warehouse). The
+   * ids travel as ONE bound uuid[] parameter, so a 50,000-row register binds
+   * one, not 50,000. Instants come back canonical ISO.
+   */
+  async batchFactsByIdsInTx(tx: TenantTx, tenantId: string, batchIds: readonly string[]): Promise<Map<string, BatchFacts>> {
+    const ids = [...new Set(batchIds)].filter((id) => UUID_RE.test(id));
+    if (ids.length === 0) return new Map();
+    await rearmTxDeadline(tx);
+    const rows = (await tx.execute(sql`
+      select b.id::text as "id", b.code as "code",
+             to_char(b.mfg_date at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "mfgDate",
+             to_char(b.expiry_date at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "expiryDate",
+             to_char(b.created_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"
+      from batches b
+      where b.tenant_id = ${tenantId}::uuid and b.id = any(${sql.param(ids)}::uuid[])
+    `)) as unknown as BatchFacts[];
+    return new Map(rows.map((row) => [row.id, row]));
   }
 
   async getImportSummary(tenantId: string): Promise<CatalogImportSummary> {

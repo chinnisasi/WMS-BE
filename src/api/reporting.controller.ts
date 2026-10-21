@@ -37,7 +37,15 @@ import {
 // The query class is bound to @Query() and read by the ValidationPipe through
 // emitDecoratorMetadata — a type-only import would erase it.
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
-import { AuditExportRequestDto, AuditTrailQueryDto, ServiceReportQuery } from './reporting.dto';
+import { AuditExportRequestDto, AuditTrailQueryDto, RegisterQueryDto, ServiceReportQuery } from './reporting.dto';
+import {
+  REGISTER_CONCURRENCY,
+  REGISTER_DEADLINE_MS,
+  REGISTER_MAX_ROWS,
+  REGISTER_NAMES,
+  XLSX_CONTENT_TYPE,
+  isRegisterName,
+} from '../modules/reporting/reporting.facade';
 import type { ReportingFigureDto, ReportingWindowedFigureDto, SyncConnectionHealthDto } from './reporting.dto';
 
 const IDEMPOTENCY_HEADER = [
@@ -147,6 +155,98 @@ export class ReportingController {
         warehouseId: query.warehouseId ?? null,
       }),
     );
+  }
+
+  /**
+   * Story 5-3a — one operational register as a CSV or Excel file: stock on
+   * hand, the inbound and outbound registers, the ledger, batch ageing /
+   * near expiry. Member-open (any staff role, like the lists behind it); a
+   * client-portal token is fenced by the session guard (403). The §6 binary
+   * pattern: the facade builds the WHOLE file first, so every refusal —
+   * 400, 404 `unknown-warehouse`, 422 `report-too-large`, 503
+   * `report-unavailable` — is thrown before a header is written.
+   */
+  @Get(':tenantId/warehouses/:warehouseId/reports/:report')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Downloads one operational register for a warehouse as CSV or Excel: stock on hand, the inbound register, the outbound register, the ledger, or batch ageing / near expiry — optionally one client',
+    description:
+      `\`stock-on-hand\` (bin × batch, non-zero, system bins flagged) and \`batch-ageing\` (bin × batch with stock, expiry first) are AS OF NOW and take no from/to; \`inbound-register\` (GRN lines), \`outbound-register\` (order lines) and \`ledger\` (events) need an inclusive IST period, at most 366 days, windowed on the source's \`created_at\`. ` +
+      `Quantities are base units, written as numbers; instants are IST wall clock (\`_ist\` columns), calendar dates IST dates; actors are display names, never emails. ` +
+      `At most ${REGISTER_MAX_ROWS.toLocaleString('en-IN')} rows (more is 422 — narrow the filters); one read under a ${REGISTER_DEADLINE_MS / 1000} s whole-read budget, and at most ${REGISTER_CONCURRENCY} registers prepared at once in the process (both 503). ` +
+      'The `Content-Disposition` filename is not readable cross-origin — a client names the file itself.',
+  })
+  @ApiProduces('text/csv', XLSX_CONTENT_TYPE)
+  @ApiResponse({
+    status: 200,
+    description: 'The register file',
+    content: {
+      'text/csv': { schema: { type: 'string', format: 'binary' } },
+      [XLSX_CONTENT_TYPE]: { schema: { type: 'string', format: 'binary' } },
+    },
+  })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      'An unknown report, a missing or unknown format, a malformed warehouseId or clientId, a dated register without from/to, a snapshot register given from/to, a from/to that is not a real YYYY-MM-DD date, from after to, or a period over 366 days (validation-failed)',
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({
+    status: 403,
+    ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session — "This is an operator surface." (role-denied)'),
+  })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such warehouse in this tenant (unknown-warehouse)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse(`More than ${REGISTER_MAX_ROWS.toLocaleString('en-IN')} rows — narrow the filters (report-too-large)`) })
+  @ApiResponse({
+    status: 503,
+    ...problemJsonResponse(
+      `The register did not finish within its ${REGISTER_DEADLINE_MS / 1000} s budget, or ${REGISTER_CONCURRENCY} registers are already being prepared (report-unavailable)`,
+    ),
+  })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  @ApiParam({ name: 'report', enum: [...REGISTER_NAMES] })
+  async downloadRegister(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('report') report: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: RegisterQueryDto,
+    @Res() res: Response,
+  ): Promise<void> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    if (!isRegisterName(report)) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Unknown register',
+        `report must be one of ${JSON.stringify(REGISTER_NAMES)} (got "${report}").`,
+      );
+    }
+    let file: Awaited<ReturnType<ReportingFacade['register']>>;
+    try {
+      file = await this.reporting.register(tenantId, warehouseId, {
+        report,
+        format: query.format,
+        clientId: query.clientId ?? null,
+        from: query.from,
+        to: query.to,
+      });
+    } catch (err) {
+      // Busy or slow: a client may retry shortly (the problem itself is still the filter's).
+      if (err instanceof ProblemException && err.getStatus() === 503) res.setHeader('Retry-After', '5');
+      throw err;
+    }
+    res.status(200);
+    res.setHeader('Content-Type', file.contentType);
+    res.setHeader('Content-Length', String(file.body.length));
+    res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(file.body);
   }
 
   /**

@@ -5,7 +5,29 @@ import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
-import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
+import { assertWarehouseInTenant, getMemberRoleIn, getWarehouseCodeInTx } from '../tenancy/tenancy.service';
+import { CatalogFacade } from '../catalog/catalog.facade';
+import { InboundFacade } from '../inbound/inbound.facade';
+import { InventoryFacade } from '../inventory/inventory.facade';
+import { OutboundFacade } from '../outbound/outbound.facade';
+import { rearmTxDeadline, setTxDeadline } from '../../shared/db/tx-deadline';
+import { buildCsv } from '../../shared/export/csv';
+import { buildXlsx } from '../../shared/export/xlsx';
+import type { ExportCell } from '../../shared/export/cells';
+import { istDateOf } from '../../shared/primitives/time';
+import { getClientsInTx } from '../clients/clients.facade';
+import {
+  CSV_CONTENT_TYPE,
+  REGISTER_CONCURRENCY,
+  REGISTER_DEADLINE_MS,
+  REGISTER_MAX_ROWS,
+  REGISTERS,
+  RegisterSlots,
+  XLSX_CONTENT_TYPE,
+  assertWithinCap,
+  invalidRegisterQuery,
+} from './registers';
+import type { RegisterContext, RegisterFormat, RegisterName } from './registers';
 import { assertPermission } from '../tenancy/permissions';
 import type { Page } from '../../shared/primitives/pagination';
 import { armAuditDeadline, AUDIT_STATEMENT_TIMEOUT_MS, readAuditPageInTx } from './audit';
@@ -52,6 +74,19 @@ export type {
 } from './service';
 export { MAX_SERVICE_REPORT_DAYS, SERVICE_STATEMENT_TIMEOUT_MS, SERVICE_TARGET_HOURS } from './service';
 export type { AuditActorKind, AuditTrailEntry, AuditTrailQuery } from './audit';
+export type { RegisterFormat, RegisterName } from './registers';
+export {
+  REGISTER_CONCURRENCY,
+  REGISTER_DEADLINE_MS,
+  REGISTER_FORMATS,
+  REGISTER_MAX_ROWS,
+  REGISTER_NAMES,
+  REGISTERS,
+  CSV_CONTENT_TYPE,
+  XLSX_CONTENT_TYPE,
+  isRegisterName,
+  referenceSummary,
+} from './registers';
 export { AUDIT_ACTION_PREFIX_RE, AUDIT_DEFAULT_LIMIT, AUDIT_MAX_LIMIT, AUDIT_STATEMENT_TIMEOUT_MS } from './audit';
 
 /** Story 21-8 — the service report's query: an inclusive IST date period, optionally one warehouse. */
@@ -116,6 +151,35 @@ class TileSlots {
 }
 
 const TILE_SLOTS = new TileSlots(TILE_CONCURRENCY);
+
+/** Story 5-3a — the process-wide register slots (decision 2): at most two register reads at once. */
+const REGISTER_SLOTS = new RegisterSlots(REGISTER_CONCURRENCY);
+
+/** Story 5-3a — one register request (the route's path and query, shape-checked by the DTO). */
+export interface RegisterQuery {
+  readonly report: RegisterName;
+  readonly format: RegisterFormat;
+  /** Null: every client. */
+  readonly clientId: string | null;
+  readonly from?: string | undefined;
+  readonly to?: string | undefined;
+}
+
+/** Story 5-3a — a finished register file, built whole before the route writes a header. */
+export interface RegisterFile {
+  readonly report: RegisterName;
+  readonly format: RegisterFormat;
+  readonly contentType: string;
+  /** The server's name for it (CORS hides `Content-Disposition` — the web names its own). */
+  readonly filename: string;
+  readonly rowCount: number;
+  readonly body: Buffer;
+}
+
+/** A code made safe for a filename: letters, digits and `-` only. */
+function slug(value: string): string {
+  return value.replace(/[^A-Za-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'x';
+}
 
 const STATEMENT_TIMEOUT_SQLSTATE = '57014';
 
@@ -187,7 +251,141 @@ export class ReportingFacade {
    */
   serviceRead: (tx: TenantTx, scope: ServiceReportScope, window: ServiceWindow) => Promise<ServiceFigures> = readServiceFiguresInTx;
 
-  constructor(@Inject(DATABASE) private readonly db: Database) {}
+  /**
+   * Story 5-3a — the register slots, the whole-read budget and the read
+   * itself: plain fields so a suite can hold the slots, shrink the budget or
+   * force a statement timeout without a second production code path (the
+   * `serviceRead` precedent).
+   */
+  registerSlots: RegisterSlots = REGISTER_SLOTS;
+  registerDeadlineMs = REGISTER_DEADLINE_MS;
+  registerMaxRows = REGISTER_MAX_ROWS;
+  registerRead: (ctx: RegisterContext) => Promise<ExportCell[][]> = (ctx) => REGISTERS[ctx.name].read(ctx);
+
+  constructor(
+    @Inject(DATABASE) private readonly db: Database,
+    // Story 5-3a — the registers read their rows through the OWNING modules'
+    // facades (AD-6), never their tables.
+    @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+    @Inject(InboundFacade) private readonly inbound: InboundFacade,
+    @Inject(OutboundFacade) private readonly outbound: OutboundFacade,
+    @Inject(CatalogFacade) private readonly catalog: CatalogFacade,
+  ) {}
+
+  /**
+   * Story 5-3a — one operational register as a file. Every refusal is thrown
+   * before the route writes a header (IMPLEMENTATION-GUIDE §6), in this order:
+   *   1. the period rule (400): a dated register needs `from`/`to` (the
+   *      service report's rules — real dates, `from ≤ to`, ≤ 366 days); a
+   *      snapshot register takes none;
+   *   2. a slot (503 `report-unavailable`, before anything reads): at most
+   *      `REGISTER_CONCURRENCY` register reads run in the process at once;
+   *   3. ONE `REPEATABLE READ, READ ONLY` tenant transaction under a
+   *      `REGISTER_DEADLINE_MS` WHOLE-read deadline, re-armed before every
+   *      statement (`setTxDeadline` — the facades' reads re-arm it too): the
+   *      warehouse (404 `unknown-warehouse`), the register's facade reads,
+   *      and the cap (422 `report-too-large` on the 50,001st row);
+   *   4. a statement timeout anywhere is 503 `report-unavailable`, nothing
+   *      partial. Only then is the file built (CSV or XLSX, in memory).
+   * Member-open (any staff role, like the source lists); no audit row (a
+   * download audit is roadmap 6.4).
+   */
+  async register(tenantId: string, warehouseId: string, rawQuery: RegisterQuery, now: Date = new Date()): Promise<RegisterFile> {
+    // Ids are compared as stored (lower-case) — an upper-case uuid must not read as an unknown client.
+    const query: RegisterQuery = { ...rawQuery, clientId: rawQuery.clientId === null ? null : rawQuery.clientId.toLowerCase() };
+    const definition = REGISTERS[query.report];
+    const hasPeriod = query.from !== undefined || query.to !== undefined;
+    if (definition.period === 'dated') {
+      if (query.from === undefined || query.to === undefined) {
+        throw invalidRegisterQuery(`The ${query.report} register needs from and to — inclusive IST dates, YYYY-MM-DD.`);
+      }
+      assertServicePeriod(query.from, query.to);
+    } else if (hasPeriod) {
+      throw invalidRegisterQuery(`The ${query.report} register is as of now and takes no from or to.`);
+    }
+
+    if (!this.registerSlots.tryAcquire()) {
+      throw new ProblemException(
+        'report-unavailable',
+        503,
+        'Report unavailable',
+        `${REGISTER_CONCURRENCY} registers are already being prepared — try again in a moment.`,
+      );
+    }
+    try {
+      const { rows, warehouseCode, clientCode } = await withTenantTransaction(
+        this.db,
+        tenantId,
+        async (tx) => {
+          const deadlineAt = Date.now() + this.registerDeadlineMs;
+          setTxDeadline(tx, deadlineAt);
+          await rearmTxDeadline(tx);
+          let code: string;
+          try {
+            code = await getWarehouseCodeInTx(tx, tenantId, warehouseId);
+          } catch (err) {
+            if (err instanceof ProblemException && (err.getResponse() as { code?: unknown }).code === 'not-found') {
+              throw new ProblemException('unknown-warehouse', 404, 'Warehouse not found', 'No warehouse with this id exists in this tenant.');
+            }
+            throw err;
+          }
+          let client: string | null = null;
+          if (query.clientId !== null) {
+            await rearmTxDeadline(tx);
+            // An unknown client is an empty file — named so, never as every client's.
+            client = (await getClientsInTx(tx, tenantId, [query.clientId])).get(query.clientId)?.code ?? 'client-unknown';
+          }
+          const window =
+            definition.period === 'dated'
+              ? serviceWindow(query.from!, query.to!, now, deadlineAt)
+              : null;
+          const cells = await this.registerRead({
+            name: query.report,
+            tx,
+            tenantId,
+            warehouseId,
+            warehouseCode: code,
+            clientId: query.clientId,
+            window: window === null ? null : { from: window.from, to: window.to },
+            now,
+            maxRows: this.registerMaxRows,
+            limit: this.registerMaxRows + 1,
+            sources: { inventory: this.inventory, inbound: this.inbound, outbound: this.outbound, catalog: this.catalog },
+          });
+          assertWithinCap(query.report, cells.length, this.registerMaxRows);
+          return { rows: cells, warehouseCode: code, clientCode: client };
+        },
+        { isolationLevel: 'repeatable read', accessMode: 'read only' },
+      );
+      const body =
+        query.format === 'csv'
+          ? buildCsv(definition.columns, rows)
+          : await buildXlsx(query.report, definition.columns, rows);
+      const span =
+        definition.period === 'dated' ? `${query.from}_${query.to}` : `asof-${istDateOf(now.toISOString())}`;
+      const filename = [query.report, slug(warehouseCode), ...(clientCode === null ? [] : [slug(clientCode)]), span].join('-');
+      return {
+        report: query.report,
+        format: query.format,
+        contentType: query.format === 'csv' ? CSV_CONTENT_TYPE : XLSX_CONTENT_TYPE,
+        filename: `${filename}.${query.format}`,
+        rowCount: rows.length,
+        body,
+      };
+    } catch (err) {
+      if (isStatementTimeout(err)) {
+        throw new ProblemException(
+          'report-unavailable',
+          503,
+          'Report unavailable',
+          `The register did not finish within ${this.registerDeadlineMs / 1000} s — narrow the filters (a client, a shorter period).`,
+        );
+      }
+      throw err;
+    } finally {
+      this.registerSlots.release();
+    }
+  }
 
   /**
    * Story 21-8 — one client's service report (CAP-10), the OPERATOR read:

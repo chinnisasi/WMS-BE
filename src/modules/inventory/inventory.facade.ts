@@ -63,6 +63,20 @@ import {
   type ClientScope,
   type ClientWarehouseScope,
 } from './client-metering';
+import {
+  batchAgeingRegisterInTx as batchAgeingRegisterInTxImpl,
+  firstDispatchByOrderInTx as firstDispatchByOrderInTxImpl,
+  ledgerRegisterInTx as ledgerRegisterInTxImpl,
+  stockOnHandRegisterInTx as stockOnHandRegisterInTxImpl,
+  type BatchAgeingRegisterRow,
+  type FirstDispatch,
+  type LedgerRegisterRow,
+  type RegisterScope,
+  type RegisterWindow,
+  type StockRegisterRow,
+} from './registers';
+// Story 5-3a — the register row shapes cross the seam here (reporting reads them).
+export type { BatchAgeingRegisterRow, FirstDispatch, LedgerRegisterRow, RegisterScope, RegisterWindow, StockRegisterRow } from './registers';
 // Story 21-4 — the metering scope shapes and the shared dispatched-order
 // predicate (21-5's dispute drill-down reuses it) cross the seam here.
 export type { ClientDayDelta, ClientScope, ClientSkuOnHand, ClientWarehouseScope, DispatchedOrderRecordRow } from './client-metering';
@@ -1606,6 +1620,30 @@ export class InventoryFacade {
     window: KeysetWindow,
   ): Promise<DispatchedOrderRecordRow[]> {
     return dispatchedOrderRecordsInTxImpl(tx, scope, from, to, window);
+  }
+
+  // ── story 5-3a: the operational registers' reads (`registers.ts`) ────────
+  // Read-only, in the caller's (reporting's repeatable-read) transaction;
+  // each statement re-arms the caller's whole-read deadline. Base units out.
+
+  /** Stock on hand, bin × batch, as of now — one statement, at most `limit` rows. */
+  async stockOnHandRegisterInTx(tx: TenantTx, scope: RegisterScope, limit: number): Promise<StockRegisterRow[]> {
+    return stockOnHandRegisterInTxImpl(tx, scope, limit);
+  }
+
+  /** Every bin × batch with stock — one statement; the batch dates are catalog's. */
+  async batchAgeingRegisterInTx(tx: TenantTx, scope: RegisterScope, limit: number): Promise<BatchAgeingRegisterRow[]> {
+    return batchAgeingRegisterInTxImpl(tx, scope, limit);
+  }
+
+  /** Every ledger event of the warehouse created in `[from, to)`, oldest first (the keyset walk). */
+  async ledgerRegisterInTx(tx: TenantTx, scope: RegisterScope & RegisterWindow, limit: number, pageSize?: number): Promise<LedgerRegisterRow[]> {
+    return ledgerRegisterInTxImpl(tx, scope, limit, pageSize);
+  }
+
+  /** Each order's FIRST `dispatch.dispatched` event (carries `reference_doc ? 'orderId'` — 0039's partial index). */
+  async firstDispatchByOrderInTx(tx: TenantTx, tenantId: string, orderIds: readonly string[]): Promise<Map<string, FirstDispatch>> {
+    return firstDispatchByOrderInTxImpl(tx, tenantId, orderIds);
   }
 
   /**

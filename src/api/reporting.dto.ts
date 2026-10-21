@@ -10,11 +10,12 @@ import {
   AUDIT_DEFAULT_LIMIT,
   AUDIT_MAX_LIMIT,
   MAX_SERVICE_REPORT_DAYS,
+  REGISTER_FORMATS,
   SERVICE_TARGET_HOURS,
   SYNC_HEALTH_REASONS,
   SYNC_HEALTH_STATES,
 } from '../modules/reporting/reporting.facade';
-import type { ServiceReport } from '../modules/reporting/reporting.facade';
+import type { RegisterFormat, ServiceReport } from '../modules/reporting/reporting.facade';
 import { AUDIT_EXPORT_FAILURE_REASONS, AUDIT_EXPORT_STATUSES } from '../modules/tenancy/audit-export.command';
 import type { AuditExportSnapshot } from '../modules/tenancy/audit-export.command';
 
@@ -662,4 +663,44 @@ export function toAuditExportDto(snapshot: AuditExportSnapshot): AuditExportDto 
     sha256: snapshot.sha256,
     failureReason: snapshot.failureReason,
   };
+}
+
+// ── Story 5-3a — the operational registers ───────────────────────────────────
+
+/**
+ * The register download's query (the report is a path segment). SHAPE only:
+ * the period rules — required for a dated register, refused for a snapshot,
+ * real dates, `from ≤ to`, at most 366 days — are the facade's.
+ */
+export class RegisterQueryDto {
+  @ApiProperty({ enum: [...REGISTER_FORMATS], description: 'The file format: `csv` (UTF-8 with a BOM) or `xlsx` (one worksheet)' })
+  @IsIn(REGISTER_FORMATS)
+  format!: RegisterFormat;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: "One client's rows only (an unknown or another tenant's id answers an empty file); absent means every client",
+  })
+  @IsOptional()
+  @Matches(UUID_RE, { message: 'clientId must be a uuid' })
+  clientId?: string;
+
+  @ApiProperty({
+    required: false,
+    example: '2026-09-01',
+    description: 'First IST date (inclusive), YYYY-MM-DD — required by the inbound, outbound and ledger registers, refused by stock-on-hand and batch-ageing',
+  })
+  @IsOptional()
+  @IsString()
+  from?: string;
+
+  @ApiProperty({
+    required: false,
+    example: '2026-09-30',
+    description: `Last IST date (inclusive), YYYY-MM-DD — the period is at most ${MAX_SERVICE_REPORT_DAYS} days in all (inclusive)`,
+  })
+  @IsOptional()
+  @IsString()
+  to?: string;
 }

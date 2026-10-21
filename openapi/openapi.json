@@ -22310,6 +22310,179 @@
         ]
       }
     },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/reports/{report}": {
+      "get": {
+        "description": "`stock-on-hand` (bin × batch, non-zero, system bins flagged) and `batch-ageing` (bin × batch with stock, expiry first) are AS OF NOW and take no from/to; `inbound-register` (GRN lines), `outbound-register` (order lines) and `ledger` (events) need an inclusive IST period, at most 366 days, windowed on the source's `created_at`. Quantities are base units, written as numbers; instants are IST wall clock (`_ist` columns), calendar dates IST dates; actors are display names, never emails. At most 50,000 rows (more is 422 — narrow the filters); one read under a 15 s whole-read budget, and at most 2 registers prepared at once in the process (both 503). The `Content-Disposition` filename is not readable cross-origin — a client names the file itself.",
+        "operationId": "ReportingController_downloadRegister",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "report",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "enum": [
+                "stock-on-hand",
+                "inbound-register",
+                "outbound-register",
+                "ledger",
+                "batch-ageing"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "required": true,
+            "in": "query",
+            "description": "The file format: `csv` (UTF-8 with a BOM) or `xlsx` (one worksheet)",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "csv",
+                "xlsx"
+              ]
+            }
+          },
+          {
+            "name": "clientId",
+            "required": false,
+            "in": "query",
+            "description": "One client's rows only (an unknown or another tenant's id answers an empty file); absent means every client",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "from",
+            "required": false,
+            "in": "query",
+            "description": "First IST date (inclusive), YYYY-MM-DD — required by the inbound, outbound and ledger registers, refused by stock-on-hand and batch-ageing",
+            "schema": {
+              "example": "2026-09-01",
+              "type": "string"
+            }
+          },
+          {
+            "name": "to",
+            "required": false,
+            "in": "query",
+            "description": "Last IST date (inclusive), YYYY-MM-DD — the period is at most 366 days in all (inclusive)",
+            "schema": {
+              "example": "2026-09-30",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The register file",
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An unknown report, a missing or unknown format, a malformed warehouseId or clientId, a dated register without from/to, a snapshot register given from/to, a from/to that is not a real YYYY-MM-DD date, from after to, or a period over 366 days (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session — \"This is an operator surface.\" (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such warehouse in this tenant (unknown-warehouse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "More than 50,000 rows — narrow the filters (report-too-large)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The register did not finish within its 15 s budget, or 2 registers are already being prepared (report-unavailable)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Downloads one operational register for a warehouse as CSV or Excel: stock on hand, the inbound register, the outbound register, the ledger, or batch ageing / near expiry — optionally one client",
+        "tags": [
+          "reporting"
+        ]
+      }
+    },
     "/tenants/{tenantId}/reporting/audit": {
       "get": {
         "description": "Owner only (`audit.view`). Ordering, paging and the from/to window all use `recordedAt` (the server commit stamp); the window is half-open [from, to). The trail is complete from story 9-3a onward — earlier actions of some commands were never audited and are not reconstructed. One read under a 5 s budget: a broad filter over a very large history can answer 503 — narrow the filters or the dates.",

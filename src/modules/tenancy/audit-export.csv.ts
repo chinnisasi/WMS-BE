@@ -2,6 +2,7 @@ import { createHash, type Hash } from 'node:crypto';
 import { createGzip, type Gzip } from 'node:zlib';
 import { SYSTEM_ACTOR_ID } from '../../shared/primitives/audit';
 import { IST_OFFSET_MS } from '../../shared/primitives/time';
+import { UTF8_BOM, csvCell } from '../../shared/export/csv';
 
 /**
  * Story 9-3b — the audit export's CSV (RFC 4180): `\r\n` line ends, UTF-8
@@ -20,8 +21,10 @@ export const AUDIT_EXPORT_CSV_HEADER = [
   'target_id',
 ] as const;
 
-/** The UTF-8 byte-order mark the file starts with. */
-export const UTF8_BOM = '﻿';
+// Story 5-3a — the BOM and the guarded cell moved to `shared/export/csv.ts`
+// (the operational registers share them); re-exported unchanged, so the
+// audit export's bytes are identical.
+export { UTF8_BOM, csvCell };
 
 /** One audit row as the export reads it (`created_at`/`occurred_at` as stored instants). */
 export interface AuditExportCsvRow {
@@ -45,17 +48,6 @@ export function istInstant(instant: string): string {
     throw new RangeError(`unparseable instant "${instant}"`);
   }
   return `${new Date(ms + IST_OFFSET_MS).toISOString().slice(0, 23)}+05:30`;
-}
-
-/**
- * One CSV cell. The formula guard first (story 21-5b's rule, the web's
- * `csvField`): a cell starting with `=`, `+`, `-`, `@`, TAB or CR gets a
- * leading `'`, so a spreadsheet never executes it. Then RFC 4180 quoting: a
- * cell holding `,`, `"`, CR or LF is quoted, with its quotes doubled.
- */
-export function csvCell(value: string): string {
-  const guarded = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
-  return /[",\r\n]/.test(guarded) ? `"${guarded.replaceAll('"', '""')}"` : guarded;
 }
 
 /** One data line, `\r\n` included. */
