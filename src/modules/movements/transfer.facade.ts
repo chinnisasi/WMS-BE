@@ -4,6 +4,8 @@ import { alias } from 'drizzle-orm/pg-core';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import type {
+  COUNT_TASK_ORIGINS,
+  COUNT_TASK_STATUSES,
   COUNT_VARIANCE_STATUSES} from '../../shared/db/schema';
 import {
   bins,
@@ -26,7 +28,8 @@ import { ProblemException } from '../../shared/problem-details/problem.exception
 import type { TenantTx } from '../../shared/db/tenant-scope';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import { skuOfClient } from '../../shared/db/client-filter';
-import { assertWarehouseInTenant } from '../tenancy/tenancy.service';
+import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
+import { ROLE_CAPABILITIES } from '../tenancy/permissions';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import {
   TransferService,
@@ -37,10 +40,14 @@ import {
 } from './transfer.command';
 import {
   CountService,
+  blindSubmitResponse,
   varianceEntry,
   type CountPoliciesSnapshot,
   type CountVarianceEntry,
   type CreateCountSnapshot,
+  type CreateCountsBulkCommand,
+  type CreateCountsBulkSnapshot,
+  type DeleteCountPolicyCommand,
   type ResolveCountVarianceCommand,
   type ResolveCountVarianceSnapshot,
   type SetVariancePolicyCommand,
@@ -82,6 +89,82 @@ export interface ListCountVariancesQuery {
   readonly clientId?: string | undefined;
   readonly cursor?: string | undefined;
   readonly limit?: number | undefined;
+}
+
+/** Story 3-5a — the web count-task list's page default and ceiling. */
+export const DEFAULT_COUNT_TASK_PAGE_SIZE = 50;
+
+export interface ListCountTasksQuery {
+  readonly warehouseId?: string | undefined;
+  readonly status?: (typeof COUNT_TASK_STATUSES)[number] | undefined;
+  readonly origin?: (typeof COUNT_TASK_ORIGINS)[number] | undefined;
+  readonly binId?: string | undefined;
+  readonly cursor?: string | undefined;
+  readonly limit?: number | undefined;
+}
+
+/** One row of the web count-task list (story 3-5a) — no quantities. */
+export interface CountTaskListEntry {
+  readonly id: string;
+  readonly warehouseId: string;
+  readonly binId: string;
+  readonly binCode: string;
+  readonly status: (typeof COUNT_TASK_STATUSES)[number];
+  readonly origin: (typeof COUNT_TASK_ORIGINS)[number];
+  /** The planner; null = the system (the scheduler, or an epoch-mismatch / review recount). */
+  readonly createdBy: string | null;
+  readonly createdAt: string;
+  readonly completedBy: string | null;
+  readonly completedAt: string | null;
+  readonly lineCount: number;
+  readonly varianceCount: number;
+  readonly openVarianceCount: number;
+}
+
+/**
+ * The web count-task detail (story 3-5a) — the ONLY read that shows expected
+ * beside counted. Staff web sessions only (`TenantSessionGuard`): a device
+ * token is 401, a portal token 403.
+ */
+export interface CountTaskDetail {
+  readonly task: {
+    readonly id: string;
+    readonly warehouseId: string;
+    readonly binId: string;
+    readonly binCode: string;
+    readonly status: (typeof COUNT_TASK_STATUSES)[number];
+    readonly origin: (typeof COUNT_TASK_ORIGINS)[number];
+    readonly binStateEpoch: number | null;
+    readonly createdBy: string | null;
+    readonly createdAt: string;
+    readonly completedBy: string | null;
+    readonly completedAt: string | null;
+    /** A movement moved the bin between task start and submit (OQ-2); false while pending. */
+    readonly epochConflict: boolean;
+  };
+  readonly lines: readonly {
+    readonly skuId: string;
+    readonly skuCode: string;
+    readonly skuName: string | null;
+    /** Base units — frozen at task start (0 for a SKU found at submit). */
+    readonly expectedQuantity: number;
+    /** Base units; null while the task is pending. */
+    readonly countedQuantity: number | null;
+  }[];
+  readonly variances: readonly {
+    readonly id: string;
+    readonly skuId: string;
+    readonly expectedQuantity: number;
+    readonly countedQuantity: number;
+    readonly delta: number;
+    readonly epochConflict: boolean;
+    readonly status: (typeof COUNT_VARIANCE_STATUSES)[number];
+    readonly recountTaskId: string | null;
+  }[];
+  /** The recount task a variance of this task names (the latest resolved); null when none. */
+  readonly recountTaskId: string | null;
+  /** The recount the submit minted on an epoch conflict (OQ-2); null when none. */
+  readonly conflictRecountTaskId: string | null;
 }
 
 export interface ListTransfersQuery {
@@ -136,17 +219,16 @@ export interface TransferTask {
 
 /**
  * One card of the device snapshot's Count inbox tasks (Story 5-3): a STORED
- * `pending` count task for this warehouse — unlike every other inbox feed,
- * its per-SKU expectations were FROZEN at task start (the task table, not a
- * derived read). The lines carry the frozen expectations in base units; the
- * submit names every line with a counted quantity (0 explicitly is valid).
+ * `pending` count task for this warehouse. Story 3-5a — BLIND: a line names
+ * the SKU and nothing else. The per-SKU expectations frozen at task start
+ * never reach a device (they are read on the web through the task detail);
+ * the submit names every line with a counted quantity (0 explicitly is
+ * valid) and may add SKUs found in the bin.
  */
 export interface CountTaskLine {
   readonly skuId: string;
   readonly skuCode: string;
   readonly skuName: string | null;
-  /** The frozen expectation, base units at the edge (story 10.1). */
-  readonly expectedQuantity: number;
 }
 
 export interface CountTaskCard {
@@ -155,7 +237,10 @@ export interface CountTaskCard {
   readonly binId: string;
   readonly binCode: string;
   readonly origin: string;
-  /** The bin state frozen at task start — the submit quotes it back. */
+  /**
+   * The bin state frozen at task start — informational: the submit reads the
+   * epoch from the task row, never from the device.
+   */
   readonly binStateEpoch: number | null;
   readonly createdAt: string;
   readonly lines: readonly CountTaskLine[];
@@ -284,11 +369,256 @@ export class MovementsFacade {
     return this.countCommands.createCount(command, idempotencyKey).then((result) => result.snapshot);
   }
 
+  /** Story 3-5a — the bulk on-demand create (bins or a zone). */
+  createCountsBulk(
+    command: CreateCountsBulkCommand,
+    idempotencyKey: string,
+  ): Promise<CreateCountsBulkSnapshot> {
+    return this.countCommands.createCountsBulk(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
   submitCount(
     command: Parameters<CountService['submitCount']>[0],
     idempotencyKey: string,
   ): Promise<SubmitCountSnapshot> {
-    return this.countCommands.submitCount(command, idempotencyKey).then((result) => result.snapshot);
+    // Story 3-5a — blind for every caller (the HTTP route and the review
+    // apply): the command already answers blind; projecting here too keeps
+    // the seam's contract independent of the command's internals.
+    return this.countCommands
+      .submitCount(command, idempotencyKey)
+      .then((result) => blindSubmitResponse(result.snapshot));
+  }
+
+  /** Story 3-5a — `DELETE …/count-policies/{abcClass}`: unschedule one class. */
+  deleteCountPolicy(
+    command: DeleteCountPolicyCommand,
+    idempotencyKey: string,
+  ): Promise<CountPoliciesSnapshot> {
+    return this.countCommands.deleteCountPolicy(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  /** Story 3-5a — `GET …/count-policies`: the warehouse's schedule (any staff). */
+  getCountPolicies(tenantId: string, warehouseId: string): Promise<CountPoliciesSnapshot> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      await assertWarehouseInTenant(tx, tenantId, warehouseId);
+      return { policies: await this.countCommands.countPoliciesInTx(tx, tenantId, warehouseId) };
+    });
+  }
+
+  /**
+   * Story 3-5a — `GET …/movements/counts`: the web count-task list. Newest
+   * first, keyset on `(created_at desc, id desc)`, filterable by warehouse,
+   * status, origin and bin. EXEMPT from the client filter (a bin may hold
+   * several clients' goods, and the list names no SKU). No quantities.
+   */
+  async listCountTasks(tenantId: string, query: ListCountTasksQuery = {}): Promise<Page<CountTaskListEntry>> {
+    const pageSize = query.limit ?? DEFAULT_COUNT_TASK_PAGE_SIZE;
+    const before = query.cursor === undefined ? undefined : decodeCursorSafe(query.cursor);
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      if (query.warehouseId !== undefined) {
+        await assertWarehouseInTenant(tx, tenantId, query.warehouseId);
+      }
+      const rows = await tx
+        .select({
+          row: countTasks,
+          binCode: bins.code,
+          createdAtText: sql<string>`${countTasks.createdAt}::text`,
+        })
+        .from(countTasks)
+        .innerJoin(bins, and(eq(bins.tenantId, countTasks.tenantId), eq(bins.id, countTasks.binId)))
+        .where(
+          and(
+            eq(countTasks.tenantId, tenantId),
+            query.warehouseId === undefined ? undefined : eq(countTasks.warehouseId, query.warehouseId),
+            query.status === undefined ? undefined : eq(countTasks.status, query.status),
+            query.origin === undefined ? undefined : eq(countTasks.origin, query.origin),
+            query.binId === undefined ? undefined : eq(countTasks.binId, query.binId),
+            before === undefined
+              ? undefined
+              : sql`(${countTasks.createdAt}, ${countTasks.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
+          ),
+        )
+        .orderBy(desc(countTasks.createdAt), desc(countTasks.id))
+        .limit(pageSize + 1);
+      const page = buildPage(
+        rows.map((wrapped) => ({
+          createdAt: fullPrecisionInstant(wrapped.createdAtText),
+          id: wrapped.row.id,
+          wrapped,
+        })),
+        pageSize,
+      );
+      const taskIds = page.items.map((item) => item.id);
+      const lineCounts = new Map<string, number>();
+      const varianceCounts = new Map<string, { all: number; open: number }>();
+      if (taskIds.length > 0) {
+        const lineRows = await tx
+          .select({ taskId: countTaskLines.taskId, n: sql<number>`count(*)::int` })
+          .from(countTaskLines)
+          .where(and(eq(countTaskLines.tenantId, tenantId), inArray(countTaskLines.taskId, taskIds)))
+          .groupBy(countTaskLines.taskId);
+        for (const row of lineRows) lineCounts.set(row.taskId, Number(row.n));
+        const varianceRows = await tx
+          .select({
+            taskId: countVariances.taskId,
+            all: sql<number>`count(*)::int`,
+            open: sql<number>`(count(*) filter (where ${countVariances.status} = 'open'))::int`,
+          })
+          .from(countVariances)
+          .where(and(eq(countVariances.tenantId, tenantId), inArray(countVariances.taskId, taskIds)))
+          .groupBy(countVariances.taskId);
+        for (const row of varianceRows) varianceCounts.set(row.taskId, { all: Number(row.all), open: Number(row.open) });
+      }
+      return {
+        items: page.items.map(({ wrapped }) => {
+          const task = wrapped.row;
+          return {
+            id: task.id,
+            warehouseId: task.warehouseId,
+            binId: task.binId,
+            binCode: wrapped.binCode,
+            status: task.status as (typeof COUNT_TASK_STATUSES)[number],
+            origin: task.origin as (typeof COUNT_TASK_ORIGINS)[number],
+            createdBy: task.createdBy,
+            createdAt: canonicalInstant(task.createdAt),
+            completedBy: task.completedBy,
+            completedAt: task.completedAt === null ? null : canonicalInstant(task.completedAt),
+            lineCount: lineCounts.get(task.id) ?? 0,
+            varianceCount: varianceCounts.get(task.id)?.all ?? 0,
+            openVarianceCount: varianceCounts.get(task.id)?.open ?? 0,
+          };
+        }),
+        nextCursor: page.nextCursor,
+      };
+    });
+  }
+
+  /**
+   * Story 3-5a — `GET …/movements/counts/{taskId}`: expected beside counted,
+   * the task's variances and the recount a variance names. The only read
+   * that shows an expected quantity; web staff sessions only.
+   */
+  async getCountTask(tenantId: string, actorUserId: string, taskId: string): Promise<CountTaskDetail> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      // A GATED read: expected quantities are for the count planners and the
+      // variance resolvers only — an operator (who counts blind on the
+      // handheld) must not read them on the web either. 403 role-denied
+      // before anything is read.
+      const role = await getMemberRoleIn(tx, tenantId, actorUserId);
+      if (!ROLE_CAPABILITIES[role].has('counts.manage') && !ROLE_CAPABILITIES[role].has('variances.resolve')) {
+        throw new ProblemException(
+          'role-denied',
+          403,
+          'Role lacks the required capability',
+          `Role "${role}" includes neither "counts.manage" nor "variances.resolve" — the count detail shows expected quantities, which the counter does not see.`,
+        );
+      }
+      const taskRows = await tx
+        .select({ row: countTasks, binCode: bins.code })
+        .from(countTasks)
+        .innerJoin(bins, and(eq(bins.tenantId, countTasks.tenantId), eq(bins.id, countTasks.binId)))
+        .where(and(eq(countTasks.tenantId, tenantId), eq(countTasks.id, taskId)))
+        .limit(1);
+      const found = taskRows[0];
+      if (found === undefined) {
+        throw new ProblemException(
+          'not-found',
+          404,
+          'Count task not found',
+          'No count task with this id exists in this tenant.',
+        );
+      }
+      const task = found.row;
+      const lineRows = await tx
+        .select({
+          skuId: countTaskLines.skuId,
+          skuCode: skus.code,
+          skuName: skus.name,
+          expected: countTaskLines.expectedQuantity,
+          counted: countTaskLines.countedQuantity,
+        })
+        .from(countTaskLines)
+        .innerJoin(skus, and(eq(skus.tenantId, countTaskLines.tenantId), eq(skus.id, countTaskLines.skuId)))
+        .where(and(eq(countTaskLines.tenantId, tenantId), eq(countTaskLines.taskId, taskId)))
+        .orderBy(asc(skus.code), asc(countTaskLines.skuId));
+      const varianceRows = await tx
+        .select()
+        .from(countVariances)
+        .where(and(eq(countVariances.tenantId, tenantId), eq(countVariances.taskId, taskId)))
+        .orderBy(asc(countVariances.createdAt), asc(countVariances.id));
+      // The recount a variance names (the resolve's recount arm) — the
+      // latest resolved one when several do, ties broken by variance id.
+      const recountRow = [...varianceRows]
+        .filter((row) => row.recountTaskId !== null)
+        .sort((a, b) => {
+          const at = a.resolvedAt ?? '';
+          const bt = b.resolvedAt ?? '';
+          if (at !== bt) return at < bt ? 1 : -1;
+          return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+        })[0];
+      // The EPOCH-CONFLICT recount (OQ-2): the submit mints it in its own
+      // transaction, stamped created_at = the source's completed_at. It is
+      // the bin's first `recount` task created at/after that instant (ties
+      // by id), accepted only when it carries exactly that stamp — a later
+      // recount (a variance resolution) is not the conflict's. A conflict
+      // with no variance rows is still found this way.
+      let conflictRecountTaskId: string | null = null;
+      if (task.completedAt !== null) {
+        const candidates = await tx
+          .select({ id: countTasks.id, exact: sql<boolean>`${countTasks.createdAt} = ${task.completedAt}::timestamptz` })
+          .from(countTasks)
+          .where(
+            and(
+              eq(countTasks.tenantId, tenantId),
+              eq(countTasks.warehouseId, task.warehouseId),
+              eq(countTasks.binId, task.binId),
+              eq(countTasks.origin, 'recount'),
+              sql`${countTasks.createdAt} >= ${task.completedAt}::timestamptz`,
+            ),
+          )
+          .orderBy(asc(countTasks.createdAt), asc(countTasks.id))
+          .limit(1);
+        if (candidates[0]?.exact === true) {
+          conflictRecountTaskId = candidates[0].id;
+        }
+      }
+      const epochConflict = conflictRecountTaskId !== null || varianceRows.some((row) => row.epochConflict);
+      return {
+        task: {
+          id: task.id,
+          warehouseId: task.warehouseId,
+          binId: task.binId,
+          binCode: found.binCode,
+          status: task.status as (typeof COUNT_TASK_STATUSES)[number],
+          origin: task.origin as (typeof COUNT_TASK_ORIGINS)[number],
+          binStateEpoch: task.binStateEpoch,
+          createdBy: task.createdBy,
+          createdAt: canonicalInstant(task.createdAt),
+          completedBy: task.completedBy,
+          completedAt: task.completedAt === null ? null : canonicalInstant(task.completedAt),
+          epochConflict,
+        },
+        lines: lineRows.map((line) => ({
+          skuId: line.skuId,
+          skuCode: line.skuCode,
+          skuName: line.skuName,
+          expectedQuantity: fromMilli(line.expected),
+          countedQuantity: line.counted === null ? null : fromMilli(line.counted),
+        })),
+        variances: varianceRows.map((row) => ({
+          id: row.id,
+          skuId: row.skuId,
+          expectedQuantity: fromMilli(row.expectedQuantity),
+          countedQuantity: fromMilli(row.countedQuantity),
+          delta: fromMilli(row.deltaMilli),
+          epochConflict: row.epochConflict,
+          status: row.status as (typeof COUNT_VARIANCE_STATUSES)[number],
+          recountTaskId: row.recountTaskId,
+        })),
+        recountTaskId: recountRow?.recountTaskId ?? null,
+        conflictRecountTaskId,
+      };
+    });
   }
 
   upsertCountPolicies(
@@ -818,7 +1148,6 @@ export class MovementsFacade {
         skuId: countTaskLines.skuId,
         skuCode: skus.code,
         skuName: skus.name,
-        expectedQuantity: countTaskLines.expectedQuantity,
       })
       .from(countTaskLines)
       .innerJoin(skus, eq(skus.id, countTaskLines.skuId))
@@ -829,11 +1158,11 @@ export class MovementsFacade {
     const linesByTask = new Map<string, CountTaskLine[]>();
     for (const line of lineRows) {
       const list = linesByTask.get(line.taskId) ?? [];
+      // Story 3-5a — blind: the SKU and nothing else (an exact key set).
       list.push({
         skuId: line.skuId,
         skuCode: line.skuCode,
         skuName: line.skuName,
-        expectedQuantity: fromMilli(line.expectedQuantity),
       });
       linesByTask.set(line.taskId, list);
     }
@@ -856,9 +1185,9 @@ export class MovementsFacade {
       // corrupt row, not a task (the pick card's requireBinCode stance).
       binCode: binCodeById.get(task.binId) ?? '',
       origin: task.origin,
-      // The FROZEN epoch from the task row, not a live re-read: "expected =
-      // bin state at count start" — a live epoch would defeat the compare
-      // the submit runs under locks.
+      // The FROZEN epoch from the task row, not a live re-read —
+      // informational on the device: the submit reads the epoch from the
+      // task row itself (story 3-5a fixed the stale "quoted back" wording).
       binStateEpoch: task.binStateEpoch,
       createdAt: canonicalInstant(task.createdAt),
       lines: linesByTask.get(task.id) ?? [],
@@ -869,6 +1198,7 @@ export class MovementsFacade {
 export type { TransferOrderSnapshot, TransferConfirmSnapshot, TransferLegEventSnapshot };
 export type {
   CreateCountSnapshot,
+  CreateCountsBulkSnapshot,
   SubmitCountSnapshot,
   CountPoliciesSnapshot,
   CountVarianceSnapshot,

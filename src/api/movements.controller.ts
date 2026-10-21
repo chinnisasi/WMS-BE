@@ -1,5 +1,5 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Inject, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Inject, Param, Post, Put, Query, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiBody, ApiExtraModels, ApiHeaders, ApiOkResponse, ApiOperation, ApiParam, ApiResponse, ApiTags, getSchemaPath } from '@nestjs/swagger';
 import { ProblemDetailsDto } from '../shared/problem-details/problem-details.dto';
 import { problemJsonResponse } from '../shared/problem-details/problem-details.openapi';
 import { ProblemException } from '../shared/problem-details/problem.exception';
@@ -9,6 +9,8 @@ import type { TenantSession } from '../modules/tenancy/jwt-session';
 import { IdempotencyKey, parseRequiredIdempotencyKey } from '../modules/tenancy/idempotency-guard';
 import { UUID_RE } from '../shared/primitives/ids';
 import { MovementsFacade } from '../modules/movements/transfer.facade';
+import { blindSubmitResponse } from '../modules/movements/count.command';
+import { ABC_CLASSES } from '../shared/primitives/abc-class';
 // eslint-disable-next-line @typescript-eslint/consistent-type-imports
 import {
   CancelTransferDto,
@@ -32,8 +34,12 @@ import {
   SubmitCountLineDto,
   UpsertCountPoliciesDto,
   CreateCountResponse,
+  CreateCountsBulkResponse,
   SubmitCountResponse,
   CountPoliciesResponse,
+  CountTaskDetailResponse,
+  CountTaskListQuery,
+  CountTaskListResponse,
 } from '../modules/movements/count.dto';
 // No eslint-disable... EXCEPT one below: CountVarianceListQuery is listed
 // with the response bodies for a REASON — a Query DTO's class must stay a
@@ -72,7 +78,7 @@ const IDEMPOTENCY_HEADER = [
  * authority.
  */
 @ApiTags('movements')
-@ApiExtraModels(ProblemDetailsDto)
+@ApiExtraModels(ProblemDetailsDto, CreateCountResponse, CreateCountsBulkResponse)
 @Controller('tenants')
 export class MovementsController {
   constructor(
@@ -365,36 +371,74 @@ export class MovementsController {
   @ApiBearerAuth()
   @ApiOperation({
     summary:
-      'Creates an on-demand count task (counts.manage): one open task per bin, with the per-SKU expected quantities and the bin\'s state epoch FROZEN at task start — an epoch-mismatch recount or the scheduler creates the other tasks',
+      'Creates on-demand count tasks (counts.manage). With binId: one open task per bin, with the per-SKU expected quantities and the bin\'s state epoch FROZEN at task start (unchanged). With binIds (1–500) or zoneId (story 3-5a): one task per eligible bin, NOT pushed to handhelds; bins with an open task (and listed system or retired bins) are skipped and listed',
   })
   @ApiBody({ type: CreateCountDto })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({
     status: HttpStatus.CREATED,
-    type: CreateCountResponse,
-    description: 'Count task pending (the idempotency snapshot)',
+    description:
+      'The idempotency snapshot: CreateCountResponse for binId (count task pending), CreateCountsBulkResponse for binIds/zoneId (created and skipped)',
+    schema: { oneOf: [{ $ref: getSchemaPath(CreateCountResponse) }, { $ref: getSchemaPath(CreateCountsBulkResponse) }] },
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, or a system bin (Receiving/QC-hold/In-Transit — counts target storage bins only) (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body (not exactly one of binId/binIds/zoneId, a repeated bin), or a system bin on the single create (Receiving/QC-hold/In-Transit — counts target storage bins only) (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)') })
-  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse or the bin does not exist in this tenant — including a bin deleted between the listing and the create (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The bin already has a pending count task (count-task-open), or a concurrent idempotent request (conflict)') })
-  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse, the zone or a bin does not exist in this tenant — including a bin deleted between the listing and the create (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The single bin already has a pending count task (count-task-open), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or more than 500 bins named or in the zone (too-many-bins)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
   async createCount(
     @Param('tenantId') tenantId: string,
     @IdempotencyKey() idempotencyKey: string | undefined,
     @CurrentSession() session: TenantSession,
     @Body() dto: CreateCountDto,
-  ): Promise<CreateCountResponse> {
+  ): Promise<CreateCountResponse | CreateCountsBulkResponse> {
     assertOwnTenantToken(session.tenantId, tenantId);
+    // `null` is absent (an explicit null must not reach a lookup or the
+    // bulk shape checks as a value).
+    const binId = dto.binId ?? undefined;
+    const binIds = dto.binIds ?? undefined;
+    const zoneId = dto.zoneId ?? undefined;
+    const named = [binId, binIds, zoneId].filter((value) => value !== undefined).length;
+    if (named !== 1) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Name one bin, a list of bins, or a zone',
+        'The body must carry exactly one of binId, binIds or zoneId.',
+      );
+    }
     const key = parseRequiredIdempotencyKey(idempotencyKey);
+    if (binId === undefined) {
+      // Story 3-5a — the bulk arm (bins or a zone).
+      const bulk = await this.movements.createCountsBulk(
+        {
+          tenantId,
+          actorUserId: session.userId,
+          warehouseId: dto.warehouseId,
+          binIds,
+          zoneId,
+          occurredAt: dto.occurredAt,
+        },
+        key,
+      );
+      return {
+        created: bulk.created.map((entry) => ({
+          taskId: entry.taskId,
+          binId: entry.binId,
+          binCode: entry.binCode,
+          lineCount: entry.lineCount,
+        })),
+        skipped: bulk.skipped.map((entry) => ({ binId: entry.binId, binCode: entry.binCode, reason: entry.reason })),
+      };
+    }
     const snapshot = await this.movements.createCount(
       {
         tenantId,
         actorUserId: session.userId,
         warehouseId: dto.warehouseId,
-        binId: dto.binId,
+        binId,
         occurredAt: dto.occurredAt,
       },
       key,
@@ -405,6 +449,67 @@ export class MovementsController {
     };
   }
 
+  @Get(':tenantId/movements/counts')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Lists count tasks (story 3-5a — keyset cursor, newest first; warehouse/status/origin/bin filters; any staff role, never capability-gated). Exempt from the client filter (a bin may hold several clients\' goods) and carries no quantity',
+  })
+  @ApiOkResponse({ type: CountTaskListResponse, description: 'The count-task page (newest first, keyset cursor)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed filter, cursor or out-of-range limit (validation-failed / invalid-cursor)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token (a device token is refused)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse filter names a warehouse outside this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async listCountTasks(
+    @Param('tenantId') tenantId: string,
+    @CurrentSession() session: TenantSession,
+    @Query() query: CountTaskListQuery,
+  ): Promise<CountTaskListResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    const page = await this.movements.listCountTasks(tenantId, {
+      warehouseId: query.warehouseId,
+      status: query.status,
+      origin: query.origin,
+      binId: query.binId,
+      cursor: query.cursor,
+      limit: query.limit,
+    });
+    return { items: page.items.map((entry) => ({ ...entry })), nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/movements/counts/:taskId')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'One count task (story 3-5a): its lines with expected beside counted, its variances, the recount task a variance names and the epoch-conflict recount. The ONLY read showing an expected quantity — a GATED read: counts.manage or variances.resolve (an operator is 403); web staff sessions only (a device token is 401, a portal token 403)',
+  })
+  @ApiOkResponse({ type: CountTaskDetailResponse, description: 'The count task detail' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed taskId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid web session token — a device token is refused (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), a client-portal session, or a role with neither counts.manage nor variances.resolve (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The count task does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'taskId', format: 'uuid' })
+  async getCountTask(
+    @Param('tenantId') tenantId: string,
+    @Param('taskId') taskId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<CountTaskDetailResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(taskId, 'taskId');
+    const detail = await this.movements.getCountTask(tenantId, session.userId, taskId);
+    return {
+      task: { ...detail.task },
+      lines: detail.lines.map((line) => ({ ...line })),
+      variances: detail.variances.map((variance) => ({ ...variance })),
+      recountTaskId: detail.recountTaskId,
+      conflictRecountTaskId: detail.conflictRecountTaskId,
+    };
+  }
+
   @Post(':tenantId/movements/counts/:taskId/submit')
   @HttpCode(HttpStatus.OK)
   @UseGuards(AnySessionGuard)
@@ -412,7 +517,7 @@ export class MovementsController {
   @ApiBearerAuth('device')
   @ApiOperation({
     summary:
-      'Submits a count (counts.execute — either session family): every task line is recorded with its counted quantity; counted ≠ expected appends an open variance row; the bin\'s epoch is compared for EQUALITY under the locks — a mismatch flags the variances AND auto-creates a fresh recount task (never a stock write)',
+      'Submits a count (counts.execute — either session family): every task line is recorded with its counted quantity, and a SKU found in the bin is added with an expected of 0; counted ≠ expected appends an open variance row; the bin\'s epoch is compared for EQUALITY under the locks — a mismatch flags the variances AND auto-creates a fresh recount task (never a stock write). Story 3-5a — the response is BLIND: variances is always empty',
     description:
       'Accepts EITHER session family on the one route (the compliance controller\'s precedent): a web session or a device badge-in session — the Count inbox task\'s submit. Every task line must be counted; a line the body does not name is 400 count-incomplete (a 0 count must be EXPLICITLY entered).',
   })
@@ -423,7 +528,7 @@ export class MovementsController {
     type: SubmitCountResponse,
     description: 'Count completed: the variances and, on an epoch conflict, the recount task (the idempotency snapshot)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, or a task line the body never counted (count-incomplete)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, an invalid body, a task line the body never counted (count-incomplete), or a found line (not on the task) of a kit or of a batch-, serial- or catch-weight-tracked SKU (count-found-sku-not-countable)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token of either family, or a device token without a badge-in session (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks counts.execute (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('The count task, a named SKU, or the count task\'s bin does not exist in this tenant — the bin may have been deleted while the count was in progress ("The count task\'s bin no longer exists in this tenant.") (not-found)') })
@@ -465,10 +570,13 @@ export class MovementsController {
       },
       key,
     );
+    // Story 3-5a — the one blind projector, again at the edge: whatever the
+    // stored snapshot holds, the wire carries exactly these keys.
+    const blind = blindSubmitResponse(snapshot);
     return {
-      countTask: { ...snapshot.countTask },
-      variances: snapshot.variances.map((variance) => ({ ...variance })),
-      recountTaskId: snapshot.recountTaskId,
+      countTask: { ...blind.countTask },
+      variances: [],
+      recountTaskId: blind.recountTaskId,
     };
   }
 
@@ -516,6 +624,70 @@ export class MovementsController {
           intervalDays: policy.intervalDays,
         })),
       },
+      key,
+    );
+    return { policies: snapshot.policies.map((policy) => ({ ...policy })) };
+  }
+
+  @Get(':tenantId/movements/warehouses/:warehouseId/count-policies')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Returns the warehouse\'s cycle-count policies, sorted by ABC class (story 3-5a; any staff role — a class with no row is never scheduled)',
+  })
+  @ApiOkResponse({ type: CountPoliciesResponse, description: 'The warehouse\'s policy set (possibly empty)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed warehouseId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse does not exist in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async getCountPolicies(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<CountPoliciesResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    const snapshot = await this.movements.getCountPolicies(tenantId, warehouseId);
+    return { policies: snapshot.policies.map((policy) => ({ ...policy })) };
+  }
+
+  @Delete(':tenantId/movements/warehouses/:warehouseId/count-policies/:abcClass')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Unschedules one ABC class in a warehouse (story 3-5a, counts.manage): the policy row is removed, so the scheduler stops minting that class\'s tasks; open tasks stay. Answers the remaining policy set',
+  })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.OK,
+    type: CountPoliciesResponse,
+    description: 'The warehouse\'s remaining policy set (the idempotency snapshot)',
+  })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, a malformed warehouseId, or an unknown ABC class (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks counts.manage (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse does not exist, or it has no policy for this class (not-found)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different request (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  @ApiParam({ name: 'abcClass', enum: [...ABC_CLASSES] })
+  async deleteCountPolicy(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('abcClass') abcClass: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentSession() session: TenantSession,
+  ): Promise<CountPoliciesResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const snapshot = await this.movements.deleteCountPolicy(
+      { tenantId, actorUserId: session.userId, warehouseId, abcClass },
       key,
     );
     return { policies: snapshot.policies.map((policy) => ({ ...policy })) };

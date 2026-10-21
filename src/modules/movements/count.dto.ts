@@ -1,7 +1,8 @@
 import { Type } from 'class-transformer';
 import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../../shared/primitives/quantity';
-import { COUNT_TASK_ORIGINS, COUNT_VARIANCE_STATUSES } from '../../shared/db/schema';
+import { COUNT_TASK_ORIGINS, COUNT_TASK_STATUSES, COUNT_VARIANCE_STATUSES } from '../../shared/db/schema';
 import { MAX_VARIANCE_THRESHOLD_BASE } from './variance-policy.command';
+import { BULK_COUNT_SKIP_REASONS, MAX_BULK_COUNT_BINS } from './count.command';
 import { ABC_CLASSES } from '../../shared/primitives/abc-class';
 import {
   ArrayMaxSize,
@@ -31,15 +32,50 @@ import { ApiProperty } from '@nestjs/swagger';
 
 // ── count.create input ───────────────────────────────────────────────────────
 
-/** POST /tenants/{tenantId}/movements/counts body. */
+/**
+ * POST /tenants/{tenantId}/movements/counts body. Exactly one of `binId`
+ * (the single-bin create — its response, refusals and fingerprint are
+ * unchanged), `binIds` or `zoneId` (story 3-5a — the bulk create).
+ */
 export class CreateCountDto {
-  @ApiProperty({ format: 'uuid', description: 'The warehouse holding the bin' })
+  @ApiProperty({ format: 'uuid', description: 'The warehouse holding the bin(s)' })
   @IsUUID()
   warehouseId!: string;
 
-  @ApiProperty({ format: 'uuid', description: 'The bin to count (in that warehouse)' })
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'The single bin to count (in that warehouse). Exactly one of binId, binIds, zoneId',
+  })
+  @IsOptional()
   @IsUUID()
-  binId!: string;
+  binId?: string;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    format: 'uuid',
+    minItems: 1,
+    maxItems: MAX_BULK_COUNT_BINS,
+    uniqueItems: true,
+    description:
+      'Story 3-5a — count many bins at once (1–500, each named once). A bin with an open task, a system bin and a retired bin are skipped and listed; more than 500 is 400 validation-failed (a zone over 500 is 422 too-many-bins)',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_BULK_COUNT_BINS)
+  @IsUUID('all', { each: true })
+  binIds?: string[];
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      "Story 3-5a — count every non-system, non-retired bin of one zone (at most 500; more is 422 too-many-bins). Bins with an open task are skipped and listed",
+  })
+  @IsOptional()
+  @IsUUID()
+  zoneId?: string;
 
   @ApiProperty({
     required: false,
@@ -221,29 +257,64 @@ export class CreateCountResponse {
   lines!: CountTaskLineResponseDto[];
 }
 
-export class CountVarianceResponseDto {
+/** Story 3-5a — one created task of a bulk create (no quantities). */
+export class BulkCreatedCountTaskDto {
   @ApiProperty({ format: 'uuid' })
-  skuId!: string;
+  taskId!: string;
 
-  @ApiProperty({ minimum: 0 })
-  expectedQuantity!: number;
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
 
-  @ApiProperty({ minimum: 0 })
-  countedQuantity!: number;
+  @ApiProperty()
+  binCode!: string;
 
-  @ApiProperty({ description: 'counted − expected (may be negative)' })
-  delta!: number;
-
-  @ApiProperty({ description: 'A movement moved the bin between task start and submit (OQ-2)' })
-  epochConflict!: boolean;
+  @ApiProperty({ description: 'How many SKU lines the task froze', minimum: 0 })
+  lineCount!: number;
 }
 
+/** Story 3-5a — one bin a bulk create passed over, and why. */
+export class BulkSkippedCountBinDto {
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty()
+  binCode!: string;
+
+  @ApiProperty({
+    enum: [...BULK_COUNT_SKIP_REASONS],
+    description: 'count-task-open: the bin already has a pending count; system-bin / bin-retired: a listed bin that cannot be counted',
+  })
+  reason!: (typeof BULK_COUNT_SKIP_REASONS)[number];
+}
+
+/** Story 3-5a — the bulk create's response (and its idempotency snapshot). */
+export class CreateCountsBulkResponse {
+  @ApiProperty({ type: [BulkCreatedCountTaskDto], description: 'One on-demand task per eligible bin — NOT pushed to handhelds' })
+  created!: BulkCreatedCountTaskDto[];
+
+  @ApiProperty({ type: [BulkSkippedCountBinDto] })
+  skipped!: BulkSkippedCountBinDto[];
+}
+
+/**
+ * The submit response. Story 3-5a — BLIND: `variances` is always empty and
+ * no field carries an expected quantity, a delta or which SKUs differed (the
+ * route is shared with the handheld and its stored answer is replayed to
+ * whoever retries). The web reads the variance rows through
+ * `GET …/movements/counts/{taskId}`.
+ */
 export class SubmitCountResponse {
   @ApiProperty({ type: CountTaskSettledResponseDto })
   countTask!: CountTaskSettledResponseDto;
 
-  @ApiProperty({ type: [CountVarianceResponseDto] })
-  variances!: CountVarianceResponseDto[];
+  @ApiProperty({
+    type: 'array',
+    items: { type: 'object', properties: {}, additionalProperties: false },
+    maxItems: 0,
+    description:
+      'Always empty (story 3-5a — counts are blind; a key stored before 3-5a is re-projected on replay). Read variances through the task detail on the web',
+  })
+  variances!: never[];
 
   @ApiProperty({
     type: String,
@@ -256,6 +327,193 @@ export class SubmitCountResponse {
 export class CountPoliciesResponse {
   @ApiProperty({ type: [CountPolicyDto] })
   policies!: CountPolicyDto[];
+}
+
+// ── story 3-5a — the web count-admin reads ───────────────────────────────────
+
+/** GET …/movements/counts query. */
+export class CountTaskListQuery {
+  @ApiProperty({ required: false, format: 'uuid', description: 'Narrow to one warehouse' })
+  @IsOptional()
+  @IsUUID()
+  warehouseId?: string;
+
+  @ApiProperty({ required: false, enum: [...COUNT_TASK_STATUSES] })
+  @IsOptional()
+  @IsIn(COUNT_TASK_STATUSES as unknown as string[])
+  status?: (typeof COUNT_TASK_STATUSES)[number];
+
+  @ApiProperty({ required: false, enum: [...COUNT_TASK_ORIGINS] })
+  @IsOptional()
+  @IsIn(COUNT_TASK_ORIGINS as unknown as string[])
+  origin?: (typeof COUNT_TASK_ORIGINS)[number];
+
+  @ApiProperty({ required: false, format: 'uuid', description: 'Narrow to one bin' })
+  @IsOptional()
+  @IsUUID()
+  binId?: string;
+
+  @ApiProperty({ required: false, description: 'Opaque keyset cursor from the previous page' })
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+
+  @ApiProperty({ required: false, example: 50, minimum: 1, maximum: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}
+
+/** One row of GET …/movements/counts (no quantities). */
+export class CountTaskListEntryDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty()
+  binCode!: string;
+
+  @ApiProperty({ enum: [...COUNT_TASK_STATUSES] })
+  status!: (typeof COUNT_TASK_STATUSES)[number];
+
+  @ApiProperty({ enum: [...COUNT_TASK_ORIGINS] })
+  origin!: (typeof COUNT_TASK_ORIGINS)[number];
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The planner; null = the system (scheduler or a recount)' })
+  createdBy!: string | null;
+
+  @ApiProperty()
+  createdAt!: string;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  completedBy!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  completedAt!: string | null;
+
+  @ApiProperty({ minimum: 0 })
+  lineCount!: number;
+
+  @ApiProperty({ minimum: 0 })
+  varianceCount!: number;
+
+  @ApiProperty({ minimum: 0 })
+  openVarianceCount!: number;
+}
+
+export class CountTaskListResponse {
+  @ApiProperty({ type: [CountTaskListEntryDto] })
+  items!: readonly CountTaskListEntryDto[];
+
+  @ApiProperty({ type: String, nullable: true, required: false })
+  nextCursor?: string | null;
+}
+
+export class CountTaskDetailTaskDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  warehouseId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  binId!: string;
+
+  @ApiProperty()
+  binCode!: string;
+
+  @ApiProperty({ enum: [...COUNT_TASK_STATUSES] })
+  status!: (typeof COUNT_TASK_STATUSES)[number];
+
+  @ApiProperty({ enum: [...COUNT_TASK_ORIGINS] })
+  origin!: (typeof COUNT_TASK_ORIGINS)[number];
+
+  @ApiProperty({ type: Number, nullable: true, description: 'The bin state epoch frozen at task start' })
+  binStateEpoch!: number | null;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  createdBy!: string | null;
+
+  @ApiProperty()
+  createdAt!: string;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid' })
+  completedBy!: string | null;
+
+  @ApiProperty({ type: String, nullable: true })
+  completedAt!: string | null;
+
+  @ApiProperty({ description: 'A movement moved the bin between task start and submit (OQ-2) — the submit minted a recount; false while pending' })
+  epochConflict!: boolean;
+}
+
+export class CountTaskDetailLineDto {
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty()
+  skuCode!: string;
+
+  @ApiProperty({ type: String, nullable: true })
+  skuName!: string | null;
+
+  @ApiProperty({ description: `Frozen at task start (0 for a SKU found at submit). ${QUANTITY_FIELD_DESCRIPTION}` })
+  expectedQuantity!: number;
+
+  @ApiProperty({ type: Number, nullable: true, description: 'What the operator counted; null while the task is pending' })
+  countedQuantity!: number | null;
+}
+
+export class CountTaskDetailVarianceDto {
+  @ApiProperty({ format: 'uuid' })
+  id!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ description: 'Base units — what the count was compared against (a recount resolution rewrites it)' })
+  expectedQuantity!: number;
+
+  @ApiProperty({ description: 'Base units — what the operator counted' })
+  countedQuantity!: number;
+
+  @ApiProperty({ description: 'counted − expected (may be negative)' })
+  delta!: number;
+
+  @ApiProperty({ description: 'A movement moved the bin between task start and submit (OQ-2)' })
+  epochConflict!: boolean;
+
+  @ApiProperty({ enum: [...COUNT_VARIANCE_STATUSES] })
+  status!: (typeof COUNT_VARIANCE_STATUSES)[number];
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The recount task a recount resolution minted' })
+  recountTaskId!: string | null;
+}
+
+/** GET …/movements/counts/{taskId} — expected beside counted (web staff only). */
+export class CountTaskDetailResponse {
+  @ApiProperty({ type: CountTaskDetailTaskDto })
+  task!: CountTaskDetailTaskDto;
+
+  @ApiProperty({ type: [CountTaskDetailLineDto] })
+  lines!: CountTaskDetailLineDto[];
+
+  @ApiProperty({ type: [CountTaskDetailVarianceDto] })
+  variances!: CountTaskDetailVarianceDto[];
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The recount task a variance of this task names (the latest); null when none' })
+  recountTaskId!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The recount task the submit minted on an epoch conflict (OQ-2); null when none' })
+  conflictRecountTaskId!: string | null;
 }
 
 // ── story 5-4 — variance resolution DTOs ─────────────────────────────────────

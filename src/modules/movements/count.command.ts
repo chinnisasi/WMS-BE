@@ -1,10 +1,11 @@
 import { Inject, Injectable } from '@nestjs/common';
-import { and, asc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
   auditEvents,
   bins,
+  zones,
   countPolicies,
   countTaskLines,
   countTasks,
@@ -29,6 +30,10 @@ import { assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { uomPrecision } from '../catalog/uom';
+// Story 3-5a — the kit-ness read for a found line (the transfer command's
+// file-level in-tx escape: catalog owns `kit_compositions`).
+import { getKitSkuIdsInTx } from '../catalog/kit.store';
+import { ABC_CLASSES } from '../../shared/primitives/abc-class';
 import { InventoryFacade } from '../inventory/inventory.facade';
 import type { AdjustStockCommand } from '../inventory/inventory.facade';
 
@@ -95,6 +100,53 @@ export interface CreateCountCommand {
   readonly occurredAt?: string | undefined;
 }
 
+/**
+ * Story 3-5a — the BULK on-demand create: many bins (`binIds`, 1–500 unique)
+ * or every countable bin of a zone (`zoneId`). The single-bin create
+ * (`CreateCountCommand`) is untouched — its response, refusals and
+ * fingerprint stay byte-identical.
+ */
+export interface CreateCountsBulkCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly warehouseId: string;
+  /** Exactly one of `binIds` / `zoneId`. */
+  readonly binIds?: readonly string[] | null | undefined;
+  readonly zoneId?: string | null | undefined;
+  readonly occurredAt?: string | undefined;
+}
+
+/** The bulk create's per-request ceiling (the spec's 1–500). */
+export const MAX_BULK_COUNT_BINS = 500;
+
+/** Why a bulk create passed over a bin. */
+export const BULK_COUNT_SKIP_REASONS = ['count-task-open', 'system-bin', 'bin-retired'] as const;
+export type BulkCountSkipReason = (typeof BULK_COUNT_SKIP_REASONS)[number];
+
+/** The bulk create's response body (and its idempotency snapshot). */
+export interface CreateCountsBulkSnapshot {
+  readonly created: readonly {
+    readonly taskId: string;
+    readonly binId: string;
+    readonly binCode: string;
+    /** How many SKU lines the task froze (no quantities — the web reads the detail). */
+    readonly lineCount: number;
+  }[];
+  readonly skipped: readonly {
+    readonly binId: string;
+    readonly binCode: string;
+    readonly reason: BulkCountSkipReason;
+  }[];
+}
+
+/** Story 3-5a — `DELETE …/count-policies/{abcClass}`: unschedule one class. */
+export interface DeleteCountPolicyCommand {
+  readonly tenantId: string;
+  readonly actorUserId: string;
+  readonly warehouseId: string;
+  readonly abcClass: string;
+}
+
 /** One counted line of a submit, in the client's own order. */
 export interface SubmitCountLineInput {
   readonly skuId: string;
@@ -145,7 +197,11 @@ export interface CreateCountSnapshot {
   }[];
 }
 
-/** One variance of the submit snapshot, in base units. */
+/**
+ * One variance of a PRE-3-5a submit snapshot, in base units. Story 3-5a made
+ * the count blind: no submit response carries a variance any more, but a key
+ * stored before 3-5a still holds these — `blindSubmitResponse` drops them.
+ */
 export interface CountVarianceSnapshot {
   readonly skuId: string;
   readonly expectedQuantity: number;
@@ -155,7 +211,13 @@ export interface CountVarianceSnapshot {
   readonly epochConflict: boolean;
 }
 
-/** The API response body (and the idempotent replay's stored copy), submit. */
+/**
+ * The API response body (and the idempotent replay's stored copy), submit.
+ * Story 3-5a — BLIND: `variances` is always empty and nothing here carries an
+ * expected quantity, a delta or which SKUs differed (the submit route is
+ * shared with the handheld, and its stored answer is replayed to whoever
+ * retries). The variance rows are read on the web through the task detail.
+ */
 export interface SubmitCountSnapshot {
   readonly countTask: {
     readonly id: string;
@@ -166,9 +228,49 @@ export interface SubmitCountSnapshot {
     /** A movement moved the bin between task start and submit (OQ-2). */
     readonly epochConflict: boolean;
   };
-  readonly variances: readonly CountVarianceSnapshot[];
+  readonly variances: readonly [];
   /** The auto-created recount task when the epoch conflicted; null otherwise. */
   readonly recountTaskId: string | null;
+}
+
+/**
+ * Story 3-5a — the ONE submit-response projector, applied on write (the
+ * stored snapshot), on replay (a key stored before 3-5a carries
+ * `variances[]` with quantities) and by the controller. An exact key
+ * allowlist rebuilt key by key — never a spread — so no stored shape, old or
+ * new, reaches the wire beyond these keys.
+ */
+export function blindSubmitResponse(stored: unknown): SubmitCountSnapshot {
+  // A malformed stored snapshot is a corrupt row — it THROWS (a 500 naming
+  // the defect), never renders a field as the string "undefined".
+  const malformed = (what: string): never => {
+    throw new Error(`count submit snapshot is malformed: ${what}`);
+  };
+  if (typeof stored !== 'object' || stored === null) malformed('not an object');
+  const snapshot = stored as { countTask?: unknown; recountTaskId?: unknown };
+  if (typeof snapshot.countTask !== 'object' || snapshot.countTask === null) malformed('no countTask');
+  const task = snapshot.countTask as Record<string, unknown>;
+  const text = (key: string): string => {
+    const value = task[key];
+    return typeof value === 'string' ? value : malformed(`countTask.${key} is not a string`);
+  };
+  if (typeof task.epochConflict !== 'boolean') malformed('countTask.epochConflict is not a boolean');
+  const recount = snapshot.recountTaskId;
+  if (recount !== null && recount !== undefined && typeof recount !== 'string') {
+    malformed('recountTaskId is not a string or null');
+  }
+  return {
+    countTask: {
+      id: text('id'),
+      status: text('status'),
+      warehouseId: text('warehouseId'),
+      binId: text('binId'),
+      completedAt: text('completedAt'),
+      epochConflict: task.epochConflict as boolean,
+    },
+    variances: [],
+    recountTaskId: typeof recount === 'string' ? recount : null,
+  };
 }
 
 /** The API response body, policy upsert. */
@@ -302,6 +404,31 @@ function countTaskOpen(binCode: string): ProblemException {
     409,
     'A count task is already open on this bin',
     `Bin "${binCode}" already has a pending count task — one open task per bin; submit it (or wait for the epoch-mismatch recount) before pointing a second task at it.`,
+  );
+}
+
+/**
+ * Story 3-5a — a found line (not on the task) whose variance could never be
+ * resolved: a kit, or a batch-, serial- or catch-weight-tracked SKU.
+ */
+function countFoundSkuNotCountable(refused: readonly { code: string; why: string }[]): ProblemException {
+  return new ProblemException(
+    'count-found-sku-not-countable',
+    400,
+    'A found SKU cannot be counted here',
+    `These SKUs are not on the count task and cannot be added to it: ${refused
+      .map((entry) => `${entry.code} (${entry.why})`)
+      .join(', ')}. A kit holds no stock, and a batch-, serial- or catch-weight-tracked item found in the bin needs a supervisor — raise it outside the count.`,
+  );
+}
+
+/** Story 3-5a — a bulk create naming (or a zone holding) more than the ceiling. */
+function tooManyBins(count: number): ProblemException {
+  return new ProblemException(
+    'too-many-bins',
+    422,
+    'Too many bins for one count request',
+    `The request selects ${count} bins — at most ${MAX_BULK_COUNT_BINS} per request; split it into smaller sets.`,
   );
 }
 
@@ -654,6 +781,358 @@ export class CountService {
     return { snapshot, replayed };
   }
 
+  // ── createCountsBulk (story 3-5a, counts.manage) ────────────────────────
+
+  /**
+   * The bulk fingerprint. The single-bin create's fingerprint is unchanged
+   * (pinned by a golden); this arm adds `mode: 'bulk'` and the SORTED bin
+   * ids (a set — a reordered retry still replays) or the zone id, so no bulk
+   * body can hash like a single one.
+   */
+  createBulkFingerprint(command: CreateCountsBulkCommand): string {
+    return hashCommandPayload({
+      tenantId: command.tenantId,
+      warehouseId: command.warehouseId,
+      mode: 'bulk',
+      ...(command.zoneId === undefined || command.zoneId === null
+        ? { binIds: [...(command.binIds ?? [])].sort() }
+        : { zoneId: command.zoneId }),
+      occurredAt: command.occurredAt,
+    });
+  }
+
+  /**
+   * Create one on-demand task per eligible bin. A bin with an open task is
+   * SKIPPED (`count-task-open`), as is a listed system or retired bin; a
+   * zone selects its non-system, non-retired bins only. The created tasks are
+   * NOT pushed (their `count.created` carries `bulk: true`, the scheduled
+   * precedent — one request can make hundreds). Locks: the bin rows
+   * `FOR UPDATE` in sorted id order, then the warehouse advisory (the
+   * scheduler's order), then the replay again UNDER the lock — a same-key
+   * duplicate parked on the bins wakes to the winner's snapshot, never to an
+   * all-skipped answer. One `count.created` audit row per created task, all
+   * under the key; an all-skipped request writes none (a named no-op arm).
+   */
+  async createCountsBulk(
+    command: CreateCountsBulkCommand,
+    idempotencyKey: string,
+  ): Promise<{ snapshot: CreateCountsBulkSnapshot; replayed: boolean }> {
+    // Shape checks above the transaction.
+    // `null` is absent (the controller normalises it too; the command does
+    // not rely on that).
+    const hasBins = command.binIds !== undefined && command.binIds !== null;
+    const hasZone = command.zoneId !== undefined && command.zoneId !== null;
+    if (hasBins === hasZone) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Name the bins or the zone',
+        'A bulk count names exactly one of binIds or zoneId.',
+      );
+    }
+    if (hasBins) {
+      const ids = command.binIds!;
+      if (ids.length === 0) {
+        throw new ProblemException('validation-failed', 400, 'No bins named', 'binIds must name at least one bin.');
+      }
+      if (new Set(ids).size !== ids.length) {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'A bin is named twice',
+          'binIds must not repeat a bin — name each bin once.',
+        );
+      }
+      if (ids.length > MAX_BULK_COUNT_BINS) {
+        throw tooManyBins(ids.length);
+      }
+    }
+    let occurredAt: string;
+    if (command.occurredAt === undefined) {
+      occurredAt = nowIso();
+    } else {
+      try {
+        occurredAt = assertUtcIso(command.occurredAt);
+      } catch {
+        throw new ProblemException(
+          'validation-failed',
+          400,
+          'occurredAt must be a valid ISO-8601 UTC instant',
+          `occurredAt must be a Z-suffixed ISO-8601 UTC timestamp (got "${command.occurredAt}").`,
+        );
+      }
+    }
+
+    const payloadHash = this.createBulkFingerprint(command);
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(
+        await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+        'counts.manage',
+      );
+
+      const replay = async (): Promise<CreateCountsBulkSnapshot | null> => {
+        const existing = await this.lookupIdempotencyKey(tx, command.tenantId, idempotencyKey);
+        if (existing === undefined) return null;
+        if (existing.payloadHash !== payloadHash) {
+          throw idempotencyKeyReuse();
+        }
+        return existing.responseSnapshot as CreateCountsBulkSnapshot;
+      };
+      const first = await replay();
+      if (first !== null) {
+        return { snapshot: first, replayed: true };
+      }
+
+      await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
+
+      // The candidate bin ids, resolved WITHOUT a lock (the lock below
+      // re-reads every fact the decision rests on).
+      let candidateIds: string[];
+      if (hasZone) {
+        const zoneRows = await tx
+          .select({ id: zones.id })
+          .from(zones)
+          .where(
+            and(
+              eq(zones.tenantId, command.tenantId),
+              eq(zones.warehouseId, command.warehouseId),
+              eq(zones.id, command.zoneId!),
+            ),
+          )
+          .limit(1);
+        if (zoneRows[0] === undefined) {
+          throw new ProblemException(
+            'not-found',
+            404,
+            'Zone not found',
+            `No zone with id "${command.zoneId!}" exists in this warehouse.`,
+          );
+        }
+        // A zone selects its countable bins only — system and retired bins
+        // are not "in" the request, so they are not reported as skipped.
+        const zoneBins = await tx
+          .select({ id: bins.id })
+          .from(bins)
+          .where(
+            and(
+              eq(bins.tenantId, command.tenantId),
+              eq(bins.warehouseId, command.warehouseId),
+              eq(bins.zoneId, command.zoneId!),
+              eq(bins.systemOwned, false),
+              isNull(bins.retiredAt),
+            ),
+          );
+        if (zoneBins.length > MAX_BULK_COUNT_BINS) {
+          throw tooManyBins(zoneBins.length);
+        }
+        candidateIds = zoneBins.map((row) => row.id);
+      } else {
+        candidateIds = [...command.binIds!];
+      }
+      candidateIds.sort();
+
+      // Locks, the canonical order: the bin rows FOR UPDATE in sorted id
+      // order (the scheduler's chain head)…
+      const lockedRows =
+        candidateIds.length === 0
+          ? []
+          : await tx
+              .select({
+                id: bins.id,
+                code: bins.code,
+                zoneId: bins.zoneId,
+                systemOwned: bins.systemOwned,
+                retiredAt: bins.retiredAt,
+              })
+              .from(bins)
+              .where(
+                and(
+                  eq(bins.tenantId, command.tenantId),
+                  eq(bins.warehouseId, command.warehouseId),
+                  inArray(bins.id, candidateIds),
+                ),
+              )
+              .orderBy(asc(bins.id))
+              .for('update');
+      // A zone request re-filters UNDER the lock: a bin moved out of the
+      // zone, retired or made a system bin between the unlocked candidate
+      // read and the lock is no longer "in" the request (not created, not
+      // reported as skipped).
+      const decidedRows = hasZone
+        ? lockedRows.filter((row) => row.zoneId === command.zoneId && !row.systemOwned && row.retiredAt === null)
+        : lockedRows;
+      if (hasBins && lockedRows.length !== candidateIds.length) {
+        const found = new Set(lockedRows.map((row) => row.id));
+        const missing = candidateIds.filter((id) => !found.has(id));
+        throw new ProblemException(
+          'not-found',
+          404,
+          'Bin not found',
+          `No bin with id ${missing.map((id) => `"${id}"`).join(', ')} exists in this warehouse.`,
+        );
+      }
+      // …then the warehouse advisory LAST…
+      await this.inventory.lockWarehouseInTx(tx, command.tenantId, command.warehouseId);
+      // …then the replay again UNDER the locks (skeleton step 6).
+      const underLock = await replay();
+      if (underLock !== null) {
+        return { snapshot: underLock, replayed: true };
+      }
+
+      const skipped: { binId: string; binCode: string; reason: BulkCountSkipReason }[] = [];
+      const eligible: { id: string; code: string }[] = [];
+      for (const row of decidedRows) {
+        if (row.systemOwned) {
+          skipped.push({ binId: row.id, binCode: row.code, reason: 'system-bin' });
+        } else if (row.retiredAt !== null) {
+          skipped.push({ binId: row.id, binCode: row.code, reason: 'bin-retired' });
+        } else {
+          eligible.push({ id: row.id, code: row.code });
+        }
+      }
+
+      // The open-task-per-bin rule, under the locks.
+      const eligibleIds = eligible.map((bin) => bin.id);
+      const openRows =
+        eligibleIds.length === 0
+          ? []
+          : await tx
+              .select({ binId: countTasks.binId })
+              .from(countTasks)
+              .where(
+                and(
+                  eq(countTasks.tenantId, command.tenantId),
+                  eq(countTasks.warehouseId, command.warehouseId),
+                  inArray(countTasks.binId, eligibleIds),
+                  eq(countTasks.status, 'pending'),
+                ),
+              );
+      const openBins = new Set(openRows.map((row) => row.binId));
+      const toCreate = eligible.filter((bin) => {
+        if (openBins.has(bin.id)) {
+          skipped.push({ binId: bin.id, binCode: bin.code, reason: 'count-task-open' });
+          return false;
+        }
+        return true;
+      });
+
+      // Expected-at-start and the epochs, one batched read each, UNDER the
+      // locks (the scheduler's reads).
+      const createIds = toCreate.map((bin) => bin.id);
+      const onHandRows =
+        createIds.length === 0
+          ? []
+          : await this.inventory.stockArmsInBinsInTx(tx, command.tenantId, command.warehouseId, createIds);
+      const onHandByBin = new Map<string, { skuId: string; quantity: number }[]>();
+      for (const row of onHandRows) {
+        const list = onHandByBin.get(row.binId) ?? [];
+        list.push({ skuId: row.skuId, quantity: row.quantity });
+        onHandByBin.set(row.binId, list);
+      }
+      const epochs =
+        createIds.length === 0
+          ? new Map<string, number>()
+          : await this.inventory.binStateEpochsInTx(tx, command.tenantId, command.warehouseId, createIds);
+
+      // The writes, BATCHED (one statement per table, not ~4 per bin) — the
+      // warehouse advisory is held for the whole of them.
+      const created: { taskId: string; binId: string; binCode: string; lineCount: number }[] = [];
+      const taskValues: (typeof countTasks.$inferInsert)[] = [];
+      const lineValues: (typeof countTaskLines.$inferInsert)[] = [];
+      const auditValues: (typeof auditEvents.$inferInsert)[] = [];
+      const auditAt = nowIso();
+      for (const bin of toCreate) {
+        const taskId = uuidv7();
+        taskValues.push({
+          id: taskId,
+          tenantId: command.tenantId,
+          warehouseId: command.warehouseId,
+          binId: bin.id,
+          status: 'pending',
+          origin: 'on_demand',
+          binStateEpoch: epochs.get(bin.id) ?? null,
+          createdBy: command.actorUserId,
+        });
+        const arms = (onHandByBin.get(bin.id) ?? []).filter((arm) => arm.quantity !== 0);
+        for (const arm of arms) {
+          lineValues.push({
+            id: uuidv7(),
+            tenantId: command.tenantId,
+            taskId,
+            skuId: arm.skuId,
+            expectedQuantity: arm.quantity,
+          });
+        }
+        // One audit row per created task, all under the request's key.
+        auditValues.push({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          actorUserId: command.actorUserId,
+          action: 'count.created',
+          targetType: 'count_task',
+          targetId: taskId,
+          reference: idempotencyKey,
+          occurredAt: auditAt,
+        });
+        created.push({ taskId, binId: bin.id, binCode: bin.code, lineCount: arms.length });
+      }
+      if (taskValues.length > 0) {
+        await tx.insert(countTasks).values(taskValues);
+      }
+      // ≤ 500 tasks; lines are chunked so a bin-dense request stays far
+      // below the 65,535 bind-parameter ceiling (5 columns per line).
+      for (let at = 0; at < lineValues.length; at += 1000) {
+        await tx.insert(countTaskLines).values(lineValues.slice(at, at + 1000));
+      }
+      for (const entry of created) {
+        await this.outbox.append(tx, {
+          messageId: uuidv7(),
+          tenantId: command.tenantId,
+          type: 'count.created',
+          occurredAt,
+          payload: {
+            taskId: entry.taskId,
+            binId: entry.binId,
+            warehouseId: command.warehouseId,
+            origin: 'on_demand',
+            // Story 3-5a — a bulk-created task is never pushed (the push
+            // enqueue skips `bulk: true`); a summary push is PENDING.
+            bulk: true,
+          },
+        });
+      }
+      if (auditValues.length > 0) {
+        await tx.insert(auditEvents).values(auditValues);
+      }
+
+      skipped.sort((a, b) => (a.binCode < b.binCode ? -1 : a.binCode > b.binCode ? 1 : 0));
+      created.sort((a, b) => (a.binCode < b.binCode ? -1 : a.binCode > b.binCode ? 1 : 0));
+      const snapshot: CreateCountsBulkSnapshot = { created, skipped };
+
+      try {
+        await tx.insert(idempotencyKeys).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          key: idempotencyKey,
+          payloadHash,
+          responseSnapshot: snapshot,
+        });
+      } catch (err) {
+        if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
+          throw new ProblemException(
+            'conflict',
+            409,
+            'Concurrent idempotent request',
+            'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
+          );
+        }
+        throw err;
+      }
+      return { snapshot, replayed: false };
+    });
+  }
+
   // ── submitCount (the floor verb, counts.execute) ────────────────────────
 
   /**
@@ -733,8 +1212,10 @@ export class CountService {
           if (existing.payloadHash !== payloadHash) {
             throw idempotencyKeyReuse();
           }
+          // Story 3-5a — a key stored before 3-5a carries the variances
+          // with their quantities; the replay re-projects it blind.
           return {
-            snapshot: existing.responseSnapshot as SubmitCountSnapshot,
+            snapshot: blindSubmitResponse(existing.responseSnapshot),
             replayed: true,
           };
         }
@@ -817,10 +1298,20 @@ export class CountService {
         // 10.2's placement rule): only the precision rule can tighten, so
         // only it sits here, after the SKU's declared precision is read.
         const skuIds = [...new Set(command.lines.map((line) => line.skuId))];
-        const skuRows = await tx
-          .select({ id: skus.id, code: skus.code, uom: skus.uom })
-          .from(skus)
-          .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.id, skuIds)));
+        const skuRows =
+          skuIds.length === 0
+            ? []
+            : await tx
+                .select({
+                  id: skus.id,
+                  code: skus.code,
+                  uom: skus.uom,
+                  batchTracked: skus.batchTracked,
+                  serialTracked: skus.serialTracked,
+                  catchWeightTracked: skus.catchWeightTracked,
+                })
+                .from(skus)
+                .where(and(eq(skus.tenantId, command.tenantId), inArray(skus.id, skuIds)));
         const skuById = new Map(skuRows.map((row) => [row.id, row]));
         for (const skuId of skuIds) {
           if (!skuById.has(skuId)) {
@@ -830,6 +1321,37 @@ export class CountService {
               'SKU not found',
               `No SKU with id "${skuId}" exists in this tenant.`,
             );
+          }
+        }
+        // Story 3-5a — a FOUND line (a SKU the task does not list) of a kit,
+        // or of a batch-, serial- or catch-weight-tracked SKU, is refused: its
+        // variance could never be resolved (approve-adjust refuses those
+        // SKUs, and a recount lists on-hand only). Behind the replay lookup —
+        // the rule tightens, so a submit committed before it still replays.
+        // A listed line is never refused here (its SKU was on-hand at task
+        // start). Another client's SKU and an inactive SKU ARE recorded: a
+        // count is an observation, and a mis-slotted item is the finding.
+        const listedSkus = new Set(taskLines.map((line) => line.skuId));
+        const foundSkuIds = skuIds.filter((skuId) => !listedSkus.has(skuId));
+        if (foundSkuIds.length > 0) {
+          const kitIds = new Set(await getKitSkuIdsInTx(tx, command.tenantId, foundSkuIds));
+          const refused = foundSkuIds
+            .map((skuId) => skuById.get(skuId)!)
+            .map((sku) => ({
+              code: sku.code,
+              why: kitIds.has(sku.id)
+                ? 'a kit'
+                : sku.serialTracked
+                  ? 'serial-tracked'
+                  : sku.batchTracked
+                    ? 'batch-tracked'
+                    : sku.catchWeightTracked
+                      ? 'catch-weight'
+                      : null,
+            }))
+            .filter((entry): entry is { code: string; why: string } => entry.why !== null);
+          if (refused.length > 0) {
+            throw countFoundSkuNotCountable(refused);
           }
         }
         const countedMilliBySku = new Map<string, number>();
@@ -980,11 +1502,15 @@ export class CountService {
         // locks.
         let recountTaskId: string | null = null;
         if (epochConflict) {
+          // Story 3-5a — stamped created_at = the source's completed_at, so
+          // the web detail can derive this conflict recount from the rows
+          // alone (the task table records no link).
           recountTaskId = await this.createRecountTaskInTx(
             tx,
             command.tenantId,
             task,
             occurredAt,
+            completedAt,
           );
         }
 
@@ -1003,7 +1529,10 @@ export class CountService {
           },
         });
 
-        const snapshot: SubmitCountSnapshot = {
+        // Story 3-5a — blind: the stored answer carries no variance, no
+        // expected quantity and no delta (the web reads the variance rows
+        // through the task detail; the handheld never sees them).
+        const snapshot: SubmitCountSnapshot = blindSubmitResponse({
           countTask: {
             id: command.taskId,
             status: 'completed',
@@ -1012,15 +1541,8 @@ export class CountService {
             completedAt,
             epochConflict,
           },
-          variances: varianceInputs.map((input) => ({
-            skuId: input.skuId,
-            expectedQuantity: fromMilli(input.expected),
-            countedQuantity: fromMilli(input.counted),
-            delta: fromMilli(input.counted - input.expected),
-            epochConflict,
-          })),
           recountTaskId,
-        };
+        });
 
         // Story 9-3a — the audit row (skeleton step 10). A submit applied from
         // a rejected op carries the original operator as its actor (the
@@ -1684,6 +2206,148 @@ export class CountService {
     return { snapshot, replayed };
   }
 
+  // ── deleteCountPolicy (story 3-5a, counts.manage) ──────────────────────
+
+  /** The policy-delete fingerprint — its own arm, so no PUT body can match it. */
+  deleteCountPolicyFingerprint(command: DeleteCountPolicyCommand): string {
+    return hashCommandPayload({
+      tenantId: command.tenantId,
+      arm: 'delete',
+      warehouseId: command.warehouseId,
+      abcClass: command.abcClass,
+    });
+  }
+
+  /**
+   * Unschedule one ABC class in a warehouse: the policy row is removed, so
+   * the scheduler stops minting that class's tasks (open tasks stay — they
+   * are counted or recounted like any other). Takes the warehouse advisory
+   * lock the upsert and the scheduler take, so a removal lands before or
+   * after a tick, never inside it. An absent class is 404 (nothing stored).
+   * Answers the warehouse's remaining policy set.
+   */
+  async deleteCountPolicy(
+    command: DeleteCountPolicyCommand,
+    idempotencyKey: string,
+  ): Promise<{ snapshot: CountPoliciesSnapshot; replayed: boolean }> {
+    if (!(ABC_CLASSES as readonly string[]).includes(command.abcClass)) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'Unknown ABC class',
+        `abcClass must be one of ${JSON.stringify(ABC_CLASSES)} (got "${command.abcClass}").`,
+      );
+    }
+    const payloadHash = this.deleteCountPolicyFingerprint(command);
+
+    return withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      assertPermission(
+        await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+        'counts.manage',
+      );
+      const replay = async (): Promise<CountPoliciesSnapshot | null> => {
+        const existing = await this.lookupIdempotencyKey(tx, command.tenantId, idempotencyKey);
+        if (existing === undefined) return null;
+        if (existing.payloadHash !== payloadHash) {
+          throw idempotencyKeyReuse();
+        }
+        return existing.responseSnapshot as CountPoliciesSnapshot;
+      };
+      const first = await replay();
+      if (first !== null) {
+        return { snapshot: first, replayed: true };
+      }
+
+      await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
+      await this.inventory.lockWarehouseInTx(tx, command.tenantId, command.warehouseId);
+      // The replay again under the lock (skeleton step 6): a same-key
+      // duplicate parked here wakes to the winner's answer, not a 404.
+      const underLock = await replay();
+      if (underLock !== null) {
+        return { snapshot: underLock, replayed: true };
+      }
+
+      const removed = await tx
+        .delete(countPolicies)
+        .where(
+          and(
+            eq(countPolicies.tenantId, command.tenantId),
+            eq(countPolicies.warehouseId, command.warehouseId),
+            eq(countPolicies.abcClass, command.abcClass),
+          ),
+        )
+        .returning({ id: countPolicies.id });
+      if (removed[0] === undefined) {
+        throw new ProblemException(
+          'not-found',
+          404,
+          'No policy for this class',
+          `This warehouse has no count policy for class "${command.abcClass}" — nothing to remove.`,
+        );
+      }
+
+      const policies = await this.countPoliciesInTx(tx, command.tenantId, command.warehouseId);
+      await this.outbox.append(tx, {
+        messageId: uuidv7(),
+        tenantId: command.tenantId,
+        type: 'count.policy_updated',
+        occurredAt: nowIso(),
+        payload: {
+          warehouseId: command.warehouseId,
+          policyCount: policies.length,
+          removedAbcClass: command.abcClass,
+        },
+      });
+      const snapshot: CountPoliciesSnapshot = { policies };
+
+      await tx.insert(auditEvents).values({
+        id: uuidv7(),
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        action: 'count_policy.removed',
+        targetType: 'warehouse',
+        targetId: command.warehouseId,
+        reference: idempotencyKey,
+        occurredAt: nowIso(),
+      });
+
+      try {
+        await tx.insert(idempotencyKeys).values({
+          id: uuidv7(),
+          tenantId: command.tenantId,
+          key: idempotencyKey,
+          payloadHash,
+          responseSnapshot: snapshot,
+        });
+      } catch (err) {
+        if (isUniqueViolationOn(err, IDEMPOTENCY_TENANT_KEY)) {
+          throw new ProblemException(
+            'conflict',
+            409,
+            'Concurrent idempotent request',
+            'The same Idempotency-Key is being processed concurrently; retry to read the settled result.',
+          );
+        }
+        throw err;
+      }
+      return { snapshot, replayed: false };
+    });
+  }
+
+  /** A warehouse's policy rows, sorted by class (the upsert's answer shape). */
+  async countPoliciesInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<{ abcClass: string; intervalDays: number }[]> {
+    const rows = await tx
+      .select({ abcClass: countPolicies.abcClass, intervalDays: countPolicies.intervalDays })
+      .from(countPolicies)
+      .where(and(eq(countPolicies.tenantId, tenantId), eq(countPolicies.warehouseId, warehouseId)))
+      .orderBy(asc(countPolicies.abcClass));
+    return rows.map((row) => ({ abcClass: row.abcClass, intervalDays: row.intervalDays }));
+  }
+
   // ── scheduled generation (the CountSchedulerWorker's entry) ─────────────
 
   /**
@@ -1974,6 +2638,7 @@ export class CountService {
     tenantId: string,
     completedTask: CountTask,
     occurredAt: string,
+    createdAt?: string,
   ): Promise<string> {
     const expected = await this.inventory.onHandInBinInTx(
       tx,
@@ -1999,6 +2664,7 @@ export class CountService {
       origin: 'recount',
       binStateEpoch: epoch,
       createdBy: null,
+      ...(createdAt === undefined ? {} : { createdAt }),
     });
     const lineValues = expected
       .filter((arm) => arm.quantity !== 0)

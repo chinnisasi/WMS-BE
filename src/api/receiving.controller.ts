@@ -221,9 +221,9 @@ export class ReceivingController {
     // shell never nests one facade's transaction inside another's.
     const transferTasks = await this.movements.getTransferTasks(tenantId, query.warehouseId);
     // Story 5-3: the Count inbox arm — STORED pending count tasks for this
-    // warehouse, with the expectations frozen at task start (the first
-    // stored task feed; every other arm derives on read). Same sequential
-    // composition.
+    // warehouse (the first stored task feed; every other arm derives on
+    // read). Story 3-5a — BLIND: each line names its SKU only; the frozen
+    // expectations never reach a device. Same sequential composition.
     const countTasks = await this.movements.getCountTasks(tenantId, query.warehouseId);
     // Story 13-2: the return-receipt arm — the warehouse's open and
     // partially received RMAs. A plain facade call in its own transaction,
@@ -254,7 +254,12 @@ export class ReceivingController {
       packTasks: packWork.packTasks.map((task) => ({ ...task })),
       handlingUnits: packWork.handlingUnits.map((unit) => ({ ...unit })),
       transferTasks: transferTasks.map((task) => ({ ...task, lines: task.lines.map((line) => ({ ...line })) })),
-      countTasks: countTasks.map((task) => ({ ...task, lines: task.lines.map((line) => ({ ...line })) })),
+      // Story 3-5a — the lines rebuilt key by key (an exact allowlist, never
+      // a spread): no expected quantity can ride along.
+      countTasks: countTasks.map((task) => ({
+        ...task,
+        lines: task.lines.map((line) => ({ skuId: line.skuId, skuCode: line.skuCode, skuName: line.skuName })),
+      })),
       openReturns: openReturns.map((rma) => ({
         ...rma,
         lines: rma.lines.map((line) => ({ ...line, batchCodes: [...line.batchCodes], serials: line.serials.map((serial) => ({ ...serial })) })),

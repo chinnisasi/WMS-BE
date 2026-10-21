@@ -418,6 +418,34 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       .send(body);
   }
 
+  /**
+   * Story 3-5a — the submit response is BLIND (`variances: []` always), so
+   * the variances a submit minted are read where the web reads them: the
+   * task detail (web staff session). The shape below is the pre-3-5a submit
+   * variance's, so the arms that pinned it keep pinning the same facts.
+   */
+  async function taskVariances(taskId: string): Promise<
+    { skuId: string; expectedQuantity: number; countedQuantity: number; delta: number; epochConflict: boolean }[]
+  > {
+    const detail = await request(app.getHttpServer())
+      .get(`${API}/${tenantId}/movements/counts/${taskId}`)
+      .set('Authorization', `Bearer ${opsToken}`)
+      .expect(200);
+    return (detail.body.variances as {
+      skuId: string;
+      expectedQuantity: number;
+      countedQuantity: number;
+      delta: number;
+      epochConflict: boolean;
+    }[]).map((v) => ({
+      skuId: v.skuId,
+      expectedQuantity: v.expectedQuantity,
+      countedQuantity: v.countedQuantity,
+      delta: v.delta,
+      epochConflict: v.epochConflict,
+    }));
+  }
+
   /** The device snapshot read (badge-in session required). */
   function snapshot(): SupertestTest {
     return request(app.getHttpServer())
@@ -617,6 +645,7 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       expect(res.body.countTask.status).toBe('completed');
       expect(res.body.countTask.epochConflict).toBe(false);
       expect(res.body.variances).toEqual([]);
+      expect(await taskVariances(binATaskId)).toEqual([]); // story 3-5a: the detail, not the blind response
       expect(res.body.recountTaskId).toBeNull();
       // Counts NEVER write stock or the ledger — the observation is the
       // product (the frozen intent).
@@ -684,14 +713,10 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       }, deviceOperatorToken).expect(200);
       // Two variances: PLAIN drifted (5 → 7) against its FROZEN expectation,
       // and MID is a beyond-task line (binB never held it — expected 0).
-      // BOTH carry the epoch-conflict flag: the whole bin moved.
-      const variances = res.body.variances as {
-        skuId: string;
-        expectedQuantity: number;
-        countedQuantity: number;
-        delta: number;
-        epochConflict: boolean;
-      }[];
+      // BOTH carry the epoch-conflict flag: the whole bin moved. Story 3-5a:
+      // the submit answers blind; the variances are read from the detail.
+      expect(res.body.variances).toEqual([]);
+      const variances = await taskVariances(frozenTaskId);
       const bySku = new Map(variances.map((v) => [v.skuId, v]));
       expect(bySku.get(plainSku()!)).toEqual({
         skuId: plainSku(),
@@ -757,13 +782,9 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
           { skuId: skuIds.get(UNCLASSED), countedQuantity: 2 },
         ],
       }, deviceOperatorToken).expect(200);
-      const variances = res.body.variances as {
-        skuId: string;
-        expectedQuantity: number;
-        countedQuantity: number;
-        delta: number;
-        epochConflict: boolean;
-      }[];
+      // Story 3-5a — blind response; the variance is read from the detail.
+      expect(res.body.variances).toEqual([]);
+      const variances = await taskVariances(taskId);
       expect(variances).toHaveLength(1);
       expect(variances[0]).toEqual({
         skuId: skuIds.get(UNCLASSED),
@@ -784,6 +805,8 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
         ],
       }, deviceOperatorToken).expect(200);
       expect(res2.body.variances).toEqual([]);
+      // Story 3-5a — the response is blind either way; the detail proves no variance.
+      expect(await taskVariances(task2.body.countTask.id as string)).toEqual([]);
       const line = await sql`
         select expected_quantity_milli, counted_quantity_milli from count_task_lines
         where tenant_id = ${tenantId} and task_id = ${task2.body.countTask.id as string}::uuid
@@ -939,8 +962,11 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       }).expect(200);
       expect(res.body.countTask.epochConflict).toBe(true);
       // The moved-in SKU is a beyond-task line (expected 0) — flagged too.
-      expect(res.body.variances).toHaveLength(1);
-      expect(res.body.variances[0]).toMatchObject({
+      // Story 3-5a — blind response; the variance is read from the detail.
+      expect(res.body.variances).toEqual([]);
+      const pristineVariances = await taskVariances(frozenTaskId);
+      expect(pristineVariances).toHaveLength(1);
+      expect(pristineVariances[0]).toMatchObject({
         skuId: skuIds.get(PLAIN),
         expectedQuantity: 0,
         countedQuantity: 3,
@@ -958,7 +984,7 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
   // ── the snapshot's countTasks arm ─────────────────────────────────────────
 
   describe('catalog snapshot arm', () => {
-    it('lists the pending task with its FROZEN expectations to the device', async () => {
+    it('lists the pending task to the device BLIND — its SKUs, never the frozen expectations (story 3-5a)', async () => {
       // binSnap holds UNCLASSED 1 — a task created here stays pending.
       const created = await createCount({ warehouseId, binId: binSnap }, opsToken, ulid()).expect(201);
       const res = await snapshot().expect(200);
@@ -968,7 +994,7 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
         binCode: string;
         origin: string;
         binStateEpoch: number | null;
-        lines: { skuId: string; skuCode: string; expectedQuantity: number }[];
+        lines: Record<string, unknown>[];
       }[];
       const card = cards.find((c) => c.taskId === (created.body.countTask.id as string));
       expect(card).toBeDefined();
@@ -977,7 +1003,9 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       expect(card!.binStateEpoch).toBe(created.body.countTask.binStateEpoch);
       expect(card!.lines).toHaveLength(1);
       expect(card!.lines[0]!.skuCode).toBe(UNCLASSED);
-      expect(card!.lines[0]!.expectedQuantity).toBe(1);
+      // Story 3-5a — the exact key set: no expected quantity reaches a device
+      // (pre-3-5a this line carried `expectedQuantity: 1`).
+      expect(Object.keys(card!.lines[0]!).sort()).toEqual(['skuCode', 'skuId', 'skuName']);
     });
 
     it('caps the card list at MAX_SNAPSHOT_COUNT_TASKS and WARNS about the truncation (computed-then-dropped is surfaced, not silent)', async () => {
@@ -1442,7 +1470,9 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
       const res = await submitCount(taskId, {
         lines: [{ skuId: skuIds.get(PLAIN), countedQuantity: 13 }],
       }, deviceOperatorToken).expect(200);
-      expect(res.body.variances).toHaveLength(1);
+      // Story 3-5a — blind response; the variance is read from the detail.
+      expect(res.body.variances).toEqual([]);
+      expect(await taskVariances(taskId)).toHaveLength(1);
       const varianceId = await varianceIdOf(taskId, skuIds.get(PLAIN)!);
       v1 = varianceId;
       const row = await varianceRow(varianceId);
@@ -1936,7 +1966,9 @@ describe('Cycle Counts: stored tasks, frozen epochs, variances without stock wri
           { skuId: skuIds.get(MID), countedQuantity: 3 },
         ],
       }, deviceOperatorToken).expect(200);
-      expect(res.body.variances).toHaveLength(1);
+      // Story 3-5a — blind response; the variance is read from the detail.
+      expect(res.body.variances).toEqual([]);
+      expect(await taskVariances(task.body.countTask.id as string)).toHaveLength(1);
       const varianceId = await varianceIdOf(task.body.countTask.id as string, skuIds.get(MID)!);
       expect((await varianceRow(varianceId)).threshold_quantity_milli).toBeNull();
       const forVariance = (await outboxPayloads('count.variance.threshold_exceeded')).filter(
