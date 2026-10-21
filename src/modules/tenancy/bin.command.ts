@@ -540,7 +540,7 @@ export class BinCommand {
         if (command.dedicatedClientId !== undefined && command.dedicatedClientId !== null) {
           await assertClientTakesWorkInTx(tx, command.tenantId, command.dedicatedClientId);
         }
-        // Story 13-2: a generated code may not take the system returns bin's.
+        // Story 13-2 / 2-4a: a generated code may not take the system RETURNS or DAMAGED bin's.
         for (const code of codes) assertNotReservedLocationCode(code, 'bin');
 
         // Collision pre-check in the same transaction: any generated code that
@@ -745,12 +745,12 @@ export class BinCommand {
         }
         if (source.systemOwned) {
           throw mergeValidation(
-            `Bin "${source.code}" is a system bin (Receiving/QC-hold) — system bins never merge.`,
+            `Bin "${source.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns/Damaged) — system bins never merge.`,
           );
         }
         if (target.systemOwned) {
           throw mergeValidation(
-            `Bin "${target.code}" is a system bin (Receiving/QC-hold) — system bins never merge.`,
+            `Bin "${target.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns/Damaged) — system bins never merge.`,
           );
         }
         if (source.retiredAt !== null) {
@@ -1268,7 +1268,7 @@ export class BinCommand {
         }
         if (row.systemOwned) {
           throw mergeValidation(
-            `Bin "${row.code}" is a system bin (Receiving/QC-hold) — system bins never retire.`,
+            `Bin "${row.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns/Damaged) — system bins never retire.`,
           );
         }
         if (row.retiredAt !== null) {
@@ -1497,7 +1497,7 @@ export class BinCommand {
             'validation-failed',
             400,
             'A system bin cannot be dedicated',
-            `Bin "${row.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns) — it can never be dedicated to a client.`,
+            `Bin "${row.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns/Damaged) — it can never be dedicated to a client.`,
           );
         }
         if (newDedicatedClientId !== null) {
@@ -1950,7 +1950,7 @@ async function insertBin(
 ): Promise<BinSnapshot['bin']> {
   // Zone must exist and belong to the warehouse before any bin write.
   await assertZoneInWarehouse(tx, command.zoneId, command.warehouseId);
-  // Story 13-2: `RETURNS` is the system returns bin's code.
+  // Story 13-2: `RETURNS` is the system returns bin's code; story 2-4a: `DAMAGED` the damaged bin's.
   assertNotReservedLocationCode(command.code, 'bin');
   try {
     const rows = await tx

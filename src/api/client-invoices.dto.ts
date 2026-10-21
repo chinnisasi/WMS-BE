@@ -263,6 +263,7 @@ export class ReceiptLineRecordDto {
   @ApiProperty() skuName!: string;
   @ApiProperty({ example: '12.5', description: 'Received, base units — a decimal string' }) qty!: string;
   @ApiProperty({ description: 'Applied at once (the rest pended as an over-receipt), base units — a decimal string' }) appliedQty!: string;
+  @ApiProperty({ required: false, description: 'Story 2-4a — the units that arrived damaged on this line (booked into the system DAMAGED bin), base units — a decimal string; present only when > 0 (an all-damaged line is still a receipt line)' }) damagedQty?: string;
   @ApiProperty({ format: 'uuid' }) actorId!: string;
   @ApiProperty({ type: String, nullable: true, description: "The actor's email; null when the user is unknown" }) actorEmail!: string | null;
 }

@@ -103,7 +103,7 @@ export class InventoryController {
     type: StockAdjustmentPendingResponse,
     description: 'Story 5-2: |quantityDelta| exceeds the tenant\'s policy threshold — the adjustment PENDS (no ledger event, no on-hand change) until an Owner approves or rejects; the body is the pend snapshot with its threshold context',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, a quantityDelta that does not equal the serial count, or a reasonCode outside the closed adjustment vocabulary') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, a quantityDelta that does not equal the serial count, or a reasonCode outside the closed adjustment vocabulary; a retired bin (bin-retired), the system QC-hold or IN-TRANSIT bin (qc-bin-not-adjustable), the system RETURNS bin (returns-bin-not-adjustable), or — story 2-4a — anything but a negative write-off on the system DAMAGED bin (damaged-bin-write-off-only, also at a pend\'s approval)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks stock.adjust (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, bin, or SKU does not exist in this tenant (not-found), or an explicit batch code does not exist for the SKU (not-found)') })
@@ -313,7 +313,7 @@ export class InventoryController {
   })
   @ApiHeaders(IDEMPOTENCY_HEADER)
   @ApiResponse({ status: HttpStatus.OK, type: AdjustmentDecisionResponse })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed pendingId (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or a malformed pendingId (validation-failed); the stored adjustment fails a guard re-run at approval — e.g. (story 2-4a) anything but a negative write-off on the system DAMAGED bin (damaged-bin-write-off-only)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks adjustments.approve (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('No pending adjustment with this id exists in this tenant (not-found)') })

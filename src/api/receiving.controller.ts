@@ -20,6 +20,7 @@ import { ReturnsFacade } from '../modules/returns/returns.facade';
 import {
   CatalogSnapshotQuery,
   CatalogSnapshotResponse,
+  GoodsReceiptLinesResponse,
   GoodsReceiptListQuery,
   GoodsReceiptListResponse,
   GoodsReceiptResponse,
@@ -94,11 +95,11 @@ export class ReceivingController {
     description:
       'GRN recorded: server-assigned code, per-line physical/applied/excess quantities, ledger events for the applied portion (the idempotency snapshot). Story 21-9: a receipt against a closed PO or a cancelled/closed ASN is no longer refused — every line pends as an over-receipt against that document (applied 0); a closed PO with an open carried successor is booked against the successor instead (poId/poCode name it)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body (validation-failed) — story 1-1: a clientId beside a poId or an asnId') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body (validation-failed) — story 1-1: a clientId beside a poId or an asnId; story 2-4a: a damaged or short quantity without its reason, a reason with 0 or outside its vocabulary, a negative or over-maximum quantity, a line with qty + damagedQty = 0, or damage on a serial-tracked or catch-weight SKU') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Unknown or revoked device (device-revoked), or the operator was demoted to accountant (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse, purchase order, advance shipment notice, a blind receipt\'s client (story 1-1), or a line\'s SKU does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('The document belongs to another warehouse (document-warehouse-mismatch — checked before the document\'s status, so a closed or cancelled document of another warehouse answers this too), the document has a status receiving does not know (po-not-open / asn-not-open — DEFENSIVE since story 21-9: a closed PO or a cancelled/closed ASN no longer refuses, the receipt pends for approval), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('The document belongs to another warehouse (document-warehouse-mismatch — checked before the document\'s status, so a closed or cancelled document of another warehouse answers this too), the document has a status receiving does not know (po-not-open / asn-not-open — DEFENSIVE since story 21-9: a closed PO or a cancelled/closed ASN no longer refuses, the receipt pends for approval), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), a line carries damaged units and a user zone or bin coded DAMAGED blocks the system damaged bin (damaged-bin-conflict, story 2-4a), or a concurrent idempotent request (conflict)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the device token)' })
   async submitGoodsReceipt(
@@ -158,6 +159,13 @@ export class ReceivingController {
             line.weightsGrams.length > 0
               ? line.weightsGrams
               : null,
+          // Story 2-4a: the condition fields, base units — absent stays
+          // absent (the command normalises `?? 0` / `?? null` and hashes each
+          // only when its quantity is > 0, so absent, null and 0 hash alike).
+          ...(line.damagedQty === undefined || line.damagedQty === null ? {} : { damagedQty: line.damagedQty }),
+          ...(line.damageReasonCode === undefined || line.damageReasonCode === null ? {} : { damageReasonCode: line.damageReasonCode }),
+          ...(line.shortQty === undefined || line.shortQty === null ? {} : { shortQty: line.shortQty }),
+          ...(line.shortReasonCode === undefined || line.shortReasonCode === null ? {} : { shortReasonCode: line.shortReasonCode }),
         })),
       },
       key,
@@ -302,6 +310,31 @@ export class ReceivingController {
       limit: query.limit,
     });
     return { items: page.items, nextCursor: page.nextCursor };
+  }
+
+  @Get(':tenantId/receiving/goods-receipts/:grnId/lines')
+  @UseGuards(TenantSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Story 2-4a — one goods receipt's lines (the web's expandable GRN row): SKU, batch, good and applied units, and the damaged and short quantities with their reasons — open to any member",
+  })
+  @ApiOkResponse({ type: GoodsReceiptLinesResponse, description: "The GRN's lines in receipt order" })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed grnId (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('No such goods receipt in this tenant (not-found)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'grnId', format: 'uuid', description: 'The goods receipt' })
+  async listGoodsReceiptLines(
+    @Param('tenantId') tenantId: string,
+    @Param('grnId') grnId: string,
+    @CurrentSession() session: TenantSession,
+  ): Promise<GoodsReceiptLinesResponse> {
+    assertOwnTenantToken(session.tenantId, tenantId);
+    assertUuidParam(grnId, 'grnId');
+    const items = await this.receiving.listGoodsReceiptLines(tenantId, grnId);
+    return { items: items.map((item) => ({ ...item })) };
   }
 
   @Get(':tenantId/receiving/over-receipts')
@@ -555,7 +588,7 @@ export class ReceivingController {
 }
 
 /** Receiving uuid path/query params fail 400 (not a 500 from the `::uuid` cast). */
-function assertUuidParam(value: string, name: 'overReceiptId' | 'holdId' | 'warehouseId'): void {
+function assertUuidParam(value: string, name: 'overReceiptId' | 'holdId' | 'warehouseId' | 'grnId'): void {
   if (!UUID_RE.test(value)) {
     throw new ProblemException(
       'validation-failed',

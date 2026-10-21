@@ -1404,10 +1404,16 @@ describe('receiving: scan-based GRN + over-receipt decisions (e2e, story 3.3)', 
         update goods_receipt_notes set status = 'posted' where id = ${grnId}
       `).rejects.toThrow(/goods_receipt_notes_status_check/);
 
+      // Story 2-4a replaced `goods_receipt_lines_qty_positive` (qty > 0): `qty`
+      // is now the GOOD units and may be 0 beside damaged units, so a line
+      // with NOTHING received (qty 0, damaged 0) is refused by the new
+      // `goods_receipt_lines_received_positive` (qty + damaged_qty > 0). The
+      // behaviour this pinned — a line that received nothing never stores —
+      // is unchanged; only the constraint's name moved.
       await expect(sql`
         insert into goods_receipt_lines (id, tenant_id, grn_id, po_line_id, sku_id, qty, applied_qty)
         values (${uuidv7()}, ${tenantId}, ${grnId}, null, ${batchSkuId}, 0, 0)
-      `).rejects.toThrow(/goods_receipt_lines_qty_positive/);
+      `).rejects.toThrow(/goods_receipt_lines_received_positive/);
 
       await expect(sql`
         insert into goods_receipt_lines (id, tenant_id, grn_id, po_line_id, sku_id, qty, applied_qty)

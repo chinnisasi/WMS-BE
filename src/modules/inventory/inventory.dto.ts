@@ -474,7 +474,7 @@ export class LedgerReferenceDocDto {
   @ApiProperty({
     required: false,
     format: 'uuid',
-    description: 'The GRN the movement landed under (grn-receipt arm only)',
+    description: 'The GRN the movement landed under (grn-receipt arm only — a `grn.received` into Receiving, or (story 2-4a) a `grn.damaged` into the system DAMAGED bin)',
   })
   grnId?: string;
 
@@ -488,7 +488,7 @@ export class LedgerReferenceDocDto {
   @ApiProperty({
     required: false,
     format: 'uuid',
-    description: 'The exact PO line (grn-receipt arm only — absent on the blind arm and on an unmatched line)',
+    description: 'The exact PO line (grn-receipt arm only — absent on the blind arm, on an unmatched line and on every `grn.damaged` event: damaged units credit no document line)',
   })
   poLineId?: string;
 
@@ -505,6 +505,14 @@ export class LedgerReferenceDocDto {
     description: 'Story 21-6 — the exact ASN line credited (grn-receipt arm only)',
   })
   asnLineId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      'The GRN line the movement belongs to: on a `putaway.placed` event the line whose received stock moved; (story 2-4a) on a `grn.damaged` event the line whose damaged units were booked into DAMAGED. Absent on every `grn.received` event',
+  })
+  grnLineId?: string;
 
   // ── Story 9-3a (additive, omitted when absent) ────────────────────────────
 
@@ -691,7 +699,7 @@ export class StockEntryDto {
 
   @ApiProperty({
     required: false,
-    description: 'Whether the bin is a system bin (RECEIVING, QC-HOLD, RETURNS, IN-TRANSIT) — present only under `order=location`',
+    description: 'Whether the bin is a system bin (RECEIVING, QC-HOLD, RETURNS, IN-TRANSIT, DAMAGED) — present only under `order=location`',
   })
   binSystemOwned?: boolean;
 }

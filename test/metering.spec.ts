@@ -642,6 +642,9 @@ describe('story 21-4: metering and storage snapshots', () => {
         'transfer.inbound': ['both', 'from', 'to'],
         // Story 13-2 — a returned unit's intake into the RETURNS bin.
         'return.received': ['to'],
+        // Story 2-4a — a damaged receipt intake into the DAMAGED bin: it is
+        // on-hand, so it bills storage like any other (decision 8).
+        'grn.damaged': ['to'],
       };
 
       it('every registered type is classified, and each arm folds as the replay rule says', async () => {

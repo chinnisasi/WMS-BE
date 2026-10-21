@@ -8,7 +8,7 @@ import { bins, inventoryQuarantines, reservations, stockOnHand } from '../../sha
 import type { Reservation } from '../../shared/db/schema';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
-import { IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
+import { DAMAGED_BIN_CODE, IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
 import { nowIso } from '../../shared/primitives/time';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
 import { isUniqueViolationOn, ProblemException } from '../../shared/problem-details/problem.exception';
@@ -180,6 +180,47 @@ export async function returnsAwaitingUnits(
 }
 
 /**
+ * The damaged hook (story 2-4a): the quantity sitting in the warehouse's
+ * system DAMAGED bin — units that arrived damaged on a receipt
+ * (`grn.damaged`), on-hand but NOT SELLABLE. The `returnsAwaitingUnits`
+ * shape verbatim: `stock_on_hand` joined to the system `DAMAGED` bin (code +
+ * system-owned identity, no receipt-table read), so the exclusion is
+ * structural over the ledger's own projection and replay-reconciliation
+ * reproduces it for free. Subtracted wherever `returnsAwaitingUnits` is — in
+ * `atp` and `committedCeiling` (and so reservations, channel publish and
+ * replenishment, which read them) — so a damaged intake raises on-hand and
+ * this term by the same quantity and ATP is unchanged; a write-off (a
+ * negative adjustment out of DAMAGED) lowers both by the same quantity and
+ * ATP is unchanged again. `::bigint` never `::int`, `Number(...)` at the
+ * boundary.
+ */
+export async function damagedUnits(
+  tx: TenantTx,
+  tenantId: string,
+  warehouseId: string,
+  skuId: string,
+): Promise<number> {
+  const rows = await tx
+    .select({ damaged: sql<string>`coalesce(sum(${stockOnHand.quantity}), 0)::bigint` })
+    .from(stockOnHand)
+    .innerJoin(bins, eq(bins.id, stockOnHand.binId))
+    .where(
+      and(
+        eq(stockOnHand.tenantId, tenantId),
+        eq(stockOnHand.warehouseId, warehouseId),
+        eq(stockOnHand.skuId, skuId),
+        // The damaged bin is system master data (tenancy-owned) read here
+        // only to locate the stock scope — no write, ever.
+        eq(bins.tenantId, tenantId),
+        eq(bins.warehouseId, warehouseId),
+        eq(bins.code, DAMAGED_BIN_CODE),
+        eq(bins.systemOwned, true),
+      ),
+    );
+  return Number(rows[0]?.damaged ?? 0);
+}
+
+/**
  * The standing-buffer owner type (story 7.1, AD-13): the ONE owner family
  * whose holds are standing (no TTL, `expires_at` null — the 0050 CHECK
  * admits NULL expiry for `buffer` rows only; the reaper's
@@ -272,6 +313,11 @@ export interface AtpSnapshot {
    */
   readonly returnsAwaiting: number;
   /**
+   * Story 2-4a: the units in the warehouse's system DAMAGED bin — received
+   * damaged, not sellable (the returns figure's mirror).
+   */
+  readonly damaged: number;
+  /**
    * Story 7.1 (AD-13): the scope's standing channel-buffer total (the journal
    * sum over `held` `owner_type: 'buffer'` rows) — transparency only. The
    * subtraction itself lives ONCE, in `reserved` (the mirror; RN-1): a
@@ -279,7 +325,7 @@ export interface AtpSnapshot {
    * separate term in the `atp` arithmetic would subtract it twice.
    */
   readonly buffer: number;
-  /** `max(0, onHand − reserved − qcHeld − inTransit − returnsAwaiting)` — never oversells (the buffer IS part of `reserved`). */
+  /** `max(0, onHand − reserved − qcHeld − inTransit − returnsAwaiting − damaged)` — never oversells (the buffer IS part of `reserved`). */
   readonly atp: number;
 }
 
@@ -345,6 +391,7 @@ function bufferOverCeiling(
       (probe.qcHeld > 0 ? ` (of which ${fromMilli(probe.qcHeld)} are QC-held)` : '') +
       (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
       (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
+      (probe.damaged > 0 ? ` (of which ${fromMilli(probe.damaged)} are damaged)` : '') +
       `, holding ${fromMilli(probe.reserved)} already — the buffer of ${fromMilli(command.targetMilli)} ` +
       `cannot be reserved.`,
   );
@@ -358,6 +405,8 @@ interface StandingBufferProbe {
   readonly qcHeld: number;
   readonly inTransit: number;
   readonly returnsAwaiting: number;
+  /** Story 2-4a: the DAMAGED bin's units — named in the refusal. */
+  readonly damaged: number;
 }
 
 /** A standing buffer command — one integer target per (integration, warehouse, sku). */
@@ -389,6 +438,8 @@ export interface ChannelVisibleSnapshot {
   readonly inTransit: number;
   /** Story 13-2: returns awaiting disposition (the RETURNS bin) — outside the pool. */
   readonly returnsAwaiting: number;
+  /** Story 2-4a: units received damaged (the DAMAGED bin) — outside the pool. */
+  readonly damaged: number;
   /** The pool ATP (every holder included). */
   readonly poolAtp: number;
   /** THIS channel's own standing buffer (milli-units). */
@@ -588,6 +639,8 @@ export class ReservationService implements OnModuleInit {
       inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
       // Story 13-2: so do returns awaiting disposition.
       returnsAwaiting: await returnsAwaitingUnits(tx, tenantId, warehouseId, skuId),
+      // Story 2-4a: and units received damaged.
+      damaged: await damagedUnits(tx, tenantId, warehouseId, skuId),
     }));
     if (probe.existing !== undefined) {
       return this.idempotentHit(probe.existing, command);
@@ -609,6 +662,7 @@ export class ReservationService implements OnModuleInit {
           (probe.qcHeld > 0 ? ` (of which ${fromMilli(probe.qcHeld)} are QC-held)` : '') +
           (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
           (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
+      (probe.damaged > 0 ? ` (of which ${fromMilli(probe.damaged)} are damaged)` : '') +
           ` — the request for ${fromMilli(command.quantity)} cannot be reserved.`,
       );
     }
@@ -871,11 +925,15 @@ export class ReservationService implements OnModuleInit {
         // received into the warehouse's system RETURNS bin, awaiting
         // disposition (same committed-read tx).
         returnsAwaiting: await returnsAwaitingUnits(tx, tenantId, warehouseId, skuId),
+        // Story 2-4a: the damaged hook reads its real source — the stock
+        // received damaged into the warehouse's system DAMAGED bin (same
+        // committed-read tx).
+        damaged: await damagedUnits(tx, tenantId, warehouseId, skuId),
         // Story 7.1: the standing-buffer figure is a journal read (AD-13) —
         // transparency only, ALREADY inside `reserved` (see the formula note).
         buffer: await bufferUnits(tx, tenantId, warehouseId, skuId),
       }));
-    let { onHand, qcHeld, inTransit, returnsAwaiting, buffer } = await readInputs();
+    let { onHand, qcHeld, inTransit, returnsAwaiting, damaged, buffer } = await readInputs();
     const counterKey = reservationCounterKey(tenantId, warehouseId, skuId);
     const readyKey = reservationReadyKey(tenantId, warehouseId);
 
@@ -902,7 +960,7 @@ export class ReservationService implements OnModuleInit {
       // Re-read the Postgres inputs AFTER the repair, so on-hand and the
       // counter come from the same side of the rebuild (never pre-rebuild
       // on-hand against a post-rebuild reserved figure).
-      ({ onHand, qcHeld, inTransit, returnsAwaiting, buffer } = await readInputs());
+      ({ onHand, qcHeld, inTransit, returnsAwaiting, damaged, buffer } = await readInputs());
     }
     let reserved: number;
     try {
@@ -935,11 +993,14 @@ export class ReservationService implements OnModuleInit {
       // Story 13-2 — returns awaiting disposition, beside the in-transit
       // figure (the subtraction is what keeps ATP unchanged by a receipt).
       returnsAwaiting,
+      // Story 2-4a — units received damaged, beside the returns figure (the
+      // subtraction keeps ATP unchanged by a damaged intake and a write-off).
+      damaged,
       // Story 7.1 — the standing-buffer total, transparency only: a buffer IS
       // a held reservation and is already inside `reserved`. Subtracting it
       // again here would double-carve it (RN-1).
       buffer,
-      atp: Math.max(0, onHand - reserved - qcHeld - inTransit - returnsAwaiting),
+      atp: Math.max(0, onHand - reserved - qcHeld - inTransit - returnsAwaiting - damaged),
     };
   }
 
@@ -1441,13 +1502,17 @@ export class ReservationService implements OnModuleInit {
     // awaiting disposition in the RETURNS bin is on-hand but never
     // promiseable until 13-3 restocks it (moves it out of RETURNS).
     const returnsAwaiting = await returnsAwaitingUnits(tx, tenantId, warehouseId, skuId);
+    // Story 2-4a: the damaged hook is a ceiling term too — units received
+    // damaged into the DAMAGED bin are on-hand but never promiseable; they
+    // leave only by a write-off.
+    const damaged = await damagedUnits(tx, tenantId, warehouseId, skuId);
     // Story 7.1 (RN-1): NO standalone buffer term. A channel's Safety Buffer
     // is a `held` reservations row since 0050 — it reaches every ceiling and
     // ATP read inside `reserved` through the counter mirror (the journalling
     // grant paths subtract Postgres-side, the script arbitrates counter-
     // side); a second subtraction here would carve every buffer off the
     // pool twice.
-    return Math.max(0, onHand - qcHeld - inTransit - returnsAwaiting);
+    return Math.max(0, onHand - qcHeld - inTransit - returnsAwaiting - damaged);
   }
 
   /** Committed on-hand, excluding every open-quarantined (sku, bin) scope. */
@@ -1619,6 +1684,9 @@ export class ReservationService implements OnModuleInit {
     // not the RETURNS row existed (or was locked) at this read. Only 13-3's
     // disposition moves stock OUT of RETURNS, and that move updates these
     // same scope rows (the ledger's own fold), so it serializes here.
+    // Story 2-4a's damaged hook is the same: a `grn.damaged` intake raises
+    // the DAMAGED bin's on-hand and `damagedUnits` together, and a write-off
+    // lowers both together — ceiling-neutral either way.
 
     await tx
       .select({ binId: stockOnHand.binId })
@@ -2029,6 +2097,7 @@ export class ReservationService implements OnModuleInit {
       qcHeld: await qcHeldUnits(tx, tenantId, warehouseId, skuId),
       inTransit: await inTransitUnits(tx, tenantId, warehouseId, skuId),
       returnsAwaiting: await returnsAwaitingUnits(tx, tenantId, warehouseId, skuId),
+      damaged: await damagedUnits(tx, tenantId, warehouseId, skuId),
     }));
     const previousMilli = probe.existing?.quantity ?? 0;
 
@@ -2093,6 +2162,7 @@ export class ReservationService implements OnModuleInit {
               (probe.qcHeld > 0 ? ` (of which ${fromMilli(probe.qcHeld)} are QC-held)` : '') +
               (probe.inTransit > 0 ? ` (of which ${fromMilli(probe.inTransit)} are in transit)` : '') +
               (probe.returnsAwaiting > 0 ? ` (of which ${fromMilli(probe.returnsAwaiting)} are returns awaiting disposition)` : '') +
+      (probe.damaged > 0 ? ` (of which ${fromMilli(probe.damaged)} are damaged)` : '') +
               `, holding ${fromMilli(lockedReserved)} already — the buffer of ${fromMilli(targetMilli)} ` +
               `cannot be reserved.`,
           );
@@ -2286,7 +2356,7 @@ export class ReservationService implements OnModuleInit {
    * The sync's per-channel visible quantity (story 7-1, RN-6): the POOL's
    * ATP read (fail-closed — a store-down ATP throws the 503 the sync
    * branches on) MINUS the channel's OWN standing buffer, clamped at zero —
-   * `V(c) = max(0, onHand − qcHeld − inTransit − returnsAwaiting − Σheld − buffer(c))` = the
+   * `V(c) = max(0, onHand − qcHeld − inTransit − returnsAwaiting − damaged − Σheld − buffer(c))` = the
    * channel's share of the shared pool minus its own staleness margin. The
    * pool's `atp` already includes `buffer(c)` inside `reserved` (RN-1's
    * single-subtraction layout), so the margin is subtracted once more for
@@ -2321,6 +2391,7 @@ export class ReservationService implements OnModuleInit {
       qcHeld: pool.qcHeld,
       inTransit: pool.inTransit,
       returnsAwaiting: pool.returnsAwaiting,
+      damaged: pool.damaged,
       poolAtp: pool.atp,
       buffer: own,
       visibleMilli: Math.max(0, pool.atp - own),

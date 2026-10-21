@@ -96,6 +96,8 @@ export interface ReceiptLineRecordView {
   /** Base units, a decimal string. */
   readonly qty: string;
   readonly appliedQty: string;
+  /** Story 2-4a — the line's damaged units (base units, a decimal string); present only when > 0. */
+  readonly damagedQty?: string;
   readonly actorId: string;
   readonly actorEmail: string | null;
 }
@@ -356,6 +358,8 @@ export class InvoiceRecordsService {
             skuName: row.skuName,
             qty: milliToDecimal(BigInt(row.qtyMilli)),
             appliedQty: milliToDecimal(BigInt(row.appliedQtyMilli)),
+            // Story 2-4a — present only when the line carried damaged units.
+            ...(BigInt(row.damagedQtyMilli) > 0n ? { damagedQty: milliToDecimal(BigInt(row.damagedQtyMilli)) } : {}),
             actorId: row.actorId,
             actorEmail: emails.get(row.actorId) ?? null,
           }));

@@ -502,7 +502,8 @@ export class InboundFacade {
       select grl.id as "id", grn.recorded_at::text as "recordedAt", grn.code as "grnCode", po.code as "poCode",
         asn.asn_code as "asnCode", (grn.blind_reason_code is not null) as "blind",
         grn.warehouse_id as "warehouseId", grl.sku_id as "skuId", s.code as "skuCode", s.name as "skuName",
-        grl.qty::text as "qtyMilli", grl.applied_qty::text as "appliedQtyMilli", grn.recorded_by as "actorId"
+        grl.qty::text as "qtyMilli", grl.applied_qty::text as "appliedQtyMilli",
+        grl.damaged_qty::text as "damagedQtyMilli", grn.recorded_by as "actorId"
       from goods_receipt_lines grl
       join goods_receipt_notes grn on grn.tenant_id = grl.tenant_id and grn.id = grl.grn_id
       join skus s on s.tenant_id = grl.tenant_id and s.id = grl.sku_id
@@ -542,6 +543,13 @@ export interface ReceiptLineRecordRow {
   readonly skuName: string;
   readonly qtyMilli: string;
   readonly appliedQtyMilli: string;
+  /**
+   * Story 2-4a — the line's damaged units (milli-units as text, '0' when
+   * none): an all-damaged line is still a billed receipt line (the 21-9
+   * precedent), so the drill shows its damaged quantity for the charge to
+   * read true.
+   */
+  readonly damagedQtyMilli: string;
   readonly actorId: string;
 }
 

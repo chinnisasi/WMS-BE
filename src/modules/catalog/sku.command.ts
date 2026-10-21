@@ -1952,7 +1952,7 @@ async function storeKey(
 /**
  * Story 1-4 (decision 7) — what makes a SKU "have stock" for the tracking
  * flags: on-hand ≠ 0 in ANY bin (the system bins — Receiving, QC-HOLD,
- * IN-TRANSIT — included), a pending over-receipt, a pending positive stock
+ * IN-TRANSIT, RETURNS, DAMAGED — included), a pending over-receipt, a pending positive stock
  * adjustment. Each becomes stock later without re-reading the flags. Empty
  * when the SKU holds none of them; otherwise one phrase per kind.
  */

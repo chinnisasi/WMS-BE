@@ -82,6 +82,13 @@ export type LedgerReferenceDoc =
        */
       readonly asnId?: string;
       readonly asnLineId?: string;
+      /**
+       * Story 2-4a — the GRN line a `grn.damaged` intake came from (the
+       * vendor claim and 2.8's return-to-vendor need it). ADDITIVE optional
+       * key, written ONLY on `grn.damaged` and omitted everywhere else, so
+       * every `grn.received` event's canonical bytes are unchanged.
+       */
+      readonly grnLineId?: string;
     }
   // Story 3.4 — the QC-hold arm: every `qc.held` / `qc.released` movement
   // names the hold that produced it. `fromBinId` rides the `qc.held` events
@@ -561,6 +568,32 @@ registerLedgerEventType({
   referenceKinds: ['return-receipt'],
   allowsBatchArm: true,
   allowsSerialArm: true,
+});
+
+/**
+ * Grammar v1, Story 2-4a — the damaged receipt intake: one POSITIVE INTAKE per
+ * GRN line that arrived with damaged units, landing them in the warehouse's
+ * system DAMAGED bin from no bin (`fromBinId` null, `toBinId` = DAMAGED) — the
+ * `return.received` intake precedent, never a `grn.received` into another
+ * bin: `grn.received` means "a credited receipt into Receiving", and putaway,
+ * the billing notes and over-receipt approval all reason about it, so a
+ * distinct type leaves each of them unchanged. The units are on-hand but
+ * excluded from ATP by `damagedUnits`; they leave only by a write-off (a
+ * negative `stock.adjusted` out of DAMAGED). The reference is the receipt arm
+ * (`grn-receipt`): the GRN, the header's PO or ASN (never a line — damaged
+ * units credit no document line) and the `grnLineId`. The batch arm is OPEN
+ * (a batch-tracked line's damaged units keep their batch); the serial arm is
+ * CLOSED — damage on a serial-tracked line is refused at receipt (decision 9).
+ * Reconcile and metering fold it by its bin arms unchanged (it bills storage
+ * like any on-hand — decision 8). Registers sinceVersion 1 — no new grammar
+ * version; the reference arm gains one optional key only.
+ */
+registerLedgerEventType({
+  type: 'grn.damaged',
+  sinceVersion: 1,
+  referenceKinds: ['grn-receipt'],
+  allowsBatchArm: true,
+  allowsSerialArm: false,
 });
 
 /** The registered definition — `undefined` for an unregistered type. */

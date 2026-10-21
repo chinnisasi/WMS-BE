@@ -638,7 +638,7 @@
             }
           },
           "409": {
-            "description": "Zone code already exists in this warehouse (duplicate-zone-code names the code), or the code is RETURNS — reserved for the system returns zone (reserved-location-code, story 13-2)",
+            "description": "Zone code already exists in this warehouse (duplicate-zone-code names the code), or the code is RETURNS or DAMAGED — reserved for the system returns and damaged zones (reserved-location-code, stories 13-2 and 2-4a)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -881,7 +881,7 @@
             }
           },
           "409": {
-            "description": "Bin code already exists in this warehouse (duplicate-bin-code names the code), the code is RETURNS — reserved for the system returns bin (reserved-location-code, story 13-2), or the dedicated client has departed (client-departed, story 1-5b)",
+            "description": "Bin code already exists in this warehouse (duplicate-bin-code names the code), the code is RETURNS or DAMAGED — reserved for the system returns and damaged bins (reserved-location-code, stories 13-2 and 2-4a), or the dedicated client has departed (client-departed, story 1-5b)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1133,7 +1133,7 @@
             }
           },
           "409": {
-            "description": "A generated code collides (duplicate-bin-code names the first conflicting code; nothing committed), a generated code is RETURNS (reserved-location-code, story 13-2), or the dedicated client has departed (client-departed, story 1-5b)",
+            "description": "A generated code collides (duplicate-bin-code names the first conflicting code; nothing committed), a generated code is RETURNS or DAMAGED (reserved-location-code, stories 13-2 and 2-4a), or the dedicated client has departed (client-departed, story 1-5b)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6258,7 +6258,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, a quantityDelta that does not equal the serial count, or a reasonCode outside the closed adjustment vocabulary",
+            "description": "Missing or malformed Idempotency-Key, invalid body, or a Story 2.4 batch/serial arm violation (validation-failed): batch/serials on an untracked SKU, a tracked movement missing its arm, malformed batch dates (or expiry preceding mfg), overrideReason on an intake or missing on an override draw, duplicate serials, a quantityDelta that does not equal the serial count, or a reasonCode outside the closed adjustment vocabulary; a retired bin (bin-retired), the system QC-hold or IN-TRANSIT bin (qc-bin-not-adjustable), the system RETURNS bin (returns-bin-not-adjustable), or — story 2-4a — anything but a negative write-off on the system DAMAGED bin (damaged-bin-write-off-only, also at a pend's approval)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6660,7 +6660,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or a malformed pendingId (validation-failed)",
+            "description": "Missing or malformed Idempotency-Key, or a malformed pendingId (validation-failed); the stored adjustment fails a guard re-run at approval — e.g. (story 2-4a) anything but a negative write-off on the system DAMAGED bin (damaged-bin-write-off-only)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -6926,7 +6926,8 @@
                   "excursion.recorded",
                   "transfer.outbound",
                   "transfer.inbound",
-                  "return.received"
+                  "return.received",
+                  "grn.damaged"
                 ]
               }
             }
@@ -12453,7 +12454,7 @@
             }
           },
           "400": {
-            "description": "Missing or malformed Idempotency-Key, or an invalid body (validation-failed) — story 1-1: a clientId beside a poId or an asnId",
+            "description": "Missing or malformed Idempotency-Key, or an invalid body (validation-failed) — story 1-1: a clientId beside a poId or an asnId; story 2-4a: a damaged or short quantity without its reason, a reason with 0 or outside its vocabulary, a negative or over-maximum quantity, a line with qty + damagedQty = 0, or damage on a serial-tracked or catch-weight SKU",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12493,7 +12494,7 @@
             }
           },
           "409": {
-            "description": "The document belongs to another warehouse (document-warehouse-mismatch — checked before the document's status, so a closed or cancelled document of another warehouse answers this too), the document has a status receiving does not know (po-not-open / asn-not-open — DEFENSIVE since story 21-9: a closed PO or a cancelled/closed ASN no longer refuses, the receipt pends for approval), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), or a concurrent idempotent request (conflict)",
+            "description": "The document belongs to another warehouse (document-warehouse-mismatch — checked before the document's status, so a closed or cancelled document of another warehouse answers this too), the document has a status receiving does not know (po-not-open / asn-not-open — DEFENSIVE since story 21-9: a closed PO or a cancelled/closed ASN no longer refuses, the receipt pends for approval), a GRN line names a kit SKU — a kit never receives stock (kit-cannot-hold-stock, naming it), a line carries damaged units and a user zone or bin coded DAMAGED blocks the system damaged bin (damaged-bin-conflict, story 2-4a), or a concurrent idempotent request (conflict)",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12762,6 +12763,94 @@
           }
         ],
         "summary": "The device catalog snapshot (badge-in session required): SKU barcode map + open PO lines for the offline decision mirror (AD-4)",
+        "tags": [
+          "receiving"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/goods-receipts/{grnId}/lines": {
+      "get": {
+        "operationId": "ReceivingController_listGoodsReceiptLines",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "grnId",
+            "required": true,
+            "in": "path",
+            "description": "The goods receipt",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The GRN's lines in receipt order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoodsReceiptLinesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed grnId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or a client-portal session (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such goods receipt in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Story 2-4a — one goods receipt's lines (the web's expandable GRN row): SKU, batch, good and applied units, and the damaged and short quantities with their reasons — open to any member",
         "tags": [
           "receiving"
         ]
@@ -34224,7 +34313,7 @@
           "grnId": {
             "type": "string",
             "format": "uuid",
-            "description": "The GRN the movement landed under (grn-receipt arm only)"
+            "description": "The GRN the movement landed under (grn-receipt arm only — a `grn.received` into Receiving, or (story 2-4a) a `grn.damaged` into the system DAMAGED bin)"
           },
           "poId": {
             "type": "string",
@@ -34234,7 +34323,7 @@
           "poLineId": {
             "type": "string",
             "format": "uuid",
-            "description": "The exact PO line (grn-receipt arm only — absent on the blind arm and on an unmatched line)"
+            "description": "The exact PO line (grn-receipt arm only — absent on the blind arm, on an unmatched line and on every `grn.damaged` event: damaged units credit no document line)"
           },
           "asnId": {
             "type": "string",
@@ -34245,6 +34334,11 @@
             "type": "string",
             "format": "uuid",
             "description": "Story 21-6 — the exact ASN line credited (grn-receipt arm only)"
+          },
+          "grnLineId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The GRN line the movement belongs to: on a `putaway.placed` event the line whose received stock moved; (story 2-4a) on a `grn.damaged` event the line whose damaged units were booked into DAMAGED. Absent on every `grn.received` event"
           },
           "adjustmentPendingId": {
             "type": "string",
@@ -34738,7 +34832,7 @@
           },
           "binSystemOwned": {
             "type": "boolean",
-            "description": "Whether the bin is a system bin (RECEIVING, QC-HOLD, RETURNS, IN-TRANSIT) — present only under `order=location`"
+            "description": "Whether the bin is a system bin (RECEIVING, QC-HOLD, RETURNS, IN-TRANSIT, DAMAGED) — present only under `order=location`"
           }
         },
         "required": [
@@ -38297,9 +38391,50 @@
           },
           "qty": {
             "type": "number",
-            "description": "Physically received quantity. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
-            "minimum": 0.001,
+            "description": "The GOOD units received (story 2-4a — damaged units go in damagedQty, never here; 0 on an all-damaged line, but every line needs qty + damagedQty > 0). A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded.",
+            "minimum": 0,
             "maximum": 9007199254740
+          },
+          "damagedQty": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "maximum": 9007199254740,
+            "description": "Story 2-4a — units that arrived DAMAGED, booked into the warehouse's system DAMAGED bin (not sellable) and never crediting the PO or ASN line. Needs damageReasonCode when > 0. Refused (400) on a serial-tracked or catch-weight SKU. Omit (or 0) when none"
+          },
+          "damageReasonCode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "crushed",
+              "wet",
+              "torn-packaging",
+              "broken",
+              "leaking",
+              "pest",
+              "other",
+              null
+            ],
+            "description": "Story 2-4a — why the damaged units are damaged; given exactly when damagedQty > 0"
+          },
+          "shortQty": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "maximum": 9007199254740,
+            "description": "Story 2-4a — units the supplier's invoice or challan listed that never arrived, typed at the dock. Recorded on the line only — no stock and no effect on the PO or ASN. Needs shortReasonCode when > 0. Omit (or 0) when none"
+          },
+          "shortReasonCode": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "not-shipped",
+              "short-packed",
+              "lost-in-transit",
+              "other",
+              null
+            ],
+            "description": "Story 2-4a — why the units are short; given exactly when shortQty > 0"
           },
           "weightsGrams": {
             "nullable": true,
@@ -38439,8 +38574,8 @@
           },
           "qty": {
             "type": "number",
-            "description": "Physical truth: everything that arrived",
-            "minimum": 0.001
+            "description": "The good units that arrived (story 2-4a — damaged units are damagedQty; 0 on an all-damaged line)",
+            "minimum": 0
           },
           "appliedQty": {
             "type": "number",
@@ -38456,6 +38591,39 @@
             "type": "number",
             "minimum": 0,
             "description": "Story 1-2b — the part of appliedQty past the open quantity that booked at once within the client's receiving tolerance (no over-receipt). Present only when > 0"
+          },
+          "damagedQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 2-4a — the units that arrived damaged, booked into the system DAMAGED bin (not sellable). Present only when > 0"
+          },
+          "damageReasonCode": {
+            "type": "string",
+            "enum": [
+              "crushed",
+              "wet",
+              "torn-packaging",
+              "broken",
+              "leaking",
+              "pest",
+              "other"
+            ],
+            "description": "Story 2-4a — why; present only beside damagedQty"
+          },
+          "shortQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 2-4a — the units short against the supplier's document (recorded only). Present only when > 0"
+          },
+          "shortReasonCode": {
+            "type": "string",
+            "enum": [
+              "not-shipped",
+              "short-packed",
+              "lost-in-transit",
+              "other"
+            ],
+            "description": "Story 2-4a — why; present only beside shortQty"
           },
           "handlingUnitIds": {
             "description": "Catch weight (story 10.3): the handling units this line produced, in the order their weights were supplied — present only on a catch-weight line. These ids are what a unit label carries and what the pack bench scans back.",
@@ -38529,7 +38697,41 @@
           },
           "qty": {
             "type": "number",
-            "minimum": 0.001
+            "minimum": 0,
+            "description": "The line's good units, as sent (story 2-4a — 0 on an all-damaged line)"
+          },
+          "damagedQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 2-4a — the refused line's damaged units, as sent (not booked — the line went to review whole). Present only when > 0"
+          },
+          "damageReasonCode": {
+            "type": "string",
+            "enum": [
+              "crushed",
+              "wet",
+              "torn-packaging",
+              "broken",
+              "leaking",
+              "pest",
+              "other"
+            ],
+            "description": "Story 2-4a — present only beside damagedQty"
+          },
+          "shortQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 2-4a — the refused line's short units, as sent. Present only when > 0"
+          },
+          "shortReasonCode": {
+            "type": "string",
+            "enum": [
+              "not-shipped",
+              "short-packed",
+              "lost-in-transit",
+              "other"
+            ],
+            "description": "Story 2-4a — present only beside shortQty"
           },
           "code": {
             "type": "string",
@@ -40141,6 +40343,35 @@
             "items": {
               "$ref": "#/components/schemas/CatalogOpenGateInDto"
             }
+          },
+          "receiptDamageReasons": {
+            "type": "array",
+            "description": "Story 2-4a (additive): the damage reason vocabulary — the handheld shows its Damaged control only when the snapshot carries it (an older server omits it), and refuses to confirm a draft holding damage against a snapshot without it",
+            "items": {
+              "type": "string",
+              "enum": [
+                "crushed",
+                "wet",
+                "torn-packaging",
+                "broken",
+                "leaking",
+                "pest",
+                "other"
+              ]
+            }
+          },
+          "receiptShortReasons": {
+            "type": "array",
+            "description": "Story 2-4a (additive): the short reason vocabulary — the Short control's gate, as receiptDamageReasons",
+            "items": {
+              "type": "string",
+              "enum": [
+                "not-shipped",
+                "short-packed",
+                "lost-in-transit",
+                "other"
+              ]
+            }
           }
         },
         "required": [
@@ -40158,7 +40389,9 @@
           "countTasks",
           "openReturns",
           "clients",
-          "openGateIns"
+          "openGateIns",
+          "receiptDamageReasons",
+          "receiptShortReasons"
         ]
       },
       "GoodsReceiptEntryDto": {
@@ -40247,11 +40480,21 @@
           },
           "totalUnits": {
             "type": "number",
-            "description": "Physical units across all lines"
+            "description": "The good units across all lines (story 2-4a — damaged units are damagedUnits)"
           },
           "appliedUnits": {
             "type": "number",
             "description": "Units applied immediately (the excess pends)"
+          },
+          "damagedUnits": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 2-4a — the damaged units across all lines (booked into the system DAMAGED bin); 0 when none"
+          },
+          "shortUnits": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Story 2-4a — the units short against the supplier's documents across all lines (recorded only); 0 when none"
           },
           "createdAt": {
             "type": "string",
@@ -40272,6 +40515,8 @@
           "lineCount",
           "totalUnits",
           "appliedUnits",
+          "damagedUnits",
+          "shortUnits",
           "createdAt"
         ]
       },
@@ -40287,6 +40532,102 @@
           "nextCursor": {
             "type": "string",
             "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "GoodsReceiptLineEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "skuCode": {
+            "type": "string"
+          },
+          "skuName": {
+            "type": "string"
+          },
+          "batchId": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true
+          },
+          "qty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "The good units (0 on an all-damaged line)"
+          },
+          "appliedQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "The good units applied at once (the rest pended as an over-receipt)"
+          },
+          "damagedQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "The damaged units, booked into the system DAMAGED bin — present only when > 0"
+          },
+          "damageReasonCode": {
+            "type": "string",
+            "enum": [
+              "crushed",
+              "wet",
+              "torn-packaging",
+              "broken",
+              "leaking",
+              "pest",
+              "other"
+            ],
+            "description": "Present only beside damagedQty"
+          },
+          "shortQty": {
+            "type": "number",
+            "minimum": 0,
+            "description": "The units short against the supplier's document (recorded only) — present only when > 0"
+          },
+          "shortReasonCode": {
+            "type": "string",
+            "enum": [
+              "not-shipped",
+              "short-packed",
+              "lost-in-transit",
+              "other"
+            ],
+            "description": "Present only beside shortQty"
+          }
+        },
+        "required": [
+          "id",
+          "skuId",
+          "skuCode",
+          "skuName",
+          "batchId",
+          "batchCode",
+          "qty",
+          "appliedQty"
+        ]
+      },
+      "GoodsReceiptLinesResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "The GRN's lines, in receipt order",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GoodsReceiptLineEntryDto"
+            }
           }
         },
         "required": [
@@ -48964,6 +49305,10 @@
           "appliedQty": {
             "type": "string",
             "description": "Applied at once (the rest pended as an over-receipt), base units — a decimal string"
+          },
+          "damagedQty": {
+            "type": "string",
+            "description": "Story 2-4a — the units that arrived damaged on this line (booked into the system DAMAGED bin), base units — a decimal string; present only when > 0 (an all-damaged line is still a receipt line)"
           },
           "actorId": {
             "type": "string",
