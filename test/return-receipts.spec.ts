@@ -904,7 +904,9 @@ describe('return receipts (e2e, story 13-2)', () => {
   // (booked lines of an inactive SKU, flagged): Discard only (the web's
   // Acknowledge). Named explicitly, the same way.
   it('the per-type decision rule: every pre-13-2 op type keeps all three decisions; return.receive, grn.lines-refused and grn.inactive-sku-received only discard; grn.shelf-life-refused and (1-6d) grn.licence-refused apply + discard', () => {
-    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received']);
+    // Story 2-3a adds a device-uploaded Discard-only type, `gate-in.unload`
+    // (a refused unload — re-applying would be refused again). Named here.
+    const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload']);
     for (const type of REJECTED_OP_TYPES) {
       const expected =
         type === 'grn.shelf-life-refused' || type === 'grn.licence-refused'

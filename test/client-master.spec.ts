@@ -404,8 +404,12 @@ describe('story 1-2a: the client master record', () => {
       expect(SKU_NAMING_OP_TYPES.every((type) => opTypes.includes(type))).toBe(true);
       // Story 1-6d — the licence-refused row names its SKUs too.
       expect(SKU_NAMING_OP_TYPES).toContain('grn.licence-refused');
+      // Story 2-3a — the gate-in unload names no SKU (a vehicle visit
+      // carries several clients' goods), so it is outside the wind-down read
+      // by design (`client-wind-down.ts` untouched).
       expect(opTypes.filter((type) => !(SKU_NAMING_OP_TYPES as readonly string[]).includes(type)).sort()).toEqual([
         'excursion.record',
+        'gate-in.unload',
         'transfer.confirm',
       ]);
     });

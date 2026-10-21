@@ -13653,6 +13653,851 @@
         ]
       }
     },
+    "/tenants/{tenantId}/receiving/gate-ins": {
+      "post": {
+        "operationId": "GateInController_create",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGateInDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "The gate-in (the idempotency snapshot; the driver phone masked)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GateInResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a field the gate-in refuses — named in the detail: the vehicle (4–15 letters and digits; spaces, dots and hyphens are ignored; required unless a hand delivery), the container, both or neither transporter, the phone, the seal pairing, a package count, a document row (kind, number, a date after today in IST, a 12-digit e-way bill, PO and ASN together, a repeated kind + number) (validation-failed); a time more than 5 minutes ahead (time-in-future)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks gate.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse, the transporter partner, or a document's purchase order or ASN does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The partner lacks the transporter role (partner-not-transporter) or is inactive (transporter-inactive); a document's PO or ASN is another warehouse's (document-warehouse-mismatch); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Records a gate-in (gate.manage) — one inbound vehicle visit: vehicle (or a hand delivery), transporter (a partner or a typed name), LR, driver, seal, packages declared, dock door and the supplier documents; GI-<n>, status gated_in",
+        "tags": [
+          "gate-ins"
+        ]
+      },
+      "get": {
+        "operationId": "GateInController_list",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "query",
+            "description": "The warehouse whose gate-ins to list (every client's — a truck can carry several)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "status",
+            "required": false,
+            "in": "query",
+            "description": "Only these statuses (repeat the parameter for several: ?status=gated_in&status=unloading)",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "gated_in",
+                  "unloading",
+                  "unloaded",
+                  "gated_out"
+                ]
+              }
+            }
+          },
+          {
+            "name": "cursor",
+            "required": false,
+            "in": "query",
+            "description": "Opaque keyset cursor from the previous page",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "required": false,
+            "in": "query",
+            "schema": {
+              "minimum": 1,
+              "maximum": 200,
+              "example": 50,
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GateInListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed warehouseId, status, cursor or limit (validation-failed / invalid-cursor)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Lists one warehouse's gate-ins, newest gated-in first (any staff member) — every client's; status repeatable; the driver phone masked; keyset cursor",
+        "tags": [
+          "gate-ins"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/gate-ins/{gateInId}": {
+      "get": {
+        "operationId": "GateInController_get",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "gateInId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GateInDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed gateInId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No gate-in with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "One gate-in's detail (any staff member): the documents with the PO / ASN codes they cover and the linked goods receipts with their client; the driver's full phone only for a gate.manage holder (masked otherwise)",
+        "tags": [
+          "gate-ins"
+        ]
+      },
+      "patch": {
+        "operationId": "GateInController_amend",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "gateInId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AmendGateInDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GateInResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or a field the gate-in refuses — named in the detail: the vehicle (4–15 letters and digits; spaces, dots and hyphens are ignored; required unless a hand delivery), the container, both or neither transporter, the phone, the seal pairing, a package count, a document row (kind, number, a date after today in IST, a 12-digit e-way bill, PO and ASN together, a repeated kind + number) (validation-failed); a time more than 5 minutes ahead (time-in-future); a malformed gateInId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks gate.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The gate-in, the (new) transporter partner, or a document's PO or ASN does not exist in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The gate-in is gated out (gate-in-closed); a different gated-in time once the unload started (gate-in-time-locked); a changed seal status, seal number or packages declared once the unload ended (gate-in-field-locked); a new transporter partner without the role (partner-not-transporter) or inactive (transporter-inactive); a document of another warehouse (document-warehouse-mismatch); or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Amends a gate-in (gate.manage) — a FULL replacement of the header (an absent or blank optional becomes null) and of the document set; the gated-in time only while gated_in; last write wins",
+        "tags": [
+          "gate-ins"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/gate-ins/{gateInId}/unload": {
+      "post": {
+        "operationId": "GateInController_unloadWeb",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "gateInId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnloadGateInDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "`applied: false` when the phase was already recorded (the first record stands; nothing changed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GateInUnloadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an unknown phase, packagesCounted missing on end / present on start / out of range, a malformed occurredAt or gateInId (validation-failed); a time more than 5 minutes ahead (time-in-future); a time before the gated-in time or, for an end, the start, or after a recorded gate-out (time-out-of-order)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks gate.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No gate-in with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A concurrent idempotent request (conflict) — never gate-in-closed: a gated-out visit still takes its unload",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Records the unload start, or its end with the packages counted, from the web (gate.manage) — each column fills only when still empty, in any status; nothing to fill answers applied: false",
+        "tags": [
+          "gate-ins"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/devices/gate-ins/{gateInId}/unload": {
+      "post": {
+        "operationId": "GateInController_unloadDevice",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the device token)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "gateInId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnloadGateInDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "`applied: false` when the phase was already recorded (the device settles it with a note)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GateInUnloadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, an unknown phase, occurredAt missing or malformed, packagesCounted missing on end / present on start / out of range, a malformed gateInId (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing/invalid device token, or a bare device credential without badge-in (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown or revoked device (device-revoked); the operator is not a floor role or lacks gate.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No gate-in with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The op's creator is not the badged operator (operator-mismatch), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "gate-in.unload — the dock handheld's unload start or end (badge-in session required; gate.manage): the device and its operator are re-read first; the time is taken as sent; each column fills only when still empty, in any status",
+        "tags": [
+          "gate-ins"
+        ]
+      }
+    },
+    "/tenants/{tenantId}/receiving/gate-ins/{gateInId}/gate-out": {
+      "post": {
+        "operationId": "GateInController_gateOut",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "gateInId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GateOutDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GateInResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, a malformed gatedOutAt or gateInId (validation-failed); a time more than 5 minutes ahead (time-in-future); before the gated-in time, the unload start or the unload end (time-out-of-order)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), or the caller lacks gate.manage (role-denied)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No gate-in with this id exists in this tenant (not-found)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already gated out (gate-in-closed), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Gates the vehicle out (gate.manage) — from any state but gated_out; closes the visit (no further edits; a late unload still records)",
+        "tags": [
+          "gate-ins"
+        ]
+      }
+    },
     "/tenants/{tenantId}/putaway/placements": {
       "post": {
         "operationId": "PutawayController_placePutaway",
@@ -21527,6 +22372,7 @@
                 "eway_gstin_setting",
                 "eway_state_threshold",
                 "expiry_alert_policy",
+                "gate_in",
                 "goods_receipt",
                 "kit",
                 "ledger_chain_break",
@@ -32485,7 +33331,8 @@
               "grn.lines-refused",
               "grn.shelf-life-refused",
               "grn.inactive-sku-received",
-              "grn.licence-refused"
+              "grn.licence-refused",
+              "gate-in.unload"
             ]
           },
           "classification": {
@@ -32637,7 +33484,8 @@
               "grn.lines-refused",
               "grn.shelf-life-refused",
               "grn.inactive-sku-received",
-              "grn.licence-refused"
+              "grn.licence-refused",
+              "gate-in.unload"
             ]
           },
           "classification": {
@@ -37504,6 +38352,11 @@
             "format": "uuid",
             "description": "Story 1-1 — the client a BLIND receipt is for (named only beside blindReasonCode; a PO or ASN receipt takes its document's client, and naming one there is a 400). Absent (an older build): the client is derived from the first line's SKU. A line whose SKU belongs to another client is refused per line (`sku-client-mismatch` in rejectedLines) and the rest settles. An unknown client is a 404"
           },
+          "gateInId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 2-3a — the gate-in (the vehicle visit) this receipt came off. NEVER refused (decision 5): an unknown id, a non-uuid or another warehouse's gate-in books the receipt UNLINKED and the answer says why in `gateInLink`; a gated-out gate-in links. Absent: the receipt books exactly as before"
+          },
           "occurredAt": {
             "type": "string",
             "description": "Device time of the receipt (ISO-8601 UTC, Z-suffixed)",
@@ -37524,6 +38377,29 @@
           "warehouseId",
           "occurredAt",
           "lines"
+        ]
+      },
+      "GateInLinkDto": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "not-linked"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "other-warehouse"
+            ],
+            "description": "`unknown`: no such gate-in (or not a uuid); `other-warehouse`: it is another warehouse's"
+          }
+        },
+        "required": [
+          "status",
+          "reason"
         ]
       },
       "GrnLineDto": {
@@ -37787,6 +38663,24 @@
             ],
             "nullable": true
           },
+          "gateInId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 2-3a — the gate-in the receipt is linked to; present only when linked"
+          },
+          "gateInCode": {
+            "type": "string",
+            "example": "GI-0001",
+            "description": "Story 2-3a — the linked gate-in's code; present only when linked"
+          },
+          "gateInLink": {
+            "description": "Story 2-3a — present only when the receipt named a gate-in that did NOT link (it booked unlinked)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GateInLinkDto"
+              }
+            ]
+          },
           "status": {
             "type": "string",
             "description": "recorded (the v1 terminal state)"
@@ -37912,6 +38806,14 @@
           "licenceReviewOpId": {
             "type": "string",
             "description": "Story 1-6d — the op id of the `grn.licence-refused` review row, when one was raised"
+          },
+          "gateInLink": {
+            "description": "Story 2-3a — present only when the receipt named a gate-in that did not link (nothing was recorded, so nothing linked)",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/GateInLinkDto"
+              }
+            ]
           }
         },
         "required": [
@@ -39053,6 +39955,92 @@
           "active"
         ]
       },
+      "CatalogOpenGateInDocumentDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "invoice",
+              "challan",
+              "bill_of_entry"
+            ]
+          },
+          "number": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "number"
+        ]
+      },
+      "CatalogOpenGateInDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "GI-0001"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "handDelivery": {
+            "type": "boolean"
+          },
+          "transporterLabel": {
+            "type": "string"
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "gated_in",
+              "unloading",
+              "unloaded"
+            ]
+          },
+          "sealStatus": {
+            "type": "string",
+            "enum": [
+              "intact",
+              "broken",
+              "none"
+            ]
+          },
+          "unloadStartedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC, null until the unload started"
+          },
+          "documents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogOpenGateInDocumentDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "vehicleNo",
+          "handDelivery",
+          "transporterLabel",
+          "dockDoor",
+          "status",
+          "sealStatus",
+          "unloadStartedAt",
+          "documents"
+        ]
+      },
       "CatalogSnapshotResponse": {
         "type": "object",
         "properties": {
@@ -39146,6 +40134,13 @@
             "items": {
               "$ref": "#/components/schemas/CatalogSnapshotClientDto"
             }
+          },
+          "openGateIns": {
+            "description": "Story 2-3a (additive): the warehouse's open gate-ins — not gated out, gated in within the last 7 days, at most 200, newest first (decision 15). The dock records their unload and receives against them. An older server omits it",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogOpenGateInDto"
+            }
           }
         },
         "required": [
@@ -39162,7 +40157,8 @@
           "transferTasks",
           "countTasks",
           "openReturns",
-          "clients"
+          "clients",
+          "openGateIns"
         ]
       },
       "GoodsReceiptEntryDto": {
@@ -39213,6 +40209,21 @@
             ],
             "nullable": true,
             "description": "Set only on a blind receipt"
+          },
+          "gateInId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 2-3a — the gate-in the receipt is linked to; present only when linked"
+          },
+          "gateInCode": {
+            "type": "string",
+            "example": "GI-0001",
+            "description": "Story 2-3a — the linked gate-in's code"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "example": "KA01AB1234",
+            "description": "Story 2-3a — the linked gate-in's vehicle; present only when linked and the gate-in has one (a hand delivery has none)"
           },
           "status": {
             "type": "string",
@@ -39741,6 +40752,1143 @@
         "required": [
           "items"
         ]
+      },
+      "GateInDocumentInputDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "invoice",
+              "challan",
+              "bill_of_entry"
+            ],
+            "description": "The supplier document: an invoice, a delivery challan or a bill of entry"
+          },
+          "number": {
+            "type": "string",
+            "maxLength": 40,
+            "description": "The document number as printed (trimmed; a repeated kind + number on one gate-in is refused)"
+          },
+          "documentDate": {
+            "type": "string",
+            "example": "2026-10-21",
+            "description": "The date printed on the document, a calendar date YYYY-MM-DD as typed (never an instant); not after today in IST"
+          },
+          "ewayBillNo": {
+            "type": "string",
+            "nullable": true,
+            "example": "1234 5678 9012",
+            "description": "The inward e-way bill number — 12 digits, spaces ignored"
+          },
+          "poId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The purchase order the document covers (any status, any client, this warehouse) — at most one of poId / asnId"
+          },
+          "asnId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The advance shipment notice the document covers (any status, any client, this warehouse)"
+          }
+        },
+        "required": [
+          "kind",
+          "number",
+          "documentDate"
+        ]
+      },
+      "CreateGateInDto": {
+        "type": "object",
+        "properties": {
+          "handDelivery": {
+            "type": "boolean",
+            "nullable": true,
+            "description": "Goods brought by hand — no vehicle; makes vehicleNo optional (decision 13). Absent = false"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true,
+            "example": "KA-01.AB 1234",
+            "description": "The registration number — uppercased, spaces, dots and hyphens stripped, then 4–15 letters and digits (BH-series and temporary plates fit). Required unless handDelivery"
+          },
+          "containerNo": {
+            "type": "string",
+            "nullable": true,
+            "example": "MSKU1234567",
+            "description": "The container number — at most 11 letters and digits (uppercased)"
+          },
+          "transporterPartnerId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "An active partner holding the transporter role — exactly one of transporterPartnerId / transporterName (decision 4)"
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 80,
+            "description": "The transporter typed by name (not in the partner master)"
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 30,
+            "description": "The lorry receipt (LR) / consignment note number"
+          },
+          "driverName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 80
+          },
+          "driverPhone": {
+            "type": "string",
+            "nullable": true,
+            "example": "98765 43345",
+            "description": "The driver's phone — 7–15 digits, optionally led by +; spaces, hyphens, dots and brackets ignored. Personal data: masked on every read but the detail for a gate.manage holder, never in an event"
+          },
+          "sealStatus": {
+            "type": "string",
+            "enum": [
+              "intact",
+              "broken",
+              "none"
+            ],
+            "description": "The seal as found at the gate — a broken seal is flagged, never blocked (decision 8)"
+          },
+          "sealNumber": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 120,
+            "description": "The seal number(s), several comma-separated — required unless sealStatus is none, refused when none"
+          },
+          "packagesDeclared": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "maximum": 1000000,
+            "description": "Packages the paperwork declares — blank means not declared, and no mismatch flag is shown (decision 11)"
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 20,
+            "description": "The dock door, a typed code (the dock-door master is 2-3b)"
+          },
+          "gatedInAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the vehicle gated in (ISO-8601 with a zone). Create: absent = now. Amend: absent = unchanged; a different time only while gated_in (409 gate-in-time-locked). More than 5 minutes ahead of the server clock is 400 time-in-future"
+          },
+          "documents": {
+            "maxItems": 20,
+            "description": "The supplier documents (0–20) — the full set (amend replaces it)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GateInDocumentInputDto"
+            }
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The warehouse whose gate the vehicle came through"
+          }
+        },
+        "required": [
+          "sealStatus",
+          "warehouseId"
+        ]
+      },
+      "GateInDocumentDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "position": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Its place on the gate-in (0-based)"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "invoice",
+              "challan",
+              "bill_of_entry"
+            ]
+          },
+          "number": {
+            "type": "string"
+          },
+          "documentDate": {
+            "type": "string",
+            "description": "A calendar date YYYY-MM-DD"
+          },
+          "ewayBillNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "12 digits"
+          },
+          "poId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "asnId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "id",
+          "position",
+          "kind",
+          "number",
+          "documentDate",
+          "ewayBillNo",
+          "poId",
+          "asnId"
+        ]
+      },
+      "GateInDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "GI-0001",
+            "description": "GI-<n>, unique per tenant"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "gated_in",
+              "unloading",
+              "unloaded",
+              "gated_out"
+            ]
+          },
+          "handDelivery": {
+            "type": "boolean"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "Normalised (KA01AB1234); null on a hand delivery"
+          },
+          "containerNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterPartnerId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterSnapshot": {
+            "nullable": true,
+            "description": "The transporter partner as it was frozen at record time (the vendor snapshot shape, v1); null for a typed name",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VendorSnapshotDto"
+              }
+            ]
+          },
+          "transporterLabel": {
+            "type": "string",
+            "description": "The frozen partner's name, else the typed name"
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "driverName": {
+            "type": "string",
+            "nullable": true
+          },
+          "driverPhone": {
+            "type": "string",
+            "nullable": true,
+            "example": "98•••••345",
+            "description": "MASKED everywhere but the detail read for a gate.manage holder (decision 10)"
+          },
+          "sealStatus": {
+            "type": "string",
+            "enum": [
+              "intact",
+              "broken",
+              "none"
+            ]
+          },
+          "sealNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "packagesDeclared": {
+            "type": "number",
+            "nullable": true
+          },
+          "packagesCounted": {
+            "type": "number",
+            "nullable": true,
+            "description": "Recorded with the unload end"
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true
+          },
+          "gatedInAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — entered at the gate (editable while gated_in)"
+          },
+          "unloadStartedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC — as recorded (a device time is taken as sent)"
+          },
+          "unloadEndedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "gatedOutAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "recordedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "unloadStartedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "unloadEndedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "gatedOutBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          },
+          "documents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GateInDocumentDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "code",
+          "status",
+          "handDelivery",
+          "vehicleNo",
+          "containerNo",
+          "transporterPartnerId",
+          "transporterName",
+          "transporterSnapshot",
+          "transporterLabel",
+          "lrNumber",
+          "driverName",
+          "driverPhone",
+          "sealStatus",
+          "sealNumber",
+          "packagesDeclared",
+          "packagesCounted",
+          "dockDoor",
+          "gatedInAt",
+          "unloadStartedAt",
+          "unloadEndedAt",
+          "gatedOutAt",
+          "recordedBy",
+          "unloadStartedBy",
+          "unloadEndedBy",
+          "gatedOutBy",
+          "createdAt",
+          "updatedAt",
+          "documents"
+        ]
+      },
+      "GateInResponse": {
+        "type": "object",
+        "properties": {
+          "gateIn": {
+            "$ref": "#/components/schemas/GateInDto"
+          }
+        },
+        "required": [
+          "gateIn"
+        ]
+      },
+      "GateInEntryDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "GI-0001",
+            "description": "GI-<n>, unique per tenant"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "gated_in",
+              "unloading",
+              "unloaded",
+              "gated_out"
+            ]
+          },
+          "handDelivery": {
+            "type": "boolean"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "Normalised (KA01AB1234); null on a hand delivery"
+          },
+          "containerNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterPartnerId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterSnapshot": {
+            "nullable": true,
+            "description": "The transporter partner as it was frozen at record time (the vendor snapshot shape, v1); null for a typed name",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VendorSnapshotDto"
+              }
+            ]
+          },
+          "transporterLabel": {
+            "type": "string",
+            "description": "The frozen partner's name, else the typed name"
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "driverName": {
+            "type": "string",
+            "nullable": true
+          },
+          "driverPhone": {
+            "type": "string",
+            "nullable": true,
+            "example": "98•••••345",
+            "description": "MASKED everywhere but the detail read for a gate.manage holder (decision 10)"
+          },
+          "sealStatus": {
+            "type": "string",
+            "enum": [
+              "intact",
+              "broken",
+              "none"
+            ]
+          },
+          "sealNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "packagesDeclared": {
+            "type": "number",
+            "nullable": true
+          },
+          "packagesCounted": {
+            "type": "number",
+            "nullable": true,
+            "description": "Recorded with the unload end"
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true
+          },
+          "gatedInAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — entered at the gate (editable while gated_in)"
+          },
+          "unloadStartedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC — as recorded (a device time is taken as sent)"
+          },
+          "unloadEndedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "gatedOutAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "recordedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "unloadStartedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "unloadEndedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "gatedOutBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          },
+          "documentCount": {
+            "type": "number",
+            "minimum": 0
+          },
+          "receiptCount": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Goods receipts linked to this visit — any client, including receipts linked after the gate-out"
+          },
+          "packagesFlag": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "short",
+              "excess",
+              "matches",
+              null
+            ],
+            "description": "Counted against declared; null while either is missing (blank declared = no flag)"
+          },
+          "packagesDifference": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "description": "|declared − counted| beside a flag"
+          },
+          "staleOpen": {
+            "type": "boolean",
+            "description": "Not gated out and gated in more than 7 days ago (the device no longer offers it)"
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "code",
+          "status",
+          "handDelivery",
+          "vehicleNo",
+          "containerNo",
+          "transporterPartnerId",
+          "transporterName",
+          "transporterSnapshot",
+          "transporterLabel",
+          "lrNumber",
+          "driverName",
+          "driverPhone",
+          "sealStatus",
+          "sealNumber",
+          "packagesDeclared",
+          "packagesCounted",
+          "dockDoor",
+          "gatedInAt",
+          "unloadStartedAt",
+          "unloadEndedAt",
+          "gatedOutAt",
+          "recordedBy",
+          "unloadStartedBy",
+          "unloadEndedBy",
+          "gatedOutBy",
+          "createdAt",
+          "updatedAt",
+          "documentCount",
+          "receiptCount",
+          "packagesFlag",
+          "packagesDifference",
+          "staleOpen"
+        ]
+      },
+      "GateInListResponse": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GateInEntryDto"
+            }
+          },
+          "nextCursor": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "required": [
+          "items"
+        ]
+      },
+      "GateInDetailDocumentDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "position": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Its place on the gate-in (0-based)"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "invoice",
+              "challan",
+              "bill_of_entry"
+            ]
+          },
+          "number": {
+            "type": "string"
+          },
+          "documentDate": {
+            "type": "string",
+            "description": "A calendar date YYYY-MM-DD"
+          },
+          "ewayBillNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "12 digits"
+          },
+          "poId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "asnId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "poCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The covered PO's code"
+          },
+          "asnCode": {
+            "type": "string",
+            "nullable": true,
+            "description": "The covered ASN's code"
+          }
+        },
+        "required": [
+          "id",
+          "position",
+          "kind",
+          "number",
+          "documentDate",
+          "ewayBillNo",
+          "poId",
+          "asnId",
+          "poCode",
+          "asnCode"
+        ]
+      },
+      "GateInReceiptDocumentDto": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "po",
+              "asn",
+              "blind"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "nullable": true,
+            "description": "The PO or ASN code; null on a blind receipt"
+          }
+        },
+        "required": [
+          "kind",
+          "code"
+        ]
+      },
+      "GateInReceiptDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "GRN-0042"
+          },
+          "clientId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The receipt's client (null on an older unattributed receipt)"
+          },
+          "document": {
+            "$ref": "#/components/schemas/GateInReceiptDocumentDto"
+          }
+        },
+        "required": [
+          "id",
+          "code",
+          "clientId",
+          "document"
+        ]
+      },
+      "GateInDetailDto": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "tenantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "warehouseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "code": {
+            "type": "string",
+            "example": "GI-0001",
+            "description": "GI-<n>, unique per tenant"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "gated_in",
+              "unloading",
+              "unloaded",
+              "gated_out"
+            ]
+          },
+          "handDelivery": {
+            "type": "boolean"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true,
+            "description": "Normalised (KA01AB1234); null on a hand delivery"
+          },
+          "containerNo": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterPartnerId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true
+          },
+          "transporterSnapshot": {
+            "nullable": true,
+            "description": "The transporter partner as it was frozen at record time (the vendor snapshot shape, v1); null for a typed name",
+            "type": "object",
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VendorSnapshotDto"
+              }
+            ]
+          },
+          "transporterLabel": {
+            "type": "string",
+            "description": "The frozen partner's name, else the typed name"
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "driverName": {
+            "type": "string",
+            "nullable": true
+          },
+          "driverPhone": {
+            "type": "string",
+            "nullable": true,
+            "example": "98•••••345",
+            "description": "MASKED everywhere but the detail read for a gate.manage holder (decision 10)"
+          },
+          "sealStatus": {
+            "type": "string",
+            "enum": [
+              "intact",
+              "broken",
+              "none"
+            ]
+          },
+          "sealNumber": {
+            "type": "string",
+            "nullable": true
+          },
+          "packagesDeclared": {
+            "type": "number",
+            "nullable": true
+          },
+          "packagesCounted": {
+            "type": "number",
+            "nullable": true,
+            "description": "Recorded with the unload end"
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true
+          },
+          "gatedInAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC — entered at the gate (editable while gated_in)"
+          },
+          "unloadStartedAt": {
+            "type": "string",
+            "nullable": true,
+            "description": "ISO-8601 UTC — as recorded (a device time is taken as sent)"
+          },
+          "unloadEndedAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "gatedOutAt": {
+            "type": "string",
+            "nullable": true
+          },
+          "recordedBy": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "unloadStartedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "unloadEndedBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "gatedOutBy": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid"
+          },
+          "createdAt": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          },
+          "documentCount": {
+            "type": "number",
+            "minimum": 0
+          },
+          "receiptCount": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Goods receipts linked to this visit — any client, including receipts linked after the gate-out"
+          },
+          "packagesFlag": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "short",
+              "excess",
+              "matches",
+              null
+            ],
+            "description": "Counted against declared; null while either is missing (blank declared = no flag)"
+          },
+          "packagesDifference": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "description": "|declared − counted| beside a flag"
+          },
+          "staleOpen": {
+            "type": "boolean",
+            "description": "Not gated out and gated in more than 7 days ago (the device no longer offers it)"
+          },
+          "documents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GateInDetailDocumentDto"
+            }
+          },
+          "receipts": {
+            "description": "The goods receipts linked to this visit, oldest first",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GateInReceiptDto"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "tenantId",
+          "warehouseId",
+          "code",
+          "status",
+          "handDelivery",
+          "vehicleNo",
+          "containerNo",
+          "transporterPartnerId",
+          "transporterName",
+          "transporterSnapshot",
+          "transporterLabel",
+          "lrNumber",
+          "driverName",
+          "driverPhone",
+          "sealStatus",
+          "sealNumber",
+          "packagesDeclared",
+          "packagesCounted",
+          "dockDoor",
+          "gatedInAt",
+          "unloadStartedAt",
+          "unloadEndedAt",
+          "gatedOutAt",
+          "recordedBy",
+          "unloadStartedBy",
+          "unloadEndedBy",
+          "gatedOutBy",
+          "createdAt",
+          "updatedAt",
+          "documentCount",
+          "receiptCount",
+          "packagesFlag",
+          "packagesDifference",
+          "staleOpen",
+          "documents",
+          "receipts"
+        ]
+      },
+      "GateInDetailResponse": {
+        "type": "object",
+        "properties": {
+          "gateIn": {
+            "$ref": "#/components/schemas/GateInDetailDto"
+          }
+        },
+        "required": [
+          "gateIn"
+        ]
+      },
+      "AmendGateInDto": {
+        "type": "object",
+        "properties": {
+          "handDelivery": {
+            "type": "boolean",
+            "nullable": true,
+            "description": "Goods brought by hand — no vehicle; makes vehicleNo optional (decision 13). Absent = false"
+          },
+          "vehicleNo": {
+            "type": "string",
+            "nullable": true,
+            "example": "KA-01.AB 1234",
+            "description": "The registration number — uppercased, spaces, dots and hyphens stripped, then 4–15 letters and digits (BH-series and temporary plates fit). Required unless handDelivery"
+          },
+          "containerNo": {
+            "type": "string",
+            "nullable": true,
+            "example": "MSKU1234567",
+            "description": "The container number — at most 11 letters and digits (uppercased)"
+          },
+          "transporterPartnerId": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "An active partner holding the transporter role — exactly one of transporterPartnerId / transporterName (decision 4)"
+          },
+          "transporterName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 80,
+            "description": "The transporter typed by name (not in the partner master)"
+          },
+          "lrNumber": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 30,
+            "description": "The lorry receipt (LR) / consignment note number"
+          },
+          "driverName": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 80
+          },
+          "driverPhone": {
+            "type": "string",
+            "nullable": true,
+            "example": "98765 43345",
+            "description": "The driver's phone — 7–15 digits, optionally led by +; spaces, hyphens, dots and brackets ignored. Personal data: masked on every read but the detail for a gate.manage holder, never in an event"
+          },
+          "sealStatus": {
+            "type": "string",
+            "enum": [
+              "intact",
+              "broken",
+              "none"
+            ],
+            "description": "The seal as found at the gate — a broken seal is flagged, never blocked (decision 8)"
+          },
+          "sealNumber": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 120,
+            "description": "The seal number(s), several comma-separated — required unless sealStatus is none, refused when none"
+          },
+          "packagesDeclared": {
+            "type": "number",
+            "nullable": true,
+            "minimum": 0,
+            "maximum": 1000000,
+            "description": "Packages the paperwork declares — blank means not declared, and no mismatch flag is shown (decision 11)"
+          },
+          "dockDoor": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 20,
+            "description": "The dock door, a typed code (the dock-door master is 2-3b)"
+          },
+          "gatedInAt": {
+            "type": "string",
+            "nullable": true,
+            "format": "date-time",
+            "description": "When the vehicle gated in (ISO-8601 with a zone). Create: absent = now. Amend: absent = unchanged; a different time only while gated_in (409 gate-in-time-locked). More than 5 minutes ahead of the server clock is 400 time-in-future"
+          },
+          "documents": {
+            "maxItems": 20,
+            "description": "The supplier documents (0–20) — the full set (amend replaces it)",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GateInDocumentInputDto"
+            }
+          }
+        },
+        "required": [
+          "sealStatus"
+        ]
+      },
+      "UnloadGateInDto": {
+        "type": "object",
+        "properties": {
+          "phase": {
+            "type": "string",
+            "enum": [
+              "start",
+              "end"
+            ],
+            "description": "`start` records the unload start; `end` records its end with the packages counted"
+          },
+          "occurredAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When it happened (ISO-8601 with a zone). REQUIRED on the device route (minted at the press, taken as sent). Web: absent = now; more than 5 minutes ahead is 400 time-in-future, and before the gated-in time (or, for an end, the start) is 400 time-out-of-order"
+          },
+          "packagesCounted": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000000,
+            "description": "The packages counted off the vehicle — required with end, refused with start"
+          }
+        },
+        "required": [
+          "phase"
+        ]
+      },
+      "GateInUnloadResponse": {
+        "type": "object",
+        "properties": {
+          "applied": {
+            "type": "boolean",
+            "description": "false when every column this unload would fill was already recorded — the first record stands, nothing changed (the web reads \"Already recorded\")"
+          },
+          "gateIn": {
+            "$ref": "#/components/schemas/GateInDto"
+          }
+        },
+        "required": [
+          "applied",
+          "gateIn"
+        ]
+      },
+      "GateOutDto": {
+        "type": "object",
+        "properties": {
+          "gatedOutAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the vehicle left (ISO-8601 with a zone); absent = now. Not before the gated-in time, not more than 5 minutes ahead"
+          }
+        }
       },
       "PlacePutawayDto": {
         "type": "object",
@@ -44998,6 +47146,7 @@
               "eway_gstin_setting",
               "eway_state_threshold",
               "expiry_alert_policy",
+              "gate_in",
               "goods_receipt",
               "kit",
               "ledger_chain_break",
@@ -45089,6 +47238,7 @@
               "eway_gstin_setting",
               "eway_state_threshold",
               "expiry_alert_policy",
+              "gate_in",
               "goods_receipt",
               "kit",
               "ledger_chain_break",

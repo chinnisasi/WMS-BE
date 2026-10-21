@@ -12,6 +12,8 @@ import { ReceivingCommand } from './receiving.command';
 import { ReceivingFacade } from './receiving.facade';
 import { QcCommand } from './qc.command';
 import { QcFacade } from './qc.facade';
+import { GateInCommand } from './gate-in.command';
+import { GateInFacade } from './gate-in.facade';
 
 /**
  * Inbound module (Story 3.1): the purchase-order lifecycle — the upstream
@@ -61,7 +63,10 @@ import { QcFacade } from './qc.facade';
     ReceivingFacade,
     QcCommand,
     QcFacade,
+    // Story 2-3a — the gate-in (an inbound vehicle visit).
+    GateInCommand,
+    GateInFacade,
   ],
-  exports: [InboundFacade, ReceivingFacade, QcFacade],
+  exports: [InboundFacade, ReceivingFacade, QcFacade, GateInFacade],
 })
 export class InboundModule {}

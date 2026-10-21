@@ -6,6 +6,7 @@ import { InventoryController } from './inventory.controller';
 import { InboundController } from './inbound.controller';
 import { OutboundController } from './outbound.controller';
 import { ReceivingController } from './receiving.controller';
+import { GateInController } from './gate-in.controller';
 import { PutawayController } from './putaway.controller';
 import { CarriersController } from './carriers.controller';
 import { ChannelsController } from './channels.controller';
@@ -95,6 +96,9 @@ import { SharedModule } from '../shared/shared.module';
     InboundController,
     OutboundController,
     ReceivingController,
+    // Story 2-3a — the gate-in (record, amend, unload — web and device —,
+    // gate-out, list, detail) through `GateInFacade` (inbound).
+    GateInController,
     PutawayController,
     CarriersController,
     // Story 12-5 — the compliance surface (excursion record/list/resolve)

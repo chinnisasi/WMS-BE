@@ -898,7 +898,12 @@ describe('users, roles, and permission gating (e2e)', () => {
     // only, never a client-held capability).
     // Story 1-6c grows it to 45 with `licences.manage` — add, edit and
     // withdraw the drug and FSSAI licences: OWNER-ONLY (decision 11).
-    expect([...CAPABILITIES]).toHaveLength(45);
+    // Story 2-3a grows it to 46 with `gate.manage` — record, amend, unload
+    // and gate out an inbound vehicle: owner, ops_manager AND operator (the
+    // gate desk and the dock are floor work; the handheld records the
+    // unload); never the accountant or a client.
+    expect([...CAPABILITIES]).toHaveLength(46);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('gate.manage'))).toEqual(['owner', 'ops_manager', 'operator']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('licences.manage'))).toEqual(['owner']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('returns.manage'))).toEqual(['owner', 'ops_manager']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('ledger.acknowledge'))).toEqual(['owner']);

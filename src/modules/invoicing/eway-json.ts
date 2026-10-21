@@ -1,3 +1,4 @@
+import { VEHICLE_NO_RE } from '../../shared/primitives/vehicle';
 import { PINCODE_RE } from '../../shared/primitives/address';
 import type { AddressSnapshot } from '../../shared/primitives/address';
 import { nicText } from '../../shared/primitives/nic-text';
@@ -48,7 +49,8 @@ export type TransMode = (typeof TRANS_MODES)[number];
 export const VEHICLE_TYPES = ['R', 'O'] as const;
 export type VehicleType = (typeof VEHICLE_TYPES)[number];
 
-export const VEHICLE_NO_RE = /^[A-Z0-9]{4,15}$/;
+// Story 2-3a — lifted to `shared/primitives/vehicle.ts` (the gate-in shares it); re-exported unchanged.
+export { VEHICLE_NO_RE } from '../../shared/primitives/vehicle';
 export const TRANSPORTER_ID_RE = /^[0-9]{2}[A-Z0-9]{13}$/;
 export const TRANSPORTER_NAME_MAX = 25;
 export const TRANS_DOC_NO_MAX = 15;

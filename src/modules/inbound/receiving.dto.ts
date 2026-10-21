@@ -24,6 +24,7 @@ import {
   Min,
   ValidateNested,
   IsBoolean,
+  MaxLength,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { BooleanFlag, IsInstant } from '../../shared/primitives/instant-range';
@@ -37,6 +38,8 @@ import { MAX_HANDLING_UNITS_PER_GRN_LINE, REJECTED_GRN_LINE_CODES, UNMATCHED_LIN
 // putaway module's DTOs (one shape on every surface).
 import { PutawayBinDto, PutawayTaskDto } from '../putaway/putaway.dto';
 import { PickTaskDto } from '../outbound/outbound.dto';
+// Story 2-3a — the gate-in link and the snapshot's open gate-ins.
+import { CatalogOpenGateInDto, GateInLinkDto } from './gate-in.dto';
 
 /** The fixed blind-receive reason enum (the I/O matrix). */
 export const BLIND_REASON_ENUM = ['unannounced-delivery', 'po-not-found', 'other'] as const;
@@ -191,6 +194,17 @@ export class SubmitGoodsReceiptDto {
   @IsOptional()
   @IsUUID()
   clientId?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description:
+      'Story 2-3a — the gate-in (the vehicle visit) this receipt came off. NEVER refused (decision 5): an unknown id, a non-uuid or another warehouse\'s gate-in books the receipt UNLINKED and the answer says why in `gateInLink`; a gated-out gate-in links. Absent: the receipt books exactly as before',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  gateInId?: string;
 
   @ApiProperty({ description: 'Device time of the receipt (ISO-8601 UTC, Z-suffixed)', minLength: 20, maxLength: 35 })
   @IsString()
@@ -380,6 +394,15 @@ export class GoodsReceiptDto {
     nullable: true })
   blindReasonCode!: string | null;
 
+  @ApiProperty({ format: 'uuid', required: false, description: 'Story 2-3a — the gate-in the receipt is linked to; present only when linked' })
+  gateInId?: string;
+
+  @ApiProperty({ required: false, example: 'GI-0001', description: "Story 2-3a — the linked gate-in's code; present only when linked" })
+  gateInCode?: string;
+
+  @ApiProperty({ type: GateInLinkDto, required: false, description: 'Story 2-3a — present only when the receipt named a gate-in that did NOT link (it booked unlinked)' })
+  gateInLink?: GateInLinkDto;
+
   @ApiProperty({ description: 'recorded (the v1 terminal state)' })
   status!: string;
 
@@ -484,6 +507,9 @@ export class RefusedReceiptDto {
 
   @ApiProperty({ required: false, description: 'Story 1-6d — the op id of the `grn.licence-refused` review row, when one was raised' })
   licenceReviewOpId?: string;
+
+  @ApiProperty({ type: GateInLinkDto, required: false, description: 'Story 2-3a — present only when the receipt named a gate-in that did not link (nothing was recorded, so nothing linked)' })
+  gateInLink?: GateInLinkDto;
 }
 
 export class GoodsReceiptResponse {
@@ -534,6 +560,15 @@ export class GoodsReceiptEntryDto {
   @ApiProperty({ enum: [...BLIND_REASON_ENUM, null], type: String,
     nullable: true, description: 'Set only on a blind receipt' })
   blindReasonCode!: string | null;
+
+  @ApiProperty({ format: 'uuid', required: false, description: 'Story 2-3a — the gate-in the receipt is linked to; present only when linked' })
+  gateInId?: string;
+
+  @ApiProperty({ required: false, example: 'GI-0001', description: "Story 2-3a — the linked gate-in's code" })
+  gateInCode?: string;
+
+  @ApiProperty({ required: false, example: 'KA01AB1234', description: "Story 2-3a — the linked gate-in's vehicle; present only when linked and the gate-in has one (a hand delivery has none)" })
+  vehicleNo?: string;
 
   @ApiProperty({ description: 'recorded (the v1 terminal state)' })
   status!: string;
@@ -1273,4 +1308,11 @@ export class CatalogSnapshotResponse {
       'Story 1-1 (additive): every client referenced by a SKU or an open document of the snapshot — the names the device shows when a scan belongs to another client, and the blind receipt\'s client picker. A snapshot WITHOUT this field (an older server) puts the device in legacy mode: no picker, no clientId sent',
   })
   clients!: readonly CatalogSnapshotClientDto[];
+
+  @ApiProperty({
+    type: [CatalogOpenGateInDto],
+    description:
+      'Story 2-3a (additive): the warehouse\'s open gate-ins — not gated out, gated in within the last 7 days, at most 200, newest first (decision 15). The dock records their unload and receives against them. An older server omits it',
+  })
+  openGateIns!: readonly CatalogOpenGateInDto[];
 }

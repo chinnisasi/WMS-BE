@@ -3114,3 +3114,45 @@ describe('architecture: the second factor’s key material has one home (story 6
     expect(check).toBeLessThan(main.indexOf('await createApp('));
   });
 });
+
+describe('architecture: the gate-in is inbound-owned (story 2-3a)', () => {
+  const inboundRoot = join(SRC_ROOT, 'modules', 'inbound');
+  const GATE_IN_TABLES = ['gateIns', 'gateInDocuments'];
+  const RAW_GATE_IN_WRITE = /\b(insert into|update|delete from)\s+gate_in(s|_documents)\b/i;
+
+  it('the detectors bite', () => {
+    const command = readFileSync(join(inboundRoot, 'gate-in.command.ts'), 'utf8');
+    expect(drizzleWriteOn('gateIns').test(command)).toBe(true);
+    expect(drizzleWriteOn('gateInDocuments').test(command)).toBe(true);
+    expect(RAW_GATE_IN_WRITE.test('sql`update gate_ins set status = 1`')).toBe(true);
+  });
+
+  it('only the gate-in command writes gate_ins / gate_in_documents', () => {
+    const offenders: string[] = [];
+    for (const file of files.filter((f) => f.path !== join(inboundRoot, 'gate-in.command.ts'))) {
+      for (const pattern of [...GATE_IN_TABLES.map((table) => drizzleWriteOn(table)), RAW_GATE_IN_WRITE]) {
+        if (pattern.test(file.source)) offenders.push(`${file.path}: /${pattern.source}/`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it('no file outside the inbound module reads the gate-in tables; the api shell reaches them only through GateInFacade', () => {
+    const offenders = files
+      .filter((file) => !file.path.startsWith(inboundRoot))
+      .filter((file) => /\bgateIns\b|\bgateInDocuments\b/.test(file.source) && /from '.*shared\/db\/schema'/.test(file.source))
+      .filter((file) => !file.path.endsWith(join('shared', 'db', 'schema.ts')))
+      .map((file) => file.path);
+    expect(offenders).toEqual([]);
+    const controller = readFileSync(join(SRC_ROOT, 'api', 'gate-in.controller.ts'), 'utf8');
+    expect(controller).toMatch(/\bGateInFacade\b/);
+    expect(controller).not.toMatch(/\bGateInCommand\b/);
+  });
+
+  it('decision 10: every outbox append of the gate-in command goes through outboxGateIn (the payload drops the driver phone)', () => {
+    const command = readFileSync(join(inboundRoot, 'gate-in.command.ts'), 'utf8');
+    const appends = [...command.matchAll(/this\.outbox\.append\(/g)];
+    expect(appends.length).toBe(1);
+    expect(command).toMatch(/payload:\s*\{\s*\.\.\.\(effect\.extra \?\? \{\}\),\s*gateIn:\s*outboxGateIn\(effect\.gateIn\)\s*\}/);
+  });
+});

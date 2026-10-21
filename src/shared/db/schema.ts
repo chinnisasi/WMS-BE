@@ -453,6 +453,12 @@ export const auditEvents = pgTable(
     targetType: text('target_type').notNull(),
     targetId: uuid('target_id').notNull(),
     reference: text('reference'),
+    /**
+     * Story 2-3a (decision 16) — what an edit changed, `{field: {before,
+     * after}}` (a personal field as `{changed: true}`, never its value).
+     * Null on every row that records no field-level change (every older row).
+     */
+    changes: jsonb('changes'),
     occurredAt: timestamp('occurred_at', { withTimezone: true, mode: 'string' }).notNull().defaultNow(),
     ...tenantTimestamps,
   },
@@ -2382,6 +2388,13 @@ export const goodsReceiptNotes = pgTable(
      */
     clientId: uuid('client_id'),
     blindReasonCode: text('blind_reason_code'),
+    /**
+     * Story 2-3a — the gate-in (the inbound vehicle visit) this receipt came
+     * off, when the device named one that resolved in this warehouse. Optional
+     * and never refused (decision 5): a receipt without one books as before.
+     * No FK (IMPLEMENTATION-GUIDE §3).
+     */
+    gateInId: uuid('gate_in_id'),
     status: text('status').notNull().default('recorded'),
     deviceId: uuid('device_id').notNull(),
     recordedBy: uuid('recorded_by').notNull(),
@@ -2420,10 +2433,103 @@ export const goodsReceiptNotes = pgTable(
     ),
     // Story 21-6 — the receipts of an ASN (the cancel guard, the drill join).
     index('goods_receipt_notes_tenant_asn_idx').on(table.tenantId, table.asnId),
+    // Story 2-3a — the receipts of a gate-in (the list's `receiptCount`, the detail's receipts).
+    index('goods_receipt_notes_tenant_gate_in_idx').on(table.tenantId, table.gateInId),
   ],
 );
 
 export type GoodsReceiptNote = typeof goodsReceiptNotes.$inferSelect;
+
+/**
+ * Story 2-3a — the gate-in: ONE inbound vehicle visit (decision 1), recorded
+ * at the gate desk (web) and unloaded at the dock (handheld or web). Its
+ * lifecycle is `gated_in → unloading → unloaded → gated_out`; gate-out closes
+ * it. Receipts link to it through `goods_receipt_notes.gate_in_id`. Owned by
+ * the inbound module (`gate-in.command.ts`). Every CHECK and the RLS policy
+ * live ONLY in `drizzle/0086_gate_ins.sql`; the vocabularies are
+ * `GATE_IN_STATUSES` / `SEAL_STATUSES` / `GATE_IN_DOCUMENT_KINDS` beside the
+ * command. `driver_phone` is personal data (DPDP, decision 10): never copied
+ * into an outbox payload, masked on every read but the detail for a
+ * `gate.manage` holder.
+ */
+export const gateIns = pgTable(
+  'gate_ins',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    warehouseId: uuid('warehouse_id').notNull(),
+    code: text('code').notNull(),
+    status: text('status').notNull().default('gated_in'),
+    handDelivery: boolean('hand_delivery').notNull().default(false),
+    vehicleNo: text('vehicle_no'),
+    containerNo: text('container_no'),
+    transporterPartnerId: uuid('transporter_partner_id'),
+    transporterSnapshot: jsonb('transporter_snapshot'),
+    transporterName: text('transporter_name'),
+    lrNumber: text('lr_number'),
+    driverName: text('driver_name'),
+    driverPhone: text('driver_phone'),
+    sealStatus: text('seal_status').notNull(),
+    sealNumber: text('seal_number'),
+    packagesDeclared: integer('packages_declared'),
+    packagesCounted: integer('packages_counted'),
+    dockDoor: text('dock_door'),
+    gatedInAt: timestamp('gated_in_at', { withTimezone: true, mode: 'string' }).notNull(),
+    unloadStartedAt: timestamp('unload_started_at', { withTimezone: true, mode: 'string' }),
+    unloadEndedAt: timestamp('unload_ended_at', { withTimezone: true, mode: 'string' }),
+    gatedOutAt: timestamp('gated_out_at', { withTimezone: true, mode: 'string' }),
+    recordedBy: uuid('recorded_by').notNull(),
+    unloadStartedBy: uuid('unload_started_by'),
+    unloadEndedBy: uuid('unload_ended_by'),
+    gatedOutBy: uuid('gated_out_by'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('gate_ins_tenant_code_unique').on(table.tenantId, table.code),
+    // The list's keyset (newest gated-in first) and the device's open set.
+    index('gate_ins_tenant_warehouse_status_gated_in_idx').on(
+      table.tenantId,
+      table.warehouseId,
+      table.status,
+      table.gatedInAt.desc(),
+    ),
+  ],
+);
+
+export type GateInRow = typeof gateIns.$inferSelect;
+
+/**
+ * Story 2-3a — the supplier documents a gate-in carries (decision 3): several
+ * per visit, each an invoice, a delivery challan or a bill of entry with its
+ * number, date, optional 12-digit inward e-way bill and optionally the PO or
+ * ASN it covers. Written only as a full set by the gate-in create and amend.
+ * CHECKs and RLS in `drizzle/0086_gate_ins.sql` only.
+ */
+export const gateInDocuments = pgTable(
+  'gate_in_documents',
+  {
+    id: uuid('id')
+      .primaryKey()
+      .$defaultFn(() => uuidv7()),
+    tenantId: uuid('tenant_id').notNull(),
+    gateInId: uuid('gate_in_id').notNull(),
+    position: integer('position').notNull(),
+    kind: text('kind').notNull(),
+    number: text('number').notNull(),
+    documentDate: date('document_date', { mode: 'string' }).notNull(),
+    ewayBillNo: text('eway_bill_no'),
+    poId: uuid('po_id'),
+    asnId: uuid('asn_id'),
+    ...tenantTimestamps,
+  },
+  (table) => [
+    uniqueIndex('gate_in_documents_tenant_gate_in_position_unique').on(table.tenantId, table.gateInId, table.position),
+  ],
+);
+
+export type GateInDocumentRow = typeof gateInDocuments.$inferSelect;
 
 /**
  * GRN lines (Story 3.3): one row per received (sku, batch) line — **physical

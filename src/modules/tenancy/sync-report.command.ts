@@ -109,7 +109,13 @@ export type RejectedOpType =
   // Story 1-4b (decision 2) — a goods receipt BOOKED blind or unmatched
   // lines of an inactive SKU; the row flags them for a look. SERVER-RAISED
   // only; Discard ONLY (the web labels it Acknowledge) — it books nothing.
-  | 'grn.inactive-sku-received';
+  | 'grn.inactive-sku-received'
+  // Story 2-3a — the dock handheld's gate-in unload (start, or end with the
+  // packages counted), refused on replay (an unknown gate-in, a malformed
+  // body, a role that lost `gate.manage`). DEVICE-UPLOADED; Discard ONLY: the
+  // dock re-records the unload on the web, or it was already recorded (a
+  // late duplicate settles 200 `applied: false` and never reaches here).
+  | 'gate-in.unload';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -124,6 +130,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.shelf-life-refused',
   'grn.inactive-sku-received',
   'grn.licence-refused',
+  'gate-in.unload',
 ];
 
 /**
@@ -181,6 +188,11 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   // Story 1-6d — the licence-refused lines: Apply (owner only, with a note)
   // re-runs them with the licence check waived, or Discard. No recount.
   'grn.licence-refused': ['apply', 'discard'],
+  // Story 2-3a — a refused gate-in unload: Discard only. Re-applying would be
+  // refused again (the gate-in is unknown, or the body malformed); the remedy
+  // is to record the unload on the web. Excluded from `ApplicableOpType`, so
+  // tenancy never imports the gate-in command.
+  'gate-in.unload': ['discard'],
 };
 
 /** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
@@ -190,7 +202,10 @@ export const LICENCE_APPLY_OWNER_ONLY = 'Accepting goods without a valid licence
 export const RESOLVE_NOTE_MAX = 500;
 
 /** The op types the apply arm can re-execute (every type admitting `apply`). */
-type ApplicableOpType = Exclude<RejectedOpType, 'return.receive' | 'grn.lines-refused' | 'grn.inactive-sku-received'>;
+type ApplicableOpType = Exclude<
+  RejectedOpType,
+  'return.receive' | 'grn.lines-refused' | 'grn.inactive-sku-received' | 'gate-in.unload'
+>;
 
 function isApplicableOpType(opType: RejectedOpType): opType is ApplicableOpType {
   return REJECTED_OP_DECISIONS_BY_TYPE[opType].includes('apply');
@@ -313,6 +328,10 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     // Story 21-6 — absent on every pre-21-6 payload (uuid-or-null admits it).
     ['asnId', 'uuid-or-null'],
     ['blindReasonCode', 'string-or-null'],
+    // Story 2-3a — the gate-in link, absent on every older payload. Any string:
+    // the receipt resolves a non-uuid to not-linked, so it must never refuse
+    // the whole report.
+    ['gateInId', 'string-or-null'],
     ['lines', 'array'],
   ],
   'putaway.place': [
@@ -368,6 +387,8 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['poId', 'uuid-or-null'],
     ['asnId', 'uuid-or-null'],
     ['blindReasonCode', 'string-or-null'],
+    // Story 2-3a — the original receipt's gate-in, present only when it named one.
+    ['gateInId', 'uuid-or-null'],
     ['lines', 'array'],
     ['refusals', 'array'],
   ],
@@ -380,6 +401,8 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
     ['poId', 'uuid-or-null'],
     ['asnId', 'uuid-or-null'],
     ['blindReasonCode', 'string-or-null'],
+    // Story 2-3a — the original receipt's gate-in, present only when it named one.
+    ['gateInId', 'uuid-or-null'],
     ['lines', 'array'],
     ['refusals', 'array'],
   ],
@@ -392,6 +415,14 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
   ],
   // Story 1-1 — server-raised: the receipt, its client and the refused lines
   // aligned with `refusals`.
+  // Story 2-3a — the handheld's unload as it enqueued it.
+  // `gateInId` any string: the device's own op, refused on replay — a
+  // malformed id must still reach the queue (to be discarded), never refuse
+  // the whole report.
+  'gate-in.unload': [
+    ['gateInId', 'string'],
+    ['phase', 'string'],
+  ],
   'grn.lines-refused': [
     ['warehouseId', 'uuid'],
     // Null when every line was refused — no receipt was recorded (decision 6).
@@ -1432,6 +1463,8 @@ export class SyncReportCommand {
             // hashes it only when present, so an older op re-applies
             // byte-identically and the client is derived from its first line.
             ...(typeof payload.clientId === 'string' ? { clientId: payload.clientId } : {}),
+            // Story 2-3a: the gate-in link — absent stays absent (hashed only when present).
+            ...(typeof payload.gateInId === 'string' ? { gateInId: payload.gateInId } : {}),
             // The op's business time: the payload's own, else the row's
             // opOccurredAt stamp (the device-sealed instant).
             occurredAt: opTime,
@@ -1457,6 +1490,8 @@ export class SyncReportCommand {
             ...(typeof payload.asnId === 'string' ? { asnId: payload.asnId } : {}),
             blindReasonCode: (payload.blindReasonCode ?? null) as string | null,
             ...(typeof payload.clientId === 'string' ? { clientId: payload.clientId } : {}),
+            // Story 2-3a (D1) — the original receipt's gate-in, so the accepted re-run links too.
+            ...(typeof payload.gateInId === 'string' ? { gateInId: payload.gateInId } : {}),
             occurredAt: opTime,
             lines: payload.lines as unknown as GrnCommand['lines'],
             shelfLifeWaiver: { byUserId: resolver.actorUserId, note: resolver.note ?? '' },
@@ -1482,6 +1517,8 @@ export class SyncReportCommand {
             ...(typeof payload.asnId === 'string' ? { asnId: payload.asnId } : {}),
             blindReasonCode: (payload.blindReasonCode ?? null) as string | null,
             ...(typeof payload.clientId === 'string' ? { clientId: payload.clientId } : {}),
+            // Story 2-3a (D1) — the original receipt's gate-in, so the accepted re-run links too.
+            ...(typeof payload.gateInId === 'string' ? { gateInId: payload.gateInId } : {}),
             occurredAt: opTime,
             lines: payload.lines as unknown as GrnCommand['lines'],
             // Carried: audited when it was granted — never a second row here.

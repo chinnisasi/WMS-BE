@@ -35,6 +35,8 @@ import { canonicalInstant, fullPrecisionInstant } from '../../shared/primitives/
 import { fromMilli } from '../../shared/primitives/quantity';
 import { OPEN_ASN_STATUSES, asnLineSnapshot, type AsnLineSnapshot } from './asn.command';
 import { partnerNamesInTx, type VendorSnapshotV1 } from '../partners/partners.facade';
+import { gateInLabelsInTx, openGateInsInTx, type OpenGateInView } from './gate-in.read';
+import { gateInClock } from './gate-in.command';
 
 /** One GRN header row of the GRN-list read (line counts + unit sums ride along). */
 export interface GoodsReceiptEntry {
@@ -49,6 +51,10 @@ export interface GoodsReceiptEntry {
   /** Story 1-1 — the receipt's client; absent on an older receipt 0076 could not attribute. */
   readonly clientId?: string;
   readonly blindReasonCode: string | null;
+  /** Story 2-3a — the linked gate-in (id, code, and its vehicle when it has one); absent when unlinked. */
+  readonly gateInId?: string;
+  readonly gateInCode?: string;
+  readonly vehicleNo?: string;
   readonly status: string;
   readonly recordedBy: string;
   readonly occurredAt: string;
@@ -198,6 +204,8 @@ export interface CatalogSnapshot {
     readonly suggestedBin: { readonly binId: string; readonly binCode: string } | null;
     readonly rationale: string;
   }[];
+  /** Story 2-3a (additive): the open gate-ins the dock unloads and receives against (decision 15). */
+  readonly openGateIns: readonly OpenGateInView[];
 }
 
 export const DEFAULT_RECEIVING_PAGE_SIZE = 50;
@@ -347,6 +355,7 @@ export class ReceivingFacade {
           asnCode: advanceShipmentNotices.asnCode,
           clientId: goodsReceiptNotes.clientId,
           blindReasonCode: goodsReceiptNotes.blindReasonCode,
+          gateInId: goodsReceiptNotes.gateInId,
           status: goodsReceiptNotes.status,
           recordedBy: goodsReceiptNotes.recordedBy,
           occurredAt: goodsReceiptNotes.occurredAt,
@@ -393,12 +402,23 @@ export class ReceivingFacade {
                 },
               ]),
             );
+      // Story 2-3a — the linked gate-ins' code and vehicle, one read over the page.
+      const gateInLabels = await gateInLabelsInTx(
+        tx,
+        tenantId,
+        rows.map((row) => row.gateInId).filter((id): id is string => id !== null),
+      );
       const items = rows.map((full) => {
         // `createdAtText` is the cursor-only projection — never in the body.
-        const { createdAtText, asnId, asnCode, clientId, ...row } = full;
+        const { createdAtText, asnId, asnCode, clientId, gateInId, ...row } = full;
         void createdAtText;
+        const gateIn = gateInId === null ? undefined : gateInLabels.get(gateInId);
         return {
         ...row,
+        // Story 2-3a: present only on a linked receipt.
+        ...(gateInId === null || gateIn === undefined
+          ? {}
+          : { gateInId, gateInCode: gateIn.code, ...(gateIn.vehicleNo === null ? {} : { vehicleNo: gateIn.vehicleNo }) }),
         // Story 21-6: present only on an ASN receipt.
         ...(asnId === null ? {} : { asnId, ...(asnCode === null ? {} : { asnCode }) }),
         // Story 1-1: absent on an older receipt the backfill left unattributed.
@@ -602,6 +622,8 @@ export class ReceivingFacade {
       // rather than four MVCC snapshots stitched together.
       const binSummaries = await this.putaway.getBinSummariesInTx(tx, tenantId, warehouseId);
       const putawayTasks = await this.putaway.getPutawayTasksInTx(tx, tenantId, warehouseId);
+      // Story 2-3a: the open gate-ins — an …InTx read on THIS transaction (Gotcha 2).
+      const openGateIns = await openGateInsInTx(tx, tenantId, warehouseId, gateInClock.now());
       return {
         generatedAt: new Date().toISOString(),
         warehouseId,
@@ -625,6 +647,7 @@ export class ReceivingFacade {
         })),
         bins: binSummaries,
         putawayTasks: putawayTasks.map((task) => ({ ...task })),
+        openGateIns,
       };
     });
   }

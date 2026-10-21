@@ -126,6 +126,8 @@ export class ReceivingController {
         blindReasonCode: dto.blindReasonCode ?? null,
         // Story 1-1: absent stays absent (hashed only when present).
         ...(dto.clientId === undefined ? {} : { clientId: dto.clientId }),
+        // Story 2-3a: the gate-in link — absent stays absent (hashed only when present).
+        ...(dto.gateInId === undefined ? {} : { gateInId: dto.gateInId }),
         occurredAt: dto.occurredAt,
         lines: dto.lines.map((line) => ({
           poLineId: line.poLineId ?? null,
@@ -250,6 +252,8 @@ export class ReceivingController {
         lines: rma.lines.map((line) => ({ ...line, batchCodes: [...line.batchCodes], serials: line.serials.map((serial) => ({ ...serial })) })),
       })),
       clients,
+      // Story 2-3a — the open gate-ins, copied key by key (a mutable DTO array).
+      openGateIns: snapshot.openGateIns.map((gateIn) => ({ ...gateIn, documents: gateIn.documents.map((doc) => ({ ...doc })) })),
     };
   }
 

@@ -266,6 +266,63 @@ export async function assertVendorLinkedInTx(
 }
 
 /**
+ * Story 2-3a — a transporter as a gate-in freezes it: the vendor snapshot's
+ * v1 shape (`vendorSnapshotOf`), every key present, null where empty. Frozen
+ * at record time (and re-frozen only when an amend names another
+ * transporter); a partner edit never rewrites it.
+ */
+export type TransporterSnapshotV1 = VendorSnapshotV1;
+
+/**
+ * Story 2-3a (decision 4) — THE transporter guard of a gate-in (its create,
+ * and an amend that names a different transporter), on the caller's
+ * transaction. A transporter is never linked to a client (`PARTNER_LINK_ROLES`
+ * — shared by every client), so this reads only the partner row, `FOR KEY
+ * SHARE` — the PO guard's mode: it conflicts only with the status flip's
+ * `FOR UPDATE`, so a deactivation and a gate-in serialise, while an edit of
+ * the partner's non-key columns never queues the gate desk.
+ *
+ * Refusals, in order: unknown partner 404 · no transporter role 409
+ * `partner-not-transporter` · inactive 409 `transporter-inactive`. Returns
+ * the v1 snapshot the gate-in freezes.
+ */
+export async function assertTransporterInTx(
+  tx: TenantTx,
+  tenantId: string,
+  partnerId: string,
+): Promise<TransporterSnapshotV1> {
+  const partnerRows = UUID_RE.test(partnerId)
+    ? await tx
+        .select()
+        .from(businessPartners)
+        .where(and(eq(businessPartners.tenantId, tenantId), eq(businessPartners.id, partnerId)))
+        .limit(1)
+        .for('key share')
+    : [];
+  const partner = partnerRows[0];
+  if (partner === undefined) {
+    throw new ProblemException('not-found', 404, 'Transporter not found', 'No transporter partner with this id exists in this tenant.');
+  }
+  if (!partner.roles.includes('transporter')) {
+    throw new ProblemException(
+      'partner-not-transporter',
+      409,
+      'Partner is not a transporter',
+      `Partner "${partner.code}" does not have the transporter role — add the role in Settings → Partners, choose a transporter, or type the transporter's name.`,
+    );
+  }
+  if (partner.status !== 'active') {
+    throw new ProblemException(
+      'transporter-inactive',
+      409,
+      'Transporter is inactive',
+      `Transporter "${partner.code}" is inactive — it cannot go on a new gate-in. Reactivate it in Settings → Partners, choose another transporter, or type the name.`,
+    );
+  }
+  return vendorSnapshotOf(partner);
+}
+
+/**
  * Story 1-3 — the client's DEFAULT vendor (decision 2): the active partner
  * holding the vendor role whose ACTIVE vendor link to the client is the
  * default (at most one — the partial unique). Null when the client has none:
