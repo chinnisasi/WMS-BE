@@ -902,7 +902,12 @@ describe('users, roles, and permission gating (e2e)', () => {
     // and gate out an inbound vehicle: owner, ops_manager AND operator (the
     // gate desk and the dock are floor work; the handheld records the
     // unload); never the accountant or a client.
-    expect([...CAPABILITIES]).toHaveLength(46);
+    // Story 3-1 grows it to 47 with `stock.move` — the bin-to-bin move: owner,
+    // ops_manager AND operator (moving stock along the shelves is floor work);
+    // never the accountant or a client. A secure origin or target still
+    // answers the cage gate, which the operator does not hold.
+    expect([...CAPABILITIES]).toHaveLength(47);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('stock.move'))).toEqual(['owner', 'ops_manager', 'operator']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('gate.manage'))).toEqual(['owner', 'ops_manager', 'operator']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('licences.manage'))).toEqual(['owner']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('returns.manage'))).toEqual(['owner', 'ops_manager']);

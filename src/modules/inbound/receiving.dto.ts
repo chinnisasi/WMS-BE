@@ -1067,6 +1067,13 @@ export class CatalogSnapshotSkuDto {
     description: 'Story 1-6a: the dangerous-goods identity, null when the SKU is not a dangerous good',
   })
   dg!: CatalogSnapshotDgDto | null;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Story 3-1: the SKU is a kit (a kit holds no stock — the handheld refuses a move of it offline). An older server omits it; the device reads absence as false',
+  })
+  isKit?: boolean;
 }
 
 
@@ -1380,6 +1387,15 @@ export class CatalogOpenReturnDto {
   lines!: readonly CatalogOpenReturnLineDto[];
 }
 
+/** Story 3-1 — one move reason as the device snapshot carries it. */
+export class CatalogMoveReasonDto {
+  @ApiProperty({ enum: ['consolidate', 're-slot', 'make-room', 'found-misplaced', 'client-request', 'other'] })
+  code!: string;
+
+  @ApiProperty({ description: 'The reason needs a note beside it (the reason `other`)' })
+  noteRequired!: boolean;
+}
+
 export class CatalogSnapshotResponse {
   @ApiProperty({ description: 'ISO-8601 UTC capture time' })
   generatedAt!: string;
@@ -1460,4 +1476,11 @@ export class CatalogSnapshotResponse {
     description: 'Story 2-4a (additive): the short reason vocabulary — the Short control\'s gate, as receiptDamageReasons',
   })
   receiptShortReasons!: readonly string[];
+
+  @ApiProperty({
+    type: [CatalogMoveReasonDto],
+    description:
+      'Story 3-1 (additive): the bin-to-bin move\'s reason vocabulary, in order — the handheld\'s reason chips. A reason with noteRequired needs a note (up to 200 characters). An older server omits it, and the handheld then offers no Move stock',
+  })
+  moveReasons!: readonly CatalogMoveReasonDto[];
 }

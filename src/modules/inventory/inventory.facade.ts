@@ -2,7 +2,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
-import { batchOnHand, bins, ledgerEvents, skus, stockOnHand } from '../../shared/db/schema';
+import { batchOnHand, bins, inventoryQuarantines, ledgerEvents, skus, stockOnHand } from '../../shared/db/schema';
 import { getClientLabelsInTx, skuCodeLabelsInTx } from '../clients/clients.facade';
 import type { LedgerEvent, UserRole } from '../../shared/db/schema';
 import { skuOfClient } from '../../shared/db/client-filter';
@@ -1320,6 +1320,41 @@ export class InventoryFacade {
   }
 
   /**
+   * Story 3-1 — which of `binIds` hold an OPEN reconcile quarantine of
+   * (sku, bin) in this warehouse, in the caller's transaction. The bin-to-bin
+   * move refuses a move whose origin OR target scope is quarantined (409
+   * `move-scope-quarantined`): a quarantined scope is excluded from ATP, so a
+   * move out of it would raise ATP with untrusted units, and a move into it
+   * would lower ATP — the move promises to change neither. A read of the
+   * inventory-owned table, so it lives here (the PROJECTION_OWNER seam).
+   */
+  async openQuarantinedBinsInTx(
+    tx: TenantTx,
+    tenantId: string,
+    warehouseId: string,
+    skuId: string,
+    binIds: readonly string[],
+  ): Promise<readonly string[]> {
+    if (binIds.length === 0) {
+      return [];
+    }
+    const rows = await tx
+      .select({ binId: inventoryQuarantines.binId })
+      .from(inventoryQuarantines)
+      .where(
+        and(
+          eq(inventoryQuarantines.tenantId, tenantId),
+          eq(inventoryQuarantines.warehouseId, warehouseId),
+          eq(inventoryQuarantines.skuId, skuId),
+          inArray(inventoryQuarantines.binId, [...new Set(binIds)]),
+          eq(inventoryQuarantines.status, 'open'),
+        ),
+      )
+      .orderBy(asc(inventoryQuarantines.binId));
+    return rows.map((row) => row.binId);
+  }
+
+  /**
    * Story 5-3 (the review's seam fix): the DISTINCT bin ids of THIS
    * warehouse holding a POSITIVE quantity of any SKU whose ABC class equals
    * the argument, in the caller's transaction — the count scheduler's
@@ -2274,8 +2309,16 @@ export class InventoryFacade {
       readonly binId: string;
       readonly intakes: readonly { readonly skuId: string; readonly qtyMilli: number }[];
       readonly role: UserRole;
+      /**
+       * Story 3-1 — the writer named in the refusal wording: `transfer` (the
+       * default — the 5-1 inbound confirm's details stay byte-identical) or
+       * `move` (the bin-to-bin move). The machine codes and statuses are the
+       * same either way.
+       */
+      readonly subject?: 'transfer' | 'move';
     },
   ): Promise<{ readonly binId: string; readonly binCode: string }> {
+    const subject = args.subject ?? 'transfer';
     // The bin row, `.for('update')` — the same mutex the placement command
     // takes (two concurrent intakes would otherwise both pass capacity and
     // then append serially — over capacity). The putaway order — bin-row →
@@ -2333,7 +2376,7 @@ export class InventoryFacade {
         'validation-failed',
         400,
         'Bin is a system bin',
-        `Bin "${bin.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns/Damaged) — transfer intake lands in storage bins only.`,
+        `Bin "${bin.code}" is a system bin (Receiving/QC-hold/In-Transit/Returns/Damaged) — ${subject} intake lands in storage bins only.`,
       );
     }
     if (bin.retiredAt !== null) {
@@ -2341,7 +2384,7 @@ export class InventoryFacade {
         'bin-retired',
         409,
         'Target bin is retired',
-        `Bin "${bin.code}" is retired — transfer intake into it is refused; retirement is terminal.`,
+        `Bin "${bin.code}" is retired — ${subject} intake into it is refused; retirement is terminal.`,
       );
     }
     if (bin.blocked) {
@@ -2349,7 +2392,7 @@ export class InventoryFacade {
         'bin-blocked',
         409,
         'Target bin is blocked',
-        `Bin "${bin.code}" is blocked — transfer intake into it is refused until it is unblocked.`,
+        `Bin "${bin.code}" is blocked — ${subject} intake into it is refused until it is unblocked.`,
       );
     }
 
@@ -2462,7 +2505,7 @@ export class InventoryFacade {
           409,
           'Bulk asset cannot hold two SKUs',
           `Bin "${bin.code}" is a ${bin.type} (a bulk asset holds exactly ONE SKU): ` +
-            `it holds ${holding.map((code) => `"${code}"`).join(', ')} and the transfer would land ` +
+            `it holds ${holding.map((code) => `"${code}"`).join(', ')} and the ${subject} would land ` +
             `${moving.map((code) => `"${code}"`).join(', ')} — land it in another bulk asset, or ` +
             'top up the holding SKU.',
         );
@@ -2583,7 +2626,7 @@ export class InventoryFacade {
           409,
           'Target bin would exceed its weight capacity',
           `Bin "${bin.code}" would carry ${fromMilliTextFacade(weightAfter)} g of its ${bin.maxWeightGrams} g ` +
-            'max weight — the transfer would exceed its weight capacity.',
+            `max weight — the ${subject} would exceed its weight capacity.`,
         );
       }
     }
@@ -2601,7 +2644,7 @@ export class InventoryFacade {
           409,
           'Target bin would exceed its volumetric capacity',
           `Bin "${bin.code}" would hold ${fromMilliTextFacade(volumeAfter)} mm³ of its ` +
-            `${bin.lengthMm * bin.widthMm * bin.heightMm} mm³ — the transfer would exceed its volumetric capacity.`,
+            `${bin.lengthMm * bin.widthMm * bin.heightMm} mm³ — the ${subject} would exceed its volumetric capacity.`,
         );
       }
     }

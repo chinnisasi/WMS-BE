@@ -272,6 +272,20 @@ export type LedgerReferenceDoc =
       readonly returnReceiptId: string;
       readonly rmaId: string;
       readonly rmaLineId: string;
+    }
+  // Story 3-1 — the bin-to-bin move arm: every `stock.moved` event names the
+  // move it belongs to (one move = one request: a batch arm, or one event per
+  // serial unit), the operator's reason code and — only when given — the
+  // note. The note is OMITTED when absent, never `null` (the 9-3a rule), so
+  // the canonical bytes carry exactly what was said. NEW union arm — the
+  // earlier kinds are never reshaped.
+  | {
+      readonly kind: 'bin-move';
+      readonly moveId: string;
+      /** The move reason (`MOVE_REASON_CODES`, movements/move-reason.ts). */
+      readonly reasonCode: string;
+      /** The operator's note, trimmed; present only when one was given. */
+      readonly note?: string;
     };
 // Later stories extend this union with NEW kinds — never by reshaping an
 // existing arm.
@@ -594,6 +608,27 @@ registerLedgerEventType({
   referenceKinds: ['grn-receipt'],
   allowsBatchArm: true,
   allowsSerialArm: false,
+});
+
+/**
+ * Grammar v1, Story 3-1 — the bin-to-bin move: stock relocating between two
+ * bins of ONE warehouse on the operator's say-so (the handheld's `stock.move`
+ * op or the web Moves page). A RELOCATION like putaway and merge — `fromBinId`
+ * (the origin) and `toBinId` (the target) on ONE event, the magnitude folding
+ * both projections, so the origin is debited and the target credited in the
+ * same transaction. One event per batch arm; a serial-tracked move writes one
+ * magnitude-1 event per serial unit, each carrying the batch its latest event
+ * carried (the merge convention). Both identity arms are open. It meters 0
+ * (a `both`-shape event) and changes no ATP: both bins are storage bins.
+ * Registers sinceVersion 1 — no new grammar version; the reference-doc union
+ * appends only.
+ */
+registerLedgerEventType({
+  type: 'stock.moved',
+  sinceVersion: 1,
+  referenceKinds: ['bin-move'],
+  allowsBatchArm: true,
+  allowsSerialArm: true,
 });
 
 /** The registered definition — `undefined` for an unregistered type. */

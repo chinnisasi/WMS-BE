@@ -739,7 +739,8 @@ describe('client portal (e2e, story 21-7)', () => {
 
     it('the AnySessionGuard web arm refuses a portal token with the fence detail; device routes refuse it as no device token', async () => {
       const anyRoutes = routes().filter((route) => route.guards.includes(AnySessionGuard));
-      expect(anyRoutes).toHaveLength(3);
+      // Story 3-1 adds the fourth either-family route: the bin-to-bin move.
+      expect(anyRoutes).toHaveLength(4);
       for (const route of anyRoutes) {
         const res = await send(route.method, route.path, portalA.token);
         expect({ route: route.path, status: res.status, code: res.body.code, detail: res.body.detail }).toEqual({

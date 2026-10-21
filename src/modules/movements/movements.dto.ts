@@ -17,6 +17,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
+import { MAX_MOVE_SERIALS, MOVE_NOTE_MAX, MOVE_REASON_CODES } from './move-reason';
 
 /**
  * The movements HTTP surface's DTOs (Story 5-1) — class-validator +
@@ -352,4 +353,127 @@ export class TransferDetailResponse {
 
   @ApiProperty({ type: [TransferLegEventResponseDto] })
   events!: TransferLegEventResponseDto[];
+}
+// ── story 3-1: the bin-to-bin move ───────────────────────────────────────────
+
+/**
+ * POST /tenants/{tenantId}/warehouses/{warehouseId}/inventory/moves body — the
+ * handheld's `stock.move` op payload (minus `warehouseId`, which rides the
+ * path) and the web Moves page's form. The command re-validates every rule
+ * (the review queue's Apply re-runs a stored payload without this DTO).
+ */
+export class MoveStockDto {
+  @ApiProperty({ format: 'uuid' })
+  @IsUUID()
+  skuId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The origin bin — the units leave it' })
+  @IsUUID()
+  fromBinId!: string;
+
+  @ApiProperty({ format: 'uuid', description: 'The target bin — the units land in it (a different bin of the same warehouse)' })
+  @IsUUID()
+  toBinId!: string;
+
+  @ApiProperty({
+    description: `Quantity to move. ${QUANTITY_FIELD_DESCRIPTION} On a serial-tracked SKU it equals the number of serials.`,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
+  })
+  @Type(() => Number)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
+  qty!: number;
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    maxLength: 100,
+    description:
+      'The batch CODE moved — required for a batch-tracked SKU (unknown → 404 not-found), refused on an untracked one and beside serials (a serial move derives each serial\'s batch)',
+  })
+  @IsOptional()
+  @IsString()
+  @Length(1, 100)
+  batchCode?: string | null;
+
+  @ApiProperty({
+    required: false,
+    type: [String],
+    nullable: true,
+    maxItems: MAX_MOVE_SERIALS,
+    description: 'The serial numbers moved — required for a serial-tracked SKU, one per unit, distinct, at most 500',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_MOVE_SERIALS)
+  @IsString({ each: true })
+  @Length(1, 100, { each: true })
+  serials?: string[] | null;
+
+  @ApiProperty({ enum: [...MOVE_REASON_CODES], description: 'Why the stock moved; `other` needs a note' })
+  @IsIn(MOVE_REASON_CODES)
+  reasonCode!: (typeof MOVE_REASON_CODES)[number];
+
+  @ApiProperty({
+    required: false,
+    type: String,
+    nullable: true,
+    maxLength: MOVE_NOTE_MAX,
+    description: 'Up to 200 characters, trimmed; required with the reason `other`',
+  })
+  @IsOptional()
+  @IsString()
+  @Length(0, MOVE_NOTE_MAX)
+  note?: string | null;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Handheld only — the op\'s business time (ISO-8601 UTC, Z-suffixed), required there; a web session sending it is refused 400 (a web move happens now)',
+    minLength: 20,
+    maxLength: 35,
+  })
+  @IsOptional()
+  @IsString()
+  @Length(20, 35)
+  occurredAt?: string;
+}
+
+/** One `stock.moved` event of a move, base units at the edge. */
+export class MoveEventDto {
+  @ApiProperty({ type: 'integer' })
+  seq!: number;
+
+  @ApiProperty({ format: 'uuid' })
+  skuId!: string;
+
+  @ApiProperty({ description: 'The event\'s magnitude in BASE UoM' })
+  quantity!: number;
+
+  @ApiProperty({ format: 'uuid' })
+  fromBinId!: string;
+
+  @ApiProperty({ format: 'uuid' })
+  toBinId!: string;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The catalog batch id (null on an untracked SKU)' })
+  batchRef!: string | null;
+
+  @ApiProperty({ type: String, nullable: true, format: 'uuid', description: 'The catalog serial id (one event per serial unit)' })
+  serialRef!: string | null;
+
+  @ApiProperty({ description: 'ISO-8601 UTC business time — the handheld\'s confirm time, or the commit time on the web' })
+  occurredAt!: string;
+}
+
+/** The move's response body (and the idempotency snapshot). */
+export class MoveStockResponse {
+  @ApiProperty({ format: 'uuid', description: 'The move — every event carries it on referenceDoc.moveId' })
+  moveId!: string;
+
+  @ApiProperty({ type: [MoveEventDto] })
+  events!: MoveEventDto[];
 }

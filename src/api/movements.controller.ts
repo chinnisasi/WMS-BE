@@ -16,6 +16,8 @@ import {
   ConfirmOutboundDto,
   ConfirmOutboundLineDto,
   CreateTransferDto,
+  MoveStockDto,
+  MoveStockResponse,
   TransferDetailResponse,
   TransferListQuery,
   TransferListResponse,
@@ -239,6 +241,75 @@ export class MovementsController {
       key,
     );
     return { transfer: { ...snapshot.transfer }, events: snapshot.events.map((event) => ({ ...event })) };
+  }
+
+  // ── the bin-to-bin move (story 3-1) ─────────────────────────────────────
+
+  @Post(':tenantId/warehouses/:warehouseId/inventory/moves')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(AnySessionGuard)
+  @ApiBearerAuth()
+  @ApiBearerAuth('device')
+  @ApiOperation({
+    summary:
+      'Moves stock between two bins of one warehouse (stock.move — either session family): the handheld\'s queued stock.move op or the web Moves page — one stock.moved ledger event per arm (a batch arm, or one per serial), both bins on each event',
+    description:
+      'Accepts EITHER session family on the one route (the inbound-confirm precedent): a web session, or a device badge-in session (a bare enrollment credential → 401; an op captured by another operator → 409 operator-mismatch). The command re-reads the device, the operator\'s role and the target\'s placement gates in its own transaction. No outbox event; ATP is unchanged.',
+  })
+  @ApiBody({ type: MoveStockDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({ status: HttpStatus.CREATED, type: MoveStockResponse, description: 'Moved: the move id and its events (the idempotency snapshot)' })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or an invalid body — the same bin on both ends, qty not equal to the serial count, a duplicate serial, more than 500 serials, a batchCode beside serials, a reason outside the vocabulary or `other` without a note, a note over 200 characters, occurredAt sent from the web or missing/malformed on the handheld, a batch missing on a batch-tracked SKU or sent for an untracked one, serials missing on a serial-tracked SKU or sent for another, a catch-weight SKU, or a quantity finer than the SKU\'s unit allows (validation-failed)') })
+  @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token of either family, or a device token without a badge-in session (unauthenticated)') })
+  @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), an unknown or revoked device (device-revoked), the caller lacks stock.move (role-denied), or the origin or target bin is secure/cage-class and the actor lacks secure.move (role-denied, FR-42)') })
+  @ApiResponse({ status: 404, ...problemJsonResponse('The warehouse, the SKU, either bin (in this warehouse) or the batch does not exist (not-found), or a serial number is unknown for the SKU (serial-unknown)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A system bin on either end (bin-not-movable), a retired origin or target (bin-retired), the target blocked or refused by a placement gate (bin-blocked, bin-storage-mismatch, bin-client-mismatch, bin-segregation-conflict, bin-occupancy-conflict, bin-full, bin-overweight, bin-volume-exceeded, bin-item-oversize), an open reconcile quarantine on the origin or target scope (move-scope-quarantined), a kit SKU (kit-cannot-hold-stock), the origin holding less than the move (move-source-short), a serial located in another bin (serial-elsewhere), the op captured by another operator (operator-mismatch), or a concurrent idempotent request (conflict)') })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  @ApiParam({ name: 'warehouseId', format: 'uuid' })
+  async moveStock(
+    @Param('tenantId') tenantId: string,
+    @Param('warehouseId') warehouseId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentAnySession() session: AnySession,
+    @Body() dto: MoveStockDto,
+  ): Promise<MoveStockResponse> {
+    assertOwnTenantToken(session.session.tenantId, tenantId);
+    assertUuidParam(warehouseId, 'warehouseId');
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    // The device arm is badge-in required (a bare enrollment credential
+    // carries no operator); X-Op-Operator was checked by the guard.
+    let actorUserId: string;
+    let deviceId: string | null;
+    if (session.family === 'device') {
+      if (session.session.userId === null) {
+        throw badgeInRequired();
+      }
+      actorUserId = session.session.userId;
+      deviceId = session.session.deviceId;
+    } else {
+      actorUserId = session.session.userId;
+      deviceId = null;
+    }
+    const snapshot = await this.movements.moveStock(
+      {
+        tenantId,
+        actorUserId,
+        deviceId,
+        warehouseId,
+        skuId: dto.skuId,
+        fromBinId: dto.fromBinId,
+        toBinId: dto.toBinId,
+        qty: dto.qty,
+        batchCode: dto.batchCode ?? null,
+        serials: dto.serials ?? null,
+        reasonCode: dto.reasonCode,
+        note: dto.note ?? null,
+        occurredAt: dto.occurredAt ?? null,
+      },
+      key,
+    );
+    return { moveId: snapshot.moveId, events: snapshot.events.map((event) => ({ ...event })) };
   }
 
   @Post(':tenantId/movements/transfers/:transferId/cancel')
