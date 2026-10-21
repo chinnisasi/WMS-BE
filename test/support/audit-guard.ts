@@ -98,6 +98,13 @@ export const AUDIT_NO_OP_ARMS = {
   /** Story 1-6d — `LicencePolicyCommand.set` to the state already in force (stores the key with `{ enforce }` — no gap scan). */
   'licencePolicy.put:unchanged': (snapshot: unknown) =>
     isRecord(snapshot) && sameKeys(snapshot, ['enforce']) && typeof snapshot.enforce === 'boolean',
+  /**
+   * Story 2-3a — `GateInCommand.unload` whose phase was already recorded (a
+   * late device replay, or the web after the device): nothing filled, the
+   * key stored with `{ applied: false, gateIn }`, nothing audited or emitted.
+   */
+  'gateIns.unload:already-recorded': (snapshot: unknown) =>
+    isRecord(snapshot) && sameKeys(snapshot, ['applied', 'gateIn']) && snapshot.applied === false && isRecord(snapshot.gateIn),
   /** Story 6-1b — `SecondFactorCommand.reset` of a user with no two-factor sign-in and no enrolment code. */
   'users.resetSecondFactor:not-enrolled': (snapshot: unknown) =>
     isRecord(snapshot) &&

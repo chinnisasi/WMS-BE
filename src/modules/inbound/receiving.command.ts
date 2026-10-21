@@ -70,6 +70,7 @@ import {
   deriveAsnStatusInTx,
   type AsnStatus,
 } from './asn.command';
+import { resolveGateInLinkInTx, type GateInLinkNotLinked } from './gate-in.read';
 
 // ── command inputs ────────────────────────────────────────────────────────────
 
@@ -144,6 +145,14 @@ export interface SubmitGoodsReceiptCommand {
    * the first line's SKU. Hashed only when present.
    */
   readonly clientId?: string | null | undefined;
+  /**
+   * Story 2-3a — the gate-in (the vehicle visit) this receipt came off.
+   * Optional: an older build sends none, and a receipt without one books as
+   * before (decision 5). NEVER refused — an unknown, non-uuid or other
+   * warehouse's id books the receipt unlinked (`gateInLink.not-linked`).
+   * Hashed only when present, right after `clientId`.
+   */
+  readonly gateInId?: string | null | undefined;
   /** Device time (AD-1) — the ledger events' and GRN's business time. */
   readonly occurredAt: string;
   readonly lines: readonly GrnLineInput[];
@@ -380,6 +389,15 @@ export interface GoodsReceiptSnapshot {
      */
     readonly clientId?: string;
     readonly blindReasonCode: string | null;
+    /**
+     * Story 2-3a — the gate-in the receipt is linked to (its id and code),
+     * present only when linked; a snapshot stored before 2-3a, and a receipt
+     * naming none, is byte-identical.
+     */
+    readonly gateInId?: string;
+    readonly gateInCode?: string;
+    /** Story 2-3a — present only when a gate-in was named and did NOT link (why, in a closed vocabulary). */
+    readonly gateInLink?: GateInLinkNotLinked;
     readonly status: string;
     readonly deviceId: string;
     readonly recordedBy: string;
@@ -447,6 +465,8 @@ export interface RefusedReceiptSnapshot {
     readonly shelfLifeReviewOpId?: string;
     /** Story 1-6d — the `grn.licence-refused` row's op id, when one was raised. */
     readonly licenceReviewOpId?: string;
+    /** Story 2-3a — present only when a gate-in was named and did not link (nothing was recorded, so nothing linked). */
+    readonly gateInLink?: GateInLinkNotLinked;
   };
 }
 
@@ -610,6 +630,12 @@ export class ReceivingCommand {
       // older blind op (no client) hashes byte-for-byte as before — pinned by
       // a literal golden in `test/per-client-sku.spec.ts`.
       clientId: command.clientId ?? undefined,
+      // ── story 2-3a: ADDITIVE, the same `?? undefined` rule ─────────────
+      // The gate-in link, hashed only when present — at this fixed position,
+      // right after `clientId` — so every queued older op (and every receipt
+      // naming no gate-in) hashes byte-for-byte as before: the goldens in
+      // `test/per-client-sku.spec.ts` stay identical, and a new one pins this.
+      gateInId: command.gateInId ?? undefined,
       // ── story 1-2b: ADDITIVE, the same `?? undefined` rule ─────────────
       // Set only by the review queue's apply arm (decision 5), so every
       // device op hashes exactly as before; a re-run under the waiver is a
@@ -664,6 +690,9 @@ export class ReceivingCommand {
     // was computed over the command as received.
     const asnId = command.asnId ?? null;
     const requestedClientId = command.clientId ?? null;
+    // Story 2-3a — the named gate-in, normalised (the replay rebuild passes a
+    // stored payload raw: an absent key is null, never `undefined` — D16).
+    const requestedGateInId = command.gateInId ?? null;
     const inputLines: readonly GrnLineInput[] = command.lines.map((line) => ({
       ...line,
       poLineId: line.poLineId ?? null,
@@ -763,6 +792,15 @@ export class ReceivingCommand {
       // Master-data integrity in the write transaction: warehouse in tenant,
       // every line's SKU in tenant (404 before any write).
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
+      // ── story 2-3a: the gate-in link — a PLAIN read, before every lock ──
+      // Before the SKU and the PO/ASN locks (nothing locks a gate-in and then
+      // a document, so no cycle). It never refuses (decision 5): an unknown,
+      // non-uuid or other warehouse's id books the receipt unlinked, said in
+      // `gateInLink`; a gated-out gate-in links.
+      const gateInLink =
+        requestedGateInId === null
+          ? null
+          : await resolveGateInLinkInTx(tx, command.tenantId, command.warehouseId, requestedGateInId);
       const skuById = await this.loadSkus(
         tx,
         command.tenantId,
@@ -1022,6 +1060,8 @@ export class ReceivingCommand {
             ...(review.shelfLifeReviewOpId === null ? {} : { shelfLifeReviewOpId: review.shelfLifeReviewOpId }),
             // Story 1-6d — present only when the licence row was raised.
             ...(review.licenceReviewOpId === null ? {} : { licenceReviewOpId: review.licenceReviewOpId }),
+            // Story 2-3a — the link's refusal only: nothing was recorded, so nothing linked.
+            ...(gateInLink?.notLinked == null ? {} : { gateInLink: gateInLink.notLinked }),
           },
         };
         // The audit row targets the review row: nothing else was written.
@@ -1234,6 +1274,8 @@ export class ReceivingCommand {
         // Story 1-1 — every new GRN stamps its client.
         clientId: receiptClientId,
         blindReasonCode,
+        // Story 2-3a — the linked gate-in, or null (unlinked or none named).
+        gateInId: gateInLink?.linked?.id ?? null,
         status: 'recorded',
         deviceId: command.deviceId,
         recordedBy: command.operatorUserId,
@@ -1769,6 +1811,9 @@ export class ReceivingCommand {
           // mixed-client blind receipt — decision 7).
           ...(receiptClientId === null ? {} : { clientId: receiptClientId }),
           blindReasonCode,
+          // Story 2-3a — present only when linked, or when the named gate-in did not link.
+          ...(gateInLink?.linked == null ? {} : { gateInId: gateInLink.linked.id, gateInCode: gateInLink.linked.code }),
+          ...(gateInLink?.notLinked == null ? {} : { gateInLink: gateInLink.notLinked }),
           status: 'recorded',
           deviceId: command.deviceId,
           recordedBy: command.operatorUserId,
@@ -2827,6 +2872,9 @@ export class ReceivingCommand {
           ...(command.asnId === null || command.asnId === undefined ? {} : { asnId: command.asnId }),
           blindReasonCode: args.blindReasonCode,
           ...(command.clientId === null || command.clientId === undefined ? {} : { clientId: command.clientId }),
+          // Story 2-3a (D1) — the named gate-in rides the row, so an accepted re-run links too
+          // (a uuid only: a non-uuid could never link, and the row's payload probe would refuse it).
+          ...(typeof command.gateInId === 'string' && UUID_RE.test(command.gateInId) ? { gateInId: command.gateInId } : {}),
           occurredAt: args.occurredAt,
           grnId: args.grnId,
           grnCode: args.grnCode,
@@ -2884,6 +2932,9 @@ export class ReceivingCommand {
           ...(command.asnId === null || command.asnId === undefined ? {} : { asnId: command.asnId }),
           blindReasonCode: args.blindReasonCode,
           ...(command.clientId === null || command.clientId === undefined ? {} : { clientId: command.clientId }),
+          // Story 2-3a (D1) — the named gate-in rides the row, so an accepted re-run links too
+          // (a uuid only: a non-uuid could never link, and the row's payload probe would refuse it).
+          ...(typeof command.gateInId === 'string' && UUID_RE.test(command.gateInId) ? { gateInId: command.gateInId } : {}),
           occurredAt: args.occurredAt,
           grnId: args.grnId,
           grnCode: args.grnCode,

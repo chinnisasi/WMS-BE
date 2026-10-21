@@ -1,3 +1,4 @@
+import { EWB_NO_RE } from '../../shared/primitives/vehicle';
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
@@ -75,7 +76,8 @@ const EWB_NO_UNIQUE = 'eway_bills_tenant_ewb_no_unique';
 const RECORD_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
 export const EXPORT_MAX_BILLS = 100;
 export const DISMISS_REASON_MAX = 200;
-export const EWB_NO_RE = /^[0-9]{12}$/;
+// Story 2-3a — lifted to `shared/primitives/vehicle.ts` (the gate-in's inward e-way bill shares it); re-exported unchanged.
+export { EWB_NO_RE } from '../../shared/primitives/vehicle';
 const STATE_CODE_RE = /^[0-9]{2}$/;
 /** Place-of-supply codes NIC cannot take as a domestic bill-from state (Other Territory, Other Country). */
 const UNSUPPORTED_STATE_CODES: ReadonlySet<string> = new Set(['97', '99']);

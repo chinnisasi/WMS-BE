@@ -294,6 +294,16 @@ export const CAPABILITIES = [
   // guard. Mirrored into wms-fe `src/lib/users.ts` (CAPABILITIES +
   // OWNER_ONLY_CAPABILITIES).
   'licences.manage',
+  // Story 2-3a — the gate-in: record an inbound vehicle at the gate, amend it,
+  // record its unload and gate it out (`GateInCommand`). Owner, Ops Manager
+  // AND Operator: the gate desk and the dock are floor work — the dock
+  // handheld records the unload (the operator's badge-in session), and the
+  // gate desk is staffed by floor staff. Accountant absent (reads only), and
+  // never a client. Every staff session READS gate-ins (reads are never
+  // gated); the driver's full phone number is shown only to a holder of this
+  // capability (decision 10). Mirrored into wms-fe `src/lib/users.ts`
+  // (CAPABILITIES — ops_manager is derived there — and the operator grant).
+  'gate.manage',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -375,6 +385,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'eway.manage',
     // Story 13-1 — return authorizations (decision 1: owner + ops manager).
     'returns.manage',
+    // Story 2-3a — the gate-in (owner holds everything).
+    'gate.manage',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
@@ -397,6 +409,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // Story 5-3 — the floor counts the bin (the Count inbox tab's op,
     // mirroring `transfers.execute`).
     'counts.execute',
+    // Story 2-3a — the gate desk and the dock: record the gate-in, its unload
+    // (the handheld's `gate-in.unload`) and its gate-out.
+    'gate.manage',
   ]),
   // Story 8-2b: the accountant's first write — the e-way paperwork (finance
   // work). Story 21-3: the client rate cards (finance work — decision 2,

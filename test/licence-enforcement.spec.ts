@@ -807,6 +807,29 @@ describe('story 1-6d: licence enforcement', () => {
         expect(await grnCount(world, rice.id)).toBe(before + 1);
       });
 
+      it('story 2-3a (D1): a licence-refused receipt against a gate-in — the row carries the gate-in, and the owner\'s accepted re-run links to it', async () => {
+        const gateIn = (
+          await http()
+            .post(`${API}/${world.tenantId}/receiving/gate-ins`)
+            .set('Authorization', `Bearer ${world.ownerToken}`)
+            .set(KEY_HEADER, ulid())
+            .send({ warehouseId: bare.id, vehicleNo: 'MH12LE0001', transporterName: 'Licence Roadways', sealStatus: 'none' })
+            .expect(201)
+        ).body.gateIn as { id: string; code: string };
+        const res = await http()
+          .post(`${API}/${world.tenantId}/receiving/goods-receipts`)
+          .set('Authorization', `Bearer ${world.operatorToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ warehouseId: bare.id, occurredAt: RECEIPT_AT, poId: null, blindReasonCode: 'other', clientId: c, gateInId: gateIn.id, lines: [line(rice.id, 2)] })
+          .expect(201);
+        const opId = res.body.refusedReceipt.licenceReviewOpId as string;
+        const row = await rejectedOp(world, opId);
+        expect(row.payload.gateInId).toBe(gateIn.id);
+        const applied = await resolveRow(world, row.id, { decision: 'apply', note: 'Licence renewal in hand' }).expect(200);
+        const snapshot = (applied.body.outcome as { snapshot: { goodsReceipt: GoodsReceipt & { gateInId?: string; gateInCode?: string } } }).snapshot.goodsReceipt;
+        expect(snapshot).toMatchObject({ gateInId: gateIn.id, gateInCode: gateIn.code });
+      });
+
       it('Apply while off: with enforcement off, an open licence row still needs the owner and a note; the owner’s Apply books', async () => {
         const row = await refusedRow(2);
         await enforce(world, false);

@@ -55,6 +55,7 @@ interface GrnBody {
   asnId?: string | null;
   blindReasonCode?: string | null;
   clientId?: string;
+  gateInId?: string;
   occurredAt: string;
   lines: GrnLine[];
 }
@@ -560,6 +561,28 @@ describe('story 1-1: per-client SKU identity (e2e)', () => {
       const golden =
         `{"tenantId":"${tenantId}","deviceId":"${deviceId}","operatorUserId":"${operatorUserId}","warehouseId":"${wh}",` +
         `"poId":null,"blindReasonCode":"other","clientId":"${beta}","occurredAt":"${occurredAt}",` +
+        `"lines":[{"poLineId":null,"skuId":"${sku('BETA', 'BETA-ONLY')}","batchCode":null,"mfgDate":null,"qty":1}]}`;
+      const stored = (await sql`select payload_hash from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`) as unknown as { payload_hash: string }[];
+      expect(stored[0]!.payload_hash).toBe(createHash('sha256').update(golden, 'utf8').digest('hex'));
+    });
+
+    it('story 2-3a: a named gate-in joins the fingerprint right after clientId (golden) — and an unknown one books unlinked, never refused', async () => {
+      const occurredAt = '2026-10-18T05:02:00.000Z';
+      const key = ulid();
+      const gateInId = uuidv7();
+      const res = await receive(
+        { warehouseId: wh, poId: null, blindReasonCode: 'other', clientId: beta, gateInId, occurredAt, lines: [line(sku('BETA', 'BETA-ONLY'), 1)] },
+        key,
+      ).expect(201);
+      const grn = res.body.goodsReceipt as GoodsReceipt & { gateInId?: string; gateInLink?: unknown };
+      expect(grn.gateInId).toBeUndefined();
+      expect(grn.gateInLink).toEqual({ status: 'not-linked', reason: 'unknown' });
+      // Written out key by key: `gateInId` sits between `clientId` and
+      // `occurredAt`, and is absent from the two goldens above (an
+      // always-present `gateInId: null` would fail them).
+      const golden =
+        `{"tenantId":"${tenantId}","deviceId":"${deviceId}","operatorUserId":"${operatorUserId}","warehouseId":"${wh}",` +
+        `"poId":null,"blindReasonCode":"other","clientId":"${beta}","gateInId":"${gateInId}","occurredAt":"${occurredAt}",` +
         `"lines":[{"poLineId":null,"skuId":"${sku('BETA', 'BETA-ONLY')}","batchCode":null,"mfgDate":null,"qty":1}]}`;
       const stored = (await sql`select payload_hash from idempotency_keys where tenant_id = ${tenantId} and key = ${key}`) as unknown as { payload_hash: string }[];
       expect(stored[0]!.payload_hash).toBe(createHash('sha256').update(golden, 'utf8').digest('hex'));

@@ -63,6 +63,9 @@ export const AUDIT_TARGET_TYPES = [
   'eway_gstin_setting',
   'eway_state_threshold',
   'expiry_alert_policy',
+  // Story 2-3a — an inbound vehicle visit (`gate_in.recorded | amended |
+  // unload_started | unload_ended | gated_out`).
+  'gate_in',
   'goods_receipt',
   'kit',
   // Story 9-3c — a ledger chain break (`ledger_chain_break.acknowledged`).
@@ -234,4 +237,13 @@ export const AUDIT_NEW_ACTIONS = [
   { action: 'licence.enforcement_enabled', targetType: 'licence_policy' },
   { action: 'licence.enforcement_disabled', targetType: 'licence_policy' },
   { action: 'goods_receipt.licence_waived', targetType: 'goods_receipt' },
+  // Story 2-3a — the gate-in (`GateInCommand`). An unload that fills nothing
+  // is a declared no-op (`gateIns.unload:already-recorded` — the key is
+  // stored, nothing audited); an end with no start audits only
+  // `gate_in.unload_ended` (it stamps the start too).
+  { action: 'gate_in.recorded', targetType: 'gate_in' },
+  { action: 'gate_in.amended', targetType: 'gate_in' },
+  { action: 'gate_in.unload_started', targetType: 'gate_in' },
+  { action: 'gate_in.unload_ended', targetType: 'gate_in' },
+  { action: 'gate_in.gated_out', targetType: 'gate_in' },
 ] as const satisfies readonly { action: string; targetType: AuditTargetType }[];

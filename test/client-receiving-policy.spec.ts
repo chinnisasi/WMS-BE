@@ -851,6 +851,31 @@ describe('story 1-2b: the client receiving policy (e2e)', () => {
       });
     });
 
+    it('story 2-3a (D1): a short-dated receipt against a gate-in — the row carries the gate-in, and the accepted re-run links to it', async () => {
+      const gateIn = (
+        await http()
+          .post(`${API}/${tenantId}/receiving/gate-ins`)
+          .set('Authorization', `Bearer ${ownerToken}`)
+          .set(KEY_HEADER, ulid())
+          .send({ warehouseId: wh, vehicleNo: 'KA01AB4321', transporterName: 'Shelf Life Roadways', sealStatus: 'none' })
+          .expect(201)
+      ).body.gateIn as { id: string; code: string };
+      const res = await receive(
+        blind('EXP', [line(sku('EXP', 'EXP-B'), 3, { batchCode: 'B-GATE', expiryDate: '2026-12-03' })], { gateInId: gateIn.id }),
+      ).expect(201);
+      expect(res.body.goodsReceipt).toBeNull();
+      // Nothing was recorded, and the gate-in resolved — so no link and no refusal of it.
+      expect(res.body.refusedReceipt.gateInLink).toBeUndefined();
+      const opId = res.body.refusedReceipt.shelfLifeReviewOpId as string;
+      const row = await rejectedOp(opId);
+      expect(row.payload.gateInId).toBe(gateIn.id);
+      const applied = await resolve(row.id, { decision: 'apply', note: 'Client accepted short-dated stock' }).expect(200);
+      const snapshot = (applied.body.outcome as { snapshot: { goodsReceipt: GoodsReceipt & { gateInId?: string; gateInCode?: string } } }).snapshot.goodsReceipt;
+      expect(snapshot).toMatchObject({ gateInId: gateIn.id, gateInCode: gateIn.code });
+      const stored = (await sql`select gate_in_id from goods_receipt_notes where id = ${snapshot.id}`) as unknown as { gate_in_id: string }[];
+      expect(stored[0]!.gate_in_id).toBe(gateIn.id);
+    });
+
     it('a retried Accept after the re-run committed replays — whoever retries, whatever the note (only the waiver\'s FACT is hashed)', async () => {
       const res = await receive(blind('EXP', [line(sku('EXP', 'EXP-B'), 2, { batchCode: 'B-RETRY', expiryDate: '2026-12-02' })])).expect(201);
       const opId = res.body.refusedReceipt.shelfLifeReviewOpId as string;
