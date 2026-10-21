@@ -27,6 +27,7 @@ import {
   licenceFacts,
   siteLicenceCovers,
   missingLicencePhrase,
+  type LicenceFacts,
   type LicenceHolder,
   type LicenceNeed,
 } from '../../shared/primitives/licence';
@@ -91,6 +92,20 @@ export async function licenceCoverageInTx(
   },
 ): Promise<UncoveredNeed[]> {
   if (!args.parties.some((party) => party.needs.length > 0)) return [];
+  return licenceCoverageOf(await activeLicenceFactsInTx(tx, args.tenantId), args);
+}
+
+/**
+ * Every ACTIVE licence of the tenant, as the coverage rule reads them —
+ * client and site licences alike. Story 4-1a: split out of
+ * `licenceCoverageInTx` so a caller whose own transaction cannot see the
+ * site licences (a client-stamped portal transaction — the 0084 policy
+ * hides every row whose `client_id` is not the stamp, and a site licence's
+ * is null) can read them in an UNSTAMPED transaction of its own and judge
+ * coverage with `licenceCoverageOf`. That caller must never return the facts
+ * or name a site gap to its client (the portal order's generic refusal).
+ */
+export async function activeLicenceFactsInTx(tx: TenantTx, tenantId: string): Promise<LicenceFacts[]> {
   const rows = await tx
     .select({
       clientId: licences.clientId,
@@ -101,9 +116,23 @@ export async function licenceCoverageInTx(
       validUntil: licences.validUntil,
     })
     .from(licences)
-    .where(and(eq(licences.tenantId, args.tenantId), eq(licences.status, 'active')));
-  const facts = rows.map(licenceFacts);
+    .where(and(eq(licences.tenantId, tenantId), eq(licences.status, 'active')));
+  return rows.map(licenceFacts);
+}
 
+/**
+ * The coverage rule over licence facts already read (`activeLicenceFactsInTx`)
+ * — `licenceCoverageInTx`'s judgement, with no read of its own. The same
+ * stable order: by SKU code, then client, then need, the client holder first.
+ */
+export function licenceCoverageOf(
+  facts: readonly LicenceFacts[],
+  args: {
+    readonly warehouseId: string;
+    readonly date: string;
+    readonly parties: readonly LicenceParty[];
+  },
+): UncoveredNeed[] {
   const seen = new Set<string>();
   const uncovered: UncoveredNeed[] = [];
   for (const party of args.parties) {

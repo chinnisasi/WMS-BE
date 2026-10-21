@@ -144,6 +144,23 @@ export async function getWarehouseCodeInTx(tx: TenantTx, tenantId: string, wareh
 }
 
 /**
+ * Story 4-1a — a warehouse's display name, in the caller's transaction (the
+ * portal order's response names the warehouse it was placed into). 404 when
+ * absent, like `getWarehouseCodeInTx`.
+ */
+export async function getWarehouseNameInTx(tx: TenantTx, tenantId: string, warehouseId: string): Promise<string> {
+  const rows = await tx
+    .select({ name: warehouses.name })
+    .from(warehouses)
+    .where(and(eq(warehouses.id, warehouseId), eq(warehouses.tenantId, tenantId)))
+    .limit(1);
+  if (rows.length === 0) {
+    throw warehouseNotFound();
+  }
+  return rows[0]!.name;
+}
+
+/**
  * The ASN import (2026-10-17) — which of a file's warehouse codes name a
  * warehouse of this tenant, in bulk: the set of UPPER-CASED codes that exist
  * (matched case-insensitively). Tells "another warehouse" from "no such

@@ -18,16 +18,24 @@ import { ProblemException, isUniqueViolationOn } from '../../shared/problem-deta
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
 import { assertPermission } from '../tenancy/permissions';
-import { assertWarehouseInTenant, getMemberRoleIn, getWarehouseCodeInTx } from '../tenancy/tenancy.service';
+import {
+  assertWarehouseInTenant,
+  getMemberPortalFactsIn,
+  getMemberRoleIn,
+  getWarehouseCodeInTx,
+  getWarehouseNameInTx,
+} from '../tenancy/tenancy.service';
 // Story 1-6d — licence enforcement: compliance's FREE functions (never its
 // Nest module — compliance forward-references outbound, so it would cycle).
 import {
+  activeLicenceFactsInTx,
   licenceCoverageInTx,
+  licenceCoverageOf,
   licenceEnforcedInTx,
   licenceNotCovered,
   licenceToday,
 } from '../compliance/licence-enforcement';
-import { needsOf, type LicenceGoodsProfile } from '../../shared/primitives/licence';
+import { needsOf, type LicenceFacts, type LicenceGoodsProfile } from '../../shared/primitives/licence';
 import { normalizeGstinInput, GSTIN_RE, gstinPrefixProblem } from '../../shared/primitives/gstin';
 import { nicText } from '../../shared/primitives/nic-text';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
@@ -54,7 +62,12 @@ import {
 } from '../../shared/primitives/address';
 import type { AddressInput, AddressSnapshot } from '../../shared/primitives/address';
 import { uomPrecision } from '../catalog/uom';
-import { assertSingleClientInTx, assertClientTakesWorkInTx } from '../clients/clients.facade';
+import {
+  assertSingleClientInTx,
+  assertClientTakesWorkInTx,
+  clientInactive,
+  shareLockClientInTx,
+} from '../clients/clients.facade';
 
 // ── state machine + policy constants (the outbound module exclusively owns
 // the order state machine, AD-6 — no other module may add or transition
@@ -209,6 +222,41 @@ export interface CreateOrderCommand {
   readonly backorderPolicy?: 'accept' | 'reject' | undefined;
 }
 
+/**
+ * Story 4-1a — `POST portal/orders`: a client user places an order for its
+ * OWN SKUs. `clientId` is the portal session's (the guard's re-read), never
+ * the body's. No source, no channel arms, no rate (the portal line carries
+ * none) and no backorder policy — the portal always refuses a shortage.
+ */
+export interface PlacePortalOrderCommand {
+  readonly tenantId: string;
+  /** From `PortalSession` — never from the request body. */
+  readonly clientId: string;
+  /** The client-portal user (the audit actor). */
+  readonly actorUserId: string;
+  readonly warehouseId: string;
+  /** In the SKU's BASE UoM; converted behind the replay lookup (story 10.2). */
+  readonly lines: readonly { readonly skuId: string; readonly quantity: number }[];
+  readonly destination?: AddressInput | undefined;
+  readonly consigneeGstin?: string | undefined;
+  readonly consigneeLegalName?: string | undefined;
+}
+
+/**
+ * Story 4-1a — the portal's answer to a placed order (and its stored
+ * idempotency snapshot): an exact key allowlist. No reservation, rate, phone,
+ * status or line detail — the client reads the order itself through
+ * `portal/orders/{orderId}`.
+ */
+export interface PortalPlacedOrder {
+  readonly orderId: string;
+  readonly warehouseName: string;
+  /** Top-level lines (the portal places no kits, so every line). */
+  readonly lineCount: number;
+  /** The order's `created_at`, canonical ISO-8601 UTC. */
+  readonly placedAt: string;
+}
+
 export interface CancelOrderCommand {
   readonly tenantId: string;
   readonly actorUserId: string;
@@ -323,6 +371,15 @@ export class OrderCommandService {
    * `backordered`), and accepts the order in one create transaction that
    * also appends `order.created`, the audit row, and the idempotency key.
    * A reservation-store failure fails the WHOLE creation closed.
+   *
+   * Story 4-1a — the three phases are shared with the portal's
+   * `placePortalOrder` through private phase helpers (`preflightPhase`,
+   * `grantPhase`, `writePhase`); what differs between the two surfaces is an
+   * `OrderSurface` (the authority gate, the transaction opener, the SKU read,
+   * the licence check, the shortage refusal, the response). The staff
+   * surface below reproduces this command's pre-4-1a behaviour, codes and
+   * fingerprint exactly (pinned by the goldens in
+   * `test/issuance-gate-parity.spec.ts`).
    */
   async createOrder(command: CreateOrderCommand, idempotencyKey: string): Promise<OrderSnapshot> {
     // Story 1-6d (D18) — ONE IST date for the licence check, captured here and
@@ -410,26 +467,354 @@ export class OrderCommandService {
       lines: command.lines.map(lineFingerprint),
     });
 
+    // The staff surface: the operator-shape transaction (never stamped — an
+    // order's reads and writes span the whole tenant), `orders.manage`, every
+    // SKU of the tenant, the licence check in the command's own transaction
+    // naming each gap, the connection's 9-1 refusal, and the operator snapshot.
+    const staff: OrderSurface<OrderSnapshot> = {
+      kind: 'staff',
+      transaction: (fn) => withTenantTransaction(this.db, command.tenantId, fn),
+      authorize: async (tx) => {
+        // Authority at command-service entry — DB role read, same tx, BEFORE
+        // the replay lookup (the deliberate fail-closed carve-out).
+        assertPermission(
+          await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
+          'orders.manage',
+        );
+      },
+      reauthorize: async () => {},
+      loadLineSkus: (tx, skuIds) => this.assertSkuIdsInTenant(tx, command.tenantId, skuIds),
+      prefetchLicences: async () => null,
+      assertLicences: async (tx, _prefetched, order) => {
+        if (tx === null) throw new Error('createOrder: the staff licence check runs inside its phase transaction');
+        await this.assertLicencesCoverInTx(tx, command.tenantId, command.warehouseId, licenceDate, order);
+      },
+      backorderRefusal: () => new BackorderRejectedError(),
+      respond: async (_tx, snapshot) => snapshot,
+    };
+
+    return this.placeOrder(
+      command,
+      idempotencyKey,
+      { integrationId, externalEventId, consigneeGstin, consigneeLegalName, sourcePayloadHash, payloadHash },
+      staff,
+    );
+  }
+
+  /**
+   * Story 4-1a — `POST portal/orders`: a client user places an outbound order
+   * for its OWN SKUs from the portal. A separate command (IMPLEMENTATION-GUIDE
+   * §7e — a portal write is never a flag on the operator one) sharing the
+   * order pipeline with `createOrder` through the phase helpers, so both
+   * surfaces keep one set of order rules. The result is an ordinary `manual`
+   * order of the session's client ("not a channel order", not "staff
+   * entered"); its portal origin is the audit row's actor, the client user.
+   *
+   * What the portal surface changes:
+   * - **Stamped.** Phase 1 and phase 3 open `withTenantTransaction(…,
+   *   { clientId: command.clientId })` — RLS binds them to the session's
+   *   client. The grants and releases stay operator-stamped (they run in the
+   *   inventory facade's own transactions: reservation counters are tenant
+   *   data, never a client's), as does the licence read (below).
+   * - **Authority** (both phases, before anything else): `orders.place`, then
+   *   the actor re-read (`getMemberPortalFactsIn` — not active 401, another
+   *   client 403 `role-denied`, which also refuses an owner, who holds every
+   *   capability), then `shareLockClientInTx` with its status (departed or
+   *   suspended 403 via `clientInactive`). Repeated at the start of phase 3,
+   *   so a suspension or deactivation committed between the phases cannot
+   *   commit an order — the refusal releases every grant.
+   * - **SKUs:** the client's ACTIVE NON-KIT SKUs only — exactly what
+   *   `portal/skus` lists. Another client's SKU, a kit, an inactive SKU and an
+   *   unknown id are the SAME 404 (never confirming another client's row);
+   *   `mixed-client` is unreachable. A SKU deactivated between the phases
+   *   refuses at phase 3 (409 `sku-inactive`) even when fully reserved — the
+   *   portal never sells down.
+   * - **Shortages refuse** (`backorderPolicy: 'reject'`): the whole order is
+   *   refused 409 `order-backorder-rejected`, naming the short SKU codes.
+   * - **Licences through an unstamped seam:** the 0084 policy hides every
+   *   site licence (null `client_id`) from a client-stamped transaction, so
+   *   the coverage rule's facts are read in an UNSTAMPED transaction of their
+   *   own (`portalLicenceSnapshot`) — once phase 1 has passed its authority
+   *   gate and missed the replay (judged against phase 1's SKUs, before any
+   *   grant), and again just before phase 3 opens (judged in it against the
+   *   locked SKUs; a line SKU the stamped read no longer sees refuses). A
+   *   missing snapshot fails closed. A gap is refused with a GENERIC
+   *   409 `licence-not-covered` — never which licence, which holder or the
+   *   site.
+   * - **The response** (and the stored idempotency snapshot) is the portal's
+   *   own `{orderId, warehouseName, lineCount, placedAt}`, built in the write
+   *   transaction; a replay never serves the operator snapshot, and the
+   *   fingerprint starts with `surface: 'portal'`. A same-key race loser
+   *   answers 409 `conflict` (the key's unique index, as on every command).
+   */
+  async placePortalOrder(command: PlacePortalOrderCommand, idempotencyKey: string): Promise<PortalPlacedOrder> {
+    const licenceDate = licenceToday();
+    const lines = command.lines.map(({ skuId, quantity }) => ({ skuId, quantity }));
+    const normalizedDestination = normalizeAddressInput(command.destination);
+    const consigneeGstin = normalizeGstinInput(command.consigneeGstin);
+    const consigneeLegalName = normalizeConsigneeLegalName(command.consigneeLegalName);
+    // The portal fingerprint: `surface` FIRST (an identical payload must never
+    // replay the operator surface's snapshot under a shared key), then the
+    // session's client; the legal name only when present, at the 8-1d
+    // position; lines in BASE units with no rate. Key order is fixed —
+    // pinned by a golden in test/portal-orders-create.spec.ts.
+    const payloadHash = hashCommandPayload({
+      surface: 'portal',
+      tenantId: command.tenantId,
+      clientId: command.clientId,
+      warehouseId: command.warehouseId,
+      destination: addressFingerprint(normalizedDestination) ?? null,
+      consigneeGstin,
+      ...(consigneeLegalName === null ? {} : { consigneeLegalName }),
+      lines,
+    });
+
+    const gate = async (tx: TenantTx): Promise<void> => {
+      assertPermission(await getMemberRoleIn(tx, command.tenantId, command.actorUserId), 'orders.place');
+      const actor = await getMemberPortalFactsIn(tx, command.tenantId, command.actorUserId);
+      if (actor === null || actor.status !== 'active') {
+        throw new ProblemException(
+          'unauthenticated',
+          401,
+          'Authentication required',
+          'The session no longer describes an active client-portal user — sign in again.',
+        );
+      }
+      if (actor.clientId !== command.clientId) {
+        throw new ProblemException(
+          'role-denied',
+          403,
+          'Role lacks the required capability',
+          'Only a client-portal user of this client may place its orders.',
+        );
+      }
+      // FOR SHARE (21-10): a suspend committing mid-phase either waits for
+      // this transaction or is re-read here once it commits.
+      const client = await shareLockClientInTx(tx, command.tenantId, command.clientId);
+      if (client.status !== 'active') {
+        throw clientInactive(client.status);
+      }
+    };
+
+    const lineSkuCount = new Set(lines.map((line) => line.skuId)).size;
+    const portal: OrderSurface<PortalPlacedOrder> = {
+      kind: 'portal',
+      transaction: (fn) => withTenantTransaction(this.db, command.tenantId, fn, { clientId: command.clientId }),
+      authorize: gate,
+      reauthorize: gate,
+      loadLineSkus: (tx, skuIds) => this.portalLineSkus(tx, command.tenantId, command.clientId, skuIds),
+      prefetchLicences: () => this.portalLicenceSnapshot(command.tenantId),
+      assertLicences: async (_tx, prefetched, order) => {
+        // Fail closed: the seam must have run (a null snapshot is a wiring fault, never "off").
+        if (prefetched === null) throw new Error('placePortalOrder: the licence check ran without its unstamped snapshot');
+        // A line SKU the stamped read no longer sees (its client was
+        // corrected away since phase 1 — RLS hides it) cannot be judged:
+        // refuse rather than check fewer SKUs than the order holds.
+        if (order.skus.length < lineSkuCount) throw portalOrderSkusChanged();
+        if (!prefetched.enforced) return;
+        const goods = order.skus.filter((sku) => needsOf(sku).length > 0);
+        if (goods.length === 0) return;
+        const uncovered = licenceCoverageOf(prefetched.facts, {
+          warehouseId: command.warehouseId,
+          date: licenceDate,
+          parties: goods.map((sku) => ({
+            clientId: order.clientId,
+            systemOwned: order.systemOwned,
+            skuCode: sku.code,
+            needs: needsOf(sku),
+          })),
+        });
+        if (uncovered.length > 0) throw portalLicenceNotCovered();
+      },
+      backorderRefusal: (shortLines, skuFacts) => portalStockShort(shortLines.map((line) => skuFacts.get(line.skuId)?.code ?? line.skuId)),
+      respond: async (tx, snapshot) => ({
+        orderId: snapshot.order.id,
+        warehouseName: await getWarehouseNameInTx(tx, command.tenantId, snapshot.order.warehouseId),
+        lineCount: snapshot.order.lines.filter((line) => line.parentLineId === null).length,
+        placedAt: snapshot.order.createdAt,
+      }),
+    };
+
+    return this.placeOrder(
+      {
+        tenantId: command.tenantId,
+        actorUserId: command.actorUserId,
+        warehouseId: command.warehouseId,
+        source: 'manual',
+        lines,
+        destination: command.destination,
+        ...(command.consigneeGstin === undefined ? {} : { consigneeGstin: command.consigneeGstin }),
+        ...(command.consigneeLegalName === undefined ? {} : { consigneeLegalName: command.consigneeLegalName }),
+        backorderPolicy: 'reject',
+      },
+      idempotencyKey,
+      { integrationId: null, externalEventId: null, consigneeGstin, consigneeLegalName, sourcePayloadHash: null, payloadHash },
+      portal,
+    );
+  }
+
+  /**
+   * Story 4-1a — the portal's SKU read: the session client's ACTIVE NON-KIT
+   * SKUs among `skuIds` (the `portal/skus` population), each with the facts
+   * the pipeline needs. Anything else — unknown, another client's, a kit, an
+   * inactive SKU — is the SAME 404, so another client's SKU is never
+   * confirmed to exist. Two layers: the explicit `client_id` predicate here,
+   * and the caller's client-stamped transaction (the `skus` policy).
+   */
+  private async portalLineSkus(
+    tx: TenantTx,
+    tenantId: string,
+    clientId: string,
+    skuIds: readonly string[],
+  ): Promise<Map<string, SkuFacts>> {
+    const distinct = [...new Set(skuIds)];
+    const rows = await tx
+      .select({
+        id: skus.id,
+        uom: skus.uom,
+        clientId: skus.clientId,
+        code: skus.code,
+        status: skus.status,
+        foodCategory: skus.foodCategory,
+        drugSchedules: skus.drugSchedules,
+      })
+      .from(skus)
+      .where(and(eq(skus.tenantId, tenantId), eq(skus.clientId, clientId), eq(skus.status, 'active'), inArray(skus.id, distinct)));
+    const kits = new Set(await this.catalog.getKitSkuIdsInTx(tx, tenantId, rows.map((row) => row.id)));
+    const byId = new Map(
+      rows
+        .filter((row) => !kits.has(row.id))
+        .map((row) => [
+          row.id,
+          {
+            uom: row.uom,
+            clientId: row.clientId,
+            code: row.code,
+            status: row.status as SkuStatus,
+            foodCategory: row.foodCategory,
+            drugSchedules: row.drugSchedules,
+          },
+        ]),
+    );
+    for (const skuId of distinct) {
+      if (!byId.has(skuId)) {
+        throw new ProblemException('not-found', 404, 'SKU not found', `No SKU with id "${skuId}" exists for this client.`);
+      }
+    }
+    return byId;
+  }
+
+  /**
+   * Story 4-1a — THE UNSTAMPED SEAM (a documented carve-out from the portal
+   * write's client stamp). A client-stamped transaction cannot see a site
+   * licence (0084: the policy admits only rows whose `client_id` is the
+   * stamp; a site licence's is null), so a portal order judged inside one
+   * would be refused for every site-covered drug or food SKU. This reads the
+   * tenant's enforcement switch and its active licences in an operator-shape
+   * transaction of its own — after phase 1's transaction closed and before
+   * phase 3's opens, never nested inside either (a second pool connection taken while one is held
+   * is the pool-deadlock gotcha). Licences and the switch only; the facts
+   * never leave the command, and a gap is answered with the generic
+   * `portalLicenceNotCovered`.
+   */
+  private async portalLicenceSnapshot(tenantId: string): Promise<LicenceSnapshot> {
+    return withTenantTransaction(this.db, tenantId, async (tx) => {
+      const enforced = await licenceEnforcedInTx(tx, tenantId);
+      return { enforced, facts: enforced ? await activeLicenceFactsInTx(tx, tenantId) : [] };
+    });
+  }
+
+  /**
+   * Story 4-1a — the order pipeline both surfaces run: phase 1 (the read
+   * transaction), phase 2 (the grants, outside any transaction), phase 2.5
+   * (the sell-down and backorder-policy refusals) and phase 3 (the write
+   * transaction). The surface supplies what differs; the order of every step
+   * is the pre-4-1a `createOrder`'s.
+   */
+  private async placeOrder<R>(
+    command: CreateOrderCommand,
+    idempotencyKey: string,
+    hashes: OrderHashStage,
+    surface: OrderSurface<R>,
+  ): Promise<R> {
+    // Story 4-1a — the portal never carries channel refs, so it can never
+    // reach the dedup-loser resolution or the channel refusal fact.
+    if (surface.kind === 'portal' && (hashes.integrationId !== null || hashes.externalEventId !== null || command.source !== 'manual')) {
+      throw new Error('placePortalOrder: a portal order carries no channel refs');
+    }
+    const preflight = await this.preflightPhase(command, idempotencyKey, hashes, surface);
+    if (preflight.replayed) {
+      return preflight.snapshot;
+    }
+    const grants = await this.grantPhase(command, preflight);
+    const { lines, explosions } = preflight;
+    const { plainHolds, childHolds, granted } = grants;
+
+    // ── phase 2.5 (story 7.2, RD-3): the connection's reject policy ────────
+    // A whole-order post-grant refusal. AFTER the grants (never a pre-probe —
+    // no TOCTOU window can refuse what would actually have granted) and
+    // BEFORE the write tx opens. The check reads PHASE-2's grant map, never
+    // order rows: any line where granted < demanded — a ZERO-grant (fully
+    // backordered) line included — refuses the WHOLE order; kit PARENTS are
+    // excluded from the map (they reserve 0 by construction; a row-based
+    // check would refuse every kit order regardless of grant success) and
+    // the kit CHILDREN are the entries. The release is the exact machinery
+    // the 503 path already runs — fail-safe toward understated ATP, never
+    // oversold.
+    // ── phase 2.5 (story 1-4b, decision 1): an inactive SKU sells down ─────
+    // An order line of an inactive SKU (a kit line: its kit SKU or any
+    // component) is accepted only when it reserved IN FULL — a shortfall
+    // would wait for inbound an inactive SKU never takes, so it refuses the
+    // whole order (409 `sku-inactive`, whatever the backorder policy; the
+    // ingest maps it to a typed 422), after every grant is released. Before
+    // the policy arm, so a channel refusal for an inactive SKU writes no
+    // backorder-refusal fact (decision 12).
+    const inactiveRefusal = inactiveShortRefusal(lines, explosions, plainHolds, childHolds, (skuId) => {
+      const facts = preflight.skuFacts.get(skuId);
+      return facts === undefined ? undefined : { code: facts.code, status: facts.status };
+    });
+    if (inactiveRefusal !== null) {
+      await this.releaseAll(command.tenantId, granted, 'sku-inactive');
+      throw inactiveRefusal;
+    }
+
+    const shortLines =
+      command.backorderPolicy === 'reject' ? this.policyShortLines(lines, explosions, plainHolds, childHolds) : [];
+    if (shortLines.length > 0) {
+      await this.releaseAll(command.tenantId, granted, 'backorder-policy-reject');
+      // Story 9-1 — the SM-4 "prevented" fact, written AFTER the grants were
+      // released and outside any transaction, best-effort: the caller gets
+      // exactly today's refusal whatever happens here. (A channel delivery
+      // only — the portal's refusal carries no channel identity.)
+      if (surface.kind === 'staff') {
+        await this.recordBackorderRefusal(command, hashes.integrationId, hashes.externalEventId, shortLines);
+      }
+      throw surface.backorderRefusal(shortLines, preflight.skuFacts);
+    }
+
+    return this.writePhase(command, idempotencyKey, hashes, surface, preflight, grants);
+  }
+
+  /**
+   * Phase 1 (the read transaction): authority → replay → validation → master
+   * data → conversion → kit explosion → channel dedup → client → licences.
+   * Returns the stored snapshot on a replay (or a channel redelivery), else
+   * everything phases 2 and 3 need.
+   */
+  private async preflightPhase<R>(
+    command: CreateOrderCommand,
+    idempotencyKey: string,
+    hashes: OrderHashStage,
+    surface: OrderSurface<R>,
+  ): Promise<Preflight<R>> {
+    const { integrationId, externalEventId, consigneeGstin, consigneeLegalName, sourcePayloadHash, payloadHash } = hashes;
     // ── phase 1 (read tx): authority → replay → validation → dedup ────────
-    const preflight = await withTenantTransaction(this.db, command.tenantId, async (tx) => {
-      // Authority at command-service entry — DB role read, same tx, BEFORE
-      // the replay lookup (the deliberate fail-closed carve-out).
-      assertPermission(
-        await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
-        'orders.manage',
-      );
+    const preflight = await surface.transaction(async (tx): Promise<Preflight<R>> => {
+      await surface.authorize(tx);
 
       const replay = await this.replay(tx, command.tenantId, idempotencyKey, payloadHash);
       if (replay !== null) {
-        return {
-          replayed: replay as OrderSnapshot,
-          destination: undefined,
-          consigneeGstin: null,
-          lines: [] as OrderLineInput[],
-          explosions: new Map(),
-          clientId: null,
-          skuFacts: new Map<string, SkuFacts>(),
-        };
+        return { replayed: true, snapshot: replay as R };
       }
 
       // ── input validation (400 before any write) ─────────────────────────
@@ -507,9 +892,8 @@ export class OrderCommandService {
 
       // ── master-data integrity in a write transaction (404 before writes) ─
       await assertWarehouseInTenant(tx, command.tenantId, command.warehouseId);
-      const lineSkus = await this.assertSkuIdsInTenant(
+      const lineSkus = await surface.loadLineSkus(
         tx,
-        command.tenantId,
         command.lines.map((line) => line.skuId),
       );
       const uomBySku = uomsOf(lineSkus);
@@ -600,7 +984,7 @@ export class OrderCommandService {
           // Same payload redelivered: the first order's snapshot, no new
           // reservation. The key is written with that snapshot so a transport
           // retry of THIS delivery replays through the key as well.
-          const snapshot = await this.snapshotOf(tx, prior);
+          const snapshot = await surface.respond(tx, await this.snapshotOf(tx, prior));
           await this.writeIdempotencyKey(
             tx,
             command.tenantId,
@@ -608,15 +992,7 @@ export class OrderCommandService {
             payloadHash,
             snapshot,
           );
-          return {
-            replayed: snapshot,
-            destination: undefined,
-            consigneeGstin: null,
-            lines,
-            explosions: new Map(),
-            clientId: null,
-            skuFacts: new Map<string, SkuFacts>(),
-          };
+          return { replayed: true, snapshot };
         }
       }
 
@@ -641,42 +1017,51 @@ export class OrderCommandService {
       // SKU, a kit parent and its components, backordered or not — must be
       // covered at this site on the captured IST date, or the WHOLE order is
       // refused 409 `licence-not-covered`. NOT the guard: phase 3 re-checks.
-      await this.assertLicencesCoverInTx(tx, command.tenantId, command.warehouseId, licenceDate, {
-        clientId,
-        systemOwned: orderClient.systemOwned,
-        skus: [...lineSkus.values(), ...componentSkus.values()],
-      });
+      // (The staff surface only — the portal judges after this transaction.)
+      if (surface.kind === 'staff') {
+        await surface.assertLicences(tx, null, {
+          clientId,
+          systemOwned: orderClient.systemOwned,
+          skus: [...lineSkus.values(), ...componentSkus.values()],
+        });
+      }
       return {
-        replayed: null,
+        replayed: false,
         destination,
-        consigneeGstin,
         lines: linesWithRates,
         explosions,
         clientId,
+        systemOwned: orderClient.systemOwned,
         // Story 1-4b — every line and component SKU's code and status.
         skuFacts: new Map<string, SkuFacts>([...lineSkus, ...componentSkus]),
       };
     });
-    if (preflight.replayed !== null) {
-      return preflight.replayed;
+    // Story 4-1a — the portal's EARLY licence check: its facts are read
+    // through the unstamped seam only now — after the authority gate and the
+    // replay miss (never for an unauthorised caller or a replay), in a
+    // transaction of their own opened after phase 1's closed (never nested) —
+    // and still before any grant moves.
+    if (surface.kind === 'portal' && !preflight.replayed) {
+      await surface.assertLicences(null, await surface.prefetchLicences(), {
+        clientId: preflight.clientId,
+        systemOwned: preflight.systemOwned,
+        skus: [...preflight.skuFacts.values()],
+      });
     }
-    // The milli-unit lines the preflight converted — the ONLY quantities the
-    // grant and write phases below ever see. The destination is the
-    // preflight's validated, normalized address (story 11-1) — defined
-    // whenever the replay did not hit, because the validation above ran.
-    const lines = preflight.lines;
-    const destination = preflight.destination!;
-    // (`consigneeGstin` is already in scope — the preflight's normalized,
-    // shape-validated value from the hash stage.)
-    // The kit explosion plan the preflight validated (empty on a replay or a
-    // dedup hit — those never reach the grant phase).
-    const explosions = preflight.explosions;
+    return preflight;
+  }
 
-    // ── phase 2: the per-line ATP split + grants (each its own atomic unit).
-    // Every grant lands before the order-create tx opens; any failure here
-    // writes nothing (the 503 propagates; a deterministic loss under the
-    // backorder policy marks the line backordered instead).
-    //
+  /**
+   * Phase 2: the per-line ATP split + grants (each its own atomic unit,
+   * through the inventory facade's own — operator-stamped — transactions).
+   * Every grant lands before the order-create tx opens; any failure here
+   * writes nothing (the 503 propagates; a deterministic loss under the
+   * backorder policy marks the line backordered instead).
+   */
+  private async grantPhase(command: CreateOrderCommand, preflight: PreflightAccepted): Promise<OrderGrants> {
+    // The milli-unit lines the preflight converted — the ONLY quantities the
+    // grant and write phases below ever see.
+    const { lines, explosions } = preflight;
     // Story 11.4: a kit line reserves through its CHILD lines — each
     // component grants against its own child line id (ownerType 'order',
     // ownerId = the child line's id), so waves/picklists/dispatch see
@@ -745,54 +1130,44 @@ export class OrderCommandService {
       await this.releaseAll(command.tenantId, granted, 'create-order-abort');
       throw err;
     }
+    return { lineIds, childIds, plainHolds, childHolds, granted };
+  }
 
-    // ── phase 2.5 (story 7.2, RD-3): the connection's reject policy ────────
-    // A whole-order post-grant refusal. AFTER the grants (never a pre-probe —
-    // no TOCTOU window can refuse what would actually have granted) and
-    // BEFORE the write tx opens. The check reads PHASE-2's grant map, never
-    // order rows: any line where granted < demanded — a ZERO-grant (fully
-    // backordered) line included — refuses the WHOLE order; kit PARENTS are
-    // excluded from the map (they reserve 0 by construction; a row-based
-    // check would refuse every kit order regardless of grant success) and
-    // the kit CHILDREN are the entries. The release is the exact machinery
-    // the 503 path already runs — fail-safe toward understated ATP, never
-    // oversold.
-    // ── phase 2.5 (story 1-4b, decision 1): an inactive SKU sells down ─────
-    // An order line of an inactive SKU (a kit line: its kit SKU or any
-    // component) is accepted only when it reserved IN FULL — a shortfall
-    // would wait for inbound an inactive SKU never takes, so it refuses the
-    // whole order (409 `sku-inactive`, whatever the backorder policy; the
-    // ingest maps it to a typed 422), after every grant is released. Before
-    // the policy arm, so a channel refusal for an inactive SKU writes no
-    // backorder-refusal fact (decision 12).
-    const inactiveRefusal = inactiveShortRefusal(lines, explosions, plainHolds, childHolds, (skuId) => {
-      const facts = preflight.skuFacts.get(skuId);
-      return facts === undefined ? undefined : { code: facts.code, status: facts.status };
-    });
-    if (inactiveRefusal !== null) {
-      await this.releaseAll(command.tenantId, granted, 'sku-inactive');
-      throw inactiveRefusal;
-    }
-
-    const shortLines =
-      command.backorderPolicy === 'reject' ? this.policyShortLines(lines, explosions, plainHolds, childHolds) : [];
-    if (shortLines.length > 0) {
-      await this.releaseAll(command.tenantId, granted, 'backorder-policy-reject');
-      // Story 9-1 — the SM-4 "prevented" fact, written AFTER the grants were
-      // released and outside any transaction, best-effort: the caller gets
-      // exactly today's refusal whatever happens here.
-      await this.recordBackorderRefusal(command, integrationId, externalEventId, shortLines);
-      throw new BackorderRejectedError();
-    }
-
+  /**
+   * Phase 3 (the write transaction): the surface's re-authorization → the
+   * client guard → the SKU re-read under lock → the licence re-check → the
+   * order + lines + outbox + audit + key. Any failure releases every grant.
+   */
+  private async writePhase<R>(
+    command: CreateOrderCommand,
+    idempotencyKey: string,
+    hashes: OrderHashStage,
+    surface: OrderSurface<R>,
+    preflight: PreflightAccepted,
+    grants: OrderGrants,
+  ): Promise<R> {
+    const { integrationId, externalEventId, consigneeGstin, consigneeLegalName, sourcePayloadHash, payloadHash } = hashes;
+    const { lines, explosions } = preflight;
+    // The destination is the preflight's validated, normalized address (story
+    // 11-1). (`consigneeGstin` is the preflight's normalized, shape-validated
+    // value from the hash stage.)
+    const destination = preflight.destination;
+    const { lineIds, childIds, plainHolds, childHolds, granted } = grants;
     // ── phase 3 (write tx): the order + lines + outbox + audit + key ──────
     try {
-      return await withTenantTransaction(this.db, command.tenantId, async (tx) => {
+      // The portal's licence facts, re-read unstamped BEFORE the write
+      // transaction opens (null on the staff surface, which re-reads in-tx).
+      const licences = await surface.prefetchLicences();
+      return await surface.transaction(async (tx) => {
+        // Story 4-1a — the portal re-reads its actor and takes its client
+        // FOR SHARE again here (a suspension since phase 1 refuses, and the
+        // catch below releases every grant); the staff surface does nothing.
+        await surface.reauthorize(tx);
         const orderId = uuidv7();
         // Story 21-2b (AD-23): an order is for one client by definition —
         // the client the preflight DERIVED from its lines' and components'
         // SKUs (the tenant's `self` client on a D2C tenant; no branch).
-        const clientId = preflight.clientId!;
+        const clientId = preflight.clientId;
         // Story 1-2a — THE guard: the first statement of the write
         // transaction takes the client FOR KEY SHARE, so a departure (FOR
         // UPDATE) either committed first — refused here, 409
@@ -820,11 +1195,21 @@ export class OrderCommandService {
         if (becameKits.length > 0) {
           throw orderCatalogChanged([...new Set(becameKits.map((skuId) => locked.get(skuId)!.code))]);
         }
+        // Story 4-1a — the portal admits ACTIVE SKUs only (phase 1's 404), so
+        // a SKU deactivated since then refuses the order even when it reserved
+        // in full: the portal never sells down (decision 8). Into the catch,
+        // which releases every grant.
+        if (surface.kind === 'portal') {
+          const deactivated = [...locked.values()].filter((sku) => sku.status !== 'active').map((sku) => sku.code);
+          if (deactivated.length > 0) {
+            throw skuInactive(deactivated, 'A SKU on this order was deactivated while it was placed — nothing was written. Remove it and place the order again.');
+          }
+        }
         // Story 1-6d — the licence RE-CHECK under the locks, on the same IST
         // date: the switch re-read, and each SKU's goods attributes as the
         // locked read sees them (an edit since phase 1 is caught). A refusal
         // throws into the catch below, which releases every grant.
-        await this.assertLicencesCoverInTx(tx, command.tenantId, command.warehouseId, licenceDate, {
+        await surface.assertLicences(tx, licences, {
           clientId,
           systemOwned: orderClient.systemOwned,
           skus: [...locked.values()],
@@ -941,6 +1326,8 @@ export class OrderCommandService {
         const snapshot = await this.snapshotById(tx, orderId);
 
         // In-transaction outbox append (AD-7) — before the idempotency key.
+        // The OPERATOR payload on both surfaces: every consumer of
+        // `order.created` reads one shape.
         await this.outbox.append(tx, {
           messageId: uuidv7(),
           tenantId: command.tenantId,
@@ -976,8 +1363,12 @@ export class OrderCommandService {
           occurredAt: nowIso(),
         });
 
-        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, snapshot);
-        return snapshot;
+        // The surface's response — the operator snapshot on the staff
+        // surface, the portal's own shape on the portal — is what the key
+        // stores, so a replay re-serves exactly what this call answers.
+        const response = await surface.respond(tx, snapshot);
+        await this.writeIdempotencyKey(tx, command.tenantId, idempotencyKey, payloadHash, response);
+        return response;
       });
     } catch (err) {
       // The create tx failed (a lost dedup race or any other write fault):
@@ -985,7 +1376,7 @@ export class OrderCommandService {
       // dedup-loser outcome against the settled state.
       await this.releaseAll(command.tenantId, granted, 'create-order-rollback');
       if (err instanceof DedupLostError) {
-        return this.resolveDedupLoser(err, idempotencyKey, payloadHash);
+        return this.resolveDedupLoser(err, idempotencyKey, payloadHash, surface);
       }
       throw err;
     }
@@ -1424,11 +1815,15 @@ export class OrderCommandService {
   }
 
   /** The concurrent-dedup-loser outcome: re-read the winner, resolve the contract. */
-  private async resolveDedupLoser(
+  private async resolveDedupLoser<R>(
     err: DedupLostError,
     idempotencyKey: string,
     payloadHash: string,
-  ): Promise<OrderSnapshot> {
+    surface: OrderSurface<R>,
+  ): Promise<R> {
+    if (surface.kind === 'portal') {
+      throw new Error('placePortalOrder: a portal order has no channel dedup to lose');
+    }
     const tenantId = err.tenantId;
     const existing = await withTenantTransaction(this.db, tenantId, (tx) =>
       tx
@@ -1459,8 +1854,10 @@ export class OrderCommandService {
     }
     // Same payload delivered concurrently: exactly one order exists — the
     // redelivery contract (the winner's snapshot, no new reservation).
+    // (A channel delivery only — the staff surface, whose response is the
+    // snapshot itself.)
     return withTenantTransaction(this.db, tenantId, async (tx) => {
-      const snapshot = await this.snapshotOf(tx, prior);
+      const snapshot = await surface.respond(tx, await this.snapshotOf(tx, prior));
       await this.writeIdempotencyKey(tx, tenantId, idempotencyKey, payloadHash, snapshot);
       return snapshot;
     });
@@ -1753,6 +2150,142 @@ export function lineSnapshot(
     parentLineId: row.parentLineId,
     createdAt: canonicalInstant(row.createdAt),
   };
+}
+
+// ── story 4-1a: the order pipeline's surfaces ─────────────────────────────────
+
+/** The hash-stage values a surface computes before phase 1 (both surfaces). */
+interface OrderHashStage {
+  readonly integrationId: string | null;
+  readonly externalEventId: string | null;
+  /** Normalized (lenient) — the shape refusal is phase 1's. */
+  readonly consigneeGstin: string | null;
+  /** Normalized (trim, blank = absent) — the refusals are phase 1's. */
+  readonly consigneeLegalName: string | null;
+  readonly sourcePayloadHash: string | null;
+  readonly payloadHash: string;
+}
+
+/** The licence check's subject: the order's client and every SKU it holds. */
+interface LicenceOrder {
+  readonly clientId: string;
+  readonly systemOwned: boolean;
+  readonly skus: readonly (LicenceGoodsProfile & { readonly code: string })[];
+}
+
+/** The portal's licence facts, read through the unstamped seam. */
+interface LicenceSnapshot {
+  readonly enforced: boolean;
+  readonly facts: readonly LicenceFacts[];
+}
+
+/**
+ * Story 4-1a — what differs between the staff (`createOrder`) and portal
+ * (`placePortalOrder`) surfaces of the one order pipeline. Everything else —
+ * the validation, the conversion, the kit explosion, the client derivation,
+ * the grants, the sell-down and policy refusals, the SKU re-read under lock
+ * and the write set — is shared, in the order `createOrder` always ran it.
+ */
+interface OrderSurface<R> {
+  /**
+   * Which surface: the staff path checks licences inside phase 1's
+   * transaction and records a channel refusal fact; the portal judges its
+   * licences after phase 1 (the unstamped seam), refuses ANY inactive SKU at
+   * phase 3, and never reaches the channel arms.
+   */
+  readonly kind: 'staff' | 'portal';
+  /** Opens phase 1's and phase 3's transactions (the portal: client-stamped). */
+  readonly transaction: <T>(fn: (tx: TenantTx) => Promise<T>) => Promise<T>;
+  /** Authority, first in phase 1 — before the replay lookup. */
+  readonly authorize: (tx: TenantTx) => Promise<void>;
+  /** First in phase 3 (the portal repeats its gate; staff: nothing). */
+  readonly reauthorize: (tx: TenantTx) => Promise<void>;
+  /** The line SKUs' facts — 404 for any the surface does not admit. */
+  readonly loadLineSkus: (tx: TenantTx, skuIds: readonly string[]) => Promise<Map<string, SkuFacts>>;
+  /** The portal's unstamped seam — read after phase 1's authority and replay miss, and before phase 3's transaction; staff: null. */
+  readonly prefetchLicences: () => Promise<LicenceSnapshot | null>;
+  /**
+   * The licence check (phase 1, and again in phase 3 against the locked
+   * SKUs). Staff: in the phase transaction (`tx`), `prefetched` null. Portal:
+   * over `prefetched` (never null — a missing snapshot refuses), `tx` unused
+   * (null after phase 1).
+   */
+  readonly assertLicences: (tx: TenantTx | null, prefetched: LicenceSnapshot | null, order: LicenceOrder) => Promise<void>;
+  /** The refusal under `backorderPolicy: 'reject'`. */
+  readonly backorderRefusal: (shortLines: readonly BackorderRefusalLine[], skuFacts: ReadonlyMap<string, SkuFacts>) => ProblemException;
+  /** The response and the stored idempotency snapshot, built in the write transaction. */
+  readonly respond: (tx: TenantTx, snapshot: OrderSnapshot) => Promise<R>;
+}
+
+/** Phase 1's outcome when the order goes on to the grants. */
+interface PreflightAccepted {
+  readonly replayed: false;
+  readonly destination: AddressInput;
+  /** Milli-units, each with its validated rate (story 8-1). */
+  readonly lines: readonly OrderLineInput[];
+  readonly explosions: Map<number, readonly KitCompositionLine[]>;
+  readonly clientId: string;
+  /** The order client's `self` flag (the licence rule's party fact). */
+  readonly systemOwned: boolean;
+  readonly skuFacts: ReadonlyMap<string, SkuFacts>;
+}
+
+type Preflight<R> = { readonly replayed: true; readonly snapshot: R } | PreflightAccepted;
+
+/** Phase 2's grants, by line index (plain lines) and `index:childIndex` (kit children). */
+interface OrderGrants {
+  readonly lineIds: readonly string[];
+  readonly childIds: ReadonlyMap<number, readonly string[]>;
+  readonly plainHolds: Map<number, ReservationSnapshot>;
+  readonly childHolds: Map<string, ReservationSnapshot>;
+  readonly granted: readonly ReservationSnapshot[];
+}
+
+/**
+ * Story 4-1a — the portal's shortage refusal (decision 6): the whole order is
+ * refused, naming the client's own short SKU codes — never a reservation, an
+ * ATP figure or another order. The code is the reject policy's
+ * (`order-backorder-rejected`); `extensions.skuCodes` carries the codes
+ * (sorted, distinct) for the web's own sentence.
+ */
+export function portalStockShort(skuCodes: readonly string[]): ProblemException {
+  const codes = [...new Set(skuCodes)].sort();
+  return new ProblemException(
+    'order-backorder-rejected',
+    409,
+    'Not enough stock for the order',
+    `Not enough stock at this warehouse for ${codes.map((code) => `"${code}"`).join(', ')} — nothing was placed. Lower the quantities or choose another warehouse.`,
+    { skuCodes: codes },
+  );
+}
+
+/**
+ * Story 4-1a — a line SKU the client-stamped phase-3 read no longer sees (its
+ * client was corrected since phase 1): the order is refused rather than
+ * judged over fewer SKUs than it holds. Every grant is released.
+ */
+export function portalOrderSkusChanged(): ProblemException {
+  return new ProblemException(
+    'order-catalog-changed',
+    409,
+    'The catalog changed while the order was placed',
+    'A product on this order changed while it was placed — nothing was written. Reload and place the order again.',
+  );
+}
+
+/**
+ * Story 4-1a (decision 5) — the portal's GENERIC licence refusal: the same
+ * code as the staff refusal (`licence-not-covered`), but never which licence
+ * is missing, which holder lacks it, the site or its code — a client must not
+ * learn the warehouse's own licence gaps.
+ */
+export function portalLicenceNotCovered(): ProblemException {
+  return new ProblemException(
+    'licence-not-covered',
+    409,
+    'A required licence is not on file',
+    'A licence for one of these products is not on file with the warehouse — nothing was placed. Contact the warehouse.',
+  );
 }
 
 // ── outcomes ─────────────────────────────────────────────────────────────────

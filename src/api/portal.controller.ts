@@ -36,6 +36,7 @@ import {
   PortalAsnPageResponse,
   PortalAsnsQuery,
   PortalCreateAsnDto,
+  PortalCreateOrderDto,
   PortalInvoiceDetailResponse,
   PortalInvoicePageResponse,
   PortalMeResponse,
@@ -43,6 +44,7 @@ import {
   PortalOrderPageResponse,
   PortalOrdersQuery,
   PortalPageQuery,
+  PortalPlacedOrderResponse,
   PortalPurchaseOrderDetailResponse,
   PortalPurchaseOrderPageResponse,
   PortalPurchaseOrdersQuery,
@@ -77,6 +79,9 @@ const PORTAL_PAGE_400 = 'A malformed cursor (invalid-cursor), a limit outside 1�
  * `POST portal/inbound/asns` (a client announces its own shipment; the
  * client is the session's, never the body's), fed by two reads for its
  * form, `portal/skus` and `portal/warehouses`.
+ *
+ * Story 4-1a — the second write, `POST portal/orders`: a client places an
+ * outbound order for its own active SKUs (the client is the session's).
  *
  * Literal segments are declared before their `:param` siblings (the guide's
  * route-declaration-order rule).
@@ -151,6 +156,73 @@ export class PortalController {
       ...(query.status === undefined ? {} : { status: query.status }),
     });
     return { items: [...page.items], nextCursor: page.nextCursor };
+  }
+
+  @Post(':tenantId/portal/orders')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(PortalSessionGuard)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      "Places an outbound order for this client's own active SKUs (orders.place; the client is the session's). Every line must be reserved in full — a shortage refuses the whole order. The result is an ordinary order the warehouse picks and ships",
+  })
+  @ApiBody({ type: PortalCreateOrderDto })
+  @ApiHeaders(IDEMPOTENCY_HEADER)
+  @ApiResponse({
+    status: HttpStatus.CREATED,
+    type: PortalPlacedOrderResponse,
+    description: 'The placed order — its id, the warehouse name, the line count and when it was placed (a matching Idempotency-Key replays it)',
+  })
+  @ApiResponse({
+    status: 400,
+    ...problemJsonResponse(
+      'Missing (idempotency-key-required) or malformed (idempotency-key-invalid) Idempotency-Key; an invalid body — a clientId or a ratePaise, no lines or more than 200, an incomplete ship-to address, a malformed consignee GSTIN or legal name, or a quantity finer than its unit (validation-failed)',
+    ),
+  })
+  @ApiResponse({ status: 401, ...problemJsonResponse(PORTAL_401) })
+  @ApiResponse({
+    status: 403,
+    ...problemJsonResponse(`${PORTAL_403}; or the user may not place orders for this client (role-denied)`),
+  })
+  @ApiResponse({
+    status: 404,
+    ...problemJsonResponse("The warehouse is not the tenant's, or a line's SKU is unknown, not this client's, a kit or inactive (not-found)"),
+  })
+  @ApiResponse({
+    status: 409,
+    ...problemJsonResponse(
+      'Not enough stock at the warehouse for a line — nothing was placed (order-backorder-rejected, extensions.skuCodes naming the short SKUs); a licence for one of the products is not on file with the warehouse (licence-not-covered); a SKU was deactivated while the order was placed — refused even when its stock covered the line, the portal never sells down (sku-inactive); a SKU became a kit or left this client while the order was placed (order-catalog-changed); or a concurrent idempotent request (conflict)',
+    ),
+  })
+  @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse)') })
+  @ApiResponse({ status: 503, ...problemJsonResponse('The stock reservation store is unreachable — nothing was placed (reservation-store-unavailable)') })
+  @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
+  async placeOrder(
+    @Param('tenantId') tenantId: string,
+    @IdempotencyKey() idempotencyKey: string | undefined,
+    @CurrentPortalSession() session: PortalSession,
+    @Body() dto: PortalCreateOrderDto,
+  ): Promise<PortalPlacedOrderResponse> {
+    assertOwnTenant(session, tenantId);
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
+    const placed = await this.outbound.placePortalOrder(
+      {
+        tenantId,
+        // The session's client (the guard's re-read) — never the body's.
+        clientId: session.clientId,
+        actorUserId: session.userId,
+        warehouseId: dto.warehouseId,
+        // BASE units cross this edge; the command scales them behind its
+        // replay lookup (story 10.2). The address and the consignee go
+        // VERBATIM — the command owns their rules behind that lookup.
+        lines: dto.lines.map((line) => ({ skuId: line.skuId, quantity: line.quantity })),
+        destination: dto.destination,
+        ...(dto.consigneeGstin === undefined ? {} : { consigneeGstin: dto.consigneeGstin }),
+        ...(dto.consigneeLegalName === undefined ? {} : { consigneeLegalName: dto.consigneeLegalName }),
+      },
+      key,
+    );
+    return { orderId: placed.orderId, warehouseName: placed.warehouseName, lineCount: placed.lineCount, placedAt: placed.placedAt };
   }
 
   @Get(':tenantId/portal/orders/:orderId')

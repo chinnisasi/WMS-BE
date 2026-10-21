@@ -902,12 +902,18 @@ describe('users, roles, and permission gating (e2e)', () => {
     // and gate out an inbound vehicle: owner, ops_manager AND operator (the
     // gate desk and the dock are floor work; the handheld records the
     // unload); never the accountant or a client.
-    // Story 3-1 grows it to 47 with `stock.move` — the bin-to-bin move: owner,
+    // Story 3-1 grew it to 47 with `stock.move` — the bin-to-bin move: owner,
     // ops_manager AND operator (moving stock along the shelves is floor work);
     // never the accountant or a client. A secure origin or target still
     // answers the cage gate, which the operator does not hold.
-    expect([...CAPABILITIES]).toHaveLength(47);
+    // Story 4-1a grows it to 48 with `orders.place` — the client portal's
+    // second write (a client user places an order for its own SKUs): held by
+    // `client`, and by owner only because owner holds everything (the
+    // `asn.announce` precedent); never by ops_manager, operator or
+    // accountant (staff key orders via `orders.manage`).
+    expect([...CAPABILITIES]).toHaveLength(48);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('stock.move'))).toEqual(['owner', 'ops_manager', 'operator']);
+    expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('orders.place'))).toEqual(['owner', 'client']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('gate.manage'))).toEqual(['owner', 'ops_manager', 'operator']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('licences.manage'))).toEqual(['owner']);
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('returns.manage'))).toEqual(['owner', 'ops_manager']);
@@ -915,7 +921,7 @@ describe('users, roles, and permission gating (e2e)', () => {
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('audit.view'))).toEqual(['owner']);
     expect(CAPABILITIES).toContain('asn.announce');
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('asn.announce'))).toEqual(['owner', 'client']);
-    expect([...ROLE_CAPABILITIES.client]).toEqual(['asn.announce']);
+    expect([...ROLE_CAPABILITIES.client]).toEqual(['asn.announce', 'orders.place']);
     expect(CAPABILITIES).toContain('asn.manage');
     expect(roles.filter((role) => ROLE_CAPABILITIES[role].has('asn.manage'))).toEqual(
       roles.filter((role) => ROLE_CAPABILITIES[role].has('po.manage')),

@@ -18,11 +18,16 @@ import {
 } from 'class-validator';
 import { PORTAL_PAGE_DEFAULT_LIMIT, PORTAL_PAGE_MAX_LIMIT } from '../shared/primitives/portal-page';
 import { MAX_QUANTITY_BASE, QUANTITY_FIELD_DESCRIPTION } from '../shared/primitives/quantity';
-import { ORDER_SOURCES, ORDER_STATUSES, type OrderStatus } from '../modules/outbound/order.command';
+import { MAX_CONSIGNEE_LEGAL_NAME_LENGTH, ORDER_SOURCES, ORDER_STATUSES, type OrderStatus } from '../modules/outbound/order.command';
 import { ASN_STATUSES, MAX_ASN_CODE_LENGTH, MAX_ASN_LINES, type AsnStatus } from '../modules/inbound/asn.command';
 import { PO_STATUSES, type PoStatus } from '../modules/inbound/po.command';
 import { CHARGE_CODES, RATE_BASES } from '../modules/billing/rate-cards';
-import { SessionClientResponse, USER_STATUSES } from '../modules/tenancy/tenancy.dto';
+import { AddressDto, SessionClientResponse, USER_STATUSES } from '../modules/tenancy/tenancy.dto';
+import { GSTIN_RE, gstinDtoTransform } from '../shared/primitives/gstin';
+import { MAX_ORDER_LINES } from '../modules/outbound/outbound.dto';
+
+/** Story 4-1a — the portal order's line ceiling IS the staff order's (`CreateOrderDto`), never a copy. */
+const MAX_PORTAL_ORDER_LINES = MAX_ORDER_LINES;
 
 /**
  * Story 21-7 — the client portal's wire shapes. Every response is an EXACT
@@ -325,6 +330,97 @@ export class PortalCreateAsnDto {
   @ValidateNested({ each: true })
   @Type(() => PortalAsnLineInputDto)
   lines!: PortalAsnLineInputDto[];
+}
+
+// ── story 4-1a: placing an order from the portal ───────────────────────────
+
+/**
+ * One portal order line — its OWN DTO, never the staff `OrderLineInputDto`:
+ * there is no `ratePaise` (a client never prices its own order), so a rate
+ * on a line is 400 `validation-failed` through the global
+ * `forbidNonWhitelisted`.
+ */
+export class PortalOrderLineInputDto {
+  @ApiProperty({ format: 'uuid', description: "One of this client's active SKUs (portal/skus) — never a kit" })
+  @IsUUID()
+  skuId!: string;
+
+  @ApiProperty({
+    description: `Ordered quantity. ${QUANTITY_FIELD_DESCRIPTION}`,
+    minimum: 0.001,
+    maximum: MAX_QUANTITY_BASE,
+  })
+  @Type(() => Number)
+  @IsNumber({ allowNaN: false, allowInfinity: false })
+  @Min(0.001)
+  @Max(MAX_QUANTITY_BASE)
+  quantity!: number;
+}
+
+/**
+ * `POST /tenants/{t}/portal/orders` body — the staff `CreateOrderDto`'s
+ * validators for the warehouse, the ship-to address and the consignee,
+ * WITHOUT `source`, the channel arms or a rate: the order is a `manual` order
+ * of the session's client (a body `clientId` is 400 `validation-failed`).
+ */
+export class PortalCreateOrderDto {
+  @ApiProperty({ format: 'uuid', description: 'The warehouse the order ships from (portal/warehouses)' })
+  @IsUUID()
+  warehouseId!: string;
+
+  @ApiProperty({ type: [PortalOrderLineInputDto], minItems: 1, maxItems: MAX_PORTAL_ORDER_LINES, description: "At least one line with one of this client's active SKUs" })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(MAX_PORTAL_ORDER_LINES)
+  @ValidateNested({ each: true })
+  @Type(() => PortalOrderLineInputDto)
+  lines!: PortalOrderLineInputDto[];
+
+  @ApiProperty({
+    type: AddressDto,
+    description: 'Where the shipment goes — every field required except line2; the pincode is six digits, as text',
+  })
+  @ValidateNested()
+  @Type(() => AddressDto)
+  destination!: AddressDto;
+
+  @ApiProperty({
+    required: false,
+    description: "The consignee's GSTIN, when the buyer is GST-registered (optional)",
+  })
+  @Transform(gstinDtoTransform)
+  @IsOptional()
+  @IsString()
+  @Matches(GSTIN_RE, { message: 'consigneeGstin must be a 15-character GSTIN (two digits, thirteen alphanumeric characters)' })
+  consigneeGstin?: string;
+
+  @ApiProperty({
+    required: false,
+    description:
+      "The GST-registered buyer's legal or trade name (optional, only alongside consigneeGstin, at most 100 characters — counted in code points after the trim, by the command). Trimmed; blank reads as absent.",
+    maxLength: MAX_CONSIGNEE_LEGAL_NAME_LENGTH,
+  })
+  @IsOptional()
+  @IsString()
+  // No DTO length cap (IMPLEMENTATION-GUIDE §4, the 8-1d rule): the 100 is
+  // counted in code points after the trim, by the command, behind its replay
+  // lookup — a UTF-16 @MaxLength here would refuse names the command accepts.
+  consigneeLegalName?: string;
+}
+
+/** `POST portal/orders` 201 — the placed order, an exact key allowlist (and the stored replay). */
+export class PortalPlacedOrderResponse {
+  @ApiProperty({ format: 'uuid', description: 'The new order — read it through portal/orders/{orderId}' })
+  orderId!: string;
+
+  @ApiProperty({ description: 'The warehouse the order was placed into' })
+  warehouseName!: string;
+
+  @ApiProperty({ type: 'integer', minimum: 1, description: 'Lines on the order' })
+  lineCount!: number;
+
+  @ApiProperty({ format: 'date-time', description: 'When the order was placed' })
+  placedAt!: string;
 }
 
 /** One option of the announce form's SKU picker (portal vocabulary, as on `portal/stock`). */

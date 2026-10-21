@@ -47,6 +47,8 @@ import type {
   CancelOrderCommand,
   CreateOrderCommand,
   OrderSnapshot,
+  PlacePortalOrderCommand,
+  PortalPlacedOrder,
   OrderSource,
   OrderStatus,
 } from './order.command';
@@ -60,6 +62,8 @@ export type {
   OrderSnapshot,
   OrderSource,
   OrderStatus,
+  PlacePortalOrderCommand,
+  PortalPlacedOrder,
 };
 import { WaveCommandService, policySnapshot } from './wave.command';
 import { PickCommandService } from './pick.command';
@@ -453,6 +457,15 @@ export class OutboundFacade {
   /** `POST .../outbound/orders` — manual entry and (adapter-ready) ingestion. */
   async createOrder(command: CreateOrderCommand, idempotencyKey: string): Promise<OrderSnapshot> {
     return this.orderCommand.createOrder(command, idempotencyKey);
+  }
+
+  /**
+   * Story 4-1a — `POST portal/orders`: a client user places an order for its
+   * own SKUs. A one-statement delegation (pinned in test/architecture.spec.ts,
+   * deliberately not `portal*`-named): the client stamp lives in the command.
+   */
+  async placePortalOrder(command: PlacePortalOrderCommand, idempotencyKey: string): Promise<PortalPlacedOrder> {
+    return this.orderCommand.placePortalOrder(command, idempotencyKey);
   }
 
   /** `POST .../outbound/orders/{id}/cancel` — releases every open hold. */
