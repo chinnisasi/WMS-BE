@@ -29,6 +29,7 @@ import {
   ManifestListResponse,
   ManifestResponse,
   OrderListQuery,
+  OrdersListQuery,
   WavePolicyListQuery,
   OrderListResponse,
   OutboundWindowListQuery,
@@ -89,11 +90,11 @@ export class OutboundController {
     description:
       'Order accepted with per-line reserved / shortfall quantities (the idempotency snapshot)',
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body (validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Missing or malformed Idempotency-Key, or invalid body — story 4-1b: a clientOrderRef that is not 1–64 printable ASCII characters, or one on an ingested order (validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied), or the caller lacks orders.manage (role-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse or a line\'s SKU does not exist in this tenant (not-found)') })
-  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict), or a concurrent first delivery of the same channel payload (conflict — retry to read the settled result); a line of an inactive SKU that stock does not cover in full — an inactive SKU sells down, never backorders (sku-inactive, naming extensions.skuCodes); a line SKU became a kit while the order was placed (order-catalog-changed — retry); story 1-6d: licence enforcement is on and no valid client and site licence covers a SKU (a line, a kit or a kit component) of drug or food goods at the warehouse today — nothing is created and every grant is released (licence-not-covered, the detail naming each SKU, its missing need and the holder, separated by "; ", and extensions.skuCodes)') })
+  @ApiResponse({ status: 409, ...problemJsonResponse('A concurrent idempotent request (conflict), or a concurrent first delivery of the same channel payload (conflict — retry to read the settled result); a line of an inactive SKU that stock does not cover in full — an inactive SKU sells down, never backorders (sku-inactive, naming extensions.skuCodes); a line SKU became a kit while the order was placed (order-catalog-changed — retry); story 1-6d: licence enforcement is on and no valid client and site licence covers a SKU (a line, a kit or a kit component) of drug or food goods at the warehouse today — nothing is created and every grant is released (licence-not-covered, the detail naming each SKU, its missing need and the holder, separated by "; ", and extensions.skuCodes); story 4-1b: the clientOrderRef is already used by another live order of the client — nothing is reserved (duplicate-client-order-ref)') })
   @ApiResponse({ status: 422, ...problemJsonResponse('Idempotency key reused with a different payload (idempotency-key-reuse), or the channel ref already created a DIFFERENT payload (order-source-conflict)') })
   @ApiResponse({ status: 503, ...problemJsonResponse('The atomic-decision store is unreachable — the creation fails closed, nothing written (reservation-store-unavailable)') })
   @ApiParam({ name: 'tenantId', format: 'uuid', description: 'Owning tenant (must match the session)' })
@@ -127,6 +128,9 @@ export class OutboundController {
         // Story 8-1d: the buyer legal name, VERBATIM — the command
         // normalizes it and owns its refusals behind the replay lookup.
         ...(dto.consigneeLegalName !== undefined ? { consigneeLegalName: dto.consigneeLegalName } : {}),
+        // Story 4-1b: the client order number, VERBATIM — the command
+        // normalizes it and owns its refusals behind the replay lookup.
+        ...(dto.clientOrderRef !== undefined ? { clientOrderRef: dto.clientOrderRef } : {}),
         lines: dto.lines.map((line) => ({
           skuId: line.skuId,
           quantity: line.quantity,
@@ -458,7 +462,7 @@ export class OutboundController {
     type: OrderListResponse,
     description: "The warehouse's order page (headers only — the detail read carries the lines; keyset cursor)",
   })
-  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor, out-of-range limit, an unknown status/source, a from/to that is not an ISO-8601 instant, from not before to, or a backordered flag other than true/false (invalid-cursor / validation-failed)') })
+  @ApiResponse({ status: 400, ...problemJsonResponse('Malformed cursor, out-of-range limit, an unknown status/source, a from/to that is not an ISO-8601 instant, from not before to, a backordered flag other than true/false, or a reference over 200 characters (invalid-cursor / validation-failed)') })
   @ApiResponse({ status: 401, ...problemJsonResponse('Missing or invalid session token') })
   @ApiResponse({ status: 403, ...problemJsonResponse('Session belongs to another tenant (permission-denied)') })
   @ApiResponse({ status: 404, ...problemJsonResponse('Warehouse does not exist in this tenant (not-found)') })
@@ -468,7 +472,7 @@ export class OutboundController {
     @Param('tenantId') tenantId: string,
     @Param('warehouseId') warehouseId: string,
     @CurrentSession() session: TenantSession,
-    @Query() query: OrderListQuery,
+    @Query() query: OrdersListQuery,
   ): Promise<OrderListResponse> {
     assertOwnTenant(session, tenantId);
     // A malformed (non-uuid) warehouseId is a 400 (the inbound uuid-guard
@@ -482,6 +486,8 @@ export class OutboundController {
       backordered: query.backordered,
       from: query.from,
       to: query.to,
+      // Story 4-1b — the exact-match search (trimmed by the DTO).
+      reference: query.reference,
       cursor: query.cursor,
       limit: query.limit,
     };

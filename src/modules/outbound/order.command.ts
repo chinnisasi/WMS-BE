@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, ne } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
 import type { Database } from '../../shared/db/db';
 import {
@@ -125,6 +125,8 @@ const MAX_GRANT_ATTEMPTS = 4;
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
 /** The channel-dedup partial unique index (the race backstop's name). */
 const ORDERS_SOURCE_EVENT_UNIQUE = 'orders_source_event_unique';
+/** Story 4-1b — the per-client live client-order-number index (0088; the race backstop). */
+const ORDERS_CLIENT_ORDER_REF_LIVE_UNIQUE = 'orders_client_order_ref_live_unique';
 
 /**
  * The line-quantity ceiling, in milli-units (story 10.1). The column is
@@ -147,6 +149,32 @@ export const MAX_CONSIGNEE_LEGAL_NAME_LENGTH = 100;
  * before the hash; the refusals live behind the replay lookup.
  */
 export function normalizeConsigneeLegalName(raw: string | null | undefined): string | null {
+  if (raw === undefined || raw === null) return null;
+  const value = raw.trim();
+  return value === '' ? null : value;
+}
+
+/**
+ * Story 4-1b — the client order number's ceiling (characters; the shape is
+ * ASCII-only, so characters, code points and UTF-16 units agree).
+ */
+export const MAX_CLIENT_ORDER_REF_LENGTH = 64;
+
+/**
+ * Story 4-1b — the client order number's shape: 1–64 printable ASCII
+ * characters, the first and the last not a space. A byte-for-byte mirror of
+ * `orders_client_order_ref_shape_check` (migration 0088), pinned against it by
+ * test/order-client-ref.spec.ts.
+ */
+export const CLIENT_ORDER_REF_RE = /^[!-~]([ -~]{0,62}[!-~])?$/;
+
+/**
+ * Story 4-1b — the client order number's normal form: JS `trim()`, and a
+ * blank (or whitespace-only) value reads as ABSENT (null). Lenient — never
+ * throws, because it runs before the hash; the shape refusal lives behind the
+ * replay lookup (the 8-1d precedent).
+ */
+export function normalizeClientOrderRef(raw: string | null | undefined): string | null {
   if (raw === undefined || raw === null) return null;
   const value = raw.trim();
   return value === '' ? null : value;
@@ -209,6 +237,13 @@ export interface CreateOrderCommand {
    * (and so NIC's `toTrdName`), falling back to the destination contact.
    */
   readonly consigneeLegalName?: string | undefined;
+  /**
+   * Story 4-1b — the client's own order number (optional; manual orders only
+   * — an ingested order carrying one is 400). Trimmed, blank = absent; 1–64
+   * printable ASCII characters (refused behind the replay lookup); unique per
+   * client among live orders (409 `duplicate-client-order-ref`). Create-only.
+   */
+  readonly clientOrderRef?: string | undefined;
   /** Channel arms — required together when `source: 'ingested'`, else absent. */
   readonly integrationId?: string | undefined;
   readonly externalEventId?: string | undefined;
@@ -240,6 +275,8 @@ export interface PlacePortalOrderCommand {
   readonly destination?: AddressInput | undefined;
   readonly consigneeGstin?: string | undefined;
   readonly consigneeLegalName?: string | undefined;
+  /** Story 4-1b — the client's own order number (the staff create's rules; the portal's 409 copy). */
+  readonly clientOrderRef?: string | undefined;
 }
 
 /**
@@ -255,6 +292,12 @@ export interface PortalPlacedOrder {
   readonly lineCount: number;
   /** The order's `created_at`, canonical ISO-8601 UTC. */
   readonly placedAt: string;
+  /**
+   * Story 4-1b — the client's own order number as stored (trimmed); null when
+   * none was given. Optional: a response stored before 4-1b lacks it (a reader
+   * treats absent as null).
+   */
+  readonly clientOrderRef?: string | null;
 }
 
 export interface CancelOrderCommand {
@@ -314,6 +357,12 @@ export interface OrderSnapshot {
     readonly source: OrderSource;
     readonly integrationId: string | null;
     readonly externalEventId: string | null;
+    /**
+     * Story 4-1b — the client's own order number; null when none was given.
+     * Optional on the interface because a snapshot stored before 4-1b (an
+     * idempotent replay) does not carry it — a reader treats absent as null.
+     */
+    readonly clientOrderRef?: string | null;
     /** Where the shipment goes (story 11-1); null on a pre-11.1 order row. */
     readonly destination: AddressSnapshot | null;
     /**
@@ -393,6 +442,15 @@ export class OrderCommandService {
         'Channel refs (integrationId/externalEventId) require source: "ingested".',
       );
     }
+    // Story 4-1b (decision 4) — a channel order's reference is its
+    // `externalEventId`; it never takes a client order number (whose per-client
+    // uniqueness could otherwise fail an ingest). 400, beside the refusal above.
+    // (Normalized first: a blank value on an ingested order reads as absent, not a 400.)
+    if (command.source === 'ingested' && normalizeClientOrderRef(command.clientOrderRef) !== null) {
+      throw validationFailed(
+        'clientOrderRef is a manual order\'s field — a channel order is named by its externalEventId.',
+      );
+    }
     const integrationId = command.source === 'ingested' ? (command.integrationId ?? null) : null;
     const externalEventId =
       command.source === 'ingested' ? (command.externalEventId ?? null) : null;
@@ -445,6 +503,15 @@ export class OrderCommandService {
     // golden hashes in `test/issuance-gate-parity.spec.ts`).
     const consigneeLegalName = normalizeConsigneeLegalName(command.consigneeLegalName);
     const legalNameFingerprint = consigneeLegalName === null ? {} : { consigneeLegalName };
+    //
+    // ── story 4-1b: `clientOrderRef` joins the payload hash ONLY WHEN PRESENT
+    // The 8-1d conditional-key rule again: normalized first (JS trim, blank =
+    // absent), spread in right after the legal name only when non-null, so an
+    // order without one hashes byte-identically to the pre-4-1b build (the
+    // existing goldens; new goldens pin the ref). Never in the channel
+    // `sourcePayloadHash` — an ingested order carries none (refused above).
+    const clientOrderRef = normalizeClientOrderRef(command.clientOrderRef);
+    const clientOrderRefFingerprint = clientOrderRef === null ? {} : { clientOrderRef };
     const sourcePayloadHash =
       command.source === 'ingested'
         ? hashCommandPayload({
@@ -464,6 +531,7 @@ export class OrderCommandService {
       destination: addressFingerprint(normalizedDestination) ?? null,
       consigneeGstin,
       ...legalNameFingerprint,
+      ...clientOrderRefFingerprint,
       lines: command.lines.map(lineFingerprint),
     });
 
@@ -490,13 +558,27 @@ export class OrderCommandService {
         await this.assertLicencesCoverInTx(tx, command.tenantId, command.warehouseId, licenceDate, order);
       },
       backorderRefusal: () => new BackorderRejectedError(),
+      // Names the clashing order: its id and warehouse ride the extensions, and
+      // the detail names the warehouse code (staff may search the other site).
+      duplicateClientOrderRef: async (tx, ref, clash) => {
+        if (clash === null) {
+          return duplicateClientOrderRef(
+            `${ref} is already used by another live order of this client — find it with the search, or use a different number (a cancelled order frees its number).`,
+          );
+        }
+        const code = await getWarehouseCodeInTx(tx, command.tenantId, clash.warehouseId);
+        return duplicateClientOrderRef(
+          `${ref} is already used by another live order of this client (in warehouse ${code}) — find it with the search, or use a different number (a cancelled order frees its number).`,
+          { orderId: clash.orderId, warehouseId: clash.warehouseId },
+        );
+      },
       respond: async (_tx, snapshot) => snapshot,
     };
 
     return this.placeOrder(
       command,
       idempotencyKey,
-      { integrationId, externalEventId, consigneeGstin, consigneeLegalName, sourcePayloadHash, payloadHash },
+      { integrationId, externalEventId, consigneeGstin, consigneeLegalName, clientOrderRef, sourcePayloadHash, payloadHash },
       staff,
     );
   }
@@ -553,11 +635,13 @@ export class OrderCommandService {
     const normalizedDestination = normalizeAddressInput(command.destination);
     const consigneeGstin = normalizeGstinInput(command.consigneeGstin);
     const consigneeLegalName = normalizeConsigneeLegalName(command.consigneeLegalName);
+    const clientOrderRef = normalizeClientOrderRef(command.clientOrderRef);
     // The portal fingerprint: `surface` FIRST (an identical payload must never
     // replay the operator surface's snapshot under a shared key), then the
     // session's client; the legal name only when present, at the 8-1d
-    // position; lines in BASE units with no rate. Key order is fixed —
-    // pinned by a golden in test/portal-orders-create.spec.ts.
+    // position, and (4-1b) the client order number only when present, right
+    // after it; lines in BASE units with no rate. Key order is fixed —
+    // pinned by goldens in test/portal-orders-create.spec.ts.
     const payloadHash = hashCommandPayload({
       surface: 'portal',
       tenantId: command.tenantId,
@@ -566,6 +650,7 @@ export class OrderCommandService {
       destination: addressFingerprint(normalizedDestination) ?? null,
       consigneeGstin,
       ...(consigneeLegalName === null ? {} : { consigneeLegalName }),
+      ...(clientOrderRef === null ? {} : { clientOrderRef }),
       lines,
     });
 
@@ -627,11 +712,17 @@ export class OrderCommandService {
         if (uncovered.length > 0) throw portalLicenceNotCovered();
       },
       backorderRefusal: (shortLines, skuFacts) => portalStockShort(shortLines.map((line) => skuFacts.get(line.skuId)?.code ?? line.skuId)),
+      // Story 4-1b (decision 9) — echoes only the user's own input.
+      duplicateClientOrderRef: async (_tx, ref) =>
+        duplicateClientOrderRef(
+          `Order number ${ref} is already used by another of your orders (a cancelled order frees its number) — use a different number.`,
+        ),
       respond: async (tx, snapshot) => ({
         orderId: snapshot.order.id,
         warehouseName: await getWarehouseNameInTx(tx, command.tenantId, snapshot.order.warehouseId),
         lineCount: snapshot.order.lines.filter((line) => line.parentLineId === null).length,
         placedAt: snapshot.order.createdAt,
+        clientOrderRef: snapshot.order.clientOrderRef ?? null,
       }),
     };
 
@@ -645,10 +736,11 @@ export class OrderCommandService {
         destination: command.destination,
         ...(command.consigneeGstin === undefined ? {} : { consigneeGstin: command.consigneeGstin }),
         ...(command.consigneeLegalName === undefined ? {} : { consigneeLegalName: command.consigneeLegalName }),
+        ...(command.clientOrderRef === undefined ? {} : { clientOrderRef: command.clientOrderRef }),
         backorderPolicy: 'reject',
       },
       idempotencyKey,
-      { integrationId: null, externalEventId: null, consigneeGstin, consigneeLegalName, sourcePayloadHash: null, payloadHash },
+      { integrationId: null, externalEventId: null, consigneeGstin, consigneeLegalName, clientOrderRef, sourcePayloadHash: null, payloadHash },
       portal,
     );
   }
@@ -807,7 +899,7 @@ export class OrderCommandService {
     hashes: OrderHashStage,
     surface: OrderSurface<R>,
   ): Promise<Preflight<R>> {
-    const { integrationId, externalEventId, consigneeGstin, consigneeLegalName, sourcePayloadHash, payloadHash } = hashes;
+    const { integrationId, externalEventId, consigneeGstin, consigneeLegalName, clientOrderRef, sourcePayloadHash, payloadHash } = hashes;
     // ── phase 1 (read tx): authority → replay → validation → dedup ────────
     const preflight = await surface.transaction(async (tx): Promise<Preflight<R>> => {
       await surface.authorize(tx);
@@ -864,6 +956,12 @@ export class OrderCommandService {
             'consigneeLegalName must contain Latin letters or digits — the e-way portal accepts only A–Z, a–z, 0–9, spaces and @ # - / , & . so this name would print blank on the e-way bill.',
           );
         }
+      }
+      // Story 4-1b: the client order number's shape — behind the replay
+      // lookup, never in the DTO (the 8-1d rule): 1–64 printable ASCII
+      // characters (the trim already ran, so no space first or last).
+      if (clientOrderRef !== null) {
+        assertClientOrderRefShape(clientOrderRef);
       }
       // Story 11-1: the destination is validated HERE, behind the replay
       // lookup — the command is the boundary (the Epic 7 adapter path bypasses
@@ -1012,6 +1110,18 @@ export class OrderCommandService {
       // `client-departed`) before any grant moves. NOT the guard: this phase
       // commits before phase 3 writes, so the check runs again there.
       const orderClient = await assertClientTakesWorkInTx(tx, command.tenantId, clientId);
+      // Story 4-1b (decision 3) — the client order number is free among the
+      // client's LIVE orders: after `client-departed`, before the licence
+      // checks, and before any grant moves (a duplicate reserves nothing). Not
+      // the guard: two different keys racing on one ref both pass here, and
+      // the partial unique index refuses the loser's insert in phase 3 with
+      // the same 409 (its grants released by the write phase's catch).
+      if (clientOrderRef !== null) {
+        const clash = await liveOrderWithRefInTx(tx, command.tenantId, clientId, clientOrderRef);
+        if (clash !== null) {
+          throw await surface.duplicateClientOrderRef(tx, clientOrderRef, clash);
+        }
+      }
       // Story 1-6d (decisions 4, 10) — the EARLY licence check, before any
       // grant moves: with enforcement on, every SKU of the order — each line
       // SKU, a kit parent and its components, backordered or not — must be
@@ -1146,7 +1256,7 @@ export class OrderCommandService {
     preflight: PreflightAccepted,
     grants: OrderGrants,
   ): Promise<R> {
-    const { integrationId, externalEventId, consigneeGstin, consigneeLegalName, sourcePayloadHash, payloadHash } = hashes;
+    const { integrationId, externalEventId, consigneeGstin, consigneeLegalName, clientOrderRef, sourcePayloadHash, payloadHash } = hashes;
     const { lines, explosions } = preflight;
     // The destination is the preflight's validated, normalized address (story
     // 11-1). (`consigneeGstin` is the preflight's normalized, shape-validated
@@ -1241,8 +1351,18 @@ export class OrderCommandService {
             // Story 8-1d: the buyer's legal / trade name (normalized, only
             // alongside a GSTIN — the preflight refused anything else).
             consigneeLegalName,
+            // Story 4-1b: the client's own order number (normalized and
+            // shape-checked in phase 1; null when none was given).
+            clientOrderRef,
           });
         } catch (err) {
+          // Story 4-1b — a concurrent order of the same client took the number
+          // between phase 1's check and this insert: the same 409 as the
+          // check, and the catch below releases this command's grants.
+          if (clientOrderRef !== null && isUniqueViolationOn(err, ORDERS_CLIENT_ORDER_REF_LIVE_UNIQUE)) {
+            // The transaction is aborted: the clash is named after the rollback.
+            throw new ClientOrderRefLostError(clientOrderRef);
+          }
           if (isUniqueViolationOn(err, ORDERS_SOURCE_EVENT_UNIQUE)) {
             // A concurrent first delivery of the same channel payload won the
             // index — this command's grants are released (they belong to no
@@ -1375,6 +1495,13 @@ export class OrderCommandService {
       // the grants belong to no order — release them, then resolve the
       // dedup-loser outcome against the settled state.
       await this.releaseAll(command.tenantId, granted, 'create-order-rollback');
+      if (err instanceof ClientOrderRefLostError) {
+        // Story 4-1b — the concurrent winner holds the number: the same 409 as
+        // phase 1's check, naming the winner (read in a fresh transaction).
+        throw await surface.transaction(async (tx) =>
+          surface.duplicateClientOrderRef(tx, err.ref, await liveOrderWithRefInTx(tx, command.tenantId, preflight.clientId, err.ref)),
+        );
+      }
       if (err instanceof DedupLostError) {
         return this.resolveDedupLoser(err, idempotencyKey, payloadHash, surface);
       }
@@ -1955,6 +2082,8 @@ export class OrderCommandService {
         source: order.source as OrderSource,
         integrationId: order.integrationId,
         externalEventId: order.externalEventId,
+        // Story 4-1b: the client's own order number (null when none).
+        clientOrderRef: order.clientOrderRef,
         // Story 11-1: the destination echoes from the flat columns; a
         // pre-11.1 row (all null) reads back `destination: null`.
         destination: addressFromColumns({
@@ -2162,6 +2291,8 @@ interface OrderHashStage {
   readonly consigneeGstin: string | null;
   /** Normalized (trim, blank = absent) — the refusals are phase 1's. */
   readonly consigneeLegalName: string | null;
+  /** Story 4-1b — normalized (trim, blank = absent); the shape refusal and the duplicate check are phase 1's. */
+  readonly clientOrderRef: string | null;
   readonly sourcePayloadHash: string | null;
   readonly payloadHash: string;
 }
@@ -2213,6 +2344,8 @@ interface OrderSurface<R> {
   readonly assertLicences: (tx: TenantTx | null, prefetched: LicenceSnapshot | null, order: LicenceOrder) => Promise<void>;
   /** The refusal under `backorderPolicy: 'reject'`. */
   readonly backorderRefusal: (shortLines: readonly BackorderRefusalLine[], skuFacts: ReadonlyMap<string, SkuFacts>) => ProblemException;
+  /** Story 4-1b — the 409 `duplicate-client-order-ref` in the surface's own words (decision 9). */
+  readonly duplicateClientOrderRef: (tx: TenantTx, ref: string, clash: LiveOrderClash | null) => Promise<ProblemException>;
   /** The response and the stored idempotency snapshot, built in the write transaction. */
   readonly respond: (tx: TenantTx, snapshot: OrderSnapshot) => Promise<R>;
 }
@@ -2333,6 +2466,51 @@ function explodeKitLine(
 
 function validationFailed(detail: string): ProblemException {
   return new ProblemException('validation-failed', 400, 'Order validation failed', detail);
+}
+
+/**
+ * Story 4-1b — the client order number's shape refusal (400
+ * `validation-failed`), run on the NORMALIZED value behind the replay lookup.
+ */
+export function assertClientOrderRefShape(ref: string): void {
+  // The character rule first, so an over-long value with a bad character
+  // reports the character, not the length.
+  const characters =
+    'clientOrderRef must be plain ASCII letters, digits, spaces and punctuation — no control characters (tabs, line breaks) and no accented or other non-ASCII characters.';
+  if (!/^[ -~]*$/.test(ref)) throw validationFailed(characters);
+  if (ref.length > MAX_CLIENT_ORDER_REF_LENGTH) {
+    throw validationFailed(`clientOrderRef is at most ${MAX_CLIENT_ORDER_REF_LENGTH} characters (got ${ref.length}).`);
+  }
+  // The column CHECK's full shape (the edges are not spaces after the trim).
+  if (!CLIENT_ORDER_REF_RE.test(ref)) throw validationFailed(characters);
+}
+
+/** Story 4-1b — 409 `duplicate-client-order-ref`; `detail` is the surface's sentence (decision 9). */
+export function duplicateClientOrderRef(detail: string, extensions?: Record<string, unknown>): ProblemException {
+  return new ProblemException('duplicate-client-order-ref', 409, 'Client order number already in use', detail, extensions);
+}
+
+/** Story 4-1b — the live order of the client holding the number (the duplicate's subject). */
+export interface LiveOrderClash {
+  readonly orderId: string;
+  readonly warehouseId: string;
+}
+
+/** Story 4-1b — the client's LIVE order holding `ref`, or null (the unique index's population). */
+async function liveOrderWithRefInTx(tx: TenantTx, tenantId: string, clientId: string, ref: string): Promise<LiveOrderClash | null> {
+  const rows = await tx
+    .select({ orderId: orders.id, warehouseId: orders.warehouseId })
+    .from(orders)
+    .where(and(eq(orders.tenantId, tenantId), eq(orders.clientOrderRef, ref), eq(orders.clientId, clientId), ne(orders.status, 'cancelled')))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+/** Story 4-1b — a concurrent order took the number (thrown in the aborted write tx; named after the rollback). */
+class ClientOrderRefLostError extends Error {
+  constructor(readonly ref: string) {
+    super('a concurrent order of the same client took the client order number');
+  }
 }
 
 function orderNotFound(orderId: string): ProblemException {

@@ -93,6 +93,11 @@ export interface DispatchSnapshot {
     readonly source: OrderSource;
     readonly integrationId: string | null;
     readonly externalEventId: string | null;
+    /**
+     * Story 4-1b — the client's own order number; null when none. Optional: a
+     * snapshot stored before 4-1b lacks it (a reader treats absent as null).
+     */
+    readonly clientOrderRef?: string | null;
     readonly dispatchedBy: string;
     readonly dispatchedAt: string;
     readonly carrierName: string | null;
@@ -453,6 +458,7 @@ export class DispatchCommandService {
           source: order.source as OrderSource,
           integrationId: order.integrationId,
           externalEventId: order.externalEventId,
+          clientOrderRef: order.clientOrderRef,
           dispatchedBy: command.actorUserId,
           dispatchedAt: canonicalInstant(dispatchedAt),
           // 4.6c: the labelled shipment's carrier/tracking auto-stamp when no

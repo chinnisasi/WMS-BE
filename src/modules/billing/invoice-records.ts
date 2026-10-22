@@ -68,12 +68,17 @@ export const RECORD_KIND_OF_CHARGE: Readonly<Record<ChargeCode, LineRecordKind>>
   storage: 'storage-day',
 };
 
-/** An order's client-facing reference; the web labels it "Channel ref", falling back to the order id. */
+/**
+ * An order's client-facing reference — the raw fields; the web composes the
+ * label `clientOrderRef ?? externalEventId ?? short id` (story 4-1b).
+ */
 export interface OrderRefView {
   /** `manual` or a channel; null only when the order row is missing. */
   readonly source: string | null;
-  /** The channel's event id; null on a manual order (there is no order number yet). */
+  /** The channel's event id; null on a manual order. */
   readonly externalEventId: string | null;
+  /** Story 4-1b — the client's own order number; null when none (or the order row is missing). */
+  readonly clientOrderRef: string | null;
   readonly orderId: string;
 }
 
@@ -376,7 +381,12 @@ export class InvoiceRecordsService {
             pickedAt: fullPrecisionInstant(row.createdAt),
             warehouseId: row.warehouseId,
             warehouseCode: codeOf(row.warehouseId),
-            orderRef: { source: row.orderSource, externalEventId: row.orderExternalEventId, orderId: row.orderId },
+            orderRef: {
+              source: row.orderSource,
+              externalEventId: row.orderExternalEventId,
+              clientOrderRef: row.orderClientOrderRef,
+              orderId: row.orderId,
+            },
             skuId: row.skuId,
             skuCode: row.skuCode,
             skuName: row.skuName,
@@ -401,7 +411,12 @@ export class InvoiceRecordsService {
               dispatchedAt: fullPrecisionInstant(row.recordedAt),
               warehouseId: row.warehouseId,
               warehouseCode: codeOf(row.warehouseId),
-              orderRef: { source: ref?.source ?? null, externalEventId: ref?.externalEventId ?? null, orderId: row.orderId },
+              orderRef: {
+                source: ref?.source ?? null,
+                externalEventId: ref?.externalEventId ?? null,
+                clientOrderRef: ref?.clientOrderRef ?? null,
+                orderId: row.orderId,
+              },
               lines: row.lines,
               carrierName: row.carrierName,
               trackingNumber: row.trackingNumber,

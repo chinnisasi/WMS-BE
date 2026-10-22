@@ -5,6 +5,7 @@ import { portalPageByCreatedAt } from '../../shared/primitives/portal-page';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { canonicalInstant } from '../../shared/primitives/time';
 import type { OrderSource, OrderStatus } from './order.command';
+import { orderReferenceMatch } from './order-reference';
 
 /**
  * Story 21-7 — the client portal's order reads. ONE client's orders, never
@@ -20,6 +21,11 @@ export interface PortalOrderRow {
   readonly source: OrderSource;
   /** The channel's own order reference (`external_event_id`); null for a manual order. */
   readonly externalRef: string | null;
+  /**
+   * Story 4-1b — the client's OWN order number (raw; null when none). The web
+   * composes the label `clientOrderRef ?? externalRef ?? …`.
+   */
+  readonly clientOrderRef: string | null;
   readonly warehouseName: string;
   readonly destinationName: string | null;
   readonly destinationCity: string | null;
@@ -48,6 +54,7 @@ interface OrderHeaderRow {
   status: string;
   source: string;
   externalRef: string | null;
+  clientOrderRef: string | null;
   warehouseName: string;
   destinationName: string | null;
   destinationCity: string | null;
@@ -60,6 +67,7 @@ interface OrderHeaderRow {
 function headerSelect(tenantId: string): ReturnType<typeof sql> {
   return sql`
     select o.id, o.status, o.source, o.external_event_id as "externalRef",
+           o.client_order_ref as "clientOrderRef",
            w.name as "warehouseName",
            o.destination_contact_name as "destinationName",
            o.destination_city as "destinationCity",
@@ -79,6 +87,7 @@ function toRow(row: OrderHeaderRow): PortalOrderRow {
     status: row.status as OrderStatus,
     source: row.source as OrderSource,
     externalRef: row.externalRef,
+    clientOrderRef: row.clientOrderRef,
     warehouseName: row.warehouseName,
     destinationName: row.destinationName,
     destinationCity: row.destinationCity,
@@ -92,12 +101,19 @@ export async function portalOrdersInTx(
   tx: TenantTx,
   tenantId: string,
   clientId: string,
-  query: { readonly status?: OrderStatus; readonly before: CursorPayload | null; readonly limit: number },
+  query: {
+    readonly status?: OrderStatus;
+    /** Story 4-1b — an exact match on this client's order number (any status) or channel reference. */
+    readonly reference?: string;
+    readonly before: CursorPayload | null;
+    readonly limit: number;
+  },
 ): Promise<Page<PortalOrderRow>> {
   const rows = (await tx.execute(sql`
     ${headerSelect(tenantId)}
       and o.client_id = ${clientId}::uuid
       ${query.status === undefined ? sql`` : sql`and o.status = ${query.status}`}
+      ${query.reference === undefined ? sql`` : sql`and ${orderReferenceMatch(sql`o.id`, tenantId, query.reference, clientId)}`}
       ${query.before === null ? sql`` : sql`and (o.created_at, o.id) < (${query.before.createdAt}::timestamptz, ${query.before.id}::uuid)`}
     order by o.created_at desc, o.id desc
     limit ${query.limit + 1}::int

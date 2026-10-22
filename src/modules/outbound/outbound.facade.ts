@@ -84,6 +84,7 @@ import type { CreateShipmentLabelCommand, ShipmentSnapshot, ShipmentStatus } fro
 import { ManifestCommandService } from './manifest.command';
 import type { CreateManifestCommand, ManifestSnapshot } from './manifest.command';
 import { RateService } from './rate.service';
+import { orderReferenceMatch } from './order-reference';
 import type { OrderRatesSnapshot } from './rate.service';
 import type {
   CreateWavePolicyCommand,
@@ -114,6 +115,8 @@ export interface OrderEntry {
   readonly source: OrderSource;
   readonly integrationId: string | null;
   readonly externalEventId: string | null;
+  /** Story 4-1b — the client's own order number; null when none. */
+  readonly clientOrderRef: string | null;
   /** Where the shipment goes (story 11-1); null on a pre-11.1 order row. */
   readonly destination: AddressSnapshot | null;
   /** Story 21-2b — the client the order is for (derived from its SKUs). */
@@ -150,6 +153,13 @@ export interface ListOrdersFilter extends ListClientFilteredQuery {
   readonly backordered?: boolean | undefined;
   readonly from?: string | undefined;
   readonly to?: string | undefined;
+  /**
+   * Story 4-1b — an exact match on the client order number (any status —
+   * `orders_client_order_ref_idx`) OR the channel reference
+   * (`external_event_id`, any status — `orders_external_event_client_idx`).
+   * Trimmed by the DTO; case-sensitive.
+   */
+  readonly reference?: string | undefined;
 }
 
 /** Story 9-1 — the windowed fact-list reads (pack failures, refusals, picklist lines). */
@@ -275,6 +285,11 @@ export interface OrderInvoiceFacts {
    */
   readonly clientId: string;
   readonly externalEventId: string | null;
+  /**
+   * Story 4-1b (additive) — the client's own order number (null when none):
+   * the RMA's `order_reference` is `clientOrderRef ?? externalEventId`.
+   */
+  readonly clientOrderRef: string | null;
   readonly lines: readonly OrderInvoiceLineFact[];
 }
 
@@ -511,6 +526,7 @@ export class OutboundFacade {
           source: orders.source,
           integrationId: orders.integrationId,
           externalEventId: orders.externalEventId,
+          clientOrderRef: orders.clientOrderRef,
           clientId: orders.clientId,
           createdAt: orders.createdAt,
           updatedAt: orders.updatedAt,
@@ -536,6 +552,7 @@ export class OutboundFacade {
         source: row.source as OrderSource,
         integrationId: row.integrationId,
         externalEventId: row.externalEventId,
+        clientOrderRef: row.clientOrderRef,
         destination: null,
         clientId: row.clientId,
         createdAt: canonicalInstant(row.createdAt),
@@ -589,6 +606,7 @@ export class OutboundFacade {
         createdAt: orders.createdAt,
         clientId: orders.clientId,
         externalEventId: orders.externalEventId,
+        clientOrderRef: orders.clientOrderRef,
       })
       .from(orders)
       .where(and(eq(orders.id, orderId), eq(orders.tenantId, tenantId)))
@@ -649,6 +667,7 @@ export class OutboundFacade {
       clientSystemOwned: (await getClientsInTx(tx, tenantId, [order.clientId])).get(order.clientId)?.systemOwned ?? null,
       clientId: order.clientId,
       externalEventId: order.externalEventId,
+      clientOrderRef: order.clientOrderRef,
       lines: lines.map((line) => ({
         orderLineId: line.orderLineId,
         parentLineId: line.parentLineId,
@@ -676,14 +695,20 @@ export class OutboundFacade {
   async portalOrders(
     tenantId: string,
     clientId: string,
-    query: { readonly status?: OrderStatus; readonly cursor?: string; readonly limit?: number } = {},
+    query: { readonly status?: OrderStatus; readonly reference?: string; readonly cursor?: string; readonly limit?: number } = {},
   ): Promise<Page<PortalOrderRow>> {
     const limit = query.limit ?? PORTAL_PAGE_DEFAULT_LIMIT;
     const before = query.cursor === undefined ? null : decodeCursorSafe(query.cursor);
     return withTenantTransaction(
       this.db,
       tenantId,
-      (tx) => portalOrdersInTx(tx, tenantId, clientId, { ...(query.status === undefined ? {} : { status: query.status }), before, limit }),
+      (tx) =>
+        portalOrdersInTx(tx, tenantId, clientId, {
+          ...(query.status === undefined ? {} : { status: query.status }),
+          ...(query.reference === undefined ? {} : { reference: query.reference }),
+          before,
+          limit,
+        }),
       { clientId },
     );
   }
@@ -745,6 +770,7 @@ export class OutboundFacade {
           source: orders.source,
           integrationId: orders.integrationId,
           externalEventId: orders.externalEventId,
+          clientOrderRef: orders.clientOrderRef,
           // Story 11-1: the list row carries the destination (city + pincode
           // are what the dispatch surface shows first); pre-11.1 rows null.
           destinationContactName: orders.destinationContactName,
@@ -777,6 +803,7 @@ export class OutboundFacade {
                 : sql`not ${anyBackordered}`,
             query.from === undefined ? undefined : sql`${orders.createdAt} >= ${query.from}::timestamptz`,
             query.to === undefined ? undefined : sql`${orders.createdAt} < ${query.to}::timestamptz`,
+            query.reference === undefined ? undefined : orderReferenceMatch(orders.id, tenantId, query.reference),
             before === undefined
               ? undefined
               : sql`(${orders.createdAt}, ${orders.id}) < (${before.createdAt}::timestamptz, ${before.id}::uuid)`,
@@ -792,6 +819,7 @@ export class OutboundFacade {
         source: row.source as OrderSource,
         integrationId: row.integrationId,
         externalEventId: row.externalEventId,
+        clientOrderRef: row.clientOrderRef,
         destination: addressFromColumns({
           contactName: row.destinationContactName,
           phone: row.destinationPhone,
@@ -1336,6 +1364,7 @@ export class OutboundFacade {
     const rows = (await tx.execute(sql`
       select p.id as "id", p.created_at::text as "createdAt", p.warehouse_id as "warehouseId",
         p.order_id as "orderId", o.source as "orderSource", o.external_event_id as "orderExternalEventId",
+        o.client_order_ref as "orderClientOrderRef",
         p.sku_id as "skuId", s.code as "skuCode", s.name as "skuName", p.qty::text as "qtyMilli",
         b.code as "binCode", p.picked_by as "actorId"
       from picks p
@@ -1352,8 +1381,10 @@ export class OutboundFacade {
 
   /**
    * Story 21-5b — the client-facing reference of each order: its source
-   * (`manual` or a channel) and the channel's event id (null on a manual
-   * order — there is no order number yet, PENDING). The dispatched-order
+   * (`manual` or a channel), the channel's event id (null on a manual
+   * order) and — story 4-1b — the client's own order number (null when
+   * none); the web labels the order `clientOrderRef ?? externalEventId ??
+   * short id`. The dispatched-order
    * drill reads its orders from the ledger (inventory) and names them here.
    * An id with no order row is absent from the map.
    */
@@ -1361,11 +1392,17 @@ export class OutboundFacade {
     const distinct = [...new Set(orderIds)].filter((id) => UUID_RE.test(id));
     if (distinct.length === 0) return new Map();
     const rows = (await tx.execute(sql`
-      select o.id as "orderId", o.source as "source", o.external_event_id as "externalEventId"
+      select o.id as "orderId", o.source as "source", o.external_event_id as "externalEventId",
+             o.client_order_ref as "clientOrderRef"
       from orders o
       where o.tenant_id = ${tenantId}::uuid and o.id = any(${sql.param(distinct)}::uuid[])
     `)) as unknown as OrderRef[];
-    return new Map(rows.map((row) => [row.orderId, { orderId: row.orderId, source: row.source, externalEventId: row.externalEventId }]));
+    return new Map(
+      rows.map((row) => [
+        row.orderId,
+        { orderId: row.orderId, source: row.source, externalEventId: row.externalEventId, clientOrderRef: row.clientOrderRef },
+      ]),
+    );
   }
 
   /**
@@ -1395,6 +1432,8 @@ export interface OrderRef {
   readonly source: string;
   /** The channel's event id; null on a manual order. */
   readonly externalEventId: string | null;
+  /** Story 4-1b — the client's own order number; null when none. */
+  readonly clientOrderRef: string | null;
 }
 
 /** Story 21-5b — one pick of a pick drill (quantity milli-units as text). */
@@ -1407,6 +1446,8 @@ export interface PickRecordRow {
   /** Null only when the order row is missing. */
   readonly orderSource: string | null;
   readonly orderExternalEventId: string | null;
+  /** Story 4-1b — the order's client order number; null when none (or the order row is missing). */
+  readonly orderClientOrderRef: string | null;
   readonly skuId: string;
   readonly skuCode: string;
   readonly skuName: string;

@@ -268,6 +268,9 @@ const OUTBOUND_COLUMNS: readonly ExportColumn[] = [
   instant('first_dispatched_ist'),
   text('carrier'),
   text('awb'),
+  // Story 4-1b — the client's own order number (blank when none), appended
+  // LAST so every existing column keeps its position for file consumers.
+  text('client_order_ref'),
 ];
 
 const outboundRegister: RegisterDefinition = {
@@ -305,6 +308,7 @@ const outboundRegister: RegisterDefinition = {
         row.quantity,
         at(dispatch?.dispatchedAt ?? null),
         ...carrierPair(dispatch, row),
+        row.clientOrderRef,
       ];
     });
   },

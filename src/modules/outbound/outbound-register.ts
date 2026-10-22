@@ -44,6 +44,8 @@ export interface OutboundRegisterRow {
   readonly source: string;
   /** `external_event_id` — the channel's order reference, on an ingested order only. */
   readonly channelOrderRef: string | null;
+  /** Story 4-1b — the client's own order number; null when none. */
+  readonly clientOrderRef: string | null;
   readonly clientId: string;
   readonly consigneeLegalName: string | null;
   readonly consigneeGstin: string | null;
@@ -97,6 +99,7 @@ export async function outboundRegisterInTx(
     const lines = (await tx.execute(sql`
       select o.id::text as "orderId", ${iso(sql`o.created_at`)} as "createdAt", o.status as "status", o.source as "source",
              case when o.source = 'ingested' then o.external_event_id end as "channelOrderRef",
+             o.client_order_ref as "clientOrderRef",
              o.client_id::text as "clientId", o.consignee_legal_name as "consigneeLegalName", o.consignee_gstin as "consigneeGstin",
              o.destination_city as "destinationCity", o.destination_state as "destinationState", o.destination_pincode as "destinationPincode",
              ol.id::text as "lineId", k.id::text as "skuId", k.code as "skuCode", k.name as "skuName", k.uom as "uom",

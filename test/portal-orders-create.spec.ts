@@ -314,7 +314,8 @@ describe('portal order entry (e2e, story 4-1a)', () => {
       const res = await place(payload, portalA.token, key).expect(201);
       const orderId = res.body.orderId as string;
       // Exact keys — no reservation, rate, phone, status or line detail.
-      expect(res.body).toEqual({ orderId, warehouseName: 'Main', lineCount: 2, placedAt: expect.any(String) });
+      // (Story 4-1b added `clientOrderRef`, null when none was given.)
+      expect(res.body).toEqual({ orderId, warehouseName: 'Main', lineCount: 2, placedAt: expect.any(String), clientOrderRef: null });
       expect(res.body.placedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
 
       // The staff view: an ordinary manual order of ACME, fully reserved.
@@ -524,6 +525,25 @@ describe('portal order entry (e2e, story 4-1a)', () => {
       expect(hashOf.get(blankKey)).toBe(sha256(`${head},"consigneeGstin":"${GSTIN}","lines":[{"skuId":"${sku.get('A-1')!}","quantity":1}]}`));
     });
 
+    it('golden (4-1b): the portal order number joins the hash ONLY when present, normalized, right after the legal name; blank is absent', async () => {
+      const line = `"lines":[{"skuId":"${sku.get('A-1')!}","quantity":1}]}`;
+      const head = `{"surface":"portal","tenantId":"${tenantId}","clientId":"${clientA}","warehouseId":"${whMain}","destination":${DESTINATION_JSON}`;
+      const namedKey = ulid();
+      const ref1 = `PG-${namedKey.slice(-8)}`;
+      const named = await place(body([{ skuId: sku.get('A-1')!, quantity: 1 }], { consigneeGstin: GSTIN, consigneeLegalName: 'Mysore Spices Pvt Ltd', clientOrderRef: ` ${ref1}  ` }), portalA.token, namedKey).expect(201);
+      expect(named.body.clientOrderRef).toBe(ref1);
+      const plainKey = ulid();
+      const ref2 = `PG-${plainKey.slice(-8)}`;
+      await place(body([{ skuId: sku.get('A-1')!, quantity: 1 }], { clientOrderRef: ref2 }), portalA.token, plainKey).expect(201);
+      const blankKey = ulid();
+      expect((await place(body([{ skuId: sku.get('A-1')!, quantity: 1 }], { clientOrderRef: '   ' }), portalA.token, blankKey).expect(201)).body.clientOrderRef).toBeNull();
+      const rows = await sql`select key, payload_hash from idempotency_keys where tenant_id = ${tenantId} and key in (${namedKey}, ${plainKey}, ${blankKey})`;
+      const hashOf = new Map(rows.map((row) => [row.key as string, row.payload_hash as string]));
+      expect(hashOf.get(namedKey)).toBe(sha256(`${head},"consigneeGstin":"${GSTIN}","consigneeLegalName":"Mysore Spices Pvt Ltd","clientOrderRef":"${ref1}",${line}`));
+      expect(hashOf.get(plainKey)).toBe(sha256(`${head},"consigneeGstin":null,"clientOrderRef":"${ref2}",${line}`));
+      expect(hashOf.get(blankKey)).toBe(sha256(`${head},"consigneeGstin":null,${line}`));
+    });
+
     it('the staff create hash and response are UNCHANGED by 4-1a (pinned golden)', async () => {
       const key = ulid();
       const res = await staffCreate(body([{ skuId: sku.get('A-1')!, quantity: 2 }]), key).expect(201);
@@ -534,6 +554,8 @@ describe('portal order entry (e2e, story 4-1a)', () => {
         ),
       );
       expect(Object.keys(res.body)).toEqual(['order']);
+      // The response keys 4-1a left unchanged — plus story 4-1b's deliberate
+      // `clientOrderRef` (null when none), right after `externalEventId`.
       expect(Object.keys(res.body.order as Record<string, unknown>)).toEqual([
         'id',
         'tenantId',
@@ -542,6 +564,7 @@ describe('portal order entry (e2e, story 4-1a)', () => {
         'source',
         'integrationId',
         'externalEventId',
+        'clientOrderRef',
         'destination',
         'clientId',
         'createdAt',

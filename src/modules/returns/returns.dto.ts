@@ -243,7 +243,7 @@ export class ReturnAuthorizationDto {
   @ApiProperty({ format: 'uuid' })
   orderId!: string;
 
-  @ApiProperty({ type: String, nullable: true, description: "The order's channel reference at authorization (its external event id); null for a manual order" })
+  @ApiProperty({ type: String, nullable: true, description: "The order's reference at authorization — story 4-1b: its client order number, else its channel reference (external event id); null when it has neither. An RMA created before 4-1b holds the channel reference only" })
   orderReference!: string | null;
 
   @ApiProperty({ format: 'uuid', description: "The order's warehouse — where the return will be received" })
@@ -332,7 +332,7 @@ export class ReturnableOrderDto {
   @ApiProperty({ format: 'uuid' })
   warehouseId!: string;
 
-  @ApiProperty({ type: String, nullable: true, description: "The order's channel reference; null for a manual order" })
+  @ApiProperty({ type: String, nullable: true, description: "Story 4-1b — the order's client order number, else its channel reference; null when it has neither" })
   orderReference!: string | null;
 
   @ApiProperty({ type: String, nullable: true, description: 'When the order was dispatched (ISO-8601 UTC); null when it is not' })

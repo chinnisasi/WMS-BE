@@ -627,7 +627,8 @@ export async function readReturnableInTx(
     orderId: computed.facts.orderId,
     status: computed.facts.status,
     warehouseId: computed.facts.warehouseId,
-    orderReference: computed.facts.externalEventId,
+    // Story 4-1b — the preview names the order as the insert below stores it.
+    orderReference: rmaOrderReference(computed.facts),
     dispatchedAt: computed.dispatchedAt,
     lines,
   };
@@ -839,7 +840,9 @@ export class ReturnAuthorizationCommand {
           clientId: computed.facts.clientId,
           warehouseId: computed.facts.warehouseId,
           orderId: command.orderId,
-          orderReference: computed.facts.externalEventId,
+          // Story 4-1b — the client's own order number, else the channel's
+          // reference (null for a manual order with neither).
+          orderReference: rmaOrderReference(computed.facts),
           code,
           externalReference: normalized.externalReference,
           status: 'open',
@@ -1139,4 +1142,15 @@ export class ReturnAuthorizationCommand {
       throw err;
     }
   }
+}
+
+/**
+ * Story 4-1b — what an RMA stores as its `order_reference` (and the
+ * returnable preview shows): the order's client order number, else its
+ * channel reference (`external_event_id`), else null. One function for the
+ * preview and the insert, so the two never disagree. An RMA created before
+ * 4-1b keeps the channel reference it stored (no backfill).
+ */
+export function rmaOrderReference(facts: { readonly clientOrderRef: string | null; readonly externalEventId: string | null }): string | null {
+  return facts.clientOrderRef ?? facts.externalEventId;
 }

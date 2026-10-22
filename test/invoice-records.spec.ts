@@ -360,10 +360,10 @@ describe('story 21-5b: the dispute drill-down', () => {
       return id;
     }
 
-    async function seedOrder(id: string, clientCode: string, where: 'w1' | 'w2' | 'w3', channel: string | null): Promise<void> {
-      await sql`insert into orders (id, tenant_id, client_id, warehouse_id, status, source, integration_id, external_event_id)
+    async function seedOrder(id: string, clientCode: string, where: 'w1' | 'w2' | 'w3', channel: string | null, clientOrderRef: string | null = null): Promise<void> {
+      await sql`insert into orders (id, tenant_id, client_id, warehouse_id, status, source, integration_id, external_event_id, client_order_ref)
         values (${id}, ${tenantId}, ${client(clientCode)}, ${wh[where]}, 'dispatched', ${channel === null ? 'manual' : 'ingested'},
-          ${channel === null ? null : uuidv7()}, ${channel})`;
+          ${channel === null ? null : uuidv7()}, ${channel}, ${clientOrderRef})`;
     }
 
     async function settle(clientCode: string, where: 'w1' | 'w2' | 'w3', nowMs: number): Promise<void> {
@@ -571,7 +571,8 @@ describe('story 21-5b: the dispute drill-down', () => {
       // ships one line on the 30th (22:00 IST) and one on Oct 1st; o3 on the
       // 8th (card A).
       await seedOrder(orders.o1, 'ACME', 'w1', 'shopify-evt-1');
-      await seedOrder(orders.o2, 'ACME', 'w1', null);
+      // Story 4-1b — o2 carries ACME's own order number (both drills return it raw).
+      await seedOrder(orders.o2, 'ACME', 'w1', null, 'SO-2002');
       await seedOrder(orders.o3, 'ACME', 'w1', null);
       await seedOrder(orders.o4, 'ACME', 'w1', null);
       await seedOrder(orders.o5, 'ACME', 'w1', null);
@@ -697,7 +698,7 @@ describe('story 21-5b: the dispute drill-down', () => {
           kind: 'pick',
           pickedAt: '2026-09-16T04:30:00.000000Z',
           warehouseCode: whCode.w1,
-          orderRef: { source: 'ingested', externalEventId: 'shopify-evt-1', orderId: orders.o1 },
+          orderRef: { source: 'ingested', externalEventId: 'shopify-evt-1', clientOrderRef: null, orderId: orders.o1 },
           skuCode: 'ACME-PC',
           qty: '2.5',
           binCode: 'A-01-01',
@@ -714,7 +715,10 @@ describe('story 21-5b: the dispute drill-down', () => {
           [orders.o5, 1, null, null],
           [orders.o2, 1, 'Ekart', 'EK-9'],
         ]);
-        expect(recs[3]).toMatchObject({ kind: 'order', dispatchedAt: '2026-09-30T16:30:00.000000Z', orderRef: { source: 'manual', externalEventId: null }, actorEmail: ownerEmail });
+        expect(recs[3]).toMatchObject({ kind: 'order', dispatchedAt: '2026-09-30T16:30:00.000000Z', orderRef: { source: 'manual', externalEventId: null, clientOrderRef: 'SO-2002' }, actorEmail: ownerEmail });
+        // Story 4-1b — the pick drill names o2 by its client order number too (the raw field; the web composes the label).
+        const picks = (await walk(acme29.id, lineOf(acme29, 'pick', '2026-09-15').id, 10)).all;
+        expect(picks.filter((rec) => (rec.orderRef as { orderId: string }).orderId === orders.o2).map((rec) => (rec.orderRef as { clientOrderRef: unknown }).clientOrderRef)).toEqual(['SO-2002']);
         // The card-A segment holds only o3.
         const early = await records(acme29.id, lineOf(acme29, 'outbound_handling', '2026-09-01').id).expect(200);
         expect((early.body.records as Rec[]).map((rec) => (rec.orderRef as { orderId: string }).orderId)).toEqual([orders.o3]);

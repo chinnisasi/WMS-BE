@@ -23,7 +23,8 @@ import {
 import { ApiProperty, OmitType } from '@nestjs/swagger';
 import { BooleanFlag, IsInstant } from '../../shared/primitives/instant-range';
 import { PACK_FAILURE_ENTRIES } from '../../shared/db/schema';
-import { ORDER_SOURCES, ORDER_STATUSES } from './order.command';
+import { CLIENT_ORDER_REF_RE, MAX_CLIENT_ORDER_REF_LENGTH, ORDER_SOURCES, ORDER_STATUSES } from './order.command';
+import { MAX_EXTERNAL_ID_LENGTH } from '../../shared/primitives/ids';
 import { AddressDto } from '../tenancy/tenancy.dto';
 import { SHORT_PICK_REASON_CODES } from './pick.command';
 // The pack bounds are the COMMAND's constants, imported rather than copied:
@@ -165,6 +166,19 @@ export class CreateOrderDto {
   @IsOptional()
   @IsString()
   consigneeLegalName?: string;
+
+  @ApiProperty({
+    required: false,
+    maxLength: MAX_CLIENT_ORDER_REF_LENGTH,
+    pattern: CLIENT_ORDER_REF_RE.source,
+    description:
+      "Story 4-1b — the client's own order number (optional; a manual order only — 400 beside source 'ingested'). Trimmed (the pattern is the trimmed value's); blank reads as absent. 1–64 printable ASCII characters (refused by the command, 400 validation-failed, behind its replay lookup); unique among the client's live orders (409 duplicate-client-order-ref — a cancelled order frees its number). Create-only.",
+  })
+  @IsOptional()
+  @IsString()
+  // No DTO shape check (IMPLEMENTATION-GUIDE §4, the 8-1d rule): the command
+  // normalizes and refuses behind its replay lookup.
+  clientOrderRef?: string;
 }
 
 /** POST /tenants/{tenantId}/outbound/orders/{orderId}/cancel body — none. */
@@ -239,6 +253,17 @@ export class OrderDto {
 
   @ApiProperty({ type: String, nullable: true, description: 'Channel external event id (null on a manual order)' })
   externalEventId!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    maxLength: MAX_CLIENT_ORDER_REF_LENGTH,
+    pattern: CLIENT_ORDER_REF_RE.source,
+    description:
+      "Story 4-1b — the client's own order number (null when none was given). Absent only on a replayed response stored before 4-1b — read absent as null",
+  })
+  clientOrderRef?: string | null;
 
   @ApiProperty({
     type: AddressDto,
@@ -344,6 +369,32 @@ export class OrderListQuery {
  */
 export class WavePolicyListQuery extends OmitType(OrderListQuery, ['clientId'] as const) {}
 
+/**
+ * Story 4-1b — `GET …/warehouses/{w}/outbound/orders` only: the shared list
+ * query plus the `reference` search. A subclass, so the manifest and wave
+ * lists (which reuse `OrderListQuery`) neither advertise nor accept it
+ * (`forbidNonWhitelisted` refuses it there 400).
+ */
+export class OrdersListQuery extends OrderListQuery {
+  @ApiProperty({
+    required: false,
+    maxLength: MAX_EXTERNAL_ID_LENGTH,
+    description:
+      "Story 4-1b — an EXACT, case-sensitive match on the order's client order number (any status) OR its channel reference (externalEventId). Trimmed; blank is no search; over 200 characters (a channel reference's ceiling) is 400. Composes with every other filter, the client filter included",
+  })
+  // Trimmed, and a blank search reads as no search (one transform — the
+  // order of two stacked @Transform decorators is not one to rely on).
+  @Transform(({ value }: { value: unknown }) => {
+    if (typeof value !== 'string') return value;
+    const trimmed = value.trim();
+    return trimmed === '' ? undefined : trimmed;
+  })
+  @IsOptional()
+  @IsString()
+  @Length(1, MAX_EXTERNAL_ID_LENGTH)
+  reference?: string;
+}
+
 /** One header row of the order list (no lines — the detail read carries them). */
 export class OrderEntryDto {
   @ApiProperty({ format: 'uuid' })
@@ -366,6 +417,15 @@ export class OrderEntryDto {
 
   @ApiProperty({ type: String, nullable: true })
   externalEventId!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    maxLength: MAX_CLIENT_ORDER_REF_LENGTH,
+    pattern: CLIENT_ORDER_REF_RE.source,
+    description: "Story 4-1b — the client's own order number; null when none was given (a live read — always present)",
+  })
+  clientOrderRef!: string | null;
 
   @ApiProperty({
     type: AddressDto,
@@ -1209,6 +1269,17 @@ export class PackDto {
   @ApiProperty({ type: String, nullable: true })
   externalEventId!: string | null;
 
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    maxLength: MAX_CLIENT_ORDER_REF_LENGTH,
+    pattern: CLIENT_ORDER_REF_RE.source,
+    description:
+      "Story 4-1b — the client's own order number (null when none was given). Absent only on a replayed response stored before 4-1b — read absent as null",
+  })
+  clientOrderRef?: string | null;
+
   @ApiProperty({ format: 'uuid', description: 'The operator who packed it' })
   packedBy!: string;
 
@@ -1342,6 +1413,17 @@ export class DispatchDto {
 
   @ApiProperty({ type: String, nullable: true })
   externalEventId!: string | null;
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    required: false,
+    maxLength: MAX_CLIENT_ORDER_REF_LENGTH,
+    pattern: CLIENT_ORDER_REF_RE.source,
+    description:
+      "Story 4-1b — the client's own order number (null when none was given). Absent only on a replayed response stored before 4-1b — read absent as null",
+  })
+  clientOrderRef?: string | null;
 
   @ApiProperty({ format: 'uuid', description: 'The operator who dispatched it' })
   dispatchedBy!: string;
