@@ -18,6 +18,8 @@ import type { AddressSnapshot } from '../../shared/primitives/address';
 import { fromMilli } from '../../shared/primitives/quantity';
 import { GSTIN_RE, gstinPrefixProblem, normalizeGstinInput } from '../../shared/primitives/gstin';
 import { FLOOR_ROLES, assertPermission } from './permissions';
+import { SYSTEM_ACTOR_ID } from '../../shared/primitives/audit';
+import { rearmTxDeadline } from '../../shared/db/tx-deadline';
 import {
   AuditExportCommand,
   toAuditExportSnapshot,
@@ -183,16 +185,46 @@ export async function existingWarehouseCodesInTx(
 }
 
 /**
- * The role of one tenant member, read **inside the caller's tenant
- * transaction** when `tx` is given (the command-service-entry pattern of
- * Story 1.5 — the DB read *is* the epoch, so a role change applies to the
- * user's next command without re-login). Without `tx`, its own tenant-scoped
- * transaction is opened. Catalog and other foreign modules call the
- * `TenancyService.getMemberRole` facade; they never touch tenancy tables.
+ * Story 5-3a — the name a register prints for each actor, never an email
+ * (design review B4: a register is forwarded to accounts and to clients).
  *
- * A missing member row fails closed: the caller has no role and no
- * capabilities (`role-denied` names it).
+ * Members carry no name column (no migration in 5-3a), so the display name is
+ * the email's LOCAL PART — the handle before `@` (`ravi.kumar@acme.in` →
+ * `ravi.kumar`): what identifies the member to colleagues, without the
+ * address or its domain. The system actor (`SYSTEM_ACTOR_ID`, never a row)
+ * reads `System`; an id with no member row in the tenant — or an empty local
+ * part — reads `user-<last 8 hex>` (the UUIDv7 tail — the random part); two
+ * members sharing a local part each get a `-user-<last 8 hex>` suffix. One
+ * query over the distinct ids, inside the caller's transaction (its deadline
+ * re-armed first).
  */
+export async function memberDisplayNamesInTx(
+  tx: TenantTx,
+  tenantId: string,
+  userIds: readonly string[],
+): Promise<Map<string, string>> {
+  const ids = [...new Set(userIds)];
+  // The caller's whole-read deadline (a register), when it set one.
+  await rearmTxDeadline(tx);
+  // `userEmailsInTx` skips malformed ids and binds ONE uuid[] parameter.
+  const emails = await userEmailsInTx(tx, tenantId, ids.filter((id) => id !== SYSTEM_ACTOR_ID));
+  const tail = (id: string): string => `user-${id.slice(-8)}`;
+  const handles = new Map<string, string>();
+  for (const [id, email] of emails) handles.set(id, email.split('@')[0] ?? '');
+  // Two members sharing a local part (ravi@a.in, ravi@b.in) must never read as one person.
+  const counts = new Map<string, number>();
+  for (const handle of handles.values()) counts.set(handle, (counts.get(handle) ?? 0) + 1);
+  const names = new Map<string, string>();
+  for (const id of ids) {
+    const handle = handles.get(id);
+    if (handle === undefined) names.set(id, id === SYSTEM_ACTOR_ID ? 'System' : tail(id));
+    else if (handle === '') names.set(id, tail(id));
+    else if ((counts.get(handle) ?? 0) > 1) names.set(id, `${handle}-${tail(id)}`);
+    else names.set(id, handle);
+  }
+  return names;
+}
+
 /**
  * Story 21-4 — the member's client (AD-23 persona arm): null for the
  * tenant's own staff, set for a client-portal user. Null for an unknown
@@ -384,6 +416,17 @@ export async function pushTokenOwners(authDb: Database, tokens: readonly string[
   return owners;
 }
 
+/**
+ * The role of one tenant member, read **inside the caller's tenant
+ * transaction** when `tx` is given (the command-service-entry pattern of
+ * Story 1.5 — the DB read *is* the epoch, so a role change applies to the
+ * user's next command without re-login). Without `tx`, its own tenant-scoped
+ * transaction is opened. Catalog and other foreign modules call the
+ * `TenancyService.getMemberRole` facade; they never touch tenancy tables.
+ *
+ * A missing member row fails closed: the caller has no role and no
+ * capabilities (`role-denied` names it).
+ */
 export async function getMemberRoleIn(
   tx: TenantTx,
   tenantId: string,

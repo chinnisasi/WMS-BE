@@ -1,5 +1,9 @@
 import { Module } from '@nestjs/common';
 import { SharedModule } from '../../shared/shared.module';
+import { CatalogModule } from '../catalog/catalog.module';
+import { InboundModule } from '../inbound/inbound.module';
+import { InventoryModule } from '../inventory/inventory.module';
+import { OutboundModule } from '../outbound/outbound.module';
 import { ReportingFacade } from './reporting.facade';
 
 /**
@@ -10,9 +14,14 @@ import { ReportingFacade } from './reporting.facade';
  * guarded by `test/architecture.spec.ts` (reporting writes nothing; nothing
  * but the api shell imports it). See `kpis.ts` for the exception's terms.
  * The audit trail and exports (9-3) join this module later.
+ *
+ * Story 5-3a — the operational registers are NOT a read-model exception:
+ * they read through the owning modules' facades, so this module imports
+ * inventory, inbound, outbound and catalog (nothing imports reporting back,
+ * so no forward reference is needed).
  */
 @Module({
-  imports: [SharedModule],
+  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, CatalogModule],
   providers: [ReportingFacade],
   exports: [ReportingFacade],
 })

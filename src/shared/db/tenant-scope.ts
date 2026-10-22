@@ -51,6 +51,13 @@ export interface TenantTransactionOptions {
    */
   readonly isolationLevel?: 'repeatable read';
   /**
+   * Story 5-3a — `read only` for a read that must never write (the
+   * operational registers' one repeatable-read snapshot): Postgres refuses
+   * any write in the transaction (25006). Omitted — every other caller —
+   * the database default (read write).
+   */
+  readonly accessMode?: 'read only';
+  /**
    * Story 21-2 (AD-24) — the client-portal scoping arm. When set, the
    * transaction stamps `app.client_id` transaction-local and the database
    * makes every other client's rows unreachable (fail-closed: set-but-wrong
@@ -87,7 +94,9 @@ export async function withTenantTransaction<T>(
     }
     return fn(tx);
   };
-  return options.isolationLevel === undefined
-    ? db.transaction(scoped)
-    : db.transaction(scoped, { isolationLevel: options.isolationLevel });
+  if (options.isolationLevel === undefined && options.accessMode === undefined) return db.transaction(scoped);
+  return db.transaction(scoped, {
+    ...(options.isolationLevel === undefined ? {} : { isolationLevel: options.isolationLevel }),
+    ...(options.accessMode === undefined ? {} : { accessMode: options.accessMode }),
+  });
 }

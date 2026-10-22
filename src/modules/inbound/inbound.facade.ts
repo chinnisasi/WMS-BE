@@ -23,6 +23,14 @@ import {
   type PortalPurchaseOrderRow,
 } from './portal-inbound';
 import type { VendorSnapshotV1 } from '../partners/partners.facade';
+import {
+  grnCodesByIdsInTx as grnCodesByIdsInTxImpl,
+  inboundRegisterInTx as inboundRegisterInTxImpl,
+  type InboundRegisterRow,
+  type InboundRegisterScope,
+} from './inbound-register';
+// Story 5-3a — the register row shapes cross the seam here (reporting reads them).
+export type { InboundRegisterRow, InboundRegisterScope } from './inbound-register';
 import { ProblemException } from '../../shared/problem-details/problem.exception';
 import { assertWarehouseInTenant, getMemberClientIdIn } from '../tenancy/tenancy.service';
 import { AsnCommand, asnPortalRefused, readAsnInTx } from './asn.command';
@@ -453,6 +461,24 @@ export class InboundFacade {
         lines: lines.map(lineSnapshot),
       };
     });
+  }
+
+  // ── story 5-3a: the operational registers' reads (`inbound-register.ts`) ──
+
+  /**
+   * The inbound register: one row per GRN line of the warehouse's GRNs
+   * created in `[from, to)`, with the header, the document (PO / ASN /
+   * blind), the PO's frozen vendor and the gate-in's linked documents;
+   * attributed (and filtered) by the line SKU's client. In the caller's
+   * repeatable-read transaction, at most `limit` rows.
+   */
+  async inboundRegisterInTx(tx: TenantTx, scope: InboundRegisterScope, limit: number, pageSize?: number): Promise<InboundRegisterRow[]> {
+    return inboundRegisterInTxImpl(tx, scope, limit, pageSize);
+  }
+
+  /** GRN id → code (the ledger register's reference summary names GRNs by code). */
+  async grnCodesByIdsInTx(tx: TenantTx, tenantId: string, grnIds: readonly string[]): Promise<Map<string, string>> {
+    return grnCodesByIdsInTxImpl(tx, tenantId, grnIds);
   }
 
   /**

@@ -27,6 +27,22 @@ export function istDateOf(instant: string): string {
 }
 
 /**
+ * Story 5-3a — an instant's IST wall clock, `YYYY-MM-DD HH:mm:ss` (seconds,
+ * no zone suffix — the operational registers name the zone in their column
+ * headers, `_ist`). Accepts an ISO string or a `Date`; throws a `RangeError`
+ * on an unparseable instant, like `istDateOf`. IST has no DST, so the fixed
+ * offset is exact.
+ */
+export function istWallClock(instant: string | Date): string {
+  const ms = typeof instant === 'string' ? Date.parse(instant) : instant.getTime();
+  if (Number.isNaN(ms)) {
+    throw new RangeError(`unparseable instant "${String(instant)}"`);
+  }
+  const iso = new Date(ms + IST_OFFSET_MS).toISOString();
+  return `${iso.slice(0, 10)} ${iso.slice(11, 19)}`;
+}
+
+/**
  * A real calendar date in `YYYY-MM-DD` (shape AND existence — `2026-02-31`
  * is refused). Moved here from `invoicing/eway-json.ts` (story 21-3).
  */
