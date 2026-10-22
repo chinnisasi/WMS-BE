@@ -911,7 +911,9 @@ describe('return receipts (e2e, story 13-2)', () => {
       const expected =
         // Story 3-1 adds the device-uploaded `stock.move` — apply + discard (a
         // move names two bins, so no recount). Named here explicitly.
-        type === 'grn.shelf-life-refused' || type === 'grn.licence-refused' || type === 'stock.move'
+        // Story 3-2b adds the device-uploaded `stock.adjust` — apply + discard
+        // (the remedy for a stock disagreement is the adjustment itself).
+        type === 'grn.shelf-life-refused' || type === 'grn.licence-refused' || type === 'stock.move' || type === 'stock.adjust'
           ? ['apply', 'discard']
           : discardOnly.has(type)
             ? ['discard']

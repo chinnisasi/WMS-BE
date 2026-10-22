@@ -115,6 +115,14 @@ export { BUFFER_OWNER_TYPE } from './reservation.service';
 // from `inventory.command` internals (the same rule as the ledger shapes
 // above).
 export type { AdjustStockCommand, StockAdjustmentSnapshot } from './inventory.command';
+// Story 3-2b — the submission service (tenancy, `adjustment-submission.ts`)
+// composes the arms and calls `adjustStock`; it reads the batch input and the
+// discriminated outcome through here.
+export type { AdjustStockBatch, StockAdjustmentPendingSnapshot, StockAdjustmentResult } from './inventory.command';
+export type { AdjustmentReasonEntry } from './adjustment-reason';
+// Story 3-2b — the vocabulary the device snapshot's DTO enumerates (inbound's
+// `CatalogAdjustReasonDto`); siblings read it here, never from the file.
+export { ADJUSTMENT_REASON_CODES } from './adjustment-reason';
 import type {
   AnchorNothing,
   ChainAnchor,
@@ -124,7 +132,9 @@ import type {
   RebuildReport,
   ReplayReport,
 } from './ledger.service';
-import { StockAdjustmentCommand } from './inventory.command';
+import { StockAdjustmentCommand, assertAdjustmentShape } from './inventory.command';
+import { adjustmentReasonEntries } from './adjustment-reason';
+import type { AdjustmentReasonEntry } from './adjustment-reason';
 import type { AdjustStockCommand, StockAdjustmentResult, StockAdjustmentSnapshot, StockAdjustmentPendingSnapshot } from './inventory.command';
 import type { SignedQuantity } from '../../shared/primitives/quantity';
 import { AdjustmentApprovalCommand } from './adjustment-approval.command';
@@ -544,6 +554,27 @@ export class InventoryFacade {
    */
   adjustmentFingerprint(command: AdjustStockCommand): string {
     return this.stockAdjustment.fingerprint(command);
+  }
+
+  /**
+   * Story 3-2b — the adjustment's request-shape checks (business time — and
+   * its requirement on the handheld — and a non-zero delta), the same
+   * function `adjust` runs above its transaction. The submission calls it
+   * BEFORE composing batch/serial identity, so a malformed request answers
+   * 400 before anything is minted. Returns the business time.
+   */
+  assertAdjustmentShape(command: AdjustStockCommand): string {
+    return assertAdjustmentShape(command);
+  }
+
+  /**
+   * Story 3-2b (A9) — the adjustment reason vocabulary with its labels: the
+   * device snapshot's `adjustReasons` arm, composed by the api shell (the
+   * `moveReasons` precedent — inbound's snapshot never imports inventory's
+   * vocabulary file).
+   */
+  adjustmentReasons(): AdjustmentReasonEntry[] {
+    return adjustmentReasonEntries();
   }
 
   /**

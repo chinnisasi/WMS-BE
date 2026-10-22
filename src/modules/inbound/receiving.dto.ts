@@ -35,6 +35,7 @@ import {
 } from '../catalog/handling-unit';
 import { MAX_HANDLING_UNITS_PER_GRN_LINE, REJECTED_GRN_LINE_CODES, UNMATCHED_LINE_REASONS } from './receiving.command';
 import { DAMAGE_REASON_CODES, SHORT_REASON_CODES } from './receipt-condition';
+import { ADJUSTMENT_REASON_CODES } from '../inventory/inventory.facade';
 // Story 3.5 (additive): the snapshot's putaway decision fields reuse the
 // putaway module's DTOs (one shape on every surface).
 import { PutawayBinDto, PutawayTaskDto } from '../putaway/putaway.dto';
@@ -1396,6 +1397,15 @@ export class CatalogMoveReasonDto {
   noteRequired!: boolean;
 }
 
+/** Story 3-2b — one adjustment reason of the device snapshot (code + the operator-facing label). */
+export class CatalogAdjustReasonDto {
+  @ApiProperty({ enum: [...ADJUSTMENT_REASON_CODES] })
+  code!: string;
+
+  @ApiProperty({ description: 'The operator-facing label (the web uses the same words)' })
+  label!: string;
+}
+
 export class CatalogSnapshotResponse {
   @ApiProperty({ description: 'ISO-8601 UTC capture time' })
   generatedAt!: string;
@@ -1483,4 +1493,11 @@ export class CatalogSnapshotResponse {
       'Story 3-1 (additive): the bin-to-bin move\'s reason vocabulary, in order — the handheld\'s reason chips. A reason with noteRequired needs a note (up to 200 characters). An older server omits it, and the handheld then offers no Move stock',
   })
   moveReasons!: readonly CatalogMoveReasonDto[];
+
+  @ApiProperty({
+    type: [CatalogAdjustReasonDto],
+    description:
+      "Story 3-2b (additive): the stock adjustment's reason vocabulary with labels, in order — the handheld's Adjust reason chips (every reason needs the note the adjustment always carries). An older server omits it, and the handheld then offers no Adjust",
+  })
+  adjustReasons!: readonly CatalogAdjustReasonDto[];
 }

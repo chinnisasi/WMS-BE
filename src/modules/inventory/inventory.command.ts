@@ -10,6 +10,7 @@ import {
   stockAdjustmentPendings,
   stockAdjustmentPolicies,
 } from '../../shared/db/schema';
+import type { AdjustmentPendReason } from '../../shared/db/schema';
 import {
   QUANTITY_SCALE,
   assertRecordableQuantity,
@@ -24,8 +25,11 @@ import { OUTBOX_SINK } from '../../shared/events/outbox.seam';
 import type { OutboxSink } from '../../shared/events/outbox.seam';
 import { hashCommandPayload } from '../tenancy/idempotency-guard';
 import { idempotencyKeyReuse } from '../tenancy/registration.command';
-import { assertPermission } from '../tenancy/permissions';
+import { assertAdjustAuthority, assertPermission } from '../tenancy/permissions';
 import { assertWarehouseInTenant, getMemberRoleIn } from '../tenancy/tenancy.service';
+// Story 3-2b — the handheld arm's device + operator re-authorization and the
+// device heartbeat (tenancy owns `devices`/`users`; the shared floor-op guard).
+import { assertDeviceOperatorInTx, touchDeviceInTx } from '../tenancy/device-operator';
 import { DAMAGED_BIN_CODE, IN_TRANSIT_BIN_CODE, QC_HOLD_BIN_CODE, RETURNS_BIN_CODE } from '../tenancy/receiving-bin';
 import { withTenantTransaction, type TenantTx } from '../../shared/db/tenant-scope';
 import { uomPrecision } from '../catalog/uom';
@@ -163,6 +167,16 @@ export interface AdjustStockCommand {
    * count resolution; undefined on the HTTP path.
    */
   readonly countVarianceId?: string | undefined;
+  /**
+   * Story 3-2b — the handheld that submitted the adjustment (a badge-in
+   * device session); null/absent on the web and on the approval and count
+   * paths. When set: `occurredAt` is required, the device and its operator
+   * are re-authorized in the command transaction before the capability
+   * check, `surface`/`deviceId` join the fingerprint (only when present — a
+   * web hash is byte-identical), the pend records it as `source_device_id`,
+   * and the device's heartbeat is stamped.
+   */
+  readonly deviceId?: string | null | undefined;
 }
 
 /**
@@ -221,8 +235,18 @@ export interface StockAdjustmentPendingSnapshot {
     readonly status: 'pending';
     readonly decidedBy: null;
     readonly decidedAt: null;
-    /** The policy threshold (base units) as it read at request time. */
-    readonly thresholdQuantityAtRequest: number;
+    /**
+     * The policy threshold (base units) as it read at request time. Story
+     * 3-2b: null when the tenant had no policy and the request was
+     * force-pended (`pendReason: 'approval-required'`).
+     */
+    readonly thresholdQuantityAtRequest: number | null;
+    /**
+     * Story 3-2b — why it pended. Optional on the type: a 202 snapshot stored
+     * before 3-2b replays without it, and the submission fills `threshold` at
+     * the edge (A7 — the only reason a pre-3-2b row could pend).
+     */
+    readonly pendReason?: AdjustmentPendReason;
   };
 }
 
@@ -238,6 +262,59 @@ export type StockAdjustmentResult =
   | { readonly kind: 'pending'; readonly pending: StockAdjustmentPendingSnapshot; readonly replayed: boolean };
 
 const IDEMPOTENCY_TENANT_KEY = 'idempotency_keys_tenant_id_key_unique';
+
+/**
+ * The adjustment's request-shape checks — answerable with no row, so ABOVE
+ * the transaction (guide §1's first tier), returning the business time:
+ *
+ * - `occurredAt` is client-supplied and UTC-validated (the primitive throws a
+ *   plain error — mapped to 400 so it never renders as 500); on the web it
+ *   defaults to the commit clock.
+ * - Story 3-2b — on the HANDHELD (`deviceId` set) `occurredAt` is REQUIRED:
+ *   a queued op's business time is the moment the operator confirmed it, not
+ *   whenever the device next reached the server (the move's rule).
+ * - Signed, non-zero delta (a zero-delta event is pure noise). Story 10.2:
+ *   this runs on the base-UoM value — "is this a movement at all" is a
+ *   question about the request, not about the SKU's unit.
+ *
+ * Exported (through the facade) so the submission service runs the same
+ * checks before it composes batch/serial identity: a malformed device request
+ * must answer 400 before anything is minted.
+ */
+export function assertAdjustmentShape(command: AdjustStockCommand): string {
+  let occurredAt: string;
+  if (command.occurredAt === undefined) {
+    if ((command.deviceId ?? null) !== null) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'occurredAt is required on a handheld adjustment',
+        'occurredAt is required on a handheld adjustment — the time the operator confirmed it (a Z-suffixed ISO-8601 UTC timestamp).',
+      );
+    }
+    occurredAt = nowIso();
+  } else {
+    try {
+      occurredAt = assertUtcIso(command.occurredAt);
+    } catch {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'occurredAt must be a valid ISO-8601 UTC instant',
+        `occurredAt must be a Z-suffixed ISO-8601 UTC timestamp (got "${command.occurredAt}").`,
+      );
+    }
+  }
+  if (command.quantityDelta === 0) {
+    throw new ProblemException(
+      'validation-failed',
+      400,
+      'quantityDelta must be a non-zero integer',
+      'A stock adjustment moves a non-zero quantity — zero deltas write no ledger event.',
+    );
+  }
+  return occurredAt;
+}
 
 @Injectable()
 export class StockAdjustmentCommand {
@@ -269,7 +346,17 @@ export class StockAdjustmentCommand {
     // guard in `test/picking.spec.ts`, so it is a recorded break and not a
     // surprise. No compatibility branch exists; there is nothing to be
     // compatible with.
+    // Story 3-2b (A8) — the handheld arm's discriminator, ONLY WHEN PRESENT
+    // (the guide §4 conditional-key exception): `surface` and `deviceId`
+    // lead a device request's hash at a fixed position, so one key can never
+    // replay the other surface's snapshot (`idempotency_keys` is unique per
+    // tenant across surfaces), while a web request — no `deviceId` — hashes
+    // byte-for-byte as before, pinned by the goldens in
+    // test/handheld-adjustment.spec.ts. `occurredAt` is required on the
+    // device, so it is always in a device hash below.
+    const deviceId = command.deviceId ?? null;
     return hashCommandPayload({
+      ...(deviceId === null ? {} : { surface: 'device', deviceId }),
       tenantId: command.tenantId,
       warehouseId: command.warehouseId,
       skuId: command.skuId,
@@ -345,24 +432,11 @@ export class StockAdjustmentCommand {
     command: AdjustStockCommand,
     idempotencyKey: string,
   ): Promise<StockAdjustmentResult> {
-    // The business time is client-supplied and UTC-validated (the primitive
-    // throws a plain error — mapped to 400 here so it never renders as 500).
-    let occurredAt: string;
-    if (command.occurredAt === undefined) {
-      occurredAt = nowIso();
-    } else {
-      try {
-        occurredAt = assertUtcIso(command.occurredAt);
-      } catch {
-        throw new ProblemException(
-          'validation-failed',
-          400,
-          'occurredAt must be a valid ISO-8601 UTC instant',
-          `occurredAt must be a Z-suffixed ISO-8601 UTC timestamp (got "${command.occurredAt}").`,
-        );
-      }
-    }
-    this.assertNonZeroDelta(command.quantityDelta);
+    // The request-shape checks that need no row (business time, the
+    // device's required `occurredAt`, a non-zero delta) — shared with the
+    // submission's pre-composition check through `assertAdjustmentShape`.
+    const occurredAt = assertAdjustmentShape(command);
+    const deviceId = command.deviceId ?? null;
 
     // Serial-tracked movements move exactly one unit per event: the serial
     // count must equal the movement's magnitude (400 otherwise — the api
@@ -428,12 +502,19 @@ export class StockAdjustmentCommand {
       this.db,
       command.tenantId,
       async (tx): Promise<StockAdjustmentResult> => {
+        // Story 3-2b — the handheld arm: the device row (active, badge-bound)
+        // and the operator's floor role, re-read and locked BEFORE the
+        // capability check (the move order, `move.command.ts`).
+        if (deviceId !== null) {
+          await assertDeviceOperatorInTx(tx, command.tenantId, deviceId, command.actorUserId);
+        }
         // Authority at command-service entry — DB read, same tx, BEFORE the
-        // replay lookup (the deliberate fail-closed carve-out).
-        assertPermission(
-          await getMemberRoleIn(tx, command.tenantId, command.actorUserId),
-          'stock.adjust',
-        );
+        // replay lookup (the deliberate fail-closed carve-out). Story 3-2b:
+        // `stock.adjust` keeps the threshold rule; holding only
+        // `stock.adjust.request` makes every adjustment pend; neither → 403
+        // naming `stock.adjust`, exactly as before.
+        const role = await getMemberRoleIn(tx, command.tenantId, command.actorUserId);
+        const authority = assertAdjustAuthority(role);
 
         const existing = await tx
           .select()
@@ -456,9 +537,16 @@ export class StockAdjustmentCommand {
           const stored = existing[0].responseSnapshot as
             | StockAdjustmentSnapshot
             | StockAdjustmentPendingSnapshot;
-          return 'pendingAdjustment' in stored
-            ? { kind: 'pending', pending: stored, replayed: true }
-            : { kind: 'applied', snapshot: stored, replayed: true };
+          if ('pendingAdjustment' in stored) {
+            return { kind: 'pending', pending: stored, replayed: true };
+          }
+          // Story 3-2b (A4) — a stored APPLIED adjustment is `stock.adjust`'s
+          // to re-serve: a holder demoted to request-only gets the 403, never
+          // the snapshot (the pre-3-2b demoted-replay rule, unchanged).
+          if (authority !== 'adjust') {
+            assertPermission(role, 'stock.adjust');
+          }
+          return { kind: 'applied', snapshot: stored, replayed: true };
         }
 
         // ── the full guard set (story 5-2 extraction) ───────────────────────
@@ -502,7 +590,14 @@ export class StockAdjustmentCommand {
           .where(eq(stockAdjustmentPolicies.tenantId, command.tenantId))
           .limit(1);
         const threshold = policyRows[0]?.quantityThreshold ?? null;
-        if (threshold !== null && Math.abs(delta) > threshold * QUANTITY_SCALE) {
+        const overThreshold = threshold !== null && Math.abs(delta) > threshold * QUANTITY_SCALE;
+        // Story 3-2b — a request-only holder's adjustment ALWAYS pends. The
+        // reason is stored (A1): `threshold` whenever the strict-greater rule
+        // fired (so an operator's large request reads exactly like a
+        // manager's), `approval-required` otherwise — including with no
+        // policy row at all (a null threshold).
+        if (overThreshold || authority === 'request') {
+          const pendReason: AdjustmentPendReason = overThreshold ? 'threshold' : 'approval-required';
           const pendingId = uuidv7();
           const requestedAt = nowIso();
           await tx.insert(stockAdjustmentPendings).values({
@@ -530,6 +625,10 @@ export class StockAdjustmentCommand {
             requestedAt,
             status: 'pending',
             thresholdQuantityAtRequest: threshold,
+            pendReason,
+            // Story 3-2b (A13) — the device rides the pend row, not the audit
+            // row (`audit_events` has no metadata column).
+            sourceDeviceId: deviceId,
           });
 
           // The audit row rides the same transaction (the decision-time
@@ -544,7 +643,12 @@ export class StockAdjustmentCommand {
             targetType: 'stock_adjustment_pending',
             targetId: pendingId,
             reference: idempotencyKey,
-            occurredAt,
+            // Story 3-2b — the server's clock (the 9-3a rule, guide §1 step
+            // 10), not the request's business time: a handheld op replayed
+            // minutes after it was confirmed must still order on the trail as
+            // the moment the server recorded it. On the web the two coincide
+            // (an absent occurredAt defaulted to the commit clock).
+            occurredAt: nowIso(),
           });
 
           // Functional entry (Epic 9 surfaces the notification): the Owner
@@ -591,8 +695,12 @@ export class StockAdjustmentCommand {
               decidedBy: null,
               decidedAt: null,
               thresholdQuantityAtRequest: threshold,
+              pendReason,
             },
           };
+          if (deviceId !== null) {
+            await touchDeviceInTx(tx, deviceId);
+          }
           await this.writeIdempotencyKeySnapshot(tx, command.tenantId, idempotencyKey, payloadHash, pending);
           return { kind: 'pending', pending, replayed: false };
         }
@@ -617,7 +725,8 @@ export class StockAdjustmentCommand {
           // aggregate snapshot carries null id/seq — retro A4).
           targetId: firstEventId,
           reference: idempotencyKey,
-          occurredAt,
+          // Story 3-2b — the server's clock (see the pend arm above).
+          occurredAt: nowIso(),
         });
 
         // In-transaction outbox append (AD-7, story outbox-relay) — replaces
@@ -648,6 +757,11 @@ export class StockAdjustmentCommand {
             eventId: snapshot.event.id,
           },
         });
+
+        // Story 3-2b (A13) — the handheld arm's heartbeat (the floor-op tail).
+        if (deviceId !== null) {
+          await touchDeviceInTx(tx, deviceId);
+        }
 
         try {
           await tx.insert(idempotencyKeys).values({
@@ -904,23 +1018,6 @@ export class StockAdjustmentCommand {
         );
       }
       throw err;
-    }
-  }
-
-  /**
-   * Signed, non-zero delta (a zero-delta event is pure noise). Story 10.2:
-   * this runs BEFORE the transaction on the base-UoM value — "is this a
-   * movement at all" is a question about the request, not about the SKU's
-   * unit, and it answered 400 before this story too.
-   */
-  private assertNonZeroDelta(raw: number): void {
-    if (raw === 0) {
-      throw new ProblemException(
-        'validation-failed',
-        400,
-        'quantityDelta must be a non-zero integer',
-        'A stock adjustment moves a non-zero quantity — zero deltas write no ledger event.',
-      );
     }
   }
 
@@ -1222,7 +1319,7 @@ export class StockAdjustmentCommand {
       ...(command.countVarianceId === undefined ? {} : { countVarianceId: command.countVarianceId }),
     };
 
-    // Zero deltas are rejected upstream (`assertNonZeroDelta`), so `< 0` /
+    // Zero deltas are rejected upstream (`assertAdjustmentShape`), so `< 0` /
     // `> 0` partition every reachable delta — a zero-delta event would carry
     // no bin on either arm. The FIRST appended event is kept separately: the
     // audit row points at it even when the response snapshot cannot name a

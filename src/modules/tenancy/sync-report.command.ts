@@ -42,6 +42,9 @@ import { OutboundFacade } from '../outbound/outbound.facade';
 import { ExcursionFacade } from '../compliance/excursion.facade';
 import { MovementsFacade } from '../movements/transfer.facade';
 import { InventoryFacade } from '../inventory/inventory.facade';
+// Story 3-2b — the one adjustment submission path (same module).
+import { AdjustmentSubmission } from './adjustment-submission';
+import type { AdjustmentBatchInput } from './adjustment-submission';
 
 /**
  * Rejected sync-report ops (story 5-6). Module ownership is **tenancy
@@ -121,7 +124,14 @@ export type RejectedOpType =
   // its retry budget). DEVICE-UPLOADED; Apply re-runs the move (every guard
   // live) under the op's device and operator, or Discard — the remedy for a
   // gate refusal is Discard, then a web move or adjustment matching the floor.
-  | 'stock.move';
+  | 'stock.move'
+  // Story 3-2b — the handheld's stock adjustment (or adjustment REQUEST),
+  // refused on replay (a guard, a role, a stale identity — every refusal but
+  // a badge-in or operator-mismatch). DEVICE-UPLOADED; Apply re-runs it
+  // through the one submission path (`AdjustmentSubmission`) under the op's
+  // device and operator — an operator's request therefore re-pends for the
+  // owner (A3); or Discard.
+  | 'stock.adjust';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -138,6 +148,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.licence-refused',
   'gate-in.unload',
   'stock.move',
+  'stock.adjust',
 ];
 
 /**
@@ -204,6 +215,12 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   // guard live), or Discard. No recount: a move names two bins, and the
   // refusal is about the move, not a count.
   'stock.move': ['apply', 'discard'],
+  // Story 3-2b — a refused adjustment: Apply re-submits it (the stored
+  // payload, every guard live, under the op's device and operator — the
+  // resolver needs only `review.decide`; approving any resulting pend still
+  // needs `adjustments.approve`), or Discard. No recount: the remedy for a
+  // stock disagreement is the adjustment itself.
+  'stock.adjust': ['apply', 'discard'],
 };
 
 /** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
@@ -437,6 +454,17 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
   // Story 3-1 — the handheld's move as it enqueued it (`warehouseId` rides the
   // queued payload; the request path carries it). `serials` (an array of
   // strings or null) is shape-checked by the command itself.
+  // Story 3-2b — the handheld's adjustment as it enqueued it (the request
+  // body plus nothing else). `batch` (an object or null) and `serials` (an
+  // array of strings or null) are shape-checked by the apply arm.
+  'stock.adjust': [
+    ['warehouseId', 'uuid'],
+    ['binId', 'uuid'],
+    ['skuId', 'uuid'],
+    ['quantityDelta', 'number'],
+    ['reasonCode', 'string'],
+    ['note', 'string'],
+  ],
   'stock.move': [
     ['warehouseId', 'uuid'],
     ['skuId', 'uuid'],
@@ -708,6 +736,8 @@ export class SyncReportCommand {
     @Inject(MovementsFacade) private readonly movements: MovementsFacade,
     // The recount arm's advisory lock (the warehouse scope, taken LAST).
     @Inject(InventoryFacade) private readonly inventory: InventoryFacade,
+    // Story 3-2b — the `stock.adjust` apply arm's seam.
+    @Inject(AdjustmentSubmission) private readonly adjustments: AdjustmentSubmission,
   ) {}
 
   /**
@@ -1665,6 +1695,44 @@ export class SyncReportCommand {
           },
           idempotencyKey,
         )) as unknown as Record<string, unknown>;
+      case 'stock.adjust': {
+        // Story 3-2b (A3) — the adjustment re-submitted through the SAME path
+        // the live route runs (normalization, the device + capability +
+        // replay pre-check, the batch/serial composition, the command), under
+        // the op's OWN device and operator: the device and the operator's
+        // role are re-read, so a revoked device refuses and an operator's
+        // request re-pends for the owner. The stored payload is raw — optional
+        // keys normalise here (the 21-6 rule); the op's own ULID is the key,
+        // so an apply after a crash replays. The outcome is the 201 snapshot
+        // or the 202 pend snapshot (`pendingAdjustment`) — the web reads the
+        // latter as "Sent for approval".
+        const reasonCodes = this.inventory.adjustmentReasons().map((entry) => entry.code as string);
+        if (!reasonCodes.includes(payload.reasonCode as string)) {
+          throw storedAdjustInvalid(row.opId, 'reasonCode', `one of ${JSON.stringify(reasonCodes)}`);
+        }
+        const note = (payload.note as string).trim();
+        if (note.length < 1 || [...note].length > 500) {
+          throw storedAdjustInvalid(row.opId, 'note', 'a 1–500 character note');
+        }
+        const result = await this.adjustments.submit(
+          {
+            tenantId,
+            actorUserId: operatorUserId,
+            deviceId,
+            warehouseId: payload.warehouseId as string,
+            skuId: payload.skuId as string,
+            binId: payload.binId as string,
+            quantityDelta: payload.quantityDelta as number,
+            reasonCode: payload.reasonCode as string,
+            note,
+            occurredAt: opTime,
+            batch: storedAdjustBatch(payload.batch, row.opId),
+            serials: storedAdjustSerials(payload.serials, row.opId),
+          },
+          idempotencyKey,
+        );
+        return (result.kind === 'pending' ? result.pending : result.snapshot) as unknown as Record<string, unknown>;
+      }
       case 'count.submit':
         return (await this.movements.submitCount(
           {
@@ -1729,6 +1797,50 @@ function storedMoveSerials(raw: unknown, opId: string): string[] | null {
     'The stored payload does not match its op type',
     `The payload of op ${opId} carries an invalid serials — expected a list of serial numbers or null.`,
   );
+}
+
+/** Story 3-2b — the stored `stock.adjust` payload's field, refused before any write. */
+function storedAdjustInvalid(opId: string, field: string, kind: string): ProblemException {
+  return new ProblemException(
+    'validation-failed',
+    400,
+    'The stored payload does not match its op type',
+    `The payload of op ${opId} carries an invalid ${field} — expected ${kind}.`,
+  );
+}
+
+/** Story 3-2b — a stored `stock.adjust` payload's serials: null/absent, or a list of non-empty strings. */
+function storedAdjustSerials(raw: unknown, opId: string): string[] | null {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw) || raw.some((serial) => typeof serial !== 'string' || serial.trim() === '')) {
+    throw storedAdjustInvalid(opId, 'serials', 'a list of serial numbers or null');
+  }
+  return raw as string[];
+}
+
+/**
+ * Story 3-2b — a stored `stock.adjust` payload's batch arm: absent/null is no
+ * batch; an object with a non-empty string `code` and optional string (or
+ * null) dates and override reason passes (trimmed, as the DTO trims the code
+ * and the reason); anything else is a malformed payload — 400.
+ */
+function storedAdjustBatch(raw: unknown, opId: string): AdjustmentBatchInput | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw storedAdjustInvalid(opId, 'batch', 'a batch object or null');
+  }
+  const { code, mfgDate, expiryDate, overrideReason } = raw as Record<string, unknown>;
+  const optionalText = (value: unknown): boolean => value === undefined || value === null || typeof value === 'string';
+  if (typeof code !== 'string' || code.trim() === '' || !optionalText(mfgDate) || !optionalText(expiryDate) || !optionalText(overrideReason)) {
+    throw storedAdjustInvalid(opId, 'batch', 'a batch object { code, mfgDate?, expiryDate?, overrideReason? }');
+  }
+  const reason = typeof overrideReason === 'string' && overrideReason.trim() !== '' ? overrideReason.trim() : null;
+  return {
+    code: code.trim(),
+    mfgDate: (mfgDate ?? null) as string | null,
+    expiryDate: (expiryDate ?? null) as string | null,
+    overrideReason: reason,
+  };
 }
 
 /** Story 1-2b — a resolve note, trimmed; blank or absent = undefined. */

@@ -7,6 +7,7 @@ import { InventoryModule } from '../inventory/inventory.module';
 import { MovementsModule } from '../movements/movements.module';
 import { OutboundModule } from '../outbound/outbound.module';
 import { PutawayModule } from '../putaway/putaway.module';
+import { AdjustmentSubmission } from './adjustment-submission';
 import { AuditExportCommand } from './audit-export.command';
 import { AuditExportRunner } from './audit-export.runner';
 import { AUDIT_EXPORT_STORE, PostgresAuditExportStore } from './audit-export.store';
@@ -79,6 +80,9 @@ import { ZoneCommand } from './zone.command';
     UsersCommand,
     EnrollmentCommand,
     SyncReportCommand,
+    // Story 3-2b — the one stock-adjustment submission path (the HTTP route,
+    // web or handheld, and the review queue's Apply of a `stock.adjust` op).
+    AdjustmentSubmission,
     // Story 9-3b — the async audit export: the request command, the worker's
     // runner, and the file store port (Postgres until 9-3c's object storage).
     AuditExportCommand,
@@ -88,6 +92,6 @@ import { ZoneCommand } from './zone.command';
     TenantSessionGuard,
     DeviceSessionGuard,
   ],
-  exports: [TenancyService, EnrollmentCommand, SyncReportCommand],
+  exports: [TenancyService, EnrollmentCommand, SyncReportCommand, AdjustmentSubmission],
 })
 export class TenancyModule {}

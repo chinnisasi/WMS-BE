@@ -28,6 +28,8 @@ import {
   LEDGER_CHAIN_BREAK_DETECTORS,
   LEDGER_CHAIN_BREAK_KINDS,
 } from '../../shared/db/schema';
+import { ADJUSTMENT_PEND_REASONS } from '../../shared/db/schema';
+import type { AdjustmentPendReason } from '../../shared/db/schema';
 import { ADJUSTMENT_REASON_CODES } from './adjustment-reason';
 import { IsInstant, BooleanFlag, RepeatableParam } from '../../shared/primitives/instant-range';
 import { isRegisteredLedgerEventType, registeredLedgerEventTypes } from './ledger-registry';
@@ -189,7 +191,8 @@ export class StockAdjustmentDto {
 
   @ApiProperty({
     required: false,
-    description: 'Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock',
+    description:
+      'Business time (ISO-8601 UTC, Z-suffixed); defaults to the commit clock on the web. Story 3-2b: REQUIRED on a handheld (device session) adjustment — the time the operator confirmed it',
   })
   @IsOptional()
   @IsString()
@@ -1019,8 +1022,21 @@ export class AdjustmentPendingDto {
   @ApiProperty({ type: String, nullable: true })
   decidedAt!: string | null;
 
-  @ApiProperty({ description: 'The policy threshold (base UoM) as it read at request time — frozen context' })
-  thresholdQuantityAtRequest!: number;
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description:
+      "The policy threshold (base UoM) as it read at request time — frozen context. Story 3-2b: null when the tenant had no policy and a request-only holder's adjustment was force-pended (pendReason 'approval-required')",
+  })
+  thresholdQuantityAtRequest!: number | null;
+
+  @ApiProperty({
+    required: false,
+    enum: [...ADJUSTMENT_PEND_REASONS],
+    description:
+      "Story 3-2b — why it pended: 'threshold' (|quantityDelta| strictly exceeded the policy threshold) or 'approval-required' (the requester holds only stock.adjust.request — every request pends). Always present on a new 202 and on the queue; a 202 replayed from before 3-2b is served with 'threshold'",
+  })
+  pendReason?: AdjustmentPendReason;
 }
 
 /** POST …/inventory/adjustments 202 body (the pend creation snapshot). */
@@ -1067,6 +1083,14 @@ export class AdjustmentPendingEntryDto extends AdjustmentPendingDto {
       'True only when an approval posted this adjustment from story 9-3a on (the row recorded its first event): its events are listed by `GET …/inventory/events?adjustmentPendingId=`. False while pending, on a reject, and for an approval decided before 9-3a',
   })
   ledgerLinked!: boolean;
+
+  @ApiProperty({
+    type: String,
+    format: 'uuid',
+    nullable: true,
+    description: 'Story 3-2b — the handheld that submitted the request (null from the web, and on every row raised before 3-2b)',
+  })
+  sourceDeviceId!: string | null;
 }
 
 /** GET …/inventory/adjustment-pendings response. */
