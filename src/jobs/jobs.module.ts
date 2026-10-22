@@ -1,4 +1,5 @@
-import { Inject, Injectable, Logger, Module, type OnApplicationBootstrap, type OnApplicationShutdown } from '@nestjs/common';
+import { Inject, Injectable, Logger, Module, type BeforeApplicationShutdown, type OnApplicationBootstrap, type OnApplicationShutdown } from '@nestjs/common';
+import { InFlightTick } from '../shared/lifecycle/shutdown';
 import { sql } from 'drizzle-orm';
 import { SharedModule, AUTH_DATABASE, DATABASE } from '../shared/shared.module';
 import { checkSessionVisibility } from '../shared/db/open-transactions';
@@ -189,11 +190,13 @@ export {
  * last_error` (IN-07 reads them later).
  */
 @Injectable()
-export class OutboxRelayWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class OutboxRelayWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('OutboxRelayWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
 
   constructor(@Inject(OUTBOX_RELAY) private readonly relay: OutboxRelay) {
     this.pollMs = parseOutboxPollMs(process.env.OUTBOX_RELAY_POLL_MS);
@@ -204,9 +207,24 @@ export class OutboxRelayWorker implements OnApplicationBootstrap, OnApplicationS
       return; // env-gated off (tests, or a deployment that drains elsewhere)
     }
     this.logger.log(`Outbox relay worker started (poll every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -245,11 +263,13 @@ export class OutboxRelayWorker implements OnApplicationBootstrap, OnApplicationS
  * detection must fail loudly, never silently.
  */
 @Injectable()
-export class ReconciliationWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class ReconciliationWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('ReconciliationWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
 
   constructor(@Inject(InventoryFacade) private readonly inventory: InventoryFacade) {
     this.pollMs = parseReconcilePollMs(process.env.OUTBOX_RECONCILE_POLL_MS);
@@ -260,9 +280,24 @@ export class ReconciliationWorker implements OnApplicationBootstrap, OnApplicati
       return; // env-gated off (tests, or a deployment that reconciles elsewhere)
     }
     this.logger.log(`Reconciliation worker started (poll every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -309,11 +344,13 @@ export class ReconciliationWorker implements OnApplicationBootstrap, OnApplicati
  * next tick — expiry is Postgres-driven; Valkey key TTLs are a backstop only.
  */
 @Injectable()
-export class ReservationReaper implements OnApplicationBootstrap, OnApplicationShutdown {
+export class ReservationReaper implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('ReservationReaper');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
 
   constructor(@Inject(InventoryFacade) private readonly inventory: InventoryFacade) {
     this.pollMs = parseReservationReaperPollMs(process.env.RESERVATION_REAPER_POLL_MS);
@@ -324,9 +361,24 @@ export class ReservationReaper implements OnApplicationBootstrap, OnApplicationS
       return; // env-gated off (tests, or a deployment that reaps elsewhere)
     }
     this.logger.log(`Reservation reaper started (poll every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -369,11 +421,13 @@ export class ReservationReaper implements OnApplicationBootstrap, OnApplicationS
  * flag, `unref`'d timer, and a shutdown hook.
  */
 @Injectable()
-export class CountSchedulerWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class CountSchedulerWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('CountSchedulerWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
 
   constructor(
     // The cross-tenant DUE enumeration read (BYPASSRLS — the reaper's
@@ -390,9 +444,24 @@ export class CountSchedulerWorker implements OnApplicationBootstrap, OnApplicati
       return; // env-gated off (tests, or a deployment that schedules elsewhere)
     }
     this.logger.log(`Count scheduler worker started (poll every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -482,11 +551,13 @@ export class CountSchedulerWorker implements OnApplicationBootstrap, OnApplicati
  * and a shutdown hook.
  */
 @Injectable()
-export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('ReplenishmentSchedulerWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
   /** The truncating ticks' rotating-window offset (advances one scope per truncated tick). */
   private tickOffset = 0;
 
@@ -505,9 +576,24 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
       return; // env-gated off (tests, or a deployment that sweeps elsewhere)
     }
     this.logger.log(`Replenishment scheduler worker started (poll every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -697,11 +783,13 @@ export class ReplenishmentSchedulerWorker implements OnApplicationBootstrap, OnA
  * timer, and a shutdown hook.
  */
 @Injectable()
-export class ChannelsSyncWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class ChannelsSyncWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('ChannelsSyncWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
 
   constructor(
     // The cross-tenant enumeration read (BYPASSRLS — the count scheduler's
@@ -718,9 +806,24 @@ export class ChannelsSyncWorker implements OnApplicationBootstrap, OnApplication
       return; // env-gated off (tests, or a deployment that syncs elsewhere)
     }
     this.logger.log(`Channels sync worker started (poll every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     // Never hold the process open on the timer alone: shutdown hooks end it.
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -848,11 +951,13 @@ export const MAX_STORAGE_SNAPSHOT_SCOPES_PER_TICK = 200;
  * `STORAGE_SNAPSHOT_POLL_MS` is unset/`0`; `unref`'d timer; shutdown hook.
  */
 @Injectable()
-export class StorageSnapshotWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class StorageSnapshotWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('StorageSnapshotWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
   /** The truncating ticks' rotating-window offset. */
   private tickOffset = 0;
 
@@ -871,8 +976,23 @@ export class StorageSnapshotWorker implements OnApplicationBootstrap, OnApplicat
     }
     this.logger.log(`Storage snapshot worker started (poll every ${this.pollMs}ms)`);
     if (this.db !== undefined) void checkSessionVisibility(this.db, this.logger, 'Storage snapshot worker');
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -1018,11 +1138,13 @@ export function parseLicenceExpiryPollMs(raw: string | undefined): number {
  * claim is `FOR UPDATE SKIP LOCKED` and committed `sending` before the send.
  */
 @Injectable()
-export class PushSenderWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class PushSenderWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('PushSenderWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
 
   constructor(
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
@@ -1036,8 +1158,23 @@ export class PushSenderWorker implements OnApplicationBootstrap, OnApplicationSh
       return; // env-gated off
     }
     this.logger.log(`Push sender worker started (poll every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -1107,11 +1244,13 @@ export class PushSenderWorker implements OnApplicationBootstrap, OnApplicationSh
  * at-risk minute, never the window); single-flight; `unref`'d timer.
  */
 @Injectable()
-export class WaveCutoffSweepWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class WaveCutoffSweepWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('WaveCutoffSweepWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
 
   constructor(
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
@@ -1125,8 +1264,23 @@ export class WaveCutoffSweepWorker implements OnApplicationBootstrap, OnApplicat
       return; // env-gated off
     }
     this.logger.log(`Wave cutoff sweep worker started (poll every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -1193,11 +1347,13 @@ export function parseAuditExportPollMs(raw: string | undefined): number {
  * claimed attempt.
  */
 @Injectable()
-export class AuditExportWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class AuditExportWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('AuditExportWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
 
   constructor(
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
@@ -1214,8 +1370,23 @@ export class AuditExportWorker implements OnApplicationBootstrap, OnApplicationS
     }
     this.logger.log(`Audit export worker started (poll every ${this.pollMs}ms)`);
     if (this.db !== undefined) void checkSessionVisibility(this.db, this.logger, 'Audit export worker');
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -1306,13 +1477,15 @@ export type LedgerIntegrityDriver = Pick<InventoryFacade, 'ledgerIntegrityScopes
  * reads "Not yet checked". `unref`'d timer; shutdown hook.
  */
 @Injectable()
-export class LedgerIntegrityWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class LedgerIntegrityWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('LedgerIntegrityWorker');
   private readonly pollMs: number;
   /** The per-tick cap — a plain field so a suite can shrink it. */
   maxScopesPerTick: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
   /** The truncating ticks' rotating-window offset. */
   private tickOffset = 0;
 
@@ -1329,8 +1502,23 @@ export class LedgerIntegrityWorker implements OnApplicationBootstrap, OnApplicat
       return; // env-gated off (tests, or a deployment that does not check its chain)
     }
     this.logger.log(`Ledger integrity worker started (poll every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -1422,11 +1610,13 @@ export function parseSessionPurgePollMs(raw: string | undefined): number {
  * in production: 86400000); single-flight; `unref`'d timer.
  */
 @Injectable()
-export class SessionPurgeWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class SessionPurgeWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('SessionPurgeWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
 
   constructor(
     @Inject(DATABASE) private readonly db: Database,
@@ -1438,8 +1628,23 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, OnApplication
   onApplicationBootstrap(): void {
     if (this.pollMs === 0) return;
     this.logger.log(`Session purge worker started (every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {
@@ -1495,11 +1700,13 @@ export class SessionPurgeWorker implements OnApplicationBootstrap, OnApplication
  * `LICENCE_EXPIRY_POLL_MS` is unset/`0`; single-flight; `unref`'d timer.
  */
 @Injectable()
-export class LicenceExpiryWorker implements OnApplicationBootstrap, OnApplicationShutdown {
+export class LicenceExpiryWorker implements OnApplicationBootstrap, BeforeApplicationShutdown, OnApplicationShutdown {
   private readonly logger = new Logger('LicenceExpiryWorker');
   private readonly pollMs: number;
   private timer: ReturnType<typeof setInterval> | undefined;
   private running = false;
+  /** Story 6-2a (A1): the timer-started tick, awaited on shutdown. */
+  private readonly ticks = new InFlightTick();
 
   constructor(
     @Inject(AUTH_DATABASE) private readonly authDb: Database,
@@ -1513,8 +1720,23 @@ export class LicenceExpiryWorker implements OnApplicationBootstrap, OnApplicatio
       return; // env-gated off
     }
     this.logger.log(`Licence expiry worker started (poll every ${this.pollMs}ms)`);
-    this.timer = setInterval(() => void this.tick(), this.pollMs);
+    this.timer = setInterval(() => this.ticks.start(() => this.tick()), this.pollMs);
     this.timer.unref?.();
+  }
+
+  /**
+   * Story 6-2a (A1): stop the timer, then await the tick already running —
+   * bounded by the shared drain deadline — so the pools it uses close after
+   * it, never under it.
+   */
+  async beforeApplicationShutdown(): Promise<void> {
+    if (this.timer !== undefined) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (!(await this.ticks.settle())) {
+      this.logger.warn('A tick was still running at the shutdown drain deadline');
+    }
   }
 
   onApplicationShutdown(): void {

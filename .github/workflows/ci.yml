@@ -42,7 +42,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          # Code review C18: the repo's own pin is the one CI runs.
+          bun-version-file: .bun-version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -88,7 +89,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          # Code review C18: the repo's own pin is the one CI runs.
+          bun-version-file: .bun-version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -106,7 +108,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          # Code review C18: the repo's own pin is the one CI runs.
+          bun-version-file: .bun-version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -155,7 +158,8 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          # Code review C18: the repo's own pin is the one CI runs.
+          bun-version-file: .bun-version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -165,3 +169,87 @@ jobs:
 
       - name: Acceptance smoke (120 s, gates enforced)
         run: bun run loadtest:smoke
+
+  image:
+    # Story 6-2a — the production image (decision 10): build it, migrate a
+    # fresh database WITH it (the guarded deploy migrator, then the role
+    # provisioning — the deploy's own order), run it as the non-superuser app
+    # role (A2: readiness must hold under wms_app's grants, not a
+    # superuser's), and probe liveness and readiness. A SIGTERM must then end
+    # it gracefully (exit 0). Nothing is pushed — the registry is story 6-2b.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: wms
+          POSTGRES_PASSWORD: wms
+          POSTGRES_DB: wms
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U wms"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      valkey:
+        image: valkey/valkey:9.1-alpine
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      OWNER_URL: postgres://wms:wms@localhost:55432/wms
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t wms-be:ci .
+
+      - name: The image runs as non-root
+        run: test "$(docker run --rm wms-be:ci id -u)" != "0"
+
+      - name: Migrate with the image (guarded deploy migrator), then provision the roles — twice
+        # Code review C17: every deploy runs both, so the second pass must be a
+        # clean no-op (up to date; the grants and passwords re-apply).
+        run: |
+          for pass in 1 2; do
+            echo "── pass $pass"
+            docker run --rm --network host -e DATABASE_URL="$OWNER_URL" wms-be:ci bun run db:migrate:deploy
+            docker run --rm --network host -e DATABASE_URL="$OWNER_URL" \
+              -e WMS_APP_PASSWORD=ci-app-password -e WMS_AUTH_PASSWORD=ci-auth-password \
+              wms-be:ci bun run db:provision-roles
+          done
+
+      - name: Run the API as wms_app (no *_POLL_MS — the API task runs no job, C17)
+        run: |
+          docker run -d --name wms-be --network host \
+            -e DATABASE_URL=postgres://wms_app:ci-app-password@localhost:55432/wms \
+            -e DATABASE_AUTH_URL=postgres://wms_auth:ci-auth-password@localhost:55432/wms \
+            -e VALKEY_URL=redis://localhost:56379/0 \
+            -e JWT_SECRET=ci-only-jwt-secret-not-a-real-one \
+            -e MFA_ENCRYPTION_KEY=ci-only-mfa-encryption-key-not-a-real-one \
+            wms-be:ci
+
+      - name: Smoke — /health and /health/ready
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:3000/api/v1/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:3000/api/v1/health
+          echo
+          curl -sf http://localhost:3000/api/v1/health/ready
+          echo
+
+      - name: SIGTERM ends it gracefully (exit 0)
+        run: |
+          docker stop -t 30 wms-be
+          test "$(docker inspect wms-be --format '{{.State.ExitCode}}')" = "0"
+
+      - name: Container logs
+        if: always()
+        run: docker logs wms-be || true

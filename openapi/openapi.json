@@ -4950,6 +4950,39 @@
         ]
       }
     },
+    "/health/ready": {
+      "get": {
+        "description": "Ready when both Postgres pools answer, Valkey answers PING, and the database has applied at least the migrations this image bundles (at or after — a database ahead of the image stays ready). 503 `not-ready` names the failing checks in `failing`, each one of: database, auth-database, valkey, migrations-unreadable, migrations-behind.",
+        "operationId": "HealthController_ready",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadinessResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Not ready (not-ready) — `failing` names the checks",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Readiness check",
+        "tags": [
+          "health"
+        ]
+      }
+    },
     "/echo": {
       "post": {
         "operationId": "EchoController_echo",
@@ -34101,6 +34134,27 @@
           "status",
           "service",
           "time"
+        ]
+      },
+      "ReadinessResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready"
+            ],
+            "example": "ready"
+          },
+          "migration": {
+            "type": "string",
+            "example": "0087_receipt_line_condition",
+            "description": "The applied migration's tag, matched by its journal `when`; when the database is AHEAD of this image (old tasks during a roll), this image's newest tag"
+          }
+        },
+        "required": [
+          "status",
+          "migration"
         ]
       },
       "EchoResponse": {

@@ -8,6 +8,16 @@ import { OpenApiDocumentHolder } from './api/openapi-document.holder';
 export const API_PREFIX = 'api/v1';
 
 /**
+ * Story 6-2a (A1) — the HTTP side of graceful shutdown. From the first step
+ * of `close()` a new request on a kept-alive connection answers 503 with
+ * `Connection: close` (`return503OnClosing`); the in-flight ones drain in
+ * `HttpDrain.beforeApplicationShutdown`; and `dispose` destroys every socket
+ * still open (`forceCloseConnections`), so an idle keep-alive connection
+ * cannot hold `server.close()` open.
+ */
+export const SHUTDOWN_HTTP_OPTIONS = { forceCloseConnections: true, return503OnClosing: true } as const;
+
+/**
  * Builds the configured application: global prefix, validation, problem-details
  * filter (via SharedModule), and the versioned OpenAPI document.
  *
@@ -18,7 +28,7 @@ export async function createApp(withListener = false): Promise<INestApplication>
   // time (req.rawBody) so the channel webhook signatures can be verified
   // over the EXACT bytes the provider signed — a re-serialized body would
   // not re-hash. Deliberately accepted app-wide cost (the spec's record).
-  const app = await NestFactory.create(AppModule, { logger: ['error', 'warn', 'log'], rawBody: true });
+  const app = await NestFactory.create(AppModule, { logger: ['error', 'warn', 'log'], rawBody: true, ...SHUTDOWN_HTTP_OPTIONS });
 
   // CORS: the web client runs on its own origin (dev: localhost:3001) and
   // talks to this API cross-origin with a bearer token — an allow-list, not a

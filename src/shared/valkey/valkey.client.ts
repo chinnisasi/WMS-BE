@@ -166,6 +166,16 @@ export class ValkeyClient implements OnApplicationShutdown {
     await this.redis().del(readyKey);
   }
 
+  /**
+   * Story 6-2a — the readiness probe's `PING` (never a decision path). Rejects
+   * when Valkey is unreachable or `VALKEY_URL` is unset, within the client's
+   * connect/command timeouts.
+   */
+  async ping(): Promise<void> {
+    const reply = await this.redis().ping();
+    if (reply !== 'PONG') throw new Error(`Valkey PING answered ${String(reply)}`);
+  }
+
   /** Removes a counter key (test/repair helper — never a decision path). */
   async deleteKey(key: string): Promise<void> {
     await this.redis().del(key);
