@@ -1,7 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { DATABASE } from '../../shared/shared.module';
-import { batches, catalogImports, products, serials, skuBarcodes, skus, uomConversions, type SkuStatus } from '../../shared/db/schema';
+import { batches, catalogImports, kitCompositions, products, serials, skuBarcodes, skus, uomConversions, type SkuStatus } from '../../shared/db/schema';
 import type { Database } from '../../shared/db/db';
 import { withTenantTransaction } from '../../shared/db/tenant-scope';
 import type { TenantTx } from '../../shared/db/tenant-scope';
@@ -258,6 +258,12 @@ export interface SkuSummary {
   readonly highValue: boolean;
   readonly maxStackLayers: number | null;
   readonly dg: SkuDangerousGoods | null;
+  /**
+   * Story 3-1 — the SKU is a kit (it has a composition). A kit holds no
+   * stock, so the handheld refuses a move of it offline instead of queueing
+   * one the server would refuse (`kit-cannot-hold-stock`).
+   */
+  readonly isKit: boolean;
 }
 
 /** Story 1-6a — a dangerous good as the device snapshot carries it. */
@@ -628,11 +634,19 @@ export class CatalogFacade {
       list.push({ barcode: row.barcode, uom: row.uom, factor });
       packBySku.set(row.skuId, list);
     }
+    // Story 3-1 — the tenant's kit set, ONE read on the caller's transaction
+    // (by tenant, never an id list — the catalog may be large).
+    const kitRows = await tx
+      .selectDistinct({ kitSkuId: kitCompositions.kitSkuId })
+      .from(kitCompositions)
+      .where(eq(kitCompositions.tenantId, tenantId));
+    const kitIds = new Set(kitRows.map((row) => row.kitSkuId));
     // Story 10.2: the unit's declared precision joins the scan identity. It is
     // a property of the UNIT, so it is looked up here rather than selected —
     // still on the caller's transaction.
     return rows.map(({ dgUnNumber, dgClass, dgSubsidiaryClasses, dgPackingGroup, ...row }) => ({
       ...row,
+      isKit: kitIds.has(row.id),
       status: row.status as SkuStatus,
       uomPrecision: uomPrecision(row.uom),
       packBarcodes: packBySku.get(row.id) ?? [],

@@ -909,7 +909,9 @@ describe('return receipts (e2e, story 13-2)', () => {
     const discardOnly = new Set(['return.receive', 'grn.lines-refused', 'grn.inactive-sku-received', 'gate-in.unload']);
     for (const type of REJECTED_OP_TYPES) {
       const expected =
-        type === 'grn.shelf-life-refused' || type === 'grn.licence-refused'
+        // Story 3-1 adds the device-uploaded `stock.move` — apply + discard (a
+        // move names two bins, so no recount). Named here explicitly.
+        type === 'grn.shelf-life-refused' || type === 'grn.licence-refused' || type === 'stock.move'
           ? ['apply', 'discard']
           : discardOnly.has(type)
             ? ['discard']

@@ -5,6 +5,7 @@ import { TenancyModule } from '../tenancy/tenancy.module';
 import { CountService } from './count.command';
 import { TransferService } from './transfer.command';
 import { VariancePolicyCommand } from './variance-policy.command';
+import { MoveCommand } from './move.command';
 import { MovementsFacade } from './transfer.facade';
 
 /**
@@ -26,7 +27,7 @@ import { MovementsFacade } from './transfer.facade';
  */
 @Module({
   imports: [SharedModule, InventoryModule, forwardRef(() => TenancyModule)],
-  providers: [TransferService, CountService, VariancePolicyCommand, MovementsFacade],
+  providers: [TransferService, CountService, VariancePolicyCommand, MoveCommand, MovementsFacade],
   exports: [MovementsFacade],
 })
 export class MovementsModule {}

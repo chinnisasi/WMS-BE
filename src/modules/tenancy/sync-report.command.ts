@@ -115,7 +115,13 @@ export type RejectedOpType =
   // body, a role that lost `gate.manage`). DEVICE-UPLOADED; Discard ONLY: the
   // dock re-records the unload on the web, or it was already recorded (a
   // late duplicate settles 200 `applied: false` and never reaches here).
-  | 'gate-in.unload';
+  | 'gate-in.unload'
+  // Story 3-1 — the handheld's bin-to-bin move, refused on replay (an
+  // identity or authority refusal, or a re-plannable gate/short refusal past
+  // its retry budget). DEVICE-UPLOADED; Apply re-runs the move (every guard
+  // live) under the op's device and operator, or Discard — the remedy for a
+  // gate refusal is Discard, then a web move or adjustment matching the floor.
+  | 'stock.move';
 
 export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.submit',
@@ -131,6 +137,7 @@ export const REJECTED_OP_TYPES: readonly RejectedOpType[] = [
   'grn.inactive-sku-received',
   'grn.licence-refused',
   'gate-in.unload',
+  'stock.move',
 ];
 
 /**
@@ -193,6 +200,10 @@ export const REJECTED_OP_DECISIONS_BY_TYPE: Readonly<Record<RejectedOpType, read
   // is to record the unload on the web. Excluded from `ApplicableOpType`, so
   // tenancy never imports the gate-in command.
   'gate-in.unload': ['discard'],
+  // Story 3-1 — a refused move: Apply re-runs it (the stored payload, every
+  // guard live), or Discard. No recount: a move names two bins, and the
+  // refusal is about the move, not a count.
+  'stock.move': ['apply', 'discard'],
 };
 
 /** Story 1-6d — the 403 an Apply on a `grn.licence-refused` row answers without `licences.manage`. */
@@ -422,6 +433,19 @@ const PAYLOAD_FIELDS: Record<RejectedOpType, readonly (readonly [string, string]
   'gate-in.unload': [
     ['gateInId', 'string'],
     ['phase', 'string'],
+  ],
+  // Story 3-1 — the handheld's move as it enqueued it (`warehouseId` rides the
+  // queued payload; the request path carries it). `serials` (an array of
+  // strings or null) is shape-checked by the command itself.
+  'stock.move': [
+    ['warehouseId', 'uuid'],
+    ['skuId', 'uuid'],
+    ['fromBinId', 'uuid'],
+    ['toBinId', 'uuid'],
+    ['qty', 'number'],
+    ['batchCode', 'string-or-null'],
+    ['reasonCode', 'string'],
+    ['note', 'string-or-null'],
   ],
   'grn.lines-refused': [
     ['warehouseId', 'uuid'],
@@ -1617,6 +1641,30 @@ export class SyncReportCommand {
           },
           idempotencyKey,
         )) as unknown as Record<string, unknown>;
+      case 'stock.move':
+        // Story 3-1 — the move re-run under the op's OWN device and operator
+        // (the device and the operator's role are re-read; a revoked device
+        // refuses), every guard live. The stored payload is raw — optional
+        // keys normalise to null here (the 21-6 rule), and the op's own
+        // ULID is the key, so an apply after a crash replays.
+        return (await this.movements.moveStock(
+          {
+            tenantId,
+            actorUserId: operatorUserId,
+            deviceId,
+            warehouseId: payload.warehouseId as string,
+            skuId: payload.skuId as string,
+            fromBinId: payload.fromBinId as string,
+            toBinId: payload.toBinId as string,
+            qty: payload.qty as number,
+            batchCode: (payload.batchCode ?? null) as string | null,
+            serials: storedMoveSerials(payload.serials, row.opId),
+            reasonCode: payload.reasonCode as string,
+            note: (payload.note ?? null) as string | null,
+            occurredAt: opTime,
+          },
+          idempotencyKey,
+        )) as unknown as Record<string, unknown>;
       case 'count.submit':
         return (await this.movements.submitCount(
           {
@@ -1665,6 +1713,22 @@ function storedShelfLifeWaiver(waivers: unknown): { byUserId: string; note: stri
   const { byUserId, note } = shelfLife as { byUserId?: unknown; note?: unknown };
   if (typeof byUserId !== 'string' || typeof note !== 'string') return null;
   return { byUserId, note };
+}
+
+/**
+ * Story 3-1 — a stored `stock.move` payload's serials: absent/null is no
+ * serials; an array passes to the command (which shape-checks each entry);
+ * anything else is a malformed payload — 400, never silently "no serials".
+ */
+function storedMoveSerials(raw: unknown, opId: string): string[] | null {
+  if (raw === undefined || raw === null) return null;
+  if (Array.isArray(raw)) return raw as string[];
+  throw new ProblemException(
+    'validation-failed',
+    400,
+    'The stored payload does not match its op type',
+    `The payload of op ${opId} carries an invalid serials — expected a list of serial numbers or null.`,
+  );
 }
 
 /** Story 1-2b — a resolve note, trimmed; blank or absent = undefined. */

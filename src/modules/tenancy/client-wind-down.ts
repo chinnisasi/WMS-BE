@@ -13,7 +13,7 @@ import { windDownBlockerInTx, type WindDownBlocker } from '../../shared/primitiv
  * — `skuId` (putaway, pick), `lines[*].skuId` (GRN submit, count submit, the
  * server-raised `grn.lines-refused` and — 1-2b — `grn.shelf-life-refused`,
  * 1-6d — `grn.licence-refused`),
- * `scanned[*].skuId` (pack) and
+ * `skuId` (3-1 — the bin-to-bin move), `scanned[*].skuId` (pack) and
  * `entries[*].skuId` (return receive) — each id joined to `skus` by its
  * primary key (a value that is not a uuid matches nothing). No text scan of
  * the payload, no per-SKU loop.
@@ -33,6 +33,8 @@ export const SKU_NAMING_OP_TYPES = [
   'pack.execute',
   'count.submit',
   'return.receive',
+  // Story 3-1 — a refused move names its SKU (`skuId`).
+  'stock.move',
 ] as const;
 
 const UUID_TEXT = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';

@@ -50,6 +50,9 @@ export const AUDIT_TARGET_TYPES = [
   'audit_export',
   'batch_alert',
   'bin',
+  // Story 3-1 — a bin-to-bin move (`stock.moved`; `targetId` = the moveId on
+  // its events' reference doc — there is no move table, the ledger is its record).
+  'bin_move',
   'carrier_connection',
   'catalog_import',
   'channel_connection',
@@ -180,6 +183,9 @@ export const AUDIT_NEW_ACTIONS = [
   // The ASN import (2026-10-17) — one row per import run, beside each created
   // ASN's own `asn.created` (all under the import's one key).
   { action: 'asn_import.executed', targetType: 'asn_import' },
+  // Story 3-1 — the bin-to-bin move (`MoveCommand.moveStock`); the actor is
+  // the operator, also on a review Apply.
+  { action: 'stock.moved', targetType: 'bin_move' },
   // Story 6-1a — staff offboarding and the lockout unlocks.
   { action: 'user.deactivated', targetType: 'user' },
   { action: 'user.reactivated', targetType: 'user' },

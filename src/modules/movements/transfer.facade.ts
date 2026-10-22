@@ -48,6 +48,8 @@ import {
   type VariancePolicySnapshot,
 } from './count.command';
 import { VariancePolicyCommand } from './variance-policy.command';
+import { MoveCommand, type MoveStockCommand, type MoveStockSnapshot } from './move.command';
+import { moveReasonEntries, type MoveReasonEntry } from './move-reason';
 
 /**
  * The movements module's public seam (Story 5-1): every other module (and the
@@ -225,6 +227,8 @@ export class MovementsFacade {
     @Inject(TransferService) private readonly commands: TransferService,
     @Inject(CountService) private readonly countCommands: CountService,
     @Inject(VariancePolicyCommand) private readonly variancePolicies: VariancePolicyCommand,
+    // Story 3-1 — the bin-to-bin move.
+    @Inject(MoveCommand) private readonly moves: MoveCommand,
     // The epoch read for the task cards (the same-tx capture the pick
     // command's task read established) and — nothing else; every stock write
     // already went through the command's facade passthroughs.
@@ -253,6 +257,21 @@ export class MovementsFacade {
 
   cancelTransfer(command: Parameters<TransferService['cancelTransfer']>[0], idempotencyKey: string) {
     return this.commands.cancelTransfer(command, idempotencyKey).then((result) => result.snapshot);
+  }
+
+  // ── the bin-to-bin move (story 3-1) ─────────────────────────────────────
+
+  /** POST …/warehouses/{w}/inventory/moves — the handheld's `stock.move` op and the web Moves page. */
+  moveStock(command: MoveStockCommand, idempotencyKey: string): Promise<MoveStockSnapshot> {
+    return this.moves.moveStock(command, idempotencyKey);
+  }
+
+  /**
+   * The move reason vocabulary — the device snapshot's `moveReasons` arm,
+   * composed by the api shell (inbound's snapshot never imports this module).
+   */
+  moveReasons(): MoveReasonEntry[] {
+    return moveReasonEntries();
   }
 
   // ── count command passthroughs (story 5-3; the api layer's only count

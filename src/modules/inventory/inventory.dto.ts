@@ -453,15 +453,24 @@ export class LedgerReferenceDocDto {
 
   @ApiProperty({
     required: false,
-    description: 'Machine reason for the correction (e.g. stock-count) — manual-adjustment arm only',
+    description:
+      'Machine reason — the correction reason on the manual-adjustment arm (e.g. stock-count), the mismatch reason on the putaway arm, and (story 3-1) the move reason on the bin-move arm (consolidate, re-slot, make-room, found-misplaced, client-request, other)',
   })
   reasonCode?: string;
 
   @ApiProperty({
     required: false,
-    description: "The Ops Manager's note, carried verbatim — manual-adjustment arm only",
+    description:
+      "The note carried verbatim — the Ops Manager's note on the manual-adjustment arm; (story 3-1) the operator's note on the bin-move arm, present only when one was given (required with the reason `other`)",
   })
   note?: string;
+
+  @ApiProperty({
+    required: false,
+    format: 'uuid',
+    description: 'Story 3-1 — the bin-to-bin move the event belongs to (bin-move arm only); a serial move writes one event per unit under one moveId',
+  })
+  moveId?: string;
 
   @ApiProperty({
     required: false,

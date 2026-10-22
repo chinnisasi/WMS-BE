@@ -645,6 +645,8 @@ describe('story 21-4: metering and storage snapshots', () => {
         // Story 2-4a — a damaged receipt intake into the DAMAGED bin: it is
         // on-hand, so it bills storage like any other (decision 8).
         'grn.damaged': ['to'],
+        // Story 3-1 — the bin-to-bin move: a relocation, both bins on one event (meters 0).
+        'stock.moved': ['both'],
       };
 
       it('every registered type is classified, and each arm folds as the replay rule says', async () => {

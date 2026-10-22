@@ -304,6 +304,16 @@ export const CAPABILITIES = [
   // capability (decision 10). Mirrored into wms-fe `src/lib/users.ts`
   // (CAPABILITIES — ops_manager is derived there — and the operator grant).
   'gate.manage',
+  // Story 3-1 — the bin-to-bin move (`MoveCommand.moveStock`): relocate stock
+  // between two bins of one warehouse, from the handheld (`stock.move` op) or
+  // the web Moves page. Owner, Ops Manager AND Operator: moving stock along
+  // the shelves is floor work (`putaway.execute`'s rationale). A secure origin
+  // or target additionally answers the 12-3 cage gate (`secure.move`), which
+  // the operator deliberately does not hold. Accountant absent (reads only),
+  // never a client. Code-only, no seed. Mirrored into wms-fe
+  // `src/lib/users.ts` (CAPABILITIES — ops_manager is derived there — and the
+  // operator grant).
+  'stock.move',
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
@@ -387,6 +397,8 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     'returns.manage',
     // Story 2-3a — the gate-in (owner holds everything).
     'gate.manage',
+    // Story 3-1 — the bin-to-bin move (owner holds everything).
+    'stock.move',
   ]),
   operator: new Set<Capability>([
     'putaway.execute',
@@ -412,6 +424,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
     // Story 2-3a — the gate desk and the dock: record the gate-in, its unload
     // (the handheld's `gate-in.unload`) and its gate-out.
     'gate.manage',
+    // Story 3-1 — the floor moves stock between bins (the handheld's
+    // `stock.move`); a secure origin or target still answers the 12-3 gate.
+    'stock.move',
   ]),
   // Story 8-2b: the accountant's first write — the e-way paperwork (finance
   // work). Story 21-3: the client rate cards (finance work — decision 2,

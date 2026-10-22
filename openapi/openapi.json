@@ -7042,7 +7042,8 @@
                   "transfer.outbound",
                   "transfer.inbound",
                   "return.received",
-                  "grn.damaged"
+                  "grn.damaged",
+                  "stock.moved"
                 ]
               }
             }
@@ -17236,6 +17237,139 @@
         ]
       }
     },
+    "/tenants/{tenantId}/warehouses/{warehouseId}/inventory/moves": {
+      "post": {
+        "description": "Accepts EITHER session family on the one route (the inbound-confirm precedent): a web session, or a device badge-in session (a bare enrollment credential → 401; an op captured by another operator → 409 operator-mismatch). The command re-reads the device, the operator's role and the target's placement gates in its own transaction. No outbox event; ATP is unchanged.",
+        "operationId": "MovementsController_moveStock",
+        "parameters": [
+          {
+            "name": "tenantId",
+            "required": true,
+            "in": "path",
+            "description": "Owning tenant (must match the session)",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "description": "Client-generated ULID key; replays return the original response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 26,
+              "maxLength": 26,
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveStockDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Moved: the move id and its events (the idempotency snapshot)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MoveStockResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or malformed Idempotency-Key, or an invalid body — the same bin on both ends, qty not equal to the serial count, a duplicate serial, more than 500 serials, a batchCode beside serials, a reason outside the vocabulary or `other` without a note, a note over 200 characters, occurredAt sent from the web or missing/malformed on the handheld, a batch missing on a batch-tracked SKU or sent for an untracked one, serials missing on a serial-tracked SKU or sent for another, a catch-weight SKU, or a quantity finer than the SKU's unit allows (validation-failed)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid session token of either family, or a device token without a badge-in session (unauthenticated)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Session belongs to another tenant (permission-denied), an unknown or revoked device (device-revoked), the caller lacks stock.move (role-denied), or the origin or target bin is secure/cage-class and the actor lacks secure.move (role-denied, FR-42)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The warehouse, the SKU, either bin (in this warehouse) or the batch does not exist (not-found), or a serial number is unknown for the SKU (serial-unknown)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A system bin on either end (bin-not-movable), a retired origin or target (bin-retired), the target blocked or refused by a placement gate (bin-blocked, bin-storage-mismatch, bin-client-mismatch, bin-segregation-conflict, bin-occupancy-conflict, bin-full, bin-overweight, bin-volume-exceeded, bin-item-oversize), an open reconcile quarantine on the origin or target scope (move-scope-quarantined), a kit SKU (kit-cannot-hold-stock), the origin holding less than the move (move-source-short), a serial located in another bin (serial-elsewhere), the op captured by another operator (operator-mismatch), or a concurrent idempotent request (conflict)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Idempotency key reused with a different payload (idempotency-key-reuse)",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetailsDto"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "device": []
+          },
+          {
+            "bearer": []
+          }
+        ],
+        "summary": "Moves stock between two bins of one warehouse (stock.move — either session family): the handheld's queued stock.move op or the web Moves page — one stock.moved ledger event per arm (a batch arm, or one per serial), both bins on each event",
+        "tags": [
+          "movements"
+        ]
+      }
+    },
     "/tenants/{tenantId}/movements/transfers/{transferId}/cancel": {
       "post": {
         "operationId": "MovementsController_cancelTransfer",
@@ -22563,6 +22697,7 @@
                 "audit_export",
                 "batch_alert",
                 "bin",
+                "bin_move",
                 "carrier_connection",
                 "catalog_import",
                 "channel_connection",
@@ -33586,7 +33721,8 @@
               "grn.shelf-life-refused",
               "grn.inactive-sku-received",
               "grn.licence-refused",
-              "gate-in.unload"
+              "gate-in.unload",
+              "stock.move"
             ]
           },
           "classification": {
@@ -33739,7 +33875,8 @@
               "grn.shelf-life-refused",
               "grn.inactive-sku-received",
               "grn.licence-refused",
-              "gate-in.unload"
+              "gate-in.unload",
+              "stock.move"
             ]
           },
           "classification": {
@@ -34465,11 +34602,16 @@
           },
           "reasonCode": {
             "type": "string",
-            "description": "Machine reason for the correction (e.g. stock-count) — manual-adjustment arm only"
+            "description": "Machine reason — the correction reason on the manual-adjustment arm (e.g. stock-count), the mismatch reason on the putaway arm, and (story 3-1) the move reason on the bin-move arm (consolidate, re-slot, make-room, found-misplaced, client-request, other)"
           },
           "note": {
             "type": "string",
-            "description": "The Ops Manager's note, carried verbatim — manual-adjustment arm only"
+            "description": "The note carried verbatim — the Ops Manager's note on the manual-adjustment arm; (story 3-1) the operator's note on the bin-move arm, present only when one was given (required with the reason `other`)"
+          },
+          "moveId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Story 3-1 — the bin-to-bin move the event belongs to (bin-move arm only); a serial move writes one event per unit under one moveId"
           },
           "overrideReason": {
             "type": "string",
@@ -39517,6 +39659,10 @@
                 "$ref": "#/components/schemas/CatalogSnapshotDgDto"
               }
             ]
+          },
+          "isKit": {
+            "type": "boolean",
+            "description": "Story 3-1: the SKU is a kit (a kit holds no stock — the handheld refuses a move of it offline). An older server omits it; the device reads absence as false"
           }
         },
         "required": [
@@ -40408,6 +40554,30 @@
           "documents"
         ]
       },
+      "CatalogMoveReasonDto": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "consolidate",
+              "re-slot",
+              "make-room",
+              "found-misplaced",
+              "client-request",
+              "other"
+            ]
+          },
+          "noteRequired": {
+            "type": "boolean",
+            "description": "The reason needs a note beside it (the reason `other`)"
+          }
+        },
+        "required": [
+          "code",
+          "noteRequired"
+        ]
+      },
       "CatalogSnapshotResponse": {
         "type": "object",
         "properties": {
@@ -40537,6 +40707,13 @@
                 "other"
               ]
             }
+          },
+          "moveReasons": {
+            "description": "Story 3-1 (additive): the bin-to-bin move's reason vocabulary, in order — the handheld's reason chips. A reason with noteRequired needs a note (up to 200 characters). An older server omits it, and the handheld then offers no Move stock",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogMoveReasonDto"
+            }
           }
         },
         "required": [
@@ -40556,7 +40733,8 @@
           "clients",
           "openGateIns",
           "receiptDamageReasons",
-          "receiptShortReasons"
+          "receiptShortReasons",
+          "moveReasons"
         ]
       },
       "GoodsReceiptEntryDto": {
@@ -43965,6 +44143,147 @@
             "maxLength": 35
           }
         }
+      },
+      "MoveStockDto": {
+        "type": "object",
+        "properties": {
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The origin bin — the units leave it"
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The target bin — the units land in it (a different bin of the same warehouse)"
+          },
+          "qty": {
+            "type": "number",
+            "description": "Quantity to move. A quantity in the SKU's base UoM, at the decimal precision that unit declares (each = 0 places, kg = 3). A value finer than its unit allows is refused, naming the unit and its precision — never silently rounded. On a serial-tracked SKU it equals the number of serials.",
+            "minimum": 0.001,
+            "maximum": 9007199254740
+          },
+          "batchCode": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 100,
+            "description": "The batch CODE moved — required for a batch-tracked SKU (unknown → 404 not-found), refused on an untracked one and beside serials (a serial move derives each serial's batch)"
+          },
+          "serials": {
+            "nullable": true,
+            "maxItems": 500,
+            "description": "The serial numbers moved — required for a serial-tracked SKU, one per unit, distinct, at most 500",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "reasonCode": {
+            "type": "string",
+            "enum": [
+              "consolidate",
+              "re-slot",
+              "make-room",
+              "found-misplaced",
+              "client-request",
+              "other"
+            ],
+            "description": "Why the stock moved; `other` needs a note"
+          },
+          "note": {
+            "type": "string",
+            "nullable": true,
+            "maxLength": 200,
+            "description": "Up to 200 characters, trimmed; required with the reason `other`"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "Handheld only — the op's business time (ISO-8601 UTC, Z-suffixed), required there; a web session sending it is refused 400 (a web move happens now)",
+            "minLength": 20,
+            "maxLength": 35
+          }
+        },
+        "required": [
+          "skuId",
+          "fromBinId",
+          "toBinId",
+          "qty",
+          "reasonCode"
+        ]
+      },
+      "MoveEventDto": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "integer"
+          },
+          "skuId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantity": {
+            "type": "number",
+            "description": "The event's magnitude in BASE UoM"
+          },
+          "fromBinId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "toBinId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "batchRef": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The catalog batch id (null on an untracked SKU)"
+          },
+          "serialRef": {
+            "type": "string",
+            "nullable": true,
+            "format": "uuid",
+            "description": "The catalog serial id (one event per serial unit)"
+          },
+          "occurredAt": {
+            "type": "string",
+            "description": "ISO-8601 UTC business time — the handheld's confirm time, or the commit time on the web"
+          }
+        },
+        "required": [
+          "seq",
+          "skuId",
+          "quantity",
+          "fromBinId",
+          "toBinId",
+          "batchRef",
+          "serialRef",
+          "occurredAt"
+        ]
+      },
+      "MoveStockResponse": {
+        "type": "object",
+        "properties": {
+          "moveId": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The move — every event carries it on referenceDoc.moveId"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MoveEventDto"
+            }
+          }
+        },
+        "required": [
+          "moveId",
+          "events"
+        ]
       },
       "CancelTransferDto": {
         "type": "object",
@@ -47639,6 +47958,7 @@
               "audit_export",
               "batch_alert",
               "bin",
+              "bin_move",
               "carrier_connection",
               "catalog_import",
               "channel_connection",
@@ -47731,6 +48051,7 @@
               "audit_export",
               "batch_alert",
               "bin",
+              "bin_move",
               "carrier_connection",
               "catalog_import",
               "channel_connection",
