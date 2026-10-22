@@ -367,6 +367,10 @@ export function referenceSummary(doc: LedgerReferenceDoc, grnCodes: ReadonlyMap<
       return `putaway ${grn(doc.grnId)}`;
     case 'bin-merge':
       return `bin merge ${doc.mergeId}`;
+    // Story 3-1's reference kind (#118). 5-3a's exhaustive switch (#121) was
+    // written before 3-1 merged, so main failed `tsc` on the merge of the two.
+    case 'bin-move':
+      return `bin move ${doc.moveId}`;
     case 'pick':
       return `pick order ${doc.orderId}${doc.shortPick === true ? ' (short)' : ''}`;
     case 'pack':
