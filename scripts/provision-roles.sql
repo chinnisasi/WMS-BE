@@ -55,3 +55,15 @@ alter default privileges in schema public
 -- Postgres's master user); verify with
 --   select pg_has_role('wms_app', 'pg_read_all_stats', 'USAGE');
 grant pg_read_all_stats to wms_app;
+
+-- Story 6-2a — readiness (`GET /health/ready`) compares the database's
+-- latest applied migration with the image's journal, reading drizzle's own
+-- table as the app role. Run AFTER `db:migrate:deploy` (which creates the
+-- schema); before it, the block is a no-op and the next run grants. Read-only:
+-- the app role can never write the migrations table.
+do $$ begin
+  if exists (select from pg_namespace where nspname = 'drizzle') then
+    grant usage on schema drizzle to wms_app;
+    grant select on all tables in schema drizzle to wms_app;
+  end if;
+end $$;

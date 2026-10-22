@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "description": "WMS backend — NestJS 12 modular monolith (api + jobs shells)",
-  "packageManager": "bun@1.2.20",
+  "packageManager": "bun@1.4.0",
   "engines": {
-    "bun": ">=1.2"
+    "bun": ">=1.4"
   },
   "scripts": {
     "dev": "bun --watch src/main.ts",
@@ -17,6 +17,8 @@
     "test:watch": "jest --watch",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "bun src/shared/db/migrate.ts",
+    "db:migrate:deploy": "bun src/shared/db/migrate-deploy.ts",
+    "db:provision-roles": "bun src/shared/db/provision-roles.ts",
     "db:verify": "bun src/shared/db/verify.ts",
     "openapi:export": "bun src/api/export-openapi.ts",
     "loadtest:smoke": "bun scripts/loadtest-acceptance.ts --mode smoke",

@@ -32,8 +32,13 @@ bun run typecheck    # tsc over src/ and test/ (no emit)
 bun run build        # tsc → dist/
 bun run db:generate  # drizzle-kit generate (after editing src/shared/db/schema.ts)
 bun run db:migrate   # apply pending migrations (needs DATABASE_URL)
+bun run db:migrate:deploy [--dry-run] [--allow-locking]  # the guarded deploy migrator (story 6-2a)
+bun run db:provision-roles  # scripts/provision-roles.sql, as the owner, every deploy
 bun run openapi:export  # write openapi/openapi.json — the API contract
+docker build -t wms-be .  # the production image: API, worker and migrate task alike
 ```
+
+**Deploying (story 6-2a):** one image for every process, `GET /api/v1/health/ready` for the load balancer, SIGTERM drains and exits 0, and `db:migrate:deploy` refuses an index build on a large table until it is pre-built CONCURRENTLY. The runbook — processes, every environment variable, the deploy order, the CONCURRENTLY table — is the meta repo's `docs/design/DEPLOY.md`.
 
 ## Demo data
 

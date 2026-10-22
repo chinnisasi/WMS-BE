@@ -51,6 +51,26 @@ export function createLazyAuthDatabase(): Database {
   });
 }
 
+/**
+ * Story 6-2a (A1) — each lazy proxy's "the client, if one was ever created"
+ * reader, so shutdown can close a pool WITHOUT going through the proxy (any
+ * property read on it would open the very connection it is closing).
+ */
+const createdInstances = new WeakMap<object, () => Database | undefined>();
+
+/**
+ * Ends the pool behind a lazy database, if it was ever opened: in-flight
+ * queries get up to `timeoutSeconds` to finish, then their connections are
+ * destroyed. A proxy never touched resolves at once and opens nothing; a
+ * non-proxy handle is ignored (its owner closes it).
+ */
+export async function closeLazyDatabase(db: Database, timeoutSeconds: number): Promise<boolean> {
+  const instance = createdInstances.get(db as unknown as object)?.();
+  if (instance === undefined) return false;
+  await (instance as unknown as { $client: postgres.Sql }).$client.end({ timeout: timeoutSeconds });
+  return true;
+}
+
 function lazyDatabaseProxy(create: () => Database): Database {
   let instance: Database | undefined;
   const resolved = (): Database => (instance ??= create());
@@ -73,7 +93,7 @@ function lazyDatabaseProxy(create: () => Database): Database {
   ]);
 
   type Mutable = Record<string | symbol, unknown>;
-  return new Proxy({} as unknown as Database, {
+  const proxy = new Proxy({} as unknown as Database, {
     get(_target, prop) {
       if (typeof prop !== 'string' || INERT.has(prop)) return undefined;
       const db = resolved() as unknown as Mutable;
@@ -94,6 +114,8 @@ function lazyDatabaseProxy(create: () => Database): Database {
       return typeof prop === 'string' && !INERT.has(prop) && prop in (resolved() as unknown as Mutable);
     },
   });
+  createdInstances.set(proxy as unknown as object, () => instance);
+  return proxy;
 }
 
 export function requiredDbUrl(): string {

@@ -162,6 +162,18 @@ describe('session visibility — the §7d probe under the provisioned two-role s
     ]);
   });
 
+  it('story 6-2a (A2): the provisioned app role READS drizzle\'s migrations table (the readiness check) and cannot write it', async () => {
+    const [applied] = (await appDb.execute(
+      dsql`select count(*)::int as n, max(created_at)::text as at from drizzle.__drizzle_migrations`,
+    )) as unknown as { n: number; at: string | null }[];
+    expect(applied!.n).toBeGreaterThan(0);
+    expect(applied!.at).not.toBeNull();
+    // The grant is select only: a write is refused 42501.
+    await expect(
+      appDb.execute(dsql`delete from drizzle.__drizzle_migrations where id = -1`),
+    ).rejects.toMatchObject({ cause: { code: '42501' } });
+  });
+
   it('positive: the provisioned app role SEES the auth role\'s open transaction and reports nothing hidden', async () => {
     const result = await probe();
     expect(result).toMatchObject({ hidden: false, hiddenCount: 0 });

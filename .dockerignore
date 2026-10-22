@@ -1,0 +1,20 @@
+# Story 6-2a — the build context is the source the image needs, nothing else.
+# Secrets never enter it: .env files are excluded (the image reads its
+# configuration from the task's environment at run time).
+.git
+.github
+.env
+.env.*
+!.env.example
+node_modules
+dist
+coverage
+artifacts
+test
+openapi
+*.log
+*.tsbuildinfo
+.DS_Store
+docker-compose.yml
+Dockerfile
+.dockerignore

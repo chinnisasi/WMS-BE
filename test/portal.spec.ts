@@ -434,6 +434,8 @@ describe('client portal (e2e, story 21-7)', () => {
   /** The routes no session guards — by EXACT method and path. */
   const UNGUARDED = new Set([
     'GET api/v1/health',
+    // Story 6-2a — readiness: the load balancer's probe, tenant-free (check names only).
+    'GET api/v1/health/ready',
     'GET api/v1/openapi.json',
     'POST api/v1/echo',
     'POST api/v1/tenants',

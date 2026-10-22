@@ -7,6 +7,8 @@ import { OUTBOX_RELAY, OUTBOX_SINK } from './events/outbox.seam';
 import { PostgresOutboxRelay, PostgresOutboxSink } from './events/outbox';
 import { ProblemDetailsFilter } from './problem-details/problem-details.filter';
 import { AUTH_DATABASE, DATABASE } from './db/tokens';
+import { DatabaseLifecycle } from './lifecycle/database-lifecycle';
+import { HttpDrain } from './lifecycle/http-drain';
 
 export type { ModuleMetadata };
 
@@ -44,6 +46,10 @@ export { DATABASE, AUTH_DATABASE } from './db/tokens';
     // OUTBOX_RELAY, which publishes through EVENT_BUS above.
     { provide: OUTBOX_SINK, useClass: PostgresOutboxSink },
     { provide: OUTBOX_RELAY, useClass: PostgresOutboxRelay },
+    // Story 6-2a (A1) — graceful shutdown: the in-flight requests drain in
+    // `beforeApplicationShutdown`, the pools close in `onApplicationShutdown`.
+    HttpDrain,
+    DatabaseLifecycle,
   ],
   exports: [DATABASE, AUTH_DATABASE, EVENT_BUS, OUTBOX_SINK, OUTBOX_RELAY],
 })

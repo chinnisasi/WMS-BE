@@ -48,6 +48,8 @@ import { NotificationsModule } from '../modules/notifications/notifications.modu
 import { ReturnsController } from './returns.controller';
 import { ReturnsModule } from '../modules/returns/returns.module';
 import { SharedModule } from '../shared/shared.module';
+import { ValkeyModule } from '../shared/valkey/valkey.module';
+import { ReadinessService } from './readiness.service';
 
 /**
  * api shell: the only HTTP surface of the monolith. Story 1.1 exposes
@@ -87,7 +89,7 @@ import { SharedModule } from '../shared/shared.module';
   // Story 21-7 — SharedModule: Nest instantiates a route guard in the
   // CONTROLLER's module, so `PortalSessionGuard`'s DATABASE dependency must
   // resolve here too.
-  imports: [SharedModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule, PartnersModule],
+  imports: [SharedModule, ValkeyModule, InventoryModule, InboundModule, OutboundModule, PutawayModule, CarriersModule, CatalogModule, TenancyModule, ComplianceModule, InvoicingModule, MovementsModule, ReplenishmentModule, ChannelsModule, ReportingModule, ClientsModule, BillingModule, NotificationsModule, ReturnsModule, PartnersModule],
   controllers: [
     HealthController,
     EchoController,
@@ -169,6 +171,6 @@ import { SharedModule } from '../shared/shared.module';
     OpenApiController,
     NotFoundController,
   ],
-  providers: [OpenApiDocumentHolder],
+  providers: [OpenApiDocumentHolder, ReadinessService],
 })
 export class ApiModule {}
