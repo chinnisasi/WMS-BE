@@ -452,7 +452,11 @@ describe('client portal (e2e, story 21-7)', () => {
   ]);
 
   /** Story 21-7b — the portal's ONLY writes, by exact method and path. */
-  const PORTAL_WRITES = new Set(['POST api/v1/tenants/:tenantId/portal/inbound/asns']);
+  const PORTAL_WRITES = new Set([
+    'POST api/v1/tenants/:tenantId/portal/inbound/asns',
+    // Story 4-1a — the portal order.
+    'POST api/v1/tenants/:tenantId/portal/orders',
+  ]);
 
   const SESSION_GUARDS = [TenantSessionGuard, DeviceSessionGuard, AnySessionGuard, PortalSessionGuard];
 
@@ -469,8 +473,8 @@ describe('client portal (e2e, story 21-7)', () => {
   // ── the role and its invite ───────────────────────────────────────────────
 
   describe('the client role and its invite', () => {
-    it('ROLE_CAPABILITIES.client is exactly asn.announce (21-7 made it empty; 21-7b grants the one portal write)', () => {
-      expect([...ROLE_CAPABILITIES.client]).toEqual(['asn.announce']);
+    it('ROLE_CAPABILITIES.client is exactly asn.announce and orders.place (21-7 made it empty; 21-7b grants the announce, 4-1a the order)', () => {
+      expect([...ROLE_CAPABILITIES.client]).toEqual(['asn.announce', 'orders.place']);
     });
 
     it('an owner invites a client user for one client brand: invited, carrying its clientId', async () => {
@@ -717,8 +721,8 @@ describe('client portal (e2e, story 21-7)', () => {
       // Every allowlisted portal write exists, too.
       expect([...PORTAL_WRITES].filter((id) => !declared.has(id))).toEqual([]);
       // 21-7's ten reads, plus 21-7b's announce and its two form reads, plus
-      // 21-8's service report.
-      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(14);
+      // 21-8's service report, plus 4-1a's order.
+      expect(all.filter((route) => route.guards.includes(PortalSessionGuard))).toHaveLength(15);
     });
 
     it('a portal token is refused on EVERY operator route — reads and writes — with the exact fence detail', async () => {

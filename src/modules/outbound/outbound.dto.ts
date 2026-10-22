@@ -86,6 +86,12 @@ export class OrderLineInputDto {
   ratePaise?: number;
 }
 
+/**
+ * An order's line ceiling (`@ArrayMaxSize`) — the staff create's, and since
+ * story 4-1a the portal order's too (`PortalCreateOrderDto` imports it).
+ */
+export const MAX_ORDER_LINES = 200;
+
 /** POST /tenants/{tenantId}/outbound/orders body (manual entry + ingestion). */
 export class CreateOrderDto {
   @ApiProperty({ format: 'uuid', description: 'The ordering warehouse' })
@@ -122,10 +128,10 @@ export class CreateOrderDto {
   @Length(1, 200)
   externalEventId?: string;
 
-  @ApiProperty({ type: [OrderLineInputDto], minItems: 1, maxItems: 200 })
+  @ApiProperty({ type: [OrderLineInputDto], minItems: 1, maxItems: MAX_ORDER_LINES })
   @IsArray()
   @ArrayMinSize(1)
-  @ArrayMaxSize(200)
+  @ArrayMaxSize(MAX_ORDER_LINES)
   @ValidateNested({ each: true })
   @Type(() => OrderLineInputDto)
   lines!: OrderLineInputDto[];

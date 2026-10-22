@@ -1470,6 +1470,130 @@ describe('story 21-2: client isolation RLS — app.client_id, the stamping primi
   });
 
   // ──────────────────────────────────────────────────────────────────────────
+  // Story 4-1a — the portal ORDER. `OrderCommandService.placePortalOrder`
+  // runs its phase-1 and phase-3 transactions stamped with the session's
+  // client; this runs the WHOLE write set as `wms_rls_probe` under client A's
+  // stamp — the reads it stamps (warehouse, the client FOR SHARE and FOR KEY
+  // SHARE, the client's SKUs plain and FOR KEY SHARE, the kit lookup, the
+  // reservation read-back) and the writes (order, line, outbox, audit, key),
+  // plus the order read-back — with a positive control (client B's order is
+  // refused 42501 inside the same transaction), all rolled back. It also
+  // proves WHY the licence check reads through an unstamped seam: under the
+  // stamp a SITE licence (null client_id) is invisible, while the operator
+  // shape sees it.
+  // ──────────────────────────────────────────────────────────────────────────
+  describe('story 4-1a: the portal order write set under a client stamp, and the licence seam', () => {
+    let probe: postgres.Sql<Record<string, unknown>>;
+    const ROLLBACK = 'probe-rollback';
+    let reservationAId: string;
+    let siteLicenceId: string;
+    let clientLicenceId: string;
+
+    beforeAll(async () => {
+      await ensureProbeRole();
+      probe = postgres(probeUrl(), { max: 1 });
+      // A held reservation for A's SKU — written operator-stamped by the
+      // inventory facade in production (grants are tenant data); the stamped
+      // write transaction only READS it back into the snapshot.
+      reservationAId = uuidv7();
+      await sql`insert into reservations (id, tenant_id, warehouse_id, sku_id, owner_type, owner_id, quantity, state, expires_at)
+        values (${reservationAId}, ${tenantId}, ${warehouseId}, ${skuAId}, 'order', ${uuidv7()}, 1000, 'held', now() + interval '1 day')`;
+      // A site licence (no client) and a client licence of A.
+      siteLicenceId = uuidv7();
+      clientLicenceId = uuidv7();
+      await sql`insert into licences (id, tenant_id, client_id, warehouse_id, kind, number)
+        values (${siteLicenceId}, ${tenantId}, null, ${warehouseId}, 'drug-20b', 'MH/20B/41')`;
+      await sql`insert into licences (id, tenant_id, client_id, warehouse_id, kind, number)
+        values (${clientLicenceId}, ${tenantId}, ${clientA}, null, 'drug-20b', 'MH/20B/42')`;
+    });
+
+    afterAll(async () => {
+      await probe?.end();
+    });
+
+    it('every statement of the portal order runs under client A’s stamp — reads, order, line, outbox, audit, key, read-back — with a positive control, all rolled back', async () => {
+      const orderId = uuidv7();
+      const key = ulid();
+      const seen: Record<string, unknown> = {};
+      const run = probe.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+        await tx`select set_config('app.client_id', ${clientA}, true)`;
+        // Phase 1 and the start of phase 3: the warehouse, the client under
+        // FOR SHARE (the gate) and FOR KEY SHARE (the take-work guard), the
+        // SKUs (the client predicate REMOVED — RLS alone), the kit lookup.
+        seen.warehouse = (await tx`select id from warehouses where tenant_id = ${tenantId} and id = ${warehouseId}`).length;
+        seen.clientShare = (await tx`select status from clients where tenant_id = ${tenantId} and id = ${clientA} for share`).map((row) => row.status);
+        seen.clientKeyShare = (await tx`select status from clients where tenant_id = ${tenantId} and id = ${clientA} for key share`).map((row) => row.status);
+        seen.skus = (await tx`select id from skus where tenant_id = ${tenantId} and id in (${skuAId}, ${skuBId}) and status = 'active'`).map((row) => row.id);
+        seen.skusLocked = (await tx`select id from skus where tenant_id = ${tenantId} and id in (${skuAId}, ${skuBId}) order by id for key share`).map((row) => row.id);
+        seen.kits = (await tx`select kit_sku_id from kit_compositions where tenant_id = ${tenantId} and kit_sku_id in (${skuAId})`).length;
+        // The write set.
+        await tx`insert into orders (id, tenant_id, client_id, warehouse_id, status, source)
+          values (${orderId}, ${tenantId}, ${clientA}, ${warehouseId}, 'accepted', 'manual')`;
+        await tx`insert into order_lines (id, tenant_id, order_id, sku_id, qty, reserved_qty, reservation_id, status)
+          values (${uuidv7()}, ${tenantId}, ${orderId}, ${skuAId}, 1000, 1000, ${reservationAId}, 'open')`;
+        // The snapshot read-back: the order, its lines, the reservation state.
+        seen.order = (await tx`select id, client_id from orders where id = ${orderId}`).map((row) => row.client_id);
+        seen.lines = (await tx`select sku_id from order_lines where order_id = ${orderId}`).map((row) => row.sku_id);
+        seen.reservation = (await tx`select state from reservations where tenant_id = ${tenantId} and id = ${reservationAId}`).map((row) => row.state);
+        await tx`insert into outbox_messages (id, tenant_id, type, payload, occurred_at)
+          values (${uuidv7()}, ${tenantId}, 'order.created', ${tx.json({ order: { id: orderId } })}, now())`;
+        await tx`insert into audit_events (id, tenant_id, actor_user_id, action, target_type, target_id, reference, occurred_at)
+          values (${uuidv7()}, ${tenantId}, ${uuidv7()}, 'order.created', 'order', ${orderId}, ${key}, now())`;
+        await tx`insert into idempotency_keys (id, tenant_id, key, payload_hash, response_snapshot)
+          values (${uuidv7()}, ${tenantId}, ${key}, 'probe', ${tx.json({ orderId })})`;
+        // Positive control: an order for client B is refused by the stamp.
+        seen.control = await tx
+          .savepoint((sp) => sp`insert into orders (id, tenant_id, client_id, warehouse_id, status, source)
+            values (${uuidv7()}, ${tenantId}, ${clientB}, ${warehouseId}, 'accepted', 'manual')`)
+          .then(
+            () => 'admitted',
+            (error: { code?: string }) => error.code,
+          );
+        throw new Error(ROLLBACK);
+      });
+      await expect(run).rejects.toThrow(ROLLBACK);
+
+      expect(seen).toEqual({
+        warehouse: 1,
+        clientShare: ['active'],
+        clientKeyShare: ['active'],
+        skus: [skuAId],
+        skusLocked: [skuAId],
+        kits: 0,
+        order: [clientA],
+        lines: [skuAId],
+        reservation: ['held'],
+        control: '42501',
+      });
+      await expectCount((t) => t`select count(*)::int as n from ${t('orders')} where id = ${orderId}`, 0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('order_lines')} where order_id = ${orderId}`, 0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('idempotency_keys')} where key = ${key}`, 0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('audit_events')} where target_id = ${orderId}`, 0);
+      await expectCount((t) => t`select count(*)::int as n from ${t('outbox_messages')} where payload->'order'->>'id' = ${orderId}`, 0);
+    });
+
+    it('the licence seam: under the client stamp a SITE licence is invisible (so a stamped check would refuse every site-covered order); the unstamped read sees both', async () => {
+      const read = (client: string | null): Promise<string[]> =>
+        probe.begin(async (tx) => {
+          await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+          if (client !== null) await tx`select set_config('app.client_id', ${client}, true)`;
+          // `activeLicenceFactsInTx`'s shape.
+          return (await tx`select id from licences where tenant_id = ${tenantId} and status = 'active' order by id`).map((row) => row.id as string);
+        });
+      expect(await read(clientA)).toEqual([clientLicenceId]);
+      expect(await read(null)).toEqual([siteLicenceId, clientLicenceId].sort());
+      // The switch the seam reads is tenant data, visible either way (no row here: off).
+      const policy = await probe.begin(async (tx) => {
+        await tx`select set_config('app.tenant_id', ${tenantId}, true)`;
+        await tx`select set_config('app.client_id', ${clientA}, true)`;
+        return (await tx`select count(*)::int as n from licence_policies where tenant_id = ${tenantId}`)[0]!.n;
+      });
+      expect(policy).toBe(0);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
   // Story 21-8 — the SERVICE REPORT's query shapes (`reporting/service.ts`),
   // proved at the database. `portalServiceReport` runs them in a transaction
   // stamped with the session's client; here each runs as `wms_rls_probe`

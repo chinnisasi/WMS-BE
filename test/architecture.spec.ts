@@ -2335,6 +2335,9 @@ describe('architecture: the client portal (story 21-7)', () => {
    */
   const PORTAL_WRITES: readonly { file: string; methods: readonly string[] }[] = [
     { file: join(SRC_ROOT, 'modules', 'inbound', 'asn.command.ts'), methods: ['announce'] },
+    // Story 4-1a — the portal order (its phases run through the shared order
+    // pipeline; the stamped transaction opener is built in this method).
+    { file: join(SRC_ROOT, 'modules', 'outbound', 'order.command.ts'), methods: ['placePortalOrder'] },
   ];
 
   function stampsCommandClient(body: string): boolean {
@@ -2352,6 +2355,37 @@ describe('architecture: the client portal (story 21-7)', () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  it('story 4-1a: placePortalOrder opens no unstamped transaction itself — its one unstamped read is the documented licence seam', () => {
+    const source = readFileSync(join(SRC_ROOT, 'modules', 'outbound', 'order.command.ts'), 'utf8');
+    const body = bodyOf(source, 'placePortalOrder')!;
+    expect(body).not.toBeNull();
+    // Every transaction the method opens is stamped with the SESSION's client…
+    const opened = body.match(/withTenantTransaction\(/g) ?? [];
+    const stamped = body.match(/\{\s*clientId:\s*command\.clientId\s*\}\s*\)/g) ?? [];
+    expect(opened.length).toBeGreaterThanOrEqual(1);
+    expect(stamped.length).toBe(opened.length);
+    // …the shared pipeline opens transactions only through the surface…
+    /** A (private, possibly generic) class member's body, to the next member. */
+    const memberBody = (name: string): string | null => {
+      const start = new RegExp(`\\n {2}(?:private |public )?async ${name}(?:<[^>]*>)?\\(`).exec(source);
+      if (start === null) return null;
+      const rest = source.slice(start.index + 1);
+      const end = /\n {2}(?:async |\/\*\*|private |public )/.exec(rest.slice(1));
+      return end === null ? rest : rest.slice(0, end.index + 1);
+    };
+    for (const phase of ['placeOrder', 'preflightPhase', 'grantPhase', 'writePhase']) {
+      const phaseBody = memberBody(phase);
+      expect(phaseBody).not.toBeNull();
+      expect(phaseBody).not.toMatch(/withTenantTransaction\(/);
+    }
+    // …and the unstamped seam reads the licence switch and the active licences, nothing else.
+    const seam = memberBody('portalLicenceSnapshot')!;
+    expect(seam).not.toBeNull();
+    expect(seam.replace(/\s+/g, ' ')).toContain('withTenantTransaction(this.db, tenantId, async (tx) => {');
+    expect([...seam.matchAll(/await (\w+)\(/g)].map((match) => match[1])).toEqual(['licenceEnforcedInTx', 'activeLicenceFactsInTx']);
+    expect(seam).not.toMatch(/\btx\s*\.\s*(select|insert|update|delete|execute)\b/);
   });
 
   it('the write-stamp detector bites (the test is meaningful)', () => {
@@ -2466,6 +2500,14 @@ describe('architecture: the client portal (story 21-7)', () => {
       target: 'announce',
       via: { member: 'asnCommand', className: 'AsnCommand' },
       statement: 'return this.asnCommand.announce(command, idempotencyKey);',
+    },
+    // Story 4-1a — the portal order: the stamp lives in the command.
+    {
+      field: 'outbound',
+      method: 'placePortalOrder',
+      target: 'placePortalOrder',
+      via: { member: 'orderCommand', className: 'OrderCommandService' },
+      statement: 'return this.orderCommand.placePortalOrder(command, idempotencyKey);',
     },
   ];
 
@@ -2638,7 +2680,7 @@ describe('architecture: the client portal (story 21-7)', () => {
     // The scan really reads the controller's calls (a broken regex would pass empty).
     const calls = [...source.matchAll(CONTROLLER_CALL)].map((match) => `${match[1]}.${match[2]}`);
     expect(calls.length).toBeGreaterThanOrEqual(14);
-    expect(calls).toEqual(expect.arrayContaining(['outbound.portalOrders', 'inbound.announceAsn', 'clients.portalMe']));
+    expect(calls).toEqual(expect.arrayContaining(['outbound.portalOrders', 'inbound.announceAsn', 'outbound.placePortalOrder', 'clients.portalMe']));
   });
 
   it('each declared delegation is exactly its pinned `return <target>(…);` to a listed portal read or write', () => {

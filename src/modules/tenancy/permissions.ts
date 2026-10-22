@@ -259,6 +259,16 @@ export const CAPABILITIES = [
   // an ASN through `asn.manage`. Mirrored into wms-fe `src/lib/users.ts`
   // (CAPABILITIES + OPS_EXCLUDED_CAPABILITIES + the client grant).
   'asn.announce',
+  // Story 4-1a — the client portal's second write: a client user places an
+  // outbound order for its OWN active SKUs (`POST portal/orders`, the client
+  // taken from the session; `OrderCommandService.placePortalOrder`). Held by
+  // `client` (and by owner, who holds everything — harmless, the
+  // `asn.announce` precedent: the fence keeps owner tokens off portal routes
+  // and the command's client re-check refuses a user without a client).
+  // Never by ops_manager, operator or accountant: staff key orders through
+  // `orders.manage`. Mirrored into wms-fe `src/lib/users.ts` (CAPABILITIES +
+  // OPS_EXCLUDED_CAPABILITIES + the client grant).
+  'orders.place',
   // Story 9-3a — FR-28: read the tenant's audit trail (who did what, when, to
   // which document) through `GET …/reporting/audit`. A READ capability,
   // enforced by `ReportingFacade.auditTrail`'s guard in its own transaction
@@ -440,8 +450,9 @@ export const ROLE_CAPABILITIES: Readonly<Record<UserRole, ReadonlySet<Capability
   // fence). 21-7 made the portal read-only and the set empty; story 21-7b
   // grants exactly one write — `asn.announce`, its own inbound shipment
   // announced from the portal (the command takes the client from the
-  // session, never from the body). Nothing else.
-  client: new Set<Capability>(['asn.announce']),
+  // session, never from the body). Story 4-1a adds `orders.place`, an
+  // outbound order of its own SKUs placed from the portal. Nothing else.
+  client: new Set<Capability>(['asn.announce', 'orders.place']),
 };
 
 /**
