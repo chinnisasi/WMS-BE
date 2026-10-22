@@ -437,6 +437,9 @@ export class StockAdjustmentCommand {
     // submission's pre-composition check through `assertAdjustmentShape`.
     const occurredAt = assertAdjustmentShape(command);
     const deviceId = command.deviceId ?? null;
+    // Story 3-2b — the audit row's time: the server clock on the handheld,
+    // the business time on the web (unchanged from before 3-2b).
+    const auditOccurredAt = deviceId === null ? occurredAt : nowIso();
 
     // Serial-tracked movements move exactly one unit per event: the serial
     // count must equal the movement's magnitude (400 otherwise — the api
@@ -643,12 +646,12 @@ export class StockAdjustmentCommand {
             targetType: 'stock_adjustment_pending',
             targetId: pendingId,
             reference: idempotencyKey,
-            // Story 3-2b — the server's clock (the 9-3a rule, guide §1 step
-            // 10), not the request's business time: a handheld op replayed
-            // minutes after it was confirmed must still order on the trail as
-            // the moment the server recorded it. On the web the two coincide
-            // (an absent occurredAt defaulted to the commit clock).
-            occurredAt: nowIso(),
+            // Story 3-2b — on the HANDHELD the server's clock (the 9-3a
+            // rule, guide §1 step 10): a queued op replayed minutes after it
+            // was confirmed must order on the trail as the moment the server
+            // recorded it. The web keeps the request's business time, as
+            // before 3-2b (code review).
+            occurredAt: auditOccurredAt,
           });
 
           // Functional entry (Epic 9 surfaces the notification): the Owner
@@ -669,6 +672,9 @@ export class StockAdjustmentCommand {
               requestedBy: command.actorUserId,
               requestedAt,
               thresholdQuantity: threshold,
+              // Story 3-2b — why it pended (additive): `threshold` or
+              // `approval-required` (a request-only holder's adjustment).
+              pendReason,
               notifyRole: 'owner',
             },
           });
@@ -725,8 +731,8 @@ export class StockAdjustmentCommand {
           // aggregate snapshot carries null id/seq — retro A4).
           targetId: firstEventId,
           reference: idempotencyKey,
-          // Story 3-2b — the server's clock (see the pend arm above).
-          occurredAt: nowIso(),
+          // Story 3-2b — the server's clock on the handheld (see the pend arm).
+          occurredAt: auditOccurredAt,
         });
 
         // In-transaction outbox append (AD-7, story outbox-relay) — replaces

@@ -87,7 +87,18 @@ export class AdjustmentSubmission {
 
   async submit(input: AdjustmentSubmissionInput, idempotencyKey: string): Promise<StockAdjustmentResult> {
     // ── 1. normalization + the request shape ──────────────────────────────
-    const arms = normalizeArms(input);
+    // Code review — the handheld has no catch-weight arm (the screen never
+    // offers one, and the review Apply carries none): refuse it rather than
+    // accept a field the replay path would silently drop.
+    if (input.deviceId !== null && (input.handlingUnitIds ?? []).length > 0) {
+      throw new ProblemException(
+        'validation-failed',
+        400,
+        'handlingUnitIds is not accepted from a handheld',
+        'A handheld adjustment carries no handling units — a catch-weight SKU is adjusted by handling unit on the web, not from a device.',
+      );
+    }
+    const arms = normalizeArms(input, input.deviceId !== null);
     const command: AdjustStockCommand = {
       tenantId: input.tenantId,
       actorUserId: input.actorUserId,
@@ -376,13 +387,22 @@ function withPendReason(pending: StockAdjustmentPendingSnapshot): StockAdjustmen
  * the fingerprint, and any identity work; throws nothing): a null batch or
  * serials behaves as absent (never a 500 on a tracked SKU, never a different
  * fingerprint than an omitted field); serial elements are trimmed (the DTO
- * trims too — idempotent) and an empty array is absent. Story 3-2b: a null
- * batch FIELD is absent too (the handheld sends explicit nulls) — before 3-2b
- * a null date was refused 400 by `assertBatchInstant`, so no stored key ever
- * hashed one and no fingerprint changes. The NORMALIZED arms feed both
+ * trims too — idempotent) and an empty array is absent. Story 3-2b: on the
+ * HANDHELD a null batch FIELD is absent too (it sends explicit nulls); the web
+ * keeps its pre-3-2b bytes exactly (see `device`). The NORMALIZED arms feed both
  * `ensureSerials`/`ensureBatches` and the idempotency fingerprint.
  */
-export function normalizeArms(input: Pick<AdjustmentSubmissionInput, 'batch' | 'serials' | 'handlingUnitIds'>): {
+export function normalizeArms(
+  input: Pick<AdjustmentSubmissionInput, 'batch' | 'serials' | 'handlingUnitIds'>,
+  /**
+   * Code review — the null-FIELD normalization applies on the HANDHELD only.
+   * On the web an explicit `batch.overrideReason: null` was hashed (and
+   * accepted on a draw) before 3-2b, so mapping it to absent there would
+   * change a stored key's hash (422 on a retry across the deploy) — pinned by
+   * a golden captured from the pre-3-2b code.
+   */
+  device: boolean,
+): {
   batch: AdjustStockBatch | undefined;
   serials: string[] | undefined;
   handlingUnitIds: string[] | undefined;
@@ -393,9 +413,9 @@ export function normalizeArms(input: Pick<AdjustmentSubmissionInput, 'batch' | '
       ? undefined
       : {
           code: rawBatch.code,
-          mfgDate: rawBatch.mfgDate ?? undefined,
-          expiryDate: rawBatch.expiryDate ?? undefined,
-          overrideReason: rawBatch.overrideReason ?? undefined,
+          mfgDate: device ? (rawBatch.mfgDate ?? undefined) : (rawBatch.mfgDate as string | undefined),
+          expiryDate: device ? (rawBatch.expiryDate ?? undefined) : (rawBatch.expiryDate as string | undefined),
+          overrideReason: device ? (rawBatch.overrideReason ?? undefined) : (rawBatch.overrideReason as string | undefined),
         };
   const trimmed = (input.serials ?? []).map((serial) => serial.trim());
   // Story 10.3: an empty array is absent, exactly as `serials` is — the two

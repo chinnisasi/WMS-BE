@@ -17,6 +17,7 @@ import type {
   RejectedOpStatus,
 } from '../../shared/db/schema';
 import { UUID_RE, uuidv7 } from '../../shared/primitives/ids';
+import { MAX_QUANTITY_BASE } from '../../shared/primitives/quantity';
 import { assertUtcIso, canonicalInstant, nowIso } from '../../shared/primitives/time';
 import { ProblemException, isUniqueViolationOn } from '../../shared/problem-details/problem.exception';
 import { buildPage, decodeCursor } from '../../shared/primitives/pagination';
@@ -1714,6 +1715,13 @@ export class SyncReportCommand {
         if (note.length < 1 || [...note].length > 500) {
           throw storedAdjustInvalid(row.opId, 'note', 'a 1–500 character note');
         }
+        // Code review — the stored payload never met the DTO, so its bounds
+        // are re-asserted here (`StockAdjustmentDto`: |quantityDelta| ≤ the
+        // base ceiling).
+        const delta = payload.quantityDelta as number;
+        if (Math.abs(delta) > MAX_QUANTITY_BASE) {
+          throw storedAdjustInvalid(row.opId, 'quantityDelta', `a quantity of at most ${MAX_QUANTITY_BASE} either way`);
+        }
         const result = await this.adjustments.submit(
           {
             tenantId,
@@ -1809,13 +1817,24 @@ function storedAdjustInvalid(opId: string, field: string, kind: string): Problem
   );
 }
 
-/** Story 3-2b — a stored `stock.adjust` payload's serials: null/absent, or a list of non-empty strings. */
+/**
+ * Story 3-2b — a stored `stock.adjust` payload's serials: null/absent, or at
+ * most 1000 strings of 1–64 characters each once trimmed (the DTO's
+ * `@ArrayMaxSize(1000)`, `@TrimEach()`, `@Length(1, 64)`).
+ */
 function storedAdjustSerials(raw: unknown, opId: string): string[] | null {
   if (raw === undefined || raw === null) return null;
-  if (!Array.isArray(raw) || raw.some((serial) => typeof serial !== 'string' || serial.trim() === '')) {
-    throw storedAdjustInvalid(opId, 'serials', 'a list of serial numbers or null');
+  if (!Array.isArray(raw) || raw.length > 1000) {
+    throw storedAdjustInvalid(opId, 'serials', 'a list of at most 1000 serial numbers, or null');
   }
-  return raw as string[];
+  const trimmed: string[] = [];
+  for (const serial of raw as unknown[]) {
+    if (typeof serial !== 'string' || serial.trim().length < 1 || [...serial.trim()].length > 64) {
+      throw storedAdjustInvalid(opId, 'serials', 'serial numbers of 1–64 characters');
+    }
+    trimmed.push(serial.trim());
+  }
+  return trimmed;
 }
 
 /**
@@ -1830,15 +1849,30 @@ function storedAdjustBatch(raw: unknown, opId: string): AdjustmentBatchInput | n
     throw storedAdjustInvalid(opId, 'batch', 'a batch object or null');
   }
   const { code, mfgDate, expiryDate, overrideReason } = raw as Record<string, unknown>;
-  const optionalText = (value: unknown): boolean => value === undefined || value === null || typeof value === 'string';
-  if (typeof code !== 'string' || code.trim() === '' || !optionalText(mfgDate) || !optionalText(expiryDate) || !optionalText(overrideReason)) {
-    throw storedAdjustInvalid(opId, 'batch', 'a batch object { code, mfgDate?, expiryDate?, overrideReason? }');
+  // The DTO's bounds (`BatchInputDto`): code 1–64 trimmed, dates 20–35
+  // characters (trimmed here), override reason 1–200 trimmed — code points.
+  const codePoints = (value: string): number => [...value].length;
+  if (typeof code !== 'string' || code.trim() === '' || codePoints(code.trim()) > 64) {
+    throw storedAdjustInvalid(opId, 'batch.code', 'a batch code of 1–64 characters');
   }
-  const reason = typeof overrideReason === 'string' && overrideReason.trim() !== '' ? overrideReason.trim() : null;
+  const date = (value: unknown, field: 'batch.mfgDate' | 'batch.expiryDate'): string | null => {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== 'string' || value.trim().length < 20 || value.trim().length > 35) {
+      throw storedAdjustInvalid(opId, field, 'a Z-suffixed ISO-8601 instant or null');
+    }
+    return value.trim();
+  };
+  let reason: string | null = null;
+  if (overrideReason !== undefined && overrideReason !== null) {
+    if (typeof overrideReason !== 'string' || overrideReason.trim() === '' || codePoints(overrideReason.trim()) > 200) {
+      throw storedAdjustInvalid(opId, 'batch.overrideReason', 'an override reason of 1–200 characters, or null');
+    }
+    reason = overrideReason.trim();
+  }
   return {
     code: code.trim(),
-    mfgDate: (mfgDate ?? null) as string | null,
-    expiryDate: (expiryDate ?? null) as string | null,
+    mfgDate: date(mfgDate, 'batch.mfgDate'),
+    expiryDate: date(expiryDate, 'batch.expiryDate'),
     overrideReason: reason,
   };
 }

@@ -9,7 +9,7 @@ import type { StockAdjustmentCommand } from '../src/modules/inventory/inventory.
 import { ADJUSTMENT_REASON_CODES, ADJUSTMENT_REASON_LABELS } from '../src/modules/inventory/adjustment-reason';
 import { ADJUSTMENT_PEND_REASONS } from '../src/shared/db/schema';
 import { hashCommandPayload } from '../src/modules/tenancy/idempotency-guard';
-import { AdjustmentSubmission } from '../src/modules/tenancy/adjustment-submission';
+import { AdjustmentSubmission, normalizeArms } from '../src/modules/tenancy/adjustment-submission';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 import { expectAuditRow, seededIdempotencyKey } from './support/audit-guard';
 import { testAddress } from './support/shipment-address';
@@ -308,6 +308,27 @@ describe('handheld stock adjustment (e2e, story 3-2b)', () => {
     }
   });
 
+  it('code review: a web batch with an explicit overrideReason null keeps its pre-3-2b hash (golden from e3f881d); the handheld normalises it', () => {
+    const base = {
+      tenantId: '01900000-0000-7000-8000-0000000000a1',
+      actorUserId: '01900000-0000-7000-8000-0000000000e1',
+      warehouseId: '01900000-0000-7000-8000-0000000000b1',
+      skuId: '01900000-0000-7000-8000-0000000000c1',
+      binId: '01900000-0000-7000-8000-0000000000d1',
+      quantityDelta: -2,
+      reasonCode: 'expired',
+      note: 'L2 expired',
+    };
+    const input = { batch: { code: 'L2', overrideReason: null } };
+    const facade = app.get(InventoryFacade);
+    // Captured by running the pre-3-2b controller's normalizeArms and
+    // fingerprint (baseline e3f881de53cd7728c4ca43b25752de85063d610b).
+    const golden = '9c42fe96a50b418e3fa86ff1b78ebb7c6a5eeebdb55c2e5ccba3e3373d8b2bad';
+    expect(facade.adjustmentFingerprint({ ...base, batch: normalizeArms(input, false).batch })).toBe(golden);
+    // On the handheld a null field is absent — a different (device-only) shape.
+    expect(facade.adjustmentFingerprint({ ...base, batch: normalizeArms(input, true).batch })).not.toBe(golden);
+  });
+
   it('A8: the stored hashes, key by key — the web shape unchanged, the device shape led by surface + deviceId', async () => {
     const webKey = ulid();
     await webAdjust(opsToken, { skuId: sku(PLAIN), binId: bin('A-04'), quantityDelta: 1, reasonCode: 'found', note: 'golden web' }, webKey).expect(201);
@@ -381,11 +402,35 @@ describe('handheld stock adjustment (e2e, story 3-2b)', () => {
 
   it('manager on a device, small: 201 applied, a stock.adjusted event whose actor is the badge-in manager', async () => {
     const key = ulid();
+    await sql`update devices set last_seen_at = null where id = ${managerDeviceId}`;
     const res = await deviceAdjust(deviceBody({ binId: bin('A-05'), quantityDelta: 3, reasonCode: 'found', note: 'three found' }), managerDeviceToken, key).expect(201);
     expect(res.body.event).toMatchObject({ type: 'stock.adjusted', quantityDelta: 3 });
     const event = (await sql<{ actor_user_id: string }[]>`select actor_user_id from ledger_events where id = ${res.body.event.id as string}`)[0]!;
     expect(event.actor_user_id).toBe(opsUserId);
     await expectAuditRow({ tenantId, key, action: 'stock_adjustment.recorded', targetType: 'ledger_event', targetId: res.body.event.id as string, actorUserId: opsUserId });
+    // The applied arm stamps the device heartbeat too.
+    const seen = await sql<{ last_seen_at: string | null }[]>`select last_seen_at from devices where id = ${managerDeviceId}`;
+    expect(seen[0]!.last_seen_at).not.toBeNull();
+  });
+
+  it('code review: the audit row\'s time — the business time on the web (as before 3-2b), the server clock on the handheld', async () => {
+    const webKey = ulid();
+    const businessTime = new Date(Date.now() - 2 * 3600_000).toISOString();
+    const web = await webAdjust(opsToken, { skuId: sku(PLAIN), binId: bin('A-05'), quantityDelta: 1, reasonCode: 'found', note: 'web business time', occurredAt: businessTime }, webKey).expect(201);
+    const webAudit = (await sql<{ occurred_at: Date }[]>`select occurred_at from audit_events where tenant_id = ${tenantId} and reference = ${webKey}`)[0]!;
+    expect(new Date(webAudit.occurred_at).toISOString()).toBe(businessTime);
+    expect(web.body.event.occurredAt).toBe(businessTime);
+
+    const deviceKey = ulid();
+    await deviceAdjust(deviceBody({ binId: bin('A-05'), quantityDelta: 1, reasonCode: 'found', note: 'device business time', occurredAt: businessTime }), managerDeviceToken, deviceKey).expect(201);
+    const deviceAudit = (await sql<{ occurred_at: Date }[]>`select occurred_at from audit_events where tenant_id = ${tenantId} and reference = ${deviceKey}`)[0]!;
+    expect(Math.abs(new Date(deviceAudit.occurred_at).getTime() - Date.now())).toBeLessThan(60_000);
+  });
+
+  it('code review: handlingUnitIds from a handheld are refused 400 (the review Apply could not carry them)', async () => {
+    const res = await deviceAdjust(deviceBody({ quantityDelta: -1, handlingUnitIds: ['01900000-0000-7000-8000-00000000aa01'] }), managerDeviceToken).expect(400);
+    expect(res.body.code).toBe('validation-failed');
+    expect(res.body.detail).toMatch(/handling units/);
   });
 
   it('the handheld\'s explicit nulls inside the batch arm read as absent: a manager\'s batch Add applies with no dates', async () => {
@@ -405,9 +450,15 @@ describe('handheld stock adjustment (e2e, story 3-2b)', () => {
     expect(lot.expiry_date).toBeNull();
   });
 
-  it('no badge-in: a bare device enrollment credential is 401 unauthenticated', async () => {
+  it('no badge-in: a bare device enrollment credential is 401 unauthenticated — even without an Idempotency-Key', async () => {
     const res = await deviceAdjust(deviceBody({ quantityDelta: -1 }), bareDeviceToken).expect(401);
     expect(res.body.code).toBe('unauthenticated');
+    const noKey = await http()
+      .post(`${API}/${tenantId}/inventory/adjustments`)
+      .set('Authorization', `Bearer ${bareDeviceToken}`)
+      .send(deviceBody({ quantityDelta: -1 }))
+      .expect(401);
+    expect(noKey.body.code).toBe('unauthenticated');
   });
 
   it('operator mismatch: X-Op-Operator naming another user is 409 operator-mismatch', async () => {
@@ -452,6 +503,15 @@ describe('handheld stock adjustment (e2e, story 3-2b)', () => {
     const pended = await webAdjust(operatorToken, pendBody, pendKey).expect(202);
     const replayed = await webAdjust(opsToken, pendBody, pendKey).expect(202);
     expect(replayed.body).toEqual(pended.body);
+  });
+
+  it('A4 on a batch-tracked SKU: an applied explicit-batch draw replayed by a request-only holder is 403 naming stock.adjust', async () => {
+    const key = ulid();
+    const body = { skuId: sku(BATCH), binId: bin('A-02'), quantityDelta: -1, reasonCode: 'damaged', note: 'a4 batch', batch: { code: 'NEW', overrideReason: 'the crushed lot' } };
+    await webAdjust(opsToken, body, key).expect(201);
+    const denied = await webAdjust(operatorToken, body, key).expect(403);
+    expect(denied.body.code).toBe('role-denied');
+    expect(denied.body.detail).toContain('stock.adjust');
   });
 
   it('A7: a 202 stored before 3-2b (no pendReason) replays with pendReason threshold', async () => {
@@ -655,6 +715,32 @@ describe('handheld stock adjustment (e2e, story 3-2b)', () => {
       .expect(200);
     expect(discarded.body.rejectedOp.status).toBe('discarded');
     expect(await count('stock_adjustment_pendings', '')).toBe(pends);
+
+    // Code review — the stored payload's DTO bounds: each refuses 400
+    // `validation-failed` before any write, and the row stays open.
+    for (const [label, extra] of [
+      ['a blank note', { note: '   ' }],
+      ['a batch that is a string', { batch: 'L1' }],
+      ['an empty batch code', { batch: { code: '' } }],
+      ['a non-string serial', { serials: [1] }],
+      ['a 65-character serial', { serials: ['S'.repeat(65)] }],
+    ] as const) {
+      const malformed = row(deviceBody({ quantityDelta: -1, ...extra }));
+      await upload(malformed).expect(201);
+      const open = ((await http().get(`${API}/${tenantId}/rejected-ops?status=open`).set('Authorization', `Bearer ${ownerToken}`).expect(200)).body.items as { id: string; opId: string }[]).find(
+        (item) => item.opId === malformed.opId,
+      )!;
+      const [pendsBefore, eventsBefore] = [await count('stock_adjustment_pendings', ''), await count('ledger_events', '')];
+      const refused = await http()
+        .post(`${API}/${tenantId}/rejected-ops/${open.id}/resolve`)
+        .set('Authorization', `Bearer ${ownerToken}`)
+        .set(KEY_HEADER, ulid())
+        .send({ decision: 'apply' });
+      expect([label, refused.status, refused.body.code]).toEqual([label, 400, 'validation-failed']);
+      expect([label, await count('stock_adjustment_pendings', ''), await count('ledger_events', '')]).toEqual([label, pendsBefore, eventsBefore]);
+      const still = (await sql<{ status: string }[]>`select status from rejected_ops where id = ${open.id}`)[0]!;
+      expect([label, still.status]).toEqual([label, 'open']);
+    }
   });
 
   it('A2: a revoked device is refused BEFORE composition — no batch identity is minted', async () => {
@@ -686,6 +772,22 @@ describe('handheld stock adjustment (e2e, story 3-2b)', () => {
       ),
     ).rejects.toMatchObject({ response: { code: 'device-revoked' } });
     expect(await count('batches', "and code = 'REVOKED-LOT'")).toBe(batches);
+  });
+
+  it('A2 through HTTP: a revoked device\'s armed adjustment is refused before composition — no batch minted', async () => {
+    const revoked = await enrollAndBadgeIn('adjust-suite revoked-http handheld', operatorEmail);
+    await http()
+      .post(`${API}/${tenantId}/devices/${revoked.deviceId}/revoke`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .set(KEY_HEADER, ulid())
+      .expect(200);
+    const before = await count('batches', "and code = 'REVOKED-HTTP-LOT'");
+    const res = await deviceAdjust(
+      deviceBody({ skuId: sku(BATCH), binId: bin('A-02'), quantityDelta: 1, reasonCode: 'found', note: 'revoked', batch: { code: 'REVOKED-HTTP-LOT', mfgDate: null, expiryDate: null, overrideReason: null } }),
+      revoked.token,
+    );
+    expect([res.status, res.body.code]).toEqual([403, 'device-revoked']);
+    expect(await count('batches', "and code = 'REVOKED-HTTP-LOT'")).toBe(before);
   });
 
   it('the snapshot carries the adjustment reasons with their labels, in vocabulary order', async () => {

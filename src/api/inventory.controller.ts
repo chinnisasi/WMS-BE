@@ -122,10 +122,15 @@ export class InventoryController {
     @Res({ passthrough: true }) res: Response,
   ): Promise<StockAdjustmentResponse | StockAdjustmentPendingResponse> {
     assertOwnTenant(session.session, tenantId);
-    const key = parseRequiredIdempotencyKey(idempotencyKey);
     // Story 3-2b — the device arm is badge-in required (a bare enrollment
     // credential carries no operator); X-Op-Operator was checked by the
     // guard. The actor is the badge-in operator; the device rides the command.
+    // The badge-in check precedes the header parse (code review): a bare
+    // credential is 401 whatever else the request lacks.
+    if (session.family === 'device' && session.session.userId === null) {
+      throw badgeInRequired();
+    }
+    const key = parseRequiredIdempotencyKey(idempotencyKey);
     let actorUserId: string;
     let deviceId: string | null;
     if (session.family === 'device') {
