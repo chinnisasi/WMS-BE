@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { sql } from 'drizzle-orm';
+import { sql, type SQL } from 'drizzle-orm';
 import type { Database } from '../shared/db/db';
 import { AUTH_DATABASE, DATABASE } from '../shared/db/tokens';
 import { settleBefore } from '../shared/lifecycle/shutdown';
@@ -105,6 +105,19 @@ async function bounded<T>(work: Promise<T>): Promise<T> {
   return value as T;
 }
 
+/**
+ * Code review C3 — a probe query runs in its own transaction under
+ * `SET LOCAL statement_timeout` equal to the check's bound, so a hung probe
+ * is CANCELLED by the server rather than left running on the request pool
+ * when `bounded()` stops waiting for it (repeated probes would pile up).
+ */
+function probe(db: Database, query: SQL): Promise<unknown> {
+  return db.transaction(async (tx) => {
+    await tx.execute(sql.raw(`set local statement_timeout = ${READINESS_CHECK_TIMEOUT_MS}`));
+    return tx.execute(query);
+  });
+}
+
 @Injectable()
 export class ReadinessService {
   private readonly logger = new Logger('Readiness');
@@ -132,14 +145,10 @@ export class ReadinessService {
     };
 
     const [database, authDatabase, valkey, applied] = await Promise.allSettled([
-      bounded(this.db.execute(sql`select 1`)),
-      bounded(this.authDb.execute(sql`select 1`)),
+      bounded(probe(this.db, sql`select 1`)),
+      bounded(probe(this.authDb, sql`select 1`)),
       bounded(this.valkey.ping()),
-      bounded(
-        this.db.execute(sql`select max(created_at)::text as applied from drizzle.__drizzle_migrations`) as Promise<
-          unknown
-        >,
-      ),
+      bounded(probe(this.db, sql`select max(created_at)::text as applied from drizzle.__drizzle_migrations`)),
     ]);
     if (database.status === 'rejected') note('database', database.reason);
     if (authDatabase.status === 'rejected') note('auth-database', authDatabase.reason);

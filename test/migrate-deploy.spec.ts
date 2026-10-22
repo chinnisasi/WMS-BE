@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import postgres from 'postgres';
 import {
   IF_NOT_EXISTS_LINT_FROM,
@@ -10,6 +11,8 @@ import {
   migrateDeploy,
   parseCreateIndex,
   planMigrations,
+  normalizeIndexDefinition,
+  parseCliArgs,
   splitStatements,
   stripSqlComments,
   type MigrateDeployOptions,
@@ -215,6 +218,136 @@ describe('the guarded deploy migrator (story 6-2a)', () => {
       expect(finding).toMatchObject({ kind: 'rebuilt-in-pending', refused: true, concurrently: null });
     });
 
+    it('C8: unnamed ADD UNIQUE / PRIMARY KEY / EXCLUDE and an ADD COLUMN … UNIQUE are unparsed and refused on a large table', async () => {
+      const findings = await planMigrations(
+        [
+          {
+            tag: '0001_x',
+            statements: [
+              'ALTER TABLE "big" ADD UNIQUE ("x")',
+              'ALTER TABLE "big" ADD PRIMARY KEY ("id")',
+              'ALTER TABLE "big" ADD EXCLUDE USING gist ("r" WITH &&)',
+              'ALTER TABLE "big" ADD COLUMN "code" text UNIQUE',
+              'ALTER TABLE "big" ADD COLUMN IF NOT EXISTS "k" uuid PRIMARY KEY',
+              // Not a key: no finding.
+              'ALTER TABLE "big" ADD COLUMN "note" text',
+              'ALTER TABLE "big" ADD CONSTRAINT "big_x_check" CHECK ("x" > 0)',
+            ],
+          },
+        ],
+        stub(),
+        THRESHOLDS,
+      );
+      expect(findings.map((f) => [f.kind, f.refused])).toEqual([
+        ['unparsed', true],
+        ['unparsed', true],
+        ['unparsed', true],
+        ['unparsed', true],
+        ['unparsed', true],
+      ]);
+    });
+
+    it('C9: the same name on the same table with ANOTHER definition is a name collision; the same definition is prebuilt', async () => {
+      const onBig = (definition: string): PlanInspector =>
+        stub({ index: async () => ({ exists: true, valid: true, onTable: { schema: 'public', table: 'big' }, definition }) });
+      const pending = [{ tag: '0001_x', statements: ['CREATE INDEX IF NOT EXISTS "n" ON "big" USING btree ("x","y")'] }];
+      const [same] = await planMigrations(pending, onBig('CREATE INDEX n ON public.big USING btree (x, y)'), THRESHOLDS);
+      expect(same).toMatchObject({ kind: 'prebuilt', refused: false });
+      const [other] = await planMigrations(pending, onBig('CREATE INDEX n ON public.big USING btree (y, x)'), THRESHOLDS);
+      expect(other).toMatchObject({ kind: 'name-collision', refused: true });
+      expect(other!.advice).toContain('different definition');
+    });
+
+    it('C10: a multi-name or schema-qualified DROP INDEX is tracked — each re-create is refused', async () => {
+      const findings = await planMigrations(
+        [
+          {
+            tag: '0001_x',
+            statements: [
+              'DROP INDEX IF EXISTS "a", "public"."b" CASCADE;',
+              'CREATE INDEX IF NOT EXISTS "a" ON "big" ("x")',
+              'CREATE INDEX IF NOT EXISTS "b" ON "big" ("y")',
+            ],
+          },
+        ],
+        stub({ index: async () => ({ exists: true, valid: true, onTable: { schema: 'public', table: 'big' } }) }),
+        THRESHOLDS,
+      );
+      expect(findings.map((f) => [f.index, f.kind])).toEqual([
+        ['a', 'rebuilt-in-pending'],
+        ['b', 'rebuilt-in-pending'],
+      ]);
+    });
+
+    it('C11: an index on a table renamed in the pending set is pre-built against the CURRENT name, and its ownership checked there', async () => {
+      const pending = [
+        {
+          tag: '0001_x',
+          statements: ['ALTER TABLE "vendors" RENAME TO "business_partners";', 'CREATE INDEX IF NOT EXISTS "bp_x" ON "business_partners" ("x")'],
+        },
+      ];
+      const estimate = async (name: { table: string }) => (name.table === 'vendors' ? big : null);
+      const [missing] = await planMigrations(pending, stub({ estimate }), THRESHOLDS);
+      expect(missing!.concurrently).toBe('CREATE INDEX CONCURRENTLY IF NOT EXISTS "bp_x" ON "vendors" ("x");');
+      const [prebuilt] = await planMigrations(
+        pending,
+        stub({
+          estimate,
+          index: async (schema, name) => {
+            expect([schema, name]).toEqual(['public', 'bp_x']);
+            return { exists: true, valid: true, onTable: { schema: 'public', table: 'vendors' }, definition: 'CREATE INDEX bp_x ON public.vendors USING btree (x)' };
+          },
+        }),
+        THRESHOLDS,
+      );
+      expect(prebuilt).toMatchObject({ kind: 'prebuilt', refused: false });
+    });
+
+    it('C12: CREATE TABLE IF NOT EXISTS over an existing large table creates nothing — its indexes are still judged', async () => {
+      const [finding] = await planMigrations(
+        [{ tag: '0001_x', statements: ['CREATE TABLE IF NOT EXISTS "big" ("id" int)', 'CREATE INDEX IF NOT EXISTS "n" ON "big" ("id")'] }],
+        stub(),
+        THRESHOLDS,
+      );
+      expect(finding).toMatchObject({ kind: 'prebuild-required', refused: true });
+      // A table that does not exist yet IS created by the same statement.
+      const [fresh] = await planMigrations(
+        [{ tag: '0001_x', statements: ['CREATE TABLE IF NOT EXISTS "new_t" ("id" int)', 'CREATE INDEX IF NOT EXISTS "n" ON "new_t" ("id")'] }],
+        stub({ estimate: async () => null }),
+        THRESHOLDS,
+      );
+      expect(fresh).toMatchObject({ kind: 'new-table', refused: false });
+    });
+
+    it('C14: keywords after ON (ON CONFLICT, ON DELETE) are not tables; a DO block naming nothing that resolves falls back to "any large table"', async () => {
+      const block = {
+        tag: '0001_x',
+        statements: [
+          `DO $$ BEGIN INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING; EXECUTE 'CREATE INDEX n ON ' || 'big (x)'; END $$`,
+        ],
+      };
+      const seen: string[] = [];
+      const [finding] = await planMigrations(
+        [block],
+        stub({
+          estimate: async (name) => {
+            seen.push(name.table);
+            return null;
+          },
+          anyLargeTable: async () => true,
+        }),
+        THRESHOLDS,
+      );
+      expect(seen).not.toContain('conflict');
+      expect(finding).toMatchObject({ kind: 'unparsed', refused: true });
+    });
+
+    it('C15: the CLI takes named acceptances only — a bare --allow-locking is an error', () => {
+      expect(parseCliArgs(['--dry-run', '--allow-locking=a_idx,0078'])).toEqual({ dryRun: true, allowLocking: ['a_idx', '0078'] });
+      expect(() => parseCliArgs(['--allow-locking'])).toThrow('Unknown argument');
+      expect(() => parseCliArgs(['--allow-locking='])).toThrow('at least one');
+    });
+
     it('a table renamed earlier in the pending set is judged by the original table\'s size (0079\'s vendors → business_partners)', async () => {
       const seen: string[] = [];
       const [finding] = await planMigrations(
@@ -282,6 +415,43 @@ describe('the guarded deploy migrator (story 6-2a)', () => {
       try {
         const [row] = await sql<{ present: boolean }[]>`select to_regclass('drizzle.__drizzle_migrations') is not null as present`;
         expect(row!.present).toBe(false);
+      } finally {
+        await sql.end();
+      }
+    });
+
+    it('C9 has no false positive on the repo: applied, every index each migration last defines normalizes equal to the server\'s pg_get_indexdef', async () => {
+      const url = withDatabase(BASE_URL, FRESH);
+      expect((await migrateDeploy({ url, migrationsFolder: join(__dirname, '..', 'drizzle'), log: () => undefined })).outcome).toBe('applied');
+      const folder = join(__dirname, '..', 'drizzle');
+      const lastDefinition = new Map<string, string>();
+      for (const file of readdirSync(folder).filter((name) => /^\d{4}_.*\.sql$/.test(name)).sort()) {
+        for (const statement of splitStatements(readFileSync(join(folder, file), 'utf8'))) {
+          const parsed = parseCreateIndex(statement);
+          if (parsed !== null) lastDefinition.set(parsed.name, statement);
+        }
+      }
+      const sql = postgres(url, { max: 1, onnotice: () => undefined });
+      try {
+        const rows = await sql<{ name: string; def: string }[]>`
+          select c.relname as name, pg_get_indexdef(c.oid) as def
+          from pg_class c join pg_namespace n on n.oid = c.relnamespace
+          where c.relkind = 'i' and n.nspname = 'public'`;
+        const server = new Map(rows.map((row) => [row.name, row.def]));
+        const compared: string[] = [];
+        const mismatched: string[] = [];
+        for (const [name, statement] of lastDefinition) {
+          const def = server.get(name);
+          if (def === undefined) continue; // dropped or renamed later
+          const parsed = parseCreateIndex(statement)!;
+          if (!def.includes(` ON public.${parsed.table.table} `) && !def.includes(` ON ONLY public.${parsed.table.table} `)) continue; // its table was renamed since
+          compared.push(name);
+          if (normalizeIndexDefinition(def) !== normalizeIndexDefinition(statement)) {
+            mismatched.push(`${name}\n  migration: ${normalizeIndexDefinition(statement)}\n  server:    ${normalizeIndexDefinition(def)}`);
+          }
+        }
+        expect(compared.length).toBeGreaterThan(200);
+        expect(mismatched).toEqual([]);
       } finally {
         await sql.end();
       }
@@ -394,7 +564,7 @@ describe('the guarded deploy migrator (story 6-2a)', () => {
       expect(await indexValid('big_y_unique')).toBe(true);
     });
 
-    it('a plain CREATE INDEX (no IF NOT EXISTS) on a large table: refused — rewrite the migration; --allow-locking proceeds, logged', async () => {
+    it('a plain CREATE INDEX (no IF NOT EXISTS) on a large table: refused — rewrite the migration; --allow-locking=<that index> proceeds, logged; naming another does not (C15)', async () => {
       const before = await appliedCount();
       folder.add('big_plain', ['CREATE INDEX "big_xy_idx" ON "big" ("x","y")']);
       const refused = await run();
@@ -403,10 +573,15 @@ describe('the guarded deploy migrator (story 6-2a)', () => {
       expect(refused.findings[0]!.advice).toContain('Rewrite the migration');
       expect(await appliedCount()).toBe(before);
 
+      // C15: an allowlist that does not name the refusal leaves it refused.
+      const unnamed = await run({ allowLocking: ['some_other_idx', '0001_other'] });
+      expect(unnamed.outcome).toBe('refused');
+      expect(await appliedCount()).toBe(before);
+
       lines.length = 0;
-      const forced = await run({ allowLocking: true });
+      const forced = await run({ allowLocking: ['big_xy_idx'] });
       expect(forced.outcome).toBe('applied');
-      expect(lines.join('\n')).toContain('--allow-locking: proceeding past 1 refusal(s)');
+      expect(lines.join('\n')).toContain('--allow-locking: accepting big_xy_idx');
       expect(await indexValid('big_xy_idx')).toBe(true);
     });
 
@@ -421,6 +596,50 @@ describe('the guarded deploy migrator (story 6-2a)', () => {
       expect(small.findings[0]).toMatchObject({ kind: 'small-table', refused: false });
       await sql.unsafe(refused.findings[0]!.concurrently!);
       expect((await run()).outcome).toBe('applied');
+    });
+
+    it('C13: a partitioned parent is judged by the sum of its partitions, not its own empty heap', async () => {
+      await sql.unsafe(`create table "parted" ("id" int, "x" int) partition by range ("id")`);
+      await sql.unsafe(`create table "parted_a" partition of "parted" for values from (0) to (3000)`);
+      await sql.unsafe(`create table "parted_b" partition of "parted" for values from (3000) to (10000)`);
+      await sql`insert into parted select g, g from generate_series(1, 5000) g`;
+      await sql`analyze parted_a`;
+      await sql`analyze parted_b`;
+      folder.add('parted_index', ['CREATE INDEX IF NOT EXISTS "parted_x_idx" ON "parted" ("x")']);
+      const result = await run({ dryRun: true });
+      expect(result.findings).toMatchObject([{ kind: 'prebuild-required', refused: true }]);
+      expect(result.findings[0]!.estimate!.reltuples).toBeGreaterThanOrEqual(THRESHOLDS.rows);
+      // Accept it by name so the later cases start from nothing pending.
+      expect((await run({ allowLocking: ['parted_x_idx'] })).outcome).toBe('applied');
+    });
+
+    it('C24: the CLI exits 2 on a refusal (and on a dry run that would refuse), 1 on a bare --allow-locking, 0 once accepted', () => {
+      folder.add('cli_index', ['CREATE INDEX IF NOT EXISTS "big_cli_idx" ON "big" ("y","x")']);
+      const cli = (...args: string[]) =>
+        spawnSync('bun', ['src/shared/db/migrate-deploy.ts', `--migrations-folder=${folder.path}`, ...args], {
+          cwd: join(__dirname, '..'),
+          env: { ...process.env, DATABASE_URL: url, MIGRATE_LARGE_TABLE_ROWS: String(THRESHOLDS.rows), MIGRATE_LARGE_TABLE_BYTES: String(THRESHOLDS.bytes) },
+          encoding: 'utf8',
+        });
+      const refused = cli();
+      expect(refused.status).toBe(2);
+      expect(refused.stdout).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS "big_cli_idx" ON "big" ("y","x");');
+      expect(refused.stdout).toContain('--allow-locking=big_cli_idx');
+      expect(cli('--dry-run').status).toBe(2);
+      expect(cli('--allow-locking').status).toBe(1);
+      expect(cli('--dry-run', '--allow-locking=big_cli_idx').status).toBe(0);
+      expect(cli('--allow-locking=big_cli_idx').status).toBe(0);
+      expect(cli().status).toBe(0); // up to date
+    });
+
+    it('C2/C24: the provisioning CLI refuses to run in production without both role passwords (exit 1, before connecting)', () => {
+      const result = spawnSync('bun', ['src/shared/db/provision-roles.ts'], {
+        cwd: join(__dirname, '..'),
+        env: { ...process.env, DATABASE_URL: 'postgres://nobody@127.0.0.1:1/none', NODE_ENV: 'production', WMS_APP_PASSWORD: 'x', WMS_AUTH_PASSWORD: '' },
+        encoding: 'utf8',
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('WMS_AUTH_PASSWORD must be set');
     });
 
     it('two migrators: the second waits on the lock, and nothing is applied twice', async () => {

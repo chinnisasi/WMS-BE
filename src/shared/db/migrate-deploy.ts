@@ -1,7 +1,7 @@
 /**
  * Story 6-2a — the guarded deploy migrator (decision 7, amendments A3–A6):
  *
- *   bun run db:migrate:deploy [--dry-run] [--allow-locking]
+ *   bun run db:migrate:deploy [--dry-run] [--allow-locking=<index-or-migration>[,…]]
  *
  * `db:migrate` (dev and the tests' template build) is unchanged; this is the
  * one a deploy runs, as the migrating owner, before any new task starts.
@@ -39,8 +39,10 @@
  *      parser cannot read is "unparsed, review" — refused when it can touch a
  *      large existing table (or names no table and the database holds one).
  *      Tables created earlier in the pending set are excluded throughout;
- *   4. `--dry-run` prints that plan and changes nothing; `--allow-locking`
- *      proceeds past the refusals (logged);
+ *   4. `--dry-run` prints that plan and changes nothing;
+ *      `--allow-locking=<index-name-or-migration-tag>[,…]` accepts exactly
+ *      the refusals it names (code review C15 — a refusal it does not name
+ *      stays refused), logged;
  *   5. then run drizzle's own `migrate()`, unchanged.
  *
  * Every connection carries `lock_timeout` (`MIGRATE_LOCK_TIMEOUT_MS`,
@@ -61,7 +63,9 @@ import postgres from 'postgres';
 
 export const DEFAULT_LARGE_TABLE_ROWS = 100_000;
 export const DEFAULT_LARGE_TABLE_BYTES = 64 * 1024 * 1024;
-export const DEFAULT_LOCK_TIMEOUT_MS = 15_000;
+// Code review C16: a waiting DDL statement queues every later lock request on
+// its table behind it for as long as it waits, so the wait is kept short.
+export const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
 export const DEFAULT_STATEMENT_TIMEOUT_MS = 600_000;
 export const DEFAULT_ADVISORY_WAIT_MS = 600_000;
 
@@ -82,18 +86,25 @@ const CREATE_INDEX = new RegExp(
 const CREATE_INDEX_PREFIX = /^CREATE\s+(UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?/i;
 const MENTIONS_CREATE_INDEX = /\bCREATE\s+(?:UNIQUE\s+)?INDEX\b/i;
 const CREATE_TABLE = new RegExp(
-  String.raw`^CREATE\s+(?:(?:GLOBAL\s+|LOCAL\s+)?(?:TEMP|TEMPORARY)\s+|UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(${QUALIFIED})`,
+  String.raw`^CREATE\s+(?:(?:GLOBAL\s+|LOCAL\s+)?(?:TEMP|TEMPORARY)\s+|UNLOGGED\s+)?TABLE\s+(IF\s+NOT\s+EXISTS\s+)?(${QUALIFIED})`,
   'i',
 );
 const RENAME_TABLE = new RegExp(
   String.raw`^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(${QUALIFIED})\s+RENAME\s+TO\s+(${IDENT})\s*;?$`,
   'i',
 );
+// Code review C10: a name LIST, each name optionally schema-qualified.
 const DROP_INDEX = new RegExp(
-  String.raw`^DROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?(${QUALIFIED})\s*(?:CASCADE|RESTRICT)?\s*;?$`,
+  String.raw`^DROP\s+INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+EXISTS\s+)?(${QUALIFIED}(?:\s*,\s*${QUALIFIED})*)\s*(?:CASCADE|RESTRICT)?\s*;?$`,
   'i',
 );
-const ADD_KEY_CONSTRAINT = /\bADD\s+CONSTRAINT\s+\S+\s+(?:UNIQUE|PRIMARY\s+KEY)\b/i;
+// Code review C8: a key or exclusion constraint builds an index whether it is
+// named or not (`ADD UNIQUE (…)`, `ADD PRIMARY KEY`, `ADD EXCLUDE`), and so
+// does a column declared `UNIQUE` / `PRIMARY KEY` in `ADD COLUMN`.
+const ADD_KEY_CONSTRAINT = /\bADD\s+(?:CONSTRAINT\s+\S+\s+)?(?:UNIQUE|PRIMARY\s+KEY|EXCLUDE)\b/i;
+const ADD_KEY_COLUMN = /\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?!CONSTRAINT\b)\S+\s+[^,;]*?\b(?:UNIQUE|PRIMARY\s+KEY)\b/i;
+// Code review C14: words that follow ON without naming a table.
+const NOT_A_TABLE = new Set(['conflict', 'delete', 'update', 'insert', 'truncate', 'commit', 'schema', 'each', 'database', 'function', 'sequence', 'sequences', 'tables', 'all', 'role']);
 const DO_BLOCK = /^DO\b/i;
 const DYNAMIC_EXECUTE = /\bEXECUTE\s+(?!FUNCTION\b|PROCEDURE\b)/i;
 const CANDIDATE_TABLES = new RegExp(
@@ -117,7 +128,13 @@ export interface TableEstimate {
 /** What `pg_index` says about one index name in a schema. */
 export type IndexState =
   | { readonly exists: false }
-  | { readonly exists: true; readonly valid: boolean; readonly onTable: TableName };
+  | {
+      readonly exists: true;
+      readonly valid: boolean;
+      readonly onTable: TableName;
+      /** `pg_get_indexdef` (code review C9); absent from a stub that does not compare. */
+      readonly definition?: string;
+    };
 
 export interface PlanInspector {
   estimate(table: TableName): Promise<TableEstimate | null>;
@@ -221,10 +238,43 @@ function closingQuote(input: string, start: number, quote: string): number {
 
 /** drizzle's statement split, comments stripped, blanks dropped. */
 export function splitStatements(fileSql: string): string[] {
-  return fileSql
-    .split(BREAKPOINT)
-    .map((part) => stripSqlComments(part).trim())
-    .filter((part) => part.length > 0);
+  return fileSql.split(BREAKPOINT).flatMap(chunkStatements);
+}
+
+/**
+ * One breakpoint chunk → its statements. drizzle sends a chunk whole, and a
+ * hand-written chunk can hold several statements (`…; ALTER TABLE …`), so the
+ * guard splits on every top-level `;` — never inside quotes or a
+ * dollar-quoted body — or a second index build in a chunk would go unjudged
+ * (found by the C9 repo check).
+ */
+export function chunkStatements(chunk: string): string[] {
+  const text = stripSqlComments(chunk);
+  const out: string[] = [];
+  let start = 0;
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i]!;
+    if (ch === "'" || ch === '"') {
+      i = closingQuote(text, i, ch);
+      continue;
+    }
+    if (ch === '$') {
+      const tag = /^\$[A-Za-z_]*\$/.exec(text.slice(i))?.[0];
+      if (tag !== undefined) {
+        const close = text.indexOf(tag, i + tag.length);
+        i = close === -1 ? text.length : close + tag.length;
+        continue;
+      }
+    }
+    if (ch === ';') {
+      out.push(text.slice(start, i + 1));
+      start = i + 1;
+    }
+    i += 1;
+  }
+  out.push(text.slice(start));
+  return out.map((statement) => statement.trim()).filter((statement) => statement !== '' && statement !== ';');
 }
 
 function unquote(ident: string): string {
@@ -287,7 +337,41 @@ function isUnparsed(statement: string): boolean {
   if (parseCreateIndex(statement) !== null) return false;
   if (MENTIONS_CREATE_INDEX.test(statement) && /^CREATE\b/i.test(statement)) return true; // an index statement the parser cannot read
   if ((DO_BLOCK.test(statement) || DYNAMIC_EXECUTE.test(statement)) && /\bINDEX\b/i.test(statement)) return true;
-  return ADD_KEY_CONSTRAINT.test(statement);
+  return ADD_KEY_CONSTRAINT.test(statement) || ADD_KEY_COLUMN.test(statement);
+}
+
+/**
+ * Code review C9 — a definition, normalised so a pending statement and the
+ * server's `pg_get_indexdef` of the same index compare equal: lower-cased,
+ * quotes, `public.`, `IF NOT EXISTS`, `CONCURRENTLY`, `ONLY`, the default
+ * `USING btree`, `::type` casts, parentheses and whitespace dropped.
+ */
+export function normalizeIndexDefinition(definition: string): string {
+  return definition
+    .toLowerCase()
+    .replace(/;\s*$/, '')
+    .replace(/"/g, '')
+    .replace(/\bpublic\./g, '')
+    .replace(/\bif\s+not\s+exists\b/g, ' ')
+    .replace(/\bconcurrently\b/g, ' ')
+    .replace(/\bon\s+only\b/g, 'on')
+    .replace(/\busing\s+btree\b/g, ' ')
+    .replace(/::[a-z_][a-z0-9_ ]*?(?=[\s,)\]]|$)/g, '')
+    // A column qualified by its own table (`t.col`) prints bare — stripped
+    // while the words are still apart.
+    .replace(/(^|[^a-z0-9_])[a-z_][a-z0-9_]*\.(?=[a-z_])/g, '$1')
+    .replace(/[()]/g, '')
+    .replace(/\s+/g, '')
+    // The server's spelling of what a migration may write another way.
+    .replace(/=anyarray\[/g, 'in')
+    .replace(/[[\]]/g, '')
+    .replace(/~~\*/g, 'ilike')
+    .replace(/~~/g, 'like');
+}
+
+/** Rewrites the statement's `ON <table>` target (code review C11: a table renamed in the pending set). */
+function retarget(statement: string, table: TableName): string {
+  return statement.replace(new RegExp(String.raw`\bON\s+(ONLY\s+)?${QUALIFIED}`, 'i'), (_m, only: string | undefined) => `ON ${only ?? ''}${quoted(table)}`);
 }
 
 function isLarge(estimate: TableEstimate, thresholds: Thresholds): boolean {
@@ -322,8 +406,9 @@ export async function planMigrations(
     index: (schema, name) => inspector.index(schema, name),
     anyLargeTable: (t) => inspector.anyLargeTable(t),
   };
-  // Index names a pending statement drops: a re-create under the same name
-  // cannot be pre-built (0078's qc_holds_open_scope_unique).
+  // Index names a pending statement drops, keyed schema.name (C10): a
+  // re-create under the same name cannot be pre-built (0078's
+  // qc_holds_open_scope_unique).
   const dropped = new Set<string>();
   const findings: Finding[] = [];
   let anyLarge: boolean | undefined;
@@ -332,7 +417,11 @@ export async function planMigrations(
     for (const statement of migration.statements) {
       const table = CREATE_TABLE.exec(statement);
       if (table !== null) {
-        created.add(tableKey(splitQualified(table[1]!)));
+        const name = splitQualified(table[2]!);
+        // C12: `IF NOT EXISTS` over a table that already exists creates
+        // nothing — its later indexes are judged against its real size.
+        const exists = table[1] !== undefined && (await view.estimate(name)) !== null;
+        if (!exists) created.add(tableKey(name));
         continue;
       }
 
@@ -347,32 +436,38 @@ export async function planMigrations(
 
       const drop = DROP_INDEX.exec(statement);
       if (drop !== null) {
-        const name = splitQualified(drop[1]!);
-        dropped.add(name.table);
+        for (const raw of drop[1]!.match(new RegExp(QUALIFIED, 'g')) ?? []) dropped.add(tableKey(splitQualified(raw)));
         continue;
       }
 
       const index = parseCreateIndex(statement);
       if (index !== null) {
-        findings.push(await judgeIndex(migration.tag, statement, index, created, view, thresholds, dropped));
+        findings.push(await judgeIndex(migration.tag, statement, index, created, view, thresholds, dropped, resolve));
         continue;
       }
 
       if (!isUnparsed(statement)) continue;
       const candidates = [...statement.matchAll(CANDIDATE_TABLES)]
         .map((m) => splitQualified(m[1]!))
+        .filter((name) => !NOT_A_TABLE.has(name.table))
         .filter((name, i, all) => all.findIndex((other) => tableKey(other) === tableKey(name)) === i);
       const existing = candidates.filter((name) => !created.has(tableKey(name)));
       let largeTable: { name: TableName; estimate: TableEstimate } | null = null;
+      let resolved = 0;
       for (const name of existing) {
         const estimate = await view.estimate(name);
+        if (estimate !== null) resolved += 1;
         if (estimate !== null && isLarge(estimate, thresholds)) {
           largeTable = { name, estimate };
           break;
         }
       }
       let refused = largeTable !== null;
-      if (candidates.length === 0) {
+      // C14: nothing named — or nothing named resolves to a table — so the
+      // statement's real target is unknown: fall back to "does the database
+      // hold any large table". A statement on tables the pending set creates
+      // only is not refused.
+      if (candidates.length === 0 || (existing.length > 0 && resolved === 0)) {
         anyLarge ??= await inspector.anyLargeTable(thresholds);
         refused = anyLarge;
       }
@@ -386,7 +481,7 @@ export async function planMigrations(
         advice: refused
           ? 'unparsed, review: this statement can build an index or a key on a large table under the ' +
             'migration transaction. Check what it locks; run it by hand first if it can, else pass ' +
-            '--allow-locking to accept the lock.'
+            `--allow-locking=${migration.tag} to accept the lock.`
           : null,
         concurrently: null,
         statement,
@@ -404,8 +499,11 @@ async function judgeIndex(
   inspector: PlanInspector,
   thresholds: Thresholds,
   dropped: ReadonlySet<string>,
+  resolve: (name: TableName) => TableName = (name) => name,
 ): Promise<Finding> {
   const base = { migration: tag, table: tableKey(index.table), index: index.name, statement };
+  // C11: the table as it exists NOW — before a rename earlier in the pending set.
+  const physical = resolve(index.table);
   const ok = (kind: FindingKind, estimate: TableEstimate | null): Finding => ({
     ...base,
     kind,
@@ -419,8 +517,8 @@ async function judgeIndex(
   if (estimate === null) return ok('missing-table', null);
   if (!isLarge(estimate, thresholds)) return ok('small-table', estimate);
 
-  const prebuild = concurrentlyStatement(statement);
-  if (dropped.has(index.name)) {
+  const prebuild = concurrentlyStatement(tableKey(physical) === tableKey(index.table) ? statement : retarget(statement, physical));
+  if (dropped.has(`${index.table.schema}.${index.name}`)) {
     return {
       ...base,
       kind: 'rebuilt-in-pending',
@@ -429,7 +527,7 @@ async function judgeIndex(
       advice:
         `"${index.name}" is DROPPED earlier in the pending set and re-created here, so it cannot be pre-built under ` +
         `its name, and ${quoted(index.table)} is large (${describeEstimate(estimate)}). Schedule a window and pass ` +
-        '--allow-locking, or split the change into a migration that builds the new index under another name first.',
+        `--allow-locking=${index.name}, or split the change into a migration that builds the new index under another name first.`,
       concurrently: null,
     };
   }
@@ -442,11 +540,11 @@ async function judgeIndex(
       advice:
         `${quoted(index.table)} is large (${describeEstimate(estimate)}) and this statement has no IF NOT EXISTS, ` +
         'so a pre-built index would fail the migration with 42P07. Rewrite the migration as ' +
-        '`CREATE INDEX IF NOT EXISTS …`, then pre-build it CONCURRENTLY (or pass --allow-locking to take the lock).',
+        `\`CREATE INDEX IF NOT EXISTS …\`, then pre-build it CONCURRENTLY (or pass --allow-locking=${index.name} to take the lock).`,
       concurrently: prebuild,
     };
   }
-  const state = await inspector.index(index.table.schema, index.name);
+  const state = await inspector.index(physical.schema, index.name);
   if (!state.exists) {
     return {
       ...base,
@@ -457,13 +555,30 @@ async function judgeIndex(
       concurrently: prebuild,
     };
   }
-  if (tableKey(state.onTable) !== tableKey(index.table)) {
+  if (tableKey(state.onTable) !== tableKey(physical)) {
     return {
       ...base,
       kind: 'name-collision',
       refused: true,
       estimate,
-      advice: `An index named "${index.name}" already exists on ${quoted(state.onTable)}, so IF NOT EXISTS would skip building it on ${quoted(index.table)}.`,
+      advice: `An index named "${index.name}" already exists on ${quoted(state.onTable)}, so IF NOT EXISTS would skip building it on ${quoted(physical)}.`,
+      concurrently: null,
+    };
+  }
+  // C9: the same name on the same table with ANOTHER definition — IF NOT
+  // EXISTS would keep the old one and the new definition would never exist.
+  if (
+    state.definition !== undefined &&
+    normalizeIndexDefinition(state.definition) !== normalizeIndexDefinition(tableKey(physical) === tableKey(index.table) ? statement : retarget(statement, physical))
+  ) {
+    return {
+      ...base,
+      kind: 'name-collision',
+      refused: true,
+      estimate,
+      advice:
+        `"${index.name}" exists on ${quoted(physical)} with a different definition (${state.definition}); IF NOT EXISTS ` +
+        'would keep it and never build this one. Drop it CONCURRENTLY and pre-build this definition, or rename one of them.',
       concurrently: null,
     };
   }
@@ -473,7 +588,7 @@ async function judgeIndex(
       kind: 'invalid-index',
       refused: true,
       estimate,
-      advice: `"${index.name}" exists but is INVALID (an interrupted concurrent build), and IF NOT EXISTS would skip it. Drop it with DROP INDEX CONCURRENTLY ${quoted({ schema: index.table.schema, table: index.name })}; then run this, check indisvalid, and re-run the deploy:`,
+      advice: `"${index.name}" exists but is INVALID (an interrupted concurrent build), and IF NOT EXISTS would skip it. Drop it with DROP INDEX CONCURRENTLY ${quoted({ schema: physical.schema, table: index.name })}; then run this, check indisvalid, and re-run the deploy:`,
       concurrently: prebuild,
     };
   }
@@ -486,16 +601,32 @@ type Sql = postgres.Sql<Record<string, unknown>>;
 export function catalogInspector(sql: Sql): PlanInspector {
   return {
     async estimate({ schema, table }) {
+      // C13: a partitioned parent ('p') holds no rows itself — sum its leaf
+      // partitions (a leaf never analysed counts as unknown, so the parent
+      // is unknown only when every leaf is).
       const rows = await sql<{ reltuples: number; bytes: string }[]>`
-        select c.reltuples::float8 as reltuples, pg_relation_size(c.oid)::text as bytes
-        from pg_class c join pg_namespace n on n.oid = c.relnamespace
-        where n.nspname = ${schema} and c.relname = ${table} and c.relkind in ('r', 'p')`;
+        with target as (
+          select c.oid, c.relkind from pg_class c join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname = ${schema} and c.relname = ${table} and c.relkind in ('r', 'p')
+        ), parts as (
+          select l.oid from target t join pg_partition_tree(t.oid) pt on pt.isleaf join pg_class l on l.oid = pt.relid
+          where t.relkind = 'p'
+          union all
+          select t.oid from target t where t.relkind = 'r'
+        )
+        select case when count(*) = 0 then -1
+                    when bool_and(c.reltuples < 0) then -1
+                    else sum(greatest(c.reltuples, 0)) end::float8 as reltuples,
+               coalesce(sum(pg_relation_size(c.oid)), 0)::text as bytes
+        from parts p join pg_class c on c.oid = p.oid
+        having exists (select 1 from target)`;
       const row = rows[0];
       return row === undefined ? null : { reltuples: Number(row.reltuples), bytes: Number(row.bytes) };
     },
     async index(schema, name) {
-      const rows = await sql<{ valid: boolean; table_schema: string; table_name: string }[]>`
-        select i.indisvalid as valid, tn.nspname as table_schema, t.relname as table_name
+      const rows = await sql<{ valid: boolean; table_schema: string; table_name: string; definition: string }[]>`
+        select i.indisvalid as valid, tn.nspname as table_schema, t.relname as table_name,
+               pg_get_indexdef(c.oid) as definition
         from pg_class c
         join pg_namespace n on n.oid = c.relnamespace
         join pg_index i on i.indexrelid = c.oid
@@ -505,7 +636,12 @@ export function catalogInspector(sql: Sql): PlanInspector {
       const row = rows[0];
       return row === undefined
         ? { exists: false }
-        : { exists: true, valid: row.valid, onTable: { schema: row.table_schema, table: row.table_name } };
+        : {
+            exists: true,
+            valid: row.valid,
+            onTable: { schema: row.table_schema, table: row.table_name },
+            definition: row.definition,
+          };
     },
     async anyLargeTable({ rows, bytes }) {
       const found = await sql<{ large: boolean }[]>`
@@ -523,7 +659,11 @@ export interface MigrateDeployOptions {
   readonly url: string;
   readonly migrationsFolder?: string;
   readonly dryRun?: boolean;
-  readonly allowLocking?: boolean;
+  /**
+   * Code review C15: the refusals to accept, each named by its index or its
+   * migration (the full tag or its four-digit number). Nothing else passes.
+   */
+  readonly allowLocking?: readonly string[];
   readonly thresholds?: Partial<Thresholds>;
   readonly lockTimeoutMs?: number;
   readonly statementTimeoutMs?: number;
@@ -572,7 +712,7 @@ async function pendingMigrations(sql: Sql, folder: string): Promise<PendingMigra
   files.forEach((file, i) => {
     if (last !== null && !(last < file.folderMillis)) return;
     const tag = entries[i]?.tag ?? String(file.folderMillis);
-    pending.push({ tag, statements: file.sql.map((part) => stripSqlComments(part).trim()).filter((s) => s !== '') });
+    pending.push({ tag, statements: file.sql.flatMap(chunkStatements) });
   });
   return pending;
 }
@@ -640,21 +780,25 @@ export async function migrateDeploy(options: MigrateDeployOptions): Promise<Migr
       const inspector = (options.inspector ?? catalogInspector)(sql);
       const findings = await planMigrations(pending, inspector, thresholds);
       printPlan(log, pending, findings);
+      const allowed = new Set(options.allowLocking ?? []);
       const refusals = findings.filter((finding) => finding.refused);
+      const accepted = refusals.filter((finding) => isAccepted(finding, allowed));
+      const blocking = refusals.filter((finding) => !isAccepted(finding, allowed));
 
       if (options.dryRun === true) {
-        log(`Dry run: nothing changed${refusals.length > 0 ? ` (${refusals.length} refusal(s) — a real run would stop)` : ''}.`);
+        log(`Dry run: nothing changed${blocking.length > 0 ? ` (${blocking.length} refusal(s) — a real run would stop)` : ''}.`);
         return { outcome: 'dry-run', pending: pending.map((m) => m.tag), findings, applied: [] };
       }
-      if (refusals.length > 0 && options.allowLocking !== true) {
+      if (blocking.length > 0) {
+        const names = blocking.map((finding) => finding.index ?? finding.migration).join(',');
         log(
-          `Refused: ${refusals.length} statement(s) would lock a large table. Nothing was applied. ` +
-            'Follow the advice above (docs/design/DEPLOY.md), or re-run with --allow-locking to accept the locks.',
+          `Refused: ${blocking.length} statement(s) would lock a large table. Nothing was applied. ` +
+            `Follow the advice above (docs/design/DEPLOY.md), or accept named locks with --allow-locking=${names}.`,
         );
         return { outcome: 'refused', pending: pending.map((m) => m.tag), findings, applied: [] };
       }
-      if (refusals.length > 0) {
-        log(`--allow-locking: proceeding past ${refusals.length} refusal(s); each listed table is locked for its build.`);
+      for (const finding of accepted) {
+        log(`--allow-locking: accepting ${finding.index ?? finding.migration} (${finding.migration}) — ${finding.table ?? 'its table'} is locked for the build.`);
       }
       if (pending.length === 0) {
         log('Migrations are up to date.');
@@ -674,27 +818,67 @@ export async function migrateDeploy(options: MigrateDeployOptions): Promise<Migr
   }
 }
 
+/** A refusal the operator named in `--allow-locking` (C15). */
+function isAccepted(finding: Finding, allowed: ReadonlySet<string>): boolean {
+  return (
+    (finding.index !== null && allowed.has(finding.index)) ||
+    allowed.has(finding.migration) ||
+    allowed.has(finding.migration.slice(0, 4))
+  );
+}
+
+export interface CliArgs {
+  readonly dryRun: boolean;
+  readonly allowLocking: readonly string[];
+  readonly migrationsFolder?: string;
+}
+
+/** Parses the CLI's arguments; throws on anything unknown (a bare `--allow-locking` included). */
+export function parseCliArgs(argv: readonly string[]): CliArgs {
+  let dryRun = false;
+  const allowLocking: string[] = [];
+  let migrationsFolder: string | undefined;
+  for (const arg of argv) {
+    if (arg === '--dry-run') {
+      dryRun = true;
+    } else if (arg.startsWith('--allow-locking=')) {
+      const names = arg.slice('--allow-locking='.length).split(',').map((name) => name.trim()).filter((name) => name !== '');
+      if (names.length === 0) throw new Error('--allow-locking= needs at least one index name or migration tag');
+      allowLocking.push(...names);
+    } else if (arg.startsWith('--migrations-folder=')) {
+      migrationsFolder = arg.slice('--migrations-folder='.length);
+    } else {
+      throw new Error(
+        `Unknown argument "${arg}" (expected --dry-run, --allow-locking=<index-or-migration>[,…], --migrations-folder=<path>)`,
+      );
+    }
+  }
+  return { dryRun, allowLocking, ...(migrationsFolder === undefined ? {} : { migrationsFolder }) };
+}
+
 async function main(): Promise<void> {
   const url = process.env.DATABASE_URL;
   if (!url) {
     console.error('DATABASE_URL is required (the migrating owner)');
     process.exit(1);
   }
-  const args = new Set(process.argv.slice(2));
-  for (const arg of args) {
-    if (arg !== '--dry-run' && arg !== '--allow-locking') {
-      console.error(`Unknown argument "${arg}" (expected --dry-run, --allow-locking)`);
-      process.exit(1);
-    }
+  let args: CliArgs;
+  try {
+    args = parseCliArgs(process.argv.slice(2));
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
   }
   try {
     const result = await migrateDeploy({
       url,
-      dryRun: args.has('--dry-run'),
-      allowLocking: args.has('--allow-locking'),
+      dryRun: args.dryRun,
+      allowLocking: args.allowLocking,
+      ...(args.migrationsFolder === undefined ? {} : { migrationsFolder: args.migrationsFolder }),
     });
-    const refused = result.findings.some((finding) => finding.refused);
-    process.exit(result.outcome === 'refused' || (result.outcome === 'dry-run' && refused) ? 2 : 0);
+    const allowed = new Set(args.allowLocking);
+    const blocking = result.findings.some((finding) => finding.refused && !isAccepted(finding, allowed));
+    process.exit(result.outcome === 'refused' || (result.outcome === 'dry-run' && blocking) ? 2 : 0);
   } catch (err) {
     console.error('Migration failed:', err);
     process.exit(1);

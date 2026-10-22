@@ -1,9 +1,9 @@
 import type { AddressInfo } from 'node:net';
-import { request as httpRequest } from 'node:http';
+import { Agent, request as httpRequest } from 'node:http';
 import type { INestApplication } from '@nestjs/common';
 import { createApp } from '../src/app.factory';
 import { HealthController, type HealthResponse } from '../src/api/health.controller';
-import { OutboxRelayWorker } from '../src/jobs/jobs.module';
+import { JobsModule, OutboxRelayWorker } from '../src/jobs/jobs.module';
 import { OUTBOX_RELAY, type OutboxRelay } from '../src/shared/events/outbox.seam';
 import { DatabaseLifecycle } from '../src/shared/lifecycle/database-lifecycle';
 import { HttpDrain } from '../src/shared/lifecycle/http-drain';
@@ -13,6 +13,7 @@ import {
   resetShutdownDrainDeadline,
   settleBefore,
   shutdownDrainDeadline,
+  SHUTDOWN_DRAIN_MS,
 } from '../src/shared/lifecycle/shutdown';
 import { ValkeyClient } from '../src/shared/valkey/valkey.client';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
@@ -105,7 +106,11 @@ describe('graceful shutdown (story 6-2a)', () => {
       const first = shutdownDrainDeadline(1_000);
       expect(shutdownDrainDeadline(9_000)).toBe(first);
       expect(first).toBe(21_000);
-      expect(settleBefore(Promise.resolve(), 0)).resolves.toBe(false);
+    });
+
+    it('settleBefore: a deadline already past answers false at once (C25 — awaited)', async () => {
+      await expect(settleBefore(Promise.resolve(), 0)).resolves.toBe(false);
+      await expect(settleBefore(Promise.resolve(), Date.now() + 1_000)).resolves.toBe(true);
     });
 
     it('armForceExit: the first signal arms a timer that exits 1 when the sequence overruns', async () => {
@@ -115,6 +120,39 @@ describe('graceful shutdown (story 6-2a)', () => {
         process.emit('SIGUSR2', 'SIGUSR2');
         await new Promise((resolve) => setTimeout(resolve, 80));
         expect(exits).toEqual([1]);
+      } finally {
+        disarm();
+      }
+    });
+
+    it('armForceExit (C4): the listener stays; a second signal is a no-op — one timer, one exit', async () => {
+      const exits: number[] = [];
+      const before = process.listenerCount('SIGUSR2');
+      const disarm = armForceExit(60, (code) => exits.push(code), ['SIGUSR2']);
+      try {
+        process.emit('SIGUSR2', 'SIGUSR2');
+        // Still listening after the first signal — a second one never reaches Node's default action.
+        expect(process.listenerCount('SIGUSR2')).toBe(before + 1);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        process.emit('SIGUSR2', 'SIGUSR2');
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        expect(exits).toEqual([1]);
+      } finally {
+        disarm();
+      }
+      expect(process.listenerCount('SIGUSR2')).toBe(before);
+    });
+
+    it('armForceExit (C5/C35): the first signal fixes the drain deadline at signal time + the drain budget', async () => {
+      const disarm = armForceExit(60_000, () => undefined, ['SIGUSR2']);
+      try {
+        const signalledAt = Date.now();
+        process.emit('SIGUSR2', 'SIGUSR2');
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        // A waiter arriving later gets the SIGNAL's deadline, not its own start + the budget.
+        const deadline = shutdownDrainDeadline(Date.now());
+        expect(deadline).toBeGreaterThanOrEqual(signalledAt + SHUTDOWN_DRAIN_MS);
+        expect(deadline).toBeLessThan(signalledAt + SHUTDOWN_DRAIN_MS + 40);
       } finally {
         disarm();
       }
@@ -230,6 +268,95 @@ describe('graceful shutdown (story 6-2a)', () => {
       await closing;
       expect(t.events[0]).toBe('request handled');
       expectPoolsLast(t.events);
+    });
+
+    it('return503OnClosing (C22): once shutdown has begun, a request that reaches the app is answered 503, Connection: close', async () => {
+      const t = await boot(false);
+      t.handler.resolve(t.ok());
+      expect((await get(t.port, '/api/v1/health')).status).toBe(200);
+      // `prepareClose` — the first step of close() — calls exactly this.
+      (t.app.getHttpAdapter() as unknown as { beforeClose: () => void }).beforeClose();
+      const refused = await new Promise<{ status: number; connection: string | undefined }>((resolve, reject) => {
+        const req = httpRequest({ host: '127.0.0.1', port: t.port, path: '/api/v1/health', agent: false }, (res) => {
+          res.resume();
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, connection: res.headers.connection }));
+        });
+        req.on('error', reject);
+        req.end();
+      });
+      expect(refused).toEqual({ status: 503, connection: 'close' });
+      await t.closeApp();
+    });
+
+    it('forceCloseConnections (C22): a keep-alive request still hung at the drain deadline is cut, and close() still ends', async () => {
+      const t = await boot(false);
+      const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+      try {
+        const hung = new Promise<string>((resolve) => {
+          const req = httpRequest({ host: '127.0.0.1', port: t.port, path: '/api/v1/health', agent }, () => resolve('answered'));
+          req.on('error', (err: NodeJS.ErrnoException) => resolve(err.code ?? 'error'));
+          req.end();
+        });
+        const drainHttp = t.app.get(HttpDrain);
+        await until(() => drainHttp.inFlightRequests === 1);
+        // A short drain budget: the deadline passes with the request still blocked.
+        shutdownDrainDeadline(Date.now() - SHUTDOWN_DRAIN_MS + 200);
+        const t0 = Date.now();
+        await t.closeApp(); // without forceCloseConnections, server.close() would wait on the hung socket forever
+        expect(Date.now() - t0).toBeLessThan(5_000);
+        expect(await hung).toMatch(/ECONNRESET|socket hang up|error/);
+        expectPoolsLast(t.events);
+      } finally {
+        agent.destroy();
+        t.handler.resolve(t.ok());
+      }
+    });
+
+    it('every JobsModule worker (C23): the timer stops and beforeApplicationShutdown waits for its blocked tick', async () => {
+      const POLLS = [
+        'OUTBOX_RELAY_POLL_MS', 'OUTBOX_RECONCILE_POLL_MS', 'RESERVATION_REAPER_POLL_MS', 'COUNT_SCHEDULER_POLL_MS',
+        'REPLENISHMENT_SCHEDULER_POLL_MS', 'CHANNELS_SYNC_POLL_MS', 'STORAGE_SNAPSHOT_POLL_MS', 'PUSH_SENDER_POLL_MS',
+        'WAVE_CUTOFF_SWEEP_POLL_MS', 'AUDIT_EXPORT_POLL_MS', 'LEDGER_INTEGRITY_POLL_MS', 'SESSION_PURGE_POLL_MS',
+        'LICENCE_EXPIRY_POLL_MS',
+      ];
+      for (const name of POLLS) process.env[name] = '20';
+      let app: INestApplication;
+      try {
+        app = await createApp(false);
+      } finally {
+        for (const name of POLLS) delete process.env[name];
+      }
+      const workerClasses = (Reflect.getMetadata('providers', JobsModule) as (new (...args: never[]) => unknown)[]).filter(
+        (provider) => typeof provider === 'function' && /Worker$|Reaper$/.test(provider.name),
+      );
+      expect(workerClasses).toHaveLength(13);
+      type Worker = { tick: () => Promise<unknown>; beforeApplicationShutdown: () => Promise<void> };
+      const rows = workerClasses.map((cls) => {
+        const worker = app.get(cls) as unknown as Worker;
+        const release = deferred<void>();
+        const state = { calls: 0, settled: false };
+        jest.spyOn(worker, 'tick').mockImplementation(async () => {
+          state.calls += 1;
+          await release.promise;
+          return undefined;
+        });
+        return { name: cls.name, worker, release, state };
+      });
+      await app.init(); // the timers start here
+      for (const row of rows) await until(() => row.state.calls === 1);
+
+      const settling = rows.map((row) =>
+        row.worker.beforeApplicationShutdown().then(() => {
+          row.state.settled = true;
+        }),
+      );
+      await pause(100);
+      expect(rows.filter((row) => row.state.settled).map((row) => row.name)).toEqual([]); // each waits for its tick
+      for (const row of rows) row.release.resolve();
+      await Promise.all(settling);
+      await pause(60); // three poll intervals: no timer may fire again
+      expect(rows.filter((row) => row.state.calls !== 1).map((row) => `${row.name}: ${row.state.calls}`)).toEqual([]);
+      await app.close();
     });
 
     it('the worker exposes the hook Nest calls before the server closes', () => {

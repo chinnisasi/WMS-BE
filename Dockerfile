@@ -24,13 +24,15 @@ WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000
 
-COPY --from=deps --chown=bun:bun /app/node_modules ./node_modules
-COPY --chown=bun:bun package.json bun.lock tsconfig.json tsconfig.build.json ./
-COPY --chown=bun:bun src ./src
-COPY --chown=bun:bun drizzle ./drizzle
-COPY --chown=bun:bun scripts/provision-roles.sql ./scripts/provision-roles.sql
+# Code review C19: code and dependencies stay ROOT-owned (and not writable
+# by the runtime user) — the process can run its code, never rewrite it.
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json bun.lock tsconfig.json tsconfig.build.json ./
+COPY src ./src
+COPY drizzle ./drizzle
+COPY scripts/provision-roles.sql ./scripts/provision-roles.sql
 
-# Non-root: the base image's `bun` user (uid 1000).
+# Non-root: the base image's `bun` user (uid 1000) only RUNS it.
 USER bun
 EXPOSE 3000
 

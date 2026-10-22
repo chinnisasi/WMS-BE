@@ -5,7 +5,7 @@ import postgres from 'postgres';
 import request from 'supertest';
 import { createApp } from '../src/app.factory';
 import { OpenApiDocumentHolder } from '../src/api/openapi-document.holder';
-import { migrationVerdict, readJournal } from '../src/api/readiness.service';
+import { READINESS_CHECK_TIMEOUT_MS, ReadinessService, migrationVerdict, readJournal } from '../src/api/readiness.service';
 import { ValkeyClient } from '../src/shared/valkey/valkey.client';
 import { useSuiteDatabase, type SuiteDatabase } from './support/suite-db';
 
@@ -20,6 +20,8 @@ delete process.env.OUTBOX_RECONCILE_POLL_MS;
  * Behind and ahead are made by editing that table directly, the one state
  * the check reads.
  */
+jest.setTimeout(30_000);
+
 describe('readiness (story 6-2a)', () => {
   let app: INestApplication;
   let suiteDb: SuiteDatabase;
@@ -85,6 +87,61 @@ describe('readiness (story 6-2a)', () => {
     expect(res.body).toMatchObject({ code: 'not-ready', detail: 'Not ready: valkey' });
     expect(res.body).toMatchObject({ failing: ['valkey'] });
     expect(JSON.stringify(res.body)).not.toMatch(/ECONNREFUSED|secret-internal|10\.0\.0\.9/);
+  });
+
+  it('auth pool down (C21) → 503 naming auth-database only', async () => {
+    const service = app.get(ReadinessService) as unknown as { authDb: unknown };
+    const real = service.authDb;
+    service.authDb = { transaction: () => Promise.reject(new Error('password authentication failed for user "wms_auth"')) };
+    try {
+      const res = await ready().expect(503);
+      expect(res.body).toMatchObject({ code: 'not-ready', failing: ['auth-database'] });
+      expect(JSON.stringify(res.body)).not.toContain('wms_auth');
+    } finally {
+      service.authDb = real;
+    }
+  });
+
+  it('the migrations table unreadable while the database answers (C21) → 503 naming migrations-unreadable', async () => {
+    await admin`alter table drizzle.__drizzle_migrations rename to __drizzle_migrations_hidden`;
+    try {
+      const res = await ready().expect(503);
+      expect(res.body).toMatchObject({ code: 'not-ready', failing: ['migrations-unreadable'] });
+    } finally {
+      await admin`alter table drizzle.__drizzle_migrations_hidden rename to __drizzle_migrations`;
+    }
+    await ready().expect(200);
+  });
+
+  it('a hung probe (C21, C3): the check answers within its bound, and the SERVER cancels the query — nothing is left running', async () => {
+    // Its own connection: `admin` (max 1) must stay free for the checks below.
+    const holder = postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => undefined });
+    try {
+      await holder`begin`;
+      await holder`lock table drizzle.__drizzle_migrations in access exclusive mode`;
+      const t0 = Date.now();
+      const res = await ready().expect(503);
+      expect(Date.now() - t0).toBeLessThan(READINESS_CHECK_TIMEOUT_MS + 1_500);
+      expect(res.body).toMatchObject({ failing: ['migrations-unreadable'] });
+      // statement_timeout cancelled the probe server-side: no backend is still waiting on the lock.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const [waiting] = await admin<{ n: string }[]>`
+        select count(*)::text as n from pg_stat_activity
+        where query like '%__drizzle_migrations%' and wait_event_type = 'Lock' and pid <> pg_backend_pid()`;
+      expect(Number(waiting!.n)).toBe(0);
+    } finally {
+      await holder`rollback`.catch(() => undefined);
+      await holder.end();
+    }
+    await ready().expect(200);
+  });
+
+  it('a hung Valkey (C21) → 503 naming valkey within the bound', async () => {
+    jest.spyOn(app.get(ValkeyClient), 'ping').mockImplementation(() => new Promise(() => undefined));
+    const t0 = Date.now();
+    const res = await ready().expect(503);
+    expect(Date.now() - t0).toBeLessThan(READINESS_CHECK_TIMEOUT_MS + 1_500);
+    expect(res.body).toMatchObject({ failing: ['valkey'] });
   });
 
   it('the liveness route is unchanged and needs nothing (no session, no tenant)', async () => {

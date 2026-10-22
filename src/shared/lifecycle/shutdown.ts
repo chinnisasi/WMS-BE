@@ -113,7 +113,18 @@ export class InFlightTick {
  * Arms the force exit on the first SIGTERM / SIGINT: if the graceful
  * sequence has not ended the process within `ms`, exit 1 (a hung pool, a
  * request that ignores its socket being destroyed). The timer is unref'd, so
- * it never itself holds the process open. Returns a disarm function (tests).
+ * it never itself holds the process open.
+ *
+ * Code review C4: the listener is PERSISTENT (`process.on`, not `once`) and a
+ * second signal is a no-op. Nest removes its own listeners when its sequence
+ * starts, so without this one a second SIGTERM (an orchestrator retrying)
+ * would hit Node's default action and kill the process mid-drain.
+ *
+ * Code review C5/C35: the first signal also fixes the shared drain deadline
+ * at signal time + `SHUTDOWN_DRAIN_MS`, so the drain budget counts from the
+ * signal, not from whenever the first waiter happens to start.
+ *
+ * Returns a disarm function (tests).
  */
 export function armForceExit(
   ms: number = SHUTDOWN_FORCE_EXIT_MS,
@@ -122,14 +133,15 @@ export function armForceExit(
 ): () => void {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const onSignal = (signal: NodeJS.Signals): void => {
-    if (timer !== undefined) return;
+    if (timer !== undefined) return; // a repeated signal: the sequence is already running
+    shutdownDrainDeadline(Date.now());
     timer = setTimeout(() => {
       console.error(`Graceful shutdown (${signal}) did not finish within ${ms}ms — forcing exit`);
       exit(1);
     }, ms);
     timer.unref?.();
   };
-  for (const signal of signals) process.once(signal, onSignal);
+  for (const signal of signals) process.on(signal, onSignal);
   return () => {
     for (const signal of signals) process.removeListener(signal, onSignal);
     if (timer !== undefined) clearTimeout(timer);
